@@ -16,7 +16,7 @@ import {
   Trash2,
   User,
 } from "lucide-react";
-import { lazy, type ReactNode, Suspense, useCallback, useEffect, useId, useMemo, useState } from "react";
+import { lazy, type ReactNode, useCallback, useEffect, useId, useMemo, useState } from "react";
 import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import { useMdViewport } from "../../hooks/useMdViewport";
 import { useProjectScope } from "../../hooks/useProjectScope";
@@ -34,7 +34,7 @@ import type {
   MemoryIndexResponse,
   MemoryUsageDashboard,
 } from "../../lib/types";
-import { formatBytes } from "../../lib/chat/download";
+import { LazyBoundary } from "../ChunkErrorBoundary";
 import { cn } from "../../lib/utils";
 import { AgentProjectPreview } from "./AgentProjectPreview";
 import { IdentityManual, useIdentityManualAuthority } from "./IdentityManual";
@@ -982,7 +982,7 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
       setArchivingFile(file.file);
       try {
         await api.archiveMemoryFiles(auth, agentId, [file.file], "manual_archive");
-        toast(`已归档「${file.name?.trim() || file.file.replace(/\.md$/i, "")}」，随时可在归档箱还原`, "success");
+        toast(`已收纳「${file.name?.trim() || file.file.replace(/\.md$/i, "")}」，随时可在已收纳记录恢复`, "success");
         reload();
       } catch (e) {
         toast(apiErrorMessage(e, "归档失败"), "error");
@@ -1240,7 +1240,7 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
         />
       )}
       {slimOpen && (
-        <Suspense fallback={null}>
+        <LazyBoundary fallback={null}>
           <ContextSlimModal
             open={slimOpen}
             onOpenChange={setSlimOpen}
@@ -1250,10 +1250,10 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
             onSlimmed={reload}
             onOpenArchive={() => setArchiveOpen(true)}
           />
-        </Suspense>
+        </LazyBoundary>
       )}
       {archiveOpen && (
-        <Suspense fallback={null}>
+        <LazyBoundary fallback={null}>
           <ContextArchiveDrawer
             open={archiveOpen}
             onOpenChange={setArchiveOpen}
@@ -1262,7 +1262,7 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
             initialTab="memory"
             onRestored={reload}
           />
-        </Suspense>
+        </LazyBoundary>
       )}
     </div>
   );
@@ -1295,7 +1295,7 @@ function contextReadText(read: MemoryContextRead): string {
   if (read.status !== "ready") return CONTEXT_REASON_LABEL[read.reason] ?? "暂时读不到";
   if (!read.sources.length) return "还没有可用的记忆";
   return read.sources
-    .map((s) => `${s.kind === "core-index" ? "记忆索引" : "项目记忆"}（${formatBytes(s.bytes)}）`)
+    .map((s) => (s.kind === "core-index" ? "记忆索引" : "项目记忆"))
     .join("、");
 }
 
@@ -1655,7 +1655,6 @@ function MemoryFileCard({
   const typeMeta = TYPE_META[file.type] ?? { label: file.type || "记忆", tone: "neutral" as const };
   const { Icon, badgeClass } = memoryTypeVisual(file.type);
   const title = file.name?.trim() || file.file.replace(/\.md$/i, "");
-  const fileBytes = typeof file.bytes === "number" ? file.bytes : file.size;
   return (
     // 分组容器里的一行:整行可点,左侧类型图标徽章 + 清晰内容层次 + 悬停微动效箭头。
     <ListRow className="flex items-center p-0">
@@ -1693,9 +1692,6 @@ function MemoryFileCard({
                 已过期
               </Badge>
             )}
-            {typeof fileBytes === "number" && fileBytes > 0 && (
-              <span className="tabular-nums">{formatBytes(fileBytes)}</span>
-            )}
             {typeof file.hitCount30d === "number" && (
               <span className="tabular-nums">近30天命中 {file.hitCount30d} 次</span>
             )}
@@ -1716,7 +1712,7 @@ function MemoryFileCard({
           <IconButton
             size="sm"
             aria-label={`归档 ${title}`}
-            title="移入归档箱（随时可还原）"
+            title="移入已收纳记录（随时可恢复）"
             disabled={archiving}
             className="oc-icon-btn-tactile shrink-0 text-faint hover:text-fg"
             onClick={(e) => {

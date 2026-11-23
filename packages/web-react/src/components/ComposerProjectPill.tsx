@@ -12,7 +12,7 @@ import {
 } from "./ui/DropdownMenu";
 
 const PILL =
-  "oc-btn-tactile oc-spring-press inline-flex min-w-0 max-w-[11rem] items-center gap-1.5 rounded-full px-2.5 py-1 text-caption font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-10 sm:max-w-[16rem]";
+  "oc-btn-tactile oc-spring-press inline-flex min-w-0 max-w-[11rem] items-center gap-1.5 rounded-full px-2.5 py-1 text-caption font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11 sm:max-w-[16rem]";
 
 function ProjectDot({ color }: { color: string | null | undefined }) {
   const swatch = PROJECT_COLORS.find((c) => c.key === color);

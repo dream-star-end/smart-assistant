@@ -2,14 +2,19 @@ import * as assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
-import { describe, it } from 'node:test'
+import { afterEach, describe, it } from 'node:test'
+import type { Pool } from 'pg'
 import { type V3ContainerStatus, V3_CONTAINER_PORT } from '../agent-sandbox/v3supervisor.js'
 import {
   COLLAB_BRIDGE_AGENT_HEADER,
   COLLAB_BRIDGE_MODEL_HEADER,
   COLLAB_BRIDGE_SESSION_HEADER,
 } from '@openclaude/gateway'
+import { signAccess } from '../auth/jwt.js'
+import { resetPool, setPoolOverride } from '../db/index.js'
 import { containerApiProxy, matchContainerApiProxyRoute } from '../http/containerApiProxy.js'
+import { createCommercialHandler } from '../http/router.js'
+import { _clearMaintenanceCache } from '../middleware/maintenanceMode.js'
 
 function makeReq(opts: {
   method?: string
@@ -80,12 +85,21 @@ function makeStatus(overrides: Partial<V3ContainerStatus> = {}): V3ContainerStat
 }
 
 function makeCtx() {
+  const log = {
+    info() {},
+    warn() {},
+    error() {},
+    debug() {},
+    child() {
+      return log
+    },
+  }
   return {
     requestId: 'req_1',
     clientIp: '1.2.3.4',
     authBoundIp: '127.0.0.1',
     userAgent: 'ua',
-    log: { info() {}, warn() {}, error() {}, debug() {} },
+    log,
   }
 }
 
@@ -142,6 +156,24 @@ describe('containerApiProxy', () => {
     assert.equal(matchContainerApiProxyRoute('/api/agent-teams/dev_team', 'DELETE'), false)
     assert.equal(matchContainerApiProxyRoute('/api/team-runs/trun-abc123', 'GET'), false)
     assert.equal(matchContainerApiProxyRoute('/api/tasks-executions', 'POST'), false)
+    // Clarvy 上下文健康与记忆/技能归档代理白名单(OCV5-859)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/context-health', 'GET'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/context-health', 'POST'), false)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/context-hygiene/run', 'POST'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/context-hygiene/run', 'GET'), false)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/context-hygiene/history', 'GET'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/context-hygiene/history', 'POST'), false)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/archive', 'GET'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/archive', 'POST'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/archive', 'DELETE'), false)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/archive/restore', 'POST'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/archive/restore', 'GET'), false)
+    assert.equal(matchContainerApiProxyRoute('/api/skills/archive', 'GET'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/skills/archive', 'POST'), false)
+    assert.equal(matchContainerApiProxyRoute('/api/skills/archive/restore', 'POST'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/skills/archive/restore', 'GET'), false)
+    assert.equal(matchContainerApiProxyRoute('/api/skills/my-skill/archive', 'POST'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/skills/my-skill/archive', 'GET'), false)
   })
 
   it('proxies local JSON API calls with bridge headers and stripped auth', async () => {
@@ -532,5 +564,216 @@ describe('containerApiProxy', () => {
     assert.equal(res.statusCode, 200)
     assert.equal(initialTimeout, 3_000)
     assert.ok(promotedTimeouts.includes(60_000), `expected IDLE_MS(60000), got ${JSON.stringify(promotedTimeouts)}`)
+  })
+})
+
+describe('Clarvy context-health & archive router firewall (OCV5-859)', () => {
+  const JWT_SECRET = 'c'.repeat(64)
+  const CLARVY_ROUTES: ReadonlyArray<{ method: string; path: string; wrongMethod: string }> = [
+    { method: 'GET', path: '/api/agents/main/context-health', wrongMethod: 'POST' },
+    { method: 'POST', path: '/api/agents/main/context-hygiene/run', wrongMethod: 'GET' },
+    { method: 'GET', path: '/api/agents/main/context-hygiene/history', wrongMethod: 'POST' },
+    { method: 'GET', path: '/api/agents/main/memory/archive', wrongMethod: 'DELETE' },
+    { method: 'POST', path: '/api/agents/main/memory/archive', wrongMethod: 'PUT' },
+    { method: 'POST', path: '/api/agents/main/memory/archive/restore', wrongMethod: 'GET' },
+    // /api/skills/:name allows GET/PUT/DELETE, so POST is the disallowed method on /api/skills/archive.
+    { method: 'GET', path: '/api/skills/archive', wrongMethod: 'POST' },
+    { method: 'POST', path: '/api/skills/archive/restore', wrongMethod: 'GET' },
+    { method: 'POST', path: '/api/skills/my-skill/archive', wrongMethod: 'DELETE' },
+  ]
+
+  function makeStubPool(): Pool {
+    return {
+      async query(sql: string) {
+        const text = sql.replace(/\s+/g, ' ')
+        if (text.includes('FROM system_settings')) {
+          return {
+            rowCount: 1,
+            rows: [{ value: false, description: null, updated_at: new Date(), updated_by: '1' }],
+          }
+        }
+        if (text.includes('FROM users')) {
+          return { rowCount: 1, rows: [{ role: 'user', status: 'active' }] }
+        }
+        return { rowCount: 0, rows: [] }
+      },
+      async connect() {
+        throw new Error('not used')
+      },
+      async end() {},
+      on() {
+        return this
+      },
+    } as unknown as Pool
+  }
+
+  afterEach(async () => {
+    _clearMaintenanceCache()
+    await resetPool()
+  })
+
+  it('unauthenticated and gateway-only/cross-layer credential requests to Clarvy routes fail closed with 401 UNAUTHORIZED (never fall through to gateway)', async () => {
+    const pool = makeStubPool()
+    setPoolOverride(pool)
+    const { token: userToken } = await signAccess({ sub: '42', role: 'user' }, JWT_SECRET)
+    const { token: foreignGatewayToken } = await signAccess(
+      { sub: '42', role: 'user' },
+      'different-gateway-access-token-secret',
+    )
+    const handler = createCommercialHandler(
+      {
+        jwtSecret: JWT_SECRET,
+        mailer: { async send() {} },
+        redis: { async incr() { return 1 }, async expire() { return 1 } },
+        turnstileBypass: true,
+        verifyEmailUrlBase: 'https://test.local',
+        resetPasswordUrlBase: 'https://test.local',
+        v3Supervisor: { pool } as any,
+        bridgeSecret: 'bridge-secret',
+      },
+      { logger: makeCtx().log as any },
+    )
+
+    const credVariants: Array<{ name: string; headers: Record<string, string> }> = [
+      { name: 'no credentials', headers: {} },
+      // Gateway extractToken() accepts `sec-websocket-protocol: bearer, <tok>` and raw `Authorization: <tok>`
+      // without `Bearer ` prefix, whereas commercial extractTokenFromReq() ignores both.
+      // Clarvy routes MUST terminate with 401 in commercial instead of returning false to gateway.
+      {
+        name: 'sec-websocket-protocol bearer user JWT (gateway-only extraction)',
+        headers: { 'sec-websocket-protocol': `bearer, ${userToken}` },
+      },
+      {
+        name: 'raw Authorization header without Bearer prefix (gateway-only extraction)',
+        headers: { authorization: userToken },
+      },
+      {
+        name: 'non-commercial gateway-signed JWT',
+        headers: { authorization: `Bearer ${foreignGatewayToken}` },
+      },
+    ]
+
+    for (const v of credVariants) {
+      for (const r of CLARVY_ROUTES) {
+        const req = makeReq({ method: r.method, url: r.path, headers: v.headers })
+        const res = makeRes()
+        const handled = await handler(req as any, res as any)
+        assert.equal(
+          handled,
+          true,
+          `${r.method} ${r.path} (${v.name}) must terminate in commercial and NEVER fall through to gateway`,
+        )
+        assert.equal(
+          res.statusCode,
+          401,
+          `${r.method} ${r.path} (${v.name}) expected 401, got ${res.statusCode} ${res.body.toString()}`,
+        )
+        assert.equal(JSON.parse(res.body.toString()).error?.code, 'UNAUTHORIZED')
+      }
+    }
+  })
+
+  it('blocks commercial users on host fallback (proxy off or disallowed method) with 403 FORBIDDEN', async () => {
+    const pool = makeStubPool()
+    setPoolOverride(pool)
+    const { token } = await signAccess({ sub: '42', role: 'user' }, JWT_SECRET)
+
+    // 1) Without v3Supervisor (host fallback): allowed methods must be blocked with 403 FORBIDDEN.
+    const hostFallbackHandler = createCommercialHandler(
+      {
+        jwtSecret: JWT_SECRET,
+        mailer: { async send() {} },
+        redis: { async incr() { return 1 }, async expire() { return 1 } },
+        turnstileBypass: true,
+        verifyEmailUrlBase: 'https://test.local',
+        resetPasswordUrlBase: 'https://test.local',
+      },
+      { logger: makeCtx().log as any },
+    )
+    for (const r of CLARVY_ROUTES) {
+      const req = makeReq({
+        method: r.method,
+        url: r.path,
+        headers: { host: 'claudeai.chat', authorization: `Bearer ${token}` },
+      })
+      const res = makeRes()
+      const handled = await hostFallbackHandler(req as any, res as any)
+      assert.equal(handled, true, `${r.method} ${r.path} must be intercepted by BLOCKED_FOR_USER_RULES`)
+      assert.equal(res.statusCode, 403, `${r.method} ${r.path} body=${res.body.toString()}`)
+      assert.equal(JSON.parse(res.body.toString()).error?.code, 'FORBIDDEN')
+    }
+
+    // 2) With v3Supervisor enabled: disallowed methods and %-encoded agent/skill segments still hit 403 FORBIDDEN.
+    const proxyHandler = createCommercialHandler(
+      {
+        jwtSecret: JWT_SECRET,
+        mailer: { async send() {} },
+        redis: { async incr() { return 1 }, async expire() { return 1 } },
+        turnstileBypass: true,
+        verifyEmailUrlBase: 'https://test.local',
+        resetPasswordUrlBase: 'https://test.local',
+        v3Supervisor: { pool } as any,
+        bridgeSecret: 'bridge-secret',
+      },
+      { logger: makeCtx().log as any },
+    )
+    for (const r of CLARVY_ROUTES) {
+      const req = makeReq({
+        method: r.wrongMethod,
+        url: r.path,
+        headers: { host: 'claudeai.chat', authorization: `Bearer ${token}` },
+      })
+      const res = makeRes()
+      const handled = await proxyHandler(req as any, res as any)
+      assert.equal(handled, true, `${r.wrongMethod} ${r.path} must be blocked`)
+      assert.equal(res.statusCode, 403, `${r.wrongMethod} ${r.path} body=${res.body.toString()}`)
+    }
+
+    for (const encodedPath of ['/api/agents/ma%69n/context-health', '/api/skills/my%2dskill/archive']) {
+      const req = makeReq({
+        method: 'GET',
+        url: encodedPath,
+        headers: { host: 'claudeai.chat', authorization: `Bearer ${token}` },
+      })
+      const res = makeRes()
+      const handled = await proxyHandler(req as any, res as any)
+      assert.equal(handled, true, `${encodedPath} must be blocked`)
+      assert.equal(res.statusCode, 403, `${encodedPath} must return 403`)
+    }
+  })
+
+  it('authenticated commercial users still enter containerApiProxy before BLOCKED_FOR_USER_RULES', async () => {
+    const pool = makeStubPool()
+    setPoolOverride(pool)
+    const { token } = await signAccess({ sub: '42', role: 'user' }, JWT_SECRET)
+    const readyCalls: string[] = []
+    const handler = createCommercialHandler(
+      {
+        jwtSecret: JWT_SECRET,
+        mailer: { async send() {} },
+        redis: { async incr() { return 1 }, async expire() { return 1 } },
+        turnstileBypass: true,
+        verifyEmailUrlBase: 'https://test.local',
+        resetPasswordUrlBase: 'https://test.local',
+        v3Supervisor: { pool } as any,
+        bridgeSecret: 'bridge-secret',
+        ensureContainerReady: async (uid) => {
+          readyCalls.push(uid.toString())
+        },
+      },
+      { logger: makeCtx().log as any },
+    )
+
+    const req = makeReq({
+      method: 'GET',
+      url: '/api/agents/main/context-health',
+      headers: { host: 'claudeai.chat', authorization: `Bearer ${token}` },
+    })
+    const res = makeRes()
+    const handled = await handler(req as any, res as any)
+    assert.equal(handled, true)
+    assert.deepEqual(readyCalls, ['42'], 'must dispatch through containerApiProxy, not BLOCKED_FOR_USER_RULES')
+    assert.notEqual(res.statusCode, 403)
+    assert.notEqual(res.statusCode, 404)
   })
 })

@@ -33,9 +33,24 @@ describe("PreferencesSchema (full)", () => {
     assert.equal(r.success, true);
   });
 
-  test("拒绝未知字段(strict)", () => {
-    const r = PreferencesSchema.safeParse({ random_field: "x" });
-    assert.equal(r.success, false);
+  test("读回未知字段自动剥离并保留其余有效偏好(strip，滚动发布前向兼容)", () => {
+    const r = PreferencesSchema.safeParse({
+      theme: "dark",
+      random_field: "x",
+      system_assistant_profile: {
+        enabled: true,
+        nickname: "小林",
+        sessionId: "scope-1",
+        future_nested_field: true,
+      },
+    });
+    assert.equal(r.success, true);
+    if (r.success) {
+      assert.equal(r.data.theme, "dark");
+      assert.equal("random_field" in r.data, false);
+      assert.equal(r.data.system_assistant_profile?.nickname, "小林");
+      assert.equal("future_nested_field" in (r.data.system_assistant_profile ?? {}), false);
+    }
   });
 
   test("theme 越界值 → 拒绝", () => {

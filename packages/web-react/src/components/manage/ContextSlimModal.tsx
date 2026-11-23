@@ -18,6 +18,7 @@ import {
   ListGroup,
   ListRow,
   Modal,
+  useConfirm,
   useToast,
 } from "../ui";
 
@@ -133,6 +134,7 @@ export function ContextSlimModal({
   onOpenArchive,
 }: ContextSlimModalProps) {
   const toast = useToast();
+  const [confirmPermanent, confirmPermanentEl] = useConfirm();
   const candidates = useMemo(() => report?.slimCandidates ?? [], [report]);
   const actionable = useMemo(() => candidates.filter((c) => c.actionable), [candidates]);
 
@@ -211,6 +213,15 @@ export function ContextSlimModal({
 
   const handleSlim = async () => {
     if (selectedList.length === 0 || submitting) return;
+    if (selectedPermanentCount > 0) {
+      const ok = await confirmPermanent({
+        title: `永久清理 ${selectedPermanentCount} 项记录？`,
+        body: `本次将永久清理 ${selectedPermanentCount} 项旧快照或过期记录，不会进入已收纳记录且无法恢复。${selectedReversibleCount > 0 ? `其余 ${selectedReversibleCount} 项仍会安全收纳，随时可恢复。` : ""}确定继续吗？`,
+        confirmText: "确认永久清理",
+        danger: true,
+      });
+      if (ok !== true) return;
+    }
     setSubmitting(true);
     setErr(null);
     try {
@@ -401,8 +412,11 @@ export function ContextSlimModal({
               )}
               <Button
                 size="sm"
-                variant="primary"
-                className="oc-btn-tactile oc-btn-primary-craft gap-1.5"
+                variant={selectedPermanentCount > 0 ? "danger" : "primary"}
+                className={cn(
+                  "oc-btn-tactile gap-1.5",
+                  selectedPermanentCount === 0 && "oc-btn-primary-craft",
+                )}
                 loading={submitting}
                 disabled={selectedList.length === 0 || submitting}
                 onClick={() => void handleSlim()}
@@ -481,6 +495,7 @@ export function ContextSlimModal({
           </div>
         )}
       </div>
+      {confirmPermanentEl}
     </Modal>
   );
 }

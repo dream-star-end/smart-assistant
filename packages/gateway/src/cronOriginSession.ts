@@ -20,6 +20,9 @@ export type CronOriginFireResult =
   | { kind: 'retryable_failure'; code: string }
   | { kind: 'terminal_failure'; code: string }
 
+import { ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE } from './originInjectBackoff.js'
+export { ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE }
+
 export type OriginWebchatSession = {
   sessionKey: string
   agentId: string
@@ -75,10 +78,13 @@ export function cronOriginIdempotencyKey(jobId: string, deliveryId: string): str
  * `cron.remind-a.123` 与 `cron.remind-a1.23` 剥点后同串,跨 job 互相幂等吞掉。
  * 摘要保证不同 deliveryId 必得不同 id;结果满足 ^[A-Za-z0-9_-]{1,128}$。
  */
-export function cronOriginClientMessageId(deliveryId: string): string {
-  const compact = deliveryId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 60)
-  const digest = createHash('sha256').update(deliveryId, 'utf8').digest('hex').slice(0, 12)
-  return `cron-origin-${compact ? `${compact}-` : ''}${digest}`
+export function cronOriginClientMessageId(deliveryId: string, callbackEpoch = 1): string {
+  const epoch = Number.isFinite(callbackEpoch) && callbackEpoch > 1 ? Math.floor(callbackEpoch) : 1
+  const seed = epoch > 1 ? `${deliveryId}:e${epoch}` : deliveryId
+  const compact = deliveryId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, epoch > 1 ? 52 : 60)
+  const digest = createHash('sha256').update(seed, 'utf8').digest('hex').slice(0, 12)
+  const epochTag = epoch > 1 ? `e${epoch}-` : ''
+  return `cron-origin-${compact ? `${compact}-` : ''}${epochTag}${digest}`
 }
 
 /**

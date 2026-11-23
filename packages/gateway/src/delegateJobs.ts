@@ -19,6 +19,16 @@ import {
   type DelegateJobKind,
   type DelegateJobState,
 } from '@openclaude/protocol'
+import {
+  NOTIFY_MAX_CALLBACK_EPOCH,
+  abandonNotifyClaimOp,
+  abandonNotifyOp,
+  deferPendingNotifyOp,
+  releaseNotifyClaimWithEpochBumpOp,
+  shouldAbandonNotifyAfterAttemptOp,
+  type DelegateNotifyOpsHost,
+} from './delegateJobsNotifyOps.js'
+export { NOTIFY_MAX_CALLBACK_EPOCH }
 import type { DelegateDurableDb, DurableJobRecord } from './delegateDurable.js'
 
 export const DEFAULT_DELEGATE_JOB_TTL_MS = 2 * 60 * 60_000
@@ -370,6 +380,7 @@ export class DelegateJobStore {
     string,
     { claimToken: string; fencingEpoch: number; phase: 'attached' | 'quiesce_acked' }
   >()
+  private closed = false
 
   constructor(opts: DelegateJobStoreOptions = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_DELEGATE_JOB_TTL_MS
@@ -1336,6 +1347,7 @@ export class DelegateJobStore {
 
   /** Terminal jobs whose Completer callback is still pending/injecting. */
   listPendingNotify(): DelegateJobSnapshot[] {
+    if (this.closed) return []
     const out: DelegateJobSnapshot[] = []
     if (this.durable) {
       for (const row of this.durable.loadAll()) this.ingestDurableRow(row)
@@ -1653,54 +1665,38 @@ export class DelegateJobStore {
     return true
   }
 
+  private notifyOpsHost(): DelegateNotifyOpsHost<JobEntry> {
+    return {
+      durable: this.durable, now: this.now, refreshJob: (id) => this.refreshJob(id),
+      ingestDurableRow: (row) => this.ingestDurableRow(row), cloneEntry: (j) => this.cloneEntry(j),
+      commit: (j, d, t) => this.commit(j, d, t), nextNotifyBackoffMs, shouldAbandonPendingNotify, isLegalCallbackTransition,
+    }
+  }
+
+  releaseNotifyClaimWithEpochBump(jobId: string, deliveryToken: string, fence?: { claimToken: string; fencingEpoch: number }, opts?: { maxCallbackEpoch?: number }): 'bumped' | 'abandoned_at_epoch_cap' | 'stale' {
+    return releaseNotifyClaimWithEpochBumpOp(this.notifyOpsHost(), jobId, deliveryToken, fence, opts)
+  }
+
   shouldAbandonNotify(jobId: string): boolean {
     const job = this.refreshJob(jobId)
     if (!job) return false
     return shouldAbandonPendingNotify(job, this.now())
   }
 
-  /**
-   * Terminal notify budget exhausted. Clears the claim/retry so the
-   * scheduler never picks the row again. pending|injecting → abandoned.
-   */
-  abandonNotify(
-    jobId: string,
-    fence?: { claimToken: string; fencingEpoch: number },
-  ): boolean {
-    const job = this.refreshJob(jobId)
-    if (!job) return false
-    if (job.claimToken) {
-      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
-        return false
-      }
-    }
-    if (job.callbackState === 'abandoned') return true
-    if (!isLegalCallbackTransition(job.callbackState, 'abandoned')) return false
-    const draft = this.cloneEntry(job)
-    draft.callbackState = 'abandoned'
-    draft.notifyDeliveryToken = undefined
-    draft.notifyClaimedUntil = null
-    draft.notifyRetryAt = null
-    draft.lastActivityAt = this.now()
-    return this.commit(job, draft, false)
+  shouldAbandonNotifyAfterAttempt(jobId: string): boolean {
+    return shouldAbandonNotifyAfterAttemptOp(this.notifyOpsHost(), jobId)
   }
 
-  deferPendingNotify(
-    jobId: string,
-    fence?: { claimToken: string; fencingEpoch: number },
-  ): boolean {
-    const job = this.refreshJob(jobId)
-    if (!job || job.callbackState !== 'pending') return false
-    if (job.claimToken) {
-      if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
-        return false
-      }
-    }
-    const draft = this.cloneEntry(job)
-    draft.notifyRetryAt = this.now() + nextNotifyBackoffMs(job.notifyAttempt ?? 0)
-    draft.notifyAttempt = (job.notifyAttempt ?? 0) + 1
-    draft.lastActivityAt = this.now()
-    return this.commit(job, draft, false)
+  abandonNotifyClaim(jobId: string, deliveryToken: string, fence?: { claimToken: string; fencingEpoch: number }): boolean {
+    return abandonNotifyClaimOp(this.notifyOpsHost(), jobId, deliveryToken, fence)
+  }
+
+  abandonNotify(jobId: string, fence?: { claimToken: string; fencingEpoch: number }): boolean {
+    return abandonNotifyOp(this.notifyOpsHost(), jobId, fence)
+  }
+
+  deferPendingNotify(jobId: string, fence?: { claimToken: string; fencingEpoch: number }): boolean {
+    return deferPendingNotifyOp(this.notifyOpsHost(), jobId, fence)
   }
 
   restoreSnapshot(snap: DelegateJobSnapshot, agentId = 'restored'): void {
@@ -1819,6 +1815,7 @@ export class DelegateJobStore {
   }
 
   close(): void {
+    this.closed = true
     for (const job of this.jobs.values()) {
       const waiters = job.waiters.splice(0)
       for (const w of waiters) w({ status: 'expired', jobId: job.id })

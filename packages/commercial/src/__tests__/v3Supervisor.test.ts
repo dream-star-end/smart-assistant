@@ -55,6 +55,8 @@ import {
   V3_USER_LOCAL_MOUNT,
   V3_USER_CONFIG_MOUNT,
   V5_CURSOR_AUTH_RO_MOUNT,
+  ANTIGRAVITY_CLEARCUT_BLOCK_EXTRA_HOST,
+  buildContainerExtraHosts,
   SupervisorError,
   classifyRuntimeArtifactFailure,
 } from "../agent-sandbox/index.js";
@@ -884,6 +886,7 @@ describe("provisionV3Container", () => {
 
     // 网络 + IP forced via IPAMConfig
     assert.equal(opts.HostConfig?.NetworkMode, V3_NETWORK_NAME);
+    assert.deepEqual(opts.HostConfig?.ExtraHosts, [ANTIGRAVITY_CLEARCUT_BLOCK_EXTRA_HOST]);
     const epc = opts.NetworkingConfig?.EndpointsConfig?.[V3_NETWORK_NAME];
     assert.equal(epc?.IPAMConfig?.IPv4Address, IP);
 
@@ -945,6 +948,36 @@ describe("provisionV3Container", () => {
 
     // start 成功
     assert.equal(captured.started, 1);
+  });
+
+  test("OCV5-860: buildContainerExtraHosts 默认注入 play.googleapis.com:127.0.0.1 并保留既有条目且按主机名去重", () => {
+    assert.deepEqual(buildContainerExtraHosts(), ["play.googleapis.com:127.0.0.1"]);
+    assert.deepEqual(buildContainerExtraHosts([]), ["play.googleapis.com:127.0.0.1"]);
+
+    const existing = ["host.docker.internal:host-gateway"] as const;
+    assert.deepEqual(buildContainerExtraHosts(existing), [
+      "host.docker.internal:host-gateway",
+      "play.googleapis.com:127.0.0.1",
+    ]);
+    assert.deepEqual(existing, ["host.docker.internal:host-gateway"], "must not mutate caller input");
+
+    // 精确重复与大小写主机名去重：保留先出现的调用方条目，绝不覆盖用户/平台已有项
+    assert.deepEqual(
+      buildContainerExtraHosts([
+        "host.docker.internal:host-gateway",
+        "play.googleapis.com:127.0.0.1",
+        "HOST.DOCKER.INTERNAL:10.0.0.1",
+      ]),
+      ["host.docker.internal:host-gateway", "play.googleapis.com:127.0.0.1"],
+    );
+    assert.deepEqual(
+      buildContainerExtraHosts([
+        "  ",
+        "PLAY.GOOGLEAPIS.COM:127.0.0.2",
+        "host.docker.internal:host-gateway",
+      ]),
+      ["PLAY.GOOGLEAPIS.COM:127.0.0.2", "host.docker.internal:host-gateway"],
+    );
   });
 
   test("OC_TASKBOARD_ENABLED explicit master env is passed through to the container", async () => {

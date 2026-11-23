@@ -289,6 +289,10 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     inspect: scriptProbe('oc-docx.py', ['inspect', '--help'], { code: 0, stdout: /逐页配对/ }),
     check: scriptProbe('oc-docx.py', ['check', '--help'], { code: 0, stdout: /--expect-formulas/ }),
     scrub: scriptProbe('oc-docx.py', ['scrub', '--help'], { code: 0, stdout: /--keep-author/ }),
+    diff: scriptProbe('oc-docx.py', ['diff', '--help'], { code: 0, stdout: /--out-highlighted/ }),
+  },
+  'oc-stylecheck': {
+    check: scriptProbe('oc-stylecheck.py', ['--help'], { code: 0, stdout: /--style-file/ }),
   },
   'oc-docxcheck': {
     check: scriptProbe('oc-docxcheck.sh', ['--help'], { code: 0, stdout: /--expect-formulas/ }),
@@ -952,6 +956,11 @@ function productionSurfaces(): Record<string, Set<string>> {
     ),
     'oc-docx': pythonArgparseCommands(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docx.py',
+    ),
+    'oc-stylecheck': singlePurpose(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-stylecheck.py',
+      'check',
+      /prog="oc-stylecheck"/,
     ),
     'oc-muse': pythonArgparseCommands(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-muse.py',

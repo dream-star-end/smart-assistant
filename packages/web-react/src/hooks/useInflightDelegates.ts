@@ -118,6 +118,10 @@ export function useInflightDelegates(opts: {
   const seenLiveRef = useRef(new Set<string>());
   const authRef = useRef(auth);
   authRef.current = auth;
+  const authEpoch = auth?.snapshot().epoch ?? -1;
+  useEffect(() => {
+    notFoundRef.current.clear();
+  }, [auth, authEpoch, enabled]);
   const genRef = useRef(0);
   const lastPullAtRef = useRef(0);
   const refreshTimerRef = useRef<number | null>(null);
@@ -140,9 +144,10 @@ export function useInflightDelegates(opts: {
     const a = authRef.current;
     if (!a) return;
     if (notFoundRef.current.has(sid)) return;
+    const epoch = a.snapshot().epoch;
     lastPullAtRef.current = Date.now();
     const result = await fetchInflightDelegatesResult(sid, a);
-    if (genRef.current !== myGen) return;
+    if (genRef.current !== myGen || authRef.current !== a || a.snapshot().epoch !== epoch) return;
     if (result.ok) {
       for (const item of result.items) {
         if (!isTerminalDelegateState(item.state)) seenLiveRef.current.add(item.jobId);
@@ -160,10 +165,11 @@ export function useInflightDelegates(opts: {
       const sid = sessionIdRef.current;
       const a = authRef.current;
       if (!sid || !a || !jobId) return false;
+      const epoch = a.snapshot().epoch;
       const myGen = genRef.current;
       const res = await cancelInflightDelegate(sid, jobId, a);
       if (!res.ok) return false;
-      if (genRef.current === myGen) {
+      if (genRef.current === myGen && authRef.current === a && a.snapshot().epoch === epoch) {
         await pull(sid, myGen);
       }
       return true;

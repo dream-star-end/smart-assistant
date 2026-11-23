@@ -44,7 +44,7 @@ export function BatchBar({
           type="button"
           variant="ghost"
           size="sm"
-          className="h-6 shrink-0 rounded-xs px-2 text-caption"
+          className="h-6 shrink-0 rounded-xs px-2 text-caption [@media(hover:none)]:h-11 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
           onClick={onCancel}
         >
           取消

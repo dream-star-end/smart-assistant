@@ -13,8 +13,16 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 import type { Pool } from 'pg'
-import type { PendingDecisionAction, PendingDecisionRiskLevel } from '@openclaude/protocol'
+import {
+  type BrowserHandoffResumeWhen,
+  type PendingDecisionAction,
+  type PendingDecisionRiskLevel,
+  normalizeBrowserHandoffResumeWhen,
+} from '@openclaude/protocol'
+import { rootLogger } from '../logging/logger.js'
 import { PendingDecisionError, type BrowserHandoffRecord, type BrowserHandoffStore } from './types.js'
+
+const handoffLog = rootLogger.child({ module: 'pending-decisions.browser-handoff' })
 
 const DEFAULT_HANDOFF_TTL_MS = 15 * 60_000
 
@@ -169,7 +177,9 @@ export class PgBrowserHandoffStore implements BrowserHandoffStore {
     if ((inserted.rowCount ?? 0) > 0 && inserted.rows[0]) {
       const rec = rowToRecord(inserted.rows[0])
       if (this.onCreated) {
-        await Promise.resolve(this.onCreated(rec)).catch(() => {})
+        await Promise.resolve(this.onCreated(rec)).catch((err) => {
+          handoffLog.warn('browser_handoff onCreated listener failed', { id: rec.id, userId: rec.userId, err })
+        })
       }
       return rec
     }
@@ -270,6 +280,7 @@ export interface ParsedBrowserHandoffCard {
   url: string
   reason: string
   continuePrompt?: string
+  resumeWhen?: BrowserHandoffResumeWhen
 }
 
 const UI_FENCE_RE = /```ui\s*\r?\n([\s\S]*?)```/gi
@@ -301,7 +312,14 @@ export function extractBrowserHandoffCardsFromText(text: string): ParsedBrowserH
         typeof parsed.continue_prompt === 'string' && parsed.continue_prompt.trim()
           ? parsed.continue_prompt.trim()
           : undefined
-      out.push({ title, url, reason, ...(continuePrompt ? { continuePrompt } : {}) })
+      const resumeWhen = normalizeBrowserHandoffResumeWhen(parsed.resume_when ?? parsed.resumeWhen)
+      out.push({
+        title,
+        url,
+        reason,
+        ...(continuePrompt ? { continuePrompt } : {}),
+        ...(resumeWhen ? { resumeWhen } : {}),
+      })
     } catch {
       // ignore malformed ui block
     }
@@ -331,7 +349,13 @@ export function onOutboundBrowserHandoffFrame(
 export function emitOutboundBrowserHandoffFrame(evt: OutboundBrowserHandoffFrameEvent): void {
   if (outboundBrowserHandoffListeners.size === 0) return
   for (const listener of outboundBrowserHandoffListeners) {
-    void Promise.resolve(listener(evt)).catch(() => {})
+    void Promise.resolve(listener(evt)).catch((err) => {
+      handoffLog.warn('outbound browser_handoff listener failed', {
+        userId: evt.userId,
+        sessionId: evt.sessionId,
+        err,
+      })
+    })
   }
 }
 
@@ -392,16 +416,17 @@ export class OutboundBrowserHandoffFrameObserver {
     this.emitFn = opts?.emit ?? emitOutboundBrowserHandoffFrame
   }
 
-  observeOutboundFrame(userId: string, data: unknown): void {
-    const raw =
-      typeof data === 'string'
-        ? data
-        : Buffer.isBuffer(data)
-          ? data.toString('utf8')
-          : ''
-    if (!raw || !raw.includes('outbound.message')) return
+  private hasActiveStreamForUser(userId: string): boolean {
+    if (this.streams.size === 0) return false
+    const prefix = `${userId}\0`
+    for (const key of this.streams.keys()) {
+      if (key.startsWith(prefix)) return true
+    }
+    return false
+  }
 
-    let frame: {
+  observeOutboundFrame(userId: string, data: unknown): void {
+    type OutboundFrameShape = {
       type?: unknown
       messageId?: unknown
       clientMessageId?: unknown
@@ -409,10 +434,34 @@ export class OutboundBrowserHandoffFrameObserver {
       peer?: { id?: unknown }
       blocks?: Array<{ kind?: unknown; text?: unknown }>
     }
-    try {
-      frame = JSON.parse(raw) as typeof frame
-    } catch {
-      return
+
+    let frame: OutboundFrameShape
+    const isPreParsed =
+      data !== null &&
+      typeof data === 'object' &&
+      !Buffer.isBuffer(data) &&
+      !(data instanceof ArrayBuffer) &&
+      !Array.isArray(data)
+
+    if (isPreParsed) {
+      frame = data as OutboundFrameShape
+    } else {
+      const raw =
+        typeof data === 'string'
+          ? data
+          : Buffer.isBuffer(data)
+            ? data.toString('utf8')
+            : ''
+      if (!raw || !raw.includes('outbound.message')) return
+      // Fast pre-screen before JSON.parse: pass any frame containing a backtick or marker so split fences (e.g. "``" + "`ui") are never missed.
+      if (!this.hasActiveStreamForUser(userId) && !raw.includes('browser_handoff') && !raw.includes('`')) {
+        return
+      }
+      try {
+        frame = JSON.parse(raw) as OutboundFrameShape
+      } catch {
+        return
+      }
     }
     if (!frame || frame.type !== 'outbound.message') return
 
@@ -439,7 +488,7 @@ export class OutboundBrowserHandoffFrameObserver {
     const streamKey = `${userId}\0${sessionId ?? ''}\0${messageId ?? '__session__'}`
     let state = this.streams.get(streamKey)
 
-    if (!state && !chunk && !isFinal) return
+    if (!state && !chunk.includes('browser_handoff') && !chunk.includes('`')) return
 
     if (!state) {
       this.prune(nowMs)

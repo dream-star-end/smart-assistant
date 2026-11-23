@@ -163,4 +163,19 @@ describe('cron origin ids', () => {
       cronOriginClientMessageId('cron.remind-a1.23'),
     )
   })
+
+  it('mints distinct valid clientMessageIds when callbackEpoch bumps past 1 (OCV5-73)', () => {
+    const idDefault = cronOriginClientMessageId('cron.remind-a.123')
+    const idEpoch1 = cronOriginClientMessageId('cron.remind-a.123', 1)
+    assert.equal(idEpoch1, idDefault)
+    const ids = new Set<string>([idEpoch1])
+    for (let epoch = 2; epoch <= 5; epoch += 1) {
+      const id = cronOriginClientMessageId('cron.remind-a.123', epoch)
+      assert.match(id, /^cron-origin-[A-Za-z0-9_-]+$/)
+      assert.ok(id.length <= 128)
+      assert.equal(ids.has(id), false, `epoch ${epoch} collided`)
+      ids.add(id)
+    }
+    assert.equal(ids.size, 5)
+  })
 })

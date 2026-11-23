@@ -715,7 +715,10 @@ for (const entry of ["header", "picker", "goal", "github"]) test(`team close per
         await page.getByText("设定目标", { exact: true }).click();
         await page.getByPlaceholder("这次会话要达成什么？").fill("关闭团队首发回归");
         await page.getByRole("button", { name: "设置并开始", exact: true }).click();
-      } else await page.getByRole("button", { name: "关联 GitHub 仓库", exact: true }).first().click();
+      } else {
+        await page.getByRole("button", { name: "更多选项", exact: true }).click();
+        await page.getByTestId("composer-menu-repo").click();
+      }
       assert.equal((await saved).status(), 200, "materialization persists the same draft intent");
       if (entry === "github") await page.keyboard.press("Escape");
       await page.getByRole("dialog").waitFor({ state: "hidden" });

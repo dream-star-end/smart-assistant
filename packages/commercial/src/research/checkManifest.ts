@@ -15,14 +15,15 @@
  * fail-closed:不整篇拒答 —— 未过闸的 claim 标 unsupported(红标)/无 support 标 unchecked。
  */
 
-import type {
-  CitationVerdict,
-  Claim,
-  EvidenceManifest,
-  GateResult,
-  NormalizedDocument,
-  QuoteHandle,
-  SourceRecord,
+import {
+  type CitationVerdict,
+  type Claim,
+  type EvidenceManifest,
+  type GateResult,
+  type NormalizedDocument,
+  type QuoteHandle,
+  type SourceRecord,
+  resolveEvidenceGrade,
 } from "@openclaude/protocol/research";
 
 /** 闸⑤ 请求级预算(防 MiniCheck 慢/黑洞放大成数小时挂起)。 */
@@ -121,6 +122,7 @@ export async function checkManifest(
       charEnd: q.charEnd,
       text: span.text.slice(relStart, relEnd),
       score: typeof q.score === "number" ? q.score : undefined,
+      evidenceGrade: resolveEvidenceGrade({ docId: q.docId, spanId: q.spanId }),
     };
     canonicalQuotes.push(cq);
     validQuoteIds.add(cq.id);
@@ -219,17 +221,25 @@ export async function checkManifest(
     else if (validSupports.length === 0 || publishedFail) status = "unsupported";
     else status = "verified"; // quote-bound + (上传 OR 出版身份 resolved & 未撤稿)
 
+    const evidenceGrade = resolveEvidenceGrade({
+      quoteBound: validSupports.length > 0,
+      // 仅允许调用方显式降级为 'B',严禁凭自报 'A' 在无本地全文证据时提权。
+      evidenceGrade: c?.evidenceGrade === "B" ? "B" : undefined,
+    });
+
     return {
       id: typeof c?.id === "string" ? c.id : "",
       text: typeof c?.text === "string" ? c.text : "",
       supports: validSupports,
       status,
+      evidenceGrade,
       verdict: {
         verifier: "oc-cite",
         quoteBound: validSupports.length > 0,
         // identifierVerified:仅当有出版身份且全 resolved/未撤稿;上传文档为 false(诚实)
         identifierVerified: hasPublished && !publishedFail,
         retracted: anyRetracted,
+        evidenceGrade,
       },
     };
   });

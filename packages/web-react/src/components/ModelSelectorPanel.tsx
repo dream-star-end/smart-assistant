@@ -103,6 +103,10 @@ export type ModelSelectorPanelProps = {
   tierLabel: string | null
   shortViewport?: boolean
   effectiveMultiplier?: number
+  /** 桌面端下拉展开方向（顶栏向下 bottom / 输入坞底栏向上 top）。 */
+  side?: 'top' | 'bottom'
+  /** 桌面端下拉水平对齐（顶栏左对齐 start / 输入坞右侧右对齐 end）。 */
+  align?: 'start' | 'end'
 }
 
 function PickerItem({
@@ -150,7 +154,7 @@ function PickerItem({
       onClick={() => onSelect?.({ preventDefault() {} })}
       style={style}
       className={cn(
-        'flex min-h-11 w-full cursor-pointer select-none items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm outline-none transition-colors',
+        'flex min-h-11 w-full cursor-pointer select-none items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-body outline-none transition-colors',
         'hover:bg-hover focus-visible:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
         'disabled:pointer-events-none disabled:opacity-50',
         className,
@@ -184,7 +188,7 @@ function PickerLabel({
   return (
     <div
       className={cn(
-        'flex items-center justify-between gap-2 px-2.5 py-1.5 text-xs font-medium text-faint',
+        'flex items-center justify-between gap-2 px-2.5 py-1.5 text-caption font-medium text-faint',
         className,
       )}
       {...rest}
@@ -238,6 +242,13 @@ function rowFamily(row: ModelPickerRow): ModelFamilyKind {
   return detectModelFamily(`${row.row.family} ${row.row.label}`)
 }
 
+function rowKey(row: ModelPickerRow): string {
+  if (row.kind === 'plain') return `plain:${row.model.id}`
+  if (row.kind === 'locked-plain') return `locked-plain:${row.model.id}`
+  if (row.kind === 'locked-cursor-family') return `locked-cursor-family:${row.row.family}`
+  return `${row.kind}:${row.row.family}`
+}
+
 function groupUsableByFamily(rows: readonly ModelPickerRow[]) {
   const groups: Array<{ family: ModelFamilyKind; rows: ModelPickerRow[] }> = []
   const byFamily = new Map<ModelFamilyKind, ModelPickerRow[]>()
@@ -285,6 +296,8 @@ export function ModelSelectorPanel({
   tierLabel,
   shortViewport = false,
   effectiveMultiplier = 1,
+  side = 'bottom',
+  align = 'start',
 }: ModelSelectorPanelProps) {
   const selected = models.find((m) => m.id === selectedId)
   const selectedCursor = cursorPickerDef(
@@ -707,24 +720,27 @@ export function ModelSelectorPanel({
     )
   }
 
-  const usableVisibleRows = visibleRows.filter((r) => !isLockedRow(r) && !isDegradedRow(r))
-  const lockedVisibleRows = visibleRows.filter(isLockedRow)
-  const degradedVisibleRows = visibleRows.filter(isDegradedRow)
+  const recentKeySet = new Set(recentRows.map(rowKey))
+  const dedupedVisibleRows = visibleRows.filter((r) => !recentKeySet.has(rowKey(r)))
+  const dedupedCollapsedRows = collapsedRows.filter((r) => !recentKeySet.has(rowKey(r)))
+  const usableVisibleRows = dedupedVisibleRows.filter((r) => !isLockedRow(r) && !isDegradedRow(r))
+  const lockedVisibleRows = dedupedVisibleRows.filter(isLockedRow)
+  const degradedVisibleRows = dedupedVisibleRows.filter(isDegradedRow)
   const familyGroups = groupUsableByFamily(usableVisibleRows)
   const showFamilyGroups = familyGroups.length >= 2 && usableVisibleRows.length >= 3
 
   const notes = selectedDegraded && !teamEngineActive ? (
     <div
       role="note"
-      className="oc-callout oc-callout-danger mx-2 my-1.5 shrink-0 rounded-md px-3 py-2 text-xs leading-relaxed"
+      className="oc-callout oc-callout-danger mx-2 my-1.5 shrink-0 rounded-md px-3 py-2 text-caption leading-relaxed"
     >
       <span className="flex items-center gap-1.5 font-semibold text-danger">
         <AlertTriangle size={13} strokeWidth={1.75} className="shrink-0" /> 当前模型暂不可用
       </span>
       <span className="mt-0.5 block text-muted">
         {hasAlternatives
-          ? '该服务商暂时降级,建议改用下方可用模型。'
-          : '该服务商暂时降级,暂无同类可用模型,请稍后重试。'}
+          ? '该服务商暂时降级，建议改用下方可用模型。'
+          : '该服务商暂时降级，暂无同类可用模型，请稍后重试。'}
       </span>
     </div>
   ) : null
@@ -767,9 +783,9 @@ export function ModelSelectorPanel({
           )}
         </>
       ) : (
-        visibleRows.map((row) => renderRow(row, ''))
+        dedupedVisibleRows.map((row) => renderRow(row, ''))
       )}
-      {showCollapsedGroup && (
+      {dedupedCollapsedRows.length > 0 && showCollapsedGroup && (
         <>
           <PickerSeparator mode={mode} />
           <PickerItem
@@ -791,10 +807,10 @@ export function ModelSelectorPanel({
               <span>{COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL}</span>
             </span>
             <span className="text-caption font-normal tabular-nums text-faint">
-              {collapsedRows.length} 个
+              {dedupedCollapsedRows.length} 个
             </span>
           </PickerItem>
-          {collapsedOpen && collapsedRows.map((row) => renderRow(row, ''))}
+          {collapsedOpen && dedupedCollapsedRows.map((row) => renderRow(row, ''))}
         </>
       )}
     </>
@@ -917,13 +933,15 @@ export function ModelSelectorPanel({
                     className="oc-surface-recessed flex gap-1 rounded-md p-1"
                   >
                     <button
+                      id="model-picker-tab-models"
                       type="button"
                       role="tab"
                       data-testid="model-picker-tab-models"
                       aria-selected={shortTab === 'models'}
+                      aria-controls="model-picker-panel-models"
                       onClick={() => setShortTab('models')}
                       className={cn(
-                        'oc-btn-tactile oc-spring-press min-h-9 flex-1 rounded-sm px-3 py-1 text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                        'oc-btn-tactile oc-spring-press min-h-9 flex-1 rounded-sm px-3 py-1 text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11',
                         shortTab === 'models'
                           ? 'oc-segmented-thumb text-fg'
                           : 'text-muted hover:text-fg',
@@ -932,13 +950,15 @@ export function ModelSelectorPanel({
                       模型
                     </button>
                     <button
+                      id="model-picker-tab-extras"
                       type="button"
                       role="tab"
                       data-testid="model-picker-tab-extras"
                       aria-selected={shortTab === 'extras'}
+                      aria-controls="model-picker-panel-extras"
                       onClick={() => setShortTab('extras')}
                       className={cn(
-                        'oc-btn-tactile oc-spring-press min-h-9 flex-1 rounded-sm px-3 py-1 text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                        'oc-btn-tactile oc-spring-press min-h-9 flex-1 rounded-sm px-3 py-1 text-meta font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11',
                         shortTab === 'extras'
                           ? 'oc-segmented-thumb text-fg'
                           : 'text-muted hover:text-fg',
@@ -950,16 +970,25 @@ export function ModelSelectorPanel({
                 </div>
                 {shortTab === 'models' ? (
                   <div
-                    role="menu"
-                    data-testid="model-picker-sheet-scroll"
-                    className="model-picker-sheet-scroll min-h-0 flex-1 space-y-0.5 overflow-y-auto overscroll-contain px-2.5 py-2.5"
+                    id="model-picker-panel-models"
+                    role="tabpanel"
+                    aria-labelledby="model-picker-tab-models"
+                    className="flex min-h-0 flex-1 flex-col"
                   >
-                    {notes}
-                    {list}
+                    <div
+                      role="menu"
+                      data-testid="model-picker-sheet-scroll"
+                      className="model-picker-sheet-scroll min-h-0 flex-1 space-y-0.5 overflow-y-auto overscroll-contain px-2.5 py-2.5"
+                    >
+                      {notes}
+                      {list}
+                    </div>
                   </div>
                 ) : (
                   <div
+                    id="model-picker-panel-extras"
                     role="tabpanel"
+                    aria-labelledby="model-picker-tab-extras"
                     data-testid="model-picker-extras-panel"
                     className="model-picker-sheet-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain px-3.5 py-3"
                   >
@@ -992,7 +1021,7 @@ export function ModelSelectorPanel({
                     className="flex shrink-0 items-center gap-1.5 border-t border-border/70 bg-bg/60 px-3.5 py-2.5 text-caption text-muted"
                   >
                     <AtelierIcon name="swarm" size={12} className="shrink-0 text-accent/80" />
-                    <span>切至 Gemini 4 / Antigravity 模型可启用蜂群协作</span>
+                    <span>切至带蜂群星轨徽标的模型即可启用蜂群协作</span>
                   </div>
                 ) : null}
               </>
@@ -1008,7 +1037,9 @@ export function ModelSelectorPanel({
     return (
       <>
         <DropdownMenuContent
-          align="start"
+          side={side}
+          align={align}
+          sideOffset={side === 'top' ? 8 : undefined}
           data-testid="model-picker-two-col"
           className="model-picker-popover oc-surface-popover flex w-[min(620px,calc(100vw-24px))] flex-col overflow-hidden p-0"
         >
@@ -1047,7 +1078,9 @@ export function ModelSelectorPanel({
   return (
     <>
       <DropdownMenuContent
-        align="start"
+        side={side}
+        align={align}
+        sideOffset={side === 'top' ? 8 : undefined}
         data-testid="model-picker-single-col"
         className="model-picker-popover oc-surface-popover flex w-[min(340px,calc(100vw-24px))] min-w-[15.5rem] flex-col overflow-hidden p-1.5"
       >
@@ -1070,7 +1103,7 @@ export function ModelSelectorPanel({
             className="mt-1 flex shrink-0 items-center gap-1.5 border-t border-border/70 px-2 pt-2 pb-1 text-caption text-muted"
           >
             <AtelierIcon name="swarm" size={12} className="shrink-0 text-accent/80" />
-            <span>切至 Gemini 4 / Antigravity 模型可启用蜂群协作</span>
+            <span>切至带蜂群星轨徽标的模型即可启用蜂群协作</span>
           </div>
         )}
       </DropdownMenuContent>

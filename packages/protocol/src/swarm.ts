@@ -28,6 +28,8 @@ export interface SwarmMemberSnapshot {
   wakeMode?: string
   stepCount: number
   activity?: string
+  /** Structured parked-waiting state (preferred over matching localized `activity` text). */
+  waitingOnBoard?: boolean
   failed?: boolean
   lastError?: string
   unreadCount: number

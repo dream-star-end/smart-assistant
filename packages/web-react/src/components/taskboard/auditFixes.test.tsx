@@ -680,7 +680,7 @@ describe('T-22 护栏设置', () => {
 
     expect(screen.getByLabelText('连续失败熔断')).toHaveValue(3)
     expect(screen.getByLabelText('同一阶段最多打回次数')).toHaveValue(5)
-    expect(screen.getByLabelText('每轮巡检最多启动')).toHaveValue(2)
+    expect(screen.getByLabelText('每轮自动调度最多启动')).toHaveValue(2)
 
     fireEvent.change(concurrent, { target: { value: '4' } })
     fireEvent.change(screen.getByLabelText('连续失败熔断'), { target: { value: '6' } })

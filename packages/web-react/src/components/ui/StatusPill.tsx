@@ -35,13 +35,13 @@ const TEXT: Record<SemanticTone, string> = {
   idle: "text-status-idle",
 };
 
-/** 压在实心状态圆点上的前景色（如 needs_you 问号）：暗色 --warning(#e0a03a) 须配近黑 --warning-fg（8.01:1）。 */
+/** 压在实心状态圆点上的前景色（如 needs_you 问号）：深浅双主题均走语义 *-fg token 满足 WCAG AA。 */
 const ON_FILL: Record<SemanticTone, string> = {
   running: "text-accent-fg",
   attention: "text-warning-fg",
-  done: "text-white",
+  done: "text-success-fg",
   failed: "text-danger-fg",
-  idle: "text-white",
+  idle: "text-primary-fg",
 };
 
 /** 失败 / 需要处理的点带同色柔光晕(只在 md,也就是侧栏行首这种需要一眼扫到的位置)。 */

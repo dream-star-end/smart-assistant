@@ -39,13 +39,39 @@ function key(): string {
 
 test('mode: env wins, then the flag file, default enforce (OCV5-840)', () => {
   const home = mkdtempSync(join(tmpdir(), 'ocv5-755-mode-'))
+  freeze.resetPromptFreezeFlagCache()
   assert.equal(freeze.resolvePromptFreezeMode(home, {}), 'enforce')
   mkdirSync(join(home, 'runtime-flags'))
   writeFileSync(join(home, 'runtime-flags', 'prompt-freeze'), 'shadow\n')
+  freeze.resetPromptFreezeFlagCache()
   assert.equal(freeze.resolvePromptFreezeMode(home, {}), 'shadow')
   assert.equal(freeze.resolvePromptFreezeMode(home, { OC_PROMPT_FREEZE: 'off' }), 'off')
   writeFileSync(join(home, 'runtime-flags', 'prompt-freeze'), 'bogus')
+  freeze.resetPromptFreezeFlagCache()
   assert.equal(freeze.resolvePromptFreezeMode(home, {}), 'enforce')
+})
+
+test('mode: runtime-flag file reads use 5s in-memory TTL cache with test reset export', () => {
+  const home = mkdtempSync(join(tmpdir(), 'ocv5-755-ttl-'))
+  mkdirSync(join(home, 'runtime-flags'))
+  const flagPath = join(home, 'runtime-flags', 'prompt-freeze')
+  writeFileSync(flagPath, 'shadow\n')
+  freeze.resetPromptFreezeFlagCache()
+
+  const t0 = 1_700_000_000_000
+  assert.equal(freeze.resolvePromptFreezeMode(home, {}, t0), 'shadow')
+  // Rewrite file on disk: within 5s TTL, cached value is served without re-reading disk
+  writeFileSync(flagPath, 'off\n')
+  assert.equal(freeze.resolvePromptFreezeMode(home, {}, t0 + freeze.PROMPT_FREEZE_FLAG_CACHE_TTL_MS - 1), 'shadow')
+  // Explicit env var always bypasses the file cache immediately
+  assert.equal(freeze.resolvePromptFreezeMode(home, { OC_PROMPT_FREEZE: 'enforce' }, t0 + 100), 'enforce')
+  // Once 5s TTL expires, the updated flag file is read from disk
+  assert.equal(freeze.resolvePromptFreezeMode(home, {}, t0 + freeze.PROMPT_FREEZE_FLAG_CACHE_TTL_MS), 'off')
+  // Explicit reset immediately invalidates cached value
+  writeFileSync(flagPath, 'enforce\n')
+  assert.equal(freeze.resolvePromptFreezeMode(home, {}, t0 + freeze.PROMPT_FREEZE_FLAG_CACHE_TTL_MS + 10), 'off')
+  freeze.resetPromptFreezeFlagCache()
+  assert.equal(freeze.resolvePromptFreezeMode(home, {}, t0 + freeze.PROMPT_FREEZE_FLAG_CACHE_TTL_MS + 10), 'enforce')
 })
 
 test('enforce: a respawn with drifted memory index reuses the first prompt', () => {

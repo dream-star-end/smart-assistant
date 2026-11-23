@@ -31,6 +31,7 @@ import { classifyRunError } from './errorClassify.js'
 import {
   LOCAL_CATALOG_HEADER,
   getLocalCatalogToken,
+  getModelCatalogClient,
   triggerLocalCatalogRefreshOnConfigChanged,
 } from './modelCatalogClient.js'
 import { resolveConnectorEndpoint } from './ocConnectorsClient.js'
@@ -62,7 +63,15 @@ const DEFAULT_GROK_TIMEOUT_MS = 120_000
 // 经容器 internal anthropic proxy(ANTHROPIC_BASE_URL + oc-v3 容器 bearer)调用 —— 上游 key
 // 留 master,容器只用身份 bearer。codex backend 仅 OPENCLAUDE_VISION_BACKEND=codex 显式启用。
 export const STATIC_VISION_MODEL = 'k3-256k'
-const MINIMAX_VISION_MAX_TOKENS = 1024
+/**
+ * Flagship static vision models permitted when Grok vision is unavailable on this deployment
+ * (e.g. selfhost with grokEnabled=false). Never includes weak/flash/free models.
+ */
+export const FLAGSHIP_STATIC_VISION_MODELS = ['k3.1-pro', 'kimi-k3', 'k3-256k'] as const
+// Thinking-only flagship static vision models (e.g. k3.1-pro) count thinking toward
+// max_tokens; give ample headroom alongside low effort (master proxy strips output_config
+// for providers that do not support it).
+const MINIMAX_VISION_MAX_TOKENS = 6_144
 const DEFAULT_MINIMAX_TIMEOUT_MS = 60_000
 // master proxy messages body budget = 8MB(shared.ts);base64 膨胀 ~1.33x → raw cap 5MB → base64 ~6.7MB < 8MB。
 const DEFAULT_MINIMAX_MAX_IMAGE_BYTES = 5 * 1024 * 1024
@@ -752,9 +761,12 @@ async function readAnthropicSseText(resp: Response): Promise<string> {
   return out
 }
 
-// 静态模型 vision backend:经容器 internal anthropic proxy 发 STATIC_VISION_MODEL + image content block,
-// 复用 master 的路由/计费/authz/key 管理。**不 spawn 子进程、不写 auth.json、不碰 minimax key。**
-async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
+// 静态模型 vision backend:经容器 internal anthropic proxy 发 STATIC_VISION_MODEL(或指定旗舰视觉模型) + image content block,
+// 复用 master 的路由/计费/authz/key 管理。**不 spawn 子进程、不写 auth.json、不碰上游 key。**
+async function runMinimaxVision(
+  input: ResolvedVisionInput,
+  modelOverride?: string,
+): Promise<string> {
   const release = acquireVisionLock(input.timeoutMs)
   try {
     let endpoint: { masterBaseUrl: string; containerToken: string }
@@ -802,8 +814,9 @@ async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
     if (!ext) throw new Error('image_file is not a supported raster image (PNG/JPEG/GIF/WebP)')
 
     const body = {
-      model: STATIC_VISION_MODEL,
+      model: modelOverride ?? STATIC_VISION_MODEL,
       max_tokens: MINIMAX_VISION_MAX_TOKENS,
+      output_config: { effort: 'low' },
       messages: [
         {
           role: 'user',
@@ -864,9 +877,54 @@ async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
 
 export const runMinimaxVisionForTest = runMinimaxVision
 
+class GrokVisionUnavailableError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'GrokVisionUnavailableError'
+  }
+}
+
+export type VisionRunResult = {
+  text: string
+  backend: string
+}
+
+function parseErrorCode(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw) as { error?: { code?: unknown } }
+    return typeof parsed?.error?.code === 'string' ? parsed.error.code : null
+  } catch {
+    return null
+  }
+}
+
+async function pickFlagshipStaticVisionModel(): Promise<string> {
+  try {
+    const client = getModelCatalogClient()
+    if (client.configured) {
+      const view = await client.getView()
+      for (const candidate of FLAGSHIP_STATIC_VISION_MODELS) {
+        const canonical = view.canonicalize(candidate)
+        if (!view.isRoutable(canonical)) continue
+        const resolved = view.resolve(canonical)
+        if (resolved?.supportsVision === true && resolved.available !== false) {
+          return canonical
+        }
+      }
+    }
+  } catch {
+    // Fall back to the canonical flagship static vision model; /v1/messages still enforces catalog authority.
+  }
+  return STATIC_VISION_MODEL
+}
+
 // Grok vision backend:把图片 + 问题 POST 给 master 的 GROK_VISION_PATH,拿回识图文本。
 // 路由/authz/计费/Grok 订阅 token 全在 master。**不 spawn 子进程、不拿 relay route、不碰 Grok token。**
-async function runGrokVision(input: ResolvedVisionInput): Promise<string> {
+async function runGrokVisionDetailed(input: ResolvedVisionInput): Promise<VisionRunResult> {
   const release = acquireVisionLock(input.timeoutMs)
   try {
     let endpoint: { masterBaseUrl: string; containerToken: string }
@@ -909,17 +967,29 @@ async function runGrokVision(input: ResolvedVisionInput): Promise<string> {
       })
       const raw = await resp.text()
       if (!resp.ok) {
-        throw new Error(`grok vision upstream ${resp.status}${raw ? `: ${raw.slice(0, 300)}` : ''}`)
+        const msg = `grok vision upstream ${resp.status}${raw ? `: ${raw.slice(0, 300)}` : ''}`
+        const code = parseErrorCode(raw)
+        if (
+          resp.status === 503 &&
+          (code === 'GROK_VISION_MODEL_UNAVAILABLE' || code === 'GROK_VISION_NOT_CONFIGURED')
+        ) {
+          throw new GrokVisionUnavailableError(resp.status, code, msg)
+        }
+        throw new Error(msg)
       }
-      let text: unknown
+      let parsed: { text?: unknown; model?: unknown }
       try {
-        text = (JSON.parse(raw) as { text?: unknown }).text
+        parsed = JSON.parse(raw) as { text?: unknown; model?: unknown }
       } catch {
         throw new Error('grok vision returned invalid JSON')
       }
-      const out = typeof text === 'string' ? text.trim() : ''
+      const out = typeof parsed.text === 'string' ? parsed.text.trim() : ''
       if (!out) throw new Error('empty vision response')
-      return out
+      const actualModel =
+        typeof parsed.model === 'string' && parsed.model.trim()
+          ? parsed.model.trim()
+          : GROK_VISION_MODEL
+      return { text: out, backend: actualModel }
     } catch (err) {
       if (controller.signal.aborted) {
         throw new Error(`grok vision timed out after ${input.timeoutMs}ms`)
@@ -933,16 +1003,39 @@ async function runGrokVision(input: ResolvedVisionInput): Promise<string> {
   }
 }
 
+async function runGrokVision(input: ResolvedVisionInput): Promise<string> {
+  return (await runGrokVisionDetailed(input)).text
+}
+
 export const runGrokVisionForTest = runGrokVision
 
 // backend 路由:默认 Grok backend(GROK_VISION_MODEL);OPENCLAUDE_VISION_BACKEND=minimax 走静态模型
 // backend(STATIC_VISION_MODEL),=codex 走 codex。
-// **不做自动 fallback**:业务错误(4xx/余额/413)不绕到别的 backend(避免绕过 authz/计费语义),
-// 直接把错误返回给调用方模型。
-export async function runVision(input: ResolvedVisionInput): Promise<string> {
+// 业务错误(4xx/余额/413/限流/上游异常)原样返回不切换后端;仅当部署层明确返回
+// 503 GROK_VISION_MODEL_UNAVAILABLE / GROK_VISION_NOT_CONFIGURED(如自用版禁用 Grok)时,
+// 容灾到当前活跃可用的旗舰视觉模型(k3.1-pro / kimi-k3 / k3-256k),绝不静默降级弱模型。
+export async function runVisionWithBackend(input: ResolvedVisionInput): Promise<VisionRunResult> {
   const backend = visionBackend()
-  if (backend === 'codex') return runCodexVision(input)
-  return backend === 'grok' ? runGrokVision(input) : runMinimaxVision(input)
+  if (backend === 'codex') {
+    return { text: await runCodexVision(input), backend: visionBackendLabel() }
+  }
+  if (backend === 'minimax') {
+    return { text: await runMinimaxVision(input), backend: STATIC_VISION_MODEL }
+  }
+  try {
+    return await runGrokVisionDetailed(input)
+  } catch (err) {
+    if (err instanceof GrokVisionUnavailableError) {
+      const fallbackModel = await pickFlagshipStaticVisionModel()
+      const text = await runMinimaxVision(input, fallbackModel)
+      return { text, backend: fallbackModel }
+    }
+    throw err
+  }
+}
+
+export async function runVision(input: ResolvedVisionInput): Promise<string> {
+  return (await runVisionWithBackend(input)).text
 }
 
 async function runCodexVision(input: ResolvedVisionInput): Promise<string> {

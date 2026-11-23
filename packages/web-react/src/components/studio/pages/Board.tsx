@@ -1,6 +1,6 @@
 // OCV5-593 镜头看板 (d04 / m02): shot cards, the multi-track timeline and the director panel.
 
-import { LayoutGrid, List, Plus, Sparkles } from 'lucide-react'
+import { LayoutGrid, List, Sparkles } from 'lucide-react'
 import { useMemo, useState } from 'react'
 
 import { kindView } from '../../../hooks/useStudioProviders'
@@ -61,7 +61,7 @@ export function BoardPage(props: {
                 ? `${needs} 个镜头需要你`
                 : view.project.status === 'running'
                   ? '正在生成镜头'
-                  : '导演 agent'}
+                  : '导演助手'}
             </span>
             <span className="st-cap tnum">
               {formatCredits(view.project.spentCredits)} /{' '}
@@ -110,7 +110,7 @@ export function BoardPage(props: {
                 还没有镜头
               </div>
               <div className="st-cap" style={{ color: 'var(--st-stage-muted)', maxWidth: 440 }}>
-                开拍后导演 agent 会写分镜并逐个生成镜头，进度会实时出现在这里。
+                开拍后导演助手会写分镜并逐个生成镜头，进度会实时出现在这里。
               </div>
               <div>
                 <button type="button" className="st-btn st-btn-sm" onClick={props.onOpenBrief}>
@@ -128,10 +128,6 @@ export function BoardPage(props: {
                   onOpen={() => props.onOpenShot(c.shot.id)}
                 />
               ))}
-              <div className="st-card st-add-shot" aria-hidden="true">
-                <Plus size={18} />
-                <span className="st-cap st-hide-sm">加镜头，或让 agent 补一个（即将开放）</span>
-              </div>
             </div>
           ) : (
             <ul className="st-shot-list">

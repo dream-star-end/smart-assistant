@@ -28,13 +28,50 @@ export const DocLang = Type.Union([
 ])
 export type DocLang = Static<typeof DocLang>
 
-/** 引用格式样式。GB/T 7714-2015 是中文国标(走 citeproc + zotero-chinese CSL)。 */
+/** 引用格式样式。GB/T 7714-2015 / gb-t-7714 是中文国标;同时支持 APA / BibTeX / IEEE / Nature。 */
 export const CitationStyle = Type.Union([
   Type.Literal('gb-t-7714-2015'),
+  Type.Literal('gb-t-7714'),
   Type.Literal('apa'),
   Type.Literal('bibtex'),
+  Type.Literal('ieee'),
+  Type.Literal('nature'),
 ])
 export type CitationStyle = Static<typeof CitationStyle>
+
+/**
+ * 证据来源分级:
+ *   - 'A': 本地权威全文逐字核验(绑定本地 docId + spanId / quote-bound)
+ *   - 'B': 仅摘要/题录元数据(未绑定本地原文 span)
+ */
+export const EvidenceGrade = Type.Union([
+  Type.Literal('A'),
+  Type.Literal('B'),
+])
+export type EvidenceGrade = Static<typeof EvidenceGrade>
+
+export function resolveEvidenceGrade(input: {
+  /** 调用方声明等级:仅允许显式降级为 'B',绝不凭自报提升为权威 'A'。 */
+  evidenceGrade?: EvidenceGrade | null
+  docId?: string | null
+  spanId?: string | null
+  quoteBound?: boolean
+  /** 上层已完成本地库归属与引文绑定核验后的权威布尔信号。 */
+  localEvidenceVerified?: boolean
+}): EvidenceGrade {
+  if (input.evidenceGrade === 'B') return 'B'
+  if (typeof input.localEvidenceVerified === 'boolean') {
+    return input.localEvidenceVerified ? 'A' : 'B'
+  }
+  if (input.quoteBound === true) return 'A'
+  if (input.quoteBound === false) return 'B'
+  const hasLocalSpan =
+    typeof input.docId === 'string' &&
+    input.docId.trim().length > 0 &&
+    typeof input.spanId === 'string' &&
+    input.spanId.trim().length > 0
+  return hasLocalSpan ? 'A' : 'B'
+}
 
 // ───────────────────────────────────────────────
 // 1) 文献元数据(oc-lit 多源检索产出)
@@ -42,6 +79,10 @@ export type CitationStyle = Static<typeof CitationStyle>
 
 export const Author = Type.Object({
   name: Type.String(),
+  /** 可选结构化名(Crossref given / PubMed initials),便于精确格式化 APA/IEEE/Nature。 */
+  given: Type.Optional(Type.String()),
+  /** 可选结构化姓(Crossref family / PubMed surname)。 */
+  family: Type.Optional(Type.String()),
   /** OpenAlex / ORCID 作者 id,缺失常见(中文文献尤甚)。 */
   id: Type.Optional(Type.String()),
 })
@@ -68,6 +109,10 @@ export const SourceRecord = Type.Object({
   authors: Type.Array(Author),
   year: Type.Optional(Type.Integer()),
   venue: Type.Optional(Type.String()),
+  volume: Type.Optional(Type.String()),
+  issue: Type.Optional(Type.String()),
+  pages: Type.Optional(Type.String()),
+  publisher: Type.Optional(Type.String()),
   doi: Type.Optional(Type.String()),
   arxivId: Type.Optional(Type.String()),
   openalexId: Type.Optional(Type.String()),
@@ -83,6 +128,8 @@ export const SourceRecord = Type.Object({
   retracted: Type.Optional(Type.Union([Type.Boolean(), Type.Null()])),
   /** 经 oc-cite identifier 闸命中可信记录(DOI/arXiv/OpenAlex/Crossref ≥1)。 */
   identifiersVerified: Type.Optional(Type.Boolean()),
+  /** 证据来源分级(A=本地全文逐字核验, B=仅摘要/题录元数据;缺省由调用方按本地绑定推导)。 */
+  evidenceGrade: Type.Optional(EvidenceGrade),
 })
 export type SourceRecord = Static<typeof SourceRecord>
 
@@ -175,6 +222,8 @@ export const QuoteHandle = Type.Object({
   text: Type.String(),
   /** 检索得分(召回排序用,非权威信号)。 */
   score: Type.Optional(Type.Number()),
+  /** 证据分级(绑定本地 docId+spanId 默认为 'A')。 */
+  evidenceGrade: Type.Optional(EvidenceGrade),
 })
 export type QuoteHandle = Static<typeof QuoteHandle>
 
@@ -242,6 +291,8 @@ export const ClaimVerdict = Type.Object({
   retracted: Type.Boolean(),
   /** P1.5 MiniCheck 蕴含分(0~1),MVP 缺省。 */
   entailmentScore: Type.Optional(Type.Number()),
+  /** 证据来源分级(A=本地全文逐字核验, B=仅摘要/题录元数据)。 */
+  evidenceGrade: Type.Optional(EvidenceGrade),
   note: Type.Optional(Type.String()),
 })
 export type ClaimVerdict = Static<typeof ClaimVerdict>
@@ -253,6 +304,8 @@ export const Claim = Type.Object({
   supports: Type.Array(QuoteRef),
   status: ClaimStatus,
   verdict: Type.Optional(ClaimVerdict),
+  /** 证据来源分级(A=本地全文逐字核验, B=仅摘要/题录元数据;缺省按是否绑定本地 span 推导)。 */
+  evidenceGrade: Type.Optional(EvidenceGrade),
 })
 export type Claim = Static<typeof Claim>
 
@@ -392,6 +445,10 @@ export const CitationVerdict = Type.Object({
   bibtex: Type.Optional(Type.String()),
   gbt7714: Type.Optional(Type.String()),
   apa: Type.Optional(Type.String()),
+  ieee: Type.Optional(Type.String()),
+  nature: Type.Optional(Type.String()),
+  /** 证据来源分级(A=本地全文逐字核验, B=仅摘要/题录元数据)。 */
+  evidenceGrade: Type.Optional(EvidenceGrade),
   /** 未命中/不可用时的结构化原因(如 'ads_token_not_configured');R5 Phase B。 */
   reason: Type.Optional(Type.String()),
   /** 原因对应的上游获取指引(如 ADS token 生成路径)。 */
@@ -539,56 +596,250 @@ export function checkManifestStructuralInvariants(m: EvidenceManifest): {
 // ───────────────────────────────────────────────
 
 function asciiCiteKey(rec: SourceRecord): string {
-  const surname = rec.authors[0]?.name?.split(/\s+/).pop() ?? 'anon'
+  const first = rec.authors[0]
+  const surname = first ? splitAuthorParts(first).family : 'anon'
   const ascii = surname.replace(/[^A-Za-z]/g, '') || 'ref'
   return `${ascii.toLowerCase()}${rec.year ?? ''}`
 }
 
-/** BibTeX(type 按 crossrefType/arXiv 粗映射)。 */
+function isConferenceRecord(rec: SourceRecord): boolean {
+  const t = (rec.crossrefType ?? '').toLowerCase()
+  return t === 'proceedings-article' || t === 'paper-conference' || t === 'conference-paper'
+}
+
+function isBookRecord(rec: SourceRecord): boolean {
+  const t = (rec.crossrefType ?? '').toLowerCase()
+  return t === 'book' || t === 'monograph' || t === 'edited-book'
+}
+
+function isCjkName(name: string): boolean {
+  return /[\u3400-\u9fff]/.test(name)
+}
+
+function splitCompactInitials(token: string): string[] {
+  const cleaned = token.replace(/\./g, '').trim()
+  if (!cleaned) return []
+  return cleaned
+    .split('-')
+    .filter(Boolean)
+    .flatMap((seg) => (/^[A-Z]{2,4}$/.test(seg) ? seg.split('') : [seg]))
+}
+
+function extractInitials(given: string[]): string {
+  const letters: string[] = []
+  for (const part of given) {
+    const pieces = part
+      .split(/[\s.]+/)
+      .map((p) => p.trim())
+      .filter(Boolean)
+    for (const piece of pieces) {
+      if (/^[A-Z]{2,4}(?:-[A-Z]{1,2})*$/.test(piece)) {
+        for (const ch of splitCompactInitials(piece)) {
+          letters.push(`${ch[0]!.toUpperCase()}.`)
+        }
+      } else if (piece.includes('-')) {
+        const hyph = piece
+          .split('-')
+          .filter(Boolean)
+          .map((s) => `${s[0]!.toUpperCase()}.`)
+          .join('-')
+        if (hyph) letters.push(hyph)
+      } else {
+        letters.push(`${piece[0]!.toUpperCase()}.`)
+      }
+    }
+  }
+  return letters.join(' ')
+}
+
+function splitAuthorParts(author: Author | string): { given: string[]; family: string } {
+  if (typeof author !== 'string' && author.family?.trim()) {
+    return {
+      family: author.family.trim(),
+      given: (author.given ?? '').trim().split(/\s+/).filter(Boolean),
+    }
+  }
+  const trimmed = (typeof author === 'string' ? author : author.name).trim()
+  if (trimmed.includes(',')) {
+    const [fam, rest] = trimmed.split(',', 2)
+    return {
+      family: (fam ?? '').trim(),
+      given: (rest ?? '').trim().split(/\s+/).filter(Boolean),
+    }
+  }
+  const parts = trimmed.split(/\s+/).filter(Boolean)
+  if (parts.length <= 1) return { family: trimmed, given: [] }
+  // PubMed / MEDLINE 题录形态: "<Family> <INITIALS>" (如 "Smith JA"、"van der Berg HM")
+  const last = parts[parts.length - 1]!
+  const prev = parts[parts.length - 2]!
+  if (
+    /^[A-Z]{1,4}(?:-[A-Z]{1,2})*$/.test(last) &&
+    (/[a-z]/.test(prev) || (prev.length >= 2 && !/^[A-Z]\.?$/.test(prev)))
+  ) {
+    return {
+      family: parts.slice(0, -1).join(' '),
+      given: splitCompactInitials(last),
+    }
+  }
+  return { family: parts[parts.length - 1]!, given: parts.slice(0, -1) }
+}
+
+function formatIeeeAuthor(author: Author | string): string {
+  const rawName = (typeof author === 'string' ? author : author.name).trim()
+  if (!rawName || isCjkName(rawName)) return rawName
+  const { given, family } = splitAuthorParts(author)
+  if (given.length === 0) return family
+  const initials = extractInitials(given)
+  return initials ? `${initials} ${family}`.trim() : family
+}
+
+function formatFamilyInitialsAuthor(author: Author | string): string {
+  const rawName = (typeof author === 'string' ? author : author.name).trim()
+  if (!rawName || isCjkName(rawName)) return rawName
+  const { given, family } = splitAuthorParts(author)
+  if (given.length === 0) return family
+  const initials = extractInitials(given)
+  return initials ? `${family}, ${initials}`.trim() : family
+}
+
+function formatNatureAuthor(author: Author | string): string {
+  return formatFamilyInitialsAuthor(author)
+}
+
+function formatApaAuthors(authors: Author[]): string {
+  const formatted = authors.map((a) => formatFamilyInitialsAuthor(a)).filter(Boolean)
+  if (formatted.length === 0) return ''
+  if (formatted.length === 1) return formatted[0]!
+  if (formatted.length === 2) return `${formatted[0]}, & ${formatted[1]}`
+  if (formatted.length <= 20) {
+    return `${formatted.slice(0, -1).join(', ')}, & ${formatted[formatted.length - 1]}`
+  }
+  return `${formatted.slice(0, 19).join(', ')}, ... ${formatted[formatted.length - 1]}`
+}
+
+function normalizePagesDash(pages: string | undefined, dash: string): string | undefined {
+  if (!pages) return undefined
+  const clean = pages.trim().replace(/^[pP]{1,2}\.?\s*/, '')
+  if (!clean) return undefined
+  return clean.replace(/\s*[-–—]+\s*/g, dash)
+}
+
+/** BibTeX(按 crossrefType/arXiv 映射 article/inproceedings/book/misc, 含卷期页码与出版商)。 */
 export function formatBibtex(rec: SourceRecord): string {
-  const type = rec.arxivId && !rec.doi ? 'misc' : 'article'
+  const isConf = isConferenceRecord(rec)
+  const isBook = isBookRecord(rec)
+  const isArxivPreprint = Boolean(rec.arxivId && !rec.doi && !isConf && !isBook)
+  const type = isArxivPreprint
+    ? 'misc'
+    : isConf
+      ? 'inproceedings'
+      : isBook
+        ? 'book'
+        : 'article'
   const fields: string[] = [`  title = {${rec.title}}`]
   if (rec.authors.length) fields.push(`  author = {${rec.authors.map((a) => a.name).join(' and ')}}`)
-  if (rec.venue) fields.push(`  journal = {${rec.venue}}`)
+  if (rec.venue && !isArxivPreprint && !/^arxiv$/i.test(rec.venue.trim())) {
+    fields.push(`  ${isConf ? 'booktitle' : 'journal'} = {${rec.venue}}`)
+  }
   if (rec.year) fields.push(`  year = {${rec.year}}`)
+  if (rec.volume) fields.push(`  volume = {${rec.volume}}`)
+  if (rec.issue) fields.push(`  number = {${rec.issue}}`)
+  const pages = normalizePagesDash(rec.pages, '--')
+  if (pages) fields.push(`  pages = {${pages}}`)
+  if (rec.publisher) fields.push(`  publisher = {${rec.publisher}}`)
   if (rec.doi) fields.push(`  doi = {${rec.doi}}`)
-  if (rec.arxivId) fields.push(`  eprint = {${rec.arxivId}}`)
+  if (rec.arxivId) {
+    fields.push(`  eprint = {${rec.arxivId}}`)
+    fields.push(`  archivePrefix = {arXiv}`)
+  }
   if (rec.pmid) fields.push(`  pmid = {${rec.pmid}}`)
   return `@${type}{${asciiCiteKey(rec)},\n${fields.join(',\n')}\n}`
 }
 
-/** 作者列表(GB/T 7714:超 3 人取前 3 + 等)。 */
+/** 作者列表(GB/T 7714-2015 §8.1.2:超 3 人取前 3, 中文含 CJK 接 ", 等", 西文/拉丁字母接 ", et al")。 */
 function gbtAuthors(rec: SourceRecord): string {
-  const names = rec.authors.map((a) => a.name)
+  const names = rec.authors.map((a) => a.name.trim()).filter(Boolean)
   if (names.length === 0) return '佚名'
   if (names.length <= 3) return names.join(', ')
-  return `${names.slice(0, 3).join(', ')}, 等`
+  const hasCjk = names.some((n) => isCjkName(n))
+  return `${names.slice(0, 3).join(', ')}, ${hasCjk ? '等' : 'et al'}`
 }
 
 /**
- * GB/T 7714-2015(中文国标)。覆盖常见类型:期刊[J] / 预印本(arXiv,[J/OL] 在线)。
- * 全 CSL 覆盖(citeproc-js + zotero-chinese)留 P1.5;此为"够用"级。
+ * GB/T 7714-2015(中文国标)。完整支持期刊[J](含卷/期/页码/DOI)、会议[C]、专著[M]、预印本[J/OL]。
  */
 export function formatGbt7714(rec: SourceRecord): string {
   const authors = gbtAuthors(rec)
-  if (rec.arxivId && !rec.doi) {
+  const pages = normalizePagesDash(rec.pages, '-')
+  if (rec.arxivId && !rec.doi && !isConferenceRecord(rec) && !isBookRecord(rec)) {
     return `${authors}. ${rec.title}[J/OL]. arXiv, ${rec.year ?? ''}. https://arxiv.org/abs/${rec.arxivId}.`.replace(
       /,\s*\./,
       '.',
     )
   }
+  if (isConferenceRecord(rec)) {
+    const body = [`${authors}. ${rec.title}[C]`]
+    if (rec.venue) body.push(`//${rec.venue}`)
+    else body.push('.')
+    const tail: string[] = []
+    if (rec.publisher) tail.push(rec.publisher)
+    if (rec.year) tail.push(String(rec.year))
+    if (tail.length > 0) {
+      body.push(`${rec.venue ? '. ' : ' '}${tail.join(', ')}`)
+    }
+    if (pages) body.push(`: ${pages}`)
+    body.push('.')
+    if (rec.doi) body.push(` DOI: ${rec.doi}.`)
+    return body.join('').replace(/\.\.+/g, '.').replace(/,\s*\./g, '.').trim()
+  }
+  if (isBookRecord(rec)) {
+    const parts = [`${authors}. ${rec.title}[M].`]
+    const pubYear = [rec.publisher, rec.year ? String(rec.year) : undefined].filter(Boolean).join(', ')
+    if (pubYear) parts.push(` ${pubYear}`)
+    if (pages) parts.push(`: ${pages}`)
+    if (pubYear || pages) parts.push('.')
+    if (rec.doi) parts.push(` DOI: ${rec.doi}.`)
+    return parts.join('').replace(/\.\.+/g, '.').replace(/,\s*\./g, '.').trim()
+  }
   const parts = [`${authors}. ${rec.title}[J].`]
-  if (rec.venue) parts.push(` ${rec.venue},`)
-  if (rec.year) parts.push(` ${rec.year}.`)
+  const pubMeta: string[] = []
+  if (rec.venue) pubMeta.push(rec.venue)
+  const yearVolIssue = (() => {
+    const volIssue = rec.volume
+      ? rec.issue
+        ? `${rec.volume}(${rec.issue})`
+        : rec.volume
+      : rec.issue
+        ? `(${rec.issue})`
+        : ''
+    if (rec.year && volIssue) return `${rec.year}, ${volIssue}`
+    if (rec.year) return String(rec.year)
+    return volIssue
+  })()
+  if (yearVolIssue) pubMeta.push(yearVolIssue)
+  if (pubMeta.length > 0) {
+    parts.push(` ${pubMeta.join(', ')}${pages ? `: ${pages}` : ''}.`)
+  } else if (pages) {
+    parts.push(` ${pages}.`)
+  }
   if (rec.doi) parts.push(` DOI: ${rec.doi}.`)
   return parts.join('').replace(/,\s*\./g, '.').trim()
 }
 
-/** APA(7th,简化)。 */
+/** APA(7th)。支持规范作者(姓前名缩写 + 末作者 ", & ")、卷期页码、会议/期刊与 DOI/arXiv 链接。 */
 export function formatApa(rec: SourceRecord): string {
-  const authors = rec.authors.map((a) => a.name).join(', ')
+  const authors = formatApaAuthors(rec.authors)
   const year = rec.year ? `(${rec.year}). ` : ''
-  const venue = rec.venue ? ` ${rec.venue}.` : ''
+  const pages = normalizePagesDash(rec.pages, '–')
+  const venueParts: string[] = []
+  if (rec.venue) venueParts.push(rec.venue)
+  if (rec.volume) {
+    venueParts.push(rec.issue ? `${rec.volume}(${rec.issue})` : rec.volume)
+  } else if (rec.issue) {
+    venueParts.push(`(${rec.issue})`)
+  }
+  if (pages) venueParts.push(pages)
+  const venue = venueParts.length > 0 ? ` ${venueParts.join(', ')}.` : ''
   const doi = rec.doi
     ? ` https://doi.org/${rec.doi}`
     : rec.arxivId
@@ -597,8 +848,78 @@ export function formatApa(rec: SourceRecord): string {
   return `${authors} ${year}${rec.title}.${venue}${doi}`.trim()
 }
 
+/** IEEE 引用格式。支持作者缩写、双引号题名、会议 in / 期刊、vol./no./pp./year/doi。 */
+export function formatIeee(rec: SourceRecord): string {
+  const formattedAuthors = rec.authors.map((a) => formatIeeeAuthor(a)).filter(Boolean)
+  let authorStr = ''
+  if (formattedAuthors.length === 1) {
+    authorStr = formattedAuthors[0]!
+  } else if (formattedAuthors.length === 2) {
+    authorStr = `${formattedAuthors[0]} and ${formattedAuthors[1]}`
+  } else if (formattedAuthors.length > 6) {
+    authorStr = `${formattedAuthors[0]} et al.`
+  } else if (formattedAuthors.length > 2) {
+    authorStr = `${formattedAuthors.slice(0, -1).join(', ')}, and ${formattedAuthors[formattedAuthors.length - 1]}`
+  }
+  const parts: string[] = []
+  if (authorStr) parts.push(authorStr)
+  const details: string[] = []
+  if (rec.venue) {
+    details.push(isConferenceRecord(rec) ? `in ${rec.venue}` : rec.venue)
+  }
+  if (rec.volume) details.push(`vol. ${rec.volume}`)
+  if (rec.issue) details.push(`no. ${rec.issue}`)
+  const pages = normalizePagesDash(rec.pages, '–')
+  if (pages) details.push(`pp. ${pages}`)
+  if (rec.year) details.push(String(rec.year))
+  const titleChunk = details.length > 0 ? `"${rec.title},"` : `"${rec.title}."`
+  parts.push(titleChunk)
+  let out = parts.join(', ')
+  if (details.length > 0) out += ` ${details.join(', ')}.`
+  if (rec.doi) out += ` doi: ${rec.doi}.`
+  else if (rec.arxivId) out += ` arXiv:${rec.arxivId}.`
+  return out.replace(/\.\.+/g, '.').trim()
+}
+
+/** Nature 引用格式。超过 5 位作者用首作者 et al., 含期刊、卷、页码、(年)与 DOI。 */
+export function formatNature(rec: SourceRecord): string {
+  const formattedAuthors = rec.authors.map((a) => formatNatureAuthor(a)).filter(Boolean)
+  let authorStr = ''
+  if (formattedAuthors.length === 1) {
+    authorStr = formattedAuthors[0]!
+  } else if (formattedAuthors.length === 2) {
+    authorStr = `${formattedAuthors[0]} & ${formattedAuthors[1]}`
+  } else if (formattedAuthors.length > 5) {
+    authorStr = `${formattedAuthors[0]} et al.`
+  } else if (formattedAuthors.length > 2) {
+    authorStr = `${formattedAuthors.slice(0, -1).join(', ')} & ${formattedAuthors[formattedAuthors.length - 1]}`
+  }
+  const segments: string[] = []
+  if (authorStr) segments.push(authorStr)
+  segments.push(`${rec.title}.`)
+  const pages = normalizePagesDash(rec.pages, '–')
+  if (rec.arxivId && !rec.doi && !rec.venue) {
+    segments.push(
+      `Preprint at https://arxiv.org/abs/${rec.arxivId}${rec.year ? ` (${rec.year})` : ''}.`,
+    )
+    return segments.join(' ').replace(/\.\.+/g, '.').trim()
+  }
+  const pubBits: string[] = []
+  if (rec.venue) pubBits.push(rec.venue)
+  if (rec.volume) pubBits.push(rec.volume)
+  let pub = pubBits.join(' ')
+  if (pages) pub = pub ? `${pub}, ${pages}` : pages
+  if (rec.year) pub = pub ? `${pub} (${rec.year})` : `(${rec.year})`
+  if (pub) segments.push(`${pub}.`)
+  if (rec.doi) segments.push(`https://doi.org/${rec.doi}`)
+  else if (rec.arxivId) segments.push(`https://arxiv.org/abs/${rec.arxivId}`)
+  return segments.join(' ').replace(/\.\.+/g, '.').trim()
+}
+
 export function formatCitation(rec: SourceRecord, style: CitationStyle): string {
   if (style === 'bibtex') return formatBibtex(rec)
   if (style === 'apa') return formatApa(rec)
+  if (style === 'ieee') return formatIeee(rec)
+  if (style === 'nature') return formatNature(rec)
   return formatGbt7714(rec)
 }

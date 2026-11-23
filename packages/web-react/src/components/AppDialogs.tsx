@@ -12,7 +12,7 @@ import { TASKBOARD_ENABLED } from "../lib/taskboardFeature";
 import { normalizeManageTab } from "../lib/manageTabs";
 import { taskContinuationPrompt } from "../lib/chat/manualTaskContinuation";
 import { DEFAULT_AGENT } from "../lib/agents";
-import { lazy, useEffect, useState } from "react";
+import { createRetryableLazy } from "./ui/retryableLazy";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import type { Agent } from "../lib/agents";
 import type { PrefsView } from "../lib/modelPreferences";
@@ -34,45 +34,43 @@ import type { Theme } from "../hooks/useTheme";
 import type { SettingsDestinationSection } from "../lib/productCapabilities";
 import type { ToastFn } from "./ui/Toast";
 
-const AgentPicker = lazy(() => import("./AgentPicker").then((m) => ({ default: m.AgentPicker })));
-
-const SettingsCenter = lazy(() =>
+const SettingsCenter = createRetryableLazy(() =>
   import("./SettingsCenter").then((m) => ({ default: m.SettingsCenter })),
 );
 
-const MessageFeedbackDialog = lazy(() =>
+const MessageFeedbackDialog = createRetryableLazy(() =>
   import("./chat/MessageFeedbackDialog").then((m) => ({ default: m.MessageFeedbackDialog })),
 );
 
-const ProjectArchiveDialog = lazy(() =>
+const ProjectArchiveDialog = createRetryableLazy(() =>
   import("./ProjectArchiveDialog").then((m) => ({ default: m.ProjectArchiveDialog })),
 );
 
 // Ctrl/⌘K palette: lazy, mounted on first open (first-screen budget).
-const CommandPalette = lazy(() =>
+const CommandPalette = createRetryableLazy(() =>
   import("./CommandPalette").then((m) => ({ default: m.CommandPalette })),
 );
 // OCV5-840: 上下文健康与一键瘦身弹层，按需懒加载（零首屏开销）。
-const ContextHealthPopover = lazy(() =>
+const ContextHealthPopover = createRetryableLazy(() =>
   import("./chat/ContextHealthPopover").then((m) => ({ default: m.ContextHealthPopover })),
 );
 
 // P5b「记住这条 / 存为项目技能」弹窗：点了才下载（带 lib/taskboard）。
-const SaveToProjectDialog = lazy(() =>
+const SaveToProjectDialog = createRetryableLazy(() =>
   import("./project/SaveToProjectDialog").then((m) => ({ default: m.SaveToProjectDialog })),
 );
 
-const CreateProjectDialog = lazy(() =>
+const CreateProjectDialog = createRetryableLazy(() =>
   import("./CreateProjectDialog").then((m) => ({ default: m.CreateProjectDialog })),
 );
 
-const ProjectSettingsDialog = lazy(() =>
+const ProjectSettingsDialog = createRetryableLazy(() =>
   import("./ProjectSettingsDialog").then((m) => ({ default: m.ProjectSettingsDialog })),
 );
 
-const InboxDialog = lazy(() => import("./InboxDialog").then((m) => ({ default: m.InboxDialog })));
+const InboxDialog = createRetryableLazy(() => import("./InboxDialog").then((m) => ({ default: m.InboxDialog })));
 
-const MediaTaskCenter = lazy(() =>
+const MediaTaskCenter = createRetryableLazy(() =>
   import("./MediaTaskCenter").then((m) => ({ default: m.MediaTaskCenter })),
 );
 
@@ -86,24 +84,24 @@ export function mediaTaskContinuationDraft(
   return { sessionId, text: taskContinuationPrompt(job.prompt) };
 }
 
-const ShareDialog = lazy(() => import("./ShareDialog").then((m) => ({ default: m.ShareDialog })));
+const ShareDialog = createRetryableLazy(() => import("./ShareDialog").then((m) => ({ default: m.ShareDialog })));
 
-const ChatGptProxyDialog = lazy(() =>
+const ChatGptProxyDialog = createRetryableLazy(() =>
   import("./ChatGptProxyDialog").then((m) => ({ default: m.ChatGptProxyDialog })),
 );
 
-const GithubRepoModal = lazy(() =>
+const GithubRepoModal = createRetryableLazy(() =>
   import("./github/GithubRepoModal").then((m) => ({ default: m.GithubRepoModal })),
 );
 
-const ManageCenter = lazy(() => import("./ManageCenter").then((m) => ({ default: m.ManageCenter })));
+const ManageCenter = createRetryableLazy(() => import("./ManageCenter").then((m) => ({ default: m.ManageCenter })));
 
-const MarketplaceCenter = lazy(() =>
+const MarketplaceCenter = createRetryableLazy(() =>
   import("./MarketplaceCenter").then((m) => ({ default: m.MarketplaceCenter })),
 );
 
 // 企业版(P3.1)第四中心。仅 org owner/admin 有入口(成员在设置·账户页只读展示)。
-const OrgCenter = lazy(() => import("./OrgCenter").then((m) => ({ default: m.OrgCenter })));
+const OrgCenter = createRetryableLazy(() => import("./OrgCenter").then((m) => ({ default: m.OrgCenter })));
 
 export type AppDialogsProps = {
   preferencesRevision?: number;

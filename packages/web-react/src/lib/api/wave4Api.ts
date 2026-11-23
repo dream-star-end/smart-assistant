@@ -558,7 +558,9 @@ export type SwarmPlaybookId =
   | "parallel-impl-verify"
   | "multi-source-lit-verify"
   | "arch-deep-audit"
-  | "multi-option-review";
+  | "multi-option-review"
+  | "research-write-review-revise"
+  | "research-controlled-exp-loop";
 
 export interface SwarmPlaybookPreset {
   id: SwarmPlaybookId;
@@ -611,6 +613,26 @@ export const SWARM_PLAYBOOK_PRESETS: readonly SwarmPlaybookPreset[] = Object.fre
     roles: ["coordinator", "proposer-conservative", "proposer-radical", "devil-advocate"],
     defaultTaskHint: "请填写待决策的技术问题、核心约束与评估维度",
     guardrailSummary: "双提案独立发帖防锚定，最终结论须附明确回滚路径",
+  },
+  {
+    id: "research-write-review-revise",
+    title: "论文写作+盲审+批判修订",
+    category: "research",
+    categoryLabel: "科研写作",
+    summary: "跨强模型写稿、独立盲审与批判修订闭环，输出干净版 + Word 标黄 Diff 双版与去 AI 味报告。",
+    roles: ["coordinator", "author-writer", "blind-reviewer", "revision-editor"],
+    defaultTaskHint: "请填写论文题目/草稿路径、目标期刊引用规范与修订重点",
+    guardrailSummary: "盲审员严格只读，终稿必过 oc-cite A/B 分级、oc-docx diff 双版与 oc-stylecheck",
+  },
+  {
+    id: "research-controlled-exp-loop",
+    title: "受控实验循环（防刷分）",
+    category: "research",
+    categoryLabel: "受控实验",
+    summary: "锁评测脚本与测试集防 Reward Hacking，按单变量假设、复现验证与消融分析闭环迭代。",
+    roles: ["coordinator", "exp-engineer", "eval-guardian", "ablation-analyst"],
+    defaultTaskHint: "请填写实验目标、锁定评测脚本路径、基线指标与核心假设",
+    guardrailSummary: "严禁改动锁定评测与测试集，每轮单变量改动须经独立守护员复现核验",
   },
 ]);
 

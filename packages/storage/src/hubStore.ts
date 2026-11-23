@@ -13,12 +13,13 @@
  *   4. Update lockfile
  */
 
-import { execSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
+import { promisify } from 'node:util'
 import { paths } from './paths.js'
 import {
   normalizeSkillAgentScope,
@@ -27,6 +28,8 @@ import {
   type SkillMetadata,
 } from './skillStore.js'
 import { hubDownload, hubSearch, hubDetail, type HubSearchResult, type HubSkillDetail } from './clawhubClient.js'
+
+const execFileAsync = promisify(execFile)
 
 export { hubSearch, type HubSearchResult, type HubSkillDetail }
 
@@ -60,13 +63,13 @@ async function writeLock(lock: HubLockfile): Promise<void> {
 
 async function extractZip(zipBuf: Buffer, destDir: string): Promise<void> {
   await mkdir(destDir, { recursive: true })
-  // Write to temp file, then use system `unzip`
+  // Write to temp file, then invoke system `unzip` without a shell
   const tmpZip = join(tmpdir(), `clawhub-${randomUUID()}.zip`)
   await writeFile(tmpZip, zipBuf)
   try {
-    execSync(`unzip -o -q "${tmpZip}" -d "${destDir}"`, {
-      stdio: 'pipe',
+    await execFileAsync('unzip', ['-o', '-q', tmpZip, '-d', destDir], {
       timeout: 30_000,
+      maxBuffer: 10 * 1024 * 1024,
     })
   } finally {
     try {
@@ -134,15 +137,21 @@ export class HubStore {
       const entries = await readdir(destDir, { withFileTypes: true })
       const dirs = entries.filter((e) => e.isDirectory())
       if (dirs.length === 1) {
-        // Move contents up from the single nested dir
+        // Move contents up from the single nested dir (stage under a unique sibling name
+        // first so a child with the same name as dirs[0].name cannot collide with `nested`).
         const nested = join(destDir, dirs[0].name)
-        const nestedEntries = await readdir(nested)
-        for (const ne of nestedEntries) {
-          const src = join(nested, ne)
-          const dst = join(destDir, ne)
-          execSync(`mv "${src}" "${dst}"`, { stdio: 'pipe' })
+        const staging = join(destDir, `.flatten-${randomUUID()}`)
+        await rename(nested, staging)
+        try {
+          const nestedEntries = await readdir(staging)
+          for (const ne of nestedEntries) {
+            const src = join(staging, ne)
+            const dst = join(destDir, ne)
+            await rename(src, dst)
+          }
+        } finally {
+          await rm(staging, { recursive: true, force: true })
         }
-        await rm(nested, { recursive: true, force: true })
       }
     }
 

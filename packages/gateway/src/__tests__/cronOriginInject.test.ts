@@ -19,13 +19,14 @@ interface Captured {
   init: { method?: string; headers?: Record<string, string>; body?: string }
 }
 
-function mockFetcher(captured: Captured[], statusCode = 200) {
+function mockFetcher(captured: Captured[], statusCode = 200, responseBody: unknown = {}) {
   return (async (url: string, init: any) => {
     captured.push({ url, init })
+    const raw = typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody)
     return {
       statusCode,
       headers: {},
-      body: Readable.from([Buffer.from('{}', 'utf8')]),
+      body: Readable.from([Buffer.from(raw, 'utf8')]),
     }
   }) as unknown as typeof import('undici').request
 }
@@ -66,11 +67,50 @@ describe('postCronOriginInject', () => {
   })
 
   test('404/409/503 映射 gone / in_flight / retryable', async () => {
-    const r404 = await postCronOriginInject(PAYLOAD, {
+    // 404: ONLY complete read with explicit SESSION_GONE or exact empty body '' maps to gone
+    const r404Empty = await postCronOriginInject(PAYLOAD, {
       config: CONFIG,
-      fetcher: mockFetcher([], 404),
+      fetcher: mockFetcher([], 404, ''),
     })
-    assert.deepEqual(r404, { kind: 'gone' })
+    assert.deepEqual(r404Empty, { kind: 'gone' })
+    const r404SessionGone = await postCronOriginInject(PAYLOAD, {
+      config: CONFIG,
+      fetcher: mockFetcher([], 404, {
+        error: { code: 'SESSION_GONE', message: 'origin session missing or deleted' },
+      }),
+    })
+    assert.deepEqual(r404SessionGone, { kind: 'gone' })
+
+    // Non-empty 404 without SESSION_GONE (HTML, codeless JSON, wrong code, empty JSON object) → retryable
+    for (const body of [
+      '<html><body>404 Not Found</body></html>',
+      { message: 'route not found' },
+      { error: { code: 'NOT_FOUND', message: 'route missing' } },
+      {},
+      'x'.repeat(10_000),
+    ]) {
+      const r404Retry = await postCronOriginInject(PAYLOAD, {
+        config: CONFIG,
+        fetcher: mockFetcher([], 404, body),
+      })
+      assert.deepEqual(r404Retry, { kind: 'retryable', code: 'HTTP_404' })
+    }
+
+    // 404 whose body stream errors mid-read → retryable (never treat incomplete body as gone)
+    const brokenBodyFetcher = (async () => ({
+      statusCode: 404,
+      headers: {},
+      body: (async function* () {
+        yield Buffer.from('{"error":{"code":"SESSION', 'utf8')
+        throw new Error('aborted stream')
+      })(),
+    })) as unknown as typeof import('undici').request
+    const r404ReadErr = await postCronOriginInject(PAYLOAD, {
+      config: CONFIG,
+      fetcher: brokenBodyFetcher,
+    })
+    assert.deepEqual(r404ReadErr, { kind: 'retryable', code: 'HTTP_404' })
+
     const r409 = await postCronOriginInject(PAYLOAD, {
       config: CONFIG,
       fetcher: mockFetcher([], 409),
@@ -81,5 +121,52 @@ describe('postCronOriginInject', () => {
       fetcher: mockFetcher([], 503),
     })
     assert.equal(r503.kind, 'retryable')
+  })
+
+  test('仅 503 + PREVIOUSLY_FAILED_UNEXECUTED 映射 previously_failed，泛化 503 与所有 409 均保持原义 (OCV5-73)', async () => {
+    // Authoritative Master proven-unexecuted signal → previously_failed (authorizes epoch bump)
+    const rProvenUnexecuted = await postCronOriginInject(PAYLOAD, {
+      config: CONFIG,
+      fetcher: mockFetcher([], 503, {
+        error: {
+          code: 'PREVIOUSLY_FAILED_UNEXECUTED',
+          message: 'previously_failed_unexecuted',
+          request_id: 'req-123',
+        },
+        userError: { code: 'unknown', message: 'internal' },
+      }),
+    })
+    assert.deepEqual(rProvenUnexecuted, { kind: 'previously_failed' })
+
+    // 409 MUST NEVER bump epoch regardless of error code/message
+    for (const body of [
+      { error: { code: 'TURN_IN_FLIGHT', message: 'origin session has another open turn' } },
+      { error: { code: 'PREVIOUSLY_FAILED_UNEXECUTED', message: 'previously_failed_unexecuted' } },
+      { error: { code: 'TURN_PREVIOUSLY_FAILED', message: 'terminal failed' } },
+    ]) {
+      const r409 = await postCronOriginInject(PAYLOAD, {
+        config: CONFIG,
+        fetcher: mockFetcher([], 409, body),
+      })
+      assert.deepEqual(r409, { kind: 'in_flight' })
+    }
+
+    // Generic 503 INJECT_FAILED/previously_failed (executed_error, recovery sentinel, billed, legacy master)
+    // and all other 503 reasons MUST stay retryable (preserve same-epoch idempotency, zero double-billing)
+    for (const body of [
+      { error: { code: 'INJECT_FAILED', message: 'previously_failed', request_id: 'req-exec-err' } },
+      { error: { code: 'TURN_PREVIOUSLY_FAILED', message: 'previously_failed' } },
+      { error: { code: 'NO_TRANSPORT', message: 'no attested container bridge' } },
+      { error: { code: 'INJECT_FAILED', message: 'delivery_unknown' } },
+      { error: { code: 'INJECT_FAILED', message: 'manual_hold' } },
+      { error: { code: 'INJECT_FAILED', message: 'dispatch_rejected' } },
+      'not-json',
+    ]) {
+      const r = await postCronOriginInject(PAYLOAD, {
+        config: CONFIG,
+        fetcher: mockFetcher([], 503, body),
+      })
+      assert.deepEqual(r, { kind: 'retryable', code: 'HTTP_503' })
+    }
   })
 })

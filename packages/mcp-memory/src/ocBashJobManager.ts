@@ -101,6 +101,15 @@ export function hasAliveVerifiedGroupMembers(pgid: number, minStartTicks: number
   if (process.platform !== 'linux' || !Number.isInteger(pgid) || pgid <= 1 || minStartTicks === null) {
     return false
   }
+  // Fast short-circuit: ESRCH proves zero processes exist in process group `pgid`,
+  // avoiding a synchronous full scan of /proc/<pid>/stat on normal exits.
+  try {
+    process.kill(-pgid, 0)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ESRCH') {
+      return false
+    }
+  }
   let entries: string[]
   try {
     entries = readdirSync('/proc')

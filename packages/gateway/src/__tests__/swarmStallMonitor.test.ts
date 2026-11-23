@@ -11,7 +11,12 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { extractSwarmMentions, type SwarmMemberSnapshot, type SwarmSnapshot } from '@openclaude/protocol'
 
-import { AntigravitySwarmWatcher, parseMemberTranscriptTail, readAntigravitySwarmSnapshot } from '../engine/antigravitySwarmWatcher.js'
+import {
+  AntigravitySwarmWatcher,
+  normalizeSwarmToolName,
+  parseMemberTranscriptTail,
+  readAntigravitySwarmSnapshot,
+} from '../engine/antigravitySwarmWatcher.js'
 import {
   GATEWAY_STALL_MONITOR_AGENT,
   SwarmStallMonitor,
@@ -783,4 +788,64 @@ test('OCV5-852 P0-1/P1-4: DONE_PREFIX_RE accepts markdown bold & optional @all, 
   } finally {
     rmSync(brainDir, { recursive: true, force: true })
   }
+})
+
+test('OCV5-863: normalizeSwarmToolName strips mcp_openclaude-memory_ prefix and waitingOnBoard drives structured park detection', () => {
+  assert.equal(normalizeSwarmToolName('mcp_openclaude-memory_swarm_wait'), 'swarm_wait')
+  assert.equal(normalizeSwarmToolName('mcp_openclaude-memory_post_message'), 'post_message')
+  assert.equal(normalizeSwarmToolName('mcp_openclaude-memory_read_board'), 'read_board')
+  assert.equal(normalizeSwarmToolName('swarm_wait'), 'swarm_wait')
+
+  const waitTail = parseMemberTranscriptTail(
+    `${JSON.stringify({
+      step_index: 1,
+      type: 'TOOL_CALL',
+      status: 'ACTIVE',
+      tool_calls: [{ name: 'mcp_openclaude-memory_swarm_wait', arguments: { since: 3 } }],
+    })}\n`,
+  )
+  assert.equal(waitTail.activity, '等待讨论板消息')
+  assert.equal(waitTail.waitingOnBoard, true)
+
+  const postTail = parseMemberTranscriptTail(
+    `${JSON.stringify({
+      step_index: 2,
+      type: 'TOOL_CALL',
+      status: 'ACTIVE',
+      tool_calls: [{ name: 'mcp_openclaude-memory_post_message', arguments: { text: 'hi' } }],
+    })}\n`,
+  )
+  assert.equal(postTail.activity, '发送讨论消息')
+  assert.equal(postTail.waitingOnBoard, undefined)
+
+  const readTail = parseMemberTranscriptTail(
+    `${JSON.stringify({
+      step_index: 3,
+      type: 'TOOL_CALL',
+      status: 'ACTIVE',
+      tool_calls: [{ name: 'mcp_openclaude-memory_read_board', arguments: {} }],
+    })}\n`,
+  )
+  assert.equal(readTail.activity, '查看讨论板')
+
+  // Structured waitingOnBoard takes priority over localized activity text
+  assert.equal(
+    isMemberEffectivelyWaiting(
+      makeMember({ name: 'w1', role: 'worker', status: 'working', activity: '自定义状态', waitingOnBoard: true }),
+    ),
+    true,
+  )
+  assert.equal(
+    isMemberEffectivelyWaiting(
+      makeMember({ name: 'w2', role: 'worker', status: 'working', activity: '等待讨论板消息', waitingOnBoard: false }),
+    ),
+    false,
+  )
+  // Legacy fallback when waitingOnBoard is omitted
+  assert.equal(
+    isMemberEffectivelyWaiting(
+      makeMember({ name: 'w3', role: 'worker', status: 'working', activity: '等待讨论板消息' }),
+    ),
+    true,
+  )
 })

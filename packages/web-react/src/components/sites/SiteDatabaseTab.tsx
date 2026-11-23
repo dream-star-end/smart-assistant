@@ -125,7 +125,7 @@ export function SiteDatabaseTab({
             <EmptyState
               icon={Database}
               title="暂无数据表"
-              hint="在站点后端 `/api/*` 中调用 `ctx.db.exec/run`，或通过 `oc-site db-sql` 建表写入后，可在此实时浏览表结构与数据行。"
+              hint="当站点开始保存业务数据时会自动建库建表，届时可在此实时浏览表结构与数据行。"
             />
           </div>
         ) : (

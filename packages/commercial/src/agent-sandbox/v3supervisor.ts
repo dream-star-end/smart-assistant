@@ -71,7 +71,7 @@ import { v3MayServe } from "../channelMigration/channelState.js";
 import { containerSubnetPrefixForChannel } from "../containerNet.js";
 import { codexBindingAffinityKey, dockerContainerOwnedByChannel, getRuntimeChannel, type RuntimeChannel } from "../runtimeChannel.js";
 import { rootLogger } from "../logging/logger.js";
-import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
+import { V3_AGENT_GID, V3_AGENT_UID, buildContainerExtraHosts } from "./constants.js";
 import { SupervisorError } from "./types.js";
 import { assertFlavorIdentity, FlavorIdentityError } from "../flavor/assertFlavor.js";
 import { taskboardContainerEnv } from "./taskboardEnv.js";
@@ -3536,6 +3536,7 @@ export async function provisionV3Container(
           },
           HostConfig: {
             NetworkMode: v3NetworkNameForChannel(),
+            ExtraHosts: buildContainerExtraHosts(),
             // 资源硬限额 — 普通用户单容器吃不光宿主;admin 传 0 = Docker 不限
             Memory: memoryBytes,
             // MemorySwap == Memory → 禁 swap;admin 0/0 = 不限。

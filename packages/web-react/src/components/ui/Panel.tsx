@@ -32,7 +32,7 @@ export function PanelHeader({
     if (slot) {
       return (
         <div data-panel-header="" className="sr-only">
-          <h3>{title}</h3>
+          <h3 className="truncate">{title}</h3>
           {hint && <p>{hint}</p>}
           {action && createPortal(<div className="flex min-w-0 items-center gap-1">{action}</div>, slot)}
         </div>

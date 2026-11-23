@@ -130,7 +130,7 @@ export function ModelRow({
   };
 
   const cellInput =
-    "oc-field-control h-8 w-full min-w-[5.5rem] font-mono text-[13px] tabular-nums";
+    "oc-field-control h-8 w-full min-w-[5.5rem] font-mono text-base md:text-body tabular-nums";
 
   return (
     <tr className="transition-colors duration-150 hover:bg-hover/55">
@@ -141,7 +141,7 @@ export function ModelRow({
           onChange={(e) => setDisplayName(e.target.value)}
           maxLength={120}
           placeholder="—"
-          className="oc-field-control h-8 w-full min-w-[8rem] text-body"
+          className="oc-field-control h-8 w-full min-w-[8rem] text-base md:text-body"
         />
       </td>
       <td className="px-3 py-2.5">
@@ -178,7 +178,7 @@ export function ModelRow({
         <Input
           value={multiplier}
           onChange={(e) => setMultiplier(e.target.value)}
-          className="oc-field-control h-8 w-full min-w-[4.5rem] font-mono text-body tabular-nums"
+          className="oc-field-control h-8 w-full min-w-[4.5rem] font-mono text-base md:text-body tabular-nums"
         />
       </td>
       <td className="px-3 py-2">
@@ -212,7 +212,7 @@ export function ModelRow({
             onCheckedChange={handleToggle}
             aria-label={model.enabled ? "点击下线" : "点击上线"}
           />
-          <span className={`text-[12px] ${model.enabled ? "text-success" : "text-faint"}`}>
+          <span className={`text-meta ${model.enabled ? "text-success" : "text-faint"}`}>
             {model.enabled ? "上线中" : "已下线"}
           </span>
         </span>

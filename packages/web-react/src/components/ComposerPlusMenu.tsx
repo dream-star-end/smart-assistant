@@ -1,5 +1,6 @@
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { Plus, Target } from "lucide-react";
+import { useRef, useState } from "react";
 import { goalNearBudget } from "../lib/goalPresentation";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { RepoSelection } from "../lib/types";
@@ -41,6 +42,11 @@ export function ComposerPlusMenu({
   const hasBoundRepo = Boolean(onOpenRepo && repoSelection?.selected);
   const showSwarmPlaybooks = Boolean(hasSwarmPlaybooks && onOpenSwarmPlaybooks);
   const hasMenu = canGoal || Boolean(onOpenRepo) || showSwarmPlaybooks;
+  // 选中会接管焦点的菜单项（剧本弹层 / 目标 / 仓库弹窗）时：
+  // 1) 阻止菜单关闭把焦点抢回「+」按钮；
+  // 2) 跳过 120ms 退场动画让菜单立刻卸载，避免退场期残留的 FocusScope 抢走新弹层焦点并触发 focusOutside 秒关（OCV5-861）。
+  const suppressCloseFocusRef = useRef(false);
+  const [instantClose, setInstantClose] = useState(false);
 
   const goalDot = visibleGoal ? (
     <span
@@ -68,8 +74,24 @@ export function ComposerPlusMenu({
     );
   }
 
+  const handoffToOverlay = (action: () => void) => {
+    suppressCloseFocusRef.current = true;
+    setInstantClose(true);
+    action();
+  };
+
   return (
-    <DropdownMenu open={open} onOpenChange={onOpenChange}>
+    <DropdownMenu
+      open={open}
+      modal={false}
+      onOpenChange={(next) => {
+        if (next) {
+          suppressCloseFocusRef.current = false;
+          setInstantClose(false);
+        }
+        onOpenChange(next);
+      }}
+    >
       <DropdownMenuTrigger asChild>
         <IconButton
           data-product-feature={PRODUCT_CAPABILITIES.files.id}
@@ -89,11 +111,21 @@ export function ComposerPlusMenu({
           {goalDot}
         </IconButton>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" side="top" className="min-w-[13rem]">
+      <DropdownMenuContent
+        align="start"
+        side="top"
+        className={cn("min-w-[13rem]", instantClose && "data-[state=closed]:animate-none")}
+        onCloseAutoFocus={(event) => {
+          if (suppressCloseFocusRef.current) {
+            suppressCloseFocusRef.current = false;
+            event.preventDefault();
+          }
+        }}
+      >
         {canGoal && (
           <DropdownMenuItem
             data-product-feature={PRODUCT_CAPABILITIES.sessionGoal.id}
-            onSelect={onOpenGoal}
+            onSelect={() => handoffToOverlay(onOpenGoal)}
             className="gap-2.5"
           >
             <span
@@ -125,7 +157,7 @@ export function ComposerPlusMenu({
           <DropdownMenuItem
             data-product-feature={PRODUCT_CAPABILITIES.github.id}
             data-testid="composer-menu-repo"
-            onSelect={onOpenRepo}
+            onSelect={() => handoffToOverlay(onOpenRepo)}
             className="gap-2.5"
           >
             <span
@@ -148,7 +180,7 @@ export function ComposerPlusMenu({
           <DropdownMenuItem
             data-product-control
             data-testid="composer-menu-swarm-playbooks"
-            onSelect={onOpenSwarmPlaybooks}
+            onSelect={() => handoffToOverlay(() => onOpenSwarmPlaybooks?.())}
             className="gap-2.5"
           >
             <span

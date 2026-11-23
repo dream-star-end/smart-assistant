@@ -203,9 +203,12 @@ function typecheckCommands(sel: GateSelection, cwd: string): { label: string; co
   return out;
 }
 
-function gateCommand(gate: GateMeta): { command: string; args: string[] } {
+export function gateCommand(gate: GateMeta, base?: string): { command: string; args: string[] } {
   const args = ["run", gate.npmScript];
-  if (gate.npmArgs?.length) args.push("--", ...gate.npmArgs);
+  const extra: string[] = [];
+  if (gate.npmArgs?.length) extra.push(...gate.npmArgs);
+  if (gate.passBaseFlag && base) extra.push("--base", base);
+  if (extra.length) args.push("--", ...extra);
   return { command: "npm", args };
 }
 
@@ -307,7 +310,7 @@ export async function runFast(opts: FastCliOptions): Promise<number> {
         }
         continue;
       }
-      const { command, args } = gateCommand(gate);
+      const { command, args } = gateCommand(gate, opts.base);
       items.push({ label: gate.id, command, args, lock: gate.lock });
     }
     const result = await runPhase(phase.cost, items, opts.cwd);

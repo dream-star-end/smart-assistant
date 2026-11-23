@@ -1394,7 +1394,7 @@ export async function submit(
       }, CHECK_INTERVAL)
     })
     log.info('turn_pipeline_timing', { traceId, stage: 'context_ready', elapsedMs: performance.now() - submitStartedAt })
-    beginTurnOverflowContext(session, userTextOrBlocks, pendingCheckpoint?.generation)
+    beginTurnOverflowContext(session, userTextOrBlocks, pendingCheckpoint?.generation, effectiveMasterHistoricalMessages ?? undefined)
     logicalTurnRun = this.runOneTurnWithRetry(
       session,
       runnerPayload,

@@ -245,7 +245,7 @@ export function TaskboardView({
       const reason = await askReason(
         `打回 ${ticket.identifier}？`,
         '打回',
-        '这条理由会作为评论交给目标站的 agent。',
+        '这条理由会作为评论交给目标站的智能体。',
       )
       if (reason) return runMove(ticket, toStageId, { ...extras, reason })
       return false
@@ -372,7 +372,7 @@ export function TaskboardView({
             void (async () => {
               const ok = await confirm({
                 title: `完成 ${ticket.identifier}？`,
-                body: '完成后不再参与巡检。',
+                body: '完成后不再参与自动调度。',
                 confirmText: '标记完成',
                 cancelText: '返回',
               })
@@ -389,7 +389,7 @@ export function TaskboardView({
             void (async () => {
               const ok = await confirm({
                 title: `取消单据 ${ticket.identifier}？`,
-                body: '取消后单据进入终态，不再参与巡检，也不能再改动。',
+                body: '取消后单据进入终态，不再参与自动调度，也不能再改动。',
                 confirmText: '取消单据',
                 cancelText: '返回',
                 danger: true,

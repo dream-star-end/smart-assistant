@@ -27,6 +27,7 @@ import {
   savePendingCheckpoint,
   unmarkSessionCompacting,
 } from './sessionCheckpointStore.js'
+import { clearSessionAutoCompactState } from './sessionAutoCompact.js'
 import {
   abandonAllIdle,
   consumeIdleReset,
@@ -465,6 +466,7 @@ export async function runEvictionPass(this: SessionLifecycleHost): Promise<Evict
     // Phase 5:同步清 peer→sessionKey 反查索引(避免悬挂条目)。
     this._sessionIdToKey.delete(s.peerId)
     if (!key.includes(':webchat:')) {
+      clearSessionAutoCompactState(key)
       this._resumeMap.delete(key)
       this._resumeMapTimestamps.delete(key)
       this._resumeMapLastCost.delete(key)
@@ -624,6 +626,7 @@ export async function shutdownAll(this: SessionLifecycleHost): Promise<void> {
   // Phase 5:整体清空时同步清反查索引。
   this._sessionIdToKey.clear()
   for (const k of keysToClear) {
+    clearSessionAutoCompactState(k)
     try {
       this.onSessionDestroyed?.(k)
     } catch {}
@@ -663,7 +666,7 @@ export async function destroySession(
     cancelIdlePreExpiry(s)
   }
   clearPendingCheckpoint(sessionKey)
-  void import('./sessionAutoCompact.js').then((m) => m.clearSessionAutoCompactState(sessionKey)).catch(() => {})
+  clearSessionAutoCompactState(sessionKey)
   // OCV5-840 (B4): clean up ONLY artifacts and context references owned by this exact full sessionKey.
   {
     const candidateDirs = new Set<string>()

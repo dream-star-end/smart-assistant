@@ -315,9 +315,8 @@ function requestToken(init?: RequestInit): string {
 }
 
 async function openAgentPicker() {
-  const more = await screen.findByTestId('header-overflow-trigger')
-  fireEvent.pointerDown(more, { button: 0, pointerType: 'mouse' })
-  fireEvent.click(await screen.findByTestId('overflow-agent-item'))
+  const chip = await screen.findByTestId('chat-agent-chip')
+  fireEvent.click(chip)
   await screen.findByRole('dialog', { name: '选择智能体' })
 }
 
@@ -1196,7 +1195,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 })
 
 describe('Aurora v5 skeleton — demo mode (no network)', () => {
-  test('renders workspace from local fixtures with no fetch', () => {
+  test('renders workspace from local fixtures with no fetch', async () => {
     window.history.replaceState({}, '', '/?demo=1')
     const noFetch = vi.fn(() => {
       throw new Error('demo mode must not hit the network')
@@ -1204,9 +1203,9 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     vi.stubGlobal('fetch', noFetch as unknown as typeof fetch)
 
     render(<App />)
-    // 工作区直接从 fixtures 渲染：Composer 占位可见，且全程零网络。
+    // 工作区直接从 fixtures 渲染：Composer 占位可见，且全程零网络（lib/demo 按需动态加载不进线上首屏）。
     expect(screen.getByPlaceholderText('和「全能助手」对话…')).toBeInTheDocument()
-    expect(screen.getByText('锂金属负极枝晶抑制机理综述')).toBeInTheDocument()
+    expect(await screen.findByText('锂金属负极枝晶抑制机理综述')).toBeInTheDocument()
     expect(noFetch).not.toHaveBeenCalled()
   })
 
@@ -1263,7 +1262,7 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
     render(<App />)
     const title = '锂金属负极枝晶抑制机理综述'
-    expect(screen.getAllByRole('button', { name: title }).some((b) => b.getAttribute('aria-current') === 'true')).toBe(false)
+    expect((await screen.findAllByRole('button', { name: title })).some((b) => b.getAttribute('aria-current') === 'true')).toBe(false)
     fireEvent.keyDown(window, { key: 'k', metaKey: true })
     const input = await screen.findByRole('combobox', { name: '搜索与跳转' })
     fireEvent.change(input, { target: { value: '锂金属' } })

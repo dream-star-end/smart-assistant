@@ -55,8 +55,17 @@ const HOUR_OPTIONS = [
   })),
 ]
 
+const ENTRY_CONDITION_PRESETS = [
+  { value: '', label: '插入常用准入条件预设…' },
+  { value: 'no_open_blockers', label: '无未解除阻塞项' },
+  { value: 'last_run_succeeded', label: '上一阶段执行成功' },
+  { value: 'has_comment_from(human)', label: '已有人工评论确认' },
+  { value: 'priority_at_least(P1)', label: '优先级 P1 及以上' },
+  { value: 'always', label: '始终放行' },
+]
+
 const ENTRY_HINT =
-  '空则放行。可用 always、no_open_blockers、has_body_section("章节名")、has_label("标签")、has_comment_from(human|agent|system)、priority_at_least(P0|P1|P2|P3)、last_run_succeeded，以及 && || ! ()。'
+  '留空默认放行。可通过上方预设快速选择，或组合规则（支持 &&、||、! 以及章节/标签/评论来源校验）。'
 
 function blankToNull(s: string): string | null {
   const t = s.trim()
@@ -169,7 +178,7 @@ function buildStagePatch(draft: StageDraft): { patch: StagePatchInput; error: st
   }
   const kind = draft.kind
   if (kind === 'ai') {
-    if (!draft.agentId) return { patch: {}, error: 'AI 阶段必须绑定 agent' }
+    if (!draft.agentId) return { patch: {}, error: 'AI 阶段必须绑定智能体' }
     if (!draft.promptTemplate.trim()) return { patch: {}, error: 'AI 阶段必须填写提示词模板' }
   }
   const human = kind === 'human'
@@ -177,7 +186,7 @@ function buildStagePatch(draft: StageDraft): { patch: StagePatchInput; error: st
     const cronErr = patrolCronError(draft.patrolCron)
     if (cronErr) return { patch: {}, error: cronErr }
     if (draft.patrolEnabled && !draft.patrolCron.trim()) {
-      return { patch: {}, error: '开启巡检时必须填写 5 段 Cron 表达式' }
+      return { patch: {}, error: '开启自动调度时必须填写 5 段 Cron 表达式' }
     }
   }
   const patch: StagePatchInput = {
@@ -306,7 +315,7 @@ function StageEditor({
 
   const agentOptions = useMemo(() => {
     const opts = [
-      { value: '', label: ai ? '请选择 agent' : '无需绑定' },
+      { value: '', label: ai ? '请选择智能体' : '无需绑定' },
       ...agents.map((a) => ({ value: a.id, label: a.name || a.id })),
     ]
     if (draft.agentId && !opts.some((o) => o.value === draft.agentId)) {
@@ -318,7 +327,7 @@ function StageEditor({
   const modelOptions = useMemo(() => {
     const available = models.filter((m) => m.degraded !== true)
     const opts = [
-      { value: '', label: '留空=用 agent 默认' },
+      { value: '', label: '留空=用智能体默认' },
       ...available.map((m) => ({ value: m.id, label: modelLabel(m) })),
     ]
     if (draft.model && !opts.some((o) => o.value === draft.model)) {
@@ -380,14 +389,31 @@ function StageEditor({
           />
         </Field>
         <Field label="准入条件" hint={ENTRY_HINT}>
-          <Textarea
-            aria-label="准入条件"
-            rows={3}
-            value={draft.entryCondition}
-            onChange={(e) => setDraft((d) => ({ ...d, entryCondition: e.target.value }))}
-          />
+          <div className="flex flex-col gap-2">
+            <Select
+              aria-label="常用准入条件预设"
+              inputSize="sm"
+              value=""
+              onValueChange={(preset) => {
+                if (!preset) return
+                setDraft((d) => {
+                  const cur = d.entryCondition.trim()
+                  if (!cur || preset === 'always') return { ...d, entryCondition: preset }
+                  if (cur.includes(preset)) return d
+                  return { ...d, entryCondition: `${cur} && ${preset}` }
+                })
+              }}
+              options={ENTRY_CONDITION_PRESETS}
+            />
+            <Textarea
+              aria-label="准入条件"
+              rows={3}
+              value={draft.entryCondition}
+              onChange={(e) => setDraft((d) => ({ ...d, entryCondition: e.target.value }))}
+            />
+          </div>
         </Field>
-        <Field label="产出要求" hint="这一站做完要交出什么，agent 会据此自检。">
+        <Field label="产出要求" hint="这一站做完要交出什么，智能体会据此自检。">
           <Textarea
             aria-label="产出要求"
             rows={3}
@@ -398,11 +424,11 @@ function StageEditor({
       </EditorSection>
       <EditorSection title="执行" hint={ai ? undefined : '仅 AI 阶段需要'} defaultOpen={ai}>
         <Field
-          label="绑定 agent"
-          hint={ai ? '只列出可绑定的 agent，隐藏 agent 不在其中。' : '仅 AI 阶段需要绑定 agent'}
+          label="绑定智能体"
+          hint={ai ? '只列出可绑定的智能体，隐藏智能体不在其中。' : '仅 AI 阶段需要绑定智能体'}
         >
           <Select
-            aria-label="绑定 agent"
+            aria-label="绑定智能体"
             inputSize="sm"
             value={draft.agentId}
             disabled={!ai}
@@ -410,7 +436,7 @@ function StageEditor({
             options={agentOptions}
           />
         </Field>
-        <Field label="模型" hint={ai ? '留空则沿用该 agent 的默认模型。' : '仅 AI 阶段可覆盖模型'}>
+        <Field label="模型" hint={ai ? '留空则沿用该智能体的默认模型。' : '仅 AI 阶段可覆盖模型'}>
           <Select
             aria-label="模型覆盖"
             inputSize="sm"
@@ -432,7 +458,7 @@ function StageEditor({
             onChange={(e) => setDraft((d) => ({ ...d, promptTemplate: e.target.value }))}
           />
         </Field>
-        <Field label="工具集" hint="逗号分隔；留空则用 agent 默认">
+        <Field label="工具集" hint="逗号分隔；留空则用智能体默认">
           <Input
             aria-label="工具集"
             inputSize="sm"
@@ -447,7 +473,7 @@ function StageEditor({
             value={draft.effort}
             onValueChange={(v) => setDraft((d) => ({ ...d, effort: v }))}
             options={[
-              { value: '', label: '跟随 agent 默认' },
+              { value: '', label: '跟随智能体默认' },
               ...STAGE_EFFORTS.map((k) => ({ value: k, label: STAGE_EFFORT_LABEL[k] })),
             ]}
           />
@@ -468,21 +494,21 @@ function StageEditor({
         </Field>
       </EditorSection>
       <EditorSection
-        title="巡检"
+        title="自动调度"
         hint={human ? '人工阶段无需配置' : undefined}
         defaultOpen={!human && draft.patrolEnabled}
       >
         {toggleRow(
-          '启用巡检',
+          '启用自动调度',
           human ? false : draft.patrolEnabled,
           (v) => setDraft((d) => ({ ...d, patrolEnabled: v })),
           human,
         )}
         <Field
-          label="巡检表达式"
+          label="自动调度表达式"
           hint={
             human
-              ? '人工阶段不参与巡检，不能填写巡检表达式。'
+              ? '人工阶段不参与自动调度，不能填写自动调度表达式。'
               : cronPreview
                 ? `预览：${cronPreview}`
                 : '5 段 Cron：分 时 日 月 周，例如 */30 9-19 * * 1-5'
@@ -490,7 +516,7 @@ function StageEditor({
           error={cronErr ?? undefined}
         >
           <Input
-            aria-label="巡检表达式"
+            aria-label="自动调度表达式"
             inputSize="sm"
             disabled={human}
             placeholder="*/30 9-19 * * 1-5"
@@ -498,9 +524,9 @@ function StageEditor({
             onChange={(e) => setDraft((d) => ({ ...d, patrolCron: e.target.value }))}
           />
         </Field>
-        <Field label="巡检时区">
+        <Field label="自动调度时区">
           <Input
-            aria-label="巡检时区"
+            aria-label="自动调度时区"
             inputSize="sm"
             disabled={human}
             value={draft.patrolTimezone}
@@ -1130,7 +1156,7 @@ export function StageSettings({
                 </Button>
               </div>
               <p className="text-caption text-muted">
-                要加 AI 阶段：先建成人工或闸门，建好会自动展开编辑，把类型改成 AI 并绑定 agent 即可。
+                要加 AI 阶段：先建成人工或闸门，建好会自动展开编辑，把类型改成 AI 并绑定智能体即可。
               </p>
             </div>
           </div>

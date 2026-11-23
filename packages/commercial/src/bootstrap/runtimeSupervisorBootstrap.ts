@@ -130,11 +130,19 @@ import {
   createContainerPreviewBridge,
   type ContainerPreviewBridgeHandler,
 } from "../ws/containerPreviewBridge.js";
-import type { ContainerPreviewTicketStore } from "../ws/containerPreviewTickets.js";
+import { ContainerPreviewTicketStore } from "../ws/containerPreviewTickets.js";
 import {
   createDirectContainerPreviewService,
   type DirectContainerPreviewService,
 } from "../ws/directContainerPreview.js";
+import {
+  LIVE_BROWSER_MAX_FRAME_BYTES,
+  claimUnavailableLiveBrowserUpgrade,
+  createLiveBrowserBridge,
+  type LiveBrowserBridgeHandler,
+} from "../ws/liveBrowserBridge.js";
+export { claimUnavailableLiveBrowserUpgrade };
+import { LiveBrowserTicketStore } from "../ws/liveBrowserTickets.js";
 import { createTunnelContainerSocket } from "../ws/tunnelContainerSocket.js";
 import type { ResolveContainerEndpoint } from "../ws/userChatBridge.js";
 
@@ -959,45 +967,106 @@ export function createOptionalDirectContainerPreview(deps: {
   }
 }
 
+export function createPreviewAndLiveBrowserTickets(deps: {
+  runtimeChannel: string;
+  modelAuthoritySigner: AuthoritySigner | undefined;
+  v3Deps: V3SupervisorDeps | undefined;
+  baseUrl: string | undefined;
+}): {
+  containerPreviewTickets: ContainerPreviewTicketStore | undefined;
+  liveBrowserTickets: LiveBrowserTicketStore | undefined;
+} {
+  const ready =
+    deps.runtimeChannel === "v5" &&
+    Boolean(deps.modelAuthoritySigner) &&
+    Boolean(deps.v3Deps) &&
+    Boolean(deps.baseUrl);
+  return {
+    containerPreviewTickets: ready ? new ContainerPreviewTicketStore() : undefined,
+    liveBrowserTickets: ready ? new LiveBrowserTicketStore() : undefined,
+  };
+}
+
 export function createOptionalContainerPreviewBridge(deps: {
   env: NodeJS.ProcessEnv;
   containerPreviewTickets: ContainerPreviewTicketStore | undefined;
+  liveBrowserTickets?: LiveBrowserTicketStore | undefined;
   modelAuthoritySigner: AuthoritySigner | undefined;
   containerPreviewBaseUrl: string | undefined;
   dockerEnsureRunning: ResolveContainerEndpoint;
 }): ContainerPreviewBridgeHandler | undefined {
-  if (
-    !deps.containerPreviewTickets ||
-    !deps.modelAuthoritySigner ||
-    !deps.containerPreviewBaseUrl
-  ) {
+  if (!deps.modelAuthoritySigner || !deps.containerPreviewBaseUrl) {
     return undefined;
   }
-  try {
-    const bridge = createContainerPreviewBridge({
-      tickets: deps.containerPreviewTickets,
-      signer: deps.modelAuthoritySigner,
-      resolveContainerEndpoint: deps.dockerEnsureRunning,
-      allowedOrigin: deps.containerPreviewBaseUrl,
-      maxGlobalSessions: Number(deps.env.OC_CONTAINER_PREVIEW_MAX_SESSIONS),
-      createTunnelContainerSocket: (tunnel, port, assertion, connectionTraceId, signal) =>
-        createTunnelContainerSocket(tunnel.nodeAgent, tunnel.containerInternalId, port, signal, {
-          maxFrameBytes: CONTAINER_PREVIEW_MAX_FRAME_BYTES,
-          connectionTraceId,
-          containerWsPath: "/ws/container-preview",
-          previewAssertion: assertion,
-        }),
-      logger: rootLogger.child({ subsys: "commercial", module: "containerPreviewBridge" }),
-    });
-    // eslint-disable-next-line no-console
-    console.log("[commercial] V5 container web preview ENABLED");
-    return bridge;
-  } catch (err) {
-    rootLogger.error("[commercial] container web preview disabled", {
-      error: (err as Error)?.message ?? String(err),
-    });
-    return undefined;
+  let previewBridge: ContainerPreviewBridgeHandler | undefined;
+  if (deps.containerPreviewTickets) {
+    try {
+      previewBridge = createContainerPreviewBridge({
+        tickets: deps.containerPreviewTickets,
+        signer: deps.modelAuthoritySigner,
+        resolveContainerEndpoint: deps.dockerEnsureRunning,
+        allowedOrigin: deps.containerPreviewBaseUrl,
+        maxGlobalSessions: Number(deps.env.OC_CONTAINER_PREVIEW_MAX_SESSIONS),
+        createTunnelContainerSocket: (tunnel, port, assertion, connectionTraceId, signal) =>
+          createTunnelContainerSocket(tunnel.nodeAgent, tunnel.containerInternalId, port, signal, {
+            maxFrameBytes: CONTAINER_PREVIEW_MAX_FRAME_BYTES,
+            connectionTraceId,
+            containerWsPath: "/ws/container-preview",
+            previewAssertion: assertion,
+          }),
+        logger: rootLogger.child({ subsys: "commercial", module: "containerPreviewBridge" }),
+      });
+      // eslint-disable-next-line no-console
+      console.log("[commercial] V5 container web preview ENABLED");
+    } catch (err) {
+      rootLogger.error("[commercial] container web preview disabled", {
+        error: (err as Error)?.message ?? String(err),
+      });
+    }
   }
+  let liveBrowserBridge: LiveBrowserBridgeHandler | undefined;
+  if (deps.liveBrowserTickets) {
+    try {
+      liveBrowserBridge = createLiveBrowserBridge({
+        tickets: deps.liveBrowserTickets,
+        signer: deps.modelAuthoritySigner,
+        resolveContainerEndpoint: deps.dockerEnsureRunning,
+        allowedOrigin: deps.containerPreviewBaseUrl,
+        maxGlobalSessions: Number(deps.env.OC_LIVE_BROWSER_MAX_SESSIONS || 8),
+        createTunnelContainerSocket: (tunnel, port, assertion, connectionTraceId, signal) =>
+          createTunnelContainerSocket(tunnel.nodeAgent, tunnel.containerInternalId, port, signal, {
+            maxFrameBytes: LIVE_BROWSER_MAX_FRAME_BYTES,
+            connectionTraceId,
+            containerWsPath: "/ws/live-browser",
+            liveBrowserAssertion: assertion,
+          }),
+        logger: rootLogger.child({ subsys: "commercial", module: "liveBrowserBridge" }),
+      });
+      // eslint-disable-next-line no-console
+      console.log("[commercial] V5 live cloud browser WS stream ENABLED");
+    } catch (err) {
+      rootLogger.error("[commercial] live cloud browser WS stream disabled", {
+        error: (err as Error)?.message ?? String(err),
+      });
+    }
+  }
+  if (!previewBridge && !liveBrowserBridge) return undefined;
+  return {
+    handleUpgrade(req, socket, head): boolean {
+      if (previewBridge?.handleUpgrade(req, socket, head)) return true;
+      if (liveBrowserBridge?.handleUpgrade(req, socket, head)) return true;
+      return false;
+    },
+    async shutdown(): Promise<void> {
+      await Promise.allSettled([
+        previewBridge?.shutdown(),
+        liveBrowserBridge?.shutdown(),
+      ]);
+    },
+    activeCount(): number {
+      return (previewBridge?.activeCount() ?? 0) + (liveBrowserBridge?.activeCount() ?? 0);
+    },
+  };
 }
 
 export async function bootstrapMailerBridgeAndAuthority(deps: {

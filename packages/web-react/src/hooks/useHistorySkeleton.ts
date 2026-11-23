@@ -52,24 +52,39 @@ export function useHistorySkeleton(input: HistorySkeletonInput): {
   slowHistory: boolean;
 } {
   const { demo, activeId, sessions } = input;
-  // activeId 变化即重置截止标记；GRACE 用于 meta 未知（深链）分支，CAP 是安全封顶，SLOW 触发慢网重试条。
-  const [historyGraceExpired, setHistoryGraceExpired] = useState(false);
-  const [historyCapExpired, setHistoryCapExpired] = useState(false);
-  const [historySlow, setHistorySlow] = useState(false);
+  // activeId 变化即同步派生重置截止标记，彻底消除旧会话 >8s 后切冷会话首帧闪现欢迎页；
+  // GRACE 用于 meta 未知（深链）分支，CAP 是安全封顶，SLOW 触发慢网重试条。
+  const [expiredState, setExpiredState] = useState<{
+    sessionId: string | undefined;
+    grace: boolean;
+    cap: boolean;
+    slow: boolean;
+  }>({ sessionId: activeId, grace: false, cap: false, slow: false });
   useEffect(() => {
-    setHistoryGraceExpired(false);
-    setHistoryCapExpired(false);
-    setHistorySlow(false);
+    setExpiredState({ sessionId: activeId, grace: false, cap: false, slow: false });
     if (demo || !activeId) return;
-    const t1 = setTimeout(() => setHistoryGraceExpired(true), HISTORY_SKELETON_GRACE_MS);
-    const t2 = setTimeout(() => setHistoryCapExpired(true), HISTORY_SKELETON_CAP_MS);
-    const t3 = setTimeout(() => setHistorySlow(true), HISTORY_SKELETON_SLOW_MS);
+    const t1 = setTimeout(
+      () => setExpiredState((prev) => (prev.sessionId === activeId ? { ...prev, grace: true } : prev)),
+      HISTORY_SKELETON_GRACE_MS,
+    );
+    const t2 = setTimeout(
+      () => setExpiredState((prev) => (prev.sessionId === activeId ? { ...prev, cap: true } : prev)),
+      HISTORY_SKELETON_CAP_MS,
+    );
+    const t3 = setTimeout(
+      () => setExpiredState((prev) => (prev.sessionId === activeId ? { ...prev, slow: true } : prev)),
+      HISTORY_SKELETON_SLOW_MS,
+    );
     return () => {
       clearTimeout(t1);
       clearTimeout(t2);
       clearTimeout(t3);
     };
   }, [demo, activeId]);
+  const expiredForActive = expiredState.sessionId === activeId;
+  const historyGraceExpired = expiredForActive && expiredState.grace;
+  const historyCapExpired = expiredForActive && expiredState.cap;
+  const historySlow = expiredForActive && expiredState.slow;
 
   const activeMeta = !demo && activeId ? sessions.find((s) => s.id === activeId) : undefined;
   const hasHistoryError = !demo && input.historyError !== null;

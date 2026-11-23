@@ -37,6 +37,7 @@ import {
 } from "./chat/render";
 import { friendlyDelegateResultPreview } from "./chat/reducer";
 import { sessionTitleFromText } from "./sessionTitle";
+import { isActiveTurnLiveRow, repositionActiveTurnRowsAfterOwner } from "./persistActiveTurn";
 import { observeTimelineShadow } from "./timeline/shadowLifecycle";
 
 /** turn 终态收敛(RFC §5 M5):server 载荷自证的 turn 终态类别。 */
@@ -261,23 +262,17 @@ class IdbKV {
     let opening!: Promise<IDBDatabase | null>;
     opening = new Promise<IDBDatabase | null>((resolve) => {
       let settled = false;
+      let blockedTimer: ReturnType<typeof setTimeout> | null = null;
       const finish = (db: IDBDatabase | null) => {
-        if (settled) {
-          db?.close();
-          return;
-        }
+        if (blockedTimer) { clearTimeout(blockedTimer); blockedTimer = null; }
+        if (settled) { db?.close(); return; }
         settled = true;
         resolve(db);
       };
       let req: IDBOpenDBRequest;
       try {
-        req = this.version === undefined
-          ? f.open(this.dbName)
-          : f.open(this.dbName, this.version);
-      } catch {
-        finish(null);
-        return;
-      }
+        req = this.version === undefined ? f.open(this.dbName) : f.open(this.dbName, this.version);
+      } catch { finish(null); return; }
       req.onupgradeneeded = () => {
         const db = req.result;
         for (const storeName of this.storesToCreate) {
@@ -293,7 +288,9 @@ class IdbKV {
         finish(db);
       };
       req.onerror = () => finish(null);
-      req.onblocked = () => {};
+      req.onblocked = () => {
+        if (!blockedTimer) blockedTimer = setTimeout(() => finish(null), 3_000);
+      };
     });
     this.dbp = opening;
     void opening.then((db) => {
@@ -1221,8 +1218,8 @@ export function mergeFullServerWins(
   };
   // In-flight order is the live order. Repair would pull process cards in
   // front of a partial assistant and the refresh would not match the open tab.
-  const settle = (rows: ChatMessage[]) => finishShadow(
-    activeOwner ? rows : coalesceProcessIdentities(repairPostFinalProcessOrder(rows)),
+  const settle = (rows: ChatMessage[], preOverrides?: ReadonlyMap<ChatMessage, number>) => finishShadow(
+    activeOwner ? repositionActiveTurnRowsAfterOwner(rows, activeOwner, turnOwnerId, (pre) => stableSortByTs(pre, preOverrides)) : coalesceProcessIdentities(repairPostFinalProcessOrder(rows)),
   );
   local = activeOwner ? local : repairPostFinalProcessOrder(local);
   const legacyActiveRows = new Set<ChatMessage>();
@@ -1374,7 +1371,8 @@ export function mergeFullServerWins(
           // Repeated Phase-A pages move live process rows into the middle once
           // the fallback assistant is already the durable tail. Preserve them
           // until Phase-B exact tape rows positively supersede the live copy.
-          isUnpublishedProcessRow(m)),
+          isUnpublishedProcessRow(m) ||
+          isActiveTurnLiveRow(m, activeOwner, turnOwnerId)),
     );
   if (!tail.length && !preservedMid.length) {
     return settle(stableSortByTs(serverChanged ? serverMerged : server));
@@ -1433,9 +1431,7 @@ export function mergeFullServerWins(
       if (m?.id) emittedServerIds.add(m.id);
     }
   }
-  return settle(
-    activeOwner ? inLocalOrder : stableSortByTs(inLocalOrder, anchorOverrides),
-  );
+  return settle(activeOwner ? inLocalOrder : stableSortByTs(inLocalOrder, anchorOverrides), anchorOverrides);
 }
 
 /**
@@ -1505,7 +1501,7 @@ export function applyServerIncremental(
   const seen = new Set<string>();
   for (const m of local) if (m?.id) seen.add(m.id);
   for (const m of incoming) if (m?.id && !seen.has(m.id)) merged.push(m);
-  return finishShadow(activeOwner ? merged : repairPostFinalProcessOrder(stableSortByTs(merged)));
+  return finishShadow(activeOwner ? repositionActiveTurnRowsAfterOwner(merged, activeOwner, turnOwnerId, stableSortByTs) : repairPostFinalProcessOrder(stableSortByTs(merged)));
 }
 
 /**
@@ -2301,20 +2297,31 @@ export class SessionStore {
     );
   }
 
-  private async collectPendingControls(): Promise<StoredPendingControl[]> {
-    const [pending, settled] = await Promise.all([
+  private async readAndPruneSettledKeys(now = Date.now()): Promise<Set<string>> {
+    const settled = await this.dispatchKv.getAll<{ key?: string; settledAt?: number }>(SETTLED_DISPATCH_STORE);
+    const cutoff = now - 14 * 24 * 60 * 60 * 1000;
+    const keys = new Set<string>();
+    const expired: string[] = [];
+    for (const item of settled) {
+      if (typeof item?.key !== "string") continue;
+      if (typeof item.settledAt === "number" && item.settledAt > 0 && item.settledAt < cutoff) expired.push(item.key);
+      else keys.add(item.key);
+    }
+    if (expired.length > 0) void Promise.allSettled(expired.map((k) => this.dispatchKv.delete(SETTLED_DISPATCH_STORE, k)));
+    return keys;
+  }
+
+  private async collectPendingControls(settledKeys?: Set<string>): Promise<StoredPendingControl[]> {
+    const [pending, keys] = await Promise.all([
       this.dispatchKv.getAll<StoredPendingControl>(PENDING_DISPATCH_STORE),
-      this.dispatchKv.getAll<{ key?: string }>(SETTLED_DISPATCH_STORE),
+      settledKeys ? Promise.resolve(settledKeys) : this.readAndPruneSettledKeys(),
     ]);
-    const settledKeys = new Set(
-      settled.flatMap((item) => typeof item?.key === "string" ? [item.key] : []),
-    );
     return pending
       .filter((item) =>
         item?.kind === "control" &&
         typeof item.sessId === "string" && item.sessId.length > 0 &&
         typeof item.controlId === "string" && item.controlId.length > 0 &&
-        !settledKeys.has(pendingControlKey(item.sessId, item.controlId)))
+        !keys.has(pendingControlKey(item.sessId, item.controlId)))
       .sort((a, b) => a.enqueuedAt - b.enqueuedAt);
   }
 
@@ -2325,24 +2332,19 @@ export class SessionStore {
 
   private async collectPendingDispatches(
     sessions?: StoredSession[],
+    settledKeys?: Set<string>,
   ): Promise<StoredPendingDispatchRecord[]> {
     const sessionRows = sessions ?? await this.sessionsKv.getAll<StoredSession>(SESSION_STORE);
-    const [pending, legacyV2, settled] = await Promise.all([
+    const [pending, legacyV2, keys] = await Promise.all([
       this.dispatchKv.getAll<StoredPendingDispatchRecord>(PENDING_DISPATCH_STORE),
       this.sessionsKv.getAll<StoredPendingDispatchRecord>(PENDING_DISPATCH_STORE),
-      this.dispatchKv.getAll<{ key?: string }>(SETTLED_DISPATCH_STORE),
+      settledKeys ? Promise.resolve(settledKeys) : this.readAndPruneSettledKeys(),
     ]);
-    const settledKeys = new Set(
-      settled.flatMap((item) => typeof item?.key === "string" ? [item.key] : []),
-    );
     const unresolved = new Map<string, StoredPendingDispatchRecord>();
     const add = (item: StoredPendingDispatchRecord) => {
-      if (
-        !item || typeof item.sessId !== "string" || !item.sessId ||
-        typeof item.msgId !== "string" || !item.msgId
-      ) return;
+      if (!item || typeof item.sessId !== "string" || !item.sessId || typeof item.msgId !== "string" || !item.msgId) return;
       const key = pendingDispatchKey(item.sessId, item.msgId);
-      if (!settledKeys.has(key) && !unresolved.has(key)) unresolved.set(key, item);
+      if (!keys.has(key) && !unresolved.has(key)) unresolved.set(key, item);
     };
     for (const item of pending) add(item);
     for (const item of legacyV2) add(item);
@@ -2361,10 +2363,13 @@ export class SessionStore {
    * in memory without ever writing it back into the sessions store. */
   async getAllForHydration(): Promise<StoredSession[]> {
     if (this.dead) return [];
-    const sessions = await this.sessionsKv.getAll<StoredSession>(SESSION_STORE);
+    const [sessions, settledKeys] = await Promise.all([
+      this.sessionsKv.getAll<StoredSession>(SESSION_STORE),
+      this.readAndPruneSettledKeys(),
+    ]);
     const [pending, pendingControls] = await Promise.all([
-      this.collectPendingDispatches(sessions),
-      this.collectPendingControls(),
+      this.collectPendingDispatches(sessions, settledKeys),
+      this.collectPendingControls(settledKeys),
     ]);
     const bySession = new Map<string, StoredPendingDispatch[]>();
     for (const item of pending) {
@@ -2528,23 +2533,15 @@ export class SessionStore {
       this.collectPendingDispatches(),
       this.collectPendingControls(),
     ]);
-    await Promise.allSettled([
-      ...pending.map((item) =>
-        this.dispatchKv.settleDispatchDurably(
-          pendingDispatchKey(item.sessId, item.msgId),
-          Date.now(),
-        )),
-      ...controls.map((item) =>
-        this.dispatchKv.settleDispatchDurably(
-          pendingControlKey(item.sessId, item.controlId),
-          Date.now(),
-        )),
-    ]);
-    // Settled identities contain no payload and deliberately survive logout:
-    // an old v1 tab may still write an acknowledged inline journal back later.
     await Promise.all([
       this.sessionsKv.clearStores([SESSION_STORE, PENDING_DISPATCH_STORE]),
-      this.dispatchKv.clearStores([PENDING_DISPATCH_STORE]),
+      this.dispatchKv.clearStores([PENDING_DISPATCH_STORE, SETTLED_DISPATCH_STORE]),
+    ]);
+    // 清理历史 settled 记录后，仅对本次 wipe 捕获的在途项写入新鲜墓碑，防旧 tab 延迟回灌。
+    const now = Date.now();
+    await Promise.allSettled([
+      ...pending.map((item) => this.dispatchKv.settleDispatchDurably(pendingDispatchKey(item.sessId, item.msgId), now)),
+      ...controls.map((item) => this.dispatchKv.settleDispatchDurably(pendingControlKey(item.sessId, item.controlId), now)),
     ]);
   }
   close(): void {

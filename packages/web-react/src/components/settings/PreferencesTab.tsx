@@ -24,7 +24,7 @@ import {
   LONG_CONTEXT_CONFIRM_TITLE,
   LongContextCostWarning,
 } from '../LongContextCostWarning'
-import { Alert, Button, Select, Switch, useConfirm } from '../ui'
+import { Alert, Button, Select, Switch, useConfirm, useToast } from '../ui'
 import { QqBindingCard } from './QqBindingCard'
 import { EFFORT_OPTIONS } from './labels'
 import { AssistantPrivacyPreferences } from './AssistantPrivacyPreferences'
@@ -90,9 +90,12 @@ export function PreferencesTab({
   onPatch: (patch: Record<string, unknown>) => Promise<void>
 }) {
   const [models, setModels] = useState<PublicModel[]>([])
+  const [modelsErr, setModelsErr] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [savingFields, setSavingFields] = useState<ReadonlySet<string>>(() => new Set())
   const [optimizerClosing, setOptimizerClosing] = useState(false)
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
+  const toast = useToast()
   const composerPrefs = useLocalComposerPrefs()
   const iui = useIntelligentUiState()
   const desktopNotify = useSyncExternalStore(
@@ -103,6 +106,7 @@ export function PreferencesTab({
 
   useEffect(() => {
     let alive = true
+    setModelsErr(null)
     api
       .getPublicModels(auth)
       .then((res) => {
@@ -110,19 +114,40 @@ export function PreferencesTab({
         if (alive) setModels(Array.isArray(res?.models) ? res.models : [])
       })
       .catch(() => {
-        /* 模型列表拉取失败不致命：default_model 退化为只读展示当前值 */
+        if (alive) setModelsErr('模型列表暂时无法加载，仅展示当前已选值。')
       })
     return () => {
       alive = false
     }
   }, [auth])
 
-  async function patch(p: Record<string, unknown>) {
+  async function patch(
+    p: Record<string, unknown>,
+    opts?: { field?: string; savedToast?: string },
+  ) {
+    const field = opts?.field
+    if (field && savingFields.has(field)) return
     setErr(null)
+    if (field) {
+      setSavingFields((prev) => {
+        const next = new Set(prev)
+        next.add(field)
+        return next
+      })
+    }
     try {
       await onPatch(p)
+      if (opts?.savedToast) toast(opts.savedToast, 'success')
     } catch (e) {
       setErr(apiErrorMessage(e, '保存失败'))
+    } finally {
+      if (field) {
+        setSavingFields((prev) => {
+          const next = new Set(prev)
+          next.delete(field)
+          return next
+        })
+      }
     }
   }
 
@@ -168,7 +193,7 @@ export function PreferencesTab({
       })
       if (!confirmed) return
     }
-    await patch({ default_model: nextModelId })
+    await patch({ default_model: nextModelId }, { field: 'default_model', savedToast: '已保存默认模型' })
   }
 
   const effortModelId = initialModelFromPreferences(models, prefs)
@@ -263,6 +288,7 @@ export function PreferencesTab({
                 inputSize="sm"
                 className="w-auto max-w-[55%]"
                 value={prefs.default_model ?? ''}
+                disabled={savingFields.has('default_model')}
                 onValueChange={(v) => {
                   void changeDefaultModel(v)
                 }}
@@ -276,12 +302,22 @@ export function PreferencesTab({
                 inputSize="sm"
                 className="w-auto max-w-[55%]"
                 value={selectedEffort}
-                onValueChange={(v) => patch({ default_effort: v === '' ? null : v })}
-                disabled={effortDisabled}
+                onValueChange={(v) =>
+                  void patch(
+                    { default_effort: v === '' ? null : v },
+                    { field: 'default_effort', savedToast: '已保存思考深度' },
+                  )
+                }
+                disabled={effortDisabled || savingFields.has('default_effort')}
                 options={effortSelectOptions}
               />
             </label>
           </div>
+          {modelsErr && (
+            <p className="mt-2 text-caption text-warning" role="status">
+              {modelsErr}
+            </p>
+          )}
         </section>
       </div>
 
@@ -466,18 +502,24 @@ export function PreferencesTab({
                 }}
               />
             </label>
-            {NOTIF_FIELDS.map((f) => (
-              <label key={String(f.key)} className="flex items-center justify-between gap-3 py-2.5">
-                <span className="min-w-0">
-                  <span className="block text-section font-medium text-fg">{f.label}</span>
-                  {f.hint && <span className="block text-caption text-faint">{f.hint}</span>}
-                </span>
-                <Switch
-                  checked={prefs[f.key] === true}
-                  onCheckedChange={(c) => patch({ [f.key]: c })}
-                />
-              </label>
-            ))}
+            {NOTIF_FIELDS.map((f) => {
+              const fieldKey = String(f.key)
+              return (
+                <label key={fieldKey} className="flex items-center justify-between gap-3 py-2.5">
+                  <span className="min-w-0">
+                    <span className="block text-section font-medium text-fg">{f.label}</span>
+                    {f.hint && <span className="block text-caption text-faint">{f.hint}</span>}
+                  </span>
+                  <Switch
+                    checked={prefs[f.key] === true}
+                    disabled={savingFields.has(fieldKey)}
+                    onCheckedChange={(c) =>
+                      void patch({ [f.key]: c }, { field: fieldKey, savedToast: `已更新${f.label}` })
+                    }
+                  />
+                </label>
+              )
+            })}
           </div>
         </section>
       </div>
@@ -490,11 +532,14 @@ export function PreferencesTab({
 /** 内置快捷键只读表。由 SettingsCenter 的「快捷键」分区直接渲染,不依赖 prefs / 模型列表。 */
 export function BuiltinHotkeysTable() {
   const mod = modifierKeyLabel()
+  const composerPrefs = useLocalComposerPrefs()
+  const sendKeys =
+    composerPrefs.sendKey === 'mod-enter' ? `${mod}+Enter / Enter` : 'Enter / Shift+Enter'
   const rows: Array<{ keys: string; action: string }> = [
     { keys: `${mod}+K`, action: '搜索与跳转（项目、会话、文件）' },
     { keys: `${mod}+Shift+O`, action: '新建会话' },
     { keys: 'Esc', action: '确认停止（生成中）' },
-    { keys: 'Enter / Shift+Enter', action: '发送 / 换行（桌面）' },
+    { keys: sendKeys, action: '发送 / 换行（桌面）' },
     { keys: `${mod}+V`, action: '粘贴图片为附件' },
     { keys: `${mod}+F`, action: '会话内查找' },
     { keys: '↑(空输入框)', action: '编辑上一条' },

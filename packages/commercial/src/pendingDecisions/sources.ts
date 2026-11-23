@@ -10,6 +10,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { Pool } from 'pg'
 import {
   encodePendingDecisionId,
+  normalizeBrowserHandoffResumeWhen,
   type InboundPermissionResponse,
   type PendingDecisionAction,
   type PendingDecisionItem,
@@ -238,22 +239,30 @@ export function createTurnPermissionSource(deps: TurnPermissionSourceDeps): Pend
 
     async resolve(userId, sourceId, req, nowMs = Date.now()): Promise<ResolvePendingDecisionResponse> {
       const uid = parseUidBigInt(userId)
+      const uidStr = uid.toString()
+      // Hot path: point lookup on PK (user_id, request_id) instead of full-table scan on request_id.
       const lookup = await deps.pool.query<TurnPermissionPgRow>(
         `SELECT user_id::text, request_id, session_id, client_message_id, tool_use_id,
                 tool_name, input_json, ask_payload_json, status, response_json,
                 created_at, updated_at, expires_at
            FROM turn_permission_requests
-          WHERE request_id = $1
-          ORDER BY (user_id = $2) DESC
+          WHERE user_id = $1 AND request_id = $2
           LIMIT 1`,
-        [sourceId, uid.toString()],
+        [uidStr, sourceId],
       )
       const row = lookup.rows[0]
       if (!row) {
+        const ownerProbe = await deps.pool.query<{ user_id: string }>(
+          `SELECT user_id::text
+             FROM turn_permission_requests
+            WHERE request_id = $1
+            LIMIT 1`,
+          [sourceId],
+        )
+        if (ownerProbe.rows[0] && ownerProbe.rows[0].user_id !== uidStr) {
+          throw new PendingDecisionError('FORBIDDEN', 'permission request belongs to another user')
+        }
         throw new PendingDecisionError('NOT_FOUND', `permission request not found: ${sourceId}`)
-      }
-      if (row.user_id !== uid.toString()) {
-        throw new PendingDecisionError('FORBIDDEN', 'permission request belongs to another user')
       }
 
       if (isStructuredAskUserPrompt(row) && req.decision === 'approve') {
@@ -833,25 +842,32 @@ export function createBrowserHandoffSource(store: BrowserHandoffStore): PendingD
     async listPending(userId, opts): Promise<PendingDecisionItem[]> {
       const limit = Math.max(1, Math.min(opts?.limit ?? 50, 200))
       const rows = await store.listPending(userId, limit, opts?.nowMs)
-      return rows.map((rec) => ({
-        id: encodePendingDecisionId('browser_handoff', rec.id),
-        source: 'browser_handoff',
-        sourceId: rec.id,
-        userId: rec.userId,
-        sessionId: rec.sessionId,
-        title: rec.title || '浏览器人工接管',
-        summary: `${rec.reason} (${rec.url})`,
-        riskLevel: rec.riskLevel ?? 'high',
-        status: 'pending',
-        metadata: {
-          url: rec.url,
-          reason: rec.reason,
-          ...(rec.metadata ?? {}),
-        },
-        createdAt: rec.createdAt,
-        expiresAt: rec.expiresAt,
-        allowedActions: ['approve', 'deny'],
-      }))
+      return rows.map((rec) => {
+        const rawMeta = rec.metadata ?? {}
+        const normalizedResumeWhen = normalizeBrowserHandoffResumeWhen(
+          rawMeta.resumeWhen ?? rawMeta.resume_when,
+        )
+        return {
+          id: encodePendingDecisionId('browser_handoff', rec.id),
+          source: 'browser_handoff',
+          sourceId: rec.id,
+          userId: rec.userId,
+          sessionId: rec.sessionId,
+          title: rec.title || '浏览器人工接管',
+          summary: `${rec.reason} (${rec.url})`,
+          riskLevel: rec.riskLevel ?? 'high',
+          status: 'pending',
+          metadata: {
+            url: rec.url,
+            reason: rec.reason,
+            ...rawMeta,
+            ...(normalizedResumeWhen ? { resumeWhen: normalizedResumeWhen } : {}),
+          },
+          createdAt: rec.createdAt,
+          expiresAt: rec.expiresAt,
+          allowedActions: ['approve', 'deny'],
+        }
+      })
     },
 
     async resolve(userId, sourceId, req, nowMs = Date.now()): Promise<ResolvePendingDecisionResponse> {

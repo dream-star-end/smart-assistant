@@ -274,7 +274,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           不再写死 top-16(shell 审计 S-20),也不再自带安全区内边距(实测下沿已经包含)。 */}
       <div
         data-toast-rail
-        className="pointer-events-none fixed inset-x-0 top-[var(--oc-toast-top)] z-[100] flex flex-col items-center gap-2 px-3"
+        className="pointer-events-none fixed inset-x-0 top-[var(--oc-toast-top)] z-[var(--z-toast)] flex flex-col items-center gap-2 px-3"
       >
         {items.map((t) => {
           const s = TONE_STYLE[t.tone];

@@ -309,7 +309,7 @@ export function BoardColumns({
           onDragLeave={leaveColumn}
         >
           {waitingTickets.length === 0 && hoverDropId !== INBOX_DROP_ID ? (
-            <ColumnEmpty>agent 做完等人拍板的单会出现在这里。</ColumnEmpty>
+            <ColumnEmpty>智能体做完等人拍板的单会出现在这里。</ColumnEmpty>
           ) : (
             waitingTickets.map(renderCard)
           )}

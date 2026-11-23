@@ -222,6 +222,6 @@ export function ackPendingCheckpointIfTurnSucceeded(
 ): boolean {
   const outcome = checkpointTurnOutcomes.get(session)
   checkpointTurnOutcomes.delete(session)
-  if (outcome === 'failed') return false
+  if (outcome !== 'completed') return false
   return ackPendingCheckpoint(session.sessionKey, generation, baseDir)
 }

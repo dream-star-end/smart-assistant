@@ -803,6 +803,11 @@ export interface CommercialPendingDecisionsRuntimeDeps {
   /** Optional lazy push targets for proactive IM alerts when new pending decisions arrive. */
   pushToWechat?: (item: PendingDecisionItem) => Promise<unknown>
   pushToQq?: (item: PendingDecisionItem) => Promise<unknown>
+  /** Optional callback fired when a browser_handoff pending decision is resolved (non-replay). */
+  onBrowserHandoffResolved?: (
+    result: import('@openclaude/protocol').ResolvePendingDecisionResponse,
+    userId: string,
+  ) => void | Promise<void>
   /** Optional overrides for tests. */
   taskboardEnabled?: boolean
   taskboardBackend?: TaskboardDecisionBackend
@@ -971,6 +976,32 @@ export function createCommercialPendingDecisionsRuntime(
     if (tasks.length > 0) await Promise.all(tasks)
   })
 
+  // Clean up IM push-dedup slots on resolve and emit browser_handoff resolution hooks.
+  const unsubOnResolved = service.onResolved(async (result, userId) => {
+    pushedKeys.delete(`wechat:${userId}:${result.id}`)
+    pushedKeys.delete(`qqbot:${userId}:${result.id}`)
+    if (result.source === 'browser_handoff' && !result.idempotentReplay) {
+      log.info('browser_handoff_resolved', {
+        decisionId: result.id,
+        sourceId: result.sourceId,
+        userId,
+        decision: result.decision,
+        status: result.status,
+      })
+      if (deps.onBrowserHandoffResolved) {
+        try {
+          await deps.onBrowserHandoffResolved(result, userId)
+        } catch (err) {
+          log.warn('browser_handoff_resolved_hook_failed', {
+            decisionId: result.id,
+            userId,
+            errMessage: err instanceof Error ? err.message : String(err),
+          })
+        }
+      }
+    }
+  })
+
   // B3: Real producer wiring #1 — newly persisted `turn_permission_requests` rows.
   const unsubPerm = onPermissionAuthorityCreated(async (input) => {
     const askUser =
@@ -1046,6 +1077,9 @@ export function createCommercialPendingDecisionsRuntime(
         title: card.title,
       })
       try {
+        const metadata: Record<string, unknown> = {}
+        if (card.continuePrompt) metadata.continuePrompt = card.continuePrompt
+        if (card.resumeWhen) metadata.resumeWhen = card.resumeWhen
         const rec = await browserHandoffStore.create({
           id,
           userId: evt.userId,
@@ -1054,7 +1088,7 @@ export function createCommercialPendingDecisionsRuntime(
           url: card.url,
           reason: card.reason,
           riskLevel: 'high',
-          ...(card.continuePrompt ? { metadata: { continuePrompt: card.continuePrompt } } : {}),
+          ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
         })
         // Custom injected test stores (e.g. InMemoryBrowserHandoffStore) do not have PgBrowserHandoffStore's
         // built-in onCreated callback, so notify service explicitly (dedup protects PgBrowserHandoffStore).
@@ -1082,6 +1116,7 @@ export function createCommercialPendingDecisionsRuntime(
       if (disposed) return
       disposed = true
       unsubOnCreated()
+      unsubOnResolved()
       unsubPerm()
       unsubConn()
       unsubHandoff()

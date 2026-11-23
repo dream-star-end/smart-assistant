@@ -14,15 +14,8 @@
  */
 
 import { randomBytes } from 'node:crypto'
-import {
-  closeSync,
-  constants as fsConstants,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readFileSync,
-  realpathSync,
-} from 'node:fs'
+import { constants as fsConstants, type Stats } from 'node:fs'
+import { lstat, open, realpath, type FileHandle } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -355,10 +348,10 @@ export async function handleInternalOfficePreview(
   }
 }
 
-function readCachedPageImageSafe(
+async function readCachedPageImageSafe(
   imgPath: string,
   cacheRoot: string,
-): { bytes: Buffer; contentType: 'image/png' | 'image/jpeg' } {
+): Promise<{ bytes: Buffer; contentType: 'image/png' | 'image/jpeg' }> {
   const ext = path.extname(imgPath).toLowerCase()
   const contentType =
     ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : null
@@ -368,14 +361,14 @@ function readCachedPageImageSafe(
 
   let realRoot: string
   try {
-    realRoot = realpathSync(cacheRoot)
+    realRoot = await realpath(cacheRoot)
   } catch {
     throw new OfficePreviewError('FILE_NOT_FOUND', 404, 'preview image not found')
   }
 
-  let st
+  let st: Stats
   try {
-    st = lstatSync(imgPath)
+    st = await lstat(imgPath)
   } catch {
     throw new OfficePreviewError('FILE_NOT_FOUND', 404, 'preview image not found')
   }
@@ -385,7 +378,7 @@ function readCachedPageImageSafe(
 
   let realImg: string
   try {
-    realImg = realpathSync(imgPath)
+    realImg = await realpath(imgPath)
   } catch {
     throw new OfficePreviewError('FILE_NOT_FOUND', 404, 'preview image not found')
   }
@@ -393,27 +386,31 @@ function readCachedPageImageSafe(
     throw new OfficePreviewError('PATH_ESCAPE', 403, 'preview image escapes cache root')
   }
 
-  let fd: number | null = null
+  let fh: FileHandle | null = null
   try {
     const flags =
       fsConstants.O_RDONLY |
       (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0)
-    fd = openSync(realImg, flags)
-    const fst = fstatSync(fd)
+    fh = await open(realImg, flags)
+    const fst = await fh.stat()
     if (!fst.isFile() || fst.dev !== st.dev || fst.ino !== st.ino) {
       throw new OfficePreviewError('SYMLINK_REJECTED', 403, 'preview image changed during read')
     }
     if (fst.size > MAX_PAGE_IMAGE_BYTES) {
       throw new OfficePreviewError('FILE_TOO_LARGE', 413, 'preview page image exceeds size limit')
     }
-    return { bytes: readFileSync(fd), contentType }
+    const bytes = await fh.readFile()
+    if (bytes.length > MAX_PAGE_IMAGE_BYTES) {
+      throw new OfficePreviewError('FILE_TOO_LARGE', 413, 'preview page image exceeds size limit')
+    }
+    return { bytes, contentType }
   } catch (err) {
     if (err instanceof OfficePreviewError) throw err
     throw new OfficePreviewError('FILE_NOT_FOUND', 404, 'preview image unreadable')
   } finally {
-    if (fd !== null) {
+    if (fh !== null) {
       try {
-        closeSync(fd)
+        await fh.close()
       } catch {
         // ignore
       }
@@ -467,7 +464,7 @@ export async function handleInternalOfficePreviewPage(
   }
 
   try {
-    const img = readCachedPageImageSafe(resolved.imgPath, resolved.cacheRoot)
+    const img = await readCachedPageImageSafe(resolved.imgPath, resolved.cacheRoot)
     res.statusCode = 200
     res.setHeader('Content-Type', img.contentType)
     res.setHeader('Content-Length', img.bytes.length)

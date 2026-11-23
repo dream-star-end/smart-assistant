@@ -141,6 +141,19 @@ export class MarketplaceError extends Error {
   }
 }
 
+/** Structured transient concurrency-drift conflict; retryable by installMarketplaceBundle. */
+export class RetryableInstallConflictError extends MarketplaceError {
+  readonly retryable = true as const
+  constructor(message: string) {
+    super('INSTALL_CONFLICT', message)
+    this.name = 'RetryableInstallConflictError'
+  }
+}
+
+function isPgUniqueViolation(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === '23505'
+}
+
 export type InstallScopeMode = 'preserve' | 'replace' | 'merge' | 'legacy_union'
 
 const VALID_AGENT_SCOPE_ID_RE = /^[A-Za-z0-9_-]+$/
@@ -681,7 +694,7 @@ async function publishSkillVersionInternal(
       }
       return { versionId: ins.rows[0].id }
     } catch (e) {
-      if (e instanceof Error && /duplicate key|unique/i.test(e.message))
+      if (isPgUniqueViolation(e))
         throw new MarketplaceError('DUPLICATE_VERSION', `版本 ${input.version} 已存在`)
       throw e
     }
@@ -2159,7 +2172,7 @@ export async function installMarketplaceBundle(args: {
             (item, index) => item.slug !== before[index]?.slug || item.kind !== before[index]?.kind,
           )
         )
-          throw new MarketplaceError('INSTALL_CONFLICT', '能力绑定在安装期间发生变化,请重试')
+          throw new RetryableInstallConflictError('能力绑定在安装期间发生变化,请重试')
       } else {
         const now = await c.query<{ agent_slug: string }>(
           `SELECT agent_slug FROM marketplace_agent_capability_bindings
@@ -2173,7 +2186,7 @@ export async function installMarketplaceBundle(args: {
           now.rows.length !== before.length ||
           now.rows.some((item, index) => item.agent_slug !== before[index])
         )
-          throw new MarketplaceError('INSTALL_CONFLICT', '手动归属在安装期间发生变化,请重试')
+          throw new RetryableInstallConflictError('手动归属在安装期间发生变化,请重试')
       }
 
       const currentRefs = await c.query<BundleRequirementRow & { version_id: string | null }>(
@@ -2196,7 +2209,7 @@ export async function installMarketplaceBundle(args: {
             ref.required !== requirements[index]?.required,
         )
       )
-        throw new MarketplaceError('INSTALL_CONFLICT', '能力依赖在安装期间发生变化,请重试')
+        throw new RetryableInstallConflictError('能力依赖在安装期间发生变化,请重试')
 
       const versionIds = [
         args.versionId,
@@ -2221,7 +2234,7 @@ export async function installMarketplaceBundle(args: {
         if (listing) listings.set(slug, listing)
       }
       if (refs.some((ref) => listings.get(ref.slug)?.currentApprovedVersionId !== ref.version_id))
-        throw new MarketplaceError('INSTALL_CONFLICT', '能力版本在安装期间发生变化,请重试')
+        throw new RetryableInstallConflictError('能力版本在安装期间发生变化,请重试')
 
       const version = versions.get(args.versionId)
       const rootListing = listings.get(root.slug)
@@ -2361,12 +2374,7 @@ export async function installMarketplaceBundle(args: {
       }
     })
   } catch (error) {
-    if (
-      error instanceof MarketplaceError &&
-      error.code === 'INSTALL_CONFLICT' &&
-      error.message.includes('期间发生变化') &&
-      (args.retryAttempt ?? 0) < 2
-    )
+    if (error instanceof RetryableInstallConflictError && (args.retryAttempt ?? 0) < 2)
       return installMarketplaceBundle({ ...args, retryAttempt: (args.retryAttempt ?? 0) + 1 })
     throw error
   }

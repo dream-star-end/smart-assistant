@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { reportClientFrictionOnce } from "../../lib/clientFriction";
 import { savePendingPayment, type PendingPayment } from "../../lib/pendingPayment";
 import { formatCentsYuan } from "../../lib/utils";
-import { Alert, Button, Spinner, buttonVariants } from "../ui";
+import { Alert, Button, Input, Spinner, buttonVariants, useToast } from "../ui";
 
 export type PaymentClientKind = "desktop" | "mobile" | "wechat";
 
@@ -86,16 +86,21 @@ export function HupijiaoPaymentEntry({
   token?: string | null;
 }) {
   const client = paymentClientKind();
+  const toast = useToast();
   const [now, setNow] = useState(() => Date.now());
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   // 二维码是第三方图片，加载失败时不能只剩一张裂图（审计 SET-31）：给出说明与「重新获取」。
   const [qrFailed, setQrFailed] = useState(false);
   const remaining = expiresAt ? remainingPaymentMs(expiresAt, now) : null;
   const expired = remaining === 0;
+  const recoveryUrl = paymentRecoveryUrl(pendingPayment.orderNo);
 
   // 换了订单（重新下单）→ 新的二维码 URL，失败态复位。
   useEffect(() => {
     setQrFailed(false);
+    setCopyFailed(false);
+    setCopied(false);
   }, [qrcodeUrl]);
 
   useEffect(() => {
@@ -111,8 +116,11 @@ export function HupijiaoPaymentEntry({
     try {
       await navigator.clipboard.writeText(url);
       setCopied(true);
+      setCopyFailed(false);
     } catch {
       setCopied(false);
+      setCopyFailed(true);
+      toast("自动复制失败，请长按下方链接手动复制", "error");
     }
   }
 
@@ -141,17 +149,17 @@ export function HupijiaoPaymentEntry({
     </div>
   );
 
-  const reorderBtn = (
+  const reorderBtn = onReorder ? (
     <Button
       variant="primary"
       size="md"
       className="w-full"
       data-testid="payment-reorder"
-      onClick={() => onReorder?.()}
+      onClick={() => onReorder()}
     >
       重新下单
     </Button>
-  );
+  ) : null;
 
   useEffect(() => {
     if (client !== "desktop" || !qrcodeUrl) return;
@@ -189,6 +197,21 @@ export function HupijiaoPaymentEntry({
               {copied ? <Check size={16} strokeWidth={2} /> : <Copy size={16} strokeWidth={1.75} />}{" "}
               {copied ? "已复制" : "复制链接"}
             </Button>
+            {copyFailed && (
+              <div className="w-full space-y-1.5" data-testid="wechat-copy-fallback">
+                <p className="text-caption text-warning">
+                  自动复制受限，请长按或全选下方链接手动复制：
+                </p>
+                <Input
+                  readOnly
+                  value={recoveryUrl}
+                  aria-label="支付恢复链接"
+                  onFocus={(e) => e.currentTarget.select()}
+                  onClick={(e) => e.currentTarget.select()}
+                  className="font-mono text-base md:text-sm"
+                />
+              </div>
+            )}
             <p className="text-center text-meta text-faint">
               在系统浏览器打开后自动恢复本次订单
             </p>

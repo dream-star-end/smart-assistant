@@ -187,7 +187,7 @@ describe('FinalPage (OCV5-593 FE-3)', () => {
         `/blob/${'a'.repeat(64)}`,
       ),
     )
-    expect(screen.getByText('QA 全部通过')).toBeInTheDocument()
+    expect(screen.getByText('质量评估全部通过')).toBeInTheDocument()
     expect(screen.getByText('-16.1 LUFS')).toBeInTheDocument()
     expect(screen.getByText('742 / 2,000')).toBeInTheDocument()
   })
@@ -209,7 +209,7 @@ describe('compose has no fixed fee (user 2026-10-23 21:42)', () => {
     expect(costBreakdown(takes).map((r) => r.label)).toEqual(['设定图 · GPT Image'])
     render(<FinalPage auth={auth} view={view({ takes })} onOpenBoard={() => {}} />)
     expect(screen.getByTestId('compose-fee-note')).toHaveTextContent(
-      '成片合成由导演 agent 完成，按 agent 实际用量计费，不另收固定费用。',
+      '成片合成由导演助手完成，按导演助手实际用量计费，不另收固定费用。',
     )
     const text = document.body.textContent ?? ''
     expect(text).not.toMatch(/合成[^。]{0,12}\d+\s*积分/)
@@ -273,7 +273,7 @@ describe('FE-3 code r1 fixes', () => {
       ],
     })
     render(<FinalPage auth={auth} view={v} onOpenBoard={() => {}} />)
-    expect(screen.queryByText('QA 全部通过')).not.toBeInTheDocument()
+    expect(screen.queryByText('质量评估全部通过')).not.toBeInTheDocument()
     expect(screen.getAllByRole('img', { name: '通过' })).toHaveLength(1)
     expect(screen.getAllByRole('img', { name: '未达标' })).toHaveLength(2)
     expect(screen.getByText('3 处')).toBeInTheDocument()

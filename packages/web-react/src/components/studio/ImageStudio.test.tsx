@@ -117,8 +117,8 @@ describe('ImageStudioPage (OCV5-593 FE-2c)', () => {
       'data-state',
       'unconfigured',
     )
-    expect(screen.getByRole('button', { name: /再生成/ })).toBeDisabled()
-    expect(screen.getByRole('button', { name: /锁定为设定/ })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: /再生成/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /锁定为设定/ })).not.toBeInTheDocument()
   })
 
   test('uploading a reference calls the real endpoint and reloads', async () => {

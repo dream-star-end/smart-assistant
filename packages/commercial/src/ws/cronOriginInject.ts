@@ -3,7 +3,11 @@ import type { Pool } from "pg";
 import { computeDispatchRequestHash, isClientMessageId } from "@openclaude/protocol";
 import { ModelSwitchCostError, type ModelSwitchCostService } from "../billing/modelSwitchCost.js";
 import { readClientSessionModelId } from "../db/pgSessionsBackend.js";
-import { casToTerminal } from "../dispatch/turnDispatchStore.js";
+import {
+  assessDispatchBilling,
+  type BillingAssessment,
+} from "../dispatch/turnDispatchReconciler.js";
+import { casToTerminal, type TurnDispatchRow } from "../dispatch/turnDispatchStore.js";
 import type { Logger } from "../logging/logger.js";
 import type {
   CronOriginExecutor,
@@ -46,6 +50,61 @@ export async function lookupCronOriginSessionModel(
   return readClientSessionModelId(pool, sessionId, sessionUserId);
 }
 
+export const CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_REASON =
+  "previously_failed_unexecuted";
+export const CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE =
+  "PREVIOUSLY_FAILED_UNEXECUTED";
+
+/**
+ * Authoritative Master billing-safety gate (OCV5-73): a terminal
+ * `previously_failed` dispatch row authorizes the container to bump
+ * `callback_epoch` (minting a fresh clientMessageId / dispatchId /
+ * billingRequestId) ONLY when Master has durable negative proof that the old
+ * dispatch never executed, cannot late-converge to `completed`, and carries no
+ * billing evidence:
+ *  - `status === "terminal"` and `outcome === "not_accepted"` (I2 container
+ *    durable rejected tombstone — excludes `executed_error`, `crashed`,
+ *    `interrupted`, and provisional recovery sentinels `RESULT_RECOVERY_PENDING`
+ *    / `SERVICE_RESTART`).
+ *  - `failureCode !== "USER_CANCELLED"` (explicit user cancel is never re-injected).
+ *  - `producerFencedAt == null` and `visibleAt == null` (not fenced / never visible).
+ *  - Billing assessment (`assessBilling` or `assessDispatchBilling(pgPool, dispatchId)`)
+ *    proves `"not_billed"`. Missing oracle or DB failure fails closed (`false`).
+ */
+export async function isCronOriginPreviouslyFailedSafeToBumpEpoch(opts: {
+  dispatch?: Pick<
+    TurnDispatchRow,
+    "dispatchId" | "status" | "outcome" | "failureCode" | "producerFencedAt" | "visibleAt"
+  >;
+  pgPool?: UserChatBridgeDeps["pgPool"];
+  assessBilling?: (dispatchId: string) => Promise<BillingAssessment>;
+  log?: Logger;
+}): Promise<boolean> {
+  const { dispatch, pgPool, assessBilling, log } = opts;
+  if (!dispatch) return false;
+  if (dispatch.status !== "terminal") return false;
+  if (dispatch.outcome !== "not_accepted") return false;
+  if (dispatch.failureCode === "USER_CANCELLED") return false;
+  if (dispatch.producerFencedAt != null) return false;
+  if (dispatch.visibleAt != null) return false;
+
+  const checkBilling = assessBilling
+    ? () => assessBilling(dispatch.dispatchId)
+    : pgPool
+      ? () => assessDispatchBilling(pgPool, dispatch.dispatchId)
+      : null;
+  if (!checkBilling) return false;
+  try {
+    return (await checkBilling()) === "not_billed";
+  } catch (err) {
+    log?.warn("user-chat-bridge: cron origin billing assessment failed; refusing epoch bump", {
+      dispatchId: dispatch.dispatchId,
+      err,
+    });
+    return false;
+  }
+}
+
 /** Shared origin-session inject path used by the bridge and unit tests. */
 export async function executeCronOriginInject(opts: {
   input: CronOriginInjectInput
@@ -55,6 +114,7 @@ export async function executeCronOriginInject(opts: {
     sessionId: string,
     sessionUserId: string,
   ) => Promise<string | null | undefined>
+  assessBilling?: (dispatchId: string) => Promise<BillingAssessment>
   admitUserTurn: NonNullable<UserChatBridgeDeps["admitUserTurn"]>
   /** Resolve transport candidates only after durable admission. A bridge that
    * disappeared during the admission await must never be called as a stale
@@ -149,10 +209,23 @@ export async function executeCronOriginInject(opts: {
     return { kind: "gone" };
   }
   if (admit.kind === "session_busy") return { kind: "in_flight" };
+  if (admit.kind === "previously_failed") {
+    const safeToBump = await isCronOriginPreviouslyFailedSafeToBumpEpoch({
+      dispatch: admit.dispatch,
+      pgPool,
+      assessBilling: opts.assessBilling,
+      log,
+    });
+    return {
+      kind: "failed",
+      reason: safeToBump
+        ? CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_REASON
+        : "previously_failed",
+    };
+  }
   if (
     admit.kind === "append_error" ||
     admit.kind === "recovery_conflict" ||
-    admit.kind === "previously_failed" ||
     admit.kind === "manual_hold" ||
     admit.kind === "immutable_conflict"
   ) {

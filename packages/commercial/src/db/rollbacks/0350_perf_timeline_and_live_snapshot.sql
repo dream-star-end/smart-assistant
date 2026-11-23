@@ -1,4 +1,4 @@
--- Rollback for 0346_commercial_perf_timeline_and_live_snapshot.sql (OCV5-824 / OCV5-856)
+-- Rollback for 0350_perf_timeline_and_live_snapshot.sql (OCV5-824)
 DROP TRIGGER IF EXISTS trg_client_sessions_invalidate_last_preview ON client_sessions;
 DROP FUNCTION IF EXISTS trg_client_sessions_invalidate_last_preview();
 

@@ -282,7 +282,8 @@
     min-height: 2.75rem;
   }
   .oc-pd-filter-pill {
-    min-height: 2.25rem;
+    min-width: 2.75rem;
+    min-height: 2.75rem;
     padding: 0 0.625rem;
   }
 }

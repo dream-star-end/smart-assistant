@@ -206,13 +206,26 @@ export default function LiveAgentCapsule({
   );
   // 当前回合正在执行时不重复弹出后台命令胶囊，仅对脱离当前回合的独立/残留后台任务展示
   const visibleBgCommands = wsSending ? [] : bgCommands;
+  // OCV5-858: 过滤已完成且已停用的一次性续跑 cron，避免已完成的一次性定时任务残留为「定时已暂停」。
+  const visibleSessionCrons = useMemo(
+    () =>
+      sessionCrons.filter((c) => {
+        const hasRun = typeof c.lastRunAt === "number" && Number.isFinite(c.lastRunAt) && c.lastRunAt > 0;
+        const nextAfterLast =
+          typeof c.nextRunAt === "number" &&
+          Number.isFinite(c.nextRunAt) &&
+          (!hasRun || c.nextRunAt > (c.lastRunAt as number));
+        return !(c.oneshot && !c.enabled && hasRun && !nextAfterLast);
+      }),
+    [sessionCrons],
+  );
 
   const swarmActive = latestSwarm ? isSwarmActive(latestSwarm.phase) : false;
   const hasSwarm = swarmActive;
   const hasDelegate = visibleDelegates.length > 0;
   const hasMedia = visibleMuseJobs.length > 0 || visibleMediaJobs.length > 0;
   const hasBgCmd = visibleBgCommands.length > 0;
-  const hasSchedule = sessionCrons.length > 0;
+  const hasSchedule = visibleSessionCrons.length > 0;
   const hasIncompleteTodo = todos.some((t) => t.status !== "completed");
   const hasTask = hasIncompleteTodo && (!settled || wsSending);
 
@@ -248,10 +261,10 @@ export default function LiveAgentCapsule({
 
   const primaryBgCmd = visibleBgCommands[0] ?? null;
   const enabledCrons = useMemo(
-    () => sessionCrons.filter((c) => c.enabled),
-    [sessionCrons],
+    () => visibleSessionCrons.filter((c) => c.enabled),
+    [visibleSessionCrons],
   );
-  const primaryCron = enabledCrons[0] ?? sessionCrons[0] ?? null;
+  const primaryCron = enabledCrons[0] ?? visibleSessionCrons[0] ?? null;
 
   // 活跃运行态优先于待触发定时/已终态提示，保持单行胶囊只聚焦此刻最关键的运行态
   const activeOrder: HudKind[] = [];
@@ -296,7 +309,7 @@ export default function LiveAgentCapsule({
     setNow(Date.now());
     const id = window.setInterval(() => setNow(Date.now()), 30_000);
     return () => window.clearInterval(id);
-  }, [slowCountdownRunning, sessionCrons]);
+  }, [slowCountdownRunning, visibleSessionCrons]);
 
   useEffect(() => {
     if (activeOrder.length === 0 && expanded) setExpanded(false);
@@ -451,7 +464,7 @@ export default function LiveAgentCapsule({
               museJobs={visibleMuseJobs}
               mediaJobs={visibleMediaJobs}
               bgCommands={visibleBgCommands}
-              sessionCrons={sessionCrons}
+              sessionCrons={visibleSessionCrons}
               now={now}
               autoDismissSucceeded={false}
               onCancelMuseJob={onCancelMuseJob}
@@ -564,8 +577,8 @@ export default function LiveAgentCapsule({
               }
               className={
                 swarmAlerts.failedMembers.length > 0
-                  ? "oc-spring-press inline-flex shrink-0 items-center gap-1 rounded-full bg-danger-soft px-2 py-1 text-micro font-semibold text-danger transition-colors hover:bg-danger/20"
-                  : "oc-spring-press inline-flex shrink-0 items-center gap-1 rounded-full bg-warning-soft px-2 py-1 text-micro font-semibold text-warning transition-colors hover:bg-warning/20"
+                  ? "oc-spring-press inline-flex shrink-0 items-center gap-1 rounded-full bg-danger-soft px-2 py-1 text-caption font-semibold text-danger transition-colors hover:bg-danger/20 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+                  : "oc-spring-press inline-flex shrink-0 items-center gap-1 rounded-full bg-warning-soft px-2 py-1 text-caption font-semibold text-warning transition-colors hover:bg-warning/20 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
               }
             >
               <AlertTriangle size={11} aria-hidden className="shrink-0" />
@@ -588,11 +601,7 @@ export default function LiveAgentCapsule({
                   blockId: latestSwarmBlockId,
                 })
               }
-              className={
-                isRunning
-                  ? "oc-live-capsule-action oc-spring-press oc-shimmer-sheen shrink-0"
-                  : "oc-live-capsule-action oc-spring-press shrink-0"
-              }
+              className="oc-live-capsule-action oc-spring-press shrink-0"
             >
               <span>看板</span>
               <ArrowUpRight size={11} aria-hidden className="shrink-0" />

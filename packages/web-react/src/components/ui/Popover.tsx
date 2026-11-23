@@ -21,7 +21,7 @@ export const PopoverContent = forwardRef<
       sideOffset={sideOffset}
       className={cn(
         "oc-surface-popover z-[var(--z-popover-portal)] w-72 rounded-xl p-3.5 text-fg outline-none",
-        "data-[state=open]:animate-pop",
+        "origin-[var(--radix-popper-transform-origin)] data-[state=open]:animate-pop data-[state=closed]:oc-pop-out",
         className,
       )}
       {...props}

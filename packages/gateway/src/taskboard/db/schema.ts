@@ -30,7 +30,7 @@ import type Database from 'better-sqlite3'
 export type TaskboardDb = Database.Database
 
 /** 当前 schema 版本。加列时递增,并在 migrate() 里补一段 < N 的 ALTER。 */
-export const TASKBOARD_SCHEMA_VERSION = 10
+export const TASKBOARD_SCHEMA_VERSION = 11
 
 /** 项目 key:大写字母开头,2–12 位 [A-Z0-9]。创建后冻结。 */
 export const PROJECT_KEY_RE = /^[A-Z][A-Z0-9]{1,11}$/
@@ -125,6 +125,8 @@ CREATE TABLE IF NOT EXISTS tb_ticket (
 
 CREATE INDEX IF NOT EXISTS idx_tb_ticket_status_stage ON tb_ticket(status, stage_id);
 CREATE INDEX IF NOT EXISTS idx_tb_ticket_project ON tb_ticket(project_id);
+CREATE INDEX IF NOT EXISTS idx_tb_ticket_project_status ON tb_ticket(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_tb_ticket_origin_session ON tb_ticket(origin_session_key);
 
 CREATE TABLE IF NOT EXISTS tb_ticket_run (
   id TEXT PRIMARY KEY,
@@ -153,6 +155,10 @@ CREATE INDEX IF NOT EXISTS idx_tb_ticket_run_ticket_created
   ON tb_ticket_run(ticket_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tb_ticket_run_stage_status
   ON tb_ticket_run(stage_id, status);
+CREATE INDEX IF NOT EXISTS idx_tb_ticket_run_status_lease
+  ON tb_ticket_run(status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_tb_ticket_run_session_key
+  ON tb_ticket_run(session_key);
 
 CREATE TABLE IF NOT EXISTS tb_ticket_relation (
   id TEXT PRIMARY KEY,
@@ -165,6 +171,8 @@ CREATE TABLE IF NOT EXISTS tb_ticket_relation (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tb_rel_single_parent
   ON tb_ticket_relation(from_ticket_id) WHERE kind = 'parent';
+CREATE INDEX IF NOT EXISTS idx_tb_ticket_relation_to
+  ON tb_ticket_relation(to_ticket_id);
 
 CREATE TABLE IF NOT EXISTS tb_ticket_comment (
   id TEXT PRIMARY KEY,
@@ -175,6 +183,9 @@ CREATE TABLE IF NOT EXISTS tb_ticket_comment (
   run_id TEXT,
   created_at INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_tb_ticket_comment_ticket_created
+  ON tb_ticket_comment(ticket_id, created_at);
 
 CREATE TABLE IF NOT EXISTS tb_ticket_activity (
   id TEXT PRIMARY KEY,
@@ -223,6 +234,24 @@ CREATE TABLE IF NOT EXISTS tb_pipeline_template (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+`
+
+/**
+ * v11: 补齐热路径二级索引（存量 v1–v10 库无缝升级，幂等 IF NOT EXISTS）。
+ */
+export const TASKBOARD_DDL_V11 = `
+CREATE INDEX IF NOT EXISTS idx_tb_ticket_comment_ticket_created
+  ON tb_ticket_comment(ticket_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tb_ticket_run_status_lease
+  ON tb_ticket_run(status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_tb_ticket_run_session_key
+  ON tb_ticket_run(session_key);
+CREATE INDEX IF NOT EXISTS idx_tb_ticket_relation_to
+  ON tb_ticket_relation(to_ticket_id);
+CREATE INDEX IF NOT EXISTS idx_tb_ticket_project_status
+  ON tb_ticket(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_tb_ticket_origin_session
+  ON tb_ticket(origin_session_key);
 `
 
 // ── 可辨识错误(供 HTTP 层映射 409 / 404 / 403 / 422)────────────────────────

@@ -8,7 +8,11 @@ import { describe, it } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { DelegateJobStore } from '../delegateJobs.js'
 import { DELEGATE_CONTEXT_HEADER, issueDelegateContextToken } from '../delegateContext.js'
-import { handoffDelegateWait } from '../delegateWaitHandoff.js'
+import {
+  handedOffDelegateRetryDelay,
+  handoffDelegateWait,
+  retryHandedOffDelegateNotifies,
+} from '../delegateWaitHandoff.js'
 import { handleDelegateWait } from '../delegateRuntime.js'
 import { _ensureDurableSendToAgentCallback, _queueSendToAgentCallback } from '../delegateCallbacks.js'
 import { persistSendToAgentIntent } from '../sendToAgentIntentStore.js'
@@ -271,4 +275,59 @@ describe('MCP deadline handoff', () => {
       assert.equal(f.host._notifyRetryTimer, undefined)
     })
   }
+
+  it('CALLBACK_OWNER=intent + NOTIFIER=0: skips kind=send_to_agent rows while keeping kind=delegate handoffs', async () => {
+    process.env.OC_DELEGATE_SM = '1'
+    process.env.OC_DELEGATE_DURABLE = '0'
+    process.env.OC_DELEGATE_NOTIFIER = '0'
+    process.env.OC_DELEGATE_CALLBACK_OWNER = 'intent'
+    const f = fixture(true)
+    const staCreated = f.store.create('coding-assistant', {
+      queued: true,
+      kind: 'send_to_agent',
+      callback: 'origin-inject',
+      parentSessionKey: PARENT,
+      callbackOriginSessionKey: PARENT,
+    })
+    assert.ok('jobId' in staCreated)
+    const staClaim = f.store.claimQueued(staCreated.jobId)
+    assert.equal(staClaim.ok, true)
+    if (!staClaim.ok) throw new Error('claim failed')
+    assert.equal(
+      f.store.complete(staCreated.jobId, { httpStatus: 200, body: { output: 'sta-ok' } }, staClaim),
+      true,
+    )
+
+    // send_to_agent row owned by intent MUST NOT be selected or retried by flag-off job scheduler
+    assert.equal(handedOffDelegateRetryDelay(f.store), undefined)
+    await retryHandedOffDelegateNotifies(f.host)
+    assert.equal(f.calls.length, 0)
+    assert.equal(
+      await f.host._ensureDurableSendToAgentCallback(
+        f.store.snapshotOf(staCreated.jobId),
+        f.intent(staCreated.jobId),
+      ),
+      false,
+    )
+    assert.equal(f.calls.length, 0)
+
+    // Handed-off kind=delegate row is still owned and drained by the flag-off retry path
+    const dlgId = f.create()
+    await f.previouslyHandedOff(dlgId)
+    const dlgOwner = f.store.snapshotOf(dlgId)!
+    assert.equal(
+      f.store.complete(
+        dlgId,
+        { httpStatus: 200, body: { output: 'dlg-ok' } },
+        { claimToken: dlgOwner.claimToken!, fencingEpoch: dlgOwner.fencingEpoch },
+      ),
+      true,
+    )
+    assert.notEqual(handedOffDelegateRetryDelay(f.store), undefined)
+    await retryHandedOffDelegateNotifies(f.host)
+    assert.equal(f.calls.length, 1)
+    assert.equal(f.calls[0].jobId, dlgId)
+    assert.equal(f.store.snapshotOf(dlgId)?.callbackState, 'delivered')
+    assert.equal(f.store.snapshotOf(staCreated.jobId)?.callbackState, 'pending')
+  })
 })

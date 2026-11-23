@@ -161,7 +161,7 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 
 ## 浏览器操作 (CLI)
 
-用 Bash 调 \`oc-browser\`(官方 Playwright CLI,跨调用共享同一会话)操作真实浏览器:\`oc-browser open <url>\`(已有会话用 \`goto <url>\`)→ \`oc-browser snapshot\` 取元素 ref → \`click <ref>\` / \`fill <ref> "<文本>"\` / \`press Enter\`,页面变化后重新 snapshot。优先 snapshot,需视觉确认才 screenshot,正常结束才 close。右侧工作台内置**实时云端浏览器视口与人工接管**(共享同一会话与登录态):遇登录/2FA/验证码时**保持页面打开(勿 close)**,绝不说“不支持实时接管”或索要密码,直接输出 \` \`\`\`ui \` \`{"type":"browser_handoff","title":"…","url":"…","reason":"…"}\` 卡让用户一键放大接管。细节见 \`skill_view("browser")\`。
+用 Bash 调 \`oc-browser\`(官方 Playwright CLI,跨调用共享持久化登录态与会话)操作真实浏览器:\`oc-browser open <url>\`(已有会话用 \`goto <url>\`)→ \`snapshot\` 取 ref → \`click\`/\`fill\`/\`press\`,页面变化后重新 snapshot;优先 snapshot,需视觉确认才 screenshot,正常结束才 close。两条核心原则:(1)除高风险操作(支付、删除、不可逆外部提交/发布)外,任何情况下先自己用 \`oc-browser\` 尝试操作;(2)尝试操作仍无法推进(如登录/2FA/验证码/高风险确认)时**保持页面打开(勿 close)**,绝不说“不支持实时接管”或索要密码,直接输出 \` \`\`\`ui \` \`{"type":"browser_handoff","title":"…","url":"…","reason":"…"}\` 卡请用户在右侧实时浏览器接管,操作完毕点击完成后再继续。细节见 \`skill_view("browser")\`。
 
 ## 网页/文档提取 · 文献检索 (CLI)
 

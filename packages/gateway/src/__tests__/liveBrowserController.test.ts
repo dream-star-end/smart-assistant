@@ -11,6 +11,7 @@ import {
   LIVE_BROWSER_MAX_QUEUE_DEPTH,
   LiveBrowserController,
   LiveBrowserError,
+  acquireHumanTakeoverLease,
   buildPlaywrightRunCodeScript,
   handleLiveBrowserActionHttp,
   handleLiveBrowserLiveHttp,
@@ -18,12 +19,19 @@ import {
   ocBrowserAgentKey,
   parsePlaywrightRunCodeResult,
   parsePlaywrightTabList,
+  readActiveHumanTakeoverLease,
   readPngDimensions,
   resolvePlaywrightDaemonEndpoint,
   sendPlaywrightDaemonRpc,
   validateLiveBrowserAction,
   validateLiveBrowserUrl,
 } from '../liveBrowserController.js'
+
+async function acquireTestTakeover(ctrl: LiveBrowserController, agentId = 'main'): Promise<string> {
+  const res = await ctrl.performAction(agentId, { action: 'takeover', active: true })
+  assert.equal(typeof res.takeoverToken, 'string')
+  return res.takeoverToken!
+}
 
 function mockRunCodeOutput(payload: Record<string, unknown>): string {
   return `### Result\n${JSON.stringify(payload)}\n### Ran Playwright code\n\`\`\`js\nawait page.screenshot()\n\`\`\`\n`
@@ -66,9 +74,30 @@ describe('liveBrowserController', () => {
     assert.notEqual(ocBrowserAgentKey('main'), ocBrowserAgentKey('coder'))
   })
 
-  it('strictly allows only http: and https: URLs', () => {
+  it('strictly allows only public http: and https: URLs and blocks private/loopback SSRF targets', () => {
     assert.equal(validateLiveBrowserUrl('https://arxiv.org/abs/2501.00001'), 'https://arxiv.org/abs/2501.00001')
-    assert.equal(validateLiveBrowserUrl('http://127.0.0.1:8765/demo.html'), 'http://127.0.0.1:8765/demo.html')
+    assert.equal(validateLiveBrowserUrl('http://example.com:8080/demo.html'), 'http://example.com:8080/demo.html')
+    // OCV5-857 / OCV5-343: cloud live browser blocks loopback/private/link-local SSRF targets;
+    // local container dev servers must use the dedicated containerPreview pipeline instead.
+    for (const ssrf of [
+      'http://127.0.0.1:8765/demo.html',
+      'http://localhost:3000/',
+      'http://[::1]:8080/',
+      'http://0.0.0.0:80/',
+      'http://169.254.169.254/latest/meta-data/',
+      'http://10.0.0.1/',
+      'http://172.16.0.5/',
+      'http://192.168.1.10/',
+      'http://[fc00::1]/',
+      'http://[fe80::1]/',
+      'http://[::ffff:127.0.0.1]/',
+      'http://user:pass@example.com/',
+    ]) {
+      assert.throws(
+        () => validateLiveBrowserUrl(ssrf),
+        (err: unknown) => err instanceof LiveBrowserError && err.code === 'UNSAFE_URL',
+      )
+    }
     for (const bad of [
       'file:///etc/passwd',
       'javascript:alert(1)',
@@ -155,120 +184,142 @@ describe('liveBrowserController', () => {
   })
 
   it('coalesces concurrent GET frame reads and invalidates coalesced read when an action arrives', async () => {
-    let execCount = 0
-    let releaseFirst!: () => void
-    const firstGate = new Promise<void>((r) => {
-      releaseFirst = r
-    })
-    const ctrl = new LiveBrowserController({
-      ocBrowserBin: '/usr/local/bin/oc-browser',
-      existsSync: () => true,
-      execFn: async (_bin, args) => {
-        const myCall = ++execCount
-        if (myCall === 1) await firstGate
-        const title = args[1]?.includes('"click"') ? 'After Click' : `Frame ${myCall}`
-        return {
-          stdout: mockRunCodeOutput({
-            url: 'https://example.com',
-            title,
-            viewport: { width: 1280, height: 720 },
-            tabs: [{ index: 0, title, url: 'https://example.com', active: true }],
-            imageBase64: 'AAAA',
-            capturedAt: 1000 + myCall,
-          }),
-          stderr: '',
-        }
-      },
-    })
+    const stateRoot = mkdtempSync(join(tmpdir(), 'oc-lb-coalesce-'))
+    try {
+      let execCount = 0
+      let releaseFirst!: () => void
+      const firstGate = new Promise<void>((r) => {
+        releaseFirst = r
+      })
+      const ctrl = new LiveBrowserController({
+        ocBrowserBin: '/usr/local/bin/oc-browser',
+        stateRoot,
+        existsSync: () => true,
+        dnsLookup: (async () => [{ address: '93.184.216.34', family: 4 }]) as any,
+        execFn: async (_bin, args) => {
+          const myCall = ++execCount
+          if (myCall === 2) await firstGate
+          const title = args[1]?.includes('"click"') ? 'After Click' : `Frame ${myCall}`
+          return {
+            stdout: mockRunCodeOutput({
+              url: 'https://example.com',
+              title,
+              viewport: { width: 1280, height: 720 },
+              tabs: [{ index: 0, title, url: 'https://example.com', active: true }],
+              imageBase64: 'AAAA',
+              capturedAt: 1000 + myCall,
+            }),
+            stderr: '',
+          }
+        },
+      })
 
-    const p1 = ctrl.getLiveState('main')
-    const p2 = ctrl.getLiveState('main')
-    // Coalesced while first read is in-flight
-    const actionP = ctrl.performAction('main', { action: 'click', x: 0.5, y: 0.5, normalized: true })
-    // Poll arriving AFTER action must NOT reuse p1
-    const p3 = ctrl.getLiveState('main')
+      const tok = await acquireTestTakeover(ctrl)
+      const p1 = ctrl.getLiveState('main')
+      const p2 = ctrl.getLiveState('main')
+      // Coalesced while first read is in-flight
+      const actionP = ctrl.performAction('main', { action: 'click', x: 0.5, y: 0.5, normalized: true, takeoverToken: tok })
+      // Poll arriving AFTER action must NOT reuse p1
+      const p3 = ctrl.getLiveState('main')
 
-    releaseFirst()
-    const [r1, r2, rAct, r3] = await Promise.all([p1, p2, actionP, p3])
-    assert.equal(r1.title, 'Frame 1')
-    assert.equal(r2.title, 'Frame 1')
-    assert.equal(rAct.title, 'After Click')
-    assert.equal(r3.title, 'Frame 3')
-    assert.equal(execCount, 3)
+      releaseFirst()
+      const [r1, r2, rAct, r3] = await Promise.all([p1, p2, actionP, p3])
+      assert.equal(r1.title, 'Frame 2')
+      assert.equal(r2.title, 'Frame 2')
+      assert.equal(rAct.title, 'After Click')
+      assert.equal(r3.title, 'Frame 4')
+      assert.equal(execCount, 4)
+    } finally {
+      rmSync(stateRoot, { recursive: true, force: true })
+    }
   })
 
   it('rejects excess queued actions with 429 BROWSER_BUSY', async () => {
-    let release!: () => void
-    const gate = new Promise<void>((r) => {
-      release = r
-    })
-    const ctrl = new LiveBrowserController({
-      ocBrowserBin: '/usr/local/bin/oc-browser',
-      existsSync: () => true,
-      execFn: async () => {
-        await gate
-        return { stdout: mockRunCodeOutput({ url: 'https://example.com', title: 'ok', viewport: { width: 1280, height: 720 }, tabs: [] }), stderr: '' }
-      },
-    })
+    const stateRoot = mkdtempSync(join(tmpdir(), 'oc-lb-busy-'))
+    try {
+      let release!: () => void
+      const gate = new Promise<void>((r) => {
+        release = r
+      })
+      const ctrl = new LiveBrowserController({
+        ocBrowserBin: '/usr/local/bin/oc-browser',
+        stateRoot,
+        existsSync: () => true,
+        execFn: async (_bin, args) => {
+          if (args[1]?.includes('"reload"')) await gate
+          return { stdout: mockRunCodeOutput({ url: 'https://example.com', title: 'ok', viewport: { width: 1280, height: 720 }, tabs: [] }), stderr: '' }
+        },
+      })
 
-    const queued: Promise<unknown>[] = []
-    for (let i = 0; i < LIVE_BROWSER_MAX_QUEUE_DEPTH; i++) {
-      queued.push(ctrl.performAction('main', { action: 'reload' }))
+      const tok = await acquireTestTakeover(ctrl)
+      const queued: Promise<unknown>[] = []
+      for (let i = 0; i < LIVE_BROWSER_MAX_QUEUE_DEPTH; i++) {
+        queued.push(ctrl.performAction('main', { action: 'reload', takeoverToken: tok }))
+      }
+      await assert.rejects(() => ctrl.performAction('main', { action: 'reload', takeoverToken: tok }), (err: unknown) => {
+        assert.ok(err instanceof LiveBrowserError)
+        assert.equal(err.status, 429)
+        assert.equal(err.code, 'BROWSER_BUSY')
+        return true
+      })
+      release()
+      await Promise.all(queued)
+    } finally {
+      rmSync(stateRoot, { recursive: true, force: true })
     }
-    await assert.rejects(() => ctrl.performAction('main', { action: 'reload' }), (err: unknown) => {
-      assert.ok(err instanceof LiveBrowserError)
-      assert.equal(err.status, 429)
-      assert.equal(err.code, 'BROWSER_BUSY')
-      return true
-    })
-    release()
-    await Promise.all(queued)
   })
 
   it('supports cold-start open/goto, idempotent close, and rejects inactive non-nav actions with 409', async () => {
-    let active = false
-    const cmds: Array<readonly string[]> = []
-    const ctrl = new LiveBrowserController({
-      ocBrowserBin: '/usr/local/bin/oc-browser',
-      existsSync: (p) => p === '/usr/local/bin/oc-browser' || (active && p.endsWith('/activity')),
-      execFn: async (_bin, args) => {
-        cmds.push(args)
-        if (args[0] === 'open') {
-          active = true
-          return { stdout: '', stderr: '' }
-        }
-        if (args[0] === 'close') {
-          active = false
-          return { stdout: '', stderr: '' }
-        }
-        return {
-          stdout: mockRunCodeOutput({
-            url: 'https://arxiv.org/',
-            title: 'arXiv',
-            viewport: { width: 1280, height: 720 },
-            tabs: [{ index: 0, title: 'arXiv', url: 'https://arxiv.org/', active: true }],
-            imageBase64: 'BBBB',
-          }),
-          stderr: '',
-        }
-      },
-    })
+    const stateRoot = mkdtempSync(join(tmpdir(), 'oc-lb-cold-'))
+    try {
+      let active = false
+      const cmds: Array<readonly string[]> = []
+      const ctrl = new LiveBrowserController({
+        ocBrowserBin: '/usr/local/bin/oc-browser',
+        stateRoot,
+        existsSync: (p) => p === '/usr/local/bin/oc-browser' || (active && p.endsWith('/activity')),
+        execFn: async (_bin, args) => {
+          cmds.push(args)
+          if (args[0] === 'open') {
+            active = true
+            return { stdout: '', stderr: '' }
+          }
+          if (args[0] === 'close') {
+            active = false
+            return { stdout: '', stderr: '' }
+          }
+          return {
+            stdout: mockRunCodeOutput({
+              url: 'https://arxiv.org/',
+              title: 'arXiv',
+              viewport: { width: 1280, height: 720 },
+              tabs: [{ index: 0, title: 'arXiv', url: 'https://arxiv.org/', active: true }],
+              imageBase64: 'BBBB',
+            }),
+            stderr: '',
+          }
+        },
+      })
 
-    await assert.rejects(() => ctrl.performAction('main', { action: 'click', x: 0.2, y: 0.2, normalized: true }), (err: unknown) => {
-      assert.ok(err instanceof LiveBrowserError)
-      assert.equal(err.status, 409)
-      return true
-    })
+      await assert.rejects(() => ctrl.performAction('main', { action: 'click', x: 0.2, y: 0.2, normalized: true }), (err: unknown) => {
+        assert.ok(err instanceof LiveBrowserError)
+        assert.equal(err.status, 409)
+        return true
+      })
 
-    const opened = await ctrl.performAction('main', { action: 'goto', url: 'https://arxiv.org/' })
-    assert.equal(opened.active, true)
-    assert.equal(opened.title, 'arXiv')
-    assert.equal(cmds[0][0], 'open')
+      const opened = await ctrl.performAction('main', { action: 'goto', url: 'https://arxiv.org/' })
+      assert.equal(opened.active, true)
+      assert.equal(opened.title, 'arXiv')
+      assert.equal(cmds[0][0], 'open')
 
-    const closed = await ctrl.performAction('main', { action: 'close' })
-    assert.equal(closed.active, false)
-    const closedAgain = await ctrl.performAction('main', { action: 'close' })
-    assert.equal(closedAgain.active, false)
+      const tok = await acquireTestTakeover(ctrl)
+      const closed = await ctrl.performAction('main', { action: 'close', takeoverToken: tok })
+      assert.equal(closed.active, false)
+      const closedAgain = await ctrl.performAction('main', { action: 'close' })
+      assert.equal(closedAgain.active, false)
+    } finally {
+      rmSync(stateRoot, { recursive: true, force: true })
+    }
   })
 
   it('HTTP handlers enforce method, agent existence, body cap, and Cache-Control: no-store', async () => {
@@ -310,7 +361,13 @@ describe('liveBrowserController', () => {
     )
     assert.equal(r200.statusCode, 200)
     assert.equal(r200.headers.get('cache-control'), 'no-store')
-    assert.deepEqual(r200.body, { available: true, active: false, agentBusy: false })
+    assert.deepEqual(r200.body, {
+      available: true,
+      active: false,
+      agentBusy: false,
+      streamAvailable: true,
+      humanTakeover: false,
+    })
 
     // 409 AGENT_RUNNING when another session for the same agent is actively executing
     const rBusy = makeFakeRes()
@@ -390,105 +447,133 @@ describe('liveBrowserController', () => {
   })
 
   it('uses native CLI tab-select / tab-new / tab-close commands and recovers stale activity markers', async () => {
-    const cmds: Array<readonly string[]> = []
-    let daemonDead = true
-    const ctrl = new LiveBrowserController({
-      ocBrowserBin: '/usr/local/bin/oc-browser',
-      // Stale activity marker exists even though daemonDead === true
-      existsSync: () => true,
-      execFn: async (_bin, args) => {
-        cmds.push(args)
-        if (args[0] === 'goto' && daemonDead) {
-          throw new Error('session not found / browser is closed')
-        }
-        if (args[0] === 'open') {
-          daemonDead = false
-          return { stdout: '', stderr: '' }
-        }
-        if (args[0] === 'tab-select' || args[0] === 'tab-new' || args[0] === 'tab-close') {
-          return { stdout: '', stderr: '' }
-        }
-        return {
-          stdout: mockRunCodeOutput({
-            url: 'https://arxiv.org/',
-            title: 'arXiv',
-            viewport: { width: 1280, height: 720 },
-            tabs: [{ index: 0, title: 'arXiv', url: 'https://arxiv.org/', active: true }],
-            imageBase64: 'CCCC',
-          }),
-          stderr: '',
-        }
-      },
-    })
+    const stateRoot = mkdtempSync(join(tmpdir(), 'oc-lb-tabs-'))
+    try {
+      const cmds: Array<readonly string[]> = []
+      let daemonDead = true
+      const ctrl = new LiveBrowserController({
+        ocBrowserBin: '/usr/local/bin/oc-browser',
+        stateRoot,
+        // Stale activity marker exists even though daemonDead === true
+        existsSync: () => true,
+        execFn: async (_bin, args) => {
+          cmds.push(args)
+          if (args[0] === 'goto' && daemonDead) {
+            throw new Error('session not found / browser is closed')
+          }
+          if (args[0] === 'open') {
+            daemonDead = false
+            return { stdout: '', stderr: '' }
+          }
+          if (args[0] === 'tab-select' || args[0] === 'tab-new' || args[0] === 'tab-close') {
+            return { stdout: '', stderr: '' }
+          }
+          return {
+            stdout: mockRunCodeOutput({
+              url: 'https://arxiv.org/',
+              title: 'arXiv',
+              viewport: { width: 1280, height: 720 },
+              tabs: [{ index: 0, title: 'arXiv', url: 'https://arxiv.org/', active: true }],
+              imageBase64: 'CCCC',
+            }),
+            stderr: '',
+          }
+        },
+      })
 
-    // Open recovers from stale activity marker via fallback `open`
-    const state = await ctrl.performAction('main', { action: 'open', url: 'https://arxiv.org/' })
-    assert.equal(state.active, true)
-    assert.deepEqual(cmds[0], ['goto', 'https://arxiv.org/'])
-    assert.deepEqual(cmds[1], ['open', 'https://arxiv.org/'])
-    assert.equal(cmds[2][0], 'run-code')
+      const tok = await acquireTestTakeover(ctrl)
+      cmds.length = 0
 
-    // Native tab commands
-    cmds.length = 0
-    await ctrl.performAction('main', { action: 'tab_select', index: 1 })
-    assert.deepEqual(cmds[0], ['tab-select', '1'])
-    assert.equal(cmds[1][0], 'run-code')
+      // Open recovers from stale activity marker via fallback `open`
+      const state = await ctrl.performAction('main', { action: 'open', url: 'https://arxiv.org/', takeoverToken: tok })
+      assert.equal(state.active, true)
+      assert.deepEqual(cmds[0], ['goto', 'https://arxiv.org/'])
+      assert.deepEqual(cmds[1], ['open', 'https://arxiv.org/'])
+      assert.equal(cmds[2][0], 'run-code')
 
-    cmds.length = 0
-    await ctrl.performAction('main', { action: 'tab_new', url: 'https://github.com/' })
-    assert.deepEqual(cmds[0], ['tab-new', 'https://github.com/'])
+      // Native tab commands
+      cmds.length = 0
+      await ctrl.performAction('main', { action: 'tab_select', index: 1, takeoverToken: tok })
+      assert.deepEqual(cmds[0], ['tab-select', '1'])
+      assert.equal(cmds[1][0], 'run-code')
 
-    cmds.length = 0
-    await ctrl.performAction('main', { action: 'tab_close', index: 1 })
-    assert.deepEqual(cmds[0], ['tab-close', '1'])
+      cmds.length = 0
+      await ctrl.performAction('main', { action: 'tab_new', url: 'https://github.com/', takeoverToken: tok })
+      assert.deepEqual(cmds[0], ['tab-new', 'https://github.com/'])
+
+      cmds.length = 0
+      await ctrl.performAction('main', { action: 'tab_close', index: 1, takeoverToken: tok })
+      assert.deepEqual(cmds[0], ['tab-close', '1'])
+    } finally {
+      rmSync(stateRoot, { recursive: true, force: true })
+    }
   })
 
   it('surfaces non-closed errors on close and accepts unified Ctrl+X/Z keys', async () => {
-    assert.deepEqual(validateLiveBrowserAction({ action: 'press', key: 'Control+x' }), {
-      action: 'press',
-      key: 'Control+x',
-    })
-    assert.deepEqual(validateLiveBrowserAction({ action: 'press', key: 'Control+z' }), {
-      action: 'press',
-      key: 'Control+z',
-    })
-    const ctrl = new LiveBrowserController({
-      ocBrowserBin: '/usr/local/bin/oc-browser',
-      existsSync: () => true,
-      execFn: async () => {
-        throw new Error('ETIMEDOUT waiting for flock')
-      },
-    })
-    await assert.rejects(() => ctrl.performAction('main', { action: 'close' }), (err: unknown) => {
-      assert.ok(err instanceof LiveBrowserError)
-      assert.equal(err.status, 502)
-      assert.equal(err.code, 'BROWSER_CLOSE_FAILED')
-      return true
-    })
+    const stateRoot = mkdtempSync(join(tmpdir(), 'oc-lb-close-err-'))
+    try {
+      assert.deepEqual(validateLiveBrowserAction({ action: 'press', key: 'Control+x' }), {
+        action: 'press',
+        key: 'Control+x',
+      })
+      assert.deepEqual(validateLiveBrowserAction({ action: 'press', key: 'Control+z' }), {
+        action: 'press',
+        key: 'Control+z',
+      })
+      const ctrl = new LiveBrowserController({
+        ocBrowserBin: '/usr/local/bin/oc-browser',
+        stateRoot,
+        existsSync: () => true,
+        execFn: async (_bin, args) => {
+          if (args[0] === 'close') throw new Error('ETIMEDOUT waiting for flock')
+          return { stdout: mockRunCodeOutput({ url: 'https://example.com/', title: 'ok', viewport: { width: 1280, height: 720 }, tabs: [] }), stderr: '' }
+        },
+      })
+      const tok = await acquireTestTakeover(ctrl)
+      await assert.rejects(() => ctrl.performAction('main', { action: 'close', takeoverToken: tok }), (err: unknown) => {
+        assert.ok(err instanceof LiveBrowserError)
+        assert.equal(err.status, 502)
+        assert.equal(err.code, 'BROWSER_CLOSE_FAILED')
+        return true
+      })
+    } finally {
+      rmSync(stateRoot, { recursive: true, force: true })
+    }
   })
 
   it('does NOT cold-restart browser on webpage network error ERR_CONNECTION_CLOSED', async () => {
-    const cmds: Array<readonly string[]> = []
-    const ctrl = new LiveBrowserController({
-      ocBrowserBin: '/usr/local/bin/oc-browser',
-      existsSync: () => true,
-      execFn: async (_bin, args) => {
-        cmds.push(args)
-        throw new Error('page.goto: net::ERR_CONNECTION_CLOSED at https://flaky.invalid/')
-      },
-    })
-    await assert.rejects(
-      () => ctrl.performAction('main', { action: 'goto', url: 'https://flaky.invalid/' }),
-      (err: unknown) => {
-        assert.ok(err instanceof LiveBrowserError)
-        assert.equal(err.status, 502)
-        assert.equal(err.code, 'BROWSER_ACTION_FAILED')
-        return true
-      },
-    )
-    // Must NOT invoke `open` which would restart the healthy browser and lose tabs/forms.
-    assert.equal(cmds.length, 1)
-    assert.equal(cmds[0][0], 'run-code')
+    const stateRoot = mkdtempSync(join(tmpdir(), 'oc-lb-neterr-'))
+    try {
+      const cmds: Array<readonly string[]> = []
+      const ctrl = new LiveBrowserController({
+        ocBrowserBin: '/usr/local/bin/oc-browser',
+        stateRoot,
+        existsSync: () => true,
+        dnsLookup: (async () => [{ address: '93.184.216.34', family: 4 }]) as any,
+        execFn: async (_bin, args) => {
+          if (args[1]?.includes('"goto"')) {
+            cmds.push(args)
+            throw new Error('page.goto: net::ERR_CONNECTION_CLOSED at https://flaky.invalid/')
+          }
+          return { stdout: mockRunCodeOutput({ url: 'https://example.com/', title: 'ok', viewport: { width: 1280, height: 720 }, tabs: [] }), stderr: '' }
+        },
+      })
+      const tok = await acquireTestTakeover(ctrl)
+      await assert.rejects(
+        () => ctrl.performAction('main', { action: 'goto', url: 'https://flaky.invalid/', takeoverToken: tok }),
+        (err: unknown) => {
+          assert.ok(err instanceof LiveBrowserError)
+          assert.equal(err.status, 502)
+          assert.equal(err.code, 'BROWSER_ACTION_FAILED')
+          return true
+        },
+      )
+      // Must NOT invoke `open` which would restart the healthy browser and lose tabs/forms.
+      assert.equal(cmds.length, 1)
+      assert.equal(cmds[0][0], 'run-code')
+    } finally {
+      rmSync(stateRoot, { recursive: true, force: true })
+    }
   })
 
   it('parses playwright-cli tab-list output including titles with brackets, markdown links, and URLs containing ]( or parens', () => {
@@ -506,71 +591,79 @@ describe('liveBrowserController', () => {
   })
 
   it('tracks real PNG IHDR viewport dimensions, holds activity lock, and routes dblclick cleanly', async () => {
-    const makePng = (w: number, h: number) => {
-      const b = Buffer.alloc(24)
-      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]).copy(b)
-      b.writeUInt32BE(w, 16)
-      b.writeUInt32BE(h, 20)
-      return b
-    }
-    assert.deepEqual(readPngDimensions(makePng(800, 600)), { width: 800, height: 600 })
+    const stateRoot = mkdtempSync(join(tmpdir(), 'oc-lb-ihdr-'))
+    try {
+      const makePng = (w: number, h: number) => {
+        const b = Buffer.alloc(24)
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]).copy(b)
+        b.writeUInt32BE(w, 16)
+        b.writeUInt32BE(h, 20)
+        return b
+      }
+      assert.deepEqual(readPngDimensions(makePng(800, 600)), { width: 800, height: 600 })
 
-    let lockDepth = 0
-    let lockAcquired = 0
-    const rpcCalls: Array<Record<string, unknown>> = []
-    const ctrl = new LiveBrowserController({
-      ocBrowserBin: '/usr/local/bin/oc-browser',
-      existsSync: () => true,
-      resolveDaemonEndpoint: (stateDir) => ({
-        socketPath: `${stateDir}/sockets/cli/test-browser.sock`,
-        version: '1.61.0',
-        stateDir,
-      }),
-      withLock: async (_dir, fn) => {
-        lockAcquired += 1
-        lockDepth += 1
-        try {
-          return await fn()
-        } finally {
-          lockDepth -= 1
-        }
-      },
-      daemonRpcFn: async (_ep, args) => {
-        assert.equal(lockDepth, 1, 'daemon RPC must execute while holding activity lock')
-        rpcCalls.push(args)
-        const cmd = (args._ as string[])[0]
-        if (cmd === 'tab-list') return { text: '### Result\n- 0: (current) [Resized](https://example.com/)\n' }
-        if (cmd === 'run-code') {
-          return {
-            text: mockRunCodeOutput({
-              url: 'https://example.com/',
-              title: 'Resized',
-              viewport: { width: 800, height: 600 },
-              tabs: [{ index: 0, title: 'Resized', url: 'https://example.com/', active: true }],
-              imageBase64: 'AAAA',
-            }),
+      let lockDepth = 0
+      let lockAcquired = 0
+      const rpcCalls: Array<Record<string, unknown>> = []
+      const ctrl = new LiveBrowserController({
+        ocBrowserBin: '/usr/local/bin/oc-browser',
+        stateRoot,
+        existsSync: () => true,
+        resolveDaemonEndpoint: (stateDir) => ({
+          socketPath: `${stateDir}/sockets/cli/test-browser.sock`,
+          version: '1.61.0',
+          stateDir,
+        }),
+        withLock: async (_dir, fn) => {
+          lockAcquired += 1
+          lockDepth += 1
+          try {
+            return await fn()
+          } finally {
+            lockDepth -= 1
           }
-        }
-        return { text: 'ok' }
-      },
-      readFrameFile: () => makePng(800, 600),
-      unlinkFrameFile: () => {},
-    })
+        },
+        daemonRpcFn: async (_ep, args) => {
+          assert.equal(lockDepth, 1, 'daemon RPC must execute while holding activity lock')
+          rpcCalls.push(args)
+          const cmd = (args._ as string[])[0]
+          if (cmd === 'tab-list') return { text: '### Result\n- 0: (current) [Resized](https://example.com/)\n' }
+          if (cmd === 'run-code') {
+            return {
+              text: mockRunCodeOutput({
+                url: 'https://example.com/',
+                title: 'Resized',
+                viewport: { width: 800, height: 600 },
+                tabs: [{ index: 0, title: 'Resized', url: 'https://example.com/', active: true }],
+                imageBase64: 'AAAA',
+              }),
+            }
+          }
+          return { text: 'ok' }
+        },
+        readFrameFile: () => makePng(800, 600),
+        unlinkFrameFile: () => {},
+      })
 
-    // First capture reads 800x600 from PNG IHDR
-    const st = await ctrl.getLiveState('main')
-    assert.deepEqual(st.viewport, { width: 800, height: 600 })
+      // First capture reads 800x600 from PNG IHDR
+      const st = await ctrl.getLiveState('main')
+      assert.deepEqual(st.viewport, { width: 800, height: 600 })
 
-    // Next click at center (0.5, 0.5) must target (400, 300), NOT stale (640, 360)
-    rpcCalls.length = 0
-    await ctrl.performAction('main', { action: 'click', x: 0.5, y: 0.5, normalized: true })
-    assert.deepEqual(rpcCalls[0]._, ['mousemove', '400', '300'])
+      const tok = await acquireTestTakeover(ctrl)
 
-    // dblclick uses run-code so DOM receives authentic clickCount=2
-    rpcCalls.length = 0
-    await ctrl.performAction('main', { action: 'dblclick', x: 0.5, y: 0.5, normalized: true })
-    assert.equal((rpcCalls[0]._ as string[])[0], 'run-code')
-    assert.ok(lockAcquired >= 3)
+      // Next click at center (0.5, 0.5) must target (400, 300), NOT stale (640, 360)
+      rpcCalls.length = 0
+      await ctrl.performAction('main', { action: 'click', x: 0.5, y: 0.5, normalized: true, takeoverToken: tok })
+      assert.deepEqual(rpcCalls[0]._, ['mousemove', '400', '300'])
+
+      // dblclick uses run-code so DOM receives authentic clickCount=2
+      rpcCalls.length = 0
+      await ctrl.performAction('main', { action: 'dblclick', x: 0.5, y: 0.5, normalized: true, takeoverToken: tok })
+      assert.equal((rpcCalls[0]._ as string[])[0], 'run-code')
+      assert.ok(lockAcquired >= 4)
+    } finally {
+      rmSync(stateRoot, { recursive: true, force: true })
+    }
   })
 
   it('sendPlaywrightDaemonRpc preserves split multi-byte UTF-8 and enforces byte cap; resolver rejects symlinks', async () => {
@@ -637,101 +730,109 @@ describe('liveBrowserController', () => {
   })
 
   it('uses fast direct daemon Unix socket for capture, click, type+submit, wheel, and oversized PNG JPEG fallback', async () => {
-    const rpcCalls: Array<Record<string, unknown>> = []
-    const unlinked: string[] = []
-    let cliCalls = 0
-    let shotBuf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) // PNG magic
+    const stateRoot = mkdtempSync(join(tmpdir(), 'oc-lb-fast-'))
+    try {
+      const rpcCalls: Array<Record<string, unknown>> = []
+      const unlinked: string[] = []
+      let cliCalls = 0
+      let shotBuf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) // PNG magic
 
-    const ctrl = new LiveBrowserController({
-      ocBrowserBin: '/usr/local/bin/oc-browser',
-      existsSync: () => true,
-      execFn: async () => {
-        cliCalls += 1
-        return { stdout: '', stderr: '' }
-      },
-      resolveDaemonEndpoint: (stateDir) => ({
-        socketPath: `${stateDir}/sockets/cli/test-browser.sock`,
-        version: '1.61.0',
-        stateDir,
-      }),
-      daemonRpcFn: async (_ep, args) => {
-        rpcCalls.push(args)
-        const cmd = (args._ as string[])[0]
-        if (cmd === 'tab-list') {
-          return { text: '### Result\n- 0: (current) [Scholar](https://scholar.google.com/)\n' }
-        }
-        if (cmd === 'run-code') {
-          return {
-            text: mockRunCodeOutput({
-              url: 'https://scholar.google.com/',
-              title: 'Scholar',
-              viewport: { width: 1280, height: 720 },
-              tabs: [{ index: 0, title: 'Scholar', url: 'https://scholar.google.com/', active: true }],
-              imageBase64: 'SlBFRw==',
-            }),
+      const ctrl = new LiveBrowserController({
+        ocBrowserBin: '/usr/local/bin/oc-browser',
+        stateRoot,
+        existsSync: () => true,
+        execFn: async () => {
+          cliCalls += 1
+          return { stdout: '', stderr: '' }
+        },
+        resolveDaemonEndpoint: (stateDir) => ({
+          socketPath: `${stateDir}/sockets/cli/test-browser.sock`,
+          version: '1.61.0',
+          stateDir,
+        }),
+        daemonRpcFn: async (_ep, args) => {
+          rpcCalls.push(args)
+          const cmd = (args._ as string[])[0]
+          if (cmd === 'tab-list') {
+            return { text: '### Result\n- 0: (current) [Scholar](https://scholar.google.com/)\n' }
           }
-        }
-        return { text: 'ok' }
-      },
-      readFrameFile: () => shotBuf,
-      unlinkFrameFile: (p) => unlinked.push(p),
-    })
+          if (cmd === 'run-code') {
+            return {
+              text: mockRunCodeOutput({
+                url: 'https://scholar.google.com/',
+                title: 'Scholar',
+                viewport: { width: 1280, height: 720 },
+                tabs: [{ index: 0, title: 'Scholar', url: 'https://scholar.google.com/', active: true }],
+                imageBase64: 'SlBFRw==',
+              }),
+            }
+          }
+          return { text: 'ok' }
+        },
+        readFrameFile: () => shotBuf,
+        unlinkFrameFile: (p) => unlinked.push(p),
+      })
 
-    // 1) Fast GET live frame (PNG)
-    const live = await ctrl.getLiveState('main')
-    assert.equal(live.active, true)
-    assert.equal(live.mimeType, 'image/png')
-    assert.equal(live.title, 'Scholar')
-    assert.equal(cliCalls, 0)
-    assert.equal(unlinked.length, 1)
+      // 1) Fast GET live frame (PNG)
+      const live = await ctrl.getLiveState('main')
+      assert.equal(live.active, true)
+      assert.equal(live.mimeType, 'image/png')
+      assert.equal(live.title, 'Scholar')
+      assert.equal(cliCalls, 0)
+      assert.equal(unlinked.length, 1)
 
-    // 2) Fast click sends mousemove -> mousedown -> mouseup -> tab-list -> screenshot (zero CLI spawn)
-    rpcCalls.length = 0
-    await ctrl.performAction('main', { action: 'click', x: 0.5, y: 0.25, normalized: true })
-    assert.deepEqual(
-      rpcCalls.map((c) => c._),
-      [
-        ['mousemove', '640', '180'],
-        ['mousedown'],
-        ['mouseup'],
-        ['tab-list'],
-        ['screenshot'],
-      ],
-    )
-    assert.equal(cliCalls, 0)
+      const tok = await acquireTestTakeover(ctrl)
 
-    // 3) Fast type + submit sends type -> press Enter (no slow --submit snapshot)
-    rpcCalls.length = 0
-    await ctrl.performAction('main', { action: 'type', text: 'transformer', submit: true })
-    assert.deepEqual(
-      rpcCalls.map((c) => c._),
-      [
-        ['type', 'transformer'],
-        ['press', 'Enter'],
-        ['tab-list'],
-        ['screenshot'],
-      ],
-    )
+      // 2) Fast click sends mousemove -> mousedown -> mouseup -> tab-list -> screenshot (zero CLI spawn)
+      rpcCalls.length = 0
+      await ctrl.performAction('main', { action: 'click', x: 0.5, y: 0.25, normalized: true, takeoverToken: tok })
+      assert.deepEqual(
+        rpcCalls.map((c) => c._),
+        [
+          ['mousemove', '640', '180'],
+          ['mousedown'],
+          ['mouseup'],
+          ['tab-list'],
+          ['screenshot'],
+        ],
+      )
+      assert.equal(cliCalls, 0)
 
-    // 4) Fast wheel reuses cached tabs (skips extra tab-list roundtrip)
-    rpcCalls.length = 0
-    await ctrl.performAction('main', { action: 'wheel', deltaX: 0, deltaY: 240 })
-    assert.deepEqual(
-      rpcCalls.map((c) => c._),
-      [
-        ['mousewheel', '0', '240'],
-        ['screenshot'],
-      ],
-    )
+      // 3) Fast type + submit sends type -> press Enter (no slow --submit snapshot)
+      rpcCalls.length = 0
+      await ctrl.performAction('main', { action: 'type', text: 'transformer', submit: true, takeoverToken: tok })
+      assert.deepEqual(
+        rpcCalls.map((c) => c._),
+        [
+          ['type', 'transformer'],
+          ['press', 'Enter'],
+          ['tab-list'],
+          ['screenshot'],
+        ],
+      )
 
-    // 5) Oversized PNG (>900 KiB) automatically steps down to JPEG run-code over the same socket
-    rpcCalls.length = 0
-    shotBuf = Buffer.alloc(LIVE_BROWSER_MAX_IMAGE_BYTES + 1024, 0x41)
-    const compressed = await ctrl.getLiveState('main')
-    assert.equal(compressed.mimeType, 'image/jpeg')
-    assert.equal(compressed.imageBase64, 'SlBFRw==')
-    assert.equal((rpcCalls.at(-1)?._ as string[])[0], 'run-code')
-    assert.equal(cliCalls, 0)
+      // 4) Fast wheel reuses cached tabs (skips extra tab-list roundtrip)
+      rpcCalls.length = 0
+      await ctrl.performAction('main', { action: 'wheel', deltaX: 0, deltaY: 240, takeoverToken: tok })
+      assert.deepEqual(
+        rpcCalls.map((c) => c._),
+        [
+          ['mousewheel', '0', '240'],
+          ['screenshot'],
+        ],
+      )
+
+      // 5) Oversized PNG (>900 KiB) automatically steps down to JPEG run-code over the same socket
+      rpcCalls.length = 0
+      shotBuf = Buffer.alloc(LIVE_BROWSER_MAX_IMAGE_BYTES + 1024, 0x41)
+      const compressed = await ctrl.getLiveState('main')
+      assert.equal(compressed.mimeType, 'image/jpeg')
+      assert.equal(compressed.imageBase64, 'SlBFRw==')
+      assert.equal((rpcCalls.at(-1)?._ as string[])[0], 'run-code')
+      assert.equal(cliCalls, 0)
+    } finally {
+      rmSync(stateRoot, { recursive: true, force: true })
+    }
   })
 
   it('detects live external oc-browser CLI via pending.<pid> and ignores self/dead PIDs', () => {
@@ -860,6 +961,11 @@ fs.writeFileSync(${JSON.stringify(startedFile)}, '1');
         () => controller.performAction('main', { action: 'reload' }),
         (err: unknown) => err instanceof LiveBrowserError && err.status === 409 && err.code === 'AGENT_RUNNING',
       )
+      await assert.rejects(
+        () => controller.performAction('main', { action: 'takeover', active: true }),
+        (err: unknown) => err instanceof LiveBrowserError && err.status === 409 && err.code === 'AGENT_RUNNING',
+      )
+      assert.equal(readActiveHumanTakeoverLease(agentDir), null)
 
       // Release mock CLI and wait for wrapper to clean up cli-active.<pid>
       writeFileSync(releaseFile, '')
@@ -952,6 +1058,8 @@ fs.writeFileSync(${JSON.stringify(startedFile)}, '1');
         },
         readFrameFile: () => Buffer.from('AAAA'),
       })
+      const tok = await acquireTestTakeover(controller)
+      rpcCalls.length = 0
       await assert.rejects(
         () =>
           controller.performAction('main', {
@@ -960,10 +1068,237 @@ fs.writeFileSync(${JSON.stringify(startedFile)}, '1');
             y: 0.5,
             normalized: true,
             expectedOrigin: 'https://arxiv.org',
+            takeoverToken: tok,
           }),
         (err: unknown) => err instanceof LiveBrowserError && err.status === 409 && err.code === 'PAGE_ORIGIN_CHANGED',
       )
       assert.deepEqual(rpcCalls, ['tab-list'], 'must reject before sending mousemove/mousedown')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('OCV5-873 Blocker 1 & 2: synchronizes takeover under activity.lock and enforces TAKEOVER_REQUIRED on active-browser writes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'oc-live-b12-'))
+    const agentDir = join(root, ocBrowserAgentKey('main'))
+    mkdirSync(agentDir, { recursive: true })
+    try {
+      // Blocker 1a: takeover MUST wait for activity.lock held by a simulated CLI (cannot coexist)
+      let lockHeld = true
+      let releaseLock!: () => void
+      const lockGate = new Promise<void>((r) => {
+        releaseLock = r
+      })
+      let cliBusyInsideLock = false
+      let writeExecs = 0
+      const ctrl = new LiveBrowserController({
+        ocBrowserBin: '/usr/local/bin/oc-browser',
+        stateRoot: root,
+        existsSync: () => true,
+        dnsLookup: (async () => [{ address: '93.184.216.34', family: 4 }]) as any,
+        withLock: async (_dir, fn) => {
+          if (lockHeld) await lockGate
+          return fn()
+        },
+        execFn: async () => {
+          writeExecs += 1
+          return {
+            stdout: mockRunCodeOutput({
+              url: 'https://example.com/',
+              title: 'Example',
+              viewport: { width: 1280, height: 720 },
+              tabs: [{ index: 0, title: 'Example', url: 'https://example.com/', active: true }],
+            }),
+            stderr: '',
+          }
+        },
+      })
+
+      let settled = false
+      const pendingTakeover = ctrl.performAction('main', { action: 'takeover', active: true }).then((r) => {
+        settled = true
+        return r
+      })
+      await new Promise((r) => setTimeout(r, 40))
+      assert.equal(settled, false, 'takeover must block while simulated CLI holds activity.lock')
+      assert.equal(readActiveHumanTakeoverLease(agentDir), null, 'no takeover lease may exist while CLI holds activity.lock')
+
+      lockHeld = false
+      releaseLock()
+      const leaseRes = await pendingTakeover
+      assert.equal(leaseRes.humanTakeover, true)
+      assert.equal(typeof leaseRes.takeoverToken, 'string')
+      await ctrl.performAction('main', { action: 'takeover', active: false, token: leaseRes.takeoverToken })
+
+      // Blocker 1b: if CLI becomes active right as lock is acquired, takeover MUST reject 409 AGENT_RUNNING with zero lease written
+      const origExt = ctrl.isExternalCliActive.bind(ctrl)
+      ctrl.isExternalCliActive = () => cliBusyInsideLock
+      const ctrlLockedBusy = new LiveBrowserController({
+        ocBrowserBin: '/usr/local/bin/oc-browser',
+        stateRoot: root,
+        existsSync: () => true,
+        withLock: async (_dir, fn) => {
+          cliBusyInsideLock = true
+          try {
+            return await fn()
+          } finally {
+            cliBusyInsideLock = false
+          }
+        },
+      })
+      ctrlLockedBusy.isExternalCliActive = () => cliBusyInsideLock
+      await assert.rejects(
+        () => ctrlLockedBusy.performAction('main', { action: 'takeover', active: true }),
+        (err: unknown) => err instanceof LiveBrowserError && err.status === 409 && err.code === 'AGENT_RUNNING',
+      )
+      assert.equal(readActiveHumanTakeoverLease(agentDir), null)
+      ctrl.isExternalCliActive = origExt
+
+      // Blocker 2: active browser watching mode (no takeover) rejects ALL mutating actions with 409 TAKEOVER_REQUIRED
+      writeExecs = 0
+      const blockedActions: Array<Record<string, unknown>> = [
+        { action: 'click', x: 0.5, y: 0.5, normalized: true },
+        { action: 'goto', url: 'https://example.org/' },
+        { action: 'reload' },
+        { action: 'tab_close', index: 0 },
+        { action: 'close' },
+        { action: 'dialog', accept: true },
+        { action: 'open', url: 'https://example.org/' },
+      ]
+      for (const payload of blockedActions) {
+        await assert.rejects(
+          () => ctrl.performAction('main', payload),
+          (err: unknown) =>
+            err instanceof LiveBrowserError &&
+            err.status === 409 &&
+            err.code === 'TAKEOVER_REQUIRED' &&
+            err.message === '请先点击「接管」后再操作浏览器',
+        )
+      }
+      assert.equal(writeExecs, 0, 'blocked watching-mode actions must never invoke oc-browser')
+
+      // Even if another connection holds a lease, caller without matching takeoverToken is rejected
+      acquireHumanTakeoverLease(agentDir, { token: 'other-tok', ttlMs: 60_000 })
+      await assert.rejects(
+        () => ctrl.performAction('main', { action: 'click', x: 0.5, y: 0.5, normalized: true }),
+        (err: unknown) => err instanceof LiveBrowserError && err.status === 409 && err.code === 'TAKEOVER_REQUIRED',
+      )
+      assert.equal(writeExecs, 0)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('OCV5-873: differentiates AGENT_RUNNING error text by action and only locks via isExternalCliActive when coarse isAgentRunning is omitted', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'oc-live-busy-msg-'))
+    const agentDir = join(root, ocBrowserAgentKey('main'))
+    mkdirSync(agentDir, { recursive: true })
+    try {
+      const ctrl = new LiveBrowserController({
+        ocBrowserBin: '/usr/local/bin/oc-browser',
+        stateRoot: root,
+        existsSync: (p) => p === '/usr/local/bin/oc-browser' || p.endsWith('/activity'),
+        dnsLookup: (async () => [{ address: '93.184.216.34', family: 4 }]) as any,
+        execFn: async () => ({
+          stdout: mockRunCodeOutput({
+            url: 'https://example.com/',
+            title: 'Example',
+            viewport: { width: 1280, height: 720 },
+            tabs: [{ index: 0, title: 'Example', url: 'https://example.com/', active: true }],
+          }),
+          stderr: '',
+        }),
+      })
+
+      // Without coarse isAgentRunning and without external CLI marker -> not locked
+      const idleRes = makeFakeRes()
+      await handleLiveBrowserLiveHttp(
+        { controller: ctrl, hasAgent: async () => true, sendJson: idleRes.sendJson, sendError: idleRes.sendError },
+        { method: 'GET' } as IncomingMessage,
+        idleRes.res,
+        'main',
+        new URL('http://gw/api/agents/main/browser/live?frame=0'),
+      )
+      assert.equal(idleRes.statusCode, 200)
+      assert.equal((idleRes.body as { agentBusy?: boolean }).agentBusy, false)
+
+      // Action-specific 409 AGENT_RUNNING copy via both HTTP handler and performAction
+      const cases: Array<{ payload: Record<string, unknown>; expected: string }> = [
+        { payload: { action: 'open', url: 'https://example.com/' }, expected: '助手正在操作浏览器，请等待当前浏览器操作完成后再启动' },
+        { payload: { action: 'close' }, expected: '助手正在操作浏览器，请等待当前浏览器操作完成后再关闭' },
+        { payload: { action: 'takeover', active: true }, expected: '助手正在操作浏览器，请等待当前浏览器操作完成后再接管' },
+        { payload: { action: 'click', x: 0.5, y: 0.5, normalized: true }, expected: '助手正在操作浏览器，请等待当前浏览器操作完成后再操作' },
+      ]
+
+      // 1) HTTP handler path (with isAgentRunning simulated)
+      for (const tc of cases) {
+        const fake = makeFakeRes()
+        await handleLiveBrowserActionHttp(
+          {
+            controller: ctrl,
+            hasAgent: async () => true,
+            isAgentRunning: () => true,
+            readBody: async () => JSON.stringify(tc.payload),
+            sendJson: fake.sendJson,
+            sendError: fake.sendError,
+          },
+          { method: 'POST' } as IncomingMessage,
+          fake.res,
+          'main',
+        )
+        assert.equal(fake.statusCode, 409)
+        assert.deepEqual(fake.body, { error: tc.expected, code: 'AGENT_RUNNING' })
+      }
+
+      // 2) Controller performAction path (with real external CLI active check stubbed via cli-active.<pid> or setAgentRunningCheck)
+      ctrl.setAgentRunningCheck(() => true)
+      for (const tc of cases) {
+        await assert.rejects(
+          () => ctrl.performAction('main', tc.payload),
+          (err: unknown) =>
+            err instanceof LiveBrowserError &&
+            err.status === 409 &&
+            err.code === 'AGENT_RUNNING' &&
+            err.message === tc.expected,
+        )
+      }
+      ctrl.setAgentRunningCheck(() => false)
+
+      // 3) External CLI active alone locks live state & rejects actions even without isAgentRunning
+      const origExternal = ctrl.isExternalCliActive.bind(ctrl)
+      ctrl.isExternalCliActive = () => true
+      try {
+        const cliBusyLive = makeFakeRes()
+        await handleLiveBrowserLiveHttp(
+          { controller: ctrl, hasAgent: async () => true, sendJson: cliBusyLive.sendJson, sendError: cliBusyLive.sendError },
+          { method: 'GET' } as IncomingMessage,
+          cliBusyLive.res,
+          'main',
+          new URL('http://gw/api/agents/main/browser/live?frame=0'),
+        )
+        assert.equal((cliBusyLive.body as { agentBusy?: boolean }).agentBusy, true)
+
+        const cliBusyOpen = makeFakeRes()
+        await handleLiveBrowserActionHttp(
+          {
+            controller: ctrl,
+            hasAgent: async () => true,
+            readBody: async () => JSON.stringify({ action: 'open', url: 'https://example.com/' }),
+            sendJson: cliBusyOpen.sendJson,
+            sendError: cliBusyOpen.sendError,
+          },
+          { method: 'POST' } as IncomingMessage,
+          cliBusyOpen.res,
+          'main',
+        )
+        assert.equal(cliBusyOpen.statusCode, 409)
+        assert.deepEqual(cliBusyOpen.body, {
+          error: '助手正在操作浏览器，请等待当前浏览器操作完成后再启动',
+          code: 'AGENT_RUNNING',
+        })
+      } finally {
+        ctrl.isExternalCliActive = origExternal
+      }
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

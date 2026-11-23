@@ -15,8 +15,6 @@
  * —— 攻击者无法通过 raw 字符串污染日志 / 撑大字段。
  */
 
-import { randomBytes } from 'node:crypto'
-
 /** trace id 合法字符集 + 长度。Go 端的 ParseTraceIDCandidate 必须遵守同一 regex。 */
 export const TRACE_ID_REGEX = /^[A-Za-z0-9_-]{16,64}$/
 
@@ -28,7 +26,13 @@ const TRACE_ID_CHARSET = /^[A-Za-z0-9_-]+$/
 
 /** 16 bytes hex = 32 chars, 与 ensureRequestId 一致;落到 TRACE_ID_REGEX 合法范围内。 */
 export function newTraceId(): string {
-  return randomBytes(16).toString('hex')
+  const bytes = new Uint8Array(16)
+  globalThis.crypto.getRandomValues(bytes)
+  let hex = ''
+  for (let i = 0; i < bytes.length; i += 1) {
+    hex += bytes[i]!.toString(16).padStart(2, '0')
+  }
+  return hex
 }
 
 /**

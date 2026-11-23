@@ -7,7 +7,7 @@ import { DialogFallback } from "./components/DialogFallback";
 import { useDraftSessionMaterialization } from "./hooks/useDraftSessionMaterialization";
 import { useDraftPreparation } from "./hooks/useDraftPreparation";
 import { createGoalStarter } from "./lib/goalStart";
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { appUpdate } from "./lib/appUpdate";
 import {
   type CursorContextTier,
@@ -18,6 +18,7 @@ import {
   type MessageReplyQuote,
 } from "@openclaude/protocol/browser";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
+import { createRetryableLazy } from "./components/ui/retryableLazy";
 import type { AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
 import { applyIntelligentUiSnapshot } from "./lib/intelligentUi";
@@ -196,7 +197,7 @@ import {
   resolveSessionModel,
 } from "./lib/modelPreferences";
 import type { ChatProject, LockedPublicModel, Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
-import type { LockedSelectInfo } from "./components/ModelSelector";
+import { ModelSelector, type LockedSelectInfo } from "./components/ModelSelector";
 import { lockedModelUnlockNotice } from "./lib/cursorModelPicker";
 import {
   freshSessionRequiredForSwitch,
@@ -233,7 +234,7 @@ const EMPTY_LOCKED_CATALOG_MODELS: LockedPublicModel[] = [];
 const CACHED_HISTORY_RETRY_DELAYS_MS = [2_000, 5_000] as const;
 
 // 仅 ?demo=1 时按需加载旧演示消息视图（components/Message.tsx），普通线上首屏零加载。
-const DemoMessageStream = lazy(() =>
+const DemoMessageStream = createRetryableLazy(() =>
   import("./components/Message").then(({ AssistantMessage, UserMessage }) => ({
     default: ({ messages, busy, streamText, toolCards, onRegenerate }: {
       messages: Message[]; busy: boolean; streamText: string; toolCards: ToolCard[]; onRegenerate: () => void;
@@ -340,8 +341,8 @@ export function App() {
   isWideRef.current = isWideViewport;
   /** 从面板外打开 / 定位面板:宽屏展开内联列,窄屏弹出贴底面板。 */
   const openPane = useCallback(
-    (tab?: PaneTab, message?: ToolLike | null, liveBrowser?: PaneRequest["liveBrowser"]) => {
-      setPaneRequest((prev) => ({ tab, message, liveBrowser, nonce: Math.max(Date.now(), (prev?.nonce ?? 0) + 1), sessionId: activeIdRef.current }));
+    (tab?: PaneTab, message?: ToolLike | null, liveBrowser?: PaneRequest["liveBrowser"], targetSessionId?: string | null) => {
+      setPaneRequest((prev) => ({ tab, message, liveBrowser, nonce: Math.max(Date.now(), (prev?.nonce ?? 0) + 1), sessionId: targetSessionId !== undefined ? targetSessionId : activeIdRef.current }));
       if (isWideRef.current) setPaneOpen(true);
       else setPaneSheetOpen(true);
     },
@@ -584,7 +585,8 @@ export function App() {
       demoModRef.current = m;
       setModels((p) => (p.length ? p : m.DEMO_MODELS));
       setModelId((p) => p ?? m.DEMO_MODELS[0]?.id);
-      setMessages((p) => (p.length ? p : (activeIdRef.current ? (m.DEMO_MESSAGES_BY_SESSION[activeIdRef.current] ?? []) : [])));
+      const targetId = activeIdRef.current ?? m.DEMO_SESSIONS[0]?.id;
+      setMessages((p) => (p.length ? p : (targetId ? (m.DEMO_MESSAGES_BY_SESSION[targetId] ?? []) : [])));
     });
     return () => { cancelled = true; };
   }, [demo]);
@@ -1200,7 +1202,7 @@ export function App() {
   activeIdRef.current = activeId ?? null;
   // 详情面板可用 = 对话视图(非任务看板 / 项目主页)里有会话内容;demo 只在点了某张工具卡时出现。
   const paneAvailable =
-    !boardOpen && !sitesOpen && !projectHome && (demo ? !!paneRequest?.message : !!activeId && wsMessages.length > 0);
+    !boardOpen && !sitesOpen && !projectHome && (demo ? !!paneRequest?.message : (!!activeId && wsMessages.length > 0) || Boolean(auth && agent.id));
   const paneRequestHere = paneRequestForSession(paneRequest, activeId);
   const paneInline = paneAvailable && isWideViewport && paneOpen;
   useEffect(() => {
@@ -1595,11 +1597,24 @@ export function App() {
   const lastUserText = findLastUserText(demo, messages, wsMessages);
   // 输入预测(OCV5-375):按需加载解析器,不进首屏包。
   const inputPrediction = useSessionInputPrediction(demo, wsMessages);
-  const timelineMessages = wsMessages.filter(
-    (message) => message.role !== "user" || message.status !== "queued",
+  const timelineMessages = useMemo(
+    () => wsMessages.filter((message) => message.role !== "user" || message.status !== "queued"),
+    // wsMessages is mutated in place on streaming deltas; length & metaVersion cover additions/status transitions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [wsMessages, wsMessages.length, chat.metaVersion],
   );
-  const queuedOutgoing = wsMessages.filter(
-    (message) => message.role === "user" && message.status === "queued",
+  const queuedOutgoing = useMemo(
+    () => wsMessages.filter((message) => message.role === "user" && message.status === "queued"),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [wsMessages, wsMessages.length, chat.metaVersion],
+  );
+  const hasToolTimelineMessage = useMemo(
+    () => timelineMessages.some((m) => m.role === "tool"),
+    [timelineMessages],
+  );
+  const messageListFind = useMemo(
+    () => (findOpen ? { onClose: () => setFindOpen(false) } : undefined),
+    [findOpen],
   );
   // B4a: honest "this turn is still running" banner + soft confirm before a 继续-style send.
   const backgroundTurn = useBackgroundTurn({ chat, sess: activeSess, enabled: !demo && !gated,
@@ -1628,24 +1643,16 @@ export function App() {
   }, [mediaGateEnabled]);
 
   // 媒体工作台开放探测:登录后拉一次(按身份 epoch 缓存),失败一律视为未开放。
+  const studioUserId = user?.id ?? null;
   useEffect(() => {
-    if (demo || !user) {
-      setStudioAvailable(false);
-      return;
-    }
+    if (demo || !studioUserId) { setStudioAvailable(false); return; }
     let cancelled = false;
     import("./hooks/useStudioProviders")
       .then((m) => m.probeStudio(authRef.current))
-      .then((view) => {
-        if (!cancelled) setStudioAvailable(view !== null);
-      })
-      .catch(() => {
-        if (!cancelled) setStudioAvailable(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [demo, user]);
+      .then((view) => { if (!cancelled) setStudioAvailable(view !== null); })
+      .catch(() => { if (!cancelled) setStudioAvailable(false); });
+    return () => { cancelled = true; };
+  }, [demo, studioUserId]);
 
   // ChatGPT 直连授权探测:登录后拉一次。与视频任务相反,这里默认隐藏、只有服务端明确
   // enabled:true 才显示入口 —— 未授权用户看不到任何代理信息。
@@ -1803,6 +1810,7 @@ export function App() {
       setBoardTicketType(ticketType);
     },
   });
+  useEffect(() => { setBannersExpanded(false); }, [activeId]);
 
   // 启动续期检查中:极简 splash(避免"闪一下首页又跳工作区"的割裂;通常 <300ms)。
   if (!demo && booting) {
@@ -1996,7 +2004,8 @@ export function App() {
   if (!gated && connBanner && isMdViewport) activeBannerKinds.push("connection");
   if (!demo && updateBannerVisible) activeBannerKinds.push("update");
   if (!demo && !gated && activeSess?._turnCostReminderCredits) activeBannerKinds.push("cost");
-  const bannerStack = resolveBanners(activeBannerKinds, bannersExpanded);
+  const bannerCanCollapse = activeBannerKinds.length > 2;
+  const bannerStack = resolveBanners(activeBannerKinds, bannersExpanded && bannerCanCollapse);
   const showBanner = (kind: BannerKind) => bannerStack.visible.includes(kind);
 
   // 更早对话仍只靠显式按钮，滚动不发请求。
@@ -2127,7 +2136,7 @@ export function App() {
     loadingArchived,
     onSearchMessages: searchSessionMessages,
     onOpenPalette: closeMobileThen(() => setPaletteOpen(true)),
-    onOpenLiveBrowser: demo ? undefined : (opts?: { url?: string; sessionId?: string | null }) => { setMobileNavOpen(false); if (opts?.sessionId && sessions.some((s) => s.id === opts.sessionId)) selectSession(opts.sessionId); openPane("browser", null, opts?.url ? { url: opts.url } : undefined); },
+    onOpenLiveBrowser: demo ? undefined : (opts?: import("./components/sidebar/PendingDecisionsDock").PendingDecisionBrowserHandoffOpenOpts) => { setMobileNavOpen(false); const targetSid = opts?.sessionId && sessions.some((s) => s.id === opts.sessionId) ? opts.sessionId : undefined; if (targetSid) selectSession(targetSid); openPane("browser", null, { takeover: true, expand: true, ...(opts?.url ? { url: opts.url } : {}), ...(opts?.handoffId ? { handoffId: opts.handoffId } : {}), ...(opts?.continuePrompt ? { continuePrompt: opts.continuePrompt } : {}), ...(opts?.resumeWhen ? { resumeWhen: opts.resumeWhen } : {}) }, targetSid); },
   };
   return (
     <MediaSignProvider
@@ -2304,26 +2313,6 @@ export function App() {
           }}
           models={models}
           lockedModels={lockedModels}
-          selectedModelId={modelId}
-          onSelectModel={selectModel}
-          onLockedSelect={demo ? undefined : handleLockedSelect}
-          // 已有模型列表时的后台重拉不锁选择器、不显示「切换中…」：拉取无超时，
-          // 弱网下会一直挂着，看起来就是切模型卡死。
-          modelsLoading={(modelsLoading && models.length === 0) || modelSwitchPreparing}
-          onCancelModelSwitch={modelSwitchPreparing ? cancelModelSwitch : undefined}
-          effortSupported={effortSupported}
-          effortActive={effortActive}
-          onSelectEffort={demo ? undefined : setSessionEffort}
-          contextTier={contextTier}
-          onSelectContextTier={demo ? undefined : setContextTier}
-          serviceTier={serviceTier}
-          onSelectServiceTier={demo ? undefined : setServiceTier}
-          swarmSupported={swarmSupported}
-          swarmMode={swarmMode}
-          swarmRunning={swarmRunning}
-          onSelectSwarmMode={demo ? undefined : setSwarmMode}
-          modelPickerOpen={modelPickerOpen}
-          onModelPickerOpenChange={setModelPickerOpen}
           // 团队模式知情指示:与 send 生效条件同构(仅 main 生效),顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
           teamLeaderModelId={teamLeaderModelId}
@@ -2436,7 +2425,7 @@ export function App() {
               onOpenGoal={demo ? undefined : () => setGoalOpenNonce(Date.now())}
             />
           ) : demo ? (
-            <Suspense fallback={null}><DemoMessageStream messages={messages} busy={busy} streamText={streamText} toolCards={toolCards} onRegenerate={regenerate} /></Suspense>
+            <LazyBoundary fallback={null}><DemoMessageStream messages={messages} busy={busy} streamText={streamText} toolCards={toolCards} onRegenerate={regenerate} /></LazyBoundary>
           ) : (
             // 非 demo：真实 WS 消息流 → P5 九类 Aurora 富卡（MessageList 按 role 分派、
             // 签名 memo 防闪；tool 委托 ToolCardSlot；权限审批经 onRespondPermission）。
@@ -2455,7 +2444,7 @@ export function App() {
                       action={
                         <button
                           type="button"
-                          className="rounded-full bg-hover px-3 py-1.5 text-xs text-fg"
+                          className="rounded-full bg-hover px-3 py-1.5 text-caption text-fg [@media(hover:none)]:min-h-11"
                           onClick={() => activeId && retryHistory(activeId)}
                         >
                           重试
@@ -2482,7 +2471,7 @@ export function App() {
                   historyGeneration={`${activeId ?? "none"}::${activeSess?._timelineGeneration ?? "legacy"}`}
                   sessionId={activeId}
                   followBottomRef={stickToBottomRef}
-                  find={findOpen ? { onClose: () => setFindOpen(false) } : undefined}
+                  find={messageListFind}
                 />
               </SessionTimelineBoundary>
             </ResponseRatingProvider>
@@ -2496,8 +2485,9 @@ export function App() {
               null(收口后由 MessageRenderer 的 inline 只读 TodoWrite/plan 卡兜底)。 */}
           {!demo && !gated && (
             <>
-              {(wsSending || inflightDelegates.items.length > 0 || bgTasks.hasAny || Boolean(swarmUi.latestSwarm) || timelineMessages.some((m) => m.role === "tool")) && (
+              {(wsSending || inflightDelegates.items.length > 0 || bgTasks.hasAny || Boolean(swarmUi.latestSwarm) || hasToolTimelineMessage) && (
                 <PinnedHudStack
+                  key={activeId ?? "none"}
                   timelineMessages={timelineMessages} chatVersion={chat.version} wsSending={wsSending}
                   tokenUsage={activeSess?._liveTurnUsage?.usage}
                   delegateItems={inflightDelegates.items} onDismissDelegate={inflightDelegates.dismiss} onCancelDelegate={inflightDelegates.cancel}
@@ -2554,19 +2544,19 @@ export function App() {
               <TurnCostReminder credits={activeSess._turnCostReminderCredits} />
             </div>
           )}
-          {bannerStack.hidden.length > 0 && (
+          {(bannerStack.hidden.length > 0 || (bannersExpanded && bannerCanCollapse)) && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
-              <Alert tone="info" density="compact" live="off" data-testid="banner-stack-collapsed">
+              <Alert tone="info" density="compact" live="off" data-testid={bannersExpanded ? "banner-stack-expanded" : "banner-stack-collapsed"}>
                 <div className="flex items-center justify-between gap-3">
-                  <span>{collapsedBannersLabel(bannerStack.hidden.length)}</span>
+                  <span>{bannersExpanded ? `已展开全部 ${activeBannerKinds.length} 条提示` : collapsedBannersLabel(bannerStack.hidden.length)}</span>
                   <Button
                     size="sm"
                     variant="ghost"
                     className="-my-1.5 -mr-1.5 shrink-0"
                     aria-expanded={bannersExpanded}
-                    onClick={() => setBannersExpanded(true)}
+                    onClick={() => setBannersExpanded((v) => !v)}
                   >
-                    展开
+                    {bannersExpanded ? "收起" : "展开"}
                   </Button>
                 </div>
               </Alert>
@@ -2577,7 +2567,7 @@ export function App() {
               <Alert tone="danger" density="compact" data-testid="credits-depleted-banner">
                 <div className="flex items-center justify-between gap-3">
                   <span>积分余额已耗尽，充值后可继续对话。</span>
-                  <Button size="sm" variant="secondary" className="-my-1 shrink-0" onClick={() => openSettings("account")}>去充值</Button>
+                  <Button size="sm" variant="secondary" className="-my-1 shrink-0" onClick={() => { openSettings("account"); setSubscribeOpenSignal((n) => n + 1); }}>去充值</Button>
                 </div>
               </Alert>
             </div>
@@ -2648,6 +2638,22 @@ export function App() {
             onCompactCommand={demo || gated || !activeId ? undefined : (ins) => void handleCompactSession(ins)}
             onOpenContextHealth={demo || gated || !activeId ? undefined : () => setContextHealthOpen(true)}
             onStartNewSession={demo ? undefined : handleNew}
+            modelSlot={
+              <ModelSelector
+                placement="composer"
+                models={models} lockedModels={lockedModels} selectedId={modelId}
+                onSelect={selectModel} onLockedSelect={demo ? undefined : handleLockedSelect}
+                loading={(modelsLoading && models.length === 0) || modelSwitchPreparing}
+                onCancelSwitch={modelSwitchPreparing ? cancelModelSwitch : undefined}
+                teamEngineActive={!demo && teamMode && agent.id === "main"} teamLeaderModelId={teamLeaderModelId}
+                effortSupported={effortSupported} effortActive={effortActive} onSelectEffort={demo ? undefined : setSessionEffort}
+                contextTier={contextTier} onSelectContextTier={demo ? undefined : setContextTier}
+                serviceTier={serviceTier} onSelectServiceTier={demo ? undefined : setServiceTier}
+                swarmSupported={swarmSupported} swarmMode={swarmMode} swarmRunning={swarmRunning}
+                onSelectSwarmMode={demo ? undefined : setSwarmMode}
+                open={modelPickerOpen} onOpenChange={setModelPickerOpen}
+              />
+            }
             projectSlot={
               // 仍是未发首条的草稿时可改归属:包括被 GitHub/目标提前物化成空会话行的草稿。
               activeId && !sessions.some((x) => x.id === activeId && x.messageCount === 0 && !x.projectId) ? undefined : (
@@ -2902,7 +2908,7 @@ export function App() {
             sending={sending}
             sessionTitle={activeSess?.title ?? sessions.find((session) => session.id === activeId)?.title ?? ""}
             sessionProjectId={sessions.find((session) => session.id === activeId)?.projectId ?? null}
-            onClose={() => { setTutorialOpen(false); setTutorialCommunity(null); setTutorialTab(null); setTutorialWork(null); setTutorialStep(null); }}
+            onClose={() => { setTutorialOpen(false); setTutorialTopic(null); setTutorialCase(null); setTutorialCommunity(null); setTutorialTab(null); setTutorialWork(null); setTutorialStep(null); }}
             actionState={(feature) => resolveTutorialAction(feature, tutorialActionContext)}
             onRunAction={runTutorialAction}
           />
@@ -2915,7 +2921,7 @@ export function App() {
         <LazyBoundary key={user?.id ?? "anon"} fallback={null}>
           <QuickAskWindow
             open={quickAsk.open} onClose={closeQuickAsk} onSendingChange={onQuickAskSending} seed={quickAsk.seed}
-            onQuoteToComposer={appendToComposer}
+            onQuoteToComposer={appendToComposer} sendKey={composerPrefs.sendKey}
             chat={chat} authRef={authRef} user={user} demo={demo} agent={agent} models={models} mainlineModelId={modelId}
             authorizeSwitch={demo ? undefined : authorizeSwitch}
             mainlineSessionId={activeId} mainlineTitle={activeSess?.title ?? sessions.find((s) => s.id === activeId)?.title}

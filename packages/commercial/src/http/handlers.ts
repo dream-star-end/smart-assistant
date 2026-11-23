@@ -118,6 +118,7 @@ import {
 } from "../inbox/assets.js";
 import type { ContainerPreviewTicketStore } from '../ws/containerPreviewTickets.js'
 import type { DirectContainerPreviewService } from '../ws/directContainerPreview.js'
+import type { LiveBrowserTicketStore } from '../ws/liveBrowserTickets.js'
 import type { ChatGptProxyHttpDeps } from './chatgptProxy.js'
 import type { PluginRuntimeFacade } from '../plugins/runtime.js'
 import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetup.js'
@@ -179,6 +180,10 @@ export interface CommercialHttpDeps {
   containerPreviewTickets?: ContainerPreviewTicketStore;
   /** Prevent issuing a ticket until the public WS bridge is fully assembled. */
   containerPreviewAvailable?: () => boolean;
+  /** Short-lived one-time browser tickets for V5 live cloud browser WS stream (OCV5-857). */
+  liveBrowserTickets?: LiveBrowserTicketStore;
+  /** Prevent issuing a live browser stream ticket until the WS bridge is assembled. */
+  liveBrowserStreamAvailable?: () => boolean;
   /** Optional native iframe transport; legacy screencast remains the fallback. */
   directContainerPreview?: DirectContainerPreviewService
   /** ChatGPT direct-connect proxy management; undefined when the listener is off. */
@@ -1261,52 +1266,36 @@ export async function handleMe(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret);
-  // 0096：保证每个活跃用户有一行订阅（首次惰性 bootstrap 免费档 + 发首期 300）。快路径已存在即返回。
-  await ensureFreeSubscription(user.id);
-  // 双钱包：展示「总可用余额」= users.credits 持久钱包 + active 订阅 period_credits 期内桶。
-  const r = await query<{
-    id: string;
-    email: string;
-    email_verified: boolean;
-    role: "user" | "admin";
-    display_name: string | null;
-    avatar_url: string | null;
-    wallet_credits: string;
-    period_credits: string;
-    total_credits: string;
-    status: string;
-    created_at: Date;
-    on_v5: boolean;
-    // 企业版(P3.1):caller 的 active org 归属(uq_user_active_org 保证至多一行 → 无 cartesian)。
-    // org suspended 仍返回(带 status,前端提示用),故 orgs LEFT JOIN 不按 o.status 过滤。
-    org_id: string | null;
-    org_name: string | null;
-    org_role: "owner" | "admin" | "member" | null;
-    org_status: string | null;
-    org_billing_enabled: boolean | null;
-    org_billing_delegate: boolean | null;
-  }>(
+  // 0096：user_subscriptions 按 user_id 唯一；主查询直接左连判断 has_sub，仅缺行时惰性 bootstrap，99.99% 省 1 次 PG RTT。
+  type MeRow = {
+    id: string; email: string; email_verified: boolean; role: "user" | "admin";
+    display_name: string | null; avatar_url: string | null;
+    wallet_credits: string; period_credits: string; total_credits: string;
+    has_sub: boolean; status: string; created_at: Date; on_v5: boolean;
+    org_id: string | null; org_name: string | null; org_role: "owner" | "admin" | "member" | null;
+    org_status: string | null; org_billing_enabled: boolean | null; org_billing_delegate: boolean | null;
+  };
+  const fetchMe = () => query<MeRow>(
     `SELECT u.id::text AS id, u.email, u.email_verified, u.role, u.display_name, u.avatar_url,
             u.credits::text AS wallet_credits,
-            COALESCE(us.period_credits, 0)::text AS period_credits,
-            (u.credits + COALESCE(us.period_credits, 0))::text AS total_credits,
-            u.status, u.created_at,
-            (u.v5_migrated_at IS NOT NULL) AS on_v5,
+            COALESCE(CASE WHEN us.status = 'active' AND us.period_end > NOW() THEN us.period_credits ELSE 0 END, 0)::text AS period_credits,
+            (u.credits + COALESCE(CASE WHEN us.status = 'active' AND us.period_end > NOW() THEN us.period_credits ELSE 0 END, 0))::text AS total_credits,
+            (us.id IS NOT NULL) AS has_sub, u.status, u.created_at, (u.v5_migrated_at IS NOT NULL) AS on_v5,
             o.id::text AS org_id, o.name AS org_name, om.org_role,
-            o.status AS org_status, om.billing_enabled AS org_billing_enabled,
-            om.billing_delegate AS org_billing_delegate
+            o.status AS org_status, om.billing_enabled AS org_billing_enabled, om.billing_delegate AS org_billing_delegate
        FROM users u
-       LEFT JOIN user_subscriptions us
-         ON us.user_id = u.id AND us.status = 'active' AND us.period_end > NOW()
-       LEFT JOIN org_memberships om
-         ON om.user_id = u.id AND om.status = 'active'
+       LEFT JOIN user_subscriptions us ON us.user_id = u.id
+       LEFT JOIN org_memberships om ON om.user_id = u.id AND om.status = 'active'
        LEFT JOIN orgs o ON o.id = om.org_id
       WHERE u.id = $1`,
     [user.id],
   );
-  if (r.rows.length === 0 || r.rows[0].status !== "active") {
-    // 用户 token 还有效但账号被删/封 → 401
-    throw new HttpError(401, "UNAUTHORIZED", "user is not active");
+  let r = await fetchMe();
+  if (r.rows.length === 0 || r.rows[0].status !== "active") throw new HttpError(401, "UNAUTHORIZED", "user is not active");
+  if (!r.rows[0].has_sub) {
+    await ensureFreeSubscription(user.id);
+    r = await fetchMe();
+    if (r.rows.length === 0 || r.rows[0].status !== "active") throw new HttpError(401, "UNAUTHORIZED", "user is not active");
   }
   const u = r.rows[0];
   // v3→v5 迁移路由(对称于 v3 handleMe):已迁移用户刷新 oc_v5user cookie(路由维持在 v5);
@@ -1470,7 +1459,13 @@ export async function handleListPublicModels(
   if (typeof authHeader === "string") {
     token = authHeader.replace(/^Bearer\s+/i, "").trim();
   }
-  const claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null;
+  let claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null;
+  if (!claims) {
+    const cookieToken = getSessionCookieToken(req);
+    if (cookieToken && cookieToken !== token) {
+      claims = verifyCommercialJwtSync(cookieToken, deps.jwtSecret);
+    }
+  }
   // 0108 provider 健康度:degraded provider 的模型附 degraded:true(**只注解不过滤**;
   // 前端标「暂不可用」+ 禁选)。fail-soft:读失败返回空集 → 不误标降级(UX 红线)。
   const degraded = await getDegradedProviders();
@@ -1583,76 +1578,70 @@ function annotateDegraded(models: PublicModel[], degraded: ReadonlySet<string>):
 // GET:不存在记录 → 默认空对象 + 当前时间戳;不写 DB(避免 read-write 副作用)。
 // PATCH:body 必须是 object(strict allowlist 字段);返回新快照。
 
+const resolvePromptPrivacySafe = (deps: CommercialHttpDeps, userId: string) =>
+  (deps.resolvePromptPrivacySupport?.(userId) ?? Promise.resolve({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })).catch(() => ({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT }));
+
 export async function handleGetMyPreferences(
-  req: IncomingMessage,
-  res: ServerResponse,
-  _ctx: RequestContext,
-  deps: CommercialHttpDeps,
+  req: IncomingMessage, res: ServerResponse, _ctx: RequestContext, deps: CommercialHttpDeps,
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret);
-  const { getPreferences } = await import("../user/preferences.js");
-  const { getAutoDreamFeature } = await import("../user/autoDream.js");
-  const { inputPredictionFeatureView, intelligentUiFeatureView } = await import("../intelligentUi/index.js");
+  const [{ getPreferences }, { getAutoDreamFeature }, { inputPredictionFeatureView, intelligentUiFeatureView }] = await Promise.all([
+    import("../user/preferences.js"), import("../user/autoDream.js"), import("../intelligentUi/index.js"),
+  ]);
   const snap = await getPreferences(user.id);
-  const autoDream = await getAutoDreamFeature(
-    user.id,
-    snap.prefs.auto_dream_enabled === true,
-    snap.prefs.auto_optimizer_enabled === true,
-  );
+  const [autoDream, promptPrivacy] = await Promise.all([
+    getAutoDreamFeature(user.id, snap.prefs.auto_dream_enabled === true, snap.prefs.auto_optimizer_enabled === true),
+    resolvePromptPrivacySafe(deps, user.id),
+  ]);
   sendJson(res, 200, {
     ...snap,
-    features: {
-      auto_dream: autoDream,
-      intelligent_ui: intelligentUiFeatureView(snap.prefs),
-      input_prediction: inputPredictionFeatureView(snap.prefs),
-      prompt_privacy: await (deps.resolvePromptPrivacySupport?.(user.id) ?? Promise.resolve({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })).catch(() => ({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })),
-    },
+    features: { auto_dream: autoDream, intelligent_ui: intelligentUiFeatureView(snap.prefs), input_prediction: inputPredictionFeatureView(snap.prefs), prompt_privacy: promptPrivacy },
   });
 }
 
 export async function handlePatchMyPreferences(
-  req: IncomingMessage,
-  res: ServerResponse,
-  _ctx: RequestContext,
-  deps: CommercialHttpDeps,
+  req: IncomingMessage, res: ServerResponse, _ctx: RequestContext, deps: CommercialHttpDeps,
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret);
   const body = await readJsonBody(req);
-  if (typeof body !== "object" || body === null || Array.isArray(body)) {
-    throw new HttpError(400, "INVALID_BODY", "body must be a JSON object");
-  }
-  const profile = (body as Record<string, unknown>).system_assistant_profile;
+  if (typeof body !== "object" || body === null || Array.isArray(body)) throw new HttpError(400, "INVALID_BODY", "body must be a JSON object");
+  const rawBody = body as Record<string, unknown>;
+  const profile = rawBody.system_assistant_profile;
+  let cachedPromptPrivacy: Awaited<ReturnType<typeof resolvePromptPrivacySafe>> | undefined;
   if (profile && typeof profile === 'object' && (profile as { enabled?: unknown }).enabled === true) {
-    const support = await (deps.resolvePromptPrivacySupport?.(user.id) ?? Promise.resolve({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })).catch(() => ({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT }));
-    if (support.state !== 'ready') throw new HttpError(409, 'PRIVACY_RUNTIME_REQUIRED', '当前运行环境尚未支持此设置，请更新运行环境后再授权。');
+    cachedPromptPrivacy = await resolvePromptPrivacySafe(deps, user.id);
+    if (cachedPromptPrivacy.state !== 'ready') throw new HttpError(409, 'PRIVACY_RUNTIME_REQUIRED', '当前运行环境尚未支持此设置，请更新运行环境后再授权。');
   }
-  const { patchPreferences, PreferencesError, resolvePreferencesPatch } = await import("../user/preferences.js");
+  const [{ patchPreferences, PreferencesError, resolvePreferencesPatch }, { getAutoDreamFeature, normalizeAutoDreamPreferencePatch }, { inputPredictionFeatureView, intelligentUiFeatureView }] = await Promise.all([
+    import("../user/preferences.js"), import("../user/autoDream.js"), import("../intelligentUi/index.js"),
+  ]);
   try {
-    const effectiveBody = await resolvePreferencesPatch(user.id, body);
+    let cachedAutoDream: Awaited<ReturnType<typeof getAutoDreamFeature>> | undefined;
+    const effectiveBody = await resolvePreferencesPatch(user.id, rawBody, {
+      feature: async (uid) => {
+        const norm = normalizeAutoDreamPreferencePatch(rawBody);
+        cachedAutoDream = await getAutoDreamFeature(uid, norm.auto_dream_enabled === true, norm.auto_optimizer_enabled === true);
+        return cachedAutoDream;
+      },
+    });
     const snap = await patchPreferences(user.id, effectiveBody);
-    const { getAutoDreamFeature } = await import("../user/autoDream.js");
-    const autoDream = await getAutoDreamFeature(
-      user.id,
-      snap.prefs.auto_dream_enabled === true,
-      snap.prefs.auto_optimizer_enabled === true,
-    );
-    const { inputPredictionFeatureView, intelligentUiFeatureView } = await import("../intelligentUi/index.js");
+    const snapLegacy = snap.prefs.auto_dream_enabled === true;
+    const snapOpt = snap.prefs.auto_optimizer_enabled === true;
+    const reuseAutoDream = cachedAutoDream !== undefined && cachedAutoDream.legacy_enabled === snapLegacy && cachedAutoDream.optimizer_enabled === snapOpt;
+    const [autoDream, promptPrivacy] = await Promise.all([
+      reuseAutoDream ? Promise.resolve(cachedAutoDream!) : getAutoDreamFeature(user.id, snapLegacy, snapOpt),
+      cachedPromptPrivacy ? Promise.resolve(cachedPromptPrivacy) : resolvePromptPrivacySafe(deps, user.id),
+    ]);
     sendJson(res, 200, {
       ...snap,
-      features: {
-        auto_dream: autoDream,
-        intelligent_ui: intelligentUiFeatureView(snap.prefs),
-        input_prediction: inputPredictionFeatureView(snap.prefs),
-      prompt_privacy: await (deps.resolvePromptPrivacySupport?.(user.id) ?? Promise.resolve({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })).catch(() => ({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })),
-      },
+      features: { auto_dream: autoDream, intelligent_ui: intelligentUiFeatureView(snap.prefs), input_prediction: inputPredictionFeatureView(snap.prefs), prompt_privacy: promptPrivacy },
     });
   } catch (err) {
     if (err instanceof PreferencesError) {
       if (err.code === 'FORBIDDEN') throw new HttpError(403, 'AUTO_DREAM_MAX_REQUIRED', err.message);
       if (err.code === 'UNAVAILABLE') throw new HttpError(503, 'AUTO_DREAM_UNAVAILABLE', err.message);
-      if (err.code === "VALIDATION") {
-        throw new HttpError(400, "INVALID_PREFERENCES", err.message);
-      }
+      if (err.code === 'CONFLICT') throw new HttpError(409, 'PREFERENCES_CONFLICT', err.message);
+      if (err.code === "VALIDATION") throw new HttpError(400, "INVALID_PREFERENCES", err.message);
       throw new HttpError(500, "PREFERENCES_INTERNAL", "preferences update failed");
     }
     throw err;

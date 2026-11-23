@@ -35,8 +35,10 @@ import {
   buildDurableSwarmBoardInput,
   compactSwarmSnapshotForPersistence,
   formatSwarmWorkingDetail,
+  getSwarmRealRootResolveCount,
   parseMemberTranscriptTail,
   readAntigravitySwarmSnapshot,
+  resetSwarmRealRootCache,
   settleSwarmSnapshotTerminal,
 } from '../engine/antigravitySwarmWatcher.js'
 import {
@@ -1475,6 +1477,162 @@ test('OCV5-852 P0-1: native CLI 1.5.8 vs Remote status semantics, SYSTEM_MESSAGE
     assert.equal(abs.workspaceBranch, 'feat/isolated')
     assert.equal(abs.workspacePath, '…/secret-repo/worktree-1')
     assert.ok(!abs.workspacePath?.includes('/Users/alice'))
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})
+
+test('W3 hot-path: caches resolved realRoot across reads and runs interval polls asynchronously with stop fencing', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-w3-async-'))
+  try {
+    const { swarmDir } = await writeSwarmFixture(brainDir)
+    resetSwarmRealRootCache()
+
+    // Multiple reads under the same brainDir resolve realRoot only ONCE
+    for (let i = 0; i < 3; i += 1) {
+      const snap = readAntigravitySwarmSnapshot({
+        brainDir,
+        conversationId: COORD_CONV,
+        phase: 'running',
+        revision: i + 1,
+      })
+      assert.ok(snap)
+      assert.equal(snap.totalPosts, 2)
+    }
+    assert.equal(getSwarmRealRootResolveCount(), 1, 'realRoot must be cached for unchanged brainDir inode')
+
+    // High-frequency interval polling runs asynchronously and emits new board posts without manual kick()
+    const emitted: SwarmSnapshot[] = []
+    const watcher = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: COORD_CONV,
+      pollMs: 25,
+      activityThrottleMs: 0,
+      onSnapshot: (snap) => emitted.push(snap),
+    })
+    watcher.start()
+    assert.equal(emitted.length, 1)
+
+    await writeFile(
+      path.join(swarmDir, 'board.jsonl'),
+      `${readFileSync(path.join(swarmDir, 'board.jsonl'), 'utf8')}${JSON.stringify({
+        seq: 3,
+        agent: 'parser',
+        channel: 'parser',
+        text: '异步轮询捕获第 3 条消息',
+      })}\n`,
+    )
+
+    const deadline = Date.now() + 1_000
+    while (emitted.length < 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 15))
+    }
+    assert.equal(emitted.length, 2, 'async interval poll must detect and emit new post')
+    assert.equal(emitted[1]!.totalPosts, 3)
+
+    // After stop(), subsequent disk writes must never trigger late async emissions
+    watcher.stop()
+    await writeFile(
+      path.join(swarmDir, 'board.jsonl'),
+      `${readFileSync(path.join(swarmDir, 'board.jsonl'), 'utf8')}${JSON.stringify({
+        seq: 4,
+        agent: 'parser',
+        channel: 'parser',
+        text: 'stop 后不应再发射',
+      })}\n`,
+    )
+    await new Promise((r) => setTimeout(r, 80))
+    assert.equal(emitted.length, 2, 'stopped watcher must not emit after stop()')
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})
+
+test('W3 auditor R1 regressions: telemetry sync/async fence (no double count), dormant terminal capture, and strictly monotonic revisions', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-w3-r1-'))
+  try {
+    const { swarmDir } = await writeSwarmFixture(brainDir)
+    const transcriptPath = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs', 'transcript.jsonl')
+
+    // 1. P1 #4: Concurrent scanAsync() + sync scan() must never double-count the same 7-token line
+    await writeFile(
+      transcriptPath,
+      `${JSON.stringify({ type: 'ASSISTANT', created_at: '2026-11-23T10:00:00Z', usage: { input_tokens: 7 } })}\n`,
+    )
+    const cache = new IncrementalTranscriptTelemetryCache()
+    const asyncPromise = cache.scanAsync(brainDir, WORKER_CONV)
+    const syncSnap = cache.scan(brainDir, WORKER_CONV)
+    const asyncSnap = await asyncPromise
+    assert.equal(syncSnap?.inputTokens, 7)
+    assert.equal(asyncSnap?.inputTokens, 7)
+    // Append 3 more tokens and drain -> total must be exact 10, never 14
+    await writeFile(
+      transcriptPath,
+      `${readFileSync(transcriptPath, 'utf8')}${JSON.stringify({ type: 'ASSISTANT', created_at: '2026-11-23T10:00:01Z', usage: { input_tokens: 3 } })}\n`,
+    )
+    const finalTel = cache.scan(brainDir, WORKER_CONV, { drainAll: true })
+    assert.equal(finalTel?.inputTokens, 10, 'sync+async concurrent scan must yield exact 10 tokens')
+
+    // 2. P1 #5: Dormant resumed session whose board mutates before async poll finishes must still persist in stopAndReadFinal
+    const dormantWatcher = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: COORD_CONV,
+      pollMs: 60_000, // won't fire before stopAndReadFinal
+      seedBaselineOnStart: true,
+      onSnapshot: () => {},
+    })
+    dormantWatcher.start()
+    assert.equal(dormantWatcher.hasTurnActivity(), false)
+    await writeFile(
+      path.join(swarmDir, 'board.jsonl'),
+      `${readFileSync(path.join(swarmDir, 'board.jsonl'), 'utf8')}${JSON.stringify({
+        seq: 3,
+        agent: 'parser',
+        channel: 'parser',
+        text: '恢复会话中的成员新帖子',
+      })}\n`,
+    )
+    const terminal = dormantWatcher.stopAndReadFinal('completed')
+    assert.ok(terminal, 'stopAndReadFinal must synchronously detect board mutation even if async poll had not run')
+    assert.equal(terminal.phase, 'completed')
+    assert.equal(terminal.totalPosts, 3)
+
+    // 3. P1 #6: Throttled activity timer + async poll never reuse the same revision
+    const revs: number[] = []
+    let fakeNow = 10_000
+    const revWatcher = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: COORD_CONV,
+      pollMs: 20,
+      activityThrottleMs: 30,
+      now: () => fakeNow,
+      onSnapshot: (s) => revs.push(s.revision),
+    })
+    revWatcher.start()
+    // Activity-only change scheduled on throttleTimer
+    fakeNow += 5
+    await writeFile(
+      transcriptPath,
+      `${readFileSync(transcriptPath, 'utf8')}${JSON.stringify({ type: 'ASSISTANT', created_at: '2026-11-23T10:00:02Z', usage: { input_tokens: 1 } })}\n`,
+    )
+    revWatcher.kick()
+    // Structural change right as throttleTimer fires
+    fakeNow += 40
+    await writeFile(
+      path.join(swarmDir, 'board.jsonl'),
+      `${readFileSync(path.join(swarmDir, 'board.jsonl'), 'utf8')}${JSON.stringify({
+        seq: 4,
+        agent: 'parser',
+        channel: 'parser',
+        text: '版本严格递增',
+      })}\n`,
+    )
+    await new Promise((r) => setTimeout(r, 90))
+    revWatcher.stop()
+    assert.ok(revs.length >= 2)
+    for (let i = 1; i < revs.length; i += 1) {
+      assert.ok(revs[i]! > revs[i - 1]!, `revisions must be strictly monotonic: ${JSON.stringify(revs)}`)
+    }
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }

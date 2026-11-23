@@ -29,9 +29,12 @@ SOFTWARE.
 from __future__ import annotations
 
 import argparse
+import copy
+import difflib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -164,6 +167,56 @@ def _resolve_output(value: str | Path) -> Path:
     return output
 
 
+def _clean_converted_docx(output: Path, *, strip_empty_toc: bool) -> None:
+    """Strip Pandoc's empty word/comments.xml and unpopulated TOC placeholders."""
+    import xml.etree.ElementTree as ET
+
+    with zipfile.ZipFile(output, "r") as archive:
+        members = set(archive.namelist())
+        strip_comments = False
+        if "word/comments.xml" in members:
+            try:
+                c_root = ET.fromstring(archive.read("word/comments.xml"))
+                has_real_comment = any(el.tag == f"{{{W_NS}}}comment" for el in c_root.iter())
+                strip_comments = not has_real_comment
+            except ET.ParseError:
+                strip_comments = False
+
+        doc_xml_raw = archive.read("word/document.xml").decode("utf-8") if "word/document.xml" in members else ""
+        cleaned_doc_xml = doc_xml_raw
+        if strip_empty_toc and doc_xml_raw:
+            def _drop_if_empty_toc(match: re.Match[str]) -> str:
+                block = match.group(0)
+                if 'w:val="Table of Contents"' in block and "TOC" in block and "<w:hyperlink" not in block:
+                    return ""
+                return block
+
+            cleaned_doc_xml = re.sub(r"<w:sdt\b[^>]*>.*?</w:sdt>", _drop_if_empty_toc, doc_xml_raw, flags=re.S)
+
+        if not strip_comments and cleaned_doc_xml == doc_xml_raw:
+            return
+
+        with tempfile.TemporaryDirectory(prefix=".oc-docx-clean-", dir=str(output.parent)) as temporary:
+            temp_out = Path(temporary) / output.name
+            with zipfile.ZipFile(temp_out, "w", zipfile.ZIP_DEFLATED) as outgoing:
+                for info in archive.infolist():
+                    if strip_comments and info.filename == "word/comments.xml":
+                        continue
+                    data = archive.read(info.filename)
+                    if info.filename == "word/document.xml" and cleaned_doc_xml != doc_xml_raw:
+                        data = cleaned_doc_xml.encode("utf-8")
+                    elif strip_comments and info.filename == "word/_rels/document.xml.rels":
+                        text = data.decode("utf-8")
+                        text = re.sub(r'<Relationship\b[^>]*\bTarget="comments\.xml"[^>]*/>', "", text)
+                        data = text.encode("utf-8")
+                    elif strip_comments and info.filename == "[Content_Types].xml":
+                        text = data.decode("utf-8")
+                        text = re.sub(r'<Override\b[^>]*\bPartName="/word/comments\.xml"[^>]*/>', "", text)
+                        data = text.encode("utf-8")
+                    outgoing.writestr(info, data)
+            os.replace(temp_out, output)
+
+
 def convert_docx(
     input_path: str | Path,
     output_path: str | Path | None,
@@ -171,6 +224,8 @@ def convert_docx(
     engine: str | None,
     reference_doc: str | Path | None,
     use_reference: bool,
+    toc: bool = False,
+    number_sections: bool = False,
 ) -> Path:
     source = _resolve_existing_file(input_path, "输入文件")
     extension = source.suffix.lower()
@@ -190,9 +245,11 @@ def convert_docx(
             "--to=docx",
             "--output",
             str(output),
-            "--toc",
-            "--number-sections",
         ]
+        if toc:
+            command.append("--toc")
+        if number_sections:
+            command.append("--number-sections")
         if reference:
             command.extend(["--reference-doc", str(reference)])
         subprocess.run(command, check=True)
@@ -218,6 +275,7 @@ def convert_docx(
 
     if not output.is_file() or output.stat().st_size == 0:
         raise RuntimeError(f"DOCX 未生成：{output}")
+    _clean_converted_docx(output, strip_empty_toc=not toc)
     return output
 
 
@@ -883,7 +941,16 @@ def render_docx(
             str(temp),
             str(source),
         ]
-        result = subprocess.run(command, env=env, text=True, capture_output=True)
+        try:
+            result = subprocess.run(
+                command,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=_SUBPROCESS_RENDER_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RenderError(f"LibreOffice 转换超时（>{_SUBPROCESS_RENDER_TIMEOUT_SEC}s）") from exc
         if verbose:
             print(result.stdout, file=sys.stderr)
             print(result.stderr, file=sys.stderr)
@@ -892,11 +959,15 @@ def render_docx(
             raise RenderError(f"LibreOffice 转换失败：{result.stderr.strip() or result.stdout.strip()}")
         if emit_pdf:
             shutil.copy2(pdf, final_pdf)
-        ppm = subprocess.run(
-            [pdftoppm, "-png", "-r", str(dpi), str(pdf), str(destination / "page")],
-            text=True,
-            capture_output=True,
-        )
+        try:
+            ppm = subprocess.run(
+                [pdftoppm, "-png", "-r", str(dpi), str(pdf), str(destination / "page")],
+                text=True,
+                capture_output=True,
+                timeout=_SUBPROCESS_PDFTOTEXT_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RenderError(f"PDF 转 PNG 超时（>{_SUBPROCESS_PDFTOTEXT_TIMEOUT_SEC}s）") from exc
         if verbose:
             print(ppm.stdout, file=sys.stderr)
             print(ppm.stderr, file=sys.stderr)
@@ -932,7 +1003,15 @@ def inspect_docx(input_path: str | Path, render_dir: str | Path | None = None) -
         bad_member = archive.testzip()
         members = archive.namelist()
         image_members = [name for name in members if name.startswith("word/media/")]
-        has_comments = "word/comments.xml" in members
+        has_comments = False
+        if "word/comments.xml" in members:
+            try:
+                import xml.etree.ElementTree as ET
+
+                comments_root = ET.fromstring(archive.read("word/comments.xml"))
+                has_comments = any(el.tag == f"{{{W_NS}}}comment" for el in comments_root.iter())
+            except Exception:
+                has_comments = True
         has_custom_properties = "docProps/custom.xml" in members
     document = Document(source)
     headings: list[dict[str, Any]] = []
@@ -1128,6 +1207,8 @@ def _convert_command(args: argparse.Namespace) -> int:
         engine=engine,
         reference_doc=args.reference_doc,
         use_reference=not args.no_reference_doc,
+        toc=bool(args.toc),
+        number_sections=bool(args.number_sections),
     )
     print(output)
     return 0
@@ -1150,8 +1231,8 @@ def _inspect_command(args: argparse.Namespace) -> int:
 
 
 def _docxcheck_enabled() -> bool:
-    raw = (os.environ.get("OC_DOCXCHECK") or "off").strip().lower()
-    return raw in {"on", "1", "true", "enforce"}
+    raw = (os.environ.get("OC_DOCXCHECK") or "on").strip().lower()
+    return raw not in {"off", "0", "false"}
 
 
 def _check_add_failure(report: dict[str, Any], code: str, message: str) -> None:
@@ -1224,10 +1305,259 @@ def _check_omml_and_structure(
     report["has_toc_field"] = toc
 
 
-def _check_render_readback(source: Path, report: dict[str, Any], required_text: list[str]) -> None:
+_RENDER_GARBLED_RE = re.compile(r"[¿□❑\ufffd]")
+_SUBPROCESS_RENDER_TIMEOUT_SEC = 120
+_SUBPROCESS_PDFTOTEXT_TIMEOUT_SEC = 60
+_ANCHOR_CTX_LEN = 12
+
+
+def _compact_norm(text: str) -> str:
+    import unicodedata
+
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+
+
+def _extract_non_omml_garbled_anchors(source: Path) -> dict[str, list[dict[str, Any]]]:
+    """Extract context-anchored non-OMML ¿/□/❑/U+FFFD occurrences separated into body (1x) vs repeating header/footer."""
+    import xml.etree.ElementTree as ET
+
+    w_p = f"{{{W_NS}}}p"
+    w_t = f"{{{W_NS}}}t"
+    m_omath = f"{{{M_NS}}}oMath"
+    body_anchors: list[dict[str, Any]] = []
+    repeating_anchors: list[dict[str, Any]] = []
+
+    def _collect_segments(node: Any, out: list[str], buf: list[str]) -> None:
+        if node.tag == m_omath:
+            if buf:
+                out.append("".join(buf))
+                buf.clear()
+            return
+        if node.tag == w_t and node.text:
+            buf.append(node.text)
+        for child in node:
+            _collect_segments(child, out, buf)
+
+    def _add_anchors_from_paragraph(p_el: Any, target: list[dict[str, Any]]) -> None:
+        segments: list[str] = []
+        buf: list[str] = []
+        _collect_segments(p_el, segments, buf)
+        if buf:
+            segments.append("".join(buf))
+        for seg in segments:
+            compact = _compact_norm(seg)
+            if not compact or not _RENDER_GARBLED_RE.search(compact):
+                continue
+            for m in _RENDER_GARBLED_RE.finditer(compact):
+                idx = m.start()
+                left = compact[max(0, idx - _ANCHOR_CTX_LEN) : idx]
+                right = compact[idx + 1 : idx + 1 + _ANCHOR_CTX_LEN]
+                target.append(
+                    {
+                        "char": m.group(0),
+                        "left": left,
+                        "right": right,
+                        "segment": compact,
+                        "isolated": not left and not right,
+                    }
+                )
+
+    try:
+        with zipfile.ZipFile(source, "r") as archive:
+            for name in archive.namelist():
+                is_body = name in {"word/document.xml", "word/footnotes.xml", "word/endnotes.xml"}
+                is_repeating = bool(re.fullmatch(r"word/(?:header\d+|footer\d+)\.xml", name))
+                if not is_body and not is_repeating:
+                    continue
+                try:
+                    root = ET.fromstring(archive.read(name))
+                except ET.ParseError:
+                    continue
+                target = repeating_anchors if is_repeating else body_anchors
+                for p_el in root.iter(w_p):
+                    _add_anchors_from_paragraph(p_el, target)
+    except Exception:
+        return {"body": [], "repeating": []}
+    return {"body": body_anchors, "repeating": repeating_anchors}
+
+
+def _anchor_matches_at(
+    anchor: dict[str, Any],
+    *,
+    ch: str,
+    page_compact: str,
+    compact_pos: int,
+    line_compact: str,
+    require_full_segment: bool,
+) -> bool:
+    if anchor["char"] != ch:
+        return False
+    if anchor["isolated"]:
+        return line_compact == ch
+    left = anchor["left"]
+    right = anchor["right"]
+    if left and not page_compact[max(0, compact_pos - len(left)) : compact_pos].endswith(left):
+        return False
+    if right and not page_compact[compact_pos + 1 : compact_pos + 1 + len(right)].startswith(right):
+        return False
+    if require_full_segment:
+        seg = anchor["segment"]
+        if seg and seg not in line_compact:
+            return False
+    return True
+
+
+def _scan_rendered_text_garbled(
+    rendered_text: str,
+    *,
+    source_anchors: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Scan pdftotext output page-by-page for newly introduced StarMath / font garbled glyphs."""
+    raw_pages = rendered_text.split("\f")
+    if len(raw_pages) > 1 and not raw_pages[-1].strip():
+        raw_pages = raw_pages[:-1]
+    remaining_body = list((source_anchors or {}).get("body") or [])
+    repeating = list((source_anchors or {}).get("repeating") or [])
+    hits: list[dict[str, Any]] = []
+    for page_idx, page_text in enumerate(raw_pages, start=1):
+        lines = page_text.splitlines()
+        line_compacts = [_compact_norm(line) for line in lines]
+        page_compact = "".join(line_compacts)
+        page_repeating = list(repeating)
+        page_offset = 0
+        for line, line_compact in zip(lines, line_compacts):
+            if _RENDER_GARBLED_RE.search(line):
+                for match in _RENDER_GARBLED_RE.finditer(line):
+                    ch = match.group(0)
+                    prefix_compact = _compact_norm(line[: match.start()])
+                    compact_pos = page_offset + len(prefix_compact)
+                    matched = False
+                    # 1. Check repeating header/footer anchors (at most once per anchor per page, full-line segment match)
+                    for r_idx, anchor in enumerate(page_repeating):
+                        if _anchor_matches_at(
+                            anchor,
+                            ch=ch,
+                            page_compact=page_compact,
+                            compact_pos=compact_pos,
+                            line_compact=line_compact,
+                            require_full_segment=True,
+                        ):
+                            page_repeating.pop(r_idx)
+                            matched = True
+                            break
+                    # 2. Check body non-OMML anchors (at most once across the entire document, context-anchored)
+                    if not matched:
+                        for b_idx, anchor in enumerate(remaining_body):
+                            if _anchor_matches_at(
+                                anchor,
+                                ch=ch,
+                                page_compact=page_compact,
+                                compact_pos=compact_pos,
+                                line_compact=line_compact,
+                                require_full_segment=False,
+                            ):
+                                remaining_body.pop(b_idx)
+                                matched = True
+                                break
+                    if matched:
+                        continue
+                    start = max(0, match.start() - 30)
+                    end = min(len(line), match.end() + 30)
+                    context = re.sub(r"\s+", " ", line[start:end]).strip()
+                    hits.append(
+                        {
+                            "page": page_idx,
+                            "char": ch,
+                            "codepoint": f"U+{ord(ch):04X}",
+                            "context": context,
+                        }
+                    )
+            page_offset += len(line_compact)
+    return hits
+
+
+def _format_render_garbled_summary(hits: list[dict[str, Any]]) -> str:
+    samples = [
+        f"page {h['page']} '{h['char']}' ({h['codepoint']}) in \"{h['context']}\""
+        for h in hits[:5]
+    ]
+    suffix = f" (+{len(hits) - 5} more)" if len(hits) > 5 else ""
+    return f"rendered PDF contains StarMath/font garbled glyphs ({len(hits)} hit(s)): " + "; ".join(samples) + suffix
+
+
+def _render_pdf_garbled_scan(source: Path) -> dict[str, Any]:
+    """Convert DOCX to PDF via LibreOffice and scan pdftotext output for newly introduced ¿/□/❑/U+FFFD."""
+    libreoffice = _which("libreoffice", "soffice")
+    pdftotext = _which("pdftotext")
+    source_anchors = _extract_non_omml_garbled_anchors(source)
+    with tempfile.TemporaryDirectory(prefix="oc-docx-render-scan-") as temporary:
+        temp = Path(temporary)
+        home = temp / "home"
+        profile = temp / "profile"
+        home.mkdir()
+        profile.mkdir()
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        command = [
+            libreoffice,
+            "--headless",
+            "--nologo",
+            "--nodefault",
+            "--nolockcheck",
+            "--nofirststartwizard",
+            f"-env:UserInstallation={profile.resolve().as_uri()}",
+            "--convert-to",
+            "pdf:writer_pdf_Export",
+            "--outdir",
+            str(temp),
+            str(source),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=_SUBPROCESS_RENDER_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RenderError(f"LibreOffice 转换超时（>{_SUBPROCESS_RENDER_TIMEOUT_SEC}s）") from exc
+        pdf = temp / f"{source.stem}.pdf"
+        if result.returncode != 0 or not pdf.is_file() or pdf.stat().st_size == 0:
+            raise RenderError(f"LibreOffice 转换失败：{result.stderr.strip() or result.stdout.strip()}")
+        text_out = temp / "rendered.txt"
+        try:
+            extracted = subprocess.run(
+                [pdftotext, "-layout", str(pdf), str(text_out)],
+                capture_output=True,
+                text=True,
+                timeout=_SUBPROCESS_PDFTOTEXT_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RenderError(f"pdftotext 提取超时（>{_SUBPROCESS_PDFTOTEXT_TIMEOUT_SEC}s）") from exc
+        if extracted.returncode != 0 or not text_out.is_file():
+            raise RenderError(f"pdftotext 提取失败：{extracted.stderr.strip() or extracted.stdout.strip()}")
+        rendered_text = text_out.read_text(encoding="utf-8", errors="replace")
+    return {
+        "hits": _scan_rendered_text_garbled(rendered_text, source_anchors=source_anchors),
+        "text_sample": rendered_text[:1000],
+    }
+
+
+def _check_render_readback(
+    source: Path,
+    report: dict[str, Any],
+    required_text: list[str],
+    *,
+    render_check: bool | None = None,
+) -> None:
     import re
     import tempfile
 
+    should_scan_garbled = render_check is True or (render_check is None and report.get("omml_count", 0) > 0)
+    report["render_garbled_hits"] = []
+    report["render_garbled_check_executed"] = False
+    source_anchors = _extract_non_omml_garbled_anchors(source) if should_scan_garbled else None
     try:
         with tempfile.TemporaryDirectory(prefix="oc-docx-check-") as temporary:
             rendered = render_docx(source, temporary, emit_pdf=True)
@@ -1237,23 +1567,58 @@ def _check_render_readback(source: Path, report: dict[str, Any], required_text: 
                 return
             pdf = rendered.get("pdf")
             rendered_text = ""
-            if pdf and shutil.which("pdftotext"):
+            pdftotext_bin = shutil.which("pdftotext")
+            if pdf and pdftotext_bin:
                 text_out = Path(temporary) / "rendered.txt"
-                result = subprocess.run(
-                    [shutil.which("pdftotext") or "pdftotext", "-layout", str(pdf), str(text_out)],
-                    capture_output=True,
-                    text=True,
-                )
-                if result.returncode == 0 and text_out.is_file():
+                try:
+                    result = subprocess.run(
+                        [pdftotext_bin, "-layout", str(pdf), str(text_out)],
+                        capture_output=True,
+                        text=True,
+                        timeout=_SUBPROCESS_PDFTOTEXT_TIMEOUT_SEC,
+                    )
+                except subprocess.TimeoutExpired:
+                    result = None
+                    if should_scan_garbled or required_text:
+                        _check_add_failure(
+                            report,
+                            "render-text-extract-failed",
+                            f"pdftotext timed out after {_SUBPROCESS_PDFTOTEXT_TIMEOUT_SEC}s",
+                        )
+                if result is not None and result.returncode == 0 and text_out.is_file():
                     rendered_text = text_out.read_text(encoding="utf-8", errors="replace")
                     report["rendered_text_sample"] = rendered_text[:2000]
-                    compact = re.sub(r"\s+", "", rendered_text)
-                    squares = sum(compact.count(ch) for ch in ("□", "■", "�"))
-                    if "�" in compact or (squares >= 4 and squares / max(1, len(compact)) >= 0.1):
-                        _check_add_failure(report, "suspicious-glyphs", "rendered PDF text contains replacement/tofu glyphs")
+                    if should_scan_garbled:
+                        report["render_garbled_check_executed"] = True
+                        garbled_hits = _scan_rendered_text_garbled(
+                            rendered_text,
+                            source_anchors=source_anchors,
+                        )
+                        report["render_garbled_hits"] = garbled_hits
+                        if garbled_hits:
+                            _check_add_failure(
+                                report,
+                                "render-garbled-glyphs",
+                                _format_render_garbled_summary(garbled_hits),
+                            )
+                        else:
+                            compact = re.sub(r"\s+", "", rendered_text)
+                            solid_squares = compact.count("■")
+                            if solid_squares >= 4 and solid_squares / max(1, len(compact)) >= 0.1:
+                                _check_add_failure(
+                                    report,
+                                    "suspicious-glyphs",
+                                    "rendered PDF text contains replacement/tofu glyphs",
+                                )
                     for needle in required_text:
                         if needle and needle not in rendered_text:
                             _check_add_failure(report, "required-text-rendered", f"missing after render: {needle}")
+                elif result is not None and (should_scan_garbled or required_text):
+                    detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+                    _check_add_failure(report, "render-text-extract-failed", f"pdftotext failed: {detail}")
+            elif should_scan_garbled or required_text:
+                reason = "pdftotext not available" if not pdftotext_bin else "rendered PDF missing"
+                _check_add_failure(report, "render-text-extract-failed", f"cannot verify rendered text: {reason}")
             whites = 0
             for page in pages:
                 try:
@@ -1275,6 +1640,7 @@ def check_docx(
     required_text: list[str] | None = None,
     render_dir: str | Path | None = None,
     vision: bool = False,
+    render_check: bool | None = None,
 ) -> dict[str, Any]:
     report = inspect_docx(input_path, render_dir)
     report["failures"] = []
@@ -1300,7 +1666,7 @@ def check_docx(
         _check_add_failure(report, "docx-xml", f"cannot parse document.xml: {error}")
     if vision:
         report.setdefault("warnings", []).append("vision sampling is optional and was not executed")
-    _check_render_readback(source, report, required_text or [])
+    _check_render_readback(source, report, required_text or [], render_check=render_check)
     if render_dir and not report.get("render_pairing_ok", True):
         _check_add_failure(report, "render-pairing", "render directory page pairing failed")
     report["passed"] = len(report["failures"]) == 0
@@ -1318,6 +1684,7 @@ def _check_command(args: argparse.Namespace) -> int:
         required_text=list(args.required_text or []),
         render_dir=args.render_dir,
         vision=bool(args.vision),
+        render_check=args.render_check,
     )
     if args.json:
         output = _resolve_output(args.json)
@@ -1333,12 +1700,68 @@ def _scrub_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def diff_docx(
+    base_path: str | Path,
+    revised_path: str | Path,
+    out_clean_path: str | Path,
+    out_highlighted_path: str | Path,
+    *,
+    render_check: bool | None = None,
+) -> dict[str, Any]:
+    _load_docx_dependencies()
+    for candidate_dir in (
+        Path(__file__).resolve().parent.parent / "entrypoint",
+        Path("/usr/local/lib/openclaude"),
+    ):
+        if (candidate_dir / "oc_docx_diff.py").is_file():
+            dir_str = str(candidate_dir)
+            if dir_str not in sys.path:
+                sys.path.insert(0, dir_str)
+            break
+    from oc_docx_diff import diff_docx_impl
+
+    base_file = _resolve_existing_file(base_path, "基准 DOCX")
+    revised_file = _resolve_existing_file(revised_path, "修订 DOCX")
+    clean_out = _resolve_output(out_clean_path)
+    hl_out = _resolve_output(out_highlighted_path)
+    return diff_docx_impl(
+        base_file,
+        revised_file,
+        clean_out,
+        hl_out,
+        Document=Document,
+        OxmlElement=OxmlElement,
+        qn=qn,
+        render_pdf_garbled_scan=_render_pdf_garbled_scan,
+        render_error_cls=RenderError,
+        render_check=render_check,
+    )
+
+
+def _diff_command(args: argparse.Namespace) -> int:
+    report = diff_docx(
+        args.base,
+        args.revised,
+        args.out_clean,
+        args.out_highlighted,
+        render_check=args.render_check,
+    )
+    if args.json:
+        output = _resolve_output(args.json)
+        output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        report["report_file"] = str(output)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["passed"] else 1
+
+
 def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
     engines = parser.add_mutually_exclusive_group()
     engines.add_argument("--quarto", action="store_true", help="使用 Quarto")
     engines.add_argument("--pandoc", action="store_true", help="使用 Pandoc")
     parser.add_argument("--reference-doc", help="自定义 Word reference.docx")
     parser.add_argument("--no-reference-doc", action="store_true", help="不使用默认 reference.docx")
+    parser.add_argument("--toc", action="store_true", help="插入 Word 目录字段（默认关闭，避免未更新的静态 Table of Contents 占位行）")
+    parser.add_argument("--number-sections", action="store_true", help="由 Pandoc 自动为标题添加编号（默认关闭，避免与正文已有章节号冲突）")
     parser.add_argument("-o", "--output", help="输出 DOCX；默认与输入同目录同名")
     parser.add_argument("input", help="输入 .md/.markdown/.qmd")
 
@@ -1400,6 +1823,20 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--required-text", action="append", default=[], help="渲染 PDF 中必须出现的文本，可重复")
     check.add_argument("--vision", action="store_true", help="对公式页做 vision（默认关，最多 8 页）")
     check.add_argument("--kind", default="document", help="document|formula（formula 时等同 --expect-formulas）")
+    check_render_group = check.add_mutually_exclusive_group()
+    check_render_group.add_argument(
+        "--render-check",
+        dest="render_check",
+        action="store_true",
+        default=None,
+        help="强制启用渲染期 ¿/□ 乱码门禁（含 OMML 时默认自动启用）",
+    )
+    check_render_group.add_argument(
+        "--no-render-check",
+        dest="render_check",
+        action="store_false",
+        help="跳过渲染期 ¿/□ 乱码扫描",
+    )
     check.set_defaults(func=_check_command)
     scrub = subparsers.add_parser(
         "scrub",
@@ -1411,12 +1848,37 @@ def build_parser() -> argparse.ArgumentParser:
     scrub.add_argument("--keep-title", action="store_true", help="保留文档属性中的标题")
     scrub.add_argument("--keep-author", action="store_true", help="保留用户明确要求的作者")
     scrub.set_defaults(func=_scrub_command)
+    diff = subparsers.add_parser(
+        "diff",
+        help="对比两份 DOCX：输出干净版 + 改动处黄色高亮修订版，并执行 OMML 零乱码检查",
+        description="按段落与词句级对比两份 DOCX，输出干净版与 w:highlight yellow 标黄修订版，并自动执行 OMML 零 ¿ 乱码检查",
+    )
+    diff.add_argument("--base", required=True, help="修订前基准 DOCX")
+    diff.add_argument("--revised", required=True, help="修订后新版 DOCX")
+    diff.add_argument("--out-clean", required=True, help="干净版输出 DOCX 路径")
+    diff.add_argument("--out-highlighted", required=True, help="标黄修订版输出 DOCX 路径")
+    render_group = diff.add_mutually_exclusive_group()
+    render_group.add_argument(
+        "--render-check",
+        dest="render_check",
+        action="store_true",
+        default=None,
+        help="强制启用 LibreOffice + pdftotext 渲染期 ¿/□ 乱码门禁（含 OMML 且环境具备工具时默认自动启用）",
+    )
+    render_group.add_argument(
+        "--no-render-check",
+        dest="render_check",
+        action="store_false",
+        help="跳过 LibreOffice + pdftotext 渲染期乱码扫描",
+    )
+    diff.add_argument("--json", help="保存 Diff 与 OMML 检查报告 JSON")
+    diff.set_defaults(func=_diff_command)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     actual = list(sys.argv[1:] if argv is None else argv)
-    commands = {"convert", "build", "render", "inspect", "check", "scrub"}
+    commands = {"convert", "build", "render", "inspect", "check", "scrub", "diff"}
     if actual and actual[0] not in commands and actual[0] not in {"-h", "--help"}:
         actual.insert(0, "convert")
     parser = build_parser()

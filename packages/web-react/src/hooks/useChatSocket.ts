@@ -387,7 +387,9 @@ export function useChatSocket(opts: {
         const a = authRef.current;
         const sock = socketRef.current;
         if (!a || !sock || requestIds.length === 0) return;
+        const authEpoch = a.snapshot().epoch;
         const pending = api.getSession(a, sessId, 0, undefined, requestIds).then((detail) => {
+          if (authRef.current !== a || a.snapshot().epoch !== authEpoch || !sock.sessions.has(sessId)) return;
           const snap = detail.permissionPrompts;
           if (!snap || snap.completeness === "unavailable") {
             permissionLookupFailRef.current.set(sessId, fails + 1);
@@ -401,6 +403,7 @@ export function useChatSocket(opts: {
           const missed = requestIds.some((id) => !returned.has(id));
           permissionLookupFailRef.current.set(sessId, missed ? fails + 1 : 0);
         }).catch(() => {
+          if (authRef.current !== a || a.snapshot().epoch !== authEpoch) return;
           permissionLookupFailRef.current.set(sessId, fails + 1);
         }).finally(() => {
           permissionLookupInflightRef.current.delete(sessId);
@@ -547,8 +550,10 @@ export function useChatSocket(opts: {
       syncGoalState: async (sessId) => {
         const a = authRef.current;
         if (!a) return;
+        const authEpoch = a.snapshot().epoch;
         const goal = await api.getSessionGoal(a, sessId);
-        socketRef.current?.setGoalState(sessId, goal);
+        if (authRef.current !== a || a.snapshot().epoch !== authEpoch || !socketRef.current?.sessions.has(sessId)) return;
+        socketRef.current.setGoalState(sessId, goal);
       },
       // 首次发消息前在主控建 client_sessions 行（见 socket.ts deps.ensureServerSession 注释）。
       // fire-and-forget：建行是快 REST，远早于容器跑完 turn 后的 authored POST；失败不阻塞发送
@@ -671,10 +676,16 @@ export function useChatSocket(opts: {
     const flushAll = () => {
       const st = storeRef.current;
       if (!st) return;
-      for (const [id] of socket.sessions) {
+      const ids = new Set(socket.consumeDirtyPersistIds());
+      const activeSessId = socket.getActiveSessionId();
+      if (activeSessId && socket.sessions.has(activeSessId)) ids.add(activeSessId);
+      for (const id of ids) {
         const stored = socket.toStored(id);
         if (!stored) continue;
-        sigRef.current.set(id, persistSignature(stored));
+        const sig = persistSignature(stored);
+        if (sigRef.current.get(id) === sig) continue;
+        sigRef.current.set(id, sig);
+        socket.markPersisted(id);
         void st.putSession(stored);
       }
     };
@@ -766,33 +777,22 @@ export function useChatSocket(opts: {
   const getMessages = useCallback(
     (sessId: string | undefined) => {
       if (!sessId) return EMPTY_MESSAGES;
-      // 依赖 snap.version 触发重算；messages 是就地 mutation 的同一数组。
-      void snap.version;
-      return snap.sessions.get(sessId)?.messages ?? EMPTY_MESSAGES;
+      return socket.sessions.get(sessId)?.messages ?? EMPTY_MESSAGES;
     },
-    [snap],
+    [socket],
   );
   const getSession = useCallback(
-    (sessId: string | undefined) => {
-      void snap.version;
-      return sessId ? snap.sessions.get(sessId) : undefined;
-    },
-    [snap],
+    (sessId: string | undefined) => (sessId ? socket.sessions.get(sessId) : undefined),
+    [socket],
   );
   const isSending = useCallback(
-    (sessId: string | undefined) => {
-      void snap.version;
-      return !!(sessId && socket.isSessionBusy(sessId));
-    },
-    [snap, socket],
+    (sessId: string | undefined) => !!(sessId && socket.isSessionBusy(sessId)),
+    [socket],
   );
 
   const dispatchStatus = useCallback(
-    (sessId: string | undefined) => {
-      void snap.version;
-      return sessId ? socket.getDispatchStatus(sessId) : null;
-    },
-    [snap, socket],
+    (sessId: string | undefined) => (sessId ? socket.getDispatchStatus(sessId) : null),
+    [socket],
   );
 
   const ensureSession = useCallback((sessId: string, agentId: string, title?: string) => {
@@ -968,18 +968,26 @@ export function useChatSocket(opts: {
       if (liveUnitsFetchingRef.current.has(inflightKey)) {
         return { ok: true, loaded: 0, hasMore: true, inflight: true };
       }
+      const authEpoch = a.snapshot().epoch;
       liveUnitsFetchingRef.current.add(inflightKey);
       try {
         const raw = await api.getSessionLiveUnits(a, sessId, { n: 20, before });
+        const current = socket.sessions.get(sessId);
+        if (
+          authRef.current !== a || a.snapshot().epoch !== authEpoch ||
+          !current || current._liveUnitsBeforeCursor !== before
+        ) {
+          return { ok: false, loaded: 0, hasMore: current?._liveUnitsHasMoreBefore === true };
+        }
         if (!isLiveUnitsPage(raw) || raw.degraded === "fallback") {
           return { ok: false, loaded: 0, hasMore: true, error: true };
         }
-        const beforeCount = session.messages.length;
+        const beforeCount = current.messages.length;
         socket.prependLiveUnits(sessId, raw.units);
-        const current = socket.sessions.get(sessId);
-        if (current) {
-          current._liveUnitsHasMoreBefore = raw.hasMoreBefore;
-          current._liveUnitsBeforeCursor = raw.beforeCursor;
+        const updated = socket.sessions.get(sessId);
+        if (updated) {
+          updated._liveUnitsHasMoreBefore = raw.hasMoreBefore;
+          updated._liveUnitsBeforeCursor = raw.beforeCursor;
         }
         const loaded = Math.max(0, (socket.sessions.get(sessId)?.messages.length ?? beforeCount) - beforeCount);
         return { ok: true, loaded, hasMore: raw.hasMoreBefore };
@@ -1035,8 +1043,23 @@ export function useChatSocket(opts: {
     [userId],
   );
   const auxiliaryHydrationRef = useRef<Set<string>>(new Set());
+  const auxiliaryScanMarkRef = useRef<Map<string, { ref: ChatMessage[]; len: number }>>(new Map());
   useEffect(() => {
+    auxiliaryScanMarkRef.current.clear();
+  }, [userId]);
+  useEffect(() => {
+    const marks = auxiliaryScanMarkRef.current;
+    if (marks.size > socket.sessions.size) {
+      for (const id of marks.keys()) {
+        if (!socket.sessions.has(id)) marks.delete(id);
+      }
+    }
     for (const [sessId, session] of socket.sessions) {
+      const prev = marks.get(sessId);
+      if (prev && prev.ref === session.messages && prev.len === session.messages.length) {
+        continue;
+      }
+      marks.set(sessId, { ref: session.messages, len: session.messages.length });
       for (const message of session.messages) {
         if (
           message._timelineAuxiliary !== "bash-tail" ||
@@ -1063,9 +1086,8 @@ export function useChatSocket(opts: {
         ).then((records) => {
           if (records) socket.resolveTimelineAuxiliary(sessId, message._timelineUnitKey!, records);
         }).catch(() => {
-          // The exact locator remains resident and can retry after the next
-          // history/sync event; a transient Range failure never creates a
-          // substitute ToolCard or discards the visible transcript.
+          // Clear scan mark so next history/sync can retry this deferred locator.
+          marks.delete(sessId);
         }).finally(() => {
           auxiliaryHydrationRef.current.delete(requestKey);
         });
@@ -1119,19 +1141,15 @@ export function useChatSocket(opts: {
     [userId],
   );
   const storedMaxSeq = useCallback(
-    (sessId: string | undefined) => {
-      void snap.version;
-      return (sessId && snap.sessions.get(sessId)?._maxSeq) || 0;
-    },
-    [snap],
+    (sessId: string | undefined) => (sessId && socket.sessions.get(sessId)?._maxSeq) || 0,
+    [socket],
   );
   const storedHistoryRevision = useCallback(
     (sessId: string | undefined) => {
-      void snap.version;
-      const value = sessId ? snap.sessions.get(sessId)?._historyRevision : undefined;
+      const value = sessId ? socket.sessions.get(sessId)?._historyRevision : undefined;
       return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
     },
-    [snap],
+    [socket],
   );
   const removePersisted = useCallback((sessId: string) => {
     sigRef.current.delete(sessId);

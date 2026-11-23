@@ -74,6 +74,7 @@ export function SubscriptionDialog({
   const [sub, setSub] = useState<MySubscription | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
   const [busyCode, setBusyCode] = useState<string | null>(null);
   const [intent, setIntent] = useState<SubscribeIntent | null>(initialIntent ?? null);
   const [confirmAction, confirmActionEl] = useConfirm();
@@ -147,7 +148,7 @@ export function SubscriptionDialog({
     return () => {
       alive = false;
     };
-  }, [open, stage.kind, plans, auth]);
+  }, [open, stage.kind, plans, auth, reloadTick]);
 
   useEffect(() => () => stopPoll(), [stopPoll]);
 
@@ -268,7 +269,21 @@ export function SubscriptionDialog({
       {confirmActionEl}
       <div>
         {err && (
-          <Alert tone="warning" className="mb-3 text-meta">
+          <Alert
+            tone="danger"
+            className="mb-3 text-meta"
+            action={
+              stage.kind === "plans" && !plans && !loading ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setReloadTick((n) => n + 1)}
+                >
+                  重试
+                </Button>
+              ) : undefined
+            }
+          >
             {err}
           </Alert>
         )}

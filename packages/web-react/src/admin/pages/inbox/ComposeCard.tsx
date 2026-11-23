@@ -638,7 +638,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
         )}
 
         {hasExternalImage && (
-          <div className="oc-callout oc-callout-warning rounded-xl px-3.5 py-2.5 text-[12px] leading-relaxed text-warning">
+          <div className="oc-callout oc-callout-warning rounded-xl px-3.5 py-2.5 text-meta leading-relaxed text-warning">
             外链图片会让第三方图片服务器看到收件人的 IP 与访问时间；敏感内容请使用平台上传。
           </div>
         )}

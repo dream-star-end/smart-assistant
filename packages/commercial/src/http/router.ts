@@ -1,4 +1,5 @@
 import { dispatchSessionMetadataRead } from './sessionMetadata.js'
+import { handleUnauthenticatedClarvyRoute } from './clarvyRouteGuard.js'
 /**
  * T-16 — 商业化模块的 HTTP 路由器(无框架,基于 node:http)。
  *
@@ -413,6 +414,7 @@ import {
   handleCommercialOfficePreviewPage,
 } from './containerOfficePreviewProxy.js'
 import { handleCommercialSwarmCommand } from './containerSwarmCommandProxy.js'
+import { handleCreateLiveBrowserStreamTicket, isLiveBrowserStreamTicketPath } from './liveBrowserTicket.js'
 import {
   handleCommercialSessionBackgroundTasks,
   isSessionBackgroundTasksPath,
@@ -511,13 +513,9 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   { re: /^\/api\/agents\/[^/]+\/persona$/, label: '/api/agents/:id/persona' },
   // /api/agents/:id/message POST + /api/agents/:id/delegate POST —— host agent 执行 prompt = RCE
   { re: /^\/api\/agents\/[^/]+\/(message|delegate)$/, label: '/api/agents/:id/(message|delegate)' },
-  // 内存 / 技能(host singleton 存储)。memdir 范式后 memory 面多了 files/:file 子路由
-  // (单条记忆文件 CRUD),与 memory/user 同属 host singleton,必须一并拦死;文件名段
-  // 放宽到任意非斜杠段(拦截面宁宽勿漏,文件名合法性校验是容器 gateway 的事)。
-  {
-    re: /^\/api\/agents\/[^/]+\/memory\/(memory|user|usage|context|files\/[^/]+)$/,
-    label: '/api/agents/:id/memory/*',
-  },
+  // 内存/技能与 Clarvy 上下文健康/清理/记忆归档箱(OCV5-859):host singleton 兜底拦截
+  { re: /^\/api\/agents\/[^/]+\/memory\/(memory|user|usage|context|files\/[^/]+|archive(\/restore)?)$/, label: '/api/agents/:id/memory/*' },
+  { re: /^\/api\/agents\/[^/]+\/(context-health|context-hygiene\/.+)$/, label: '/api/agents/:id/context-(health|hygiene)' },
   // Auto-Dream Optimizer 读写用户容器内的审计/建议状态并可应用已确认的变更。
   // 正常请求先由 containerApiProxy 转发；这里全方法拦截仅作 host singleton 兜底。
   {
@@ -536,8 +534,9 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // 容器内实时云浏览器接管(OCV5-813):必须经 containerApiProxy 落入调用者自己的隔离容器,
   // 禁止在 host singleton 兜底执行。
   { re: /^\/api\/agents\/[A-Za-z0-9_-]+\/browser\/(live|action)$/, label: '/api/agents/:id/browser/*' },
-  // 用户级共享技能库(host singleton 存储);付费用户只能经 container proxy 操作自己容器
+  // 用户级共享技能库与 Clarvy 技能归档箱(OCV5-859):host singleton 兜底
   { re: /^\/api\/skills(\/[A-Za-z0-9_\-]+)?$/, label: '/api/skills' },
+  { re: /^\/api\/skills\/(archive\/restore|[^/]+\/archive)$/, label: '/api/skills/:name/archive' },
   // SkillOpt 训练(/api/skills/:name/train + /api/skill-training/*):同样落 host singleton
   // 存储 + 起 host 主 agent 会话 = RCE/越权,付费用户必须经 container proxy(见 bridge
   // allowlist)。这里 block host 兜底,防 proxy 关闭/admin 绕过时落到 master host。
@@ -1890,10 +1889,12 @@ export function createCommercialHandler(
     // 这里**先检查 isOurs**,把 "不关心的路径(如 /ws 、/healthz)" 留给下层。
     const isSwarmCommandPath = SWARM_COMMAND_ROUTE_RE.test(path)
     const isSessionBgTasksPath = isSessionBackgroundTasksPath(path)
+    const isLiveBrowserTicketPath = isLiveBrowserStreamTicketPath(path)
     const isOursForMaintenance =
       prefixes.some((p) => path === p || path.startsWith(p)) ||
       isSwarmCommandPath ||
-      isSessionBgTasksPath
+      isSessionBgTasksPath ||
+      isLiveBrowserTicketPath
     const isAllowlistForMaintenance =
       path.startsWith('/api/admin/') ||
       path === '/api/public/config' ||
@@ -2044,58 +2045,30 @@ export function createCommercialHandler(
       return true
     }
 
-    // ── Swarm 控制指令代理(OCV5-828 / OCV5-832)──────────────────────────
-    // POST /api/sessions/:id/swarm/command:预路由直发，不把 `/api/sessions/` 加进
-    // COMMERCIAL_ROUTE_PREFIXES(以免吞掉 gateway 负责的 /api/sessions/list 等路由)。
-    // handler 内强校验 JWT、session 归属并拒客户端 brainDir，转发至用户容器 /internal/swarm/command。
-    if (isSwarmCommandPath) {
+    // ── 预路由直发（Swarm 指令 OCV5-828、会话后台任务 OCV5-844、实时浏览器 WS 票据 OCV5-857）──
+    // 不将 /api/sessions/ 或 /api/agents/ 加入 COMMERCIAL_ROUTE_PREFIXES（避免吞掉容器代理与 gateway 路由）。
+    const preRoute = isSwarmCommandPath
+      ? { route: '/api/sessions/:id/swarm/command', handler: handleCommercialSwarmCommand }
+      : isSessionBgTasksPath
+        ? { route: '/api/sessions/:id/background-tasks', handler: handleCommercialSessionBackgroundTasks }
+        : isLiveBrowserTicketPath
+          ? { route: '/api/agents/:id/browser/stream-ticket', handler: handleCreateLiveBrowserStreamTicket }
+          : null
+    if (preRoute) {
       setSecurityHeaders(res)
       const requestId = ensureRequestId(req)
       res.setHeader(REQUEST_ID_HEADER, requestId)
       const { traceId, traceIdOrigin } = resolveRequestTrace(req.headers)
-      const swarmLog = httpLogger.child({
-        requestId,
-        route: '/api/sessions/:id/swarm/command',
-        method,
-        path: safeLogPath,
-        clientIp: clientIpOf(req),
-        traceId,
-        traceIdOrigin,
-      })
-      const swarmCtx: RequestContext = {
-        requestId,
-        clientIp: clientIpOf(req),
-        authBoundIp: req.socket.remoteAddress ?? 'unknown',
-        userAgent: userAgentOf(req),
-        log: swarmLog,
-      }
+      const preLog = httpLogger.child({ requestId, route: preRoute.route, method, path: safeLogPath, clientIp: clientIpOf(req), traceId, traceIdOrigin })
+      const preCtx: RequestContext = { requestId, clientIp: clientIpOf(req), authBoundIp: req.socket.remoteAddress ?? 'unknown', userAgent: userAgentOf(req), log: preLog }
       const startedAt = Date.now()
       try {
-        await handleCommercialSwarmCommand(req, res, swarmCtx, deps)
+        await preRoute.handler(req, res, preCtx, deps)
       } catch (err) {
-        handleError(err, res, requestId, swarmLog)
+        handleError(err, res, requestId, preLog)
       }
-      incrGatewayRequest('/api/sessions/:id/swarm/command', method, res.statusCode)
-      swarmLog.info('http_request', { status: res.statusCode, durationMs: Date.now() - startedAt })
-      return true
-    }
-
-    // ── 会话后台任务聚合与单条取消代理(OCV5-844)──────────────────────────
-    if (isSessionBgTasksPath) {
-      setSecurityHeaders(res)
-      const requestId = ensureRequestId(req)
-      res.setHeader(REQUEST_ID_HEADER, requestId)
-      const { traceId, traceIdOrigin } = resolveRequestTrace(req.headers)
-      const bgLog = httpLogger.child({ requestId, route: '/api/sessions/:id/background-tasks', method, path: safeLogPath, clientIp: clientIpOf(req), traceId, traceIdOrigin })
-      const bgCtx: RequestContext = { requestId, clientIp: clientIpOf(req), authBoundIp: req.socket.remoteAddress ?? 'unknown', userAgent: userAgentOf(req), log: bgLog }
-      const startedAt = Date.now()
-      try {
-        await handleCommercialSessionBackgroundTasks(req, res, bgCtx, deps)
-      } catch (err) {
-        handleError(err, res, requestId, bgLog)
-      }
-      incrGatewayRequest('/api/sessions/:id/background-tasks', method, res.statusCode)
-      bgLog.info('http_request', { status: res.statusCode, durationMs: Date.now() - startedAt })
+      incrGatewayRequest(preRoute.route, method, res.statusCode)
+      preLog.info('http_request', { status: res.statusCode, durationMs: Date.now() - startedAt })
       return true
     }
 
@@ -2406,8 +2379,8 @@ export function createCommercialHandler(
         incrGatewayRequest('__blocked_for_user__', method, res.statusCode)
         return true
       }
-      // 无 commercial JWT:可能是 legacy 单 token / 无 token / 非法 token。
-      // 不在这里拦 —— fall through 给 gateway 自己的 auth 层按正常 401/403 流程处理。
+      if (handleUnauthenticatedClarvyRoute(path, method, res, requestId, blockLog)) return true
+      // 无 commercial JWT:fall through 给 gateway auth 层处理 401/403
       return false
     }
 

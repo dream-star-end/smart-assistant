@@ -4,7 +4,9 @@
  * The close itself stays in BoxDurableJournal (markRunExpiredUnproven and the
  * proof-based closers); kept apart from it under the file-size ratchet. */
 import type { Pool } from "pg";
-import { BOX_MODEL_IDS_SQL, BoxDurableJournalError, OWNER_CONTAINER_GONE, STOP_MODE_FENCE, STOP_PROBE_STATE_FENCE,
+import { updateClearRunAbsence, updateRecordAbandonedHandoffStop,
+  updateRecordRunAbsence } from "../../billing/boxBillingStore.js";
+import { BOX_MODEL_IDS_SQL, BoxDurableJournalError, STOP_MODE_FENCE, STOP_PROBE_STATE_FENCE,
   type BoxJournalAdmission, type BoxStoppedFailureProbeCandidate } from "./boxDurableJournal.js";
 import { isBoxBootId, parseBoxRunAbsent, type BoxRunAbsent } from "./boxExpiredClose.js";
 
@@ -22,35 +24,21 @@ export class BoxHoldRelease {
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !isBoxBootId(input.boot)) {
       throw new BoxDurableJournalError("BOX_RUN_ABSENT_IDENTITY_INVALID");
     }
-    const changed = await this.pool.query<{ seen: unknown }>(
-      `WITH prior AS (
-         SELECT ctx->'boxRunAbsent' AS seen FROM request_finalize_journal
-          WHERE request_id=$1 AND user_id=$2 FOR UPDATE)
-       UPDATE request_finalize_journal
-          SET ctx=CASE WHEN ctx ? 'boxRunAbsent' THEN ctx
-            ELSE ctx || jsonb_build_object('boxRunAbsent',jsonb_build_object('v',1,
-              'atMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint,'boot',$6::text)) END
-         FROM prior
-        WHERE request_id=$1 AND user_id=$2 AND ${STOP_PROBE_STATE_FENCE}
-          AND ctx->>'boxInvocationRecovery'='v1'
-          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
-          AND ctx->>'boxLeaseEpoch'=$5
-          AND NOT (ctx ? 'boxResumeRequestId') AND NOT (ctx ? 'boxTerminalProof')
-        RETURNING prior.seen`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch, input.boot]);
+    const changed = await updateRecordRunAbsence(this.pool, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch, boot: input.boot,
+    });
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_RUN_ABSENT_FENCE_LOST");
-    return parseBoxRunAbsent(changed.rows[0]?.seen);
+    return parseBoxRunAbsent(changed.seen);
   }
 
   /** OCV5-488: a later look found the run alive again; the next absence
    * starts over. */
   async clearRunAbsence(input: BoxStoppedFailureProbeCandidate): Promise<void> {
-    await this.pool.query(
-      `UPDATE request_finalize_journal SET ctx=ctx - 'boxRunAbsent'
-        WHERE request_id=$1 AND user_id=$2 AND ctx ? 'boxRunAbsent'
-          AND ctx->>'boxRunNonce'=$3 AND ctx->>'boxLeaseEpoch'=$4`,
-      [input.requestId, input.uid.toString(), input.runNonce, input.leaseEpoch]);
+    await updateClearRunAbsence(this.pool, {
+      requestId: input.requestId, uid: input.uid,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
+    });
   }
 
   /** OCV5-488: durable intent before the worker asks the original keeper to
@@ -64,22 +52,10 @@ export class BoxHoldRelease {
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) {
       throw new BoxDurableJournalError("BOX_ABANDONED_STOP_IDENTITY_INVALID");
     }
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx=ctx || jsonb_build_object('boxAbandonedHandoffStop',
-            COALESCE(ctx->'boxAbandonedHandoffStop', jsonb_build_object(
-              'atMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint)))
-        WHERE request_id=$1 AND user_id=$2
-          AND state IN ('inflight','finalizing','committed')
-          AND ctx->>'boxInvocationRecovery'='v1'
-          AND ctx->>'boxState'='handoff' AND ctx ? 'boxToolHandoff'
-          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
-          AND ctx->>'boxLeaseEpoch'=$5
-          AND NOT (ctx ? 'boxTerminalProof') AND NOT (ctx ? 'boxResumeRequestId')
-          AND ${OWNER_CONTAINER_GONE}`,
-      [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch]);
-    return changed.rowCount === 1;
+    return updateRecordAbandonedHandoffStop(this.pool, {
+      requestId: input.requestId, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
+    });
   }
 
   /** OCV5-488: the container reads a turn's idle proof only after that turn

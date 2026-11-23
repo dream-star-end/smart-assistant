@@ -233,17 +233,7 @@ export function sseText(raw: string): string {
   return text;
 }
 
-/** The compaction runs before the request's dispatch identity is known, so its usage row first
- * carries the container's session id. Once the proxy has the final (server-owned) session id it
- * relabels that one row, so per-session usage counts the compaction with its chat. Statistics
- * only: cost, ledger and journal are untouched. */
-export async function relabelBoxSwitchSession(pool: Pick<Pool, "query">, input: { uid: bigint;
-  billingRequestId: string; sessionId: string }): Promise<boolean> {
-  const updated = await pool.query(`UPDATE usage_records SET session_id = $3
-     WHERE user_id = $1 AND request_id = $2 AND session_id IS DISTINCT FROM $3`,
-  [input.uid.toString(), input.billingRequestId, input.sessionId]);
-  return updated.rowCount === 1;
-}
+export { relabelBoxSwitchSession } from "../../billing/boxBillingStore.js";
 
 export interface BoxSwitchDeps {
   pgPool: Pool;

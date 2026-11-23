@@ -19,7 +19,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import type { EvidenceManifest } from "@openclaude/protocol/research";
+import type { CitationStyle, EvidenceManifest, NormalizedDocument } from "@openclaude/protocol/research";
+import { resolveEvidenceGrade } from "@openclaude/protocol/research";
 import {
   getSkillEmbeddingProvider,
   skillEmbeddingBackendId,
@@ -41,6 +42,7 @@ import {
 import { makePgSkillEmbedCache } from "../http/skillEmbedCachePg.js";
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from "../http/util.js";
 import { formatRecord, verifyIdentifier, verifyIdentifiers } from "./cite.js";
+import { buildExternalPdfExtractor } from "./externalExtract.js";
 import type { FetchFulltextConfig, FetchRecordInput } from "./fetchFulltext.js";
 import { type LitSourceName, searchMultiSource } from "./litSearch.js";
 import { type SemanticQueryDeps, queryDocuments } from "./litrag.js";
@@ -192,6 +194,12 @@ export interface ResearchProxyDeps {
   jobStore?: Partial<ResearchJobStoreDeps>;
   /** lit/fetch 的 ingest 抽取注入(测试;同 researchHandlers.IngestDeps.extract)。 */
   fetchExtract?: Parameters<typeof ingestBlob>[1]["extract"];
+  /** ingest/parse 的本地抽取注入(测试;同 researchHandlers.IngestDeps.extract)。 */
+  ingestExtract?: Parameters<typeof ingestBlob>[1]["extract"];
+  /** 外部 PDF 解析 HTTP 超时覆盖(ms, 测试用)。 */
+  externalExtractTimeoutMs?: number;
+  /** 外部 PDF 解析响应字节上限覆盖(测试用)。 */
+  externalExtractMaxResponseBytes?: number;
 }
 
 /** fetch-batch / job-status 用的 durable job store 面(注入 seam)。 */
@@ -402,11 +410,11 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
         return;
       }
       if (reqPath === `${RESEARCH_PREFIX}cite/format`) {
-        await handleCiteFormat(res, body, cfg, readSecrets, deps.fetchImpl, requestId);
+        await handleCiteFormat(res, body, cfg, identity.userId, store, readSecrets, deps.fetchImpl, requestId);
         return;
       }
       if (reqPath === `${RESEARCH_PREFIX}ingest/parse`) {
-        await handleIngest(res, body, cfg, identity.userId, store, requestId);
+        await handleIngest(res, body, cfg, identity.userId, store, readSecrets, deps, log, requestId);
         return;
       }
       if (reqPath === `${RESEARCH_PREFIX}litrag/query`) {
@@ -440,7 +448,7 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
           return;
         }
         if (reqPath === `${RESEARCH_PREFIX}lit/fetch`) {
-          await handleLitFetch(res, body, cfg, identity.userId, deps, store, requestId);
+          await handleLitFetch(res, body, cfg, identity.userId, deps, store, readSecrets, log, requestId);
           return;
         }
         if (reqPath === `${RESEARCH_PREFIX}lit/fetch-batch`) {
@@ -618,18 +626,67 @@ async function handleCiteVerify(
   sendJson(res, 200, { verdicts }, requestId);
 }
 
+const VALID_CITATION_STYLES = new Set<CitationStyle>([
+  "bibtex",
+  "apa",
+  "gb-t-7714-2015",
+  "gb-t-7714",
+  "ieee",
+  "nature",
+]);
+
+function normalizeEvidenceMatchText(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9\u3400-\u9fff]+/g, "");
+}
+
+function documentMatchesSourceRecord(
+  doc: NormalizedDocument,
+  record: NonNullable<Awaited<ReturnType<typeof verifyIdentifier>>["record"]>,
+): boolean {
+  // 仅比对文档自身标题与前部头信息(前 3 段 / 1500 字符),绝不扫描全文或参考文献表,
+  // 防止综述类文档因参考文献表列出某篇论文 DOI 就被误判为该论文的本地全文(Grade A)。
+  const doi = record.doi?.trim().toLowerCase();
+  const arxivId = record.arxivId?.trim().toLowerCase();
+  const headerParts: string[] = [];
+  if (doc.title) headerParts.push(doc.title);
+  let headerChars = 0;
+  for (let i = 0; i < Math.min(doc.spans.length, 3) && headerChars < 1500; i++) {
+    const s = doc.spans[i]!;
+    if (/^(references|bibliography|参考文献)\b/i.test(s.text.trim())) break;
+    const slice = s.text.slice(0, 1500 - headerChars);
+    headerParts.push(slice);
+    headerChars += slice.length;
+  }
+  const rawHeader = headerParts.join("\n").toLowerCase();
+  const normRecordTitle = normalizeEvidenceMatchText(record.title);
+  const normDocTitle = normalizeEvidenceMatchText(doc.title ?? "");
+  if (normRecordTitle && normDocTitle && normDocTitle === normRecordTitle) return true;
+  if (normRecordTitle && normRecordTitle.length >= 12 && normDocTitle.includes(normRecordTitle)) {
+    return true;
+  }
+  if (doi && rawHeader.includes(doi)) return true;
+  if (arxivId && rawHeader.includes(arxivId)) return true;
+  if (normRecordTitle && normRecordTitle.length >= 12) {
+    const normHeader = normalizeEvidenceMatchText(rawHeader);
+    if (normHeader.includes(normRecordTitle)) return true;
+  }
+  return false;
+}
+
 async function handleCiteFormat(
   res: ServerResponse,
   body: Record<string, unknown>,
   cfg: ResearchConfigPublic,
+  userId: number,
+  store: ResearchStoreDeps,
   readSecrets: () => Promise<ResearchSecrets>,
   fetchImpl: FetchLike | undefined,
   requestId: string,
 ): Promise<void> {
   const identifier = typeof body.identifier === "string" ? body.identifier : "";
-  const style =
-    body.style === "bibtex" || body.style === "apa" || body.style === "gb-t-7714-2015"
-      ? body.style
+  const style: CitationStyle =
+    typeof body.style === "string" && VALID_CITATION_STYLES.has(body.style as CitationStyle)
+      ? (body.style as CitationStyle)
       : "gb-t-7714-2015";
   if (!identifier) {
     sendErr(res, 400, "BAD_REQUEST", "identifier required", requestId);
@@ -644,10 +701,28 @@ async function handleCiteFormat(
     sendJson(res, 200, { verdict }, requestId);
     return;
   }
+  const docId = typeof body.docId === "string" ? body.docId.trim() : "";
+  const spanId = typeof body.spanId === "string" ? body.spanId.trim() : "";
+  let localEvidenceVerified = false;
+  if (docId && spanId) {
+    const doc = await store.getDocument(userId, docId).catch(() => null);
+    if (
+      doc &&
+      doc.spans.some((s) => s.spanId === spanId) &&
+      documentMatchesSourceRecord(doc, verdict.record)
+    ) {
+      localEvidenceVerified = true;
+    }
+  }
+  // 权威 A 级只能来自已核验且归属该用户并关联本条引文的本地全文 span;调用方自报仅可降级为 'B'。
+  const evidenceGrade = resolveEvidenceGrade({
+    evidenceGrade: body.evidenceGrade === "B" ? "B" : undefined,
+    localEvidenceVerified,
+  });
   sendJson(
     res,
     200,
-    { verdict: { ...verdict, formatted: formatRecord(verdict.record, style) } },
+    { verdict: { ...verdict, evidenceGrade, formatted: formatRecord(verdict.record, style) } },
     requestId,
   );
 }
@@ -679,6 +754,9 @@ async function handleIngest(
   cfg: ResearchConfigPublic,
   userId: number,
   store: ResearchStoreDeps,
+  readSecrets: () => Promise<ResearchSecrets>,
+  deps: ResearchProxyDeps,
+  log: (level: "warn" | "error", msg: string, fields?: Record<string, unknown>) => void,
   requestId: string,
 ): Promise<void> {
   const blobId = typeof body.blobId === "string" ? body.blobId : "";
@@ -702,6 +780,12 @@ async function handleIngest(
       throw err;
     }
   }
+  const externalExtract = buildExternalPdfExtractor(cfg, readSecrets, {
+    fetchImpl: deps.fetchImpl,
+    timeoutMs: deps.externalExtractTimeoutMs,
+    maxResponseBytes: deps.externalExtractMaxResponseBytes,
+    log,
+  });
   const outcome = await ingestBlob(
     { userId, blobId, filename, engine: cfg.config.ingest.engine },
     {
@@ -711,6 +795,8 @@ async function handleIngest(
       },
       readBlobBytes: store.readBlobBytes,
       putDocument: (uid, doc) => store.putDocument({ userId: uid, doc }),
+      extract: deps.ingestExtract,
+      externalExtract,
     },
   );
   if (!outcome.ok) {
@@ -945,6 +1031,8 @@ async function handleLitFetch(
   userId: number,
   deps: ResearchProxyDeps,
   store: ResearchStoreDeps,
+  readSecrets: () => Promise<ResearchSecrets>,
+  log: (level: "warn" | "error", msg: string, fields?: Record<string, unknown>) => void,
   requestId: string,
 ): Promise<void> {
   const records = parseFetchRecords(body.records, 5);
@@ -970,6 +1058,13 @@ async function handleLitFetch(
     addMembership = (uid, docId, pid) => lib.addMembership(uid, docId, pid);
   }
 
+  const externalExtract = buildExternalPdfExtractor(cfg, readSecrets, {
+    fetchImpl: deps.fetchImpl,
+    timeoutMs: deps.externalExtractTimeoutMs,
+    maxResponseBytes: deps.externalExtractMaxResponseBytes,
+    log,
+  });
+
   const results: FetchRecordOutcome[] = [];
   for (const record of records) {
     results.push(
@@ -990,6 +1085,7 @@ async function handleLitFetch(
           recordAttempt: store.recordFetchAttempt,
           addMembership,
           extract: deps.fetchExtract,
+          externalExtract,
         },
       ),
     );

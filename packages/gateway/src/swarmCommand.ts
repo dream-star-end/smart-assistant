@@ -676,13 +676,15 @@ export async function terminateSwarmMember(
   };
 }
 
-// ── 高阶剧本库(4 套内置科研/工程默认模板) ─────────────────────────────────────
+// ── 高阶剧本库(6 套内置科研/工程默认模板) ─────────────────────────────────────
 
 export type SwarmPlaybookId =
   | "parallel-impl-verify"
   | "multi-source-lit-verify"
   | "arch-deep-audit"
-  | "multi-option-review";
+  | "multi-option-review"
+  | "research-write-review-revise"
+  | "research-controlled-exp-loop";
 
 export interface SwarmPlaybookRoleSpec {
   name: string;
@@ -905,6 +907,119 @@ export const SWARM_PLAYBOOK_TEMPLATES: readonly SwarmPlaybookTemplate[] = Object
     guardrails: [
       "双提案阶段独立发帖，避免过早趋同。",
       "最终推荐必须附带明确的不选理由与可验证的回滚路径。",
+    ],
+  },
+  {
+    id: "research-write-review-revise",
+    title: "论文写作+盲审+批判修订",
+    aliases: [
+      "写审修",
+      "write-review-revise",
+      "论文盲审修订",
+      "科研双版修订",
+    ],
+    category: "research",
+    summary:
+      "跨强模型主笔撰稿、独立双盲审稿质询与批判修订闭环，最终交付干净版 + Word 标黄 Diff 修订双版与去 AI 味体检报告。",
+    channels: [
+      { name: "main", topic: "选题范围、终稿定版与双版 DOCX 交付清单" },
+      { name: "draft", topic: "初稿撰写、oc-cite 引用接地与 A/B 级证据标注" },
+      { name: "review", topic: "独立盲审意见、逐条 Rebuttal 与修订核验" },
+    ],
+    roles: [
+      {
+        name: "coordinator",
+        role: "coordinator",
+        workspace: "inherit",
+        responsibility: "明确投稿体裁与引用格式（GB/T 7714/APA/IEEE/Nature），统筹写→盲审→批判修订节奏并核验收口双版产物。",
+      },
+      {
+        name: "author-writer",
+        role: "worker",
+        workspace: "share",
+        responsibility: "基于已入库权威文献撰写初稿（强制 oc-cite 校验与 A/B 证据分级），产出可对比基准稿 base.docx。",
+      },
+      {
+        name: "blind-reviewer",
+        role: "verifier",
+        workspace: "inherit",
+        readOnly: true,
+        responsibility: "独立只读盲审：从方法学严谨性、论证漏洞、引用可溯源性与 AI 味表达四维提出分级审稿意见（Major/Minor）。",
+      },
+      {
+        name: "revision-editor",
+        role: "worker",
+        workspace: "share",
+        responsibility: "逐条回应审稿意见完成批判修订，运行 oc-docx diff 生成干净版+标黄修订双版并过 OMML 零乱码与 oc-stylecheck 门禁。",
+      },
+    ],
+    workflow: [
+      "1. @coordinator 划定论文结构、目标期刊引用规范与去 AI 味风格基线。",
+      "2. @author-writer 完成初稿并经 oc-cite 核验全部引文与 A/B 级证据，导出 base.docx 后交接 @blind-reviewer。",
+      "3. @blind-reviewer 严格只读执行独立盲审，按 Major/Minor 列出可复核问题，交接 @revision-editor。",
+      "4. @revision-editor 逐条批判修订并产出 revised.docx，执行 `oc-docx diff` 输出干净版 + 标黄修订双版与 `oc-stylecheck` 报告，交 @coordinator 终审交付。",
+    ],
+    guardrails: [
+      "严格执行 quote-first 与 A/B 级证据分级（A=本地全文逐字核验，B=仅摘要/题录元数据），禁止臆造任何引文与实验数据。",
+      "盲审员保持只读且不与主笔串通，避免自我辩护式橡皮图章审查。",
+      "交付前必须通过 `oc-docx diff`（含 OMML 零 `¿` 乱码核验）与 `oc-stylecheck` 去 AI 味扫描。",
+    ],
+  },
+  {
+    id: "research-controlled-exp-loop",
+    title: "受控实验循环（防刷分）",
+    aliases: [
+      "受控实验",
+      "controlled-exp",
+      "exp-loop",
+      "防刷分实验循环",
+    ],
+    category: "research",
+    summary:
+      "锁定评测集与评判脚本防 Reward Hacking，按「假设→单变量改动→复现实验→独立锁评测审计」闭环推进受控实验迭代。",
+    channels: [
+      { name: "main", topic: "研究假设、基线指标与最终实验结论" },
+      { name: "experiment", topic: "单变量改动记录、随机种子与实验原始输出" },
+      { name: "eval-audit", topic: "评测集哈希锁校验、统计显著性与消融复核" },
+    ],
+    roles: [
+      {
+        name: "coordinator",
+        role: "coordinator",
+        workspace: "inherit",
+        responsibility: "制定研究假设与评测锁定清单，记录每轮迭代指标账本，基于统计证据决定继续、回退或收敛交付。",
+      },
+      {
+        name: "exp-engineer",
+        role: "worker",
+        workspace: "share",
+        responsibility: "在严格不改动锁定评测代码/测试集的前提下，每轮仅执行一个明确假设驱动的单变量实验改动并保留完整运行日志。",
+      },
+      {
+        name: "eval-guardian",
+        role: "verifier",
+        workspace: "inherit",
+        readOnly: true,
+        responsibility: "独立只读守护评测完整性：校验评测脚本/测试集哈希零篡改、排查数据泄漏与过拟合刷分（Reward Hacking），复跑验证结果可复现。",
+      },
+      {
+        name: "ablation-analyst",
+        role: "worker",
+        workspace: "inherit",
+        readOnly: true,
+        responsibility: "汇总多轮对比指标、执行消融与误差分析、用科学绘图与 oc-figcheck 输出出版级实验图表。",
+      },
+    ],
+    workflow: [
+      "1. @coordinator 与 @eval-guardian 先记录锁定评测脚本、测试集切分与基线分数的 SHA-256 指纹并广播 @all。",
+      "2. @exp-engineer 提出单一可证伪假设并实施最小单变量改动，跑完固定随机种子实验后交接 @eval-guardian。",
+      "3. @eval-guardian 核查评测文件零篡改、零测试集泄漏并独立复跑核验指标；发现 Reward Hacking 立即判 FAIL 并退回。",
+      "4. 有效增益经 @ablation-analyst 补齐消融对比与统计分析，由 @coordinator 汇总可复现实验报告与图表。",
+    ],
+    guardrails: [
+      "严禁修改、放宽或绕过锁定的评测脚本、测试集切分与指标计算公式（零容忍 Reward Hacking）。",
+      "每轮实验只允许单变量改动，必须记录随机种子、命令、基线对照与失败实验（禁止只报喜不报忧）。",
+      "评测守护员保持只读，未通过完整性与可复现核验的分数不得进入结论。",
     ],
   },
 ]);

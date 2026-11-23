@@ -11,10 +11,10 @@ export default function ComposerImageLightbox({
   return (
     <Dialog.Root open onOpenChange={(o) => !o && onClose()}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm data-[state=open]:animate-fade" />
+        <Dialog.Overlay className="fixed inset-0 z-[var(--z-viewer)] bg-black/70 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
           aria-describedby={undefined}
-          className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 focus:outline-none"
+          className="fixed left-1/2 top-1/2 z-[var(--z-viewer)] max-h-[90vh] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 focus:outline-none"
         >
           <Dialog.Title className="sr-only">{preview.name || "图片预览"}</Dialog.Title>
           <img
@@ -26,7 +26,8 @@ export default function ComposerImageLightbox({
             <button
               type="button"
               aria-label="关闭预览"
-              className="oc-surface-glass oc-btn-tactile absolute -right-2 -top-2 flex size-9 items-center justify-center rounded-full text-fg outline-none hover:text-accent focus-visible:ring-2 focus-visible:ring-ring"
+              title="关闭预览"
+              className="oc-surface-glass oc-btn-tactile absolute right-2 top-2 flex size-11 items-center justify-center rounded-full text-fg outline-none hover:text-accent focus-visible:ring-2 focus-visible:ring-ring"
             >
               <X size={16} strokeWidth={1.75} />
             </button>

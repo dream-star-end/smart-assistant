@@ -7,6 +7,7 @@
  * it (enforced by router.ts's agent-bypass guard + no user JWT in containers).
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { Pool } from 'pg'
 
 import { marketplaceArtifactCompatibility } from '@openclaude/protocol'
 import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
@@ -16,7 +17,10 @@ import { writeAdminAuditBestEffort } from '../admin/audit.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
 import { isSignalTrafficFilter, signalTrafficFilterValue } from '../analytics/signalTraffic.js'
 import { query } from '../db/queries.js'
-import { requireAuth } from '../http/auth.js'
+import {
+  authenticateActiveCommercialUser,
+  authenticateCommercialUser,
+} from '../http/activeUserAuth.js'
 import { HttpError, clientIpOf, readJsonBody, sendJson, userAgentOf } from '../http/util.js'
 import {
   VETTED_AGENT_TOOLSETS,
@@ -180,15 +184,30 @@ function mapMarketplaceError(e: unknown): HttpError {
   return e instanceof HttpError ? e : new HttpError(500, 'INTERNAL', 'marketplace error')
 }
 
+type MarketplaceAuthDeps = {
+  jwtSecret: string | Uint8Array
+  v3Supervisor?: { pool?: Pool }
+  verifyActiveAccount?: (userId: string) => Promise<boolean>
+  skipDbActiveCheck?: boolean
+}
+
+function authActiveMarketplaceUser(req: IncomingMessage, deps: MarketplaceAuthDeps) {
+  return authenticateActiveCommercialUser(req, deps.jwtSecret, {
+    pool: deps.v3Supervisor?.pool,
+    verifyActiveAccount: deps.verifyActiveAccount,
+    skipDbActiveCheck: deps.skipDbActiveCheck,
+  })
+}
+
 // ── GET /api/marketplace/revision ─────────────────────────────────────────
 // Opaque invalidation token for cross-client publication visibility. The
 // caller must compare equality only; one transaction may advance it >1.
 export async function handleMarketplaceRevision(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: MarketplaceAuthDeps,
 ): Promise<void> {
-  await requireAuth(req, deps.jwtSecret)
+  await authenticateCommercialUser(req, deps.jwtSecret)
   res.setHeader('Cache-Control', 'private, no-store')
   sendJson(res, 200, { revision: await getMarketplaceCatalogRevision() })
 }
@@ -225,9 +244,9 @@ function humanMetaScanBlocked(res: ServerResponse, name: string, meta: HumanMeta
 export async function handleMarketplacePublish(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: MarketplaceAuthDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveMarketplaceUser(req, deps)
   // 发布是唯一携带 bundle 的入口,body 上限放大到 PUBLISH_MAX_REQUEST_BYTES
   // (历史 bug:全局 64KB 默认让满额 bundle 在这里 413,能力被静默阉割)。
   const body = (await readJsonBody(req, PUBLISH_MAX_REQUEST_BYTES)) as Record<string, unknown>
@@ -286,9 +305,9 @@ export async function handleMarketplacePublish(
 export async function handleMarketplaceAgentPublish(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array; pricing?: { listPublic: () => Array<{ id: string }> } },
+  deps: MarketplaceAuthDeps & { pricing?: { listPublic: () => Array<{ id: string }> } },
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveMarketplaceUser(req, deps)
   const body = (await readJsonBody(req)) as Record<string, unknown>
   const slug = asStr(body.slug, 'slug', 64)
   if (!SLUG_RE.test(slug)) throw new HttpError(400, 'BAD_SLUG', 'slug 须为小写字母数字连字符(2-64)')
@@ -398,11 +417,11 @@ export async function handleMarketplaceAgentPublish(
 export async function handleMarketplaceConnectorPublish(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: MarketplaceAuthDeps,
 ): Promise<void> {
   if (!marketplaceConnectorsEnabled())
     throw new HttpError(404, 'NOT_FOUND', 'connector marketplace is not available')
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveMarketplaceUser(req, deps)
   const body = (await readJsonBody(req, PUBLISH_MAX_REQUEST_BYTES)) as Record<string, unknown>
   const prepared = prepareConnectorPublish(body)
   if (!prepared.ok) {
@@ -463,9 +482,9 @@ export async function handleMarketplaceConnectorPublish(
 export async function handleMarketplaceMyAgents(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: MarketplaceAuthDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authenticateCommercialUser(req, deps.jwtSecret)
   // 预设(编程/办公/科研,current approved,evergreen)+ 用户已装;同 slug 预设优先
   // (预设不 pin 版本,平台改版全员生效),与容器 sync 的合并规则一致。
   const presetSlugs = await platformPresetAgentSlugs()
@@ -549,9 +568,9 @@ export async function handleMarketplaceMyAgents(
 export async function handleMarketplaceInstall(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: MarketplaceAuthDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveMarketplaceUser(req, deps)
   const body = (await readJsonBody(req)) as Record<string, unknown>
   const versionId = asStr(body.versionId, 'versionId', 32)
   if (!/^\d+$/.test(versionId)) throw new HttpError(400, 'BAD_ID', 'invalid versionId')
@@ -636,9 +655,9 @@ export async function handleMarketplaceInstall(
 export async function handleMarketplaceInstalled(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: MarketplaceAuthDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authenticateCommercialUser(req, deps.jwtSecret)
   // 预设 slug 的历史安装行不展示:预设已平台化(恒在、evergreen、不可卸),
   // 在「已安装」里露出只会引导出没有意义的卸载/更新操作。
   const presetSet = new Set(await platformPresetAgentSlugs())
@@ -664,9 +683,9 @@ export async function handleMarketplaceInstalled(
 export async function handleMarketplaceInstalledScope(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: MarketplaceAuthDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveMarketplaceUser(req, deps)
   const userId = uid(user)
   const slug = slugFromPrefix(req, '/api/marketplace/installed/')
   if (!SLUG_RE.test(slug)) throw new HttpError(400, 'BAD_SLUG', 'invalid slug')
@@ -688,9 +707,9 @@ export async function handleMarketplaceInstalledScope(
 export async function handleMarketplaceMyPublishes(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: MarketplaceAuthDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authenticateCommercialUser(req, deps.jwtSecret)
   const publishes = await listMyPublishes(uid(user))
   sendJson(res, 200, {
     publishes: publishes.map((row) => ({
@@ -706,9 +725,9 @@ export async function handleMarketplaceMyPublishes(
 export async function handleMarketplaceWithdrawPublish(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: MarketplaceAuthDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveMarketplaceUser(req, deps)
   const m = (req.url ?? '').match(/\/api\/marketplace\/my-publishes\/(\d+)\/withdraw(?:\?|$)/)
   const versionId = m?.[1]
   if (!versionId) throw new HttpError(400, 'BAD_ID', 'invalid version id')
@@ -726,9 +745,9 @@ export async function handleMarketplaceWithdrawPublish(
 export async function handleMarketplaceUnlist(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: MarketplaceAuthDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveMarketplaceUser(req, deps)
   const m = (req.url ?? '').match(/\/api\/marketplace\/([a-z0-9][a-z0-9-]{1,63})\/unlist(?:\?|$)/)
   const slug = m?.[1]
   if (!slug) throw new HttpError(400, 'BAD_SLUG', 'invalid slug')
@@ -750,9 +769,9 @@ export async function handleMarketplaceUnlist(
 export async function handleMarketplaceDetail(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: MarketplaceAuthDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authenticateCommercialUser(req, deps.jwtSecret)
   const slug = slugFromPrefix(req, '/api/marketplace/')
   if (!SLUG_RE.test(slug)) throw new HttpError(400, 'BAD_SLUG', 'invalid slug')
   // org 可见性收口:org-private listing 对非本 org caller 视同不存在(404,不泄露存在性 oracle)。
@@ -788,9 +807,9 @@ export async function handleMarketplaceDetail(
 export async function handleMarketplaceUninstall(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { jwtSecret: string | Uint8Array },
+  deps: MarketplaceAuthDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const user = await authActiveMarketplaceUser(req, deps)
   const slug = slugFromPrefix(req, '/api/marketplace/installed/')
   if (!SLUG_RE.test(slug)) throw new HttpError(400, 'BAD_SLUG', 'invalid slug')
   // 平台预设与全能助手同级,不可卸载(sync 侧也会恒下发,卸了只会状态漂移)。

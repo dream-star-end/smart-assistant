@@ -17,6 +17,8 @@ export function QqBindingCard({
   onPatch: (patch: Record<string, unknown>) => Promise<void>
 }) {
   const [status, setStatus] = useState<QqBindingStatus | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [reloadTick, setReloadTick] = useState(0)
   const [binding, setBinding] = useState<QqBindingStart | null>(null)
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -35,10 +37,20 @@ export function QqBindingCard({
   }, [auth])
 
   useEffect(() => {
-    void refresh().catch((err) => {
-      setError(apiErrorMessage(err, 'QQ 绑定状态加载失败'))
-    })
-  }, [refresh])
+    let alive = true
+    setLoading(true)
+    setError(null)
+    void refresh()
+      .catch((err) => {
+        if (alive) setError(apiErrorMessage(err, 'QQ 绑定状态加载失败'))
+      })
+      .finally(() => {
+        if (alive) setLoading(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [refresh, reloadTick])
 
   useEffect(() => {
     if (!binding) return
@@ -105,10 +117,31 @@ export function QqBindingCard({
     }
   }
 
-  if (!status) {
+  if (loading && !status) {
     return (
       <div className="oc-surface-recessed flex items-center gap-2 rounded-xl px-4 py-4 text-meta text-muted">
         <Spinner /> 正在读取 QQ 绑定状态…
+      </div>
+    )
+  }
+
+  if (!status) {
+    return (
+      <div className="oc-surface-card rounded-xl p-4">
+        <Alert
+          tone="danger"
+          action={
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => setReloadTick((n) => n + 1)}
+            >
+              重试
+            </Button>
+          }
+        >
+          {error || 'QQ 绑定状态加载失败'}
+        </Alert>
       </div>
     )
   }

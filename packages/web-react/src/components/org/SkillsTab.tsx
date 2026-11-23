@@ -2,7 +2,7 @@ import { Boxes, Check, Plus } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, OrgSkill, OrgSkillsResponse } from "../../lib/types";
-import { Alert, Button, EmptyState, Spinner, useToast } from "../ui";
+import { Alert, Button, EmptyState, Spinner, useConfirm, useToast } from "../ui";
 import { orgErrText } from "./orgShared";
 
 /**
@@ -14,7 +14,9 @@ export function SkillsTab({ auth }: { auth: AuthSession }) {
   const [data, setData] = useState<OrgSkillsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
   const [busySlug, setBusySlug] = useState<string | null>(null);
+  const [confirm, confirmEl] = useConfirm();
   const toast = useToast();
 
   // 首次挂载拉技能（依赖数组不含 loading，防转圈）。
@@ -36,7 +38,7 @@ export function SkillsTab({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth]);
+  }, [auth, reloadTick]);
 
   async function reload() {
     try {
@@ -59,10 +61,17 @@ export function SkillsTab({ auth }: { auth: AuthSession }) {
     }
   }
 
-  async function uninstall(slug: string) {
-    setBusySlug(slug);
+  async function uninstall(skill: OrgSkill) {
+    const ok = await confirm({
+      title: `从组织移除技能「${skill.name}」？`,
+      body: "移除后，组织内所有成员的对话将不再自动加载该共享技能。",
+      danger: true,
+      confirmText: "移除",
+    });
+    if (ok !== true) return;
+    setBusySlug(skill.slug);
     try {
-      await api.uninstallOrgSkill(auth, slug);
+      await api.uninstallOrgSkill(auth, skill.slug);
       await reload();
       toast("已从组织移除", "success");
     } catch (e) {
@@ -82,7 +91,15 @@ export function SkillsTab({ auth }: { auth: AuthSession }) {
   if (err) {
     return (
       <div className="px-5 py-4">
-        <Alert tone="danger" className="text-meta">
+        <Alert
+          tone="danger"
+          className="text-meta"
+          action={
+            <Button size="sm" variant="secondary" onClick={() => setReloadTick((n) => n + 1)}>
+              重试
+            </Button>
+          }
+        >
           {err}
         </Alert>
       </div>
@@ -112,7 +129,7 @@ export function SkillsTab({ auth }: { auth: AuthSession }) {
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => uninstall(s.slug)}
+            onClick={() => void uninstall(s)}
             disabled={busySlug === s.slug}
           >
             {busySlug === s.slug ? <Spinner size={14} /> : null}
@@ -138,6 +155,7 @@ export function SkillsTab({ auth }: { auth: AuthSession }) {
           </Button>
         )}
       />
+      {confirmEl}
     </div>
   );
 }

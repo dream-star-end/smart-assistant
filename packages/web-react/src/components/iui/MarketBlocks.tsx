@@ -234,7 +234,7 @@ function useScrub(count: number, x0: number, x1: number) {
 
 // ── K 线 ──────────────────────────────────────────────────────────────
 
-const MA_COLORS = ["var(--iui-c3, #e0a45e)", "var(--iui-c2, #3b82f6)", "var(--iui-c4, #a855f7)"];
+const MA_COLORS = ["var(--iui-c3, var(--warning))", "var(--iui-c2, var(--info))", "var(--iui-c4, var(--accent))"];
 
 function KlineChart({ spec, width }: { spec: KlineSpec; width: number }) {
   const rows = spec.rows;

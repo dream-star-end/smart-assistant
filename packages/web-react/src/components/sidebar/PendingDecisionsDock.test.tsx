@@ -186,6 +186,7 @@ describe("PendingDecisionsDock · 统一待拍板聚合收件箱", () => {
     expect(onOpenLiveBrowser).toHaveBeenCalledWith({
       url: "https://github.com/login",
       sessionId: "sess-browser",
+      handoffId: "bh-1",
     });
 
     // 点击卡片 0 的批准按钮后从列表移除
@@ -380,5 +381,81 @@ describe("PendingDecisionsDock · 统一待拍板聚合收件箱", () => {
     expect(await screen.findByTestId("pending-decisions-dock")).toBeInTheDocument();
     expect(screen.getByTestId("pending-decisions-toggle")).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryAllByTestId("pending-decision-item")).toHaveLength(0);
+  });
+
+  it("B7: browser_handoff 直达接管透传持久化 resumeWhen/continuePrompt/handoffId，旧条目无 resumeWhen 兼容省略", async () => {
+    const auth = createMemoryAuthSession(() => {}, "jwt-pd-b7");
+    const items: PendingDecisionItem[] = [
+      makeItem({
+        id: "browser_handoff:bh-modern",
+        source: "browser_handoff",
+        sourceId: "bh-modern",
+        sessionId: "sess-modern",
+        title: "新版自动继续接管",
+        summary: "完成下载后自动交还",
+        metadata: {
+          url: "https://journal.example.org/login",
+          continuePrompt: "继续解析论文",
+          resumeWhen: {
+            urlLeave: ["/login"],
+            waitDownload: true,
+            autoResumeDelayMs: 3000,
+          },
+        },
+        allowedActions: ["approve", "deny"],
+      }),
+      makeItem({
+        id: "browser_handoff:bh-legacy",
+        source: "browser_handoff",
+        sourceId: "bh-legacy",
+        sessionId: "sess-legacy",
+        title: "旧版无条件接管",
+        summary: "请完成验证",
+        metadata: { url: "https://legacy.example.org/login" },
+        allowedActions: ["approve", "deny"],
+      }),
+    ];
+
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify(listPayload(items)), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    ) as typeof fetch;
+
+    const onOpenLiveBrowser = vi.fn();
+    render(
+      <ToastProvider>
+        <PendingDecisionsDock
+          auth={auth}
+          pollIntervalMs={0}
+          defaultCollapsed={false}
+          onOpenLiveBrowser={onOpenLiveBrowser}
+        />
+      </ToastProvider>,
+    );
+
+    const cards = await screen.findAllByTestId("pending-decision-item");
+    expect(cards).toHaveLength(2);
+
+    fireEvent.click(within(cards[0]!).getByTestId("pending-decision-goto"));
+    expect(onOpenLiveBrowser).toHaveBeenNthCalledWith(1, {
+      url: "https://journal.example.org/login",
+      sessionId: "sess-modern",
+      handoffId: "bh-modern",
+      continuePrompt: "继续解析论文",
+      resumeWhen: {
+        urlLeave: ["/login"],
+        waitDownload: true,
+        autoResumeDelayMs: 3000,
+      },
+    });
+
+    fireEvent.click(within(cards[1]!).getByTestId("pending-decision-goto"));
+    expect(onOpenLiveBrowser).toHaveBeenNthCalledWith(2, {
+      url: "https://legacy.example.org/login",
+      sessionId: "sess-legacy",
+      handoffId: "bh-legacy",
+    });
   });
 });

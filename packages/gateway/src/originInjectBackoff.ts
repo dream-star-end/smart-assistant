@@ -1,5 +1,12 @@
 import type { CronOriginFireResult } from './cronOriginSession.js'
 
+/**
+ * Master `/internal/v3/cron-origin-inject` reported proven-unexecuted
+ * `previously_failed` for this `clientMessageId`; callers must bump
+ * `callback_epoch` (bounded) to mint a fresh `clientMessageId`.
+ */
+export const ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE = 'ORIGIN_MESSAGE_PREVIOUSLY_FAILED'
+
 /** Shared with send_to_agent origin-inject: 12 attempts, 500ms → 5s. */
 export const ORIGIN_INJECT_RETRY_BUDGET = 12
 export const ORIGIN_INJECT_INITIAL_DELAY_MS = 500
@@ -31,7 +38,13 @@ export async function runBoundedOriginInjectBackoff(opts: {
     if (opts.isShuttingDown?.()) return { kind: 'fallback' }
     if (opts.shouldAbort?.()) return { kind: 'fallback' }
     const attempt = await opts.tryOnce()
-    if (attempt.kind === 'injected' || attempt.kind === 'fallback' || attempt.kind === 'terminal_failure') {
+    if (
+      attempt.kind === 'injected' ||
+      attempt.kind === 'fallback' ||
+      attempt.kind === 'terminal_failure' ||
+      (attempt.kind === 'retryable_failure' &&
+        attempt.code === ORIGIN_MESSAGE_PREVIOUSLY_FAILED_CODE)
+    ) {
       return attempt
     }
     await sleep(delayMs)

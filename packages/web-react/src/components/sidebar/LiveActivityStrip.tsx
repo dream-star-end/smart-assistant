@@ -2,7 +2,10 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { AuthSession } from "../../lib/types";
 import { StatusPill } from "../ui";
-import { PendingDecisionsDock } from "./PendingDecisionsDock";
+import {
+  type PendingDecisionBrowserHandoffOpenOpts,
+  PendingDecisionsDock,
+} from "./PendingDecisionsDock";
 import {
   type CollectLiveActivityInput,
   LIVE_ACTIVITY_BUCKETS,
@@ -87,8 +90,8 @@ export function LiveActivityStrip({
       data-has-attention={summary.counts.needs_you > 0 ? "true" : undefined}
       className="oc-live-strip"
     >
-      <div className="oc-live-strip-head">
-        <div role="group" aria-label="活态状态筛选" className="oc-live-strip-pills">
+      <div className="oc-live-strip-head flex items-center gap-1">
+        <div role="group" aria-label="活态状态筛选" className="oc-live-strip-pills flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
           {nonEmptyBuckets.map((bucket) => {
             const meta = LIVE_BUCKET_META[bucket];
             const pressed = activeFilter === bucket;
@@ -102,7 +105,7 @@ export function LiveActivityStrip({
                 aria-label={`${meta.filterAriaLabel}（${summary.counts[bucket]}）`}
                 title={pressed ? "再次点击显示全部活态会话" : meta.label}
                 onClick={() => toggleBucket(bucket)}
-                className="oc-live-strip-pill"
+                className="oc-live-strip-pill inline-flex shrink-0 items-center gap-1 whitespace-nowrap max-sm:min-h-11 max-sm:min-w-11 [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11"
               >
                 {bucketIndicator(bucket)}
                 <span>{meta.shortLabel}</span>
@@ -118,14 +121,14 @@ export function LiveActivityStrip({
           aria-label={collapsed ? `展开活态列表（${summary.total}）` : "收起活态列表"}
           title={collapsed ? "展开活态列表" : "收起活态列表"}
           onClick={() => setCollapsed((v) => !v)}
-          className="oc-live-strip-toggle"
+          className="oc-live-strip-toggle inline-flex shrink-0 items-center justify-center max-sm:size-11 [@media(hover:none)]:size-11"
         >
           {collapsed ? <ChevronRight size={14} strokeWidth={1.75} aria-hidden /> : <ChevronDown size={14} strokeWidth={1.75} aria-hidden />}
         </button>
       </div>
 
       {!collapsed && (
-        <div className="oc-live-strip-list" data-testid="live-strip-list">
+        <div className="oc-live-strip-list flex flex-col gap-0.5" data-testid="live-strip-list">
           {visibleItems.map((item) => {
             const title = item.session.title || "新对话";
             const statusLabel = liveActivityItemLabel(item);
@@ -142,13 +145,13 @@ export function LiveActivityStrip({
                   if (item.bucket === "unread_done") onMarkRead?.(item.session.id);
                   onSelect(item.session.id);
                 }}
-                className="oc-live-strip-item"
+                className="oc-live-strip-item flex w-full min-w-0 items-center gap-2.5 overflow-hidden text-ellipsis max-sm:min-h-11 [@media(hover:none)]:min-h-11"
               >
-                <span className="oc-live-strip-item-lead" aria-hidden>
+                <span className="oc-live-strip-item-lead inline-flex size-4 shrink-0 items-center justify-center" aria-hidden>
                   {bucketIndicator(item.bucket)}
                 </span>
-                <span className="oc-live-strip-item-title">{title}</span>
-                <span data-bucket={item.bucket} className="oc-live-strip-item-tag">
+                <span className="oc-live-strip-item-title min-w-0 flex-1 truncate">{title}</span>
+                <span data-bucket={item.bucket} className="oc-live-strip-item-tag shrink-0 whitespace-nowrap">
                   {statusLabel}
                 </span>
               </button>
@@ -159,7 +162,7 @@ export function LiveActivityStrip({
               type="button"
               data-testid="live-strip-show-more"
               onClick={() => setShowAll(true)}
-              className="oc-live-strip-more"
+              className="oc-live-strip-more flex w-full items-center max-sm:min-h-11 [@media(hover:none)]:min-h-11"
             >
               展开其余 {hiddenCount} 条活态会话
             </button>
@@ -169,7 +172,7 @@ export function LiveActivityStrip({
               type="button"
               data-testid="live-strip-show-less"
               onClick={() => setShowAll(false)}
-              className="oc-live-strip-more"
+              className="oc-live-strip-more flex w-full items-center max-sm:min-h-11 [@media(hover:none)]:min-h-11"
             >
               收起部分活态会话
             </button>
@@ -206,7 +209,7 @@ export function SidebarLiveActivityStrip({
   onSelect: (sessionId: string) => void;
   onMarkRead?: (sessionId: string) => void;
   onOpenBoard?: (ticketRef?: string) => void;
-  onOpenLiveBrowser?: (opts?: { url?: string; sessionId?: string | null }) => void;
+  onOpenLiveBrowser?: (opts?: PendingDecisionBrowserHandoffOpenOpts) => void;
 }) {
   const summary = useMemo(() => {
     void socketVersion;

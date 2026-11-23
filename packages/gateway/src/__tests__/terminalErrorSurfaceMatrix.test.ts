@@ -106,6 +106,20 @@ const SCENARIOS: readonly Scenario[] = [
     why: '上游 5xx 属瞬时故障,同类连续 3 次后熔断,避免空烧重试风暴',
   },
   {
+    code: 'upstream_timeout',
+    sample: 'Request timed out after 30s (UPSTREAM_TIMEOUT)',
+    attempts: 3,
+    persistEngineClass: false,
+    why: '上游超时属瞬时故障,同类连续 3 次后熔断',
+  },
+  {
+    code: 'network_error',
+    sample: 'getaddrinfo ENOTFOUND api.anthropic.com',
+    attempts: 3,
+    persistEngineClass: false,
+    why: '网络传输故障属瞬时故障,同类连续 3 次后熔断',
+  },
+  {
     code: 'insufficient_credits',
     sample: '402 INSUFFICIENT_CREDITS: balance=1 required=9',
     attempts: 1,

@@ -244,6 +244,7 @@ export function writeAntigravityPromptState(
   state: AntigravityInjectedContextState,
   now = Date.now(),
 ): void {
+  invalidateConversationInspectCacheForId(state.conversationId)
   const dir = path.join(antigravityRootDir, STATE_DIR)
   const target = stateFilePath(antigravityRootDir, state.sessionKey)
   const tmp = `${target}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
@@ -259,11 +260,62 @@ export function writeAntigravityPromptState(
 }
 
 export function clearAntigravityPromptState(antigravityRootDir: string, sessionKey: string): void {
+  const existing = readAntigravityPromptState(antigravityRootDir, sessionKey)
+  if (existing) invalidateConversationInspectCacheForId(existing.conversationId)
   try {
     rmSync(stateFilePath(antigravityRootDir, sessionKey), { force: true })
   } catch {
     /* best effort */
   }
+}
+
+interface ConversationInspectCacheEntry {
+  conversationId: string
+  injectedAfterBaseline: number
+  mtimeMs: number
+  ctimeMs: number
+  size: number
+  ino: number
+  walMtimeMs: number
+  walCtimeMs: number
+  walSize: number
+  walIno: number
+  result: { ok: true } | { ok: false; reason: AntigravityPromptElideReason }
+}
+
+const CONVERSATION_INSPECT_CACHE_MAX_ENTRIES = 256
+const conversationInspectCache = new Map<string, ConversationInspectCacheEntry>()
+let conversationDbScanCount = 0
+
+/** Test/diagnostic helper: clears the `(mtimeMs, size)` SQLite inspection cache. */
+export function resetAntigravityConversationInspectCache(): void {
+  conversationInspectCache.clear()
+  conversationDbScanCount = 0
+}
+
+/** Test/diagnostic helper: returns how many times `conversations/<uuid>.db` was opened for SQLite scan. */
+export function getAntigravityConversationDbScanCount(): number {
+  return conversationDbScanCount
+}
+
+function invalidateConversationInspectCacheForId(conversationId: string): void {
+  for (const [key, entry] of conversationInspectCache) {
+    if (entry.conversationId === conversationId) {
+      conversationInspectCache.delete(key)
+    }
+  }
+}
+
+function statWalStamp(filename: string): { mtimeMs: number; ctimeMs: number; size: number; ino: number } {
+  try {
+    const st = lstatSync(`${filename}-wal`)
+    if (st.isFile()) {
+      return { mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, ino: st.ino }
+    }
+  } catch {
+    /* no active WAL sidecar */
+  }
+  return { mtimeMs: -1, ctimeMs: -1, size: -1, ino: -1 }
 }
 
 function inspectConversationSinceInjection(
@@ -286,23 +338,63 @@ function inspectConversationSinceInjection(
   try {
     const st = lstatSync(filename)
     if (!st.isFile() || realpathSync(filename) !== filename) {
+      conversationInspectCache.delete(filename)
       return { ok: false, reason: 'db_missing_or_unsafe' }
     }
+    const wal = statWalStamp(filename)
+    const cached = conversationInspectCache.get(filename)
+    if (
+      cached &&
+      cached.injectedAfterBaseline === injectedAfterBaseline &&
+      cached.mtimeMs === st.mtimeMs &&
+      cached.ctimeMs === st.ctimeMs &&
+      cached.size === st.size &&
+      cached.ino === st.ino &&
+      cached.walMtimeMs === wal.mtimeMs &&
+      cached.walCtimeMs === wal.ctimeMs &&
+      cached.walSize === wal.size &&
+      cached.walIno === wal.ino
+    ) {
+      return cached.result
+    }
+
+    conversationDbScanCount += 1
     db = new Database(filename, { readonly: true, fileMustExist: true, timeout: 1000 })
     db.pragma('query_only = ON')
-    const maxRow = db.prepare('SELECT MAX(idx) AS maxIdx FROM steps').get() as { maxIdx: unknown } | undefined
+    // Keep the two indexed lookups so cache misses stay O(log N) on large conversation DBs.
+    const maxRow = db.prepare('SELECT MAX(idx) AS maxIdx FROM steps').get() as
+      | { maxIdx: unknown }
+      | undefined
     const maxIdx = maxRow?.maxIdx
+    let result: { ok: true } | { ok: false; reason: AntigravityPromptElideReason }
     if (typeof maxIdx !== 'number' || !Number.isSafeInteger(maxIdx) || maxIdx <= injectedAfterBaseline) {
-      return { ok: false, reason: 'db_unverified_baseline' }
+      result = { ok: false, reason: 'db_unverified_baseline' }
+    } else {
+      const compacted = db
+        .prepare('SELECT 1 AS hit FROM steps WHERE idx > ? AND step_type = ? LIMIT 1')
+        .get(injectedAfterBaseline, ANTIGRAVITY_COMPACTION_STEP_TYPE) as { hit?: number } | undefined
+      result = compacted ? { ok: false, reason: 'compacted_since_injection' } : { ok: true }
     }
-    const compacted = db
-      .prepare('SELECT 1 AS hit FROM steps WHERE idx > ? AND step_type = ? LIMIT 1')
-      .get(injectedAfterBaseline, ANTIGRAVITY_COMPACTION_STEP_TYPE) as { hit?: number } | undefined
-    if (compacted) {
-      return { ok: false, reason: 'compacted_since_injection' }
+    if (conversationInspectCache.size >= CONVERSATION_INSPECT_CACHE_MAX_ENTRIES) {
+      const oldestKey = conversationInspectCache.keys().next().value
+      if (oldestKey !== undefined) conversationInspectCache.delete(oldestKey)
     }
-    return { ok: true }
+    conversationInspectCache.set(filename, {
+      conversationId,
+      injectedAfterBaseline,
+      mtimeMs: st.mtimeMs,
+      ctimeMs: st.ctimeMs,
+      size: st.size,
+      ino: st.ino,
+      walMtimeMs: wal.mtimeMs,
+      walCtimeMs: wal.ctimeMs,
+      walSize: wal.size,
+      walIno: wal.ino,
+      result,
+    })
+    return result
   } catch {
+    conversationInspectCache.delete(filename)
     return { ok: false, reason: 'db_error' }
   } finally {
     try { db?.close() } catch { /* ignore */ }

@@ -1,6 +1,6 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { LiveUnit } from "@openclaude/protocol/browser";
-import { liveUnitToMessage } from "./liveUnitsHydrate";
+import { fetchSwarmResyncUnits, liveUnitToMessage } from "./liveUnitsHydrate";
 
 function toolUnit(overrides: Partial<LiveUnit> & { inputPreview?: string }): LiveUnit {
   return {
@@ -82,5 +82,73 @@ describe("liveUnitToMessage tool 行", () => {
     expect(msg._timelineStreamGen).toBe(2);
     expect(typeof msg._lifecycleEpoch).toBe("number");
     expect(msg._lifecycle).toBe("live_open");
+  });
+});
+
+describe("fetchSwarmResyncUnits (OCV5-867)", () => {
+  const swarmSnap = {
+    swarmId: "86700002-1111-1111-1111-111111111111",
+    title: "测试蜂群",
+    phase: "running" as const,
+    startedAt: 1000,
+    updatedAt: 2000,
+    revision: 3,
+    members: [{ name: "coordinator", role: "coordinator" as const, status: "working" as const }],
+    channels: [{ name: "main", memberCount: 1, postCount: 1 }],
+    posts: [{ seq: 1, agent: "coordinator", channel: "main", text: "hi", mentions: [] }],
+    totalPosts: 1,
+    postsMode: "full" as const,
+  };
+  const swarmUnit = (clientMessageId = "m-active"): LiveUnit => ({
+    id: "tool:3:agy-swarm-86700002",
+    kind: "tool",
+    seqFirst: 1,
+    seqLast: 3,
+    recordIdFirst: "1",
+    recordIdLast: "3",
+    open: true,
+    clientMessageId,
+    blockId: "agy-swarm-86700002",
+    toolName: "SwarmBoard",
+    inputJson: { swarmId: swarmSnap.swarmId, title: swarmSnap.title, phase: "running", snapshot: swarmSnap },
+  });
+  const basePage = (overrides: Record<string, unknown> = {}) => ({
+    view: "units" as const,
+    units: [swarmUnit("m-active")],
+    n: 1,
+    hasMoreBefore: false,
+    beforeCursor: null,
+    streamClientMessageIds: ["m-active"],
+    openDispatch: true,
+    hasTapeProjection: false,
+    tapeProjectionVersion: 0,
+    reducerEpoch: "4",
+    degraded: false as const,
+    ...overrides,
+  });
+
+  test("接受匹配活跃轮的 openDispatch SwarmBoard unit", async () => {
+    const readLiveUnits = vi.fn(async () => basePage());
+    const res = await fetchSwarmResyncUnits(readLiveUnits, "s1", "m-active");
+    expect(res).toHaveLength(1);
+    expect(res[0]?.blockId).toBe("agy-swarm-86700002");
+    expect(res[0]?.snapshot.revision).toBe(3);
+  });
+
+  test("拒绝 degraded=fallback、openDispatch=false、跨轮包和异常", async () => {
+    expect(await fetchSwarmResyncUnits(async () => basePage({ degraded: "fallback" }), "s1", "m-active")).toEqual([]);
+    expect(await fetchSwarmResyncUnits(async () => basePage({ openDispatch: false }), "s1", "m-active")).toEqual([]);
+    expect(
+      await fetchSwarmResyncUnits(
+        async () => basePage({ streamClientMessageIds: ["m-other"], units: [swarmUnit("m-other")] }),
+        "s1",
+        "m-active",
+      ),
+    ).toEqual([]);
+    expect(
+      await fetchSwarmResyncUnits(async () => {
+        throw new Error("network down");
+      }, "s1", "m-active"),
+    ).toEqual([]);
   });
 });

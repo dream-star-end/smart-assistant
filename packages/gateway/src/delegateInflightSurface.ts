@@ -314,6 +314,9 @@ export class DelegateInflightSurfaceStore {
   private deleteStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
   private loadStmt: ReturnType<InstanceType<typeof Database>['prepare']> | null = null
   private closed = false
+  /** Cold-start / explicit dirty flag so hot GET polls avoid unconditional SQLite rebuild writes. */
+  private dirty = true
+  private readonly pendingPersistJobs = new Set<string>()
 
   constructor(
     opts: {
@@ -854,6 +857,114 @@ export class DelegateInflightSurfaceStore {
     return out
   }
 
+  markDirty(): void {
+    this.dirty = true
+  }
+
+  isDirty(): boolean {
+    return this.dirty
+  }
+
+  private hasJobsDrift(
+    jobs: readonly DelegateJobSnapshot[],
+    opts: {
+      dropMissingLive?: boolean
+      resolveJob?: (jobId: string) => DelegateJobSnapshot | undefined
+    } = {},
+  ): boolean {
+    const liveIds = new Set<string>()
+    for (const job of jobs) {
+      if (!job.parentSessionKey) continue
+      if (this.droppedJobs.has(job.id) || this.pendingTombstones.has(job.id)) continue
+      const existing = this.byJob.get(job.id)
+      if (isDelegateTerminalState(job.state)) {
+        if (!existing || existing.state !== job.state) return true
+        continue
+      }
+      liveIds.add(job.id)
+      if (
+        job.state === 'queued' &&
+        typeof opts.resolveJob === 'function' &&
+        !opts.resolveJob(job.id)
+      ) {
+        return true
+      }
+      if (!existing) return true
+      if (existing.state !== job.state) return true
+      if (job.fencingEpoch > existing.fencingEpoch) return true
+      if (job.fencingEpoch === existing.fencingEpoch && job.generation > existing.generation) {
+        return true
+      }
+    }
+    for (const [jobId, row] of this.byJob.entries()) {
+      if (liveIds.has(jobId) || isDelegateTerminalState(row.state)) continue
+      const resolved = opts.resolveJob?.(jobId)
+      if (resolved && isDelegateTerminalState(resolved.state)) return true
+      if (opts.dropMissingLive || row.state === 'queued') return true
+    }
+    return false
+  }
+
+  private ensureDbOpen(): boolean {
+    if (this.db && this.upsertStmt) return true
+    if (!this.path || this.closed) return false
+    try {
+      this.openDb(this.path)
+      return Boolean(this.db && this.upsertStmt)
+    } catch (err) {
+      this.noteWriteError(err, { phase: 'reopen', dbPath: this.path })
+      this.resetDbHandles()
+      return false
+    }
+  }
+
+  private flushPendingPersists(): void {
+    if (this.pendingPersistJobs.size === 0) return
+    if (this.path && !this.upsertStmt && !this.ensureDbOpen()) return
+    for (const jobId of [...this.pendingPersistJobs]) {
+      if (this.droppedJobs.has(jobId) || this.pendingTombstones.has(jobId)) {
+        this.pendingPersistJobs.delete(jobId)
+        continue
+      }
+      const row = this.byJob.get(jobId)
+      if (!row) {
+        this.pendingPersistJobs.delete(jobId)
+        continue
+      }
+      this.persist(row)
+    }
+  }
+
+  /**
+   * On-demand rebuild for read/poll paths: runs `rebuildFromJobs` ONLY on cold
+   * start (`dirty === true`) or when an in-memory drift check finds jobs out of
+   * sync with the projection. Retries opening a locked persistent DB and flushes
+   * any rows whose prior SQLite persist hit `SQLITE_BUSY` so identity
+   * (`runId`/`goal`/`liveHint`) is durably persisted once SQLite unlocks;
+   * steady-state polls perform zero SQLite writes.
+   */
+  syncFromJobsIfNeeded(
+    jobs: readonly DelegateJobSnapshot[],
+    opts: {
+      dropMissingLive?: boolean
+      resolveJob?: (jobId: string) => DelegateJobSnapshot | undefined
+    } = {},
+  ): boolean {
+    if (this.path && !this.upsertStmt) {
+      this.ensureDbOpen()
+    }
+    const hadPendingPersists = this.pendingPersistJobs.size > 0
+    if (hadPendingPersists) {
+      this.flushPendingPersists()
+    }
+    const dbStillUnavailable = Boolean(this.path && !this.upsertStmt)
+    if (!this.dirty && !dbStillUnavailable && this.pendingPersistJobs.size === 0 && !this.hasJobsDrift(jobs, opts)) {
+      return hadPendingPersists
+    }
+    this.rebuildFromJobs(jobs, opts)
+    return true
+  }
+
   listForSessionId(
     sessionId: string,
     opts: {
@@ -861,13 +972,26 @@ export class DelegateInflightSurfaceStore {
       limit?: number
       cursor?: string
       maxBytes?: number
+      /** When true, avoids SQLite DELETE writes (filters expired rows in memory only). */
+      readOnly?: boolean
     } = {},
   ): { items: InflightDelegateSurface[]; nextCursor: string | null; truncated: boolean } {
-    this.sweepExpired()
+    const now = this.now()
+    if (!opts.readOnly) {
+      this.sweepExpired(now)
+    }
     this.refreshTombstonesFromDb()
     const matched: SurfaceRow[] = []
     for (const row of this.byJob.values()) {
       if (this.droppedJobs.has(row.jobId) || row.tombstoned) continue
+      if (
+        opts.readOnly &&
+        row.expiresAt != null &&
+        row.expiresAt <= now &&
+        isDelegateTerminalState(row.state)
+      ) {
+        continue
+      }
       if (opts.userId && row.userId && row.userId !== opts.userId) continue
       if (row.sessionId === sessionId || parentKeyMatchesSessionId(row.parentSessionKey, sessionId)) {
         matched.push(row)
@@ -1053,6 +1177,7 @@ export class DelegateInflightSurfaceStore {
         preserveIdentity: Boolean(existing),
       })
     }
+    this.dirty = this.pendingPersistJobs.size > 0 || Boolean(this.path && !this.upsertStmt)
     return [...this.byJob.values()].map(publicView)
   }
 
@@ -1264,6 +1389,13 @@ export class DelegateInflightSurfaceStore {
     try {
       if (!this.upsertStmt) {
         this.byJob.set(row.jobId, row)
+        if (this.path) {
+          // Persistent DB failed to open/migrate earlier (e.g. SQLITE_BUSY):
+          // do NOT pretend it persisted; queue for catch-up once DB reopens.
+          this.pendingPersistJobs.add(row.jobId)
+          this.dirty = true
+          return false
+        }
         return true
       }
       const info = this.upsertStmt.run({
@@ -1288,6 +1420,7 @@ export class DelegateInflightSurfaceStore {
         authority: row.authority ?? AUTHORITY_PROJECTION,
       })
       if (info.changes === 0) {
+        this.pendingPersistJobs.delete(row.jobId)
         if (this.rowIsTombstoned(row.jobId)) {
           this.rememberTombstone(row.jobId)
           return false
@@ -1296,13 +1429,17 @@ export class DelegateInflightSurfaceStore {
         if (fresh) this.byJob.set(fresh.jobId, fresh)
         return false
       }
+      this.pendingPersistJobs.delete(row.jobId)
       this.byJob.set(row.jobId, row)
       return true
     } catch (err) {
       this.noteWriteError(err, { phase: 'persist', jobId: row.jobId })
       // Fail-open, fail-fast: never throw into Enqueue / Completer / Notifier.
-      // SQLITE_BUSY is immediate (busy_timeout=0); keep the in-process row.
+      // SQLITE_BUSY is immediate (busy_timeout=0); keep the in-process row and
+      // mark it pending so the next poll after unlock durably persists its real identity.
       this.byJob.set(row.jobId, row)
+      this.pendingPersistJobs.add(row.jobId)
+      this.dirty = true
       return false
     }
   }

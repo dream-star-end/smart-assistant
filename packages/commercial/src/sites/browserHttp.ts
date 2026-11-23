@@ -1,4 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { Pool } from 'pg'
+import { authenticateActiveCommercialUser } from '../http/activeUserAuth.js'
 import { requireAuth } from '../http/auth.js'
 import type { RequestContext } from '../http/handlers.js'
 import { HttpError, readJsonBody, sendJson } from '../http/util.js'
@@ -9,6 +11,18 @@ export interface SitesBrowserDeps {
   jwtSecret: string | Uint8Array
   sites?: SitesService
   verifyEmailUrlBase?: string
+  v3Supervisor?: { pool?: Pool }
+  verifyActiveAccount?: (userId: string) => Promise<boolean>
+  skipDbActiveCheck?: boolean
+}
+
+function parseOptionalNullableFiniteNumber(value: unknown, field: string): number | null | undefined {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new HttpError(400, 'INVALID_INPUT', `${field} must be a finite number or null`)
+  }
+  return value
 }
 
 function resolveBrowserParentOrigin(req: IncomingMessage, deps: SitesBrowserDeps): string {
@@ -89,12 +103,19 @@ export async function dispatchSitesBrowserRoute(
   _ctx: RequestContext,
   deps: SitesBrowserDeps,
 ): Promise<void> {
-  const user = await requireAuth(req, deps.jwtSecret)
+  const method = req.method ?? 'GET'
+  const isWriteMethod = method !== 'GET' && method !== 'HEAD'
+  const user = isWriteMethod
+    ? await authenticateActiveCommercialUser(req, deps.jwtSecret, {
+        pool: deps.v3Supervisor?.pool,
+        verifyActiveAccount: deps.verifyActiveAccount,
+        skipDbActiveCheck: deps.skipDbActiveCheck,
+      })
+    : await requireAuth(req, deps.jwtSecret)
   const userId = parsePositiveUserId(user.id)
 
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'x.invalid'}`)
   const pathname = url.pathname
-  const method = req.method ?? 'GET'
 
   if (!deps.sites) {
     if (method === 'GET' && pathname === '/api/sites') {
@@ -237,18 +258,11 @@ export async function dispatchSitesBrowserRoute(
       }
       const slug = decodePathSegment(siteInvitesMatch[1]!)
       const body = await readJsonObject(req)
-      const expiresInHours =
-        body.expiresInHours === null
-          ? null
-          : body.expiresInHours === undefined
-            ? undefined
-            : Number(body.expiresInHours)
-      const maxUses =
-        body.maxUses === null
-          ? null
-          : body.maxUses === undefined
-            ? undefined
-            : Number(body.maxUses)
+      if (body.role !== undefined && typeof body.role !== 'string') {
+        throw new HttpError(400, 'INVALID_INPUT', 'role must be a string')
+      }
+      const expiresInHours = parseOptionalNullableFiniteNumber(body.expiresInHours, 'expiresInHours')
+      const maxUses = parseOptionalNullableFiniteNumber(body.maxUses, 'maxUses')
       sendJson(
         res,
         200,
@@ -390,6 +404,18 @@ export async function dispatchSitesBrowserRoute(
     }
     if (method === 'PATCH') {
       const patch = await readJsonObject(req)
+      if (patch.title !== undefined && typeof patch.title !== 'string') {
+        throw new HttpError(400, 'INVALID_INPUT', 'title must be a string')
+      }
+      if (patch.visibility !== undefined && typeof patch.visibility !== 'string') {
+        throw new HttpError(400, 'INVALID_INPUT', 'visibility must be a string')
+      }
+      if (patch.password !== undefined && typeof patch.password !== 'string') {
+        throw new HttpError(400, 'INVALID_INPUT', 'password must be a string')
+      }
+      if (patch.spaMode !== undefined && typeof patch.spaMode !== 'boolean') {
+        throw new HttpError(400, 'INVALID_INPUT', 'spaMode must be boolean')
+      }
       if (
         patch.customDomain !== undefined &&
         patch.customDomain !== null &&
@@ -398,21 +424,12 @@ export async function dispatchSitesBrowserRoute(
         throw new HttpError(400, 'INVALID_INPUT', 'customDomain must be string or null')
       }
       const site = await deps.sites.updateSite(userId, slug, {
-        ...(patch.title !== undefined ? { title: String(patch.title) } : {}),
+        ...(patch.title !== undefined ? { title: patch.title } : {}),
         ...(patch.visibility !== undefined
           ? { visibility: patch.visibility as 'public' | 'password' | 'disabled' }
           : {}),
-        ...(patch.password !== undefined ? { password: String(patch.password) } : {}),
-        ...(patch.spaMode !== undefined
-          ? {
-              spaMode:
-                typeof patch.spaMode === 'boolean'
-                  ? patch.spaMode
-                  : (() => {
-                      throw new HttpError(400, 'INVALID_INPUT', 'spaMode must be boolean')
-                    })(),
-            }
-          : {}),
+        ...(patch.password !== undefined ? { password: patch.password } : {}),
+        ...(patch.spaMode !== undefined ? { spaMode: patch.spaMode } : {}),
         ...(patch.customDomain !== undefined
           ? { customDomain: patch.customDomain as string | null }
           : {}),

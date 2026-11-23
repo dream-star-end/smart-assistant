@@ -192,10 +192,10 @@ export function MessageFeedbackDialog({
         <>
           {responseExcerpt && (
             <div className="mb-4 rounded-lg border border-border bg-surface px-3 py-2.5">
-              <p className="line-clamp-3 whitespace-pre-wrap break-words text-[12.5px] leading-relaxed text-muted">
+              <p className="line-clamp-3 whitespace-pre-wrap break-words text-meta leading-relaxed text-muted">
                 {responseExcerpt}
               </p>
-              <label className="mt-2 flex cursor-pointer items-start gap-2 text-[11.5px] leading-relaxed text-faint">
+              <label className="mt-2 flex cursor-pointer items-start gap-2 text-caption leading-relaxed text-faint">
                 <input
                   type="checkbox"
                   className="mt-0.5 accent-accent"
@@ -270,7 +270,7 @@ export function MessageFeedbackDialog({
         </>
       )}
 
-      <div className="mt-4 flex items-start gap-2 text-[11.5px] leading-relaxed text-faint">
+      <div className="mt-4 flex items-start gap-2 text-caption leading-relaxed text-faint">
         <ShieldCheck size={14} className="mt-0.5 shrink-0" />
         <p>不会附带前序对话、工具记录或诊断日志；回复摘录是否发送由你决定。</p>
       </div>

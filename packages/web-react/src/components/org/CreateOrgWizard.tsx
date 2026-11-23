@@ -1,5 +1,4 @@
-import * as Dialog from "@radix-ui/react-dialog";
-import { ArrowLeft, ArrowRight, Building2, Check, Minus, Plus, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, Building2, Check, Minus, Plus } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../../lib/api";
 import {
@@ -10,7 +9,7 @@ import {
 } from "../../lib/orgBilling";
 import type { AuthSession, OrgPayResult, OrgPlan } from "../../lib/types";
 import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
-import { Alert, Button, IconButton, Input, Spinner, useToast } from "../ui";
+import { Alert, Button, Input, Modal, Spinner, useToast } from "../ui";
 import { orgErrText } from "./orgShared";
 import { OrgPaySuccess, OrgPayQr } from "./OrgPayQr";
 
@@ -44,6 +43,7 @@ export function CreateOrgWizard({
   const toast = useToast();
   const [plans, setPlans] = useState<OrgPlan[] | null>(null);
   const [plansErr, setPlansErr] = useState<string | null>(null);
+  const [plansReload, setPlansReload] = useState(0);
   const [step, setStep] = useState<Step>("name");
   const [orgName, setOrgName] = useState("");
   const [planCode, setPlanCode] = useState<string | null>(null);
@@ -52,7 +52,7 @@ export function CreateOrgWizard({
   const [err, setErr] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>({ kind: "form" });
 
-  // 挂载拉套餐档(无 org 也可读)。
+  // 挂载或重试拉套餐档(无 org 也可读)。
   useEffect(() => {
     let alive = true;
     setPlansErr(null);
@@ -67,7 +67,7 @@ export function CreateOrgWizard({
     return () => {
       alive = false;
     };
-  }, [auth]);
+  }, [auth, plansReload]);
 
   const plan = useMemo(() => plans?.find((p) => p.code === planCode) ?? null, [plans, planCode]);
   const total = plan ? computeSeatTotal(plan, seats) : null;
@@ -196,7 +196,19 @@ export function CreateOrgWizard({
         {step === "plan" && (
           <div className="flex flex-col gap-3">
             {plansErr && (
-              <Alert tone="danger" className="text-meta">
+              <Alert
+                tone="danger"
+                className="text-meta"
+                action={
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => setPlansReload((n) => n + 1)}
+                  >
+                    重试
+                  </Button>
+                }
+              >
                 {plansErr}
               </Alert>
             )}
@@ -285,33 +297,24 @@ export function CreateOrgDialog({
   onCreated: () => void;
 }) {
   return (
-    <Dialog.Root open={open} onOpenChange={(o) => !o && onClose()}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
-        <Dialog.Content
-          aria-describedby={undefined}
-          className="oc-surface-popover fixed left-1/2 top-1/2 z-50 flex max-h-[85vh] w-[calc(100vw-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl focus:outline-none data-[state=open]:animate-in"
-        >
-          <div className="flex items-center justify-between gap-3 border-b border-border/70 px-5 py-4">
-            <div className="flex items-center gap-2.5">
-              <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg">
-                <Building2 size={16} strokeWidth={1.75} />
-              </span>
-              <Dialog.Title className="text-title font-semibold text-fg">创建组织</Dialog.Title>
-            </div>
-            <Dialog.Close asChild>
-              {/* 走 ui/IconButton：自带 type="button" 与触屏 44px 命中（审计 SET-11，与 OrgCenter 同款）。 */}
-              <IconButton variant="muted" size="md" shape="square" aria-label="关闭">
-                <X size={17} />
-              </IconButton>
-            </Dialog.Close>
-          </div>
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            <CreateOrgWizard auth={auth} onCreated={onCreated} onCancel={onClose} />
-          </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+    <Modal
+      open={open}
+      onOpenChange={(o) => !o && onClose()}
+      mobile="center"
+      size="md"
+      title={
+        <span className="flex items-center gap-2.5">
+          <span className="oc-icon-badge oc-icon-badge-accent size-8 rounded-lg" aria-hidden="true">
+            <Building2 size={16} strokeWidth={1.75} />
+          </span>
+          <span className="text-title font-semibold text-fg">创建组织</span>
+        </span>
+      }
+      className="rounded-2xl"
+      bodyClassName="p-0"
+    >
+      <CreateOrgWizard auth={auth} onCreated={onCreated} onCancel={onClose} />
+    </Modal>
   );
 }
 

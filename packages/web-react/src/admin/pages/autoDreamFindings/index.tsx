@@ -251,6 +251,7 @@ export default function AutoDreamFindingsPage() {
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <select
+              aria-label="流量来源筛选"
               value={traffic}
               onChange={(event) => {
                 setTraffic(event.target.value)
@@ -300,6 +301,7 @@ export default function AutoDreamFindingsPage() {
               className="oc-field-control h-9 w-36"
             />
             <select
+              aria-label="模型范围筛选"
               value={model}
               onChange={(event) => {
                 setModel(event.target.value)
@@ -311,6 +313,7 @@ export default function AutoDreamFindingsPage() {
               <option value="all">全部模型（含历史）</option>
             </select>
             <select
+              aria-label="处理状态筛选"
               value={status}
               onChange={(event) => {
                 setStatus(event.target.value)

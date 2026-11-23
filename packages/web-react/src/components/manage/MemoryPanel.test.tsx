@@ -131,7 +131,7 @@ describe("MemoryPanel · 核心记忆文件列表", () => {
     expect(context).not.toHaveBeenCalled();
     fireEvent.click(toggle);
     const region = await screen.findByRole("region", { name: "记忆使用情况" });
-    expect(await within(region).findByText("可读取：记忆索引（2 KB）")).toBeInTheDocument();
+    expect(await within(region).findByText("可读取：记忆索引")).toBeInTheDocument();
     expect(context).toHaveBeenCalledWith(auth, "main");
     expect(within(region).getByText(/已绑定项目/)).toHaveTextContent("需要时查阅记忆；还没有可用的记忆");
     expect(within(region).getByText(/按你的要求不参考历史记忆/)).toHaveTextContent("这一轮不读取记忆");

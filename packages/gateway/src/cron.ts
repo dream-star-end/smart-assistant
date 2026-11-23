@@ -84,10 +84,8 @@ import {
 } from './delegateCronIdempotency.js'
 import { cronDelegateIdempotencyKey, delegateNotifyId } from '@openclaude/protocol'
 import { isDelegateNotifierEffective, isDelegateSmEnabled } from './delegateSmFlag.js'
-import {
-  DELEGATE_LEASE_HEARTBEAT_MS,
-  type DelegateJobStore,
-} from './delegateJobs.js'
+import { DELEGATE_LEASE_HEARTBEAT_MS, NOTIFY_MAX_CALLBACK_EPOCH, type DelegateJobStore } from './delegateJobs.js'
+import { fireCronOriginWithEpochBump } from './cronOriginEpochHelper.js'
 import {
   postCronIndex,
   readV3CronIndexConfig,
@@ -139,6 +137,7 @@ interface CronOccurrenceRecord {
   /** Fence captured at claimQueued for this occurrence; never re-read from the live job. */
   delegateClaimToken?: string
   delegateFencingEpoch?: number
+  callbackEpoch?: number
 }
 
 export function classifyCronOccurrenceRecovery(
@@ -329,6 +328,7 @@ export interface CronRetryEntry {
 export interface CronDeliveryContext {
   dueMinuteKey: number
   deliveryId: string
+  callbackEpoch?: number
 }
 
 export function cronDeliveryId(jobId: string, dueMinuteKey: number): string {
@@ -1470,10 +1470,10 @@ export class CronScheduler {
         occurrenceRecords.filter((row) => row.state !== 'delivered').map((row) => row.jobId),
       )
 
-      // Cleanup: remove completed oneshot jobs from yaml
+      // Cleanup: remove completed oneshot jobs from yaml (require lastRun so manually paused unexecuted oneshots are preserved)
       const before = file.jobs.length
       file.jobs = file.jobs.filter((j) => !(
-        j.oneshot && j.enabled === false && !this.retryState.has(j.id) &&
+        j.oneshot && j.enabled === false && Boolean(lastRun[j.id]) && !this.retryState.has(j.id) &&
         !pendingOccurrenceJobs.has(j.id)
       ))
       if (file.jobs.length < before) {
@@ -1971,16 +1971,21 @@ export class CronScheduler {
               keepDelivered ? { callbackState: 'delivered' } : undefined,
             )
           }
-          // A one-shot remains enabled across retryable failures. Completed,
-          // silent, permanent and explicitly exhausted outcomes consume it.
-          if (job.oneshot) {
-            job.enabled = false
-            await saveCronFile(await ensureCronFile(), job)
-          }
           // Record the minute that actually fired (catch-up records the missed
           // minute M, not "now") so it stays idempotent across restarts.
+          // For oneshot jobs, flush lastRun immediately before disabling in cron.yaml
+          // so concurrent background-state readers never observe enabled=false && lastRunAt=null.
           lastRun[job.id] = dueMinuteKey
           lastRunDirty = true
+          if (job.oneshot) {
+            try {
+              await this.persistLastRun(lastRun)
+              lastRunDirty = false
+            } finally {
+              job.enabled = false
+              await saveCronFile(await ensureCronFile(), job)
+            }
+          }
           if (this.retryState.has(job.id)) completedRetryIds.add(job.id)
         }
       } finally {
@@ -2179,18 +2184,12 @@ export class CronScheduler {
         // remain settleable after uninstall/readiness loss.
         await resolveRuntimeExecutionAgent({ id: job.agent })
         if (useLegacyLeg && dlgJobId) this.stampLegacyCronGeneration(dlgJobId)
-        if (!useLegacyLeg) {
-          result = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
-            ? { kind: 'injected' }
-            : { kind: 'fallback' }
-        } else {
-          const fireJob: CronJob = {
-            ...job,
-            projectMode: project.mode,
-            boardProjectId: project.mode === 'fixed' ? project.boardProjectId : null,
-          }
-          result = await this.onOriginSessionFire!(fireJob, deliveryContext)
-        }
+        result = await fireCronOriginWithEpochBump({
+          useLegacyLeg, maxCallbackEpoch: NOTIFY_MAX_CALLBACK_EPOCH, job, project, deliveryContext, readOccurrence, writeOccurrence,
+          onOriginSessionFire: (j, c) => this.onOriginSessionFire!(j, c),
+          notifyOriginSessionDropped: (j, c, r) => this.notifyOriginSessionDropped(j, c, r),
+          logger,
+        })
       }
     } catch (err) {
       logger.warn(`job ${job.id} origin-session inject threw`, {

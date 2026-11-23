@@ -40,6 +40,7 @@ let pgAvailable = false
 
 const listPublicModels = () => [
   { id: 'deepseek-v4-flash' },
+  { id: 'gpt-6.2-astra' },
   { id: 'MiniMax-M3' },
   { id: 'grok-build' },
   { id: 'glm-5.2' },

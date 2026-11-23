@@ -47,6 +47,7 @@ export function OverviewTab({
   subInfo,
   subLoading = false,
   subErr = null,
+  onRetrySub,
   canManageBilling = false,
   onSubscribe,
   onAddSeats,
@@ -59,6 +60,7 @@ export function OverviewTab({
   subInfo?: OrgSubscriptionInfo | null;
   subLoading?: boolean;
   subErr?: string | null;
+  onRetrySub?: () => void;
   /** owner 才可操作订阅 / 加席。 */
   canManageBilling?: boolean;
   onSubscribe?: () => void;
@@ -102,7 +104,15 @@ export function OverviewTab({
   if (err || !org) {
     return (
       <div className="px-5 py-4">
-        <Alert tone="danger" className="text-meta">
+        <Alert
+          tone="danger"
+          className="text-meta"
+          action={
+            <Button size="sm" variant="secondary" onClick={() => setReload((n) => n + 1)}>
+              重试
+            </Button>
+          }
+        >
           {err || "组织信息不可用。"}
         </Alert>
       </div>
@@ -238,7 +248,17 @@ export function OverviewTab({
         </div>
 
         {subErr ? (
-          <Alert tone="warning" className="mt-3 text-meta">
+          <Alert
+            tone="warning"
+            className="mt-3 text-meta"
+            action={
+              onRetrySub ? (
+                <Button size="sm" variant="secondary" onClick={onRetrySub}>
+                  重试
+                </Button>
+              ) : undefined
+            }
+          >
             {subErr}
           </Alert>
         ) : subLoading ? (

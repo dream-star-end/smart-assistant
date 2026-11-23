@@ -295,6 +295,8 @@ describe("ContextSlimModal, ContextArchiveDrawer & MemoryContextHealthCard (OCV5
 
     const submitBtn = screen.getByRole("button", { name: /永久清理所选项（1）/ });
     fireEvent.click(submitBtn);
+    const confirmBtn = await screen.findByRole("button", { name: "确认永久清理" });
+    fireEvent.click(confirmBtn);
 
     await waitFor(() => expect(onSlimmed).toHaveBeenCalledTimes(1));
     expect(archiveMem).not.toHaveBeenCalled();
@@ -387,6 +389,7 @@ describe("ContextSlimModal, ContextArchiveDrawer & MemoryContextHealthCard (OCV5
 
     fireEvent.click(screen.getByRole("checkbox", { name: "选择 过期低频归档记忆 (1 条)" }));
     fireEvent.click(screen.getByRole("button", { name: /收纳 2 项并永久清理 1 项/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认永久清理" }));
 
     await waitFor(() => expect(onSlimmed).toHaveBeenCalledTimes(1));
     expect(runHygiene).toHaveBeenCalledWith(auth, "main", {

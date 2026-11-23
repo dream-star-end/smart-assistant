@@ -248,11 +248,20 @@ describe('MarkdownImpl 代码高亮', () => {
 })
 
 describe('MarkdownImpl signMedia 路径卡片', () => {
-  test('fenced 整块就是一条生成路径 → filecard，不进代码块', () => {
+  test('OCV5-865 #10: 普通三反引号围栏内仅有一行生成路径 → 仍保留 pre/code 与复制按钮，不签名不转下载卡', async () => {
+    const { MediaSignProvider } = await import('./chat/media')
+    const sign = vi.fn(async (paths: string[]) =>
+      Object.fromEntries(paths.map((p) => [p, `/api/media?signed=${encodeURIComponent(p)}`])),
+    )
     const source = ['```', '/home/agent/.openclaude/generated/report.docx', '```'].join('\n')
-    render(<MarkdownImpl signMedia>{source}</MarkdownImpl>)
-    expect(screen.getByText('report.docx')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: '复制' })).toBeNull()
+    const { container } = render(
+      <MediaSignProvider sign={sign} authKey="ocv5-865-fence">
+        <MarkdownImpl signMedia>{source}</MarkdownImpl>
+      </MediaSignProvider>,
+    )
+    expect(container.querySelector('pre code')).toHaveTextContent('/home/agent/.openclaude/generated/report.docx')
+    expect(screen.getByRole('button', { name: '复制' })).toBeInTheDocument()
+    expect(sign).not.toHaveBeenCalled()
   })
 
   test('生成目录里的 .html 路径 → 无缝嵌入外壳 + 仍保留下载卡(取到内容前只有下载卡)', () => {
@@ -266,6 +275,45 @@ describe('MarkdownImpl signMedia 路径卡片', () => {
     const { container } = render(<MarkdownImpl signMedia>{source}</MarkdownImpl>)
     expect(container.querySelector('pre code')).toHaveTextContent('report.docx')
     expect(screen.getByRole('button', { name: '复制' })).toBeInTheDocument()
+  })
+
+  test('OCV5-865: 行内反引号包裹 .docx/.pdf/.zip 与中文/含空格文件名 → 均渲染 SignedFileCard，命令与目录不误触发', async () => {
+    const { MediaSignProvider } = await import('./chat/media')
+    const sign = vi.fn(async (paths: string[]) =>
+      Object.fromEntries(paths.map((p) => [p, `/api/media?signed=${encodeURIComponent(p)}`])),
+    )
+    const md = [
+      '交付物：',
+      '- Word：`/home/agent/.openclaude/generated/report.docx`',
+      '- PDF：`/home/agent/.openclaude/generated/论文终稿 2026.pdf`',
+      '- 压缩包：`/home/agent/.openclaude/generated/实验数据包（全量）.zip`',
+      '- 目录不触发：`/home/agent/.openclaude/generated/` 与 `/home/agent/.openclaude/generated/v1.0`',
+      '',
+      '```bash',
+      'oc-docx build spec.yaml -o /home/agent/.openclaude/generated/not-a-card.docx',
+      '```',
+    ].join('\n')
+
+    const { container } = render(
+      <MediaSignProvider sign={sign} authKey="ocv5-865">
+        <MarkdownImpl signMedia>{md}</MarkdownImpl>
+      </MediaSignProvider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('link', { name: 'report.docx' })).toBeInTheDocument()
+      expect(screen.getByRole('link', { name: '论文终稿 2026.pdf' })).toBeInTheDocument()
+      expect(screen.getByRole('link', { name: '实验数据包（全量）.zip' })).toBeInTheDocument()
+    })
+    expect(sign).toHaveBeenCalledExactlyOnceWith([
+      '/home/agent/.openclaude/generated/report.docx',
+      '/home/agent/.openclaude/generated/论文终稿 2026.pdf',
+      '/home/agent/.openclaude/generated/实验数据包（全量）.zip',
+    ])
+    // 目录路径保持行内 code，不出下载卡
+    expect(screen.queryByRole('link', { name: 'v1.0' })).toBeNull()
+    expect(container.querySelector('pre code')).toHaveTextContent('not-a-card.docx')
+    expect(screen.queryByRole('link', { name: 'not-a-card.docx' })).toBeNull()
   })
 })
 

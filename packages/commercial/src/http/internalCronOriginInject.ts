@@ -22,6 +22,9 @@ import type {
   CronOriginInjectInput,
   CronOriginInjectResult,
 } from "../ws/userChatBridge.js";
+
+const CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE = "PREVIOUSLY_FAILED_UNEXECUTED";
+const CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_REASON = "previously_failed_unexecuted";
 import {
   HttpError,
   REQUEST_ID_HEADER,
@@ -140,6 +143,16 @@ export function makeCronOriginInjectHandler(
     }
     if(result.reason.startsWith('MODEL_SWITCH_')){
       sendError(res,409,result.reason,'origin model switch requires user confirmation',requestId);return;
+    }
+    if (result.reason === CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_REASON) {
+      sendError(
+        res,
+        503,
+        CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_CODE,
+        CRON_ORIGIN_PREVIOUSLY_FAILED_UNEXECUTED_REASON,
+        requestId,
+      );
+      return;
     }
     sendError(res, 503, "INJECT_FAILED", result.reason, requestId);
   };

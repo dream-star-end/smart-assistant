@@ -106,18 +106,28 @@ async function getJson<T>(auth: AuthSession, path: string, signal?: AbortSignal)
 
 /** 档位来源 → 中文(protocol 的 CursorEffortSource，含 0280 的 classifier)。 */
 const EFFORT_SOURCE_LABEL: Record<string, string> = {
-  pinned: "钉死",
+  pinned: "固定",
   request: "按请求",
-  clamped: "就近",
+  clamped: "自动匹配",
   default: "默认",
-  classifier: "分类器",
+  classifier: "自动判定",
 };
 
-/** 审计行的档位展示：`high · 按请求`；无档位家族(单档)显示「—」。 */
+/** 思考深度英文档位 → 中文展示名。 */
+const EFFORT_LEVEL_LABEL: Record<string, string> = {
+  low: "轻度",
+  medium: "标准",
+  high: "深度",
+  xhigh: "超深",
+  max: "极致",
+};
+
+/** 审计行的档位展示：`深度 · 按请求`；无档位家族(单档)显示「—」。 */
 export function effortLabel(effort: string | null, source: string | null): string {
-  if (!effort) return source ? (EFFORT_SOURCE_LABEL[source] ?? source) : "—";
+  const e = effort ? (EFFORT_LEVEL_LABEL[effort.toLowerCase()] ?? effort) : null;
   const s = source ? (EFFORT_SOURCE_LABEL[source] ?? source) : null;
-  return s ? `${effort} · ${s}` : effort;
+  if (!e) return s ?? "—";
+  return s ? `${e} · ${s}` : e;
 }
 
 /** 毫秒 → 人读耗时(`820ms` / `3.4s`);null 显示「—」。 */

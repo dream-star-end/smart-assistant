@@ -379,7 +379,7 @@ function DiffStatsBar({
           aria-pressed={wrap}
           title={wrap ? "取消自动折行" : "自动折行"}
           className={cn(
-            "oc-btn-tactile inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-sans text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-8",
+            "oc-btn-tactile inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-sans text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11 [@media(hover:none)]:justify-center",
             wrap
               ? "border-accent/30 bg-accent-soft text-accent"
               : "border-transparent text-faint hover:bg-hover hover:text-fg",
@@ -395,7 +395,7 @@ function DiffStatsBar({
             aria-label="复制新代码"
             title="复制新代码"
             className={cn(
-              "oc-btn-tactile inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-sans text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-8",
+              "oc-btn-tactile inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-sans text-caption font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11 [@media(hover:none)]:justify-center",
               copied
                 ? "border-success/30 bg-success-soft text-success"
                 : "border-transparent text-faint hover:bg-hover hover:text-fg",

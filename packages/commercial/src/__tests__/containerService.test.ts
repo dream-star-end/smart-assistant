@@ -17,13 +17,16 @@
 import { describe, test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import type { Pool } from "pg";
+import type Docker from "dockerode";
 
 import {
   HostAwareContainerService,
+  LocalDockerBackend,
   type ContainerService,
   type ContainerSpec,
   type ContainerInspect,
 } from "../compute-pool/containerService.js";
+import { ANTIGRAVITY_CLEARCUT_BLOCK_EXTRA_HOST } from "../agent-sandbox/constants.js";
 import { SupervisorError } from "../agent-sandbox/types.js";
 import type {
   AgentImageInspect,
@@ -273,5 +276,68 @@ describe("HostAwareContainerService routing", () => {
     const { svc } = makeSvc(fp);
     assert.equal(await svc.inspectImage("self-id", "absent:tag"), null);
     assert.equal(await svc.inspectImage("tk-id", "absent:tag"), null);
+  });
+});
+
+describe("LocalDockerBackend HostConfig.ExtraHosts (OCV5-860)", () => {
+  function makeLocalSpec(extraHosts?: readonly string[]): ContainerSpec {
+    return {
+      containerDbId: 42,
+      boundIp: "172.31.0.42",
+      image: "openclaude/openclaude-runtime:test",
+      name: "oc-v5-u42",
+      env: { NODE_ENV: "production" },
+      labels: { "com.openclaude.v3.uid": "42" },
+      binds: [{ source: "oc-v5-data-u42", target: "/home/agent/.openclaude", readonly: false }],
+      memoryBytes: 1024 * 1024 * 1024,
+      nanoCpus: 1_000_000_000,
+      pidsLimit: 512,
+      internalPort: 18789,
+      ...(extraHosts ? { extraHosts } : {}),
+    };
+  }
+
+  function makeMockDocker() {
+    const created: Array<Parameters<Docker["createContainer"]>[0]> = [];
+    const docker = {
+      async createContainer(opts: Parameters<Docker["createContainer"]>[0]) {
+        created.push(opts);
+        return {
+          id: "cid-local-test",
+          async start() {},
+        };
+      },
+    } as unknown as Docker;
+    return { docker, created };
+  }
+
+  test("injects play.googleapis.com:127.0.0.1 by default into HostConfig.ExtraHosts", async () => {
+    const { docker, created } = makeMockDocker();
+    const backend = new LocalDockerBackend(docker);
+    const res = await backend.createAndStart(makeLocalSpec());
+    assert.equal(res.containerInternalId, "cid-local-test");
+    assert.equal(created.length, 1);
+    assert.deepEqual(created[0]!.HostConfig?.ExtraHosts, [ANTIGRAVITY_CLEARCUT_BLOCK_EXTRA_HOST]);
+  });
+
+  test("preserves existing extraHosts entries and deduplicates by hostname without overriding", async () => {
+    const { docker, created } = makeMockDocker();
+    const backend = new LocalDockerBackend(docker);
+
+    await backend.createAndStart(
+      makeLocalSpec(["host.docker.internal:host-gateway", "play.googleapis.com:127.0.0.1"]),
+    );
+    assert.deepEqual(created[0]!.HostConfig?.ExtraHosts, [
+      "host.docker.internal:host-gateway",
+      "play.googleapis.com:127.0.0.1",
+    ]);
+
+    await backend.createAndStart(
+      makeLocalSpec(["PLAY.GOOGLEAPIS.COM:127.0.0.2", "host.docker.internal:host-gateway", "host.docker.internal:10.0.0.1"]),
+    );
+    assert.deepEqual(created[1]!.HostConfig?.ExtraHosts, [
+      "PLAY.GOOGLEAPIS.COM:127.0.0.2",
+      "host.docker.internal:host-gateway",
+    ]);
   });
 });

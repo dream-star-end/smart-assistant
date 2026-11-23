@@ -26,6 +26,16 @@ export type GateId =
   | "check:v5:incidents"
   | "check:v5:e2e-selectors"
   | "check:tutorials"
+  | "check:docs-links"
+  | "check:ui-gates"
+  | "check:no-weak-downgrade"
+  | "check:route-sync"
+  | "check:monotonic-baselines"
+  | "check:changelog-guard"
+  | "check:feature-flags-ttl"
+  | "check:pg-migration-safety"
+  | "check:rest-contract"
+  | "check:governance:fast"
   | "lint:scheduler-wiring"
   | "lint:agent-containers-sql"
   | "lint:integ-tiers"
@@ -47,16 +57,35 @@ export interface GateMeta {
   /** 根 package.json 脚本名;typecheck 在 scoped 时由 runner 改写成 tsc --build */
   npmScript: GateId;
   npmArgs?: string[];
+  /** 基线敏感门禁: run-v5-fast 需把自身的 `--base <ref>` 透传给脚本 */
+  passBaseFlag?: boolean;
   cost: GateCost;
   lock: GateLock;
 }
 
-/** check:v5 的 19 道门,顺序与 package.json 全量链一致,便于打印「跳过了哪些」。 */
+/** 本地快车道可选门清单(含 check:v5 19 门 + Wave 1/2 轻量治理快门),按 cost 组织便于打印「跳过了哪些」。 */
 export const ALL_GATES: GateMeta[] = [
   { id: "check:ci-parity", npmScript: "check:ci-parity", cost: "cheap", lock: null },
   { id: "check:v5:incidents", npmScript: "check:v5:incidents", cost: "cheap", lock: null },
   { id: "check:v5:e2e-selectors", npmScript: "check:v5:e2e-selectors", cost: "cheap", lock: null },
   { id: "check:tutorials", npmScript: "check:tutorials", cost: "cheap", lock: null },
+  { id: "check:docs-links", npmScript: "check:docs-links", cost: "cheap", lock: null },
+  { id: "check:ui-gates", npmScript: "check:ui-gates", cost: "cheap", lock: null },
+  { id: "check:no-weak-downgrade", npmScript: "check:no-weak-downgrade", cost: "cheap", lock: null },
+  { id: "check:route-sync", npmScript: "check:route-sync", cost: "cheap", lock: null },
+  { id: "check:monotonic-baselines", npmScript: "check:monotonic-baselines", passBaseFlag: true, cost: "cheap", lock: null },
+  { id: "check:changelog-guard", npmScript: "check:changelog-guard", passBaseFlag: true, cost: "cheap", lock: null },
+  { id: "check:feature-flags-ttl", npmScript: "check:feature-flags-ttl", cost: "cheap", lock: null },
+  {
+    id: "check:pg-migration-safety",
+    npmScript: "check:pg-migration-safety",
+    npmArgs: ["--no-squawk"],
+    passBaseFlag: true,
+    cost: "cheap",
+    lock: null,
+  },
+  { id: "check:rest-contract", npmScript: "check:rest-contract", passBaseFlag: true, cost: "cheap", lock: null },
+  { id: "check:governance:fast", npmScript: "check:governance:fast", cost: "cheap", lock: null },
   { id: "lint:scheduler-wiring", npmScript: "lint:scheduler-wiring", cost: "cheap", lock: null },
   { id: "lint:agent-containers-sql", npmScript: "lint:agent-containers-sql", cost: "cheap", lock: null },
   { id: "lint:integ-tiers", npmScript: "lint:integ-tiers", cost: "cheap", lock: null },
@@ -254,9 +283,115 @@ export const GATE_RULES: GateRule[] = [
       f.startsWith("scripts/v5-") ||
       f.startsWith("scripts/lib/") ||
       f === "scripts/deploy-v5.sh" ||
+      f === "scripts/deploy-v5-selfhost.sh" ||
       f === ".github/scripts/diff-known-failures.sh" ||
       f.startsWith(".github/known-failures/"),
     gates: ["test:v5:ops"],
+  },
+  {
+    id: "governance-docs-links",
+    comment:
+      "OCV5-847/859: 治理权威文档与路径链接校验(只针对受治理文档,普通 docs/README 不进门)。",
+    match: (f) =>
+      f === "AGENTS.md" ||
+      f === ".claude/CLAUDE.md" ||
+      f === "docs/UI_DESIGN_SYSTEM.md" ||
+      f === "docs/V5_SELFHOST_PLAYBOOK.md" ||
+      f === "packages/web-react/AGENTS.md" ||
+      f === "packages/commercial/AGENTS.md" ||
+      f === "packages/gateway/AGENTS.md" ||
+      f === "scripts/check-docs-links.ts",
+    gates: ["check:docs-links"],
+  },
+  {
+    id: "governance-ui-gates",
+    comment:
+      "OCV5-847/859: 静态 UI 硬门(滚动单写者 / z-index / 零学习文案 / reduced-motion),不拉重量级浏览器。",
+    match: (f) =>
+      f === "scripts/check-ui-hard-gates.ts" ||
+      f === "packages/web-react/ui-static-baseline.json" ||
+      f === "packages/web-react/design-tokens-counts.json" ||
+      (f.startsWith("packages/web-react/src/") && /\.(ts|tsx|css)$/.test(f)),
+    gates: ["check:ui-gates"],
+  },
+  {
+    id: "governance-no-weak-downgrade",
+    comment:
+      "OCV5-847/859: 禁止静默降级至弱模型。任何 packages/*.ts(x) 或门脚本改动时跑秒级快门。",
+    match: (f) =>
+      f === "scripts/check-no-silent-model-downgrade.ts" ||
+      (f.startsWith("packages/") && /\.(ts|tsx)$/.test(f) && !f.endsWith(".d.ts")),
+    gates: ["check:no-weak-downgrade"],
+  },
+  {
+    id: "governance-route-sync",
+    comment:
+      "OCV5-847/859: 容器路由 / bridge allowlist / BLOCKED_FOR_USER_RULES 三处同步门。",
+    match: (f) =>
+      f === "scripts/check-v5-route-sync.ts" ||
+      f === "packages/gateway/src/server.ts" ||
+      f.startsWith("packages/gateway/src/routes/") ||
+      f === "packages/gateway/src/bridgeApiAllowlist.ts" ||
+      f === "packages/commercial/src/http/router.ts" ||
+      f === "packages/commercial/src/__tests__/containerRouteProxyClosure.test.ts",
+    gates: ["check:route-sync"],
+  },
+  {
+    id: "governance-monotonic-baselines",
+    comment:
+      "OCV5-847/849/859: 跨基线单调防篡改门(预算 / 静态基线 / 布局基线 / flag 注册表)。",
+    match: (f) =>
+      f === "scripts/check-monotonic-baselines.ts" ||
+      f === "packages/web-react/budgets.json" ||
+      f === "packages/web-react/design-tokens-counts.json" ||
+      f === "packages/web-react/ui-static-baseline.json" ||
+      f === "packages/web-react/layout-invariants-baseline.json" ||
+      f === "deploy/v5/feature-flags-registry.json",
+    gates: ["check:monotonic-baselines"],
+  },
+  {
+    id: "governance-changelog",
+    comment: "OCV5-847/859: changelog.json 人工审批防误改快门。",
+    match: (f) => f === "changelog.json" || f === "scripts/check-changelog-guard.ts",
+    gates: ["check:changelog-guard"],
+  },
+  {
+    id: "governance-feature-flags",
+    comment: "OCV5-847/859: Feature Flags TTL 注册表快门。",
+    match: (f) =>
+      f === "deploy/v5/feature-flags-registry.json" ||
+      f === "scripts/check-feature-flags-ttl.ts",
+    gates: ["check:feature-flags-ttl"],
+  },
+  {
+    id: "governance-pg-migration-safety",
+    comment: "OCV5-849/859: PG 零停机 Expand-Contract 静态迁移安全快门。",
+    match: (f) =>
+      f === "scripts/check-pg-migration-safety.ts" ||
+      (f.startsWith("packages/commercial/src/db/migrations/") && f.endsWith(".sql")),
+    gates: ["check:pg-migration-safety"],
+  },
+  {
+    id: "governance-rest-contract",
+    comment: "OCV5-849/859: 核心 5 域 REST API 契约快照与向后兼容快门。",
+    match: (f) =>
+      f === "scripts/check-rest-contract-compat.ts" ||
+      f === "packages/protocol/src/httpContracts.ts" ||
+      f === "packages/protocol/rest-contract-snapshot.json",
+    gates: ["check:rest-contract"],
+  },
+  {
+    id: "governance-fast-self",
+    comment: "OCV5-847/849/859: 改动治理快门脚本自身时跑整条秒级只读 check:governance:fast。",
+    match: (f) =>
+      f === "scripts/check-docs-links.ts" ||
+      f === "scripts/check-ui-hard-gates.ts" ||
+      f === "scripts/check-no-silent-model-downgrade.ts" ||
+      f === "scripts/check-v5-route-sync.ts" ||
+      f === "scripts/check-changelog-guard.ts" ||
+      f === "scripts/check-feature-flags-ttl.ts" ||
+      f === "scripts/check-rest-contract-compat.ts",
+    gates: ["check:governance:fast"],
   },
   {
     id: "protocol-near-full",

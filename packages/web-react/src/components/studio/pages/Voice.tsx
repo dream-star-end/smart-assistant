@@ -2,7 +2,7 @@
 // 2026-10-23 13:03), every line with its real waveform, duration against its shot, preview playback,
 // the timeline and the director panel.
 
-import { Captions, Check, Pause, Play, RefreshCw } from 'lucide-react'
+import { Captions, Check, Pause, Play } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
 
 import { useBlobUrl } from '../../../hooks/useBlobUrl'
@@ -199,15 +199,6 @@ export function VoicePage(props: {
             {readyProvider ? (
               <span className="st-cap st-hide-sm">{readyProvider.label} · 按字计费</span>
             ) : null}
-            <button
-              type="button"
-              className="st-btn st-btn-sm"
-              disabled
-              title="导演 agent 上线后可用"
-            >
-              <RefreshCw />
-              全部重配
-            </button>
           </div>
           {voice.state !== 'ready' ? (
             <div style={{ marginBottom: 14 }}>
@@ -220,8 +211,7 @@ export function VoicePage(props: {
                 还没有台词
               </div>
               <div className="st-cap" style={{ color: 'var(--st-stage-muted)', maxWidth: 440 }}>
-                导演 agent
-                写好分镜后会同时写出旁白和台词，用锁定的音色逐句配音，台词比画面长时自动延长镜头。
+                导演助手写好分镜后会同时写出旁白和台词，用锁定的音色逐句配音，台词比画面长时自动延长镜头。
               </div>
             </div>
           ) : (

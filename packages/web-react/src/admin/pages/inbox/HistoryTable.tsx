@@ -415,7 +415,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
                       <span className="font-mono">Markdown 源码</span>
                       <span className="tabular-nums">{detail.body_md.length.toLocaleString("en-US")} chars</span>
                     </div>
-                    <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-words px-4 py-3 font-mono text-[12px] leading-relaxed text-fg">
+                    <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-words px-4 py-3 font-mono text-meta leading-relaxed text-fg">
                       {detail.body_md}
                     </pre>
                   </div>

@@ -24,10 +24,14 @@ export interface SourceSearchOpts {
   /** PubMed E-utilities polite email(未配时 litSearch 回落 mailto)。 */
   pubmedEmail?: string;
   timeoutMs?: number;
+  /** 瞬时失败轻重试的退避基数(ms);测试可传 0 加速。 */
+  retryDelayMs?: number;
   fetchImpl?: FetchLike;
 }
 
 const DEFAULT_TIMEOUT_MS = 12_000;
+/** arXiv Atom API 经出站代理时响应常在 12~16s,单独给更宽裕默认超时(仍完全尊重显式 timeoutMs);重试统一由 litSearch 预算控制。 */
+export const ARXIV_DEFAULT_TIMEOUT_MS = 18_000;
 
 async function fetchJson(
   url: string,
@@ -51,13 +55,17 @@ async function fetchJson(
 
 async function fetchText(
   url: string,
-  opts: { timeoutMs?: number; fetchImpl?: FetchLike },
+  opts: { timeoutMs?: number; fetchImpl?: FetchLike; headers?: Record<string, string> },
 ): Promise<string> {
   const fetchFn = opts.fetchImpl ?? fetch;
   const ctrl = new AbortController();
   const to = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   try {
-    const res = await fetchFn(url, { method: "GET", signal: ctrl.signal });
+    const res = await fetchFn(url, {
+      method: "GET",
+      ...(opts.headers ? { headers: opts.headers } : {}),
+      signal: ctrl.signal,
+    });
     if (!res.ok) throw new Error(`upstream_${res.status}`);
     return await res.text();
   } finally {
@@ -139,8 +147,14 @@ interface OpenAlexWork {
   publication_year?: number | null;
   cited_by_count?: number | null;
   type?: string | null;
+  biblio?: {
+    volume?: string | null;
+    issue?: string | null;
+    first_page?: string | null;
+    last_page?: string | null;
+  } | null;
   authorships?: Array<{ author?: { id?: string; display_name?: string } }>;
-  primary_location?: { source?: { display_name?: string } | null } | null;
+  primary_location?: { source?: { display_name?: string; host_organization_name?: string | null } | null } | null;
   open_access?: { is_oa?: boolean; oa_url?: string | null } | null;
   ids?: { openalex?: string; doi?: string; arxiv?: string } | null;
   is_retracted?: boolean | null;
@@ -158,12 +172,23 @@ export function parseOpenAlexWork(w: OpenAlexWork): SourceRecord {
     .filter((a) => a.name.length > 0);
   const openalexId = w.id ?? w.ids?.openalex ?? undefined;
   const oaUrl = w.open_access?.oa_url ?? undefined;
+  const volume = w.biblio?.volume?.trim() || undefined;
+  const issue = w.biblio?.issue?.trim() || undefined;
+  const pages =
+    w.biblio?.first_page && w.biblio?.last_page
+      ? `${w.biblio.first_page}-${w.biblio.last_page}`
+      : w.biblio?.first_page || undefined;
+  const publisher = w.primary_location?.source?.host_organization_name?.trim() || undefined;
   const rec: SourceRecord = {
     id: makeSourceId({ doi, arxivId, title, authors, year: w.publication_year ?? undefined }),
     title,
     authors,
     year: w.publication_year ?? undefined,
     venue: w.primary_location?.source?.display_name ?? undefined,
+    ...(volume ? { volume } : {}),
+    ...(issue ? { issue } : {}),
+    ...(pages ? { pages } : {}),
+    ...(publisher ? { publisher } : {}),
     doi,
     arxivId,
     openalexId,
@@ -196,6 +221,10 @@ interface CrossrefItem {
   title?: string[];
   author?: Array<{ given?: string; family?: string; name?: string }>;
   "container-title"?: string[];
+  volume?: string;
+  issue?: string;
+  page?: string;
+  publisher?: string;
   issued?: { "date-parts"?: number[][] };
   type?: string;
   "is-referenced-by-count"?: number;
@@ -208,20 +237,35 @@ export function parseCrossrefItem(it: CrossrefItem): SourceRecord {
   const title = (it.title?.[0] ?? "").trim();
   const doi = normalizeDoi(it.DOI);
   const authors: Author[] = (it.author ?? [])
-    .map((a) => ({
-      name: a.name?.trim() ?? `${a.given ?? ""} ${a.family ?? ""}`.trim(),
-    }))
+    .map((a) => {
+      const given = a.given?.trim() || undefined;
+      const family = a.family?.trim() || undefined;
+      const name = a.name?.trim() || [given, family].filter(Boolean).join(" ").trim();
+      return {
+        name,
+        ...(given ? { given } : {}),
+        ...(family ? { family } : {}),
+      };
+    })
     .filter((a) => a.name.length > 0);
   const year = it.issued?.["date-parts"]?.[0]?.[0];
   const retracted = Array.isArray(it["update-to"])
     ? it["update-to"].some((u) => (u.type ?? "").toLowerCase().includes("retract"))
     : null;
+  const volume = it.volume?.trim() || undefined;
+  const issue = it.issue?.trim() || undefined;
+  const pages = it.page?.trim() || undefined;
+  const publisher = it.publisher?.trim() || undefined;
   return {
     id: makeSourceId({ doi, title, authors, year }),
     title,
     authors,
     year: typeof year === "number" ? year : undefined,
     venue: it["container-title"]?.[0],
+    ...(volume ? { volume } : {}),
+    ...(issue ? { issue } : {}),
+    ...(pages ? { pages } : {}),
+    ...(publisher ? { publisher } : {}),
     doi,
     crossrefType: it.type,
     citationCount: it["is-referenced-by-count"],
@@ -308,7 +352,18 @@ export async function searchArxiv(query: string, opts: SourceSearchOpts): Promis
   params.set("start", "0");
   params.set("max_results", String(Math.min(Math.max(opts.size, 1), 100)));
   const url = `https://export.arxiv.org/api/query?${params.toString()}`;
-  const xml = await fetchText(url, opts);
+  const timeoutMs = opts.timeoutMs ?? ARXIV_DEFAULT_TIMEOUT_MS;
+  const headers: Record<string, string> = {
+    Accept: "application/atom+xml, application/xml;q=0.9, */*;q=0.8",
+    "User-Agent": opts.mailto
+      ? `OpenClaude-research/1.0 (mailto:${opts.mailto})`
+      : "OpenClaude-research/1.0 (+https://openclaude.ai)",
+  };
+  const xml = await fetchText(url, {
+    timeoutMs,
+    fetchImpl: opts.fetchImpl,
+    headers,
+  });
   return parseArxivAtom(xml);
 }
 
@@ -327,9 +382,35 @@ interface PubmedSummary {
   pubdate?: string;
   fulljournalname?: string;
   source?: string;
+  volume?: string;
+  issue?: string;
+  pages?: string;
   authors?: Array<{ name?: string; authtype?: string }>;
   articleids?: Array<{ idtype?: string; value?: string }>;
   pubtype?: string[];
+}
+
+function parsePubmedAuthorName(raw: string): Author | null {
+  const name = raw.trim();
+  if (!name) return null;
+  const parts = name.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    const last = parts[parts.length - 1]!;
+    const prev = parts[parts.length - 2]!;
+    if (
+      /^[A-Z]{1,4}(?:-[A-Z]{1,2})*$/.test(last) &&
+      (/[a-z]/.test(prev) || (prev.length >= 2 && !/^[A-Z]\.?$/.test(prev)))
+    ) {
+      const family = parts.slice(0, -1).join(" ");
+      const given = last
+        .split("-")
+        .filter(Boolean)
+        .flatMap((seg) => seg.split(""))
+        .join(" ");
+      return { name, family, given };
+    }
+  }
+  return { name };
 }
 
 export function parsePubmedSummary(s: PubmedSummary): SourceRecord | null {
@@ -337,19 +418,25 @@ export function parsePubmedSummary(s: PubmedSummary): SourceRecord | null {
   if (!title) return null;
   const authors: Author[] = (s.authors ?? [])
     .filter((a) => (a.authtype ?? "Author") === "Author")
-    .map((a) => ({ name: (a.name ?? "").trim() }))
-    .filter((a) => a.name.length > 0);
+    .map((a) => parsePubmedAuthorName(a.name ?? ""))
+    .filter((a): a is Author => a !== null);
   const yearMatch = (s.pubdate ?? "").match(/\d{4}/);
   const year = yearMatch ? Number(yearMatch[0]) : undefined;
   const doi = normalizeDoi(s.articleids?.find((i) => i.idtype === "doi")?.value);
   // 撤稿:esummary pubtype 含 "Retracted Publication" 即已撤稿;否则未知(null)。
   const retracted = (s.pubtype ?? []).some((t) => /retracted publication/i.test(t)) ? true : null;
+  const volume = s.volume?.trim() || undefined;
+  const issue = s.issue?.trim() || undefined;
+  const pages = s.pages?.trim() || undefined;
   return {
     id: makeSourceId({ doi, title, authors, year }),
     title,
     authors,
     year,
     venue: s.fulljournalname ?? s.source ?? undefined,
+    ...(volume ? { volume } : {}),
+    ...(issue ? { issue } : {}),
+    ...(pages ? { pages } : {}),
     doi,
     lang: guessLang(title),
     oa: undefined, // PubMed 题录不含 OA 全文链接;OA 富化交给 Unpaywall(litSearch)

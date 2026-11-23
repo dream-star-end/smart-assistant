@@ -11,3 +11,9 @@
 
 export const V3_AGENT_UID = 1000;
 export const V3_AGENT_GID = 1000;
+
+export {
+  ANTIGRAVITY_CLEARCUT_BLOCK_EXTRA_HOST,
+  V3_DEFAULT_EXTRA_HOSTS,
+  buildContainerExtraHosts,
+} from "../compute-pool/extraHosts.js";

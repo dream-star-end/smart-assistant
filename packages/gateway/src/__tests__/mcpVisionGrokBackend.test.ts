@@ -4,6 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { GROK_VISION_PATH } from '@openclaude/protocol'
+import {
+  LOCAL_CATALOG_HEADER,
+  type ModelCatalogClient,
+  _setModelCatalogClientForTests,
+} from '../modelCatalogClient.js'
 
 const home = mkdtempSync(join(tmpdir(), 'oc-vision-grok-'))
 process.env.OPENCLAUDE_HOME = home
@@ -175,6 +180,64 @@ describe('runGrokVision(默认识图后端 = Grok 4.7,经 master)', () => {
         },
       ),
     )
+  })
+
+  it('503 GROK_VISION_MODEL_UNAVAILABLE 自动容灾到当前活跃旗舰视觉模型 (k3.1-pro)，不降级弱模型 (OCV5-874 #2)', async () => {
+    const p = image('g7.png', PNG)
+    _setModelCatalogClientForTests({
+      configured: true,
+      getToken: async () => 'cat-tok',
+      getView: async () => ({
+        models: [],
+        projectionRevision: 'rev',
+        availabilityRevision: 'av',
+        securityEpoch: '1',
+        canonicalize: (m: string) => m,
+        aliasEntries: () => [],
+        isRoutable: (m: string) => m === 'k3.1-pro' || m === 'deepseek-v4-flash',
+        resolve: (m: string) =>
+          m === 'k3.1-pro'
+            ? ({ modelId: 'k3.1-pro', supportsVision: true, available: true } as any)
+            : null,
+        isCodexModel: () => false,
+        agentCostOverrides: new Map(),
+      }),
+    } as unknown as ModelCatalogClient)
+    try {
+      await withEnv(
+        { ...ENV, ANTHROPIC_BASE_URL: 'http://172.30.0.1:18791' },
+        () =>
+          withFetch(
+            (call) => {
+              if (call.url.endsWith(GROK_VISION_PATH)) {
+                return new Response(
+                  JSON.stringify({ error: { code: 'GROK_VISION_MODEL_UNAVAILABLE', message: 'vision model is not available' } }),
+                  { status: 503 },
+                )
+              }
+              return new Response(
+                'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"PASS: chart verified"}}\n\ndata: [DONE]\n\n',
+                { status: 200, headers: { 'content-type': 'text/event-stream' } },
+              )
+            },
+            async (calls) => {
+              const res = await vision.runVisionWithBackend(vision.resolveVisionInput({ image_file: p }))
+              assert.equal(res.text, 'PASS: chart verified')
+              assert.equal(res.backend, 'k3.1-pro')
+              assert.equal(calls.length, 2)
+              assert.equal(calls[0]!.url, `http://172.30.0.1:18791${GROK_VISION_PATH}`)
+              assert.equal(calls[1]!.url, 'http://172.30.0.1:18791/v1/messages')
+              assert.equal(calls[1]!.init.headers[LOCAL_CATALOG_HEADER], 'cat-tok')
+              const sentBody = JSON.parse(calls[1]!.init.body as string)
+              assert.equal(sentBody.model, 'k3.1-pro')
+              assert.equal(sentBody.max_tokens, 6144)
+              assert.deepEqual(sentBody.output_config, { effort: 'low' })
+            },
+          ),
+      )
+    } finally {
+      _setModelCatalogClientForTests(null)
+    }
   })
 
   it('OPENCLAUDE_VISION_BACKEND=minimax 仍走静态模型后端(不打 grok-vision)', async () => {

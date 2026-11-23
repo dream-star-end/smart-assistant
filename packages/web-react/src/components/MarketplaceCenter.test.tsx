@@ -160,7 +160,6 @@ test("目录 revision 变化会刷新跨客户端市场和发布状态", () => {
   expect(screen.getByRole("tabpanel")).toHaveAttribute("aria-labelledby", "marketplace-tab-browse");
   expect(screen.getByRole("heading", { name: "AI 市场" }).parentElement).toHaveClass("min-w-0");
   expect(screen.getByRole("dialog")).toHaveClass("oc-center-dialog", "marketplace-window");
-  expect(screen.getByRole("dialog")).not.toHaveClass("top-1/2");
 });
 
 test("连接器旧 kind 在产品层显示为插件；通过通知 CTA 实时刷新并一次性打开条目", () => {

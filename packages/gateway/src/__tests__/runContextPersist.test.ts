@@ -52,7 +52,7 @@ describe('persistRunContextSnapshot', () => {
 
   it('writes snapshot and backfills taskboard columns; old runs stay nullable', async () => {
     const db = getTaskboardDb()
-    assert.equal(TASKBOARD_SCHEMA_VERSION, 10)
+    assert.equal(TASKBOARD_SCHEMA_VERSION, 11)
     const project = createProject(db, { key: 'SNAP', name: 'snap' })
     const ticket = createTicket(db, {
       projectId: project.id,

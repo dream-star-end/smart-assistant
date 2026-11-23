@@ -25,7 +25,9 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 5
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 6
+
+const DELEGATE_WAL_CHECKPOINT_INTERVAL_MS = 30 * 60_000
 
 /**
  * OCV5-164: how long a retired (TTL-elapsed) terminal row stays readable for
@@ -166,6 +168,15 @@ CREATE INDEX IF NOT EXISTS idx_delegate_jobs_retired
   ON delegate_jobs(retired_at) WHERE retired_at IS NOT NULL;
 `
 
+const DDL_V6 = `
+CREATE INDEX IF NOT EXISTS idx_delegate_jobs_parent_session
+  ON delegate_jobs(parent_session_key);
+CREATE INDEX IF NOT EXISTS idx_delegate_jobs_callback_retry
+  ON delegate_jobs(callback_state, notify_retry_at);
+CREATE INDEX IF NOT EXISTS idx_delegate_jobs_expires_at
+  ON delegate_jobs(expires_at);
+`
+
 export function resolveDelegateJobsDbPath(env: NodeJS.ProcessEnv = process.env): string {
   const override = env.OPENCLAUDE_DELEGATE_JOBS_DB?.trim()
   if (override) return override
@@ -180,6 +191,7 @@ export class DelegateDurableDb {
   private readonly db: SqliteDb
   failNextWrite = false
   private closed = false
+  private walTimer: ReturnType<typeof setInterval> | null = null
   private readonly upsertStmt
   private readonly insertStmt
   private readonly casUpdateStmt
@@ -187,6 +199,7 @@ export class DelegateDurableDb {
   private readonly casClaimNotifyStmt
   private readonly casCompleteNotifyStmt
   private readonly casReleaseNotifyStmt
+  private readonly casAbandonNotifyStmt
   private readonly casMarkAAttemptedStmt
   private readonly getStmt
   private readonly getByIdemStmt
@@ -390,10 +403,32 @@ export class DelegateDurableDb {
     this.casReleaseNotifyStmt = this.db.prepare(`
       UPDATE delegate_jobs SET
         callback_state='pending',
+        callback_epoch=COALESCE(@callback_epoch, callback_epoch),
+        notify_id=COALESCE(@notify_id, notify_id),
         notify_delivery_token=NULL,
         notify_claimed_until=NULL,
         notify_retry_at=@retry_at,
         notify_attempt=@notify_attempt,
+        last_activity_at=@now,
+        updated_at=@now
+      WHERE job_id=@job_id
+        AND retired_at IS NULL
+        AND state=@expected_state
+        AND fencing_epoch=@expected_epoch
+        AND (
+          (@expected_token IS NULL AND claim_token IS NULL)
+          OR claim_token=@expected_token
+        )
+        AND callback_state='injecting'
+        AND notify_delivery_token=@delivery_token
+      RETURNING *
+    `)
+    this.casAbandonNotifyStmt = this.db.prepare(`
+      UPDATE delegate_jobs SET
+        callback_state='abandoned',
+        notify_delivery_token=NULL,
+        notify_claimed_until=NULL,
+        notify_retry_at=NULL,
         last_activity_at=@now,
         updated_at=@now
       WHERE job_id=@job_id
@@ -484,6 +519,15 @@ export class DelegateDurableDb {
               MIN(created_at) AS oldest
          FROM delegate_jobs`,
     )
+    this.walTimer = setInterval(() => {
+      if (this.closed) return
+      try {
+        this.db.pragma('wal_checkpoint(PASSIVE)')
+      } catch {
+        /* non-fatal; retried on next 30m checkpoint interval */
+      }
+    }, DELEGATE_WAL_CHECKPOINT_INTERVAL_MS)
+    this.walTimer.unref()
   }
 
   private migrate(): void {
@@ -500,6 +544,7 @@ export class DelegateDurableDb {
           if (!columns.has(name)) this.db.exec(`ALTER TABLE delegate_jobs ADD COLUMN ${name} TEXT`)
         }
       }
+      if (current < 6) this.db.exec(DDL_V6)
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
     apply()
@@ -678,6 +723,8 @@ export class DelegateDurableDb {
     now: number
     retryAt: number
     notifyAttempt: number
+    callbackEpoch?: number
+    notifyId?: string
   }): DurableJobRecord | undefined {
     this.throwIfInjectedFailure()
     const row = this.casReleaseNotifyStmt.get({
@@ -689,6 +736,28 @@ export class DelegateDurableDb {
       now: args.now,
       retry_at: args.retryAt,
       notify_attempt: args.notifyAttempt,
+      callback_epoch: args.callbackEpoch ?? null,
+      notify_id: args.notifyId ?? null,
+    }) as Record<string, unknown> | undefined
+    return row ? fromRow(row) : undefined
+  }
+
+  casAbandonNotify(args: {
+    jobId: string
+    state: string
+    fencingEpoch: number
+    claimToken?: string | null
+    deliveryToken: string
+    now: number
+  }): DurableJobRecord | undefined {
+    this.throwIfInjectedFailure()
+    const row = this.casAbandonNotifyStmt.get({
+      job_id: args.jobId,
+      expected_state: args.state,
+      expected_epoch: args.fencingEpoch,
+      expected_token: args.claimToken ?? null,
+      delivery_token: args.deliveryToken,
+      now: args.now,
     }) as Record<string, unknown> | undefined
     return row ? fromRow(row) : undefined
   }
@@ -808,6 +877,10 @@ export class DelegateDurableDb {
   close(): void {
     if (this.closed) return
     this.closed = true
+    if (this.walTimer !== null) {
+      clearInterval(this.walTimer)
+      this.walTimer = null
+    }
     try {
       this.db.pragma('wal_checkpoint(TRUNCATE)')
     } catch {
