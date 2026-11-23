@@ -71,9 +71,13 @@ export async function waitJourneyUserRow(page, { marker, modelLabel, timeout = 2
       if (await confirm.count() !== 1 || !await confirm.isEnabled()) {
         throw new Error("Journey model confirmation unavailable");
       }
+      const closing = dialogs.first();
       confirmed = true;
       await confirm.click({ timeout: remaining() });
       await dialog.waitFor({ state: "hidden", timeout: remaining() });
+      // Wait for Radix Dialog exit animation (data-state="closed", oc-dialog-out 150ms)
+      // to finish detaching the closing node after ConfirmDialog clears its title.
+      await closing.waitFor({ state: "detached", timeout: remaining() });
       continue;
     }
     const rows = page.getByTestId("user-row").filter({ hasText: marker });

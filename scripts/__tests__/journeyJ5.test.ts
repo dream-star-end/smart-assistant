@@ -111,6 +111,7 @@ test('OCV5-763: J4 cost confirmation is bounded and anchored to the sent user ro
       { mode: 'risk', ok: true, clicks: 1 },
       { mode: 'estimate', ok: true, clicks: 1 },
       { mode: 'delayed', ok: true, clicks: 1 },
+      { mode: 'closing-animation', ok: true, clicks: 1 },
       { mode: 'no-dialog', ok: true, clicks: 0 },
       { mode: 'wrong-target', ok: false, clicks: 0 },
       { mode: 'prefix-target', ok: false, clicks: 0 },
@@ -144,7 +145,13 @@ test('OCV5-763: J4 cost confirmation is bounded and anchored to the sent user ro
               ?'<p>目标模型：'+target+' · 当前上下文约 500 tokens</p><p>继续使用 Grok 4.7 约 1 积分。</p>'
               :'<p>无法预估本轮费用</p><p>当前输入或重建上下文缺少可靠计数，切换后第一轮可能明显更贵。确认后将使用 '+target+' 。</p>';
             d.innerHTML='<h2>'+d.getAttribute('aria-label')+'</h2><div data-testid="model-switch-cost-summary">'+summary+'</div><button>取消</button><button data-confirm '+(mode==='disabled'?'disabled':'')+'>确认切换</button>';
-            d.querySelector('[data-confirm]').onclick=()=>{window.confirmClicks++;d.remove();
+            d.querySelector('[data-confirm]').onclick=()=>{window.confirmClicks++;
+              if(mode==='closing-animation'){
+                d.removeAttribute('aria-label');d.querySelector('h2').textContent='';
+                setTimeout(()=>{d.remove();row();},150);
+                return;
+              }
+              d.remove();
               if(mode==='repeated')setTimeout(modal,60);
               else if(mode!=='no-row-after-confirm')row();};
             document.body.append(d);
