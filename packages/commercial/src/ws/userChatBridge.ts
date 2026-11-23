@@ -8299,7 +8299,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             return;
           }
         }
-        if (handleTurnDispatchReceipt(frameText, {
+        const attestPeek = frameText;
+        if (handleTurnDispatchReceipt(attestPeek, {
           pool: deps.pgPool, uid, admittedDispatches, enrichmentDispatches,
           ...(containerId !== undefined ? {
             agentContainerId: containerId,
