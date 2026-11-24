@@ -85,6 +85,7 @@ import { readV3CodexRelayConfig, V3_CODEX_RELAY_PREFIX } from './v3CodexRelay.js
 import { resolveEngine } from './engine/registry.js'
 import {
   applyAntigravitySwarmTurnDirective,
+  filterAvailableLocalSwarmModels,
   hasHistoricalAntigravitySwarm,
   listLiveAntigravitySwarmMonitors,
 } from './engine/antigravitySwarmDirective.js'
@@ -1813,14 +1814,7 @@ export async function dispatchInbound(
       if (isAntigravityTurn && !isRemoteAntigravity && swarmRequested) {
         try {
           const catalogView = await getLocalCatalogView()
-          const localModels = catalogView.models
-            .filter(
-              (m) =>
-                m.available &&
-                m.engine === 'antigravity' &&
-                isAntigravityEngineModel(m.modelId),
-            )
-            .map((m) => m.modelId)
+          const localModels = filterAvailableLocalSwarmModels(catalogView.models)
           if (localModels.length > 0) availableLocalSwarmModels = localModels
         } catch {
           // Best-effort discovery hint only; relay enforces authoritative allowlist server-side.

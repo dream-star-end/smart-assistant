@@ -6441,12 +6441,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   isAllowedForUser: modelCheckerHandle ? (id) => modelCheckerHandle.isAllowed(id) : null,
                   isCatalogRoutableLocal: catalogSnapshot
                     ? (id) => {
-                        if (!catalogSnapshot.isRoutable(id)) return false;
+                        if (!catalogSnapshot.isRoutable(id) || !catalogSnapshot.isAntigravityModel(id)) {
+                          return false;
+                        }
                         const desc = catalogSnapshot.resolve(id);
                         return (
                           desc !== null
                           && desc.canonicalModel === id
-                          && desc.engine === "antigravity"
                           && desc.placement !== "remote_pool"
                         );
                       }

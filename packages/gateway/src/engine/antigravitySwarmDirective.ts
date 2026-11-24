@@ -38,6 +38,19 @@ function formatLocalSwarmCliModelGroup(canonicalModelId: string): string | null 
   return values.join(' / ')
 }
 
+export function filterAvailableLocalSwarmModels(
+  models: readonly { modelId: string; engine: string; available: boolean }[],
+): string[] {
+  return models
+    .filter(
+      (m) =>
+        m.available &&
+        m.engine === 'antigravity' &&
+        isAntigravitySwarmMemberModel(m.modelId),
+    )
+    .map((m) => m.modelId)
+}
+
 export function formatAvailableLocalSwarmModelsHint(
   modelIds?: readonly string[] | null,
 ): string | null {

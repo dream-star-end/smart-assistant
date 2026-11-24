@@ -13,6 +13,7 @@ import {
 import {
   ANTIGRAVITY_SWARM_OFF_MARKER,
   applyAntigravitySwarmTurnDirective,
+  filterAvailableLocalSwarmModels,
   formatAvailableLocalSwarmModelsHint,
   hasHistoricalAntigravitySwarm,
   listLiveAntigravitySwarmMonitors,
@@ -384,6 +385,17 @@ test('OCV5-852 P0-3/P2-2: dual @monitor/@narrator ban, @all [done] prohibition, 
 })
 
 test('OCV5-879: local native swarm allows selecting built-in Antigravity models while remote swarm stays restricted', () => {
+  assert.deepEqual(
+    filterAvailableLocalSwarmModels([
+      { modelId: 'antigravity-gemini-4-neon', engine: 'antigravity', available: true },
+      { modelId: 'antigravity-gemini-4-carbon', engine: 'antigravity', available: false },
+      { modelId: 'antigravity-orchestrator-neon', engine: 'antigravity', available: true },
+      { modelId: 'antigravity-gemini-4-neon-remote', engine: 'antigravity', available: true },
+      { modelId: 'gpt-6.2-astra', engine: 'codex', available: true },
+    ]),
+    ['antigravity-gemini-4-neon'],
+  )
+
   const hint = formatAvailableLocalSwarmModelsHint([
     'antigravity-gemini-4-neon',
     'antigravity-gemini-4-carbon',
