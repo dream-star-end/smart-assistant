@@ -38,6 +38,31 @@ function formatLocalSwarmCliModelGroup(canonicalModelId: string): string | null 
   return values.join(' / ')
 }
 
+const MAX_ROUTE_SWARM_ALLOWED_MODELS = 32
+
+/**
+ * Parse master-injected `_antigravitySwarmAllowedModels` (OCV5-881).
+ * Returns `undefined` when absent (legacy master fallback to local catalog view),
+ * or an authoritative deduplicated list of built-in local swarm member model ids
+ * actually supported by the bound OAuth account for this turn (possibly empty when
+ * no extra member models are available beyond an orchestrator primary).
+ */
+export function extractRouteAllowedLocalSwarmModels(raw: unknown): string[] | undefined {
+  if (raw === undefined) return undefined
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const item of raw) {
+    if (out.length >= MAX_ROUTE_SWARM_ALLOWED_MODELS) break
+    if (typeof item !== 'string') continue
+    const id = item.trim()
+    if (!id || seen.has(id) || !isAntigravitySwarmMemberModel(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  return out
+}
+
 export function filterAvailableLocalSwarmModels(
   models: readonly { modelId: string; engine: string; available: boolean }[],
 ): string[] {
@@ -255,19 +280,24 @@ export function applyAntigravitySwarmTurnDirective(opts: {
       liveMonitors.length > 0
         ? `   - 检测到历史蜂群仍有残留原生辅助成员（${liveMonitors.map((n) => `\`${n}\``).join('、')}），请优先调用 \`swarm{action:"kill", name:"..."}\` 将其回收，避免后台定时空转消耗上下文。`
         : null
+    const hasExplicitLocalAllowlist = !opts.isRemoteAntigravity && Array.isArray(opts.availableLocalSwarmModels)
     const localModelsHint = opts.isRemoteAntigravity
       ? null
       : formatAvailableLocalSwarmModelsHint(opts.availableLocalSwarmModels)
     const modelRuleLine = opts.isRemoteAntigravity
       ? '2. 招募成员时**不要指定 `model` 参数**（留空以继承当前会话模型，确保计费与权限一致）。'
       : localModelsHint
-        ? `2. **按成员模型选择**：默认留空 \`model\` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可在 \`swarm{action:"add", model:"..."}\` 中指定（或对 \`waiting\` 成员用 \`swarm{action:"model", name:"...", model:"..."}\` 切换）。仅可使用本次已放行的 Antigravity 自带模型：${localModelsHint}（不支持外部非 Antigravity 模型，系统按各成员实际模型独立计费）。`
-        : '2. **按成员模型选择**：默认留空 \`model\` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可先用 \`swarm{action:"models"}\` 查看 Antigravity 自带可用模型，再在 \`swarm{action:"add", model:"..."}\` 中指定（或对 \`waiting\` 成员用 \`swarm{action:"model", name:"...", model:"..."}\` 切换；仅限平台已放行的 Antigravity 自带模型，不支持外部模型，系统按实际模型独立计费）。'
+        ? `2. **按成员模型选择**：默认留空 \`model\` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可在 \`swarm{action:"add", model:"..."}\` 中指定（或对 \`waiting\` 成员用 \`swarm{action:"model", name:"...", model:"..."}\` 切换）。仅可使用本次已放行的 Antigravity 自带模型：${localModelsHint}（即使 \`swarm{action:"models"}\` 显示其他未授权或旧版模型也请勿选用，中继会按白名单拒放；不支持外部非 Antigravity 模型，系统按各成员实际模型独立计费）。`
+        : hasExplicitLocalAllowlist
+          ? '2. **按成员模型选择**：本轮绑定账号未放行额外蜂群成员模型，招募成员时请留空 `model` 继承当前会话模型（切勿指定未放行或外部模型）。'
+          : '2. **按成员模型选择**：默认留空 `model` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可先用 `swarm{action:"models"}` 查看 Antigravity 自带可用模型，再在 `swarm{action:"add", model:"..."}` 中指定（或对 `waiting` 成员用 `swarm{action:"model", name:"...", model:"..."}` 切换；仅限平台已放行的 Antigravity 自带模型，不支持外部模型，系统按实际模型独立计费）。'
     const resumedModelRule = opts.isRemoteAntigravity
       ? '招募成员不传 `model`'
       : localModelsHint
-        ? `招募成员默认留空 \`model\` 继承主模型，也可按需指定已放行的 Antigravity 自带模型（${localModelsHint}）`
-        : '招募成员默认留空 `model` 继承主模型，也可按需指定已放行的 Antigravity 自带模型'
+        ? `招募成员默认留空 \`model\` 继承主模型，也可按需指定已放行的 Antigravity 自带模型（${localModelsHint}；勿选列表外模型）`
+        : hasExplicitLocalAllowlist
+          ? '招募成员留空 `model` 继承主模型'
+          : '招募成员默认留空 `model` 继承主模型，也可按需指定已放行的 Antigravity 自带模型'
     const swarmDirective = opts.hasHistoricalSwarm
       ? [
           '[OpenClaude Antigravity 蜂群模式已激活]',

@@ -16,10 +16,10 @@ const BYPASS_TOKEN = "bypass";
 
 /**
  * 行内文字按钮(忘记密码 / 立即注册 / 去登录 / 重新发送 …)的触屏补丁(a11y-B landing#2):
- * 桌面保持 18–20px 的文字行,hover:none 下撑到 44px 命中并左右加一点内距。
+ * 桌面保持 18–20px 的文字行,hover:none 或窄屏移动端(max-sm)下撑到 44px 命中并左右加一点内距。
  */
 const TOUCH_TEXT_BTN =
-  "[@media(hover:none)]:inline-flex [@media(hover:none)]:min-h-11 [@media(hover:none)]:items-center [@media(hover:none)]:px-2";
+  "[@media(hover:none)]:inline-flex [@media(hover:none)]:min-h-11 [@media(hover:none)]:items-center [@media(hover:none)]:px-2 max-sm:inline-flex max-sm:min-h-11 max-sm:items-center max-sm:px-2";
 
 /** 多模式鉴权表层：登录 / 注册 / 邮箱验证 / 忘记密码 / 重置密码。 */
 export type AuthMode = "login" | "register" | "verify" | "forgot" | "reset";
@@ -42,7 +42,7 @@ function PasswordInput({
       <Input
         {...props}
         type={shown ? "text" : "password"}
-        className={cn("pr-11", className)}
+        className={cn("pr-11 max-sm:min-h-11 max-sm:pr-12", className)}
       />
       <IconButton
         size="sm"
@@ -51,8 +51,8 @@ function PasswordInput({
         aria-label={`${shown ? "隐藏" : "显示"}${fieldLabel}`}
         aria-pressed={shown}
         onClick={() => setShown((s) => !s)}
-        // 输入框在触屏下 min-h-11,按钮同样升到 44px;竖向居中而不写死 top 值。
-        className="absolute inset-y-0 right-1.5 my-auto"
+        // 输入框在触屏与窄屏移动端下 min-h-11,按钮同样升到 44px;竖向居中而不写死 top 值。
+        className="absolute inset-y-0 right-1.5 my-auto max-sm:right-0.5 max-sm:size-11"
       >
         {shown ? <EyeOff size={16} /> : <Eye size={16} />}
       </IconButton>

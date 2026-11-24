@@ -1137,6 +1137,7 @@ export interface UserChatBridgeDeps {
     accessToken: string;
     accessTokenExpiresAt: string;
     idToken: string | null;
+    allowedModelIds?: readonly string[];
   }>;
   /** Drop a minted Antigravity relay token after the turn settles or aborts. */
   expireAntigravityRoute?: (token: string) => void | Promise<void>;
@@ -5982,6 +5983,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sanitizedParsed,
               "__oc_antigravity_route",
             );
+            const hasClientAntigravitySwarmAllowedModels = Object.prototype.hasOwnProperty.call(
+              sanitizedParsed,
+              "_antigravitySwarmAllowedModels",
+            );
             const hasClientWorkspaceMode = Object.prototype.hasOwnProperty.call(
               sanitizedParsed,
               "_workspaceMode",
@@ -5999,6 +6004,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               hasClientGrokRoute ||
               hasClientZcodeRoute ||
               hasClientAntigravityRoute ||
+              hasClientAntigravitySwarmAllowedModels ||
               hasClientWorkspaceMode ||
               hasClientCreditBudget ||
               teamModeMain
@@ -6022,6 +6028,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (hasClientAntigravityRoute) {
                 const { __oc_antigravity_route: _discard, ...withoutAntigravityRoute } = sanitizedParsed;
                 sanitizedParsed = withoutAntigravityRoute;
+              }
+              if (hasClientAntigravitySwarmAllowedModels) {
+                const { _antigravitySwarmAllowedModels: _discard, ...withoutSwarmAllowed } = sanitizedParsed;
+                sanitizedParsed = withoutSwarmAllowed;
               }
               if (hasClientWorkspaceMode) {
                 const { _workspaceMode: _discard, ...withoutWorkspaceMode } = sanitizedParsed;
@@ -6517,6 +6527,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 accessTokenExpiresAt: minted.accessTokenExpiresAt,
                 ...(minted.idToken ? { idToken: minted.idToken } : {}),
               },
+              ...(isLocalSwarmTurn
+                ? { _antigravitySwarmAllowedModels: minted.allowedModelIds ?? [antigravityModelId] }
+                : {}),
               ...authorityFields,
               ...dispatchAuthorityField(dispatchRecord),
             };

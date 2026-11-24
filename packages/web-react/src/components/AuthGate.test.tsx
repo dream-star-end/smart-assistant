@@ -617,6 +617,15 @@ describe("AuthGate — 密码框显示 / 隐藏(L-09)", () => {
     expect(pw).toHaveValue("s3cret-pass");
     // 登录按钮可及名唯一性红线不受新按钮影响
     expect(screen.getByRole("button", { name: "登录" })).toBeInTheDocument();
+    // OCV5-881: 窄屏移动端下（如 390×844）密码显隐按钮与忘记密码按钮保持 ≥44px 触控靶
+    expect(screen.getByRole("button", { name: "显示密码" }).className).toContain("max-sm:size-11");
+  });
+
+  test("窄屏移动端下忘记密码按钮保持 ≥44px 触控靶", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} onRequestReset={vi.fn()} turnstileBypass={true} />);
+    const forgotBtn = screen.getByRole("button", { name: "忘记密码？" });
+    expect(forgotBtn.className).toContain("max-sm:min-h-11");
+    expect(forgotBtn.className).toContain("[@media(hover:none)]:min-h-11");
   });
 
   test("注册页:两枚密码框各有一枚切换按钮,且可及名不同名;标签经 htmlFor 关联", () => {

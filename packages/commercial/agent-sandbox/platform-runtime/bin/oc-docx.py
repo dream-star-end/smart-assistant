@@ -1061,6 +1061,8 @@ def inspect_docx(input_path: str | Path, render_dir: str | Path | None = None) -
     with zipfile.ZipFile(source, "r") as archive:
         bad_member = archive.testzip()
         members = archive.namelist()
+        if "word/document.xml" not in members:
+            raise ValueError(f"{source} 缺少 word/document.xml，不是有效的 DOCX 文档")
         image_members = [name for name in members if name.startswith("word/media/")]
         has_comments = False
         if "word/comments.xml" in members:
@@ -1072,7 +1074,10 @@ def inspect_docx(input_path: str | Path, render_dir: str | Path | None = None) -
             except Exception:
                 has_comments = True
         has_custom_properties = "docProps/custom.xml" in members
-    document = Document(source)
+    try:
+        document = Document(source)
+    except Exception as exc:
+        raise ValueError(f"无法解析 DOCX 文档 {source}：{exc}") from exc
     headings: list[dict[str, Any]] = []
     non_empty = 0
     for paragraph in document.paragraphs:
@@ -1083,29 +1088,18 @@ def inspect_docx(input_path: str | Path, render_dir: str | Path | None = None) -
             headings.append({"style": paragraph.style.name, "text": text})
     core = document.core_properties
     report: dict[str, Any] = {
-        "file": str(source),
-        "size_bytes": source.stat().st_size,
-        "zip_integrity_ok": bad_member is None,
-        "bad_zip_member": bad_member,
-        "paragraph_count": len(document.paragraphs),
-        "non_empty_paragraph_count": non_empty,
-        "table_count": len(document.tables),
-        "image_count": len(image_members),
-        "headings": headings,
-        "has_comments_xml": has_comments,
+        "file": str(source), "size_bytes": source.stat().st_size,
+        "zip_integrity_ok": bad_member is None, "bad_zip_member": bad_member,
+        "paragraph_count": len(document.paragraphs), "non_empty_paragraph_count": non_empty,
+        "table_count": len(document.tables), "image_count": len(image_members),
+        "headings": headings, "has_comments_xml": has_comments,
         "has_custom_properties": has_custom_properties,
         "core_properties": {
-            "title": core.title or "",
-            "subject": core.subject or "",
-            "author": core.author or "",
-            "last_modified_by": core.last_modified_by or "",
-            "comments": core.comments or "",
-            "keywords": core.keywords or "",
-            "category": core.category or "",
+            "title": core.title or "", "subject": core.subject or "", "author": core.author or "",
+            "last_modified_by": core.last_modified_by or "", "comments": core.comments or "",
+            "keywords": core.keywords or "", "category": core.category or "",
         },
-        "render_pairing_ok": True,
-        "pages": [],
-        "warnings": [],
+        "render_pairing_ok": True, "pages": [], "warnings": [],
     }
     if non_empty == 0 and not document.tables:
         report["warnings"].append("文档似乎没有可见内容")
@@ -1304,6 +1298,8 @@ def _parse_docx_xml(source: Path) -> tuple[Any, Any | None, set[str]]:
 
     with zipfile.ZipFile(source) as archive:
         members = set(archive.namelist())
+        if "word/document.xml" not in members:
+            raise ValueError(f"{source} 缺少 word/document.xml，不是有效的 DOCX 文档")
         document = ET.fromstring(archive.read("word/document.xml"))
         numbering = ET.fromstring(archive.read("word/numbering.xml")) if "word/numbering.xml" in members else None
         media = {name for name in members if name.startswith("word/media/")}

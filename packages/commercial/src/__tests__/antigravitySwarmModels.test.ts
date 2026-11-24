@@ -189,7 +189,7 @@ describe('OCV5-879: local native Antigravity swarm per-member built-in models', 
     const now = Date.now()
     const futureReset = new Date(now + 3600_000).toISOString()
 
-    await admitAntigravityTurn(
+    const grant = await admitAntigravityTurn(
       {
         containerId: 11,
         userId: 42n,
@@ -245,10 +245,15 @@ describe('OCV5-879: local native Antigravity swarm per-member built-in models', 
       'antigravity-gemini-4-hydrogen',
       'antigravity-gemini-4-neon',
     ])
+    // OCV5-881: grant propagates the exact bound-account allowlist back to userChatBridge/container
+    assert.deepEqual(grant.allowedModelIds, [
+      'antigravity-gemini-4-hydrogen',
+      'antigravity-gemini-4-neon',
+    ])
 
     // Account with null availableModels (before first background refresh) keeps primary-only and never expands to extra members
     let nullDirAllowed: readonly string[] | undefined = ['sentinel']
-    await admitAntigravityTurn(
+    const nullDirGrant = await admitAntigravityTurn(
       {
         containerId: 11,
         userId: 42n,
@@ -278,6 +283,7 @@ describe('OCV5-879: local native Antigravity swarm per-member built-in models', 
       },
     )
     assert.equal(nullDirAllowed, undefined)
+    assert.deepEqual(nullDirGrant.allowedModelIds, ['antigravity-gemini-3.8-flash'])
   })
 
   test('route KV preserves allowedModelIds, keeps legacy routes compatible, rejects composite orchestrator extra members & tampered Redis rows', async () => {

@@ -732,6 +732,8 @@ COPY --chown=root:root ./platform-runtime/bin/oc-connect.sh /usr/local/bin/oc-co
 RUN set -eux; \
     chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-skill /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-artifact-qa /usr/local/bin/oc-figcheck /usr/local/bin/oc-diagram /usr/local/bin/oc-memory /usr/local/bin/oc-connect /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /run/oc/platform/current/bin/oc-stylecheck /usr/local/bin/oc-stylecheck; \
+    ln -sf /run/oc/platform/current/bin/oc-review /usr/local/bin/oc-review; \
+    ln -sf /run/oc/platform/current/bin/oc-docxcheck /usr/local/bin/oc-docxcheck; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $\bar{x}=\frac{1}{n}\sum_{i=1}^{n}x_i$.' '' '$$' '\mathrm{MSE}=\frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2' '$$' > /tmp/oc-docx-smoke.md; \

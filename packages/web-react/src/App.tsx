@@ -600,6 +600,13 @@ export function App() {
   const lockedModels = catalogVisible ? catalogLockedModels : EMPTY_LOCKED_CATALOG_MODELS;
 
 
+  // OCV5-870 / OCV5-881: 仅在确认登录态（或 demo 工作区）后于浏览器空闲期预取登录后
+  // 各大中心懒块；匿名访问首页（Landing / AuthGate）绝不触发，避免首屏额外拉取 8+ 大块。
+  useEffect(() => {
+    if (!authed && !demo) return;
+    return prefetchLazyCentersOnIdle();
+  }, [authed, demo]);
+
   // Assistant/tool markdown often exposes a dev-server URL such as
   // http://localhost:3000. That address belongs to the user's container, not
   // the viewer's phone or PC. Capture only explicit, validated loopback links

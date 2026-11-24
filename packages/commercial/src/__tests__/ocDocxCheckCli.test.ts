@@ -533,4 +533,39 @@ describe('oc-docx check', { skip: !pythonDocxAvailable }, () => {
     assert.equal(result.code, 0, result.stderr)
     assert.match(result.stdout, /--expect-formulas/)
   })
+
+  test('OCV5-881: malformed ZIP missing word/document.xml exits cleanly with code 2 and no Python traceback', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'oc-docx-malformed-'))
+    try {
+      const badDocx = join(work, 'missing-document.docx')
+      // Build a real ZIP containing only [Content_Types].xml (no word/document.xml)
+      const makeZip = await new Promise<RunResult>((done, reject) => {
+        const child = spawn(
+          'python3',
+          [
+            '-c',
+            `import zipfile, sys; z = zipfile.ZipFile(sys.argv[1], 'w'); z.writestr('[Content_Types].xml', '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>'); z.close()`,
+            badDocx,
+          ],
+          { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] },
+        )
+        let stdout = ''
+        let stderr = ''
+        child.stdout.on('data', (c) => (stdout += String(c)))
+        child.stderr.on('data', (c) => (stderr += String(c)))
+        child.once('error', reject)
+        child.once('close', (code) => done({ code, stdout, stderr }))
+      })
+      assert.equal(makeZip.code, 0, makeZip.stderr)
+
+      for (const subcmd of ['inspect', 'check'] as const) {
+        const res = await run([subcmd, badDocx])
+        assert.equal(res.code, 2, `${subcmd} should exit 2 on missing word/document.xml; stderr=${res.stderr}`)
+        assert.match(res.stderr, /word\/document\.xml/)
+        assert.doesNotMatch(res.stderr, /Traceback \(most recent call last\)/)
+      }
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
 })

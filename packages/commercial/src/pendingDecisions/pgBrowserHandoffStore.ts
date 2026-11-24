@@ -269,9 +269,33 @@ export class PgBrowserHandoffStore implements BrowserHandoffStore {
       )
     }
     if (existing.status === 'expired' || new Date(existing.expiresAt).getTime() <= nowMs) {
+      if (existing.status === 'pending') {
+        await this.runQuery(
+          `UPDATE pending_browser_handoffs
+              SET status = 'expired'
+            WHERE id = $1
+              AND user_id = $2
+              AND status = 'pending'
+              AND expires_at <= $3`,
+          [input.id, input.userId, nowIso],
+        ).catch((err) => {
+          handoffLog.warn('browser_handoff mark expired failed', { id: input.id, userId: input.userId, err })
+        })
+      }
       throw new PendingDecisionError('EXPIRED', 'browser handoff has expired')
     }
     throw new PendingDecisionError('CONFLICT_ALREADY_RESOLVED', 'browser handoff state changed')
+  }
+
+  async expireStale(nowMs = this.now()): Promise<number> {
+    const res = await this.runQuery(
+      `UPDATE pending_browser_handoffs
+          SET status = 'expired'
+        WHERE status = 'pending'
+          AND expires_at <= $1`,
+      [new Date(nowMs).toISOString()],
+    )
+    return res.rowCount ?? 0
   }
 }
 

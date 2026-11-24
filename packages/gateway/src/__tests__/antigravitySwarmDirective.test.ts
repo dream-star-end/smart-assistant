@@ -13,6 +13,7 @@ import {
 import {
   ANTIGRAVITY_SWARM_OFF_MARKER,
   applyAntigravitySwarmTurnDirective,
+  extractRouteAllowedLocalSwarmModels,
   filterAvailableLocalSwarmModels,
   formatAvailableLocalSwarmModelsHint,
   hasHistoricalAntigravitySwarm,
@@ -456,4 +457,45 @@ test('OCV5-879: local native swarm allows selecting built-in Antigravity models 
 
   assert.ok(!ANTIGRAVITY_PREAMBLE.includes('omit `model` on `swarm{action:"add"}`'))
   assert.ok(ANTIGRAVITY_PREAMBLE.includes('local native swarm allows choosing built-in Antigravity models'))
+})
+
+test('OCV5-881: extractRouteAllowedLocalSwarmModels honors master-injected bound-account allowlist and fails closed on empty set', () => {
+  assert.equal(extractRouteAllowedLocalSwarmModels(undefined), undefined)
+  assert.deepEqual(extractRouteAllowedLocalSwarmModels('invalid'), [])
+  assert.deepEqual(
+    extractRouteAllowedLocalSwarmModels([
+      'antigravity-gemini-4-neon',
+      'antigravity-gemini-4-carbon',
+      'antigravity-gemini-4-neon',
+      'antigravity-orchestrator-neon',
+      'gpt-6.2-astra',
+      'claude-sonnet-4-6',
+    ]),
+    ['antigravity-gemini-4-neon', 'antigravity-gemini-4-carbon'],
+  )
+  // Authoritative empty list (e.g. orchestrator primary only on account with no extra models)
+  const emptyAuthoritative = applyAntigravitySwarmTurnDirective({
+    finalText: '拆分任务',
+    rawUserText: '拆分任务',
+    isAntigravityTurn: true,
+    isRemoteAntigravity: false,
+    swarmMode: true,
+    hasHistoricalSwarm: false,
+    availableLocalSwarmModels: [],
+  })
+  assert.ok(emptyAuthoritative.text.includes('未放行额外蜂群成员模型'))
+  assert.ok(!emptyAuthoritative.text.includes('swarm{action:"models"}'))
+
+  // Bound-account allowlist without Claude 5.5 must not mention Claude and warns against unlisted models
+  const geminiOnly = applyAntigravitySwarmTurnDirective({
+    finalText: '拆分任务',
+    rawUserText: '拆分任务',
+    isAntigravityTurn: true,
+    isRemoteAntigravity: false,
+    swarmMode: true,
+    hasHistoricalSwarm: false,
+    availableLocalSwarmModels: ['antigravity-gemini-4-neon', 'antigravity-gemini-4-hydrogen'],
+  })
+  assert.ok(!geminiOnly.text.includes('claude-sonnet-5-5'))
+  assert.ok(geminiOnly.text.includes('中继会按白名单拒放'))
 })

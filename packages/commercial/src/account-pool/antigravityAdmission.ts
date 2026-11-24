@@ -21,6 +21,8 @@ export interface AntigravityRouteGrant {
   accessToken: string
   accessTokenExpiresAt: string
   idToken: string | null
+  /** Authoritative canonical Antigravity model ids permitted on this route for local native swarm. */
+  allowedModelIds?: readonly string[]
 }
 
 /**
@@ -141,11 +143,15 @@ export async function admitAntigravityTurn(
     releaseInflight(args.requestId)
     throw err
   }
+  const grantAllowedModelIds =
+    effectiveAllowedModelIds ??
+    (args.allowedModelIds && args.allowedModelIds.length > 0 ? [args.modelId] : undefined)
   return {
     token: route.token,
     baseUrl: route.baseUrl,
     accessToken: limited.accessToken,
     accessTokenExpiresAt: limited.expiresAt.toISOString(),
     idToken: limited.idToken,
+    ...(grantAllowedModelIds ? { allowedModelIds: grantAllowedModelIds } : {}),
   }
 }
