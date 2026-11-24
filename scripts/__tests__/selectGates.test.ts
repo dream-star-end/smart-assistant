@@ -185,6 +185,73 @@ describe("selectGates mapping edges", () => {
     }
   });
 
+  test("OCV5-885 check:context:static 按路径精准门控: 命中上下文/提示词/压缩/记忆/技能路径, 跳过无关路径", () => {
+    const mustHit = [
+      "scripts/check-context-static.ts",
+      "scripts/lib/contextStaticFixtures.ts",
+      ".github/context-eval-baseline.json",
+      "scripts/v5-skill-shadow-eval.ts",
+      "scripts/context-replay-eval.ts",
+      "evals/context-golden/bucket-a.json",
+      "evals/context-golden/cases.json",
+      "packages/gateway/src/promptSlots.ts",
+      "packages/gateway/src/promptFreeze.ts",
+      "packages/gateway/src/sessionLifecycle.ts",
+      "packages/gateway/src/sessionCheckpointAnchors.ts",
+      "packages/gateway/src/sessionManager.ts",
+      "packages/gateway/src/subprocessRunner.ts",
+      "packages/gateway/src/v3ToolFailureReporter.ts",
+      "packages/gateway/src/engine/antigravityAdapter.ts",
+      "packages/gateway/src/engine/antigravityPromptState.ts",
+      "packages/gateway/src/engine/resumedEnvelopeDedup.ts",
+      "packages/gateway/src/skillRetrievalShadow.ts",
+      "packages/gateway/src/autoDream.ts",
+      "packages/commercial/src/intelligentUi/index.ts",
+      "packages/commercial/agent-sandbox/platform-runtime/prompts/platform-capabilities.md",
+      "packages/commercial/agent-sandbox/ccb-baseline/skills/browser/SKILL.md",
+      "packages/mcp-memory/src/memoryTools.ts",
+      "packages/storage/src/contextJanitor.ts",
+      "packages/storage/src/memoryDir.ts",
+      "packages/storage/src/memoryLifecycle.ts",
+      "packages/storage/src/projectContext.ts",
+    ];
+    for (const file of mustHit) {
+      assert.ok(
+        ids([file]).includes("check:context:static"),
+        `expected ${file} to trigger check:context:static`,
+      );
+    }
+
+    const mustSkip = [
+      "docs/playbook.md",
+      "README.md",
+      "packages/web-react/src/App.tsx",
+      "packages/commercial/src/billing/foo.ts",
+      "packages/gateway/src/session/engine.ts",
+      "packages/channels/telegram/src/bot.ts",
+      "packages/cli/src/index.ts",
+      "changelog.json",
+    ];
+    for (const file of mustSkip) {
+      assert.equal(
+        ids([file]).includes("check:context:static"),
+        false,
+        `expected unrelated file ${file} to skip check:context:static`,
+      );
+    }
+
+    assert.equal(gateMeta("check:context:static").cost, "cheap");
+    assert.equal(gateMeta("check:context:static").lock, null);
+
+    const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    assert.ok(
+      pkg.scripts["check:governance:fast"]?.includes("tsx scripts/check-context-static.ts --skip-sub-evals"),
+      "check:governance:fast must include fast check-context-static --skip-sub-evals",
+    );
+  });
+
   test("run-v5-fast 把 --base 透传给 check:changelog-guard,干净工作树中已提交的 changelog.json 变更真实退出 1", async (t) => {
     const dir = mkdtempSync(join(tmpdir(), "oc-fast-base-"));
     t.after(() => rmSync(dir, { recursive: true, force: true }));

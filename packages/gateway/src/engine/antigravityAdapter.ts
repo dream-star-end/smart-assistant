@@ -48,7 +48,7 @@ import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { EngineAdapter, EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
 import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
-import { SubprocessRunner } from '../subprocessRunner.js'
+import { SubprocessRunner, recordContextEvalEvent } from '../subprocessRunner.js'
 import { type EngineCreateOpts, registerEngine, registerEngineRemoteContext } from './registry.js'
 import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { buildCodexEnv } from './codexShared.js'
@@ -72,6 +72,7 @@ import {
 import { reconcileAntigravitySwarmDirectiveAfterCompaction } from './antigravitySwarmDirective.js'
 import {
   buildAntigravityPromptInputsKey,
+  buildAntigravitySlotHashes,
   clearAntigravityPromptState,
   decideAntigravityPromptElision,
   writeAntigravityPromptState,
@@ -255,6 +256,8 @@ interface TurnContext {
   elidedPlatformContext: boolean
   /** OCV5-781: explicit prompt-intent fingerprint when full context was built cleanly. */
   promptInputsKey: string | null
+  /** OCV5-885: per-slot hashes captured for exact changedSlots diffing on next resumed turn. */
+  promptSlotHashes: Record<string, string> | null
   /** CLI exit code once the process closed. */
   exitCode: number | null
   /** A possibly repeated old ERROR is waiting for the exit code (Codex r2 P1). */
@@ -503,6 +506,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       resumedLaunch: false,
       elidedPlatformContext: false,
       promptInputsKey: null,
+      promptSlotHashes: null,
       exitCode: null,
       awaitingExitSince: null,
       swarmWatcher: null,
@@ -619,6 +623,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     }
     ctx.requestedConversationId = this.nativeId
     ctx.promptInputsKey = composed.inputsKey
+    ctx.promptSlotHashes = composed.slotHashes
     const conversationsDir = join(projection.root, 'home', '.gemini', 'antigravity-cli', 'conversations')
     const elideDecision = decideAntigravityPromptElision({
       openClaudeHome: dirname(projection.root),
@@ -627,15 +632,33 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       sessionKey: this.opts.sessionKey,
       requestedConversationId: ctx.requestedConversationId,
       inputsKey: composed.inputsKey,
+      slotHashes: composed.slotHashes,
     })
     ctx.elidedPlatformContext = Boolean(ctx.requestedConversationId) && elideDecision.elide
+    const decisionKind = ctx.elidedPlatformContext ? 'elide_resumed' : 'full_inject'
+    const changedSlots = elideDecision.changedSlots ?? []
     log.info('antigravity_prompt_context_mode', {
       sessionKey: this.opts.sessionKey,
       traceId: ctx.params.traceId,
       conversationId: ctx.requestedConversationId,
-      decision: ctx.elidedPlatformContext ? 'elide_resumed' : 'full_inject',
+      decision: decisionKind,
       reason: elideDecision.reason,
-      savedBytes: ctx.elidedPlatformContext ? Buffer.byteLength(composed.content, 'utf8') : 0,
+      changedSlots,
+      savedBytes: ctx.elidedPlatformContext ? composed.totalBytes : 0,
+    })
+    recordContextEvalEvent({
+      eventKind: 'prompt_context_decision',
+      sessionKey: this.opts.sessionKey,
+      agentId: this.opts.agentId,
+      traceId: ctx.params.traceId,
+      engine: this.engineId,
+      model: this.currentModel,
+      decision: decisionKind,
+      reason: elideDecision.reason,
+      ...(changedSlots.length > 0 ? { changedSlots } : {}),
+      ...(composed.contentSha256 ? { staticPrefixSha256: composed.contentSha256 } : {}),
+      totalBytes: composed.totalBytes,
+      tokensEstimate: Math.ceil(composed.totalBytes / 4),
     })
     const stdinLine = (input: string): string =>
       `${JSON.stringify({
@@ -659,7 +682,26 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       cwd: cwdDecision.cwd,
       engine: this.engineId,
       sessionKey: this.opts.sessionKey,
-      onEvent: (event) => { if (!ctx.terminal) ctx.params.onEvent(event) },
+      onEvent: (event) => {
+        if (event.kind === 'context_compacted') {
+          recordContextEvalEvent({
+            eventKind: 'context_compacted',
+            sessionKey: this.opts.sessionKey,
+            agentId: this.opts.agentId,
+            traceId: ctx.params.traceId,
+            engine: event.compaction.engine ?? this.engineId,
+            model: this.currentModel,
+            compactionScope: event.compaction.scope,
+            compactionStrategy: event.compaction.strategy,
+            beforeBytes: event.compaction.beforeBytes,
+            afterBytes: event.compaction.afterBytes,
+            beforeTokens: event.compaction.beforeTokens,
+            afterTokens: event.compaction.afterTokens,
+            droppedEntries: event.compaction.droppedEntries,
+          })
+        }
+        if (!ctx.terminal) ctx.params.onEvent(event)
+      },
     })
     // Context-file IO can outlive the logical turn. Never launch a paid CLI
     // after end()/shutdown has already retired this turn during preparation.
@@ -1011,6 +1053,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
             sessionKey: this.opts.sessionKey,
             conversationId: ctx.conversationId,
             inputsKey: ctx.promptInputsKey,
+            ...(ctx.promptSlotHashes ? { slotHashes: ctx.promptSlotHashes } : {}),
             injectedAfterBaseline: ctx.nativeBinding.baseline,
             updatedAt: Date.now(),
           })
@@ -1049,7 +1092,13 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     repoSnapshot: ReturnType<NonNullable<EngineCreateOpts['getRepoSnapshot']>> | null,
     availableMcpTools: string[],
     cwdDecision: ReturnType<typeof decideEngineCwd>,
-  ): Promise<{ content: string; inputsKey: string | null }> {
+  ): Promise<{
+    content: string
+    inputsKey: string | null
+    slotHashes: Record<string, string> | null
+    contentSha256: string | null
+    totalBytes: number
+  }> {
     try {
       const platform = await buildPromptContext({
         agentId: this.opts.agentId,
@@ -1075,7 +1124,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
       const content = platform.content || ''
-      const inputsKey = buildAntigravityPromptInputsKey({
+      const inputsKeyArgs = {
         agentId: this.opts.agentId,
         projectId: this.opts.projectId,
         sessionId: typeof this.opts.sessionId === 'string' ? this.opts.sessionId : undefined,
@@ -1093,22 +1142,27 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         frozenProjectContext: platform.frozenProjectContext,
         applied: platform.applied,
         memoryInstructionsFingerprint: memoryInstructionsFingerprint(this.opts.agentId),
-      })
+      }
+      const inputsKey = buildAntigravityPromptInputsKey(inputsKeyArgs)
+      const slotHashes = buildAntigravitySlotHashes(inputsKeyArgs)
+      const totalBytes = Buffer.byteLength(content, 'utf8')
+      const contentSha256 = platform.contentSha256 || createHash('sha256').update(content, 'utf8').digest('hex')
       log.info('prompt_context_built', {
         sessionKey: this.opts.sessionKey,
         agentId: this.opts.agentId,
         backend: 'antigravity',
-        prompt_bytes: Buffer.byteLength(content, 'utf8'),
-        prompt_sha256: createHash('sha256').update(content, 'utf8').digest('hex').slice(0, 12),
+        prompt_bytes: totalBytes,
+        prompt_sha256: contentSha256.slice(0, 12),
       })
-      return { content, inputsKey }
+      return { content, inputsKey, slotHashes, contentSha256, totalBytes }
     } catch {
       if (this.opts.identityCompat?.assets) throw new Error('COMPAT_CONFIG_CONFLICT: identity prompt assembly failed')
       let persona = ''
       if (this.opts.persona) {
         try { persona = readFileSync(this.opts.persona, 'utf8').trim() } catch { persona = '' }
       }
-      return { content: persona, inputsKey: null }
+      const totalBytes = Buffer.byteLength(persona, 'utf8')
+      return { content: persona, inputsKey: null, slotHashes: null, contentSha256: null, totalBytes }
     }
   }
 

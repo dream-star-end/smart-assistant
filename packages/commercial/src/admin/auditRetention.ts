@@ -128,6 +128,12 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
     column: "expires_at",
     days: 30,
   },
+  // OCV5-885: context compaction & prompt context decision observability events (90d TTL, aligned with turn_runtime_observations).
+  {
+    table: "context_eval_events",
+    column: "observed_at",
+    days: 90,
+  },
 ] as const;
 
 /** 显式声明永久保留的审计表——出现在删除政策里=编程错误。 */

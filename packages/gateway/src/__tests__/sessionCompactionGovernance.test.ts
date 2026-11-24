@@ -60,6 +60,7 @@ import {
   peekPendingCheckpoint,
 } from '../sessionCheckpointStore.js'
 import {
+  buildLegacyRollingCheckpointSummary,
   buildRollingCheckpointSummary,
   compactSession,
   consumePendingCheckpointSummary,
@@ -335,6 +336,80 @@ describe('OCV5-840 Cross-engine compactSession & concurrency guard', () => {
     const cp = buildRollingCheckpointSummary(msgs, 'preserve architecture decisions')
     assert.ok(cp.summary.length <= 8_000)
     assert.ok(cp.beforeBytes > cp.afterBytes)
+  })
+
+  it('OCV5-885 anchored_v2 preserves mid-session negative redlines, tail constraints, and factual anchors lost by legacy_head_tail', () => {
+    const longTailFirstUser =
+      `帮我排查网关性能问题，下面是背景日志说明：${'背景细节补充。'.repeat(130)}最后强调红线：切勿上传原始数据到公网，也不要改动 /opt/openclaude/harness-gate 目录。`
+    const messages = [
+      { role: 'user', text: longTailFirstUser },
+      { role: 'assistant', text: '收到，开始采集指标。' },
+      { role: 'tool', toolName: 'Bash', output: 'LOG_NOISE_'.repeat(1200) },
+      {
+        role: 'user',
+        text: '中段纠偏（OCV5-885）：关联基线提交 a8f3c91d4e72，分支 feat/ctx-anchor-v2，端口 port=8443，预算 budget <= 44000 bytes。严禁修改生产库，也不要 git push 到远端。',
+      },
+      { role: 'assistant', text: '明白，改为只读分析 packages/gateway/src/sessionLifecycle.ts。' },
+      { role: 'tool', toolName: 'Bash', output: 'TRACE_LINE_'.repeat(1200) },
+      { role: 'user', text: '继续查看第 2 批指标' },
+      { role: 'assistant', text: '第 2 批指标采集完成。' },
+      { role: 'tool', toolName: 'Bash', output: 'METRICS_DUMP_'.repeat(1000) },
+      { role: 'user', text: '查看最近日志' },
+      { role: 'assistant', text: '最近日志无报错。' },
+      { role: 'user', text: '准备汇总' },
+      { role: 'assistant', text: '正在整理最终报告。' },
+    ]
+
+    const legacy = buildLegacyRollingCheckpointSummary(messages, 'keep constraints')
+    const v2 = buildRollingCheckpointSummary(messages, 'keep constraints', { mode: 'anchored_v2' })
+
+    assert.ok(v2.summary.length <= 8_000, `anchored_v2 must stay <= 8000 chars, got ${v2.summary.length}`)
+    assert.ok(v2.beforeBytes > v2.afterBytes)
+    assert.match(v2.summary, /### Mid-Session Constraints & Key Anchors/)
+
+    // Legacy head+tail drops mid-session redlines, tail constraints, and factual anchors
+    assert.equal(legacy.summary.includes('严禁修改生产库'), false)
+    assert.equal(legacy.summary.includes('a8f3c91d4e72'), false)
+    assert.equal(legacy.summary.includes('切勿上传原始数据到公网'), false)
+
+    // anchored_v2 preserves full polarity clauses (negation + constrained action together) and anchors
+    assert.ok(v2.summary.includes('严禁修改生产库'), 'mid-session DB redline must survive')
+    assert.ok(v2.summary.includes('不要 git push'), 'mid-session git push redline must survive')
+    assert.ok(v2.summary.includes('切勿上传原始数据到公网'), 'truncated Turn 1 tail redline must survive')
+    assert.ok(v2.summary.includes('/opt/openclaude/harness-gate'), 'truncated tail path must survive')
+    assert.ok(v2.summary.includes('OCV5-885'), 'ticket anchor must survive')
+    assert.ok(v2.summary.includes('a8f3c91d4e72'), 'short SHA anchor must survive')
+    assert.ok(v2.summary.includes('feat/ctx-anchor-v2'), 'branch anchor must survive')
+    assert.ok(v2.summary.includes('packages/gateway/src/sessionLifecycle.ts'), 'code path anchor must survive')
+
+    // Neutral checkpoint payload wrapper wording
+    const payload = buildRollingCheckpointPayload(v2.summary, '继续下一步') as string
+    assert.ok(payload.includes('Earlier session context was compacted into this bounded checkpoint summary'))
+    assert.equal(payload.includes('The user compacted this session context'), false)
+  })
+
+  it('OCV5-885 Blocker #10: preserves ultra-short Chinese negative redlines (不要发布。 / 严禁push / 只读模式)', () => {
+    const messages = [
+      { role: 'user', text: '帮我准备本次版本构建脚本和检查清单。' },
+      { role: 'assistant', text: '收到，开始准备。' },
+      { role: 'user', text: '不要发布。' },
+      { role: 'assistant', text: '明白，仅做本地构建，不执行发布。' },
+      { role: 'user', text: '严禁push' },
+      { role: 'assistant', text: '收到。' },
+      { role: 'user', text: '只读模式' },
+      { role: 'assistant', text: '已确认只读模式。' },
+      { role: 'tool', toolName: 'Bash', output: 'BUILD_LOG_LINE_'.repeat(300) },
+      { role: 'user', text: '核对第 1 项产物' },
+      { role: 'assistant', text: '第 1 项产物正常。' },
+      { role: 'user', text: '核对第 2 项产物' },
+      { role: 'assistant', text: '第 2 项产物正常。' },
+      { role: 'user', text: '核对第 3 项产物' },
+      { role: 'assistant', text: '第 3 项产物正常。' },
+    ]
+    const cp = buildRollingCheckpointSummary(messages, 'keep short redlines', { mode: 'anchored_v2' })
+    assert.ok(cp.summary.includes('不要发布'), `short redline "不要发布。" must survive, got:\n${cp.summary}`)
+    assert.ok(cp.summary.includes('严禁push'), 'short redline "严禁push" must survive')
+    assert.ok(cp.summary.includes('只读模式'), 'short redline "只读模式" must survive')
   })
 
   it('requires real compaction confirmation for CCB /compact and rejects busy sessions', async () => {

@@ -1,0 +1,281 @@
+{
+  "schemaVersion": 1,
+  "suiteId": "ocv5-885-hygiene-queries-v1",
+  "sanitized": true,
+  "activeMemories": [
+    {
+      "file": "kestrel_deploy_policy.md",
+      "content": "---\nname: KestrelQueue Deployment Policy\ndescription: Cross-session deployment guardrails for KestrelQueue releases\ntype: feedback\n---\n# KestrelQueue Deployment Policy\n\nAll releases for KestrelQueue must run database schema validation before rollout. Never execute direct schema mutations against the primary cluster during peak traffic windows. Always require two reviewers for migration scripts.\n"
+    },
+    {
+      "file": "l2_merged_architecture_ledger.md",
+      "content": "---\nname: Merged Core Architecture Notes\ndescription: L2 consolidated architecture notes covering PolarisLedger, HeliosCache, and OCV5-731\ntype: project\n---\n# Merged Architecture Ledger (L2 Consolidated)\n\n## PolarisLedger Checkpointing\nPolarisLedger persists shard checkpoints every 120 seconds using monotonic epoch tags (`epoch_v4`).\n\n## HeliosCache Eviction\nHeliosCache enforces an LRU cap of 48000 entries and flushes stale telemetry keys after 1800 seconds.\n\n## Ticket OCV5-731 Rollout\nOCV5-731 migrated webhook signature checks to constant-time HMAC verification.\n"
+    },
+    {
+      "file": "ci_gate_rules.md",
+      "content": "---\nname: CI Architecture Gate Rules\ndescription: Mandatory pre-merge verification checklist for gateway modules\ntype: feedback\n---\n# CI Architecture Gate Rules\n\nBefore merging changes to gateway lifecycle modules, always run `check-architecture.ts --enforce` and `sessionCompactionGovernance.test.ts`. Never bypass layer boundary checks with relative cross-package imports.\n"
+    },
+    {
+      "file": "checkpoint_budget_policy.md",
+      "content": "---\nname: Rolling Checkpoint Budget Policy\ndescription: Updated v2 checkpoint size limit and retention standard\ntype: project\n---\n# Rolling Checkpoint Budget Policy (Current v2)\n\nUpdated policy: rolling checkpoint summaries must stay strictly under 8000 characters while reserving 1800 characters for Mid-Session Constraints and Key Anchors. The old 4000-char legacy draft limit is superseded.\n"
+    },
+    {
+      "file": "research_formatting_pref.md",
+      "content": "---\nname: Research Report Formatting\ndescription: Preferred structure for benchmark and ablation reports\ntype: user\n---\n# Research Report Formatting\n\nAlways present benchmark comparisons with a concise summary table first, followed by p50/p95 latency deltas and exact reproducible CLI commands.\n"
+    },
+    {
+      "file": "observability_ports.md",
+      "content": "---\nname: Local Observability Endpoints\ndescription: Synthetic loopback endpoints for local metrics inspection\ntype: reference\n---\n# Local Observability Endpoints\n\nPrometheus metrics scrape endpoint runs locally on 127.0.0.1:9464/metrics. Health probe runs on 127.0.0.1:8088/healthz.\n"
+    },
+    {
+      "file": "worktree_isolation_rule.md",
+      "content": "---\nname: Worktree File Boundary Rule\ndescription: Multi-agent parallel editing hygiene and zero-overlap discipline\ntype: feedback\n---\n# Worktree File Boundary Rule\n\nWhen multiple agents share one worktree, each owner edits only its assigned file list and never runs git commit, git checkout, or git reset.\n"
+    },
+    {
+      "file": "nightly_compaction_sla.md",
+      "content": "---\nname: Nightly Compaction SLA\ndescription: Target latency and token reduction budget for background compaction\ntype: project\n---\n# Nightly Compaction SLA\n\nBackground compaction jobs must finish in under 1500ms p95 and achieve at least 60% byte compression on transcripts exceeding 20 turns.\n"
+    }
+  ],
+  "archivedMemories": [
+    {
+      "file": "obsidian_migrator_notes.md",
+      "archiveReason": "stale_decay_90d",
+      "content": "---\nname: ObsidianMigrator Legacy Playbook\ndescription: Historical notes for the retired ObsidianMigrator v1 batch importer\ntype: reference\n---\n# ObsidianMigrator Legacy Playbook\n\nObsidianMigrator imported legacy YAML frontmatter vaults using batch size 250 and checkpoint token `obs-v1-final`.\n"
+    },
+    {
+      "file": "zephyr_telemetry_probe.md",
+      "archiveReason": "cold_topic_archived",
+      "content": "---\nname: ZephyrProbe Latency Study\ndescription: Archived latency profiling notes for ZephyrProbe collector\ntype: project\n---\n# ZephyrProbe Latency Study\n\nZephyrProbe ring buffer overflow occurred when flush interval exceeded 900ms under burst telemetry.\n"
+    },
+    {
+      "file": "cobalt_sandbox_quotas.md",
+      "archiveReason": "superseded_project",
+      "content": "---\nname: CobaltSandbox Resource Quotas\ndescription: Archived memory and CPU quota table for CobaltSandbox staging\ntype: reference\n---\n# CobaltSandbox Resource Quotas\n\nCobaltSandbox staging containers used 4096Mi memory limit and 2000m CPU ceiling.\n"
+    },
+    {
+      "file": "checkpoint_budget_legacy_v1.md",
+      "archiveReason": "superseded_by_v2",
+      "content": "---\nname: Old Rolling Checkpoint Budget Draft\ndescription: Superseded v1 draft proposing 4000-char checkpoint limit\ntype: project\n---\n# Old Rolling Checkpoint Budget Draft\n\nLegacy draft proposed capping rolling checkpoint summaries at 4000 chars without mid-session anchors.\n"
+    }
+  ],
+  "skillsCatalog": [
+    {
+      "name": "xlsx-financial-model",
+      "description": "Build and audit Excel xlsx workbooks with dynamic formulas, financial three-statement models, pivot tables, and scenario sensitivity sheets.",
+      "tags": ["xlsx", "excel", "spreadsheet", "finance", "formulas"]
+    },
+    {
+      "name": "csv-data-cleaner",
+      "description": "Clean, deduplicate, normalize encodings, and validate schemas on raw CSV and TSV tabular datasets via Python pandas scripts.",
+      "tags": ["csv", "tsv", "etl", "cleaning", "pandas"]
+    },
+    {
+      "name": "pptx-exec-deck",
+      "description": "Design executive PowerPoint pptx slide decks with structured storytelling, layout grids, speaker notes, and clean data charts.",
+      "tags": ["pptx", "powerpoint", "slides", "presentation", "deck"]
+    },
+    {
+      "name": "docx-policy-memo",
+      "description": "Draft formal Word docx policy memos, SOP manuals, and redline revision documents with tracked headings and tables.",
+      "tags": ["docx", "word", "memo", "policy", "sop"]
+    },
+    {
+      "name": "pdf-contract-review",
+      "description": "Extract clauses from PDF legal contracts, highlight indemnity and liability risks, and produce structured redline review tables.",
+      "tags": ["pdf", "contract", "legal", "clauses", "review"]
+    },
+    {
+      "name": "lit-citation-audit",
+      "description": "Verify academic literature citations, cross-check DOIs and BibTeX metadata, and audit paper reference lists for accuracy.",
+      "tags": ["literature", "citation", "bibtex", "paper", "academic"]
+    },
+    {
+      "name": "docker-compose-debug",
+      "description": "Diagnose Docker Compose container networking, volume mount permissions, healthchecks, and restart loops.",
+      "tags": ["docker", "compose", "container", "volumes", "networking"]
+    },
+    {
+      "name": "k8s-pod-triage",
+      "description": "Investigate Kubernetes pod CrashLoopBackOff, OOMKilled limits, readiness probes, and Helm deployment rollbacks.",
+      "tags": ["kubernetes", "k8s", "pod", "helm", "oomkilled"]
+    },
+    {
+      "name": "sql-query-tuning",
+      "description": "Analyze PostgreSQL EXPLAIN ANALYZE plans, design composite indexes, and eliminate sequential scans on slow SQL queries.",
+      "tags": ["sql", "postgres", "indexes", "explain", "query"]
+    },
+    {
+      "name": "redis-cache-audit",
+      "description": "Audit Redis memory fragmentation, key TTL policies, eviction metrics, and hotkey latency spikes.",
+      "tags": ["redis", "cache", "ttl", "eviction", "memory"]
+    }
+  ],
+  "queries": [
+    {
+      "id": "HQ-01",
+      "kind": "core_active_recall",
+      "query": "KestrelQueue deployment policy",
+      "description": "Cross-session rule recall for KestrelQueue deployment guardrails",
+      "expectedTopFiles": ["kestrel_deploy_policy.md"]
+    },
+    {
+      "id": "HQ-02",
+      "kind": "core_active_recall",
+      "query": "CI architecture gate check-architecture",
+      "description": "Cross-session rule recall for pre-merge architecture gate",
+      "expectedTopFiles": ["ci_gate_rules.md"]
+    },
+    {
+      "id": "HQ-03",
+      "kind": "core_active_recall",
+      "query": "Worktree file boundary git commit",
+      "description": "Cross-session multi-agent worktree isolation rule recall",
+      "expectedTopFiles": ["worktree_isolation_rule.md"]
+    },
+    {
+      "id": "HQ-04",
+      "kind": "core_active_recall",
+      "query": "PolarisLedger checkpoint epoch_v4",
+      "description": "L2 merged note proper-noun recall for PolarisLedger",
+      "expectedTopFiles": ["l2_merged_architecture_ledger.md"]
+    },
+    {
+      "id": "HQ-05",
+      "kind": "core_active_recall",
+      "query": "HeliosCache LRU eviction 48000",
+      "description": "L2 merged note proper-noun recall for HeliosCache",
+      "expectedTopFiles": ["l2_merged_architecture_ledger.md"]
+    },
+    {
+      "id": "HQ-06",
+      "kind": "core_active_recall",
+      "query": "OCV5-731 webhook HMAC verification",
+      "description": "L2 merged note ticket & technical term recall for OCV5-731",
+      "expectedTopFiles": ["l2_merged_architecture_ledger.md"]
+    },
+    {
+      "id": "HQ-07",
+      "kind": "archive_fallback",
+      "query": "ObsidianMigrator batch importer",
+      "description": "Archive fallback surfaces retired ObsidianMigrator playbook when active has no match",
+      "expectedArchivedTargets": ["obsidian_migrator_notes.md"]
+    },
+    {
+      "id": "HQ-08",
+      "kind": "archive_fallback",
+      "query": "ZephyrProbe ring buffer overflow",
+      "description": "Archive fallback surfaces archived ZephyrProbe latency study",
+      "expectedArchivedTargets": ["zephyr_telemetry_probe.md"]
+    },
+    {
+      "id": "HQ-09",
+      "kind": "archive_fallback",
+      "query": "CobaltSandbox memory CPU quota",
+      "description": "Archive fallback surfaces archived CobaltSandbox staging quotas",
+      "expectedArchivedTargets": ["cobalt_sandbox_quotas.md"]
+    },
+    {
+      "id": "HQ-10",
+      "kind": "archive_fallback",
+      "query": "obs-v1-final checkpoint token",
+      "description": "Archive fallback matches exact token inside archived ObsidianMigrator body",
+      "expectedArchivedTargets": ["obsidian_migrator_notes.md"]
+    },
+    {
+      "id": "HQ-11",
+      "kind": "active_not_shadowed",
+      "query": "Rolling Checkpoint Budget Policy 8000",
+      "description": "Active updated v2 checkpoint budget policy wins and is not shadowed by archived v1 draft",
+      "expectedTopFiles": ["checkpoint_budget_policy.md"]
+    },
+    {
+      "id": "HQ-12",
+      "kind": "active_not_shadowed",
+      "query": "Nightly compaction SLA 1500ms",
+      "description": "Active compaction SLA note ranks first cleanly without archive interference",
+      "expectedTopFiles": ["nightly_compaction_sla.md"]
+    },
+    {
+      "id": "HQ-13",
+      "kind": "memory_negative_no_match",
+      "query": "今天杭州西湖天气怎么样",
+      "description": "Negative weather query must return no_match"
+    },
+    {
+      "id": "HQ-14",
+      "kind": "memory_negative_no_match",
+      "query": "sourdough bread fermentation temperature",
+      "description": "Negative cooking query must return no_match"
+    },
+    {
+      "id": "HQ-15",
+      "kind": "memory_negative_no_match",
+      "query": "QuantumBanyan spacecraft propulsion",
+      "description": "Negative non-existent proper noun must return no_match"
+    },
+    {
+      "id": "HQ-16",
+      "kind": "memory_negative_no_match",
+      "query": "吉他和弦指法练习表",
+      "description": "Negative music practice query must return no_match"
+    },
+    {
+      "id": "HQ-17",
+      "kind": "memory_negative_no_match",
+      "query": "olympic marathon world record splits",
+      "description": "Negative sports query must return no_match"
+    },
+    {
+      "id": "HQ-18",
+      "kind": "memory_negative_no_match",
+      "query": "红烧肉糖色火候控制技巧",
+      "description": "Negative Chinese recipe query must return no_match"
+    },
+    {
+      "id": "HQ-19",
+      "kind": "skill_disambiguation",
+      "query": "Build an Excel xlsx financial three-statement model with formulas and sensitivity analysis",
+      "description": "Disambiguate xlsx-financial-model over csv-data-cleaner",
+      "expectedTopSkills": ["xlsx-financial-model"],
+      "forbiddenTop1Skills": ["csv-data-cleaner"]
+    },
+    {
+      "id": "HQ-20",
+      "kind": "skill_disambiguation",
+      "query": "Clean malformed raw CSV encoding and deduplicate rows with pandas",
+      "description": "Disambiguate csv-data-cleaner over xlsx-financial-model",
+      "expectedTopSkills": ["csv-data-cleaner"],
+      "forbiddenTop1Skills": ["xlsx-financial-model"]
+    },
+    {
+      "id": "HQ-21",
+      "kind": "skill_disambiguation",
+      "query": "Review PDF legal contract indemnity clauses and produce redline risk table",
+      "description": "Disambiguate pdf-contract-review over lit-citation-audit and docx-policy-memo",
+      "expectedTopSkills": ["pdf-contract-review"],
+      "forbiddenTop1Skills": ["lit-citation-audit", "docx-policy-memo"]
+    },
+    {
+      "id": "HQ-22",
+      "kind": "skill_disambiguation",
+      "query": "Triage Kubernetes pod CrashLoopBackOff and OOMKilled Helm deployment rollback",
+      "description": "Disambiguate k8s-pod-triage over docker-compose-debug",
+      "expectedTopSkills": ["k8s-pod-triage"],
+      "forbiddenTop1Skills": ["docker-compose-debug"]
+    },
+    {
+      "id": "HQ-23",
+      "kind": "skill_negative",
+      "query": "帮我写一首关于秋日银杏叶的七言绝句",
+      "description": "Negative poetry query must not trigger engineering/document skills",
+      "maxTopSkillScore": 0
+    },
+    {
+      "id": "HQ-24",
+      "kind": "skill_negative",
+      "query": "Recommend scenic hiking trails in Patagonia during November",
+      "description": "Negative travel query must not trigger engineering/document skills",
+      "maxTopSkillScore": 0
+    }
+  ]
+}

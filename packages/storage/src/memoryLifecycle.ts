@@ -156,6 +156,8 @@ export interface CleanupResult {
   deletedCount: number
   /** IDs of deleted entries (for vector index cleanup) */
   deletedIds: string[]
+  /** Total UTF-8 bytes of deleted archival content */
+  bytesFreed: number
 }
 
 /**
@@ -175,13 +177,13 @@ export async function cleanupArchival(options: CleanupOptions): Promise<CleanupR
   const minAgeDays = options.minAgeDays ?? 60
   const maxDeletes = options.maxDeletes ?? 50
 
-  if (maxDeletes <= 0) return { deletedCount: 0, deletedIds: [] }
+  if (maxDeletes <= 0) return { deletedCount: 0, deletedIds: [], bytesFreed: 0 }
 
   const cutoff = sqliteDatetime(new Date(Date.now() - minAgeDays * 86_400_000))
 
   // Atomic select + delete in a single transaction
   const selectStmt = db.prepare(`
-    SELECT id FROM archival
+    SELECT id, LENGTH(CAST(content AS BLOB)) AS content_bytes FROM archival
     WHERE agent_id = ?
       AND access_count <= ?
       AND created_at < ?
@@ -192,11 +194,12 @@ export async function cleanupArchival(options: CleanupOptions): Promise<CleanupR
   const result = db.transaction(() => {
     const candidates = selectStmt.all(
       options.agentId, minAccess, cutoff, maxDeletes,
-    ) as Array<{ id: string }>
+    ) as Array<{ id: string; content_bytes: number }>
 
-    if (candidates.length === 0) return { deletedCount: 0, deletedIds: [] as string[] }
+    if (candidates.length === 0) return { deletedCount: 0, deletedIds: [] as string[], bytesFreed: 0 }
 
     const ids = candidates.map(c => c.id)
+    const bytesById = new Map(candidates.map(c => [c.id, Number(c.content_bytes) || 0]))
     const placeholders = ids.map(() => '?').join(',')
 
     // Re-check predicates in DELETE for safety against concurrent access
@@ -211,8 +214,9 @@ export async function cleanupArchival(options: CleanupOptions): Promise<CleanupR
       ).all(...ids) as Array<{ id: string }>).map(r => r.id),
     )
     const actuallyDeleted = ids.filter(id => !surviving.has(id))
+    const bytesFreed = actuallyDeleted.reduce((sum, id) => sum + (bytesById.get(id) ?? 0), 0)
 
-    return { deletedCount: actuallyDeleted.length, deletedIds: actuallyDeleted }
+    return { deletedCount: actuallyDeleted.length, deletedIds: actuallyDeleted, bytesFreed }
   })()
 
   return result

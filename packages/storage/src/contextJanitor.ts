@@ -1058,6 +1058,7 @@ export async function runContextJanitor(
               maxDeletes: 50,
             })
             archivalCleaned = cleaned.deletedCount
+            bytesFreed += cleaned.bytesFreed
           }
         }
       } catch (err) {

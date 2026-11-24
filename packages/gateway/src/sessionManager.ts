@@ -603,7 +603,7 @@ export function buildRollingCheckpointPayload(
 ): string | Array<{ type: string; [key: string]: unknown }> {
   const ctx = [
     '<openclaude_rolling_checkpoint>',
-    'The user compacted this session context. Use this bounded checkpoint summary as prior conversation context and continue from here without replaying earlier verbose outputs.',
+    'Earlier session context was compacted into this bounded checkpoint summary. Use it as prior conversation context and continue from here without replaying earlier verbose outputs.',
     summaryText.trim(),
     '</openclaude_rolling_checkpoint>',
   ].join('\n')

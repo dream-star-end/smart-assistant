@@ -252,9 +252,20 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
       "image_generation_attempts",
       "prompt_queue_mutations",
       "pending_browser_handoffs",
+      "context_eval_events",
     ]) {
       assert.ok(tables.includes(t), `缺 retention 政策: ${t}`);
     }
+    assert.equal(
+      AUDIT_RETENTION_POLICIES.find((p) => p.table === "context_eval_events")?.column,
+      "observed_at",
+      "context_eval_events retention must expire relative to observed_at",
+    );
+    assert.equal(
+      AUDIT_RETENTION_POLICIES.find((p) => p.table === "context_eval_events")?.days,
+      90,
+      "context_eval_events retention must be 90 days",
+    );
     assert.equal(
       AUDIT_RETENTION_POLICIES.find((p) => p.table === "pending_browser_handoffs")?.column,
       "expires_at",

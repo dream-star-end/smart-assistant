@@ -13,12 +13,16 @@ import { join } from 'node:path'
 import { getEngineContextMessages, paths } from '@openclaude/storage'
 import {
   estimateModelHistoryTokens,
-  modelHistoryRoleLabel,
-  modelHistorySemanticText,
-  projectModelHistoryForReplay,
 } from '@openclaude/protocol'
 import { cleanupSessionArtifacts, safeSliceHead } from './payloadOffloadGate.js'
+import {
+  buildLegacyRollingCheckpointSummary,
+  buildRollingCheckpointSummary,
+  type RollingCheckpointSummaryMode,
+  type RollingCheckpointSummaryOptions,
+} from './sessionCheckpointAnchors.js'
 import { contextCompactionsTotal } from './metrics.js'
+import { enqueueContextEvalEvent } from './v3ToolFailureReporter.js'
 import {
   clearPendingCheckpoint,
   isSessionCompacting,
@@ -1136,9 +1140,13 @@ export interface SessionCompactOutcome {
   error?: string
 }
 
-const CHECKPOINT_MAX_CHARS = 8_000
-
-export { isSessionCompacting }
+export {
+  buildLegacyRollingCheckpointSummary,
+  buildRollingCheckpointSummary,
+  isSessionCompacting,
+  type RollingCheckpointSummaryMode,
+  type RollingCheckpointSummaryOptions,
+}
 
 /** Backward-compatible test/diagnostic helpers backed by durable checkpoint store (B7). */
 export function setPendingCheckpointSummary(session: AgentSession, summary: string): void {
@@ -1159,77 +1167,6 @@ export function consumePendingCheckpointSummary(session: AgentSession): string |
 
 export function peekPendingCheckpointSummary(session: AgentSession): string | null {
   return peekPendingCheckpoint(session.sessionKey)?.summary ?? null
-}
-
-/** Build a bounded structured checkpoint summary (<=8K chars) from session history. */
-export function buildRollingCheckpointSummary(
-  messages: readonly unknown[],
-  instructions?: string,
-): {
-  summary: string
-  beforeBytes: number
-  afterBytes: number
-  beforeTokens: number
-  afterTokens: number
-  droppedEntries: number
-} {
-  const projected = projectModelHistoryForReplay(messages, { recentFullTurns: 2 })
-  let beforeBytes = 0
-  let beforeTokens = 0
-  for (const row of projected) {
-    const rawText = modelHistorySemanticText(row.raw) || row.text
-    beforeBytes += Buffer.byteLength(rawText, 'utf8')
-    beforeTokens += estimateModelHistoryTokens(rawText)
-  }
-  if (projected.length === 0) {
-    return {
-      summary: '',
-      beforeBytes: 0,
-      afterBytes: 0,
-      beforeTokens: 0,
-      afterTokens: 0,
-      droppedEntries: 0,
-    }
-  }
-  const userRows = projected.filter((r) => r.role === 'user')
-  const assistantRows = projected.filter((r) => r.role === 'assistant')
-  const goalOrPlanRows = projected.filter((r) => r.role === 'goal' || r.role === 'plan')
-  const recentTail = projected.slice(-6)
-  const keptSet = new Set<unknown>(recentTail.map((r) => r.raw))
-
-  const parts: string[] = [
-    '## Rolling Context Checkpoint',
-    ...(instructions?.trim() ? [`Focus: ${safeSliceHead(instructions.trim(), 240)}`] : []),
-  ]
-  if (userRows.length > 0) {
-    keptSet.add(userRows[0]!.raw)
-    parts.push('', '### Initial Goal / Request', safeSliceHead(userRows[0]!.text, 800))
-  }
-  if (goalOrPlanRows.length > 0) {
-    const latestPlan = goalOrPlanRows[goalOrPlanRows.length - 1]!
-    keptSet.add(latestPlan.raw)
-    parts.push('', '### Latest Plan / Goal', safeSliceHead(latestPlan.text, 1_000))
-  }
-  if (assistantRows.length > 1) {
-    const midAssistant = assistantRows[Math.max(0, assistantRows.length - 2)]!
-    if (!keptSet.has(midAssistant.raw)) {
-      keptSet.add(midAssistant.raw)
-      parts.push('', '### Prior Key Conclusion', safeSliceHead(midAssistant.text, 1_000))
-    }
-  }
-  parts.push('', '### Recent Exchanges')
-  for (const item of recentTail) {
-    parts.push(`- **${modelHistoryRoleLabel(item.role)}**: ${safeSliceHead(item.text, 900)}`)
-  }
-
-  let summary = parts.join('\n')
-  if (summary.length > CHECKPOINT_MAX_CHARS) {
-    summary = `${safeSliceHead(summary, CHECKPOINT_MAX_CHARS - 32)}\n… [checkpoint truncated]`
-  }
-  const afterBytes = Buffer.byteLength(summary, 'utf8')
-  const afterTokens = estimateModelHistoryTokens(summary)
-  const droppedEntries = Math.max(0, projected.length - keptSet.size)
-  return { summary, beforeBytes, afterBytes, beforeTokens, afterTokens, droppedEntries }
 }
 
 /**
@@ -1330,6 +1267,19 @@ export async function compactSession(
       const afterTokens = summary ? estimateModelHistoryTokens(summary) : undefined
       const afterBytes = summary ? Buffer.byteLength(summary, 'utf8') : undefined
       contextCompactionsTotal.inc({ engine, strategy: 'native_summary', outcome: 'ok' })
+      enqueueContextEvalEvent({
+        eventKind: 'context_compacted',
+        sessionKey: session.sessionKey,
+        agentId: session.agentId || 'main',
+        turnIndex: session.turns > 0 ? session.turns : undefined,
+        engine,
+        model: session.model,
+        compactionScope: 'session',
+        compactionStrategy: 'native_summary',
+        ...(beforeTokens !== undefined ? { beforeTokens } : {}),
+        ...(afterTokens !== undefined ? { afterTokens } : {}),
+        ...(afterBytes !== undefined ? { afterBytes } : {}),
+      })
       return {
         ok: true,
         supported: true,
@@ -1376,6 +1326,19 @@ export async function compactSession(
         const afterTokens = summary ? estimateModelHistoryTokens(summary) : undefined
         const afterBytes = summary ? Buffer.byteLength(summary, 'utf8') : undefined
         contextCompactionsTotal.inc({ engine, strategy: 'native_summary', outcome: 'ok' })
+        enqueueContextEvalEvent({
+          eventKind: 'context_compacted',
+          sessionKey: session.sessionKey,
+          agentId: session.agentId || 'main',
+          turnIndex: session.turns > 0 ? session.turns : undefined,
+          engine,
+          model: session.model,
+          compactionScope: 'session',
+          compactionStrategy: 'native_summary',
+          ...(beforeTokens !== undefined ? { beforeTokens } : {}),
+          ...(afterTokens !== undefined ? { afterTokens } : {}),
+          ...(afterBytes !== undefined ? { afterBytes } : {}),
+        })
         return {
           ok: true,
           supported: true,
@@ -1482,6 +1445,21 @@ export async function compactSession(
       session._forceHistoricalContextOnFirstTurn = true
       session._contextRebuildNotice = undefined
       contextCompactionsTotal.inc({ engine, strategy: 'checkpoint_reset', outcome: 'ok' })
+      enqueueContextEvalEvent({
+        eventKind: 'context_compacted',
+        sessionKey: session.sessionKey,
+        agentId: session.agentId || 'main',
+        turnIndex: session.turns > 0 ? session.turns : undefined,
+        engine,
+        model: session.model,
+        compactionScope: 'session',
+        compactionStrategy: 'checkpoint_reset',
+        beforeBytes: checkpoint.beforeBytes,
+        afterBytes: checkpoint.afterBytes,
+        beforeTokens: checkpoint.beforeTokens,
+        afterTokens: checkpoint.afterTokens,
+        droppedEntries: checkpoint.droppedEntries,
+      })
       return {
         ok: true,
         supported: true,

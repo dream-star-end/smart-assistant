@@ -35,6 +35,7 @@ export type GateId =
   | "check:feature-flags-ttl"
   | "check:pg-migration-safety"
   | "check:rest-contract"
+  | "check:context:static"
   | "check:governance:fast"
   | "lint:scheduler-wiring"
   | "lint:agent-containers-sql"
@@ -85,6 +86,7 @@ export const ALL_GATES: GateMeta[] = [
     lock: null,
   },
   { id: "check:rest-contract", npmScript: "check:rest-contract", passBaseFlag: true, cost: "cheap", lock: null },
+  { id: "check:context:static", npmScript: "check:context:static", cost: "cheap", lock: null },
   { id: "check:governance:fast", npmScript: "check:governance:fast", cost: "cheap", lock: null },
   { id: "lint:scheduler-wiring", npmScript: "lint:scheduler-wiring", cost: "cheap", lock: null },
   { id: "lint:agent-containers-sql", npmScript: "lint:agent-containers-sql", cost: "cheap", lock: null },
@@ -379,6 +381,40 @@ export const GATE_RULES: GateRule[] = [
       f === "packages/protocol/src/httpContracts.ts" ||
       f === "packages/protocol/rest-contract-snapshot.json",
     gates: ["check:rest-contract"],
+  },
+  {
+    id: "governance-context-static",
+    comment:
+      "OCV5-885: T-Static 上下文/提示词/压缩/记忆/技能合前快门(0-Token 离线账本+前缀不变性+内联契约+记忆/技能基准)。",
+    match: (f) =>
+      f === "scripts/check-context-static.ts" ||
+      f === "scripts/lib/contextStaticFixtures.ts" ||
+      f === ".github/context-eval-baseline.json" ||
+      f === "scripts/v5-skill-shadow-eval.ts" ||
+      f === "scripts/context-replay-eval.ts" ||
+      f.startsWith("evals/context-golden/") ||
+      f.startsWith("packages/mcp-memory/") ||
+      f.startsWith("packages/commercial/src/intelligentUi/") ||
+      f.startsWith("packages/commercial/agent-sandbox/platform-runtime/prompts/") ||
+      f.startsWith("packages/commercial/agent-sandbox/ccb-baseline/skills/") ||
+      f === "packages/gateway/src/sessionLifecycle.ts" ||
+      f === "packages/gateway/src/sessionManager.ts" ||
+      f === "packages/gateway/src/subprocessRunner.ts" ||
+      f === "packages/gateway/src/v3ToolFailureReporter.ts" ||
+      f === "packages/gateway/src/engine/resumedEnvelopeDedup.ts" ||
+      /^packages\/gateway\/src\/sessionCheckpoint[^/]*\.ts$/.test(f) ||
+      /^packages\/gateway\/src\/engine\/antigravity[^/]*\.ts$/.test(f) ||
+      f === "packages/storage/src/contextJanitor.ts" ||
+      /^packages\/storage\/src\/memory[^/]*\.ts$/.test(f) ||
+      (f.startsWith("packages/gateway/src/") &&
+        /(?:prompt|compact|context|memory|skill|autoDream|delegateModelCatalog|envProbe|collaboratorAgents)/i.test(
+          f,
+        )) ||
+      (f.startsWith("packages/storage/src/") &&
+        /(?:memory|skill|projectContext|archival)/i.test(f)) ||
+      (f.startsWith("packages/commercial/src/") &&
+        /(?:intelligentUi|coreMemory|memory|promptSlot|skill)/i.test(f)),
+    gates: ["check:context:static"],
   },
   {
     id: "governance-fast-self",

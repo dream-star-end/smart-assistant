@@ -36,15 +36,8 @@ import { relocateCcbJsonlToCwd, relocateCcbJsonlToCwdManaged } from './engine/cc
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { projectCcbMcpAvailability } from './ccbMcpAvailability.js'
 import { buildPromptContext, type IntelligentUiApplied } from './promptSlots.js'
-import {
-  applyPromptFreeze,
-  type FrozenPromptBuild,
-  PROMPT_FREEZE_TOUCH_MS,
-  type PromptFreezeInputs,
-  promptFreezeInputsKey,
-  resolvePromptFreezeMode,
-  touchFrozenPrompt,
-} from './promptFreeze.js'
+import { applyPromptFreeze, type FrozenPromptBuild, PROMPT_FREEZE_TOUCH_MS, type PromptFreezeInputs, promptFreezeInputsKey, recordContextEvalEvent, recordPromptFreezeEvalEvent, resolvePromptFreezeMode, touchFrozenPrompt } from './promptFreeze.js'
+export { recordContextEvalEvent }
 import { boxAutoCompactWindowEnv } from './boxContextBudget.js'
 import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
@@ -1731,6 +1724,7 @@ export class SubprocessRunner extends EventEmitter {
         changed_slots: outcome.changedSlots,
         age_min: outcome.ageMs === null ? null : Math.round(outcome.ageMs / 60_000),
       })
+      recordPromptFreezeEvalEvent({ sessionKey: this.opts.sessionKey, agentId: this.opts.agentId, inputs, outcome })
       return outcome.chosen
     } catch (err) {
       this._ccbContextFreezeFile = ''
