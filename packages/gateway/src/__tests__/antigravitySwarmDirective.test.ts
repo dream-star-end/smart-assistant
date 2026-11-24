@@ -13,6 +13,7 @@ import {
 import {
   ANTIGRAVITY_SWARM_OFF_MARKER,
   applyAntigravitySwarmTurnDirective,
+  formatAvailableLocalSwarmModelsHint,
   hasHistoricalAntigravitySwarm,
   listLiveAntigravitySwarmMonitors,
 } from '../engine/antigravitySwarmDirective.js'
@@ -380,4 +381,67 @@ test('OCV5-852 P0-3/P2-2: dual @monitor/@narrator ban, @all [done] prohibition, 
     else process.env.OPENCLAUDE_HOME = prevHome
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('OCV5-879: local native swarm allows selecting built-in Antigravity models while remote swarm stays restricted', () => {
+  const hint = formatAvailableLocalSwarmModelsHint([
+    'antigravity-gemini-4-neon',
+    'antigravity-gemini-4-carbon',
+    'antigravity-orchestrator-neon', // composite orchestrator excluded as extra member
+    'antigravity-claude-opus-5.5',
+    'gpt-6.2-astra', // non-Antigravity filtered out
+    'antigravity-gemini-4-neon-remote', // remote filtered out
+  ])
+  assert.equal(
+    hint,
+    '`gemini-4-neon-{low,medium,high,xhigh}`、`gemini-4-carbon-{low,medium,high}`、`claude-opus-5-5-{low,medium,high}`',
+  )
+
+  const localFresh = applyAntigravitySwarmTurnDirective({
+    finalText: '拆分任务并分别指定模型',
+    rawUserText: '拆分任务并分别指定模型',
+    isAntigravityTurn: true,
+    isRemoteAntigravity: false,
+    swarmMode: true,
+    hasHistoricalSwarm: false,
+    availableLocalSwarmModels: [
+      'antigravity-gemini-4-neon',
+      'antigravity-gemini-4-hydrogen',
+      'antigravity-orchestrator-carbon',
+    ],
+  })
+  assert.equal(localFresh.mode, 'on')
+  assert.ok(localFresh.text.includes('按成员模型选择'))
+  assert.ok(localFresh.text.includes('`gemini-4-neon-{low,medium,high,xhigh}`'))
+  assert.ok(localFresh.text.includes('`gemini-4-hydrogen-{low,medium,high,xhigh}`'))
+  assert.ok(!localFresh.text.includes('`gemini-pro-orchestrator`'))
+  assert.ok(!localFresh.text.includes('不要指定 `model` 参数'))
+
+  const localResumed = applyAntigravitySwarmTurnDirective({
+    finalText: '继续下一阶段',
+    rawUserText: '继续下一阶段',
+    isAntigravityTurn: true,
+    isRemoteAntigravity: false,
+    swarmMode: true,
+    hasHistoricalSwarm: true,
+    availableLocalSwarmModels: ['antigravity-gemini-4-neon', 'antigravity-gemini-4-carbon'],
+  })
+  assert.ok(localResumed.text.includes('已放行的 Antigravity 自带模型'))
+  assert.ok(localResumed.text.includes('`gemini-4-carbon-{low,medium,high}`'))
+  assert.ok(!localResumed.text.includes('招募成员不传 `model`'))
+
+  const remoteFresh = applyAntigravitySwarmTurnDirective({
+    finalText: '远端拆分任务',
+    rawUserText: '远端拆分任务',
+    isAntigravityTurn: true,
+    isRemoteAntigravity: true,
+    swarmMode: true,
+    hasHistoricalSwarm: false,
+    availableLocalSwarmModels: ['antigravity-gemini-4-neon'],
+  })
+  assert.ok(remoteFresh.text.includes('不要指定 `model` 参数'))
+  assert.ok(!remoteFresh.text.includes('按成员模型选择'))
+
+  assert.ok(!ANTIGRAVITY_PREAMBLE.includes('omit `model` on `swarm{action:"add"}`'))
+  assert.ok(ANTIGRAVITY_PREAMBLE.includes('local native swarm allows choosing built-in Antigravity models'))
 })

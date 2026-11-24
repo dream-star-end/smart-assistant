@@ -7,7 +7,11 @@ import { mintAntigravityRelayRoute } from '../billing/antigravityRouteContext.js
  */
 import { antigravityModelCoolingUntil } from './antigravityModelCooldown.js'
 import { AntigravityOAuthError, mintAntigravityLimitedToken } from './antigravityOAuth.js'
-import { pickAntigravityAccount, reportAntigravityOutcome } from './antigravityPool.js'
+import {
+  antigravityAccountSupportsModel,
+  pickAntigravityAccount,
+  reportAntigravityOutcome,
+} from './antigravityPool.js'
 import { releaseInflight } from './policy/affinity.js'
 
 export interface AntigravityRouteGrant {
@@ -47,6 +51,8 @@ export async function admitAntigravityTurn(
     modelId: string
     budgetCredits: bigint
     relayPort: number
+    /** Optional canonical Antigravity model ids additionally allowed for local native swarm members. */
+    allowedModelIds?: readonly string[]
   },
   deps: {
     clientSecret: string
@@ -102,6 +108,23 @@ export async function admitAntigravityTurn(
       deadGrants.add(account.accountId)
     }
   }
+  let effectiveAllowedModelIds: string[] | undefined
+  if (args.allowedModelIds && args.allowedModelIds.length > 0 && account.availableModels) {
+    const now = Date.now()
+    const filtered: string[] = [args.modelId]
+    const seen = new Set<string>([args.modelId])
+    for (const candidate of args.allowedModelIds) {
+      if (!candidate || seen.has(candidate)) continue
+      seen.add(candidate)
+      if (!antigravityAccountSupportsModel(account.availableModels, candidate, now)) {
+        continue
+      }
+      const memberCooling = await coolingUntil(account.accountId, candidate).catch(() => null)
+      if (memberCooling !== null) continue
+      filtered.push(candidate)
+    }
+    if (filtered.length > 1) effectiveAllowedModelIds = filtered
+  }
   let route: Awaited<ReturnType<typeof mintAntigravityRelayRoute>>
   try {
     route = await (deps.mintRoute ?? mintAntigravityRelayRoute)({
@@ -112,6 +135,7 @@ export async function admitAntigravityTurn(
       accountId: account.accountId,
       budgetCredits: args.budgetCredits,
       relayPort: args.relayPort,
+      ...(effectiveAllowedModelIds ? { allowedModelIds: effectiveAllowedModelIds } : {}),
     })
   } catch (err) {
     releaseInflight(args.requestId)

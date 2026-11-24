@@ -1809,10 +1809,28 @@ export async function dispatchInbound(
       const boundSwarmConversationId = isAntigravityTurn && !isRemoteAntigravity
         ? (session.ccbSessionId ?? session.runner?.nativeSessionId ?? this.sessions.resolveAntigravitySwarmTarget?.(frame.peer.id)?.conversationId ?? undefined)
         : undefined
+      let availableLocalSwarmModels: string[] | undefined
+      if (isAntigravityTurn && !isRemoteAntigravity && swarmRequested) {
+        try {
+          const catalogView = await getLocalCatalogView()
+          const localModels = catalogView.models
+            .filter(
+              (m) =>
+                m.available &&
+                m.engine === 'antigravity' &&
+                isAntigravityEngineModel(m.modelId),
+            )
+            .map((m) => m.modelId)
+          if (localModels.length > 0) availableLocalSwarmModels = localModels
+        } catch {
+          // Best-effort discovery hint only; relay enforces authoritative allowlist server-side.
+        }
+      }
       const swarmDirectiveResult = applyAntigravitySwarmTurnDirective({
         finalText, rawUserText, isAntigravityTurn, isRemoteAntigravity, swarmMode,
         hasHistoricalSwarm: isAntigravityTurn ? hasHistoricalAntigravitySwarm({ sessionKey, isRemote: isRemoteAntigravity, conversationId: boundSwarmConversationId }) : false,
         liveMonitorNames: isAntigravityTurn && swarmRequested ? listLiveAntigravitySwarmMonitors({ sessionKey, isRemote: isRemoteAntigravity, conversationId: boundSwarmConversationId }) : [],
+        ...(availableLocalSwarmModels ? { availableLocalSwarmModels } : {}),
       })
       finalText = swarmDirectiveResult.text
       if (swarmDirectiveResult.mode === 'on') {

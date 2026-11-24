@@ -9,7 +9,12 @@
 import { createHash, randomBytes } from 'node:crypto'
 import type { AntigravityRouteAuthority } from './antigravityRouteAuthority.js'
 
-import { ANTIGRAVITY_RELAY_PREFIX, isAntigravityEngineModel } from '@openclaude/protocol'
+import {
+  ANTIGRAVITY_ENGINE_MODEL_IDS,
+  ANTIGRAVITY_RELAY_PREFIX,
+  isAntigravityEngineModel,
+  isAntigravitySwarmMemberModel,
+} from '@openclaude/protocol'
 
 export { ANTIGRAVITY_RELAY_PREFIX }
 /**
@@ -33,12 +38,69 @@ export type AntigravityRelayRoute = {
   userId: bigint
   requestId: string
   modelId: string
+  /** Optional extra canonical Antigravity model ids permitted for local native swarm members (OCV5-879). */
+  allowedModelIds?: readonly string[]
   accountId: bigint
   /** Spendable credits at admission; the relay stops new generate calls past it. */
   budgetCredits: bigint
   expiresAt: number
   /** Renewal ceiling; rows minted before renewal existed carry expiresAt here. */
   maxExpiresAt: number
+}
+
+const MAX_SWARM_ALLOWED_MODELS = 32
+
+function normalizeAllowedModelIds(
+  primaryModelId: string,
+  raw: readonly string[] | undefined,
+): readonly string[] | undefined {
+  if (!raw || raw.length === 0) return undefined
+  if (raw.length > MAX_SWARM_ALLOWED_MODELS) {
+    throw new Error('antigravity relay allowedModelIds exceeds limit')
+  }
+  const set = new Set<string>([primaryModelId])
+  for (const id of raw) {
+    if (typeof id !== 'string') {
+      throw new Error('antigravity relay allowedModelIds contains non-allowlisted model')
+    }
+    if (id === primaryModelId) {
+      set.add(id)
+      continue
+    }
+    if (!isAntigravitySwarmMemberModel(id)) {
+      throw new Error('antigravity relay allowedModelIds contains non-allowlisted model')
+    }
+    set.add(id)
+  }
+  if (set.size <= 1) return undefined
+  return [...set].sort()
+}
+
+/**
+ * Compute the server-authorized canonical Antigravity model allowlist for a local
+ * native swarm turn (OCV5-879). Fail-closed: requires authoritative user auth,
+ * active local Antigravity catalog verification, and pricing; missing any
+ * evidence falls back to primary-only (`undefined`). Also excludes composite
+ * orchestrator models as extra members to prevent shared-worker attribution ambiguity.
+ */
+export function resolveLocalSwarmAllowedAntigravityModels(args: {
+  primaryModelId: string
+  isAllowedForUser?: ((modelId: string) => boolean) | null
+  isCatalogRoutableLocal?: ((modelId: string) => boolean) | null
+  hasPricing?: ((modelId: string) => boolean) | null
+}): readonly string[] | undefined {
+  if (!isAntigravityEngineModel(args.primaryModelId)) return undefined
+  if (!args.isAllowedForUser || !args.isCatalogRoutableLocal || !args.hasPricing) return undefined
+  const out = new Set<string>([args.primaryModelId])
+  for (const candidate of ANTIGRAVITY_ENGINE_MODEL_IDS) {
+    if (candidate === args.primaryModelId) continue
+    if (!isAntigravitySwarmMemberModel(candidate)) continue
+    if (!args.isCatalogRoutableLocal(candidate)) continue
+    if (!args.hasPricing(candidate)) continue
+    if (!args.isAllowedForUser(candidate)) continue
+    out.add(candidate)
+  }
+  return out.size > 1 ? [...out].sort() : undefined
 }
 
 export type AntigravityRelayKv = {
@@ -75,6 +137,9 @@ function serialize(row: AntigravityRelayRoute): string {
     userId: row.userId.toString(),
     requestId: row.requestId,
     modelId: row.modelId,
+    ...(row.allowedModelIds && row.allowedModelIds.length > 0
+      ? { allowedModelIds: [...row.allowedModelIds] }
+      : {}),
     accountId: row.accountId.toString(),
     budgetCredits: row.budgetCredits.toString(),
     expiresAt: row.expiresAt,
@@ -98,6 +163,17 @@ function deserialize(token: string, raw: string): AntigravityRelayRoute | null {
   if (typeof body.requestId !== 'string' || !REQUEST_ID_RE.test(body.requestId)) return null
   if (typeof body.modelId !== 'string' || !isAntigravityEngineModel(body.modelId)) return null
   if (typeof body.expiresAt !== 'number' || !Number.isFinite(body.expiresAt)) return null
+  let allowedModelIds: readonly string[] | undefined
+  if (body.allowedModelIds !== undefined) {
+    if (!Array.isArray(body.allowedModelIds) || body.allowedModelIds.length > MAX_SWARM_ALLOWED_MODELS) {
+      return null
+    }
+    try {
+      allowedModelIds = normalizeAllowedModelIds(body.modelId, body.allowedModelIds as string[])
+    } catch {
+      return null
+    }
+  }
   const maxExpiresAt =
     typeof body.maxExpiresAt === 'number' && Number.isFinite(body.maxExpiresAt)
       ? body.maxExpiresAt
@@ -108,6 +184,7 @@ function deserialize(token: string, raw: string): AntigravityRelayRoute | null {
     userId: BigInt(body.userId),
     requestId: body.requestId,
     modelId: body.modelId,
+    ...(allowedModelIds ? { allowedModelIds } : {}),
     accountId: BigInt(body.accountId),
     budgetCredits: BigInt(body.budgetCredits),
     expiresAt: body.expiresAt,
@@ -120,6 +197,7 @@ export async function mintAntigravityRelayRoute(args: {
   userId: bigint | number
   requestId: string
   modelId: string
+  allowedModelIds?: readonly string[]
   accountId: bigint
   budgetCredits: bigint
   relayPort: number
@@ -136,6 +214,7 @@ export async function mintAntigravityRelayRoute(args: {
   if (!isAntigravityEngineModel(args.modelId)) {
     throw new Error('antigravity relay model is not allowlisted')
   }
+  const allowedModelIds = normalizeAllowedModelIds(args.modelId, args.allowedModelIds)
   if (args.budgetCredits <= 0n) {
     throw new Error('antigravity relay budget must be positive')
   }
@@ -152,6 +231,7 @@ export async function mintAntigravityRelayRoute(args: {
     userId: BigInt(args.userId),
     requestId: args.requestId,
     modelId: args.modelId,
+    ...(allowedModelIds ? { allowedModelIds } : {}),
     accountId: args.accountId,
     budgetCredits: args.budgetCredits,
     expiresAt: now + ttl,

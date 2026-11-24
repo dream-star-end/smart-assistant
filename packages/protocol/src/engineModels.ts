@@ -515,6 +515,64 @@ export function antigravityAllowedUpstreamModels(modelId: string | undefined): r
   ]
 }
 
+const ANTIGRAVITY_UPSTREAM_TO_CANONICAL: ReadonlyMap<string, AntigravityEngineModelId> = (() => {
+  const map = new Map<string, AntigravityEngineModelId>()
+  for (const entry of ANTIGRAVITY_ENGINE_MODELS) {
+    for (const cliId of Object.values(entry.cliModels as Readonly<Record<string, string>>)) {
+      map.set(cliId, entry.id)
+    }
+  }
+  return map
+})()
+
+/**
+ * Map a concrete Antigravity CLI upstream model id (e.g. `gemini-4-carbon-high`,
+ * `claude-opus-5-5-medium`, `gemini-pro-orchestrator`) back to its unique canonical
+ * catalog id. Returns null for aux models (`gemini-3.5-flash-lite`), shared internal
+ * orchestrator workers (`gemini-flash-worker-agy`), or unknown ids.
+ */
+export function antigravityCanonicalModelForUpstream(
+  upstreamModel: string | null | undefined,
+): AntigravityEngineModelId | null {
+  if (typeof upstreamModel !== 'string' || !upstreamModel) return null
+  return ANTIGRAVITY_UPSTREAM_TO_CANONICAL.get(upstreamModel) ?? null
+}
+
+/**
+ * True when `modelId` is a built-in Antigravity model that can be safely assigned
+ * to an additional local native swarm member without shared-worker attribution
+ * ambiguity (excludes composite orchestrators that share `gemini-flash-worker-agy`).
+ */
+export function isAntigravitySwarmMemberModel(modelId: string | null | undefined): boolean {
+  if (typeof modelId !== 'string' || !modelId) return false
+  const entry = ANTIGRAVITY_ENGINE_MODELS.find((m) => m.id === modelId)
+  if (!entry) return false
+  return !('workerModels' in entry)
+}
+
+/**
+ * Union of upstream model ids a relay route may forward when a local native
+ * Antigravity swarm turn allows per-member built-in Antigravity models.
+ * When `extraModelIds` is empty/undefined, returns the exact single-model allowlist.
+ * Extra models must pass `isAntigravitySwarmMemberModel` so shared orchestrator
+ * worker upstreams (`gemini-flash-worker-agy`) never lose unambiguous attribution.
+ */
+export function antigravitySwarmAllowedUpstreamModels(
+  primaryModelId: string | undefined,
+  extraModelIds?: readonly string[] | null,
+): readonly string[] {
+  const primary = antigravityAllowedUpstreamModels(primaryModelId)
+  if (!extraModelIds || extraModelIds.length === 0) return primary
+  const seen = new Set<string>(primary)
+  for (const candidate of extraModelIds) {
+    if (candidate === primaryModelId || !isAntigravitySwarmMemberModel(candidate)) continue
+    for (const upstream of antigravityAllowedUpstreamModels(candidate)) {
+      seen.add(upstream)
+    }
+  }
+  return [...seen]
+}
+
 /**
  * Pinned official Cursor Agent CLI model allowlist.
  *

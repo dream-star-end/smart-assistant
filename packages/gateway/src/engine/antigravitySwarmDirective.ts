@@ -9,9 +9,50 @@
  */
 import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { parseSwarmSlashCommand } from '@openclaude/protocol'
+import {
+  ANTIGRAVITY_ENGINE_MODELS,
+  isAntigravitySwarmMemberModel,
+  parseSwarmSlashCommand,
+} from '@openclaude/protocol'
 import { antigravityRoot, antigravitySessionBrainDir } from './antigravityPlatform.js'
 import { remoteSwarmLocationForSession } from '../remoteSwarmRuntime.js'
+
+function formatLocalSwarmCliModelGroup(canonicalModelId: string): string | null {
+  const entry = ANTIGRAVITY_ENGINE_MODELS.find((m) => m.id === canonicalModelId)
+  if (!entry) return null
+  const cliModels = entry.cliModels as Readonly<Record<string, string>>
+  const efforts = entry.efforts as readonly string[]
+  if (efforts.length === 0) {
+    return cliModels[entry.defaultEffort] ?? Object.values(cliModels)[0] ?? null
+  }
+  const values = efforts.map((e) => cliModels[e]).filter((v): v is string => Boolean(v))
+  if (values.length === 0) return null
+  if (values.length === 1) return values[0]!
+  const first = values[0]!
+  const suffix = `-${efforts[0]}`
+  if (first.endsWith(suffix)) {
+    const prefix = first.slice(0, -suffix.length)
+    const allMatch = efforts.every((e, i) => values[i] === `${prefix}-${e}`)
+    if (allMatch) return `${prefix}-{${efforts.join(',')}}`
+  }
+  return values.join(' / ')
+}
+
+export function formatAvailableLocalSwarmModelsHint(
+  modelIds?: readonly string[] | null,
+): string | null {
+  if (!modelIds || modelIds.length === 0) return null
+  const groups: string[] = []
+  const seen = new Set<string>()
+  for (const raw of modelIds) {
+    const id = typeof raw === 'string' ? raw.trim() : ''
+    if (!id || seen.has(id) || !isAntigravitySwarmMemberModel(id)) continue
+    seen.add(id)
+    const formatted = formatLocalSwarmCliModelGroup(id)
+    if (formatted) groups.push(`\`${formatted}\``)
+  }
+  return groups.length > 0 ? groups.join('、') : null
+}
 
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const MAX_MEMBERS_JSON_BYTES = 512 * 1024
@@ -169,6 +210,8 @@ export function applyAntigravitySwarmTurnDirective(opts: {
   swarmMode: boolean
   hasHistoricalSwarm: boolean
   liveMonitorNames?: readonly string[]
+  /** Server-projected local Antigravity canonical model ids available to this user (OCV5-879). */
+  availableLocalSwarmModels?: readonly string[]
 }): AntigravitySwarmTurnDirectiveResult {
   const slashSwarm = parseSwarmSlashCommand(opts.rawUserText)
   const viaSlash = Boolean(slashSwarm?.matched)
@@ -199,10 +242,23 @@ export function applyAntigravitySwarmTurnDirective(opts: {
       liveMonitors.length > 0
         ? `   - 检测到历史蜂群仍有残留原生辅助成员（${liveMonitors.map((n) => `\`${n}\``).join('、')}），请优先调用 \`swarm{action:"kill", name:"..."}\` 将其回收，避免后台定时空转消耗上下文。`
         : null
+    const localModelsHint = opts.isRemoteAntigravity
+      ? null
+      : formatAvailableLocalSwarmModelsHint(opts.availableLocalSwarmModels)
+    const modelRuleLine = opts.isRemoteAntigravity
+      ? '2. 招募成员时**不要指定 `model` 参数**（留空以继承当前会话模型，确保计费与权限一致）。'
+      : localModelsHint
+        ? `2. **按成员模型选择**：默认留空 \`model\` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可在 \`swarm{action:"add", model:"..."}\` 中指定（或对 \`waiting\` 成员用 \`swarm{action:"model", name:"...", model:"..."}\` 切换）。仅可使用本次已放行的 Antigravity 自带模型：${localModelsHint}（不支持外部非 Antigravity 模型，系统按各成员实际模型独立计费）。`
+        : '2. **按成员模型选择**：默认留空 \`model\` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可先用 \`swarm{action:"models"}\` 查看 Antigravity 自带可用模型，再在 \`swarm{action:"add", model:"..."}\` 中指定（或对 \`waiting\` 成员用 \`swarm{action:"model", name:"...", model:"..."}\` 切换；仅限平台已放行的 Antigravity 自带模型，不支持外部模型，系统按实际模型独立计费）。'
+    const resumedModelRule = opts.isRemoteAntigravity
+      ? '招募成员不传 `model`'
+      : localModelsHint
+        ? `招募成员默认留空 \`model\` 继承主模型，也可按需指定已放行的 Antigravity 自带模型（${localModelsHint}）`
+        : '招募成员默认留空 `model` 继承主模型，也可按需指定已放行的 Antigravity 自带模型'
     const swarmDirective = opts.hasHistoricalSwarm
       ? [
           '[OpenClaude Antigravity 蜂群模式已激活]',
-          '续聊蜂群规则（精简提醒）：同任务可复用既有蜂群，切换无关新任务前先确认改动已合入并 `swarm{action:"kill"}` 清理旧 worker；招募成员不传 `model`，**严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N`**；收口前先 `kill` 已完工且不再需要的 worker，再发不带 `@all` 的 `[done] <总结>`（**严禁 `@all [done]`**），切勿输出本地 `open_board` 链接。',
+          `续聊蜂群规则（精简提醒）：同任务可复用既有蜂群，切换无关新任务前先确认改动已合入并 \`swarm{action:"kill"}\` 清理旧 worker；${resumedModelRule}，**严禁招募 \`monitor\` / \`monitor-N\` 与 \`narrator\` / \`narrator-N\`**；收口前先 \`kill\` 已完工且不再需要的 worker，再发不带 \`@all\` 的 \`[done] <总结>\`（**严禁 \`@all [done]\`**），切勿输出本地 \`open_board\` 链接。`,
           ...(legacyMonitorCleanupLine ? [legacyMonitorCleanupLine] : []),
           '',
         ].join('\n')
@@ -213,7 +269,7 @@ export function applyAntigravitySwarmTurnDirective(opts: {
             ? '1. 若任务可拆分为 2 个及以上可并行推进的独立子方向（或需要独立校验者 review），先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员（必要时配备 `verifier` 校验者；**严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N`**，OpenClaude 网关已内置零推理停滞检测与网页端实时 SwarmBoard 渲染），随后调用 `swarm_wait{since:...}` 等待成员汇报并用 `read_board` 审阅结果。'
             : '1. 若任务可拆分为 2 个及以上可并行推进的独立子方向（或需要独立校验者 review），请立即读取内置 `swarm` skill，先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员（必要时配备 `verifier` 校验者）。**忽略内置 skill 中添加 `monitor`/`swarm_monitor` 与 `narrator`/`swarm_narrator` 的步骤，严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N` 成员**（OpenClaude 网关已接管零推理停滞检测与网页端 SwarmBoard 实时渲染）。',
           ...(legacyMonitorCleanupLine ? [legacyMonitorCleanupLine] : []),
-          '2. 招募成员时**不要指定 `model` 参数**（留空以继承当前会话模型，确保计费与权限一致）。',
+          modelRuleLine,
           '3. **生命周期边界（仅限本轮蜂群开启时）**：同任务续聊可复用既有蜂群；若切换到全新无关任务，确认旧成员无未合入改动后再 `swarm{action:"kill"}` 回收旧 worker（或开独立频道隔离）并更新 `title`。后续若关闭蜂群开关，不得再自动复用旧蜂群。',
           '4. **Git 仓库并行写手与防丢合入**：多写手并行改码默认传 `workspace:"share"`（独立 worktree 隔离）并在 `brief` 中划分清晰文件所有权（只读调研/校验成员保留默认 `inherit`）；收尾前必须检查并合入所有 `share`/`branch` 改动到主工作区再 `kill`。',
           '5. OpenClaude 网页端会实时原生渲染蜂群看板，**切勿**在回复中输出本地 `open_board` 链接或终端 `/swarm board` 命令。',
