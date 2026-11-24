@@ -13,7 +13,11 @@
  *     resolved error TurnSummaries from Cursor/Antigravity, B4) using the
  *     original raw user input and exact checkpoint generation ACK (B5).
  */
-import { resolveEffectiveModelHistoryContextWindow } from '@openclaude/protocol'
+import {
+  BOX_NATIVE_CONTEXT_OWNER,
+  isBoxApiModel,
+  resolveEffectiveModelHistoryContextWindow,
+} from '@openclaude/protocol'
 import { isCcbSlashCommandPrompt } from './ccbNativeCompaction.js'
 import { reconcileAntigravitySwarmDirectiveAfterCompaction } from './engine/antigravitySwarmDirective.js'
 import type { SessionStreamEvent, TurnSummary } from './engine/engineEvents.js'
@@ -417,6 +421,8 @@ export async function maybeAutoCompactBeforeTurn(
   userTextOrBlocks: HistoricalTurnInput,
   onEvent: (e: SessionStreamEvent) => void,
   opts?: {
+    model?: string
+    executionDescriptor?: { contextOwner?: string }
     _internalCompact?: boolean
     modelSwitchInternal?: string
     allowSingleSelfClientTurn?: boolean
@@ -438,6 +444,20 @@ export async function maybeAutoCompactBeforeTurn(
     return { compacted: false, reason: 'excluded_channel' }
   }
   if (isCcbSlashCommandPrompt(userTextOrBlocks)) return { compacted: false, reason: 'slash_cmd' }
+  // OCV5-755 × OCV5-841: Box-native CCB sessions own their own context budget
+  // (autocompact + pre-expiry deferred idle compaction with signed authority);
+  // never fire an unsigned pre-turn `/compact` that busts warm Box prompt cache.
+  const effectiveModel = opts?.model ?? session.model
+  if (
+    session._idlePreExpiryTimer !== undefined ||
+    session._idlePreExpiryActive ||
+    session._idleRunning ||
+    opts?.executionDescriptor?.contextOwner === BOX_NATIVE_CONTEXT_OWNER ||
+    session._boxContextOwner === BOX_NATIVE_CONTEXT_OWNER ||
+    isBoxApiModel(effectiveModel)
+  ) {
+    return { compacted: false, reason: 'box_native_owned' }
+  }
 
   const state = sessionAutoStates.get(session.sessionKey)
   const threshold = resolveAutoCompactRatio()
