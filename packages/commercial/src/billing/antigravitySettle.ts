@@ -1245,8 +1245,8 @@ export async function settleLateAntigravityRelayUsage(args: {
           parent.session_id,
           parent.parent_session_id,
           parent.delegate_agent_id,
-          parent.turn_key,
-          parent.parent_turn_key,
+          canonicalTurnKey(parent.turn_key) ?? null,
+          canonicalTurnKey(parent.parent_turn_key) ?? null,
         )
         .catch(() => {})
     }

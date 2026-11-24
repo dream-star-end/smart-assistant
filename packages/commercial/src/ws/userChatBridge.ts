@@ -6347,6 +6347,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (sealed === null) { failDispatchPreForward(dispatchRecord, 'cursor_authority_seal_rejected'); return; }
               authorityFields = sealed;
             }
+            delete (enriched as Record<string, unknown>)._inferredLegacySwarmMode;
             const forwarded = { ...enriched, requestId, traceId: traceCapture, _creditBudget: cursorSpendable === null ? undefined : cursorSpendable.toString(), ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
             const encoded = JSON.stringify(forwarded); const len = Buffer.byteLength(encoded);
             if (len > maxFrameBytes) { failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG'); rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG'); return; }
@@ -6847,6 +6848,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               authorityFields = sealed;
             }
             if (cleaned) { failDispatchPreForward(dispatchRecordA, "bridge_cleaned"); return; }
+            delete (enrichedParsed as Record<string, unknown>)._inferredLegacySwarmMode;
             const rewrittenObj = {
               ...enrichedParsed,
               requestId,
@@ -7535,6 +7537,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 abandonReason = "bridge_disconnect_before_forward";
                 return;
               }
+              delete (enrichedParsed as Record<string, unknown>)._inferredLegacySwarmMode;
               const rewrittenObj = applyAdmittedServiceTierToFrame({
                 ...enrichedParsed,
                 requestId,
@@ -7634,6 +7637,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     text: extractInboundPromptText(enrichedParsed),
                   })
                 : null;
+              delete (enrichedParsed as Record<string, unknown>)._inferredLegacySwarmMode;
               const rewrittenObj = applyAdmittedServiceTierToFrame({
                 ...enrichedParsed,
                 traceId: turnTraceIdCapture,
@@ -7881,8 +7885,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 turnLogCapture?.warn("user-chat-bridge: ccb spendable lookup failed, fail-open", { err });
               }
             }
+            const inferredRemoteSwarmMode =
+              isAntigravityInboundFrame &&
+              typeof enrichedParsed.swarmMode !== "boolean" &&
+              Boolean(recoveryJob) &&
+              typeof (enrichedParsed as { _inferredLegacySwarmMode?: unknown })._inferredLegacySwarmMode === "boolean"
+                ? (enrichedParsed as { _inferredLegacySwarmMode: boolean })._inferredLegacySwarmMode
+                : undefined;
+            delete (enrichedParsed as Record<string, unknown>)._inferredLegacySwarmMode;
             const rewrittenObj = {
               ...enrichedParsed,
+              ...(inferredRemoteSwarmMode !== undefined ? { swarmMode: inferredRemoteSwarmMode } : {}),
               // OCV5-746: 与 signed billingRequestId 同源同值的 server-owned requestId。
               ...(codexFrameRequestId !== undefined ? { requestId: codexFrameRequestId } : {}),
               traceId: turnTraceIdCapture,

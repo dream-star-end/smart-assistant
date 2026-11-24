@@ -1500,107 +1500,108 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     ctx.settling = true
     let resolveSettlingDone!: () => void
     ctx.settlingDone = new Promise<void>((r) => { resolveSettlingDone = r })
-    ctx.pendingResult = null
-    ctx.resultResponseBytes = Buffer.byteLength(asText(result.response), 'utf8')
-    let status = asText(result.status)
-    // OCV5-556: once a launch of a conversation failed (e.g. relay
-    // ROUTE_EXPIRED), 1.4.0 ends every later `--conversation` launch with
-    // status ERROR and that old error, even when the launch answered normally
-    // (exit 0, empty stderr). The recovery and the next messages then "failed"
-    // until the retry circuit opened. Such a launch resumed a conversation,
-    // started, answered, streamed no error step of its own, exited 0 and wrote
-    // no error to stderr; a launch that really failed (even after a partial
-    // reply) exits non-zero and prints the error (Codex r1 P1).
-    if (ctx.procClosed && ctx.exitCode === 0 && this.mayBeRepeatedOldError(ctx, result)) {
-      log.warn('antigravity CLI repeated an earlier launch error on a run that answered', {
-        sessionKey: this.opts.sessionKey,
-        error: asText(result.error).slice(0, 300),
-      })
-      status = 'SUCCESS'
-    }
-    if ((ctx.resultConversationId && ctx.initConversationId && ctx.resultConversationId !== ctx.initConversationId) ||
-        (ctx.requestedConversationId && ctx.resultConversationId !== ctx.requestedConversationId)) {
-      ctx.errorDetail ??= 'ANTIGRAVITY_CONVERSATION_MISMATCH: result does not match this launch'
-    }
-    if (status === 'CANCELED' || status === 'INTERRUPTED') ctx.interrupted = true
-    if (ctx.trailingErrorStep && ctx.trailingErrorDetail && ctx.errorDetail === null) {
-      ctx.errorDetail = ctx.trailingErrorDetail
-    }
-    if (status !== 'SUCCESS' && ctx.errorDetail === null) {
-      ctx.errorDetail = asText(result.error) || ctx.preludeErrorDetail || ctx.stderr.trim() ||
-        (ctx.procClosed && ctx.exitCode !== 0
-          ? `antigravity exited with code ${String(ctx.exitCode)}`
-          : `Antigravity turn ended with status ${status || 'unknown'}`)
-    }
-    if (ctx.procClosed && ctx.exitCode !== 0 && !ctx.interrupted) {
-      ctx.errorDetail ??= ctx.stderr.trim() || `antigravity exited with code ${String(ctx.exitCode)}`
-    }
-    if (status === 'SUCCESS' && ctx.errorDetail === null) {
-      // 1.3.4 reports SUCCESS for runs that produced nothing (oversized input)
-      // and for headless soft-denied tools. Both are failures for the user.
-      const denied = Array.isArray(result.denied_actions) ? result.denied_actions : []
-      if (ctx.trailingErrorStep) {
-        const why = asText(result.error) || ctx.stderr.trim().slice(-500) || 'CLI reported success after an error step'
-        ctx.errorDetail = `${ANTIGRAVITY_ERROR_STEP}: ${why}`
-      } else if (denied.length > 0 || SOFT_DENY_RE.test(ctx.stderr)) {
-        const actions = denied.map((d) => asText(recordOf(d)?.action) || asText(d)).filter(Boolean)
-        ctx.errorDetail = `ANTIGRAVITY_TOOL_DENIED: ${actions.length > 0 ? actions.join(',') : ctx.stderr.trim().slice(0, 500)}`
+    try {
+      ctx.pendingResult = null
+      ctx.resultResponseBytes = Buffer.byteLength(asText(result.response), 'utf8')
+      let status = asText(result.status)
+      // OCV5-556: once a launch of a conversation failed (e.g. relay
+      // ROUTE_EXPIRED), 1.4.0 ends every later `--conversation` launch with
+      // status ERROR and that old error, even when the launch answered normally
+      // (exit 0, empty stderr). The recovery and the next messages then "failed"
+      // until the retry circuit opened. Such a launch resumed a conversation,
+      // started, answered, streamed no error step of its own, exited 0 and wrote
+      // no error to stderr; a launch that really failed (even after a partial
+      // reply) exits non-zero and prints the error (Codex r1 P1).
+      if (ctx.procClosed && ctx.exitCode === 0 && this.mayBeRepeatedOldError(ctx, result)) {
+        log.warn('antigravity CLI repeated an earlier launch error on a run that answered', {
+          sessionKey: this.opts.sessionKey,
+          error: asText(result.error).slice(0, 300),
+        })
+        status = 'SUCCESS'
       }
-    }
-    const unanchoredResumeResponse = ctx.resumedLaunch && ctx.firstOwnStepIndex === null &&
-      asText(result.response).trim() !== ''
-    if (status === 'SUCCESS' && ctx.errorDetail === null && !ctx.interrupted &&
-        ctx.procClosed && ctx.exitCode === 0 && !ctx.answerText.trim() &&
-        (!asText(result.response).trim() || unanchoredResumeResponse) &&
-        !CLI_STDERR_ERROR_RE.test(ctx.stderr) && ctx.nativeBinding) {
-      const recovered = await (this.deliveryDeps.nativeTrajectory?.recover ?? recoverAntigravityNativeTrajectory)(
-        ctx.nativeBinding, ctx.initConversationId ?? undefined, ctx.resultConversationId ?? undefined,
-      )
-      // Cancellation/end/shutdown may have retired the turn while IO yielded.
-      if (ctx.terminal || ctx.abandoned) return
-      if (!ctx.interrupted && ctx.errorDetail === null) {
-        ctx.nativeRecovery = recovered.ok ? 'recovered' : recovered.reason
-        if (recovered.ok && (!unanchoredResumeResponse || recovered.text === asText(result.response))) {
-          this.appendText(ctx, recovered.text)
-        } else if (unanchoredResumeResponse) {
-          ctx.errorDetail = 'ANTIGRAVITY_UNVERIFIED_RESULT: no current launch answer boundary'
+      if ((ctx.resultConversationId && ctx.initConversationId && ctx.resultConversationId !== ctx.initConversationId) ||
+          (ctx.requestedConversationId && ctx.resultConversationId !== ctx.requestedConversationId)) {
+        ctx.errorDetail ??= 'ANTIGRAVITY_CONVERSATION_MISMATCH: result does not match this launch'
+      }
+      if (status === 'CANCELED' || status === 'INTERRUPTED') ctx.interrupted = true
+      if (ctx.trailingErrorStep && ctx.trailingErrorDetail && ctx.errorDetail === null) {
+        ctx.errorDetail = ctx.trailingErrorDetail
+      }
+      if (status !== 'SUCCESS' && ctx.errorDetail === null) {
+        ctx.errorDetail = asText(result.error) || ctx.preludeErrorDetail || ctx.stderr.trim() ||
+          (ctx.procClosed && ctx.exitCode !== 0
+            ? `antigravity exited with code ${String(ctx.exitCode)}`
+            : `Antigravity turn ended with status ${status || 'unknown'}`)
+      }
+      if (ctx.procClosed && ctx.exitCode !== 0 && !ctx.interrupted) {
+        ctx.errorDetail ??= ctx.stderr.trim() || `antigravity exited with code ${String(ctx.exitCode)}`
+      }
+      if (status === 'SUCCESS' && ctx.errorDetail === null) {
+        // 1.3.4 reports SUCCESS for runs that produced nothing (oversized input)
+        // and for headless soft-denied tools. Both are failures for the user.
+        const denied = Array.isArray(result.denied_actions) ? result.denied_actions : []
+        if (ctx.trailingErrorStep) {
+          const why = asText(result.error) || ctx.stderr.trim().slice(-500) || 'CLI reported success after an error step'
+          ctx.errorDetail = `${ANTIGRAVITY_ERROR_STEP}: ${why}`
+        } else if (denied.length > 0 || SOFT_DENY_RE.test(ctx.stderr)) {
+          const actions = denied.map((d) => asText(recordOf(d)?.action) || asText(d)).filter(Boolean)
+          ctx.errorDetail = `ANTIGRAVITY_TOOL_DENIED: ${actions.length > 0 ? actions.join(',') : ctx.stderr.trim().slice(0, 500)}`
         }
       }
-    }
-    if (ctx.terminal || ctx.abandoned) return
-    if (unanchoredResumeResponse && !ctx.answerText.trim()) {
-      ctx.errorDetail ??= 'ANTIGRAVITY_UNVERIFIED_RESULT: no current launch answer boundary'
-    }
-    if (status === 'SUCCESS' && !ctx.interrupted && ctx.errorDetail === null &&
-        !ctx.sawOutput && !asText(result.response).trim()) {
-      ctx.errorDetail = EMPTY_RUN_RE.test(ctx.stderr)
-        ? `ANTIGRAVITY_EMPTY_RUN: ${ctx.stderr.trim().slice(0, 500)}`
-        : 'ANTIGRAVITY_EMPTY_RUN: CLI reported success with no output'
-    }
-    // A terminal response is an alternate delivery channel, not evidence that
-    // erases a current error. Reconcile only after error/cancellation/denial
-    // adjudication, through the same durable text path used by streaming.
-    if (!ctx.interrupted && ctx.errorDetail === null) {
-      const response = asText(result.response)
-      if (response.trim() && response.startsWith(ctx.answerText)) {
-        const missing = response.slice(ctx.answerText.length)
-        if (missing) this.appendText(ctx, missing)
+      const unanchoredResumeResponse = ctx.resumedLaunch && ctx.firstOwnStepIndex === null &&
+        asText(result.response).trim() !== ''
+      if (status === 'SUCCESS' && ctx.errorDetail === null && !ctx.interrupted &&
+          ctx.procClosed && ctx.exitCode === 0 && !ctx.answerText.trim() &&
+          (!asText(result.response).trim() || unanchoredResumeResponse) &&
+          !CLI_STDERR_ERROR_RE.test(ctx.stderr) && ctx.nativeBinding) {
+        const recovered = await (this.deliveryDeps.nativeTrajectory?.recover ?? recoverAntigravityNativeTrajectory)(
+          ctx.nativeBinding, ctx.initConversationId ?? undefined, ctx.resultConversationId ?? undefined,
+        )
+        // Cancellation/end/shutdown may have retired the turn while IO yielded.
+        if (ctx.terminal || ctx.abandoned) return
+        if (!ctx.interrupted && ctx.errorDetail === null) {
+          ctx.nativeRecovery = recovered.ok ? 'recovered' : recovered.reason
+          if (recovered.ok && (!unanchoredResumeResponse || recovered.text === asText(result.response))) {
+            this.appendText(ctx, recovered.text)
+          } else if (unanchoredResumeResponse) {
+            ctx.errorDetail = 'ANTIGRAVITY_UNVERIFIED_RESULT: no current launch answer boundary'
+          }
+        }
       }
-    }
-    // Commit only a conversation whose turn landed. On failure or cancel the
-    // last committed id stays: SessionManager's resume map still holds it and
-    // decides history replay from it, so the adapter must not diverge.
-    if (!ctx.interrupted && ctx.errorDetail === null && ctx.conversationId !== null) {
-      this.nativeId = ctx.conversationId
-      this.emit('session_id', ctx.conversationId)
-    }
-    try {
+      if (ctx.terminal || ctx.abandoned) return
+      if (unanchoredResumeResponse && !ctx.answerText.trim()) {
+        ctx.errorDetail ??= 'ANTIGRAVITY_UNVERIFIED_RESULT: no current launch answer boundary'
+      }
+      if (status === 'SUCCESS' && !ctx.interrupted && ctx.errorDetail === null &&
+          !ctx.sawOutput && !asText(result.response).trim()) {
+        ctx.errorDetail = EMPTY_RUN_RE.test(ctx.stderr)
+          ? `ANTIGRAVITY_EMPTY_RUN: ${ctx.stderr.trim().slice(0, 500)}`
+          : 'ANTIGRAVITY_EMPTY_RUN: CLI reported success with no output'
+      }
+      // A terminal response is an alternate delivery channel, not evidence that
+      // erases a current error. Reconcile only after error/cancellation/denial
+      // adjudication, through the same durable text path used by streaming.
+      if (!ctx.interrupted && ctx.errorDetail === null) {
+        const response = asText(result.response)
+        if (response.trim() && response.startsWith(ctx.answerText)) {
+          const missing = response.slice(ctx.answerText.length)
+          if (missing) this.appendText(ctx, missing)
+        }
+      }
+      // Commit only a conversation whose turn landed. On failure or cancel the
+      // last committed id stays: SessionManager's resume map still holds it and
+      // decides history replay from it, so the adapter must not diverge.
+      if (!ctx.interrupted && ctx.errorDetail === null && ctx.conversationId !== null) {
+        this.nativeId = ctx.conversationId
+        this.emit('session_id', ctx.conversationId)
+      }
       if (ctx.swarmWatcher?.hasTurnActivity() && ctx.proc && !ctx.procClosed) {
         await reapLingeringCliProcessGroup(ctx.proc, () => ctx.procClosed)
         if (ctx.terminal || ctx.abandoned) return
       }
       this.finish(ctx, typeof result.num_turns === 'number' ? count(result.num_turns) : 1)
     } finally {
+      ctx.settling = false
       resolveSettlingDone()
     }
   }
