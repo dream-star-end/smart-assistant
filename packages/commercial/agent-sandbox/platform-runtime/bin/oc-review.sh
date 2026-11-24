@@ -15,6 +15,6 @@ EOF
   exit 0
 fi
 
-export OC_CALLER_CWD="$PWD"
+set -- --caller-cwd "$PWD" "$@"
 cd /opt/openclaude
 exec npx --no-install tsx packages/gateway/src/ocReviewCli.ts "$@"

@@ -900,15 +900,30 @@ function err(msg: string, exitCode = 1): OcReviewCliResult {
   return { exitCode, stdout: '', stderr: `${TOOL}: ${msg}\n` }
 }
 
+export interface OcReviewCliOptions {
+  callerCwd?: string
+}
+
 /**
- * 解析调用方传入的路径:若为相对路径且环境变量 OC_CALLER_CWD 非空(如经 oc-review.sh 切到 /opt/openclaude),
+ * 解析调用方传入的路径:若为相对路径且显式提供 callerCwd(如经 oc-review.sh 注入 `--caller-cwd "$PWD"`),
  * 按调用方原始工作目录解析,避免相对路径落到只读的 /opt/openclaude。
  */
-export function resolveCallerPath(p: string): string {
+export function resolveCallerPath(p: string, callerCwd?: string): string {
   if (isAbsolute(p)) return p
-  const callerCwd = process.env.OC_CALLER_CWD?.trim()
-  if (callerCwd) return resolve(callerCwd, p)
+  const base = callerCwd?.trim()
+  if (base) return resolve(base, p)
   return resolve(p)
+}
+
+function extractLeadingCallerCwd(
+  argv: string[],
+  fallbackCwd?: string,
+): { argv: string[]; callerCwd?: string } {
+  if (argv[0] === '--caller-cwd' && argv.length >= 2) {
+    const injected = argv[1]!.trim()
+    return { argv: argv.slice(2), callerCwd: injected || fallbackCwd }
+  }
+  return { argv, callerCwd: fallbackCwd }
 }
 
 function parsePositiveInt(raw: string): number | null {
@@ -917,7 +932,7 @@ function parsePositiveInt(raw: string): number | null {
   return Number.isSafeInteger(n) && n >= 1 ? n : null
 }
 
-function runLedger(rest: string[]): OcReviewCliResult {
+function runLedger(rest: string[], callerCwd?: string): OcReviewCliResult {
   const [subcmd, ...args] = rest
   if (!subcmd || (subcmd !== 'init' && subcmd !== 'record' && subcmd !== 'show')) {
     return err('ledger <init|record|show> --file <path>', 2)
@@ -927,7 +942,7 @@ function runLedger(rest: string[]): OcReviewCliResult {
   if (rawFile === undefined || rawFile === 'true' || rawFile.trim() === '') {
     return err(`ledger ${subcmd} --file <path>`, 2)
   }
-  const file = resolveCallerPath(rawFile)
+  const file = resolveCallerPath(rawFile, callerCwd)
 
   if (subcmd === 'init') {
     const force = flags.force !== undefined
@@ -1055,17 +1070,17 @@ function runLedger(rest: string[]): OcReviewCliResult {
   }
 }
 
-function runCollate(rest: string[]): OcReviewCliResult {
+function runCollate(rest: string[], callerCwd?: string): OcReviewCliResult {
   const flags = parseSimpleFlags(rest)
   const rawDir = flags.dir
   if (rawDir === undefined || rawDir === 'true') return err('collate --dir <dir>', 2)
-  const dir = resolveCallerPath(rawDir)
+  const dir = resolveCallerPath(rawDir, callerCwd)
   let ledger: DecisionLedger | undefined
   if (flags.ledger !== undefined) {
     if (flags.ledger === 'true' || flags.ledger.trim() === '') {
       return err('collate --ledger <path>', 2)
     }
-    const ledgerPath = resolveCallerPath(flags.ledger)
+    const ledgerPath = resolveCallerPath(flags.ledger, callerCwd)
     try {
       ledger = parseDecisionLedger(readFileSync(ledgerPath, 'utf8'), ledgerPath)
     } catch (e) {
@@ -1120,7 +1135,9 @@ function runCollate(rest: string[]): OcReviewCliResult {
   const result = collateReviews(files, skipped, collateOpts)
   const md = renderSummaryMd(result)
   const mdPath =
-    flags.out !== undefined && flags.out !== 'true' ? resolveCallerPath(flags.out) : join(dir, 'review-summary.md')
+    flags.out !== undefined && flags.out !== 'true'
+      ? resolveCallerPath(flags.out, callerCwd)
+      : join(dir, 'review-summary.md')
   const jsonPath = mdPath.endsWith('.md') ? `${mdPath.slice(0, -3)}.json` : `${mdPath}.json`
   try {
     writeFileSync(mdPath, md)
@@ -1134,8 +1151,9 @@ function runCollate(rest: string[]): OcReviewCliResult {
 }
 
 /** 库入口:解析 argv 并返回结果,不直接 process.exit(供测试与 probe 直接调用)。 */
-export function runOcReviewCli(argv: string[]): OcReviewCliResult {
-  const [cmd, ...rest] = argv
+export function runOcReviewCli(argv: string[], opts?: OcReviewCliOptions): OcReviewCliResult {
+  const parsed = extractLeadingCallerCwd(argv, opts?.callerCwd)
+  const [cmd, ...rest] = parsed.argv
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
     return { exitCode: 0, stdout: `${USAGE}\n`, stderr: '' }
   }
@@ -1143,9 +1161,9 @@ export function runOcReviewCli(argv: string[]): OcReviewCliResult {
     case 'schema':
       return { exitCode: 0, stdout: `${REVIEW_JSON_SCHEMA}\n`, stderr: '' }
     case 'collate':
-      return runCollate(rest)
+      return runCollate(rest, parsed.callerCwd)
     case 'ledger':
-      return runLedger(rest)
+      return runLedger(rest, parsed.callerCwd)
     default: {
       // 不写 `cmd ?? ''`:覆盖率契约用 AST 扫 `cmd` 的二元表达式,会把 '' 误当子命令。
       const shown = typeof cmd === 'string' ? cmd : ''

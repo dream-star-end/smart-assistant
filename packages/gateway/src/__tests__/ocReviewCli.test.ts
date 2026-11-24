@@ -1031,20 +1031,20 @@ describe('T2 审计阻断修复回归 (#4/#5/#6, OCV5-878)', () => {
     }
   })
 
-  it('#6: OC_CALLER_CWD 生效 — 即使进程 cwd 不同,相对路径 --file/--dir/--ledger/--out 也落盘到调用方目录', () => {
+  it('#6: --caller-cwd / opts.callerCwd 生效 — 即使进程 cwd 不同,相对路径 --file/--dir/--ledger/--out 也落盘到调用方目录', () => {
     const callerDir = mkdtempSync(join(tmpdir(), 'oc-caller-cwd-'))
-    const prevCallerCwd = process.env.OC_CALLER_CWD
     try {
-      process.env.OC_CALLER_CWD = callerDir
-      assert.equal(resolveCallerPath('decision-ledger.json'), join(callerDir, 'decision-ledger.json'))
-      assert.equal(resolveCallerPath('/abs/path.json'), '/abs/path.json')
+      assert.equal(resolveCallerPath('decision-ledger.json', callerDir), join(callerDir, 'decision-ledger.json'))
+      assert.equal(resolveCallerPath('/abs/path.json', callerDir), '/abs/path.json')
 
-      // 1. 相对路径 ledger init + record + show 落盘到 callerDir
-      const initRes = runOcReviewCli(['ledger', 'init', '--file', 'rel-ledger.json'])
+      // 1. 经 oc-review.sh 注入的前置 --caller-cwd:相对路径 ledger init + record + show 落盘到 callerDir
+      const initRes = runOcReviewCli(['--caller-cwd', callerDir, 'ledger', 'init', '--file', 'rel-ledger.json'])
       assert.equal(initRes.exitCode, 0, initRes.stderr)
       assert.equal(JSON.parse(initRes.stdout).file, join(callerDir, 'rel-ledger.json'))
 
       const recRes = runOcReviewCli([
+        '--caller-cwd',
+        callerDir,
         'ledger',
         'record',
         '--file',
@@ -1063,7 +1063,7 @@ describe('T2 审计阻断修复回归 (#4/#5/#6, OCV5-878)', () => {
       assert.equal(recRes.exitCode, 0, recRes.stderr)
       assert.equal(parseDecisionLedger(readFileSync(join(callerDir, 'rel-ledger.json'), 'utf8'), 'rel').entries.length, 1)
 
-      // 2. 相对路径 collate --dir / --ledger / --out 全部按 callerDir 解析
+      // 2. 相对路径 collate --dir / --ledger / --out 全部按 callerDir 解析(同时验证 opts.callerCwd 注入)
       writeFileSync(
         join(callerDir, 'reviews-a.json'),
         JSON.stringify({
@@ -1074,25 +1074,26 @@ describe('T2 审计阻断修复回归 (#4/#5/#6, OCV5-878)', () => {
           ],
         }),
       )
-      const colRes = runOcReviewCli([
-        'collate',
-        '--dir',
-        '.',
-        '--ledger',
-        'rel-ledger.json',
-        '--out',
-        'out-summary.md',
-        '--round',
-        '2',
-      ])
+      const colRes = runOcReviewCli(
+        [
+          'collate',
+          '--dir',
+          '.',
+          '--ledger',
+          'rel-ledger.json',
+          '--out',
+          'out-summary.md',
+          '--round',
+          '2',
+        ],
+        { callerCwd: callerDir },
+      )
       assert.equal(colRes.exitCode, 0, colRes.stderr)
       const colJson = JSON.parse(readFileSync(join(callerDir, 'out-summary.json'), 'utf8'))
       assert.equal(colJson.gate.status, 'PASS_READY')
       assert.equal(colJson.suppressedFlipFlops.length, 1)
       assert.match(readFileSync(join(callerDir, 'out-summary.md'), 'utf8'), /PASS_READY/)
     } finally {
-      if (prevCallerCwd === undefined) delete process.env.OC_CALLER_CWD
-      else process.env.OC_CALLER_CWD = prevCallerCwd
       rmSync(callerDir, { recursive: true, force: true })
     }
   })
