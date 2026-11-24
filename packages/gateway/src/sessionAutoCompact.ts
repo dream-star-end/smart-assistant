@@ -15,6 +15,7 @@
  */
 import { resolveEffectiveModelHistoryContextWindow } from '@openclaude/protocol'
 import { isCcbSlashCommandPrompt } from './ccbNativeCompaction.js'
+import { reconcileAntigravitySwarmDirectiveAfterCompaction } from './engine/antigravitySwarmDirective.js'
 import type { SessionStreamEvent, TurnSummary } from './engine/engineEvents.js'
 import type { HistoricalTurnInput } from './historicalContextPayload.js'
 import { peekPendingCheckpoint } from './sessionCheckpointStore.js'
@@ -550,7 +551,16 @@ export async function tryUniversalOverflowAutoCompact(
     })
     // B5: Always wrap original rawUserInput (blocks/attachments intact), never bloated runnerPayload!
     const rawInput = getTurnRawUserInput(session) ?? fallbackInput
-    return buildRollingCheckpointPayload(summary, rawInput)
+    const swarmCompaction = session._antigravitySwarmCompaction
+    const reconciledRawInput = swarmCompaction
+      ? reconcileAntigravitySwarmDirectiveAfterCompaction(
+          rawInput,
+          swarmCompaction,
+          { resetKind: 'rolling_checkpoint' },
+        )
+      : rawInput
+    if (swarmCompaction) session._antigravitySwarmCompaction = undefined
+    return buildRollingCheckpointPayload(summary, reconciledRawInput)
   } catch (err) {
     log.warn('overflow_auto_compact_failed', { sessionKey: session.sessionKey }, err)
     return null

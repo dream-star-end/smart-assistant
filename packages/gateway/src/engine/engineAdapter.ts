@@ -25,6 +25,7 @@ import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { RemoteExecutionBackend, GoalStateSnapshot, JobTerminal, OutboundContentBlock } from '@openclaude/protocol'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { TurnModelAuthority, UsageAttributionTag } from '../subprocessRunner.js'
+import type { AntigravitySwarmCompactionContext } from './antigravitySwarmDirective.js'
 import type {
   EngineEvent,
   DurableRuntimeEvent,
@@ -151,6 +152,8 @@ export interface TurnParams {
   nextDurableEventOrdinal?: () => number
   /** OpenClaude team-mode hint for Codex native collaboration tool calls. */
   collabAgentPolicy?: CollabAgentPolicy
+  /** Per-turn Antigravity swarm compaction metadata so CLI internal compaction / reset upgrades resumed reminders idempotently (OCV5-882). */
+  antigravitySwarmCompaction?: AntigravitySwarmCompactionContext
   /** Advisor-mode parent turn: mint an immutable per-turn consult token. */
   consultTurn?: {
     configVersion: string

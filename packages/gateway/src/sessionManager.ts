@@ -2175,8 +2175,8 @@ export class SessionManager {
       resetNativeSession?: boolean
       /** ZCode CLI receives only this one-turn opaque loopback Anthropic relay. */
       zcodeRoute?: ZcodeRouteOverride | null
-      /** Antigravity CLI: one-turn relay route + limited Google token (OCV5-415). */
-      antigravityRoute?: AntigravityRouteOverride | null
+      /** Antigravity CLI: one-turn relay route + limited Google token (OCV5-415) & swarm compaction ctx (OCV5-882). */
+      antigravityRoute?: AntigravityRouteOverride | null; antigravitySwarmCompaction?: import('./engine/antigravitySwarmDirective.js').AntigravitySwarmCompactionContext
       /** OCV5-434 GPT Fast, turn-level (frames.ts InboundMessage.serviceTier). 'fast' | null
        *  (explicit standard); omitted = leave the runner's current tier. Runners that do not
        *  implement setServiceTier ignore it. */

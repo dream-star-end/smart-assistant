@@ -2491,6 +2491,9 @@ export async function _runOneTurn(
         nextDurableEventOrdinal: () => takeDurableEventOrdinal(session),
         onPostTerminalRuntimeEvent,
         collabAgentPolicy,
+        ...(session._antigravitySwarmCompaction
+          ? { antigravitySwarmCompaction: session._antigravitySwarmCompaction }
+          : {}),
         ...(session._collabModeTurn === 'advisor' && session._advisorTurn && turnKey
           ? {
               consultTurn: {

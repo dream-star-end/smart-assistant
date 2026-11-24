@@ -43,7 +43,21 @@ export function parseTeamReviewMode(raw: unknown): TeamReviewMode {
 export function modelFamily(modelId: string): string {
   const id = modelId.toLowerCase()
   if (id.startsWith('cursor-')) return 'cursor'
-  if (id.startsWith('gpt-') || id.startsWith('o1') || id.startsWith('o3') || id.startsWith('o4'))
+  if (
+    id.startsWith('antigravity-gemini') ||
+    id.startsWith('antigravity-orchestrator') ||
+    id.startsWith('gemini')
+  )
+    return 'google'
+  if (id.startsWith('antigravity-claude') || id.startsWith('box-claude') || id.startsWith('claude'))
+    return 'anthropic'
+  if (
+    id.startsWith('box-gpt') ||
+    id.startsWith('gpt-') ||
+    id.startsWith('o1') ||
+    id.startsWith('o3') ||
+    id.startsWith('o4')
+  )
     return 'openai'
   if (id.startsWith('glm-')) return 'zhipu'
   if (id.startsWith('grok')) return 'xai'
@@ -51,7 +65,6 @@ export function modelFamily(modelId: string): string {
   if (id.startsWith('kimi') || id.startsWith('k3') || id.startsWith('moonshot')) return 'moonshot'
   if (id.startsWith('minimax')) return 'minimax'
   if (id.startsWith('qwen')) return 'qwen'
-  if (id.startsWith('claude')) return 'anthropic'
   return id
 }
 
@@ -65,9 +78,13 @@ export const DELIBERATION_PANEL_SIZE_DEFAULT = 3
 export const DELIBERATION_PANEL_PREFERENCE = [
   'gpt-6.2-astra',
   'gpt-6-astra',
+  'antigravity-gemini-4-neon',
+  'antigravity-gemini-4-carbon',
+  'box-claude-opus-5-5',
   'grok-build',
   'glm-5.3',
   'deepseek-v4-pro',
+  'deepseek-v4-flash',
   'kimi-k3',
   'qwen3.8-max',
   'MiniMax-M3',
@@ -375,9 +392,9 @@ export function buildTeamPreamble(args: TeamPreambleArgs): string {
     '## 执行类 → 执行策略(领域拆分 + 证据验收)',
     `可委派的成员(已安装 agent):\n${memberLines}`,
     '- 领域匹配优先:代码/调试/测试/重构 → `coding-assistant`;科研/文献/论文 → `research-assistant`;文档/PPT/Excel/PDF/公文 → `office-assistant`。对应成员未安装就自己做或选最接近的。',
-    `- 单个子任务用 ${delegateSingle};多个互相独立的子任务并行派发;有先后依赖的串行。复杂任务先用 \`TodoWrite\` 列拆解计划。`,
+    `- 单个子任务用 ${delegateSingle};多个互相独立的子任务并行派发;有先后依赖的串行。复杂任务先列拆解计划。`,
     '- 按子任务量级选 `effort`(low/medium/high),拿不准就不填。',
-    '- 成员的大产物以「文件路径 + 摘要」回传(落在 `/home/agent/.openclaude/generated/`),综合时用 `Read` 读回来,别凭摘要臆测。',
+    '- 成员的大产物以「文件路径 + 摘要」回传(落在 `/home/agent/.openclaude/generated/`),综合时读取回传路径文件（如 `Read`/`read_file`）,别凭摘要臆测。',
     `- 完成后先写草稿再送审:${reviewCmd('execution')}。审查员会拿到本轮每位成员的任务、状态、回传和产物路径,逐条核对你草稿里的「已完成/已验证」是否有证据。`,
     '',
     '## 通用纪律',

@@ -477,8 +477,8 @@ export async function submit(
     modelSwitchId?: string
     /** Native compact command authored by prepareModelSwitch itself. */
     modelSwitchInternal?: string
-    /** Internal manual `/compact` turn authorized by compactSession (B3). */
-    _internalCompact?: boolean
+    /** Internal manual `/compact` turn authorized by compactSession (B3) + Antigravity swarm compaction ctx (OCV5-882). */
+    _internalCompact?: boolean; antigravitySwarmCompaction?: import('./engine/antigravitySwarmDirective.js').AntigravitySwarmCompactionContext
   },
 ): Promise<void> {
   const submitStartedAt = performance.now()
@@ -650,7 +650,7 @@ export async function submit(
     )) closeIdleWait = beginIdleWait(session, onEvent)
     await prev
     session._turnReadOnly = opts?.readOnly === true
-    session._turnServiceTier = session._turnReadOnly ? null : (isServiceTier(opts?.serviceTier) ? opts.serviceTier : null)
+    session._turnServiceTier = session._turnReadOnly ? null : (isServiceTier(opts?.serviceTier) ? opts.serviceTier : null); session._antigravitySwarmCompaction = opts?.antigravitySwarmCompaction
     if (!sameRemoteExecutionBackend(session.runner.executionBackend, opts?.modelAuthority?.executionDescriptor.executionBackend)) {
       throw new Error('CC5_BACKEND_SCOPE_CHANGED')
     }
@@ -1563,7 +1563,7 @@ export async function submit(
         session._currentDispatch = undefined
         session._turnCreditBudgetFen = undefined
         session._turnReadOnly = undefined
-        session._turnServiceTier = undefined
+        session._turnServiceTier = undefined; session._antigravitySwarmCompaction = undefined
         if (queueTurn) {
           this._promptQueueExecutions.delete(session)
           this._promptQueueExecutionKeys.delete(session.sessionKey)

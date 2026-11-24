@@ -742,13 +742,14 @@ export const SWARM_PLAYBOOK_TEMPLATES: readonly SwarmPlaybookTemplate[] = Object
         role: "verifier",
         workspace: "inherit",
         readOnly: true,
-        responsibility: "独立只读复核代码差异、运行全量单测与类型检查，发现问题点名 @worker 返修。",
+        responsibility:
+          "独立只读复核代码差异、运行触碰范围目标单测与类型检查（仅做功能自测核验，不替代 T2 跨家族独立审计），发现阻断问题点名 @worker 返修（限 1 轮复核收口）。",
       },
     ],
     workflow: [
       "1. @coordinator 先明确接口契约与严格文件所有权清单，广播至 @all。",
       "2. @worker-a 与 @worker-b 在各自独立工作区并行实现并自测，完成后直接 @verifier 交接。",
-      "3. @verifier 独立跑类型检查、单测与边界审查，输出 PASS/FAIL 结论；未通过则退回对应 @worker。",
+      "3. @verifier 独立跑触碰范围目标单测、类型检查与边界复核，输出 PASS/FAIL 结论；发现阻断问题点名对应 @worker 返修（限 1 轮复核收口）。",
       "4. 验收全绿后 @coordinator 汇总交付清单并结束蜂群。",
     ],
     guardrails: [

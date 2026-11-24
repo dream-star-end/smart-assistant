@@ -23,6 +23,7 @@ import {
 import { join } from 'node:path'
 import { paths } from '@openclaude/storage'
 import type { AgentSession } from './sessionTypes.js'
+import { reconcileAntigravitySwarmDirectiveAfterCompaction } from './engine/antigravitySwarmDirective.js'
 
 export interface PersistedCheckpointRecord {
   sessionKey: string
@@ -180,7 +181,18 @@ export function applyPendingCheckpointToSession(
   session._historicalContextInjectedKey = `checkpoint-reset:${checkpoint.generation}`
   session._contextRebuildNotice = undefined
   session._forceHistoricalContextOnFirstTurn = false
-  return wrapPayload(checkpoint.summary, currentUserInput)
+  const swarmCompaction = session._antigravitySwarmCompaction
+  const reconciledInput = swarmCompaction
+    ? reconcileAntigravitySwarmDirectiveAfterCompaction(
+        currentUserInput,
+        swarmCompaction,
+        { resetKind: 'rolling_checkpoint' },
+      )
+    : currentUserInput
+  // Consume compaction context once reconciled for this rolling checkpoint so
+  // AntigravityAdapter will not run a second strip pass on user body quotes (OCV5-882).
+  if (swarmCompaction) session._antigravitySwarmCompaction = undefined
+  return wrapPayload(checkpoint.summary, reconciledInput)
 }
 
 /** Restore session injection flags when a checkpoint-carrying turn fails before engine acceptance. */

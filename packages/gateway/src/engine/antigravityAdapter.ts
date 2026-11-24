@@ -69,6 +69,7 @@ import {
   projectAntigravityPlatform,
   type AntigravityPlatformProjection,
 } from './antigravityPlatform.js'
+import { reconcileAntigravitySwarmDirectiveAfterCompaction } from './antigravitySwarmDirective.js'
 import {
   buildAntigravityPromptInputsKey,
   clearAntigravityPromptState,
@@ -306,6 +307,20 @@ export const ANTIGRAVITY_RESUMED_PREAMBLE = [
   '',
   '---',
 ].join('\n')
+
+export function reconcileAntigravityTurnInputOnElision(
+  input: string,
+  elidedPlatformContext: boolean,
+  elideReason: string,
+  swarmCompaction: import('./antigravitySwarmDirective.js').AntigravitySwarmCompactionContext | undefined,
+): string {
+  if (elidedPlatformContext || !swarmCompaction) return input
+  const isConversationReset =
+    elideReason === 'fresh_conversation' || elideReason === 'conversation_changed'
+  return reconcileAntigravitySwarmDirectiveAfterCompaction(input, swarmCompaction, {
+    resetKind: isConversationReset ? 'rolling_checkpoint' : 'cli_internal_compaction',
+  })
+}
 
 function assemblePrompt(
   platformContent: string,
@@ -631,7 +646,12 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
           }),
         },
       })}\n`
-    const input = promptText(ctx.params.input)
+    const input = reconcileAntigravityTurnInputOnElision(
+      promptText(ctx.params.input),
+      ctx.elidedPlatformContext,
+      elideDecision.reason,
+      ctx.params.antigravitySwarmCompaction,
+    )
     const line = await prepareBoundedPrompt({
       input,
       serialize: stdinLine,

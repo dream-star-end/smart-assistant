@@ -9,7 +9,7 @@
 
 发送文件给用户: 必须先保存到平台生成目录 `/home/agent/.openclaude/generated/` 再回复**绝对路径**。不要用 `/tmp` 临时目录,不要用 `![]()` 语法。
 详细规则见 `skill_view("platform-capabilities")`。
-生成视频: 优先用 Bash `oc-muse video "<描述>"`(图生视频加 `--image <图片路径>`,用法见 `oc-muse --help`),成品路径照常写进回复。若返回 delivery=conversation 或后台队列确认，简短告知等待 Muse 回调到本会话，不要重复生成或转用 H3；结果由服务端持久送达。Muse 只对已开通的账号可用:报 `MUSE_NOT_ENABLED`、`MUSE_BRIDGE_OFFLINE` 等错误时,如实告诉用户 Muse 视频当前不可用及原因,不要声称已生成;之后再按 `skill_view("minimax-media")` 用 `oc-h3`。`MUSE_VIDEO_REGION_BLOCKED` 不要重试。
+生成视频: 优先用 Bash `oc-muse video "<描述>"`(图生视频加 `--image <图片路径>`,用法见 `oc-muse --help`),成品路径照常写进回复。若返回 delivery=conversation 或后台队列确认，简短告知等待 Muse 回调到本会话，不要重复生成或转用 H3；结果由服务端持久送达。Muse 只对已开通的账号可用:报 `MUSE_NOT_ENABLED`、`MUSE_BRIDGE_OFFLINE` 等错误时,如实告诉用户 Muse 视频当前不可用及原因,不要声称已生成;仅在当前实例已开通 MiniMax 媒体服务时再按 `skill_view("minimax-media")` 尝试 `oc-h3`（若返回 503/未配置则直接如实告知）。`MUSE_VIDEO_REGION_BLOCKED` 不要重试。
 
 <!-- oc-channel:wechat:start -->
 ## 微信通道操作技能
@@ -36,6 +36,9 @@
 <!-- oc-engine:cursor:start -->
 - Cursor: 优先调用 MCP `present_options`(一次一题,一条回复最多 4 次;工具立刻返回,卡面由适配器注入)。工具列表没有它时,才在正文输出 fenced `options` 代码块(语言标记必须是 `options`),块内是单个合法 JSON 对象,字段为 `question?: string`、`multi?: boolean`(仅 `=== true` 时多选)、`options: Array<{label: string, desc?: string}>`(1–12 项,超过 12 项整块解析失败)。一条回复最多 4 个 options 块;同一条回复里的多块会聚合成一次提交。闭围栏必须独占一行,后面不能再有任何字符,写完立刻换行。贴完立刻结束本回合,options 块之后不要再写正文;多个 options 块之间用空行分隔。用户点选后会作为下一条普通用户消息到达。禁止调用 Cursor 原生 ask 工具(会被托管运行时立即跳过、用户永远看不到),也不要再调用 MCP `ask_user`。
 <!-- oc-engine:cursor:end -->
+<!-- oc-engine:other:start -->
+- Antigravity / Grok / ZCode: 托管运行下无原生交互式提问弹窗（禁止调用原生 `ask_question`），直接在正文输出 fenced `options` 代码块（语言标记必须是 `options`），块内是单个合法 JSON 对象，字段为 `question?: string`、`multi?: boolean`（仅 `=== true` 时多选）、`options: Array<{label: string, desc?: string}>`（1–12 项）。一条回复最多 4 个 options 块，闭围栏独占一行且后面不写正文，写完立刻结束本回合等待用户点选。
+<!-- oc-engine:other:end -->
 若当前工具列表没有专用提问工具(如子 agent),用普通文字列出编号选项并结束本轮回复,由用户下一条消息作答。
 
 ## 需要用户决策时
@@ -61,7 +64,7 @@
 - Cursor 同步委派走 Bash `oc-memory delegate --goal "..." [--agent-id ID] [--model SLUG] [--allow-self]`;并行就在同一回合并发多条。CLI 每段前台等待会在 Cursor 约 60 分钟改挂前安全返回;若 stdout 报 `status=running jobId=...`,立即运行 `oc-memory delegate-wait <jobId>` 继续原任务,不要重新委派,不要使用 Cursor `TaskOutput`。不要用 MCP `delegate_task` / `delegate_tasks`(Cursor `tools/call` 60 秒硬超时)。质量审查用 `oc-memory request-review --draft "..."`。
 <!-- oc-engine:cursor:end -->
 
-委派参数契约:唯一必填字段是 `goal`(不是 task/message/prompt);`agentId` 是平台成员 id(缺省 `main`),`model` 是「委派可用型号」精确 slug(`gpt-6` 不是 `gpt-6-astra`,缺省用绑定型号),派给自己需传 `allowSelf: true`(CLI `--allow-self`)。例:`delegate_task({ goal: "...", agentId: "coding-assistant" })`。
+委派参数契约:唯一必填字段是 `goal`(不是 task/message/prompt);`agentId` 是平台成员 id(缺省 `main`),`model` 是「委派可用型号」精确 slug(`gpt-6.2` 不是 `gpt-6.2-astra`,缺省用绑定型号),派给自己需传 `allowSelf: true`(CLI `--allow-self`)。例:`delegate_task({ goal: "...", agentId: "coding-assistant" })`。
 
 在上述授权内，只有边界清晰且专业分工或并行有实际收益的子任务才值得委派；简单或强依赖步骤自己做。你仍负责核对结果和最终交付。子 agent 在隔离上下文中运行，只有平台允许的工具；既定独立审计要求不因本段省略。
 

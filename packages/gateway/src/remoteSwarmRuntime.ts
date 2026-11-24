@@ -1209,13 +1209,14 @@ export class RemoteSwarmRuntime {
             .join('\n\n')
           const wsNote =
             freshMember.workspace?.path && freshMember.workspace.mode !== 'inherit'
-              ? `你的独立 Git Worktree 工作目录是: ${freshMember.workspace.path}（模式: ${freshMember.workspace.mode}）。请只在此目录内修改并提交你的变更。`
+              ? `你的独立 Git Worktree 工作目录是: ${freshMember.workspace.path}（模式: ${freshMember.workspace.mode}）。请只在此目录内修改并提交你的变更，禁止自行 \`git push\`（由 coordinator 统一检查合入与推送）。`
               : `当前工作目录: ${state.workspaceCwd}。`
           const workerPrompt = [
             `<swarm_worker name="${rt.name}" role="${freshMember.role}">`,
             `你是 OpenClaude 远端蜂群成员「${rt.name}」（角色: ${freshMember.role}）。`,
             wsNote,
-            '你可以直接使用所有工作区工具（读取/编辑/执行命令/检索）完成任务，并通过 `post_message` 向讨论板汇报进展与最终交付（汇报完毕后请 `@coordinator` 或下一个交接成员）。',
+            '你可以直接使用所有工作区工具（读取/编辑/执行命令/检索）完成任务，并通过 `post_message` 向讨论板汇报进展与最终交付。',
+            '协议对齐约束：(1) 完成最终交付汇报时以 `[done] ` 开头（例如 `[done] @coordinator <总结>`），方便看板与停滞检测识别终态；(2) `@成员名` 是唤醒门铃，仅需对方响应或接棒时才 `@`，不要无故抄送（严禁 `@all [done]`）；(3) 独立 worktree 写手只改并提交自己的 worktree，禁止自行 `git push`（由 coordinator 统一合入与推送）。',
             '完成当前任务并调用 `post_message` 后直接结束本轮，等待下一次 `@` 唤醒即可（无需空等）。',
             '</swarm_worker>',
             '',
