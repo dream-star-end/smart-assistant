@@ -184,7 +184,7 @@ function assertStaticContract(content: string): void {
   assert.match(content, /唯一必填字段是 `goal`/)
   assert.match(content, /`agentId` 是平台成员 id/)
   assert.match(content, /allowSelf: true/)
-  assert.match(content, /`gpt-6` 不是 `gpt-6-astra`/)
+  assert.match(content, /`gpt-6\.2` 不是 `gpt-6\.2-astra`/)
   assert.match(content, /delegate_task\(\{ goal: "\.\.\.", agentId: "coding-assistant" \}\)/)
 }
 
