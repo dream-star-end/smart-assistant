@@ -13,6 +13,7 @@ import {
   type RosterFile,
   type RosterMemberRecord,
   readBoardPostsFromDisk,
+  readBoardPostsSinceSeq,
 } from './remoteSwarmLocks.js'
 import {
   createWorkerGitWorktree,
@@ -142,21 +143,25 @@ export async function executeReadBoardTool(
   const channelFilter = typeof args.channel === 'string' ? args.channel.trim() : ''
   const roster = await host.readRoster()
   const memberChannels = roster.members[caller]?.channels ?? ['main']
-  const allPosts = readBoardPostsFromDisk(host.location.swarmDir)
-  const filtered = allPosts.filter((p) => {
-    if (p.seq <= since) return false
+  const postFilter = (p: BoardPostRecord): boolean => {
     if (channelFilter === '*') return true
     if (channelFilter) return p.channel === channelFilter
     if (caller === 'coordinator') return true
     return p.channel === 'main' || memberChannels.includes(p.channel)
+  }
+  const batch = readBoardPostsSinceSeq(host.location.swarmDir, since, {
+    maxPosts: limit,
+    maxBytes: 2 * 1024 * 1024,
+    filter: postFilter,
   })
-  const countTruncated = filtered.length > limit
-  const countBounded = countTruncated ? filtered.slice(filtered.length - limit) : filtered
-  // Apply UTF-8 byte budget from newest backwards, keeping complete messages without splitting UTF-8.
+  const countBounded = batch.posts
+  const countTruncated = batch.hasMore
+  // B10: Always pack chronologically forward from `since` so `last_read_seq` and `next_since`
+  // NEVER skip over undelivered posts when `maxBytes` or `limit` truncates the page!
   const byteBounded: typeof countBounded = []
   let usedBytes = 0
   let byteBudgetHit = false
-  for (let i = countBounded.length - 1; i >= 0; i -= 1) {
+  for (let i = 0; i < countBounded.length; i += 1) {
     const post = countBounded[i]!
     const postBytes = Buffer.byteLength(JSON.stringify(post), 'utf8')
     if (byteBounded.length > 0 && usedBytes + postBytes > maxBytes) {
@@ -166,7 +171,7 @@ export async function executeReadBoardTool(
     if (byteBounded.length === 0 && postBytes > maxBytes) {
       const textBudget = Math.max(256, maxBytes - 256)
       const clipped = truncateUtf8Safe(post.text, textBudget)
-      byteBounded.unshift({
+      byteBounded.push({
         ...post,
         text: clipped.truncated
           ? `${clipped.text}… [truncated to fit read_board maxBytes=${maxBytes}]`
@@ -176,27 +181,35 @@ export async function executeReadBoardTool(
       byteBudgetHit = true
       break
     }
-    byteBounded.unshift(post)
+    byteBounded.push(post)
     usedBytes += postBytes
   }
   const truncated = countTruncated || byteBudgetHit
-  const headSeq = allPosts.reduce((m, p) => Math.max(m, p.seq), 0)
-  const readCursor = byteBounded.reduce((m, p) => Math.max(m, p.seq), since)
-  if (roster.members[caller]) {
+  const headSeq = batch.headSeq
+  const nextSince =
+    byteBounded.length > 0
+      ? byteBounded[byteBounded.length - 1]!.seq
+      : batch.lastScannedSeq
+  // B10: Only advance the shared consumption cursor (`last_read_seq`) on unfiltered reads
+  // that are contiguous with the member's current watermark (never skip undelivered gaps!).
+  if (!channelFilter && roster.members[caller]) {
     await host.mutateRoster((r) => {
       const m = r.members[caller]
-      if (m) {
-        m.last_read_seq = Math.max(m.last_read_seq ?? 0, readCursor)
+      if (!m) return
+      const curAck = m.last_read_seq ?? 0
+      if (since <= curAck && nextSince > curAck) {
+        m.last_read_seq = nextSince
       }
     })
   }
   return {
     ok: true,
     head_seq: headSeq,
+    next_since: nextSince,
     truncated,
     byte_budget_hit: byteBudgetHit,
     max_bytes: maxBytes,
-    total_matching: filtered.length,
+    total_matching: byteBounded.length,
     posts: byteBounded,
   }
 }

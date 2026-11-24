@@ -33,6 +33,7 @@ import {
   ensurePrivateDir,
   formatBoardTimestamp,
   readBoardPostsFromDisk,
+  readBoardPostsSinceSeq,
   readOrInitRosterStrict,
   readRosterStrict,
   withAsyncSwarmFileLock,
@@ -1121,8 +1122,10 @@ export class RemoteSwarmRuntime {
         if (!member || member.killed) return
         rt.lastKnownConvId = member.conversation_id
 
-        const allPosts = readBoardPostsFromDisk(state.location.swarmDir)
-        const unread = allPosts.filter((p) => p.seq > (member.last_read_seq ?? 0))
+        const batch = readBoardPostsSinceSeq(state.location.swarmDir, member.last_read_seq ?? 0, {
+          maxPosts: 256,
+        })
+        const unread = batch.posts
         if (unread.length === 0 && !rt.pendingWake) return
         rt.pendingWake = false
 
@@ -1141,8 +1144,8 @@ export class RemoteSwarmRuntime {
               (p.channel === 'main' || (member.channels ?? ['main']).includes(p.channel)))
           )
         })
-        // Cursor of posts actually inspected/consumed in this turn (NEVER advance past
-        // newer messages that arrive while `runWorkerTurn` is executing — IMPORTANT 3).
+        // Cursor of posts actually inspected/consumed in this batch (NEVER skip uninspected
+        // gaps on >2 MiB boards — B10, and NEVER advance past newer messages arriving mid-turn — IMPORTANT 3).
         const consumedSeq = unread.reduce((m, p) => Math.max(m, p.seq), member.last_read_seq ?? 0)
         if (relevant.length === 0) {
           if (isCancelled()) return
@@ -1152,6 +1155,7 @@ export class RemoteSwarmRuntime {
               m.last_read_seq = Math.max(m.last_read_seq ?? 0, consumedSeq)
             }
           })
+          if (batch.hasMore) continue
           return
         }
 
@@ -1543,6 +1547,7 @@ export class RemoteSwarmRuntime {
       if (workspace?.path && workspace.mode !== 'inherit') {
         const wtRes = removeWorkerGitWorktree(state.workspaceCwd, workspace.path, {
           forceDirty: opts?.forceDirtyWorktree,
+          ...(workspace.branch ? { branchName: workspace.branch } : {}),
         })
         if (wtRes.preservedDirtyPath) {
           preservedDirtyWorktrees.push(wtRes.preservedDirtyPath)
@@ -1942,7 +1947,9 @@ export class RemoteSwarmRuntime {
       if (roster) {
         for (const rec of Object.values(roster.members)) {
           if (rec.workspace?.path && rec.workspace.mode !== 'inherit') {
-            const wtRes = removeWorkerGitWorktree(state.workspaceCwd, rec.workspace.path)
+            const wtRes = removeWorkerGitWorktree(state.workspaceCwd, rec.workspace.path, {
+              ...(rec.workspace.branch ? { branchName: rec.workspace.branch } : {}),
+            })
             if (wtRes.preservedDirtyPath) {
               preservedDirtyWorktrees.push(wtRes.preservedDirtyPath)
             }

@@ -924,6 +924,8 @@ export const commercialConfigSchema = z
       .optional(),
     OC_SITES_MAX_PER_USER: positiveInt(10_000),
     OC_SITES_MAX_SITE_BYTES: positiveInt(256 * 1024 * 1024),
+    COMMERCIAL_ANTIGRAVITY_RECONCILER_DISABLED: enabledFlag,
+    COMMERCIAL_ANTIGRAVITY_RECONCILER_INTERVAL_MS: positiveInt(86_400_000),
   })
   .superRefine((cfg, ctx) => {
     if (cfg.OC_SITES_ENABLED) {

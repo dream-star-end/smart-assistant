@@ -23,6 +23,7 @@ import {
 import type { PricingCache } from '../billing/pricing.js'
 import type { Logger } from '../logging/logger.js'
 import {
+  type AntigravityRelayDeps,
   type AntigravityRelayHandler,
   makeAntigravityRelayHandler,
 } from './internalAntigravityRelay.js'
@@ -49,6 +50,7 @@ export interface AntigravityRouteRuntimeDeps {
   readBalance: (userId: bigint) => Promise<bigint>
   rootLogger: Logger
   pricing: PricingCache
+  appendCostCredits?: AntigravityRelayDeps['appendCostCredits']
 }
 
 export interface AntigravityRouteRuntime {
@@ -65,6 +67,7 @@ export function createAntigravityRouteRuntime(
     logger: deps.rootLogger.child({ subsys: 'antigravityRelay' }),
     clientSecret: deps.clientSecret,
     pricing: deps.pricing,
+    appendCostCredits: deps.appendCostCredits,
   })
   return {
     relayHandler,

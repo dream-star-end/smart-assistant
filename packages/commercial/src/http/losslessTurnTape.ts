@@ -4,6 +4,7 @@ import { gzipSync } from "node:zlib";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   isClientMessageId,
+  isNonJournalDurableBillingEngine,
   LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
   losslessBillingAnchorId,
   type CallTokenUsageSnapshot,
@@ -264,7 +265,8 @@ function parseEngineBillingValue(value: unknown, path: string): DurableCodexBill
   if (value.status !== "success" && value.status !== "error") {
     throw new Error(`${prefix}.status is invalid`);
   }
-  if (value.engine !== undefined && value.engine !== "cursor") {
+  const rawDisc: unknown = value.engine;
+  if (rawDisc !== undefined && !isNonJournalDurableBillingEngine(rawDisc)) {
     throw new Error(`${prefix}.engine is invalid`);
   }
   if (value.terminalCode !== undefined &&

@@ -482,3 +482,95 @@ test('OCV5-763 due recovery carrier selection excludes deleted, foreign and othe
   assert.equal((await jobs()).length, 1, 'the tombstone filter, not deleting the recovery job, prevents a wake')
   assert.deepEqual(await listDueRecoveryCarrierContainers(getPool(), uid, 'v5'), [])
 })
+
+test('OCV5-887 swarmMode survives both _admissionRestartRequest and deferred oversized payload recovery', async t => {
+  if (fixture.skipIfUnavailable(t)) return
+  const request: Record<string, unknown> = { ...wire(`${'s'.repeat(300_000)}\u0000swarm-tail`), swarmMode: true }
+  const content = request.content as Record<string, unknown>
+  const message = {
+    id: sourceId,
+    role: 'user',
+    text: String(content.displayText ?? content.text),
+    _modelText: String(content.text),
+    ts: Date.now(),
+    _routing: { model: request.model, swarmMode: true },
+    _admissionRestartRequest: snapshotAdmissionRequest(request),
+  } as MessageLike & { id: string }
+  const decodedSnap = JSON.parse(
+    Buffer.from((message._admissionRestartRequest as { wireBase64: string }).wireBase64, 'base64').toString('utf8'),
+  ) as Record<string, unknown>
+  assert.equal(decodedSnap.swarmMode, true)
+
+  const admitted = await backend.admitUserTurn({
+    uid,
+    sessionUserId: `c:${uid}`,
+    sessionId,
+    clientMessageId: sourceId,
+    agentId: 'main',
+    model: 'gpt-6-sol',
+    requestHash: computeDispatchRequestHash(content as DispatchRequestContent),
+    billingRequestId: randomUUID().replaceAll('-', ''),
+    dispatchId: randomUUID(),
+    ownerId: 'old-master',
+    agentContainerId: 511,
+    runtimeKind: 'docker',
+    message,
+  })
+  assert.equal(admitted.kind, 'admitted')
+  if (admitted.kind !== 'admitted') return
+  await casToTerminal(getPool(), {
+    dispatchId: admitted.dispatch.dispatchId,
+    outcome: 'not_accepted',
+    failureCode: 'DISPATCH_NOT_ACCEPTED',
+    clientNotified: false,
+    expectedEpoch: admitted.dispatch.leaseEpoch,
+  })
+  assert.equal(await backend.recoverInterruptedAdmission(admitted.dispatch.dispatchId), true)
+  const [job] = await claimDueRecoveryJobs(getPool(), { userId: uid, ownerId: 'swarm-master', leaseMs: 60_000 })
+  assert.ok(job)
+  assert.equal(job.request.swarmMode, true, 'turn_recovery_jobs must preserve swarmMode: true across restart')
+})
+
+test('OCV5-887 B9: explicit swarmMode:false is preserved (never flipped to true) while legacy undefined swarm tape infers true', async t => {
+  if (fixture.skipIfUnavailable(t)) return
+  // 1. User sends a new single-agent turn with swarmMode: false -> recovery job preserves false!
+  const offReq: Record<string, unknown> = { ...wire('single agent turn'), swarmMode: false }
+  const offContent = offReq.content as Record<string, unknown>
+  const offMsg = {
+    id: sourceId,
+    role: 'user',
+    text: String(offContent.displayText ?? offContent.text),
+    _modelText: String(offContent.text),
+    ts: Date.now(),
+    _routing: { model: offReq.model, swarmMode: false },
+    _admissionRestartRequest: snapshotAdmissionRequest(offReq),
+  } as MessageLike & { id: string }
+  const admOff = await backend.admitUserTurn({
+    uid,
+    sessionUserId: `c:${uid}`,
+    sessionId,
+    clientMessageId: sourceId,
+    agentId: 'main',
+    model: 'gpt-6-sol',
+    requestHash: computeDispatchRequestHash(offContent as DispatchRequestContent),
+    billingRequestId: randomUUID().replaceAll('-', ''),
+    dispatchId: randomUUID(),
+    ownerId: 'old-master',
+    agentContainerId: 511,
+    runtimeKind: 'docker',
+    message: offMsg,
+  })
+  assert.equal(admOff.kind, 'admitted')
+  if (admOff.kind !== 'admitted') return
+  await casToTerminal(getPool(), {
+    dispatchId: admOff.dispatch.dispatchId,
+    outcome: 'not_accepted',
+    failureCode: 'DISPATCH_NOT_ACCEPTED',
+    clientNotified: false,
+    expectedEpoch: admOff.dispatch.leaseEpoch,
+  })
+  assert.equal(await backend.recoverInterruptedAdmission(admOff.dispatch.dispatchId), true)
+  const [offJob] = await claimDueRecoveryJobs(getPool(), { userId: uid, ownerId: 'off-master', leaseMs: 60_000 })
+  assert.ok(offJob)
+  assert.equal(offJob.request.swarmMode, false, 'explicit swarmMode: false must never be lost or inverted')
+})

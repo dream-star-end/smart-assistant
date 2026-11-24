@@ -25,8 +25,14 @@ import { antigravityOwnerProtectedSql } from './antigravityRouteAuthority.js'
  *     recorded only as an observational count (`monitoring_calls`) in
  *     price_snapshot.antigravity_aux and never waives charges or budget.
  */
+import { createHash } from 'node:crypto'
 import type { Pool } from 'pg'
 import { COST_SCALE, type TokenUsage, computeCost, multiplierToScaled } from './calculator.js'
+
+const CANONICAL_TURN_KEY_RE = /^[0-9a-f]{64}$/
+function canonicalTurnKey(raw: string | null | undefined): string | null {
+  return typeof raw === 'string' && CANONICAL_TURN_KEY_RE.test(raw) ? raw : null
+}
 import type { ModelPricing, PricingCache } from './pricing.js'
 import { type SettleResult, settleUsageAndLedger } from './proxyBilling.js'
 import { releaseInflight } from '../account-pool/policy/affinity.js'
@@ -613,6 +619,10 @@ export async function settleAntigravityTurn(args: {
   sessionId: string | null
   engineStatus: AntigravityEngineStatus
   terminalCode?: string | null
+  turnKey?: string | null
+  parentTurnKey?: string | null
+  dispatchId?: string | null
+  attemptNo?: number | null
   /**
    * Delegate turn attribution (OCV5-738). Chat turns omit it and keep the
    * historical mode='chat' shape; a delegate turn must land mode='delegate'
@@ -631,6 +641,9 @@ export async function settleAntigravityTurn(args: {
     pricingLookup: args.pricing,
     terminalCode: args.terminalCode ?? null,
   })
+  const effectiveParentTurnKey = canonicalTurnKey(
+    args.parentTurnKey ?? args.attribution?.parentTurnKey ?? null,
+  )
   const settled = await settleUsageAndLedger(args.pool, {
     userId: args.userId,
     accountId: null,
@@ -641,12 +654,16 @@ export async function settleAntigravityTurn(args: {
     costCredits: plan.costCredits,
     status: plan.settleStatus,
     sessionId: args.sessionId,
+    turnKey: canonicalTurnKey(args.turnKey),
+    parentTurnKey: effectiveParentTurnKey,
+    dispatchId: args.dispatchId ?? null,
+    attemptNo: args.attemptNo ?? null,
     ...(args.attribution
       ? {
           mode: 'delegate' as const,
           parentSessionId: args.attribution.parentSessionId ?? null,
           delegateAgentId: args.attribution.delegateAgentId ?? null,
-          parentTurnKey: args.attribution.parentTurnKey ?? null,
+          parentTurnKey: effectiveParentTurnKey,
         }
       : {}),
   })
@@ -755,6 +772,10 @@ export interface AntigravityTurnRecord {
   modelId: string
   sessionId: string | null
   traceId: string | null
+  turnKey?: string | null
+  parentTurnKey?: string | null
+  dispatchId?: string | null
+  attemptNo?: number | null
 }
 
 export async function recordAntigravityTurn(
@@ -796,6 +817,10 @@ export async function settleAntigravityTurnRecord(args: {
   userId: bigint
   engineStatus: AntigravityEngineStatus | 'unknown'
   terminalCode?: string | null
+  turnKey?: string | null
+  parentTurnKey?: string | null
+  dispatchId?: string | null
+  attemptNo?: number | null
   /** Delegate attribution; omitted for chat turns (OCV5-738). */
   attribution?: AntigravitySettleAttribution | null
   /** Reconcile pass: also take over a 'settling' row abandoned by a crash. */
@@ -825,14 +850,115 @@ export async function settleAntigravityTurnRecord(args: {
   const row = claim.rows[0]
   if (!row) return null
   if (args.staleBefore) releaseInflight(args.requestId)
+
+  let resolvedDispatchId = args.dispatchId ?? null
+  let resolvedAttemptNo = args.attemptNo ?? null
+  let resolvedTurnKey = canonicalTurnKey(args.turnKey)
+  let inferredOutcome: 'completed' | 'interrupted' | 'crashed' | 'open_dispatch' | null = null
+  try {
+    const loc = await args.pool.query<{
+      dispatch_id: string | null
+      attempt_no: number | null
+      dispatch_status: string | null
+      dispatch_outcome: string | null
+      tape_turn_key: string | null
+      tape_status: string | null
+    }>(
+      `SELECT d.dispatch_id::text AS dispatch_id,
+              d.attempt_no,
+              d.status AS dispatch_status,
+              d.outcome AS dispatch_outcome,
+              t.turn_key AS tape_turn_key,
+              t.status AS tape_status
+         FROM turn_dispatches d
+         LEFT JOIN LATERAL (
+           SELECT ct.turn_key, ct.status
+             FROM client_session_turn_tapes ct
+            WHERE ct.dispatch_id = d.dispatch_id AND ct.finalized_at IS NOT NULL
+            ORDER BY ct.finalized_at ASC LIMIT 1
+         ) t ON TRUE
+        WHERE d.billing_request_id = $1 AND d.user_id = $2
+        LIMIT 1`,
+      [args.requestId, args.userId.toString()],
+    )
+    const lr = loc.rows[0]
+    if (lr) {
+      resolvedDispatchId ??= lr.dispatch_id
+      resolvedAttemptNo ??= lr.attempt_no
+      if (!resolvedTurnKey && lr.tape_turn_key && /^[0-9a-f]{64}$/.test(lr.tape_turn_key)) {
+        resolvedTurnKey = lr.tape_turn_key
+      }
+      if (lr.tape_status === 'interrupted' || lr.dispatch_outcome === 'interrupted') {
+        inferredOutcome = 'interrupted'
+      } else if (
+        lr.tape_status === 'crashed' ||
+        lr.dispatch_outcome === 'crashed' ||
+        lr.dispatch_outcome === 'executed_error' ||
+        lr.dispatch_outcome === 'not_accepted' ||
+        lr.dispatch_outcome === 'rejected'
+      ) {
+        inferredOutcome = 'crashed'
+      } else if (lr.tape_status === 'completed' || lr.dispatch_outcome === 'completed') {
+        inferredOutcome = 'completed'
+      } else if (lr.dispatch_status !== 'terminal') {
+        inferredOutcome = 'open_dispatch'
+      }
+    }
+  } catch (err) {
+    // B2: Only ignore missing tables ('42P01') in minimal unit-test stubs; ANY other error
+    // (including connection drops without a SQLSTATE `.code`) MUST reset pending and rethrow!
+    const pgCode = (err as { code?: string } | null)?.code
+    if (pgCode !== '42P01') {
+      await args.pool
+        .query("UPDATE antigravity_turns SET status = 'pending', updated_at = NOW() WHERE request_id = $1 AND user_id = $2", [
+          args.requestId,
+          args.userId.toString(),
+        ])
+        .catch(() => {})
+      throw err
+    }
+  }
+
   const engineStatus = row.engine_status as AntigravityEngineStatus | 'unknown'
+  if (engineStatus === 'unknown' && inferredOutcome === 'open_dispatch') {
+    await args.pool
+      .query("UPDATE antigravity_turns SET status = 'pending', updated_at = NOW() WHERE request_id = $1 AND user_id = $2", [
+        args.requestId,
+        args.userId.toString(),
+      ])
+      .catch(() => {})
+    return null
+  }
   const reconciled = args.engineStatus === 'unknown'
+  const effectiveEngineStatus: AntigravityEngineStatus =
+    engineStatus === 'unknown'
+      ? inferredOutcome === 'interrupted' || inferredOutcome === 'crashed'
+        ? 'error'
+        : 'success'
+      : engineStatus
+  const effectiveTerminalCode: string | null =
+    engineStatus === 'unknown'
+      ? inferredOutcome === 'interrupted'
+        ? 'USER_CANCELLED'
+        : inferredOutcome === 'crashed'
+          ? 'ENGINE_ERROR'
+          : 'RECONCILED'
+      : reconciled
+        ? null
+        : (args.terminalCode ?? null)
+  const effectiveParentTurnKey = canonicalTurnKey(
+    args.parentTurnKey ?? args.attribution?.parentTurnKey ?? null,
+  )
   const turn: AntigravityTurnRecord = {
     requestId: args.requestId,
     userId: args.userId,
     modelId: row.model_id,
     sessionId: row.session_id,
     traceId: row.trace_id,
+    ...(resolvedTurnKey ? { turnKey: resolvedTurnKey } : {}),
+    ...(effectiveParentTurnKey ? { parentTurnKey: effectiveParentTurnKey } : {}),
+    ...(resolvedDispatchId ? { dispatchId: resolvedDispatchId } : {}),
+    ...(resolvedAttemptNo !== null ? { attemptNo: resolvedAttemptNo } : {}),
   }
   let settled: SettleResult | null = null
   try {
@@ -843,21 +969,290 @@ export async function settleAntigravityTurnRecord(args: {
       requestId: args.requestId,
       modelId: row.model_id,
       sessionId: row.session_id,
-      // Unreported turns consumed real upstream tokens; bill them (clamped to balance).
-      engineStatus: engineStatus === 'unknown' ? 'success' : engineStatus,
-      terminalCode:
-        engineStatus === 'unknown' ? 'RECONCILED' : reconciled ? null : (args.terminalCode ?? null),
+      engineStatus: effectiveEngineStatus,
+      terminalCode: effectiveTerminalCode,
+      turnKey: resolvedTurnKey,
+      parentTurnKey: effectiveParentTurnKey,
+      dispatchId: resolvedDispatchId,
+      attemptNo: resolvedAttemptNo,
       attribution: args.attribution ?? null,
     })
   } finally {
     await args.pool
       .query(
-        'UPDATE antigravity_turns SET status = $3, updated_at = NOW() WHERE request_id = $1 AND user_id = $2',
-        [args.requestId, args.userId.toString(), settled === null ? 'pending' : 'settled'],
+        'UPDATE antigravity_turns SET status = $3, engine_status = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE engine_status END, updated_at = NOW() WHERE request_id = $1 AND user_id = $2',
+        [
+          args.requestId,
+          args.userId.toString(),
+          settled === null ? 'pending' : 'settled',
+          settled !== null && engineStatus === 'unknown' && effectiveEngineStatus === 'error'
+            ? 'error'
+            : null,
+        ],
       )
       .catch(() => {})
   }
   return settled === null ? null : { settled, turn }
+}
+
+function parseFrozenModelPricingObj(
+  modelId: string,
+  raw: Record<string, unknown> | null | undefined,
+): ModelPricing | null {
+  if (!raw || typeof raw !== 'object') return null
+  try {
+    const inRate = BigInt(String(raw.input_per_mtok ?? ''))
+    const outRate = BigInt(String(raw.output_per_mtok ?? ''))
+    const cacheReadRate = BigInt(String(raw.cache_read_per_mtok ?? '0'))
+    const cacheWriteRate = BigInt(String(raw.cache_write_per_mtok ?? '0'))
+    const mult = typeof raw.multiplier === 'string' && raw.multiplier.trim() ? raw.multiplier : '1.000'
+    if (inRate < 0n || outRate < 0n || cacheReadRate < 0n || cacheWriteRate < 0n) return null
+    return {
+      model_id: typeof raw.model_id === 'string' && raw.model_id ? raw.model_id : modelId,
+      display_name: modelId,
+      input_per_mtok: inRate,
+      output_per_mtok: outRate,
+      cache_read_per_mtok: cacheReadRate,
+      cache_write_per_mtok: cacheWriteRate,
+      multiplier: mult,
+      enabled: true,
+    } as ModelPricing
+  } catch {
+    return null
+  }
+}
+
+/**
+ * B4: Reconstruct frozen pricing (including composed delegate agent multiplier and
+ * catalog rates at parent settlement time) from `parent.snapshot`, falling back to
+ * `liveFallback` only for a brand-new extra/aux model never seen on the parent turn.
+ */
+function buildFrozenAntigravityPricingLookup(
+  parentModelId: string,
+  parentSnapshot: Record<string, unknown>,
+  childSnapshots: readonly Record<string, unknown>[],
+  liveFallback: Pick<PricingCache, 'get'>,
+): { primary: ModelPricing | null; lookup: Pick<PricingCache, 'get'> } {
+  const frozenMap = new Map<string, ModelPricing>()
+  const primary = parseFrozenModelPricingObj(parentModelId, parentSnapshot) ?? liveFallback.get(parentModelId)
+  if (primary) frozenMap.set(parentModelId, primary)
+
+  const foldSnapshotModels = (snap: Record<string, unknown>): void => {
+    const modelsObj = snap.antigravity_models
+    if (modelsObj && typeof modelsObj === 'object' && !Array.isArray(modelsObj)) {
+      for (const [mId, entry] of Object.entries(modelsObj as Record<string, unknown>)) {
+        if (!frozenMap.has(mId) && entry && typeof entry === 'object' && !Array.isArray(entry)) {
+          const p = parseFrozenModelPricingObj(
+            mId,
+            (entry as Record<string, unknown>).pricing as Record<string, unknown> | undefined,
+          )
+          if (p) frozenMap.set(mId, p)
+        }
+      }
+    }
+    const auxObj = snap.antigravity_aux
+    if (auxObj && typeof auxObj === 'object' && !Array.isArray(auxObj)) {
+      const auxPricingRaw = (auxObj as Record<string, unknown>).pricing as Record<string, unknown> | undefined
+      const auxModelId = typeof auxPricingRaw?.model_id === 'string' ? auxPricingRaw.model_id : ''
+      if (auxModelId && !frozenMap.has(auxModelId)) {
+        const p = parseFrozenModelPricingObj(auxModelId, auxPricingRaw)
+        if (p) frozenMap.set(auxModelId, p)
+      }
+    }
+  }
+
+  foldSnapshotModels(parentSnapshot)
+  for (const childSnap of childSnapshots) {
+    foldSnapshotModels(childSnap)
+  }
+
+  return {
+    primary,
+    lookup: {
+      get: (modelId: string) => frozenMap.get(modelId) ?? liveFallback.get(modelId),
+    },
+  }
+}
+
+/**
+ * Settle an incremental delta row when an orphaned in-flight worker stream finishes
+ * recording in `antigravity_relay_usage` AFTER the parent turn already settled as
+ * `status = 'success'` (OCV5-887).
+ *
+ * Preserves OCV5-451 (`refreshWaivedAntigravityUsage` never mutates the parent
+ * charged row) and `turn_tape_cost_components` immutability per `request_id` by
+ * writing an exact delta `usage_records` row keyed by CAS `sha256("${requestId}:late-from:${accountedCalls}")`.
+ */
+export async function settleLateAntigravityRelayUsage(args: {
+  pool: Pool
+  pricing: Pick<PricingCache, 'get'>
+  requestId: string
+  userId: bigint
+  appendCostCredits?: (
+    requestId: string,
+    rawUserId: string,
+    costCredits: string,
+    sessionId?: string | null,
+    parentSessionId?: string | null,
+    delegateAgentId?: string | null,
+    turnKey?: string | null,
+    parentTurnKey?: string | null,
+  ) => Promise<unknown>
+}): Promise<boolean> {
+  const uidStr = args.userId.toString()
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const parentRes = await args.pool.query<{
+      model: string
+      session_id: string | null
+      parent_session_id: string | null
+      delegate_agent_id: string | null
+      mode: string
+      turn_key: string | null
+      parent_turn_key: string | null
+      dispatch_id: string | null
+      attempt_no: number | null
+      cost_credits: string
+      input_tokens: string
+      output_tokens: string
+      cache_read_tokens: string
+      snapshot: Record<string, unknown>
+      created_at: Date
+    }>(
+      `SELECT model, session_id, parent_session_id, delegate_agent_id, mode,
+              turn_key, parent_turn_key, dispatch_id::text AS dispatch_id, attempt_no,
+              cost_credits::text, input_tokens::text, output_tokens::text, cache_read_tokens::text,
+              price_snapshot AS snapshot, created_at
+         FROM usage_records
+        WHERE user_id = $1 AND request_id = $2
+          AND status = 'success'
+          AND price_snapshot ? 'antigravity_status'
+          AND price_snapshot->>'antigravity_status' = 'success'
+        LIMIT 1`,
+      [uidStr, args.requestId],
+    )
+    const parent = parentRes.rows[0]
+    if (!parent) return false
+
+    const lateRes = await args.pool.query<{
+      cost_credits: string
+      input_tokens: string
+      output_tokens: string
+      cache_read_tokens: string
+      snapshot: Record<string, unknown>
+    }>(
+      `SELECT cost_credits::text, input_tokens::text, output_tokens::text, cache_read_tokens::text,
+              price_snapshot AS snapshot
+         FROM usage_records
+        WHERE user_id = $1
+          AND created_at >= $2
+          AND price_snapshot->>'antigravity_late_of' = $3
+        ORDER BY created_at ASC`,
+      [uidStr, parent.created_at, args.requestId],
+    )
+
+    const { primary: primaryPricing, lookup: frozenPricingLookup } =
+      buildFrozenAntigravityPricingLookup(
+        parent.model,
+        parent.snapshot,
+        lateRes.rows.map((r) => r.snapshot),
+        args.pricing,
+      )
+    if (!primaryPricing) return false
+
+    let accountedCalls = Number(parent.snapshot.antigravity_calls ?? 0)
+    let accountedCredits = BigInt(parent.cost_credits)
+    let accountedIn = BigInt(parent.input_tokens)
+    let accountedOut = BigInt(parent.output_tokens)
+    let accountedCache = BigInt(parent.cache_read_tokens)
+    for (const child of lateRes.rows) {
+      accountedCalls += Number(child.snapshot.antigravity_late_calls ?? 0)
+      accountedCredits += BigInt(child.cost_credits)
+      accountedIn += BigInt(child.input_tokens)
+      accountedOut += BigInt(child.output_tokens)
+      accountedCache += BigInt(child.cache_read_tokens)
+    }
+
+    const totals = await sumAntigravityRelayUsage(args.pool, args.requestId, args.userId)
+    if (totals.calls <= accountedCalls || totals.retired) return false
+    if (!hasAllAntigravityExtraPricing(totals, frozenPricingLookup)) return false
+
+    const fullPlan = planAntigravitySettle({
+      engineStatus: 'success',
+      totals,
+      pricing: primaryPricing,
+      pricingLookup: frozenPricingLookup,
+    })
+    const deltaCalls = totals.calls - accountedCalls
+    const deltaCredits =
+      fullPlan.costCredits > accountedCredits ? fullPlan.costCredits - accountedCredits : 0n
+    const fullIn = BigInt(fullPlan.usage.input_tokens)
+    const fullOut = BigInt(fullPlan.usage.output_tokens)
+    const fullCache = BigInt(fullPlan.usage.cache_read_tokens)
+    const deltaUsage: TokenUsage = {
+      input_tokens: fullIn > accountedIn ? fullIn - accountedIn : 0n,
+      output_tokens: fullOut > accountedOut ? fullOut - accountedOut : 0n,
+      cache_read_tokens: fullCache > accountedCache ? fullCache - accountedCache : 0n,
+      cache_write_tokens: 0n,
+    }
+    const lateRequestId = createHash('sha256')
+      .update(`${args.requestId}:late-from:${accountedCalls}`, 'utf8')
+      .digest('hex')
+      .slice(0, 32)
+    const lateSnapshotJson = JSON.stringify({
+      ...(JSON.parse(fullPlan.snapshotJson) as Record<string, unknown>),
+      antigravity_late_of: args.requestId,
+      antigravity_late_from_calls: accountedCalls,
+      antigravity_late_calls: deltaCalls,
+    })
+
+    const settled = await settleUsageAndLedger(args.pool, {
+      userId: args.userId,
+      accountId: null,
+      requestId: lateRequestId,
+      model: parent.model,
+      usage: deltaUsage,
+      snapshotJson: lateSnapshotJson,
+      costCredits: deltaCredits,
+      status: 'success',
+      sessionId: parent.session_id,
+      ...(parent.mode === 'delegate'
+        ? {
+            mode: 'delegate' as const,
+            parentSessionId: parent.parent_session_id,
+            delegateAgentId: parent.delegate_agent_id,
+          }
+        : {}),
+      turnKey: canonicalTurnKey(parent.turn_key),
+      parentTurnKey: canonicalTurnKey(parent.parent_turn_key),
+      dispatchId: parent.dispatch_id,
+      attemptNo: parent.attempt_no,
+    })
+    if (settled.commitDisposition === 'existing') {
+      continue
+    }
+    const persistCredits =
+      settled.attributionCredits !== null && settled.attributionCredits !== undefined
+        ? settled.attributionCredits
+        : settled.debitedCredits !== null && settled.debitedCredits > 0n
+          ? settled.debitedCredits
+          : null
+    if (persistCredits !== null && args.appendCostCredits) {
+      await args
+        .appendCostCredits(
+          lateRequestId,
+          uidStr,
+          persistCredits.toString(),
+          parent.session_id,
+          parent.parent_session_id,
+          parent.delegate_agent_id,
+          parent.turn_key,
+          parent.parent_turn_key,
+        )
+        .catch(() => {})
+    }
+    return true
+  }
+  return false
 }
 
 /** Settle this user's turns that never got a terminal frame. Best-effort, bounded. */

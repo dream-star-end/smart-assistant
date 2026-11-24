@@ -101,6 +101,34 @@ export function listRegisteredGitWorktrees(repoTop: string): Set<string> {
   return registered
 }
 
+function listRegisteredGitWorktreeBranches(repoTop: string): Map<string, string> {
+  const byPath = new Map<string, string>()
+  try {
+    const out = execFileSync('git', ['-C', repoTop, 'worktree', 'list', '--porcelain'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5_000,
+    })
+    for (const block of out.split(/\n\n+/)) {
+      const lines = block.split('\n')
+      const wtLine = lines.find((l) => l.startsWith('worktree '))
+      const brLine = lines.find((l) => l.startsWith('branch refs/heads/'))
+      if (!wtLine || !brLine) continue
+      const rawPath = wtLine.slice('worktree '.length).trim()
+      const branch = brLine.slice('branch refs/heads/'.length).trim()
+      if (!rawPath || !branch) continue
+      try {
+        byPath.set(realpathSync(rawPath), branch)
+      } catch {
+        byPath.set(resolve(rawPath), branch)
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return byPath
+}
+
 /**
  * Prove that `wtPath` is a real, registered linked git worktree of `repoTop` (B1):
  *   1. Not a symlink, is a directory, contains `.git`.
@@ -196,6 +224,43 @@ export function createWorkerGitWorktree(
   }
 }
 
+const SAFE_SWARM_BRANCH_RE = /^swarm\/[A-Za-z0-9._/-]{1,120}$/
+
+/**
+ * B6: Delete a `swarm/*` branch ONLY when:
+ *   1. It carries the trusted `swarm/` namespace (never user branches).
+ *   2. Its current commit OID is an ancestor of `repoTop` `HEAD` (`merge-base --is-ancestor`).
+ *   3. `git branch -d` (non-force) succeeds.
+ * Missing worktree directories NEVER bypass the merge-base proof.
+ */
+export function deleteMergedSwarmBranchIfSafe(
+  repoTop: string,
+  branchName: string | undefined,
+): boolean {
+  if (!branchName || !SAFE_SWARM_BRANCH_RE.test(branchName)) return false
+  if (branchName.includes('..') || branchName.includes('//') || branchName.endsWith('.lock')) {
+    return false
+  }
+  const fullRef = `refs/heads/${branchName}`
+  try {
+    execFileSync('git', ['-C', repoTop, 'rev-parse', '--verify', `${fullRef}^{commit}`], {
+      stdio: 'ignore',
+      timeout: 3_000,
+    })
+    execFileSync('git', ['-C', repoTop, 'merge-base', '--is-ancestor', fullRef, 'HEAD'], {
+      stdio: 'ignore',
+      timeout: 3_000,
+    })
+    execFileSync('git', ['-C', repoTop, 'branch', '-d', branchName], {
+      stdio: 'ignore',
+      timeout: 5_000,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
 export function removeWorkerGitWorktree(
   baseCwd: string,
   wtPath: string | undefined,
@@ -213,16 +278,7 @@ export function removeWorkerGitWorktree(
     return { removed: false }
   }
   if (!existsSync(resolvedWt)) {
-    if (opts?.branchName) {
-      try {
-        execFileSync('git', ['-C', repoTop!, 'branch', '-D', opts.branchName], {
-          stdio: 'ignore',
-          timeout: 5_000,
-        })
-      } catch {
-        /* best-effort branch cleanup */
-      }
-    }
+    deleteMergedSwarmBranchIfSafe(repoTop!, opts?.branchName)
     return { removed: true }
   }
   // B1: Never remove symlinks or unregistered plain directories (no fs.rmSync fallback!).
@@ -241,16 +297,7 @@ export function removeWorkerGitWorktree(
     // B1: Fail closed when git refuses worktree removal — never fallback to recursive fs.rmSync.
     return { removed: false, preservedDirtyPath: resolvedWt }
   }
-  if (opts?.branchName) {
-    try {
-      execFileSync('git', ['-C', repoTop!, 'branch', '-D', opts.branchName], {
-        stdio: 'ignore',
-        timeout: 5_000,
-      })
-    } catch {
-      /* best-effort branch cleanup */
-    }
-  }
+  deleteMergedSwarmBranchIfSafe(repoTop!, opts?.branchName)
   return { removed: true }
 }
 
@@ -437,9 +484,12 @@ export async function reconcileRemoteSwarmOnBoot(
           if ((archived || member.killed) && repoTop) {
             const resolvedWt = resolve(wtPath)
             seenWorktrees.add(resolvedWt)
-            if (!existsSync(resolvedWt)) continue
-            const wtRes = removeWorkerGitWorktree(repoTop, resolvedWt, { forceDirty: false })
-            if (wtRes.removed) {
+            if (!existsSync(resolvedWt) && !member.workspace?.branch) continue
+            const wtRes = removeWorkerGitWorktree(repoTop, resolvedWt, {
+              forceDirty: false,
+              ...(member.workspace?.branch ? { branchName: member.workspace.branch } : {}),
+            })
+            if (wtRes.removed && existsSync(resolvedWt) === false) {
               result.cleanedWorktrees.push(resolvedWt)
             } else if (wtRes.preservedDirtyPath) {
               result.preservedDirtyWorktrees.push(wtRes.preservedDirtyPath)
@@ -458,6 +508,7 @@ export async function reconcileRemoteSwarmOnBoot(
     const baseStat = lstatSafe(wtBase)
     if (!baseStat || baseStat.isSymbolicLink() || !baseStat.isDirectory()) continue
     const registeredWorktrees = listRegisteredGitWorktrees(repoTop)
+    const registeredBranches = listRegisteredGitWorktreeBranches(repoTop)
     let entries: string[] = []
     try {
       entries = readdirSync(wtBase)
@@ -473,9 +524,17 @@ export async function reconcileRemoteSwarmOnBoot(
       const wtPath = resolve(wtBase, entry)
       if (seenWorktrees.has(wtPath)) continue
       seenWorktrees.add(wtPath)
+      let realCandidate = wtPath
+      try {
+        realCandidate = realpathSync(wtPath)
+      } catch {
+        /* keep resolved */
+      }
+      const detectedBranch = registeredBranches.get(realCandidate) ?? registeredBranches.get(wtPath)
       const wtRes = removeWorkerGitWorktree(repoTop, wtPath, {
         forceDirty: false,
         registeredWorktrees,
+        ...(detectedBranch && /^swarm\//i.test(detectedBranch) ? { branchName: detectedBranch } : {}),
       })
       if (wtRes.removed) {
         result.cleanedWorktrees.push(wtPath)

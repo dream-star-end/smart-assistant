@@ -33,6 +33,7 @@ import {
   type SwarmMemberRole,
   extractSwarmMentions,
 } from "@openclaude/protocol";
+import { formatBoardTimestamp } from "./remoteSwarmLocks.js";
 
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_MEMBER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -553,7 +554,7 @@ export async function injectSwarmDirective(
   }
 
   const now = opts.now ?? Date.now();
-  const time = new Date(now).toISOString();
+  const time = formatBoardTimestamp(new Date(now));
   const controlKind = (opts.controlKind ?? "steer").trim() || "steer";
   const appended = await appendBoardPostLocked(
     dirRes.dir,

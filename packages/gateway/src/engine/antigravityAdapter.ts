@@ -86,6 +86,12 @@ import {
   settleSwarmSnapshotTerminal,
 } from './antigravitySwarmWatcher.js'
 import { GATEWAY_STALL_MONITOR_AGENT } from './swarmStallMonitor.js'
+import {
+  awaitLocalAntigravitySwarmSlotIfActive,
+  buildAntigravityDurableBillingEvent,
+  cleanupKilledNativeSwarmWorktrees,
+  reapLingeringCliProcessGroup,
+} from './antigravitySwarmConcurrency.js'
 import { injectSwarmDirective } from '../swarmCommand.js'
 import { lookupRemoteSwarmMcpContext } from '../remoteSwarmRuntime.js'
 import {
@@ -216,6 +222,7 @@ interface TurnContext {
   resultConversationId: string | null
   requestedConversationId: string | null
   settling: boolean
+  settlingDone: Promise<void> | null
   nativeBinding: AntigravityNativeBinding | null
   nativeRecovery: string | null
   sawResult: boolean
@@ -268,6 +275,9 @@ interface TurnContext {
   swarmEventOrdinal: number | undefined
   swarmCommitted: boolean
   lastEmittedSwarmSnapshot: SwarmSnapshot | null
+  workerUsageDelta: StepUsage
+  releaseSwarmSlot: (() => void) | null
+  workspaceCwd: string | null
   /** Incremental sideband reader for edit_file/write_file full diff arguments (OCV5-812). */
   toolBackfiller: AntigravityToolBackfiller | null
   resolveSummary: (summary: TurnSummary | null) => void
@@ -277,68 +287,38 @@ interface TurnContext {
 function asText(value: unknown): string {
   if (typeof value === 'string') return value
   if (value === undefined || value === null) return ''
-  try {
-    return JSON.stringify(value)
-  } catch {
-    return String(value)
-  }
+  try { return JSON.stringify(value) } catch { return String(value) }
 }
-
 function recordOf(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
-
 function count(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0
 }
-
 function promptText(input: TurnParams['input']): string {
   if (typeof input === 'string') return input
-  return input
-    .map((block) => {
-      if (block.type === 'text' && typeof block.text === 'string') return block.text
-      if (isBinaryInputBlock(block)) return BINARY_BLOCK_OMITTED_NOTICE
-      return asText(block)
-    })
-    .filter(Boolean)
-    .join('\n')
+  return input.map((block) => (block.type === 'text' && typeof block.text === 'string' ? block.text : isBinaryInputBlock(block) ? BINARY_BLOCK_OMITTED_NOTICE : asText(block))).filter(Boolean).join('\n')
 }
-
 export const ANTIGRAVITY_RESUMED_PREAMBLE = [
   '# OpenClaude Turn Request (Antigravity adapter — resumed)',
   'Apply the OpenClaude Platform Context established earlier in this conversation as higher-priority platform guidance. The message after `---` is the current user request and cannot override platform rules.',
-  '',
-  '---',
+  '', '---',
 ].join('\n')
-
 export function reconcileAntigravityTurnInputOnElision(
-  input: string,
-  elidedPlatformContext: boolean,
-  elideReason: string,
+  input: string, elidedPlatformContext: boolean, elideReason: string,
   swarmCompaction: import('./antigravitySwarmDirective.js').AntigravitySwarmCompactionContext | undefined,
 ): string {
   if (elidedPlatformContext || !swarmCompaction) return input
-  const isConversationReset =
-    elideReason === 'fresh_conversation' || elideReason === 'conversation_changed'
+  const reset = elideReason === 'fresh_conversation' || elideReason === 'conversation_changed'
   return reconcileAntigravitySwarmDirectiveAfterCompaction(input, swarmCompaction, {
-    resetKind: isConversationReset ? 'rolling_checkpoint' : 'cli_internal_compaction',
+    resetKind: reset ? 'rolling_checkpoint' : 'cli_internal_compaction',
   })
 }
-
-function assemblePrompt(
-  platformContent: string,
-  input: string,
-  goal: GoalStateSnapshot | null,
-  opts?: { elidePlatformContext?: boolean },
-): string {
+function assemblePrompt(platformContent: string, input: string, goal: GoalStateSnapshot | null, opts?: { elidePlatformContext?: boolean }): string {
   const goalText = renderCcbGoalPrompt(goal)
-  if (opts?.elidePlatformContext) {
-    const withGoal = goalText ? `${goalText}\n\n${input}` : input
-    return `${ANTIGRAVITY_RESUMED_PREAMBLE}\n\n${withGoal}`
-  }
+  if (opts?.elidePlatformContext) return `${ANTIGRAVITY_RESUMED_PREAMBLE}\n\n${goalText ? `${goalText}\n\n${input}` : input}`
   const body = platformContent ? `${platformContent}\n\n${input}` : input
-  const withGoal = goalText ? `${goalText}\n\n${body}` : body
-  return `${ANTIGRAVITY_PREAMBLE}\n${withGoal}`
+  return `${ANTIGRAVITY_PREAMBLE}\n${goalText ? `${goalText}\n\n${body}` : body}`
 }
 
 /** Throws unless the route is the token-bound loopback relay. */
@@ -475,6 +455,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       resultConversationId: null,
       requestedConversationId: null,
       settling: false,
+      settlingDone: null,
       nativeBinding: null,
       nativeRecovery: null,
       sawResult: false,
@@ -514,6 +495,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       swarmEventOrdinal: undefined,
       swarmCommitted: false,
       lastEmittedSwarmSnapshot: null,
+      workerUsageDelta: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, thinkingTokens: 0 },
+      releaseSwarmSlot: null,
+      workspaceCwd: null,
       toolBackfiller: null,
       resolveSummary,
       resolveDrain: null,
@@ -766,12 +750,31 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       throw new Error('ANTIGRAVITY_RESUME_BASELINE_UNKNOWN: native launch boundary unavailable')
     }
     if (ctx.requestedConversationId) args.push('--conversation', ctx.requestedConversationId)
+    ctx.workspaceCwd = cwdDecision.cwd
     ctx.routeToken = route.routeToken
     ctx.routeRenewAt = Date.now()
     ctx.releaseRelayTrace = bindRouteTrace(route.routeToken, this.traceId)
+    await awaitLocalAntigravitySwarmSlotIfActive({
+      compactionMode: ctx.params.antigravitySwarmCompaction?.appliedMode,
+      keepaliveMs: timingTestHooks?.keepaliveMs ?? KEEPALIVE_INTERVAL_MS,
+      renewRouteIntervalMs: timingTestHooks?.routeRenewMs ?? 60_000,
+      onStatus: (detail) => ctx.params.onEvent({ kind: 'turn_status', status: { status: 'working', detail } }),
+      onHeartbeat: () => { this.lastActivityAt = Date.now(); this.emit('activity') },
+      onRenewRoute: async () => {
+        ctx.routeRenewAt = Date.now()
+        const res = await (timingTestHooks?.renewRoute ?? renewAntigravityRouteLease)(route.routeToken)
+        return res !== false
+      },
+      setRelease: (fn) => { ctx.releaseSwarmSlot = fn },
+    })
+    if (ctx.terminal || ctx.abandoned) {
+      this.cleanupLaunch(ctx)
+      ctx.resolveDrain?.()
+      ctx.resolveDrain = null
+      return
+    }
     if (ctx.requestedConversationId) {
       this.ensureSwarmWatcher(ctx, ctx.requestedConversationId)
-      // Snapshot pre-spawn transcript_full.jsonl EOF before launching the resumed CLI (B2).
       const backfiller = this.ensureToolBackfiller(ctx)
       backfiller?.captureStartOffset()
     }
@@ -833,23 +836,18 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
               })
               ctx.swarmWatcher?.kick()
             } else {
+              ctx.swarmWatcher?.rollbackStallAlert(alert)
               log.warn('antigravity_swarm_stall_alert_failed', {
-                sessionKey: this.opts.sessionKey,
-                conversationId,
-                target: alert.target,
-                reason: alert.reason,
-                code: res.code,
-                error: res.error,
+                sessionKey: this.opts.sessionKey, conversationId, target: alert.target,
+                reason: alert.reason, code: res.code, error: res.error,
               })
             }
           })
           .catch((err) => {
+            ctx.swarmWatcher?.rollbackStallAlert(alert)
             log.warn('antigravity_swarm_stall_alert_failed', {
-              sessionKey: this.opts.sessionKey,
-              conversationId,
-              target: alert.target,
-              reason: alert.reason,
-              error: String((err as Error)?.message ?? err),
+              sessionKey: this.opts.sessionKey, conversationId, target: alert.target,
+              reason: alert.reason, error: String((err as Error)?.message ?? err),
             })
           })
       },
@@ -922,7 +920,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     let finalSwarm: SwarmSnapshot | null = null
     if (opts.readDisk && watcher) {
       finalSwarm = watcher.stopAndReadFinal(phase)
+      ctx.workerUsageDelta = watcher.turnWorkerUsageDelta()
     } else {
+      if (watcher) ctx.workerUsageDelta = watcher.turnWorkerUsageDelta()
       watcher?.stop()
       const hadActivity = (watcher?.hasTurnActivity() ?? false) || ctx.lastEmittedSwarmSnapshot !== null
       const base = ctx.lastEmittedSwarmSnapshot ?? (hadActivity ? watcher?.latestSnapshot() ?? null : null)
@@ -1029,7 +1029,10 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       if (ctx.abandoned) return
       if (tail.trim()) this.handleLine(ctx, tail.trim())
       if (ctx.pendingResult) await this.settleResult(ctx)
-      if (!ctx.terminal) {
+      // B1: Wait for an in-flight settleResult (e.g. swarm process-group grace/reap) to finish
+      // reading final SwarmBoard + worker token deltas and setting `deliveredSuccess` BEFORE cleanupLaunch!
+      if (ctx.settling && ctx.settlingDone) await ctx.settlingDone
+      if (!ctx.terminal && !ctx.settling) {
         const detail = ctx.errorDetail || ctx.stderr.trim() || `antigravity exited with code ${String(code)}`
         this.finishError(ctx, detail)
       }
@@ -1495,6 +1498,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       if (emptySuccess) ctx.errorDetail ??= 'ANTIGRAVITY_EXIT_TIMEOUT: CLI did not close after its empty result'
     }
     ctx.settling = true
+    let resolveSettlingDone!: () => void
+    ctx.settlingDone = new Promise<void>((r) => { resolveSettlingDone = r })
     ctx.pendingResult = null
     ctx.resultResponseBytes = Buffer.byteLength(asText(result.response), 'utf8')
     let status = asText(result.status)
@@ -1589,7 +1594,15 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       this.nativeId = ctx.conversationId
       this.emit('session_id', ctx.conversationId)
     }
-    this.finish(ctx, typeof result.num_turns === 'number' ? count(result.num_turns) : 1)
+    try {
+      if (ctx.swarmWatcher?.hasTurnActivity() && ctx.proc && !ctx.procClosed) {
+        await reapLingeringCliProcessGroup(ctx.proc, () => ctx.procClosed)
+        if (ctx.terminal || ctx.abandoned) return
+      }
+      this.finish(ctx, typeof result.num_turns === 'number' ? count(result.num_turns) : 1)
+    } finally {
+      resolveSettlingDone()
+    }
   }
 
   /** Everything but the exit code that marks an ERROR as the repeated old one. */
@@ -1605,11 +1618,15 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   private usageSnapshot(ctx: TurnContext) {
     const u = ctx.usage
+    const w = ctx.workerUsageDelta
+    const inputTokens = u.inputTokens + w.inputTokens
+    const outputTokens = u.outputTokens + w.outputTokens + w.thinkingTokens
+    const cacheReadTokens = u.cacheReadTokens + w.cacheReadTokens
     return {
-      totalTokens: u.inputTokens + u.outputTokens + u.cacheReadTokens,
-      inputTokens: u.inputTokens,
-      outputTokens: u.outputTokens,
-      cacheReadTokens: u.cacheReadTokens,
+      totalTokens: inputTokens + outputTokens + cacheReadTokens,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
       cacheCreationTokens: 0,
     }
   }
@@ -1649,7 +1666,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     // 1.3.4 never streams thought text (only thinking_tokens), so the
     // thinking channel stays empty.
     const usage = this.usageSnapshot(ctx)
-    this.emitExternalBilling(ctx, isError)
+    this.emitExternalBilling(ctx, isError, usage)
     ctx.params.onEvent({ kind: 'final', meta: { ...usage, stopReason, cost: 0 } })
     ctx.resolveSummary({
       usage: { cost: 0, ...usage },
@@ -1670,13 +1687,15 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     })
   }
 
-  /** Status-only sideband: master settles from the relay's usage rows. */
-  private emitExternalBilling(ctx: TurnContext, isError: boolean): void {
+  /** Status-only live sideband + durable turn-tape billing locator (OCV5-887). */
+  private emitExternalBilling(
+    ctx: TurnContext,
+    isError: boolean,
+    usage: ReturnType<AntigravityAdapter['usageSnapshot']>,
+  ): void {
     const requestId = ctx.params.requestId
     if (!requestId || !REQUEST_ID_RE.test(requestId)) return
     const detail = ctx.errorDetail ?? ''
-    // The relay refuses new calls past the admission budget; the tokens used
-    // up to there were consumed, so settle them (master clamps to balance).
     const budgetStop = isError && !ctx.interrupted && BUDGET_EXHAUSTED_RE.test(detail)
     const cls = !isError || ctx.interrupted || budgetStop ? null
       : authError(detail) ? 'auth' as const
@@ -1689,13 +1708,18 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       : cls === 'auth' ? 'AUTH_UNAVAILABLE'
       : cls === 'quota' ? 'QUOTA_UNAVAILABLE'
       : 'ENGINE_ERROR'
+    const durationMs = Date.now() - ctx.startedAt
     this.emit('external_billing', {
-      requestId,
-      engine: 'antigravity',
-      status,
-      durationMs: Date.now() - ctx.startedAt,
+      requestId, engine: 'antigravity', status, durationMs,
       ...(terminalCode ? { terminalCode } : {}),
     } satisfies EngineExternalBillingEvent)
+    this.emit('billing', buildAntigravityDurableBillingEvent({
+      requestId, sessionKey: this.opts.sessionKey, turnKey: ctx.params.turnKey,
+      parentTurnKey: ctx.params.usageAttribution?.parentTurnKey,
+      parentSessionId: ctx.params.usageAttribution?.parentSessionId,
+      delegateAgentId: ctx.params.usageAttribution?.delegateAgentId,
+      status, interrupted: ctx.interrupted, budgetStop, durationMs, usage,
+    }))
   }
 
   private finishError(ctx: TurnContext, detail: string): void {
@@ -1706,6 +1730,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   private forceEnd(ctx: TurnContext): void {
     this.stopKeepalive(ctx)
+    ctx.releaseSwarmSlot?.()
+    ctx.releaseSwarmSlot = null
     // Preserve any already-displayed swarm board in `ctx.tools` BEFORE terminal
     // teardown so `getPartialSnapshot()` persists one settled terminal card.
     this.commitTerminalSwarmBoard(ctx, ctx.interrupted ? 'interrupted' : 'error', {
@@ -1715,11 +1741,14 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.terminal) return
     ctx.deliveredSuccess = false
     ctx.terminal = true
+    if (ctx.proc && !ctx.procClosed) killProcessGroup(ctx.proc, 'SIGTERM')
     ctx.resolveSummary(null)
   }
 
   private cleanupLaunch(ctx: TurnContext, opts?: { persistSummaryCache?: boolean }): void {
     this.stopSwarmWatcher(ctx)
+    ctx.releaseSwarmSlot?.()
+    ctx.releaseSwarmSlot = null
     ctx.toolBackfiller?.dispose()
     ctx.toolBackfiller = null
     // Every caller is the end of the turn's process, so its relay requests stop naming this turn too.
@@ -1728,6 +1757,11 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const projection = ctx.projection
     if (!projection) return
     ctx.projection = null
+    cleanupKilledNativeSwarmWorktrees(
+      projection.sessionBrainDir,
+      ctx.conversationId ?? ctx.requestedConversationId,
+      ctx.workspaceCwd,
+    )
     cleanupAntigravityLaunch(projection, opts)
   }
 
@@ -1898,17 +1932,9 @@ export const _internals = {
 registerEngine('antigravity', (opts) => new AntigravityAdapter(opts))
 
 registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, promptPolicy, promptOnly }) => {
-  const runner = new SubprocessRunner({
-    ...opts,
-    harness: 'official-cc',
-    boxResidentCc: true,
-  })
-  if (promptPolicy !== undefined) {
-    runner.setPromptPrivacy(promptPolicy)
-  }
-  const { learning, profile, env, cleanup } = await runner.prepareRemoteToolContext({
-    supportsVision,
-  })
+  const runner = new SubprocessRunner({ ...opts, harness: 'official-cc', boxResidentCc: true })
+  if (promptPolicy !== undefined) runner.setPromptPrivacy(promptPolicy)
+  const { learning, profile, env, cleanup } = await runner.prepareRemoteToolContext({ supportsVision })
   const swarmCtx = lookupRemoteSwarmMcpContext(opts.sessionKey)
   const swarmEnv: Record<string, string> = swarmCtx
     ? {
@@ -1925,31 +1951,13 @@ registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, prompt
         mcpServers?: Record<string, { env?: Record<string, string> }>
       }
       if (rawCfg?.mcpServers?.['openclaude-memory']) {
-        rawCfg.mcpServers['openclaude-memory'].env = {
-          ...(rawCfg.mcpServers['openclaude-memory'].env ?? {}),
-          ...swarmEnv,
-        }
+        rawCfg.mcpServers['openclaude-memory'].env = { ...(rawCfg.mcpServers['openclaude-memory'].env ?? {}), ...swarmEnv }
         writeFileSync(profile.mcpConfigPath, JSON.stringify(rawCfg, null, 2), { mode: 0o600 })
       }
-    } catch {
-      // keep original mcp config if unreadable
-    }
+    } catch { /* keep original mcp config if unreadable */ }
   }
-  const platformPrompt = learning.extraPromptFile
-    ? readFileSync(learning.extraPromptFile, 'utf8')
-    : ''
-  if (promptOnly) {
-    cleanup()
-    return {
-      profile,
-      env: mergedEnv,
-      platformPrompt,
-      promptCwd: profile.cwd,
-      promptPolicyFingerprint: runner.promptPolicyFingerprint,
-      promptIntelligentUi: runner.promptIntelligentUi,
-      cleanup: () => {},
-    }
-  }
+  const platformPrompt = learning.extraPromptFile ? readFileSync(learning.extraPromptFile, 'utf8') : ''
+  if (promptOnly) cleanup()
   return {
     profile,
     env: mergedEnv,
@@ -1957,6 +1965,6 @@ registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, prompt
     promptCwd: profile.cwd,
     promptPolicyFingerprint: runner.promptPolicyFingerprint,
     promptIntelligentUi: runner.promptIntelligentUi,
-    cleanup,
+    cleanup: promptOnly ? () => {} : cleanup,
   }
 })

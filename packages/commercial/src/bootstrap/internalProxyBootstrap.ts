@@ -193,7 +193,7 @@ import {
   makeCronOriginInjectHandler,
   type CronOriginInjectHandler,
 } from "../http/internalCronOriginInject.js";
-import { isDelegateAntigravityRoutePath } from "../http/internalDelegateAntigravityRoute.js";
+import { DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH, isDelegateAntigravityRoutePath } from "../http/internalDelegateAntigravityRoute.js";
 import {
   isDelegateEngineBillingInternalPath,
   makeDelegateEngineBillingHandler,
@@ -749,11 +749,12 @@ export async function bootstrapInternalProxyAndListeners(
         readBalance: readTotalSpendableBalance,
         rootLogger,
         pricing: deps.pricing,
+        appendCostCredits: deps.appendCostCreditsForUser,
       });
-      const delegateAntigravityRouteHandler =
-        deps.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
-          ? antigravityRouteRuntime.makeDelegateHandler()
-          : undefined;
+      // B8: Mount RENEW_PATH unconditionally so Commercial main Antigravity turns & FIFO queued
+      // swarms can renew already-minted route leases, while keeping MINT/RELEASE selfhost-only.
+      const allowDelegateAntigravityMint = deps.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1";
+      const delegateAntigravityRouteHandler = antigravityRouteRuntime.makeDelegateHandler();
       const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
         identityRepo,
         codingPlanKey: deps.cfg.ZAI_CODING_PLAN_KEY ?? "",
@@ -1146,7 +1147,12 @@ export async function bootstrapInternalProxyAndListeners(
         if (delegateGrokRouteHandler && isDelegateGrokRoutePath(path)) {
           return delegateGrokRouteHandler(req, res, ctx);
         }
-        if (delegateAntigravityRouteHandler && isDelegateAntigravityRoutePath(path)) {
+        if (
+          delegateAntigravityRouteHandler &&
+          (allowDelegateAntigravityMint
+            ? isDelegateAntigravityRoutePath(path)
+            : path === DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH)
+        ) {
           return delegateAntigravityRouteHandler(req, res, ctx);
         }
         if (

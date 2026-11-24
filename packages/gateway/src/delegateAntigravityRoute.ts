@@ -314,18 +314,22 @@ export async function acquireDelegateAntigravityRoute(args: {
   }
 }
 
-/** Main turns use the same identity-scoped renew endpoint, never the mint endpoint. */
+/** Main turns use the same identity-scoped renew endpoint, never the mint endpoint.
+ *  B8: Works across both Selfhost and Commercial containers; returns `true` when
+ *  the master renew endpoint explicitly confirmed liveness (`HTTP 200` + `{ ok: true }`),
+ *  `'unconfigured'` when master internal transport is absent, and `false` on invalid token. */
 export async function renewAntigravityRouteLease(
   routeToken: string,
   opts: { env?: NodeJS.ProcessEnv; fetcher?: typeof undiciRequest } = {},
-): Promise<void> {
+): Promise<boolean | 'unconfigured'> {
   const env = opts.env ?? process.env
-  if (env.OC_SELFHOST_ENGINE_LOCAL_TURNS !== '1') return
   const base = env.OPENCLAUDE_V3_MASTER_BASE_URL?.replace(/\/+$/, '')
   const bearer = env.OPENCLAUDE_V3_CONTAINER_TOKEN
-  if (!base || !bearer || !ROUTE_TOKEN_RE.test(routeToken)) return
+  if (!base || !bearer) return 'unconfigured'
+  if (!ROUTE_TOKEN_RE.test(routeToken)) return false
   const result = await postJson(opts.fetcher ?? undiciRequest, `${base}${RENEW_PATH}`,
     bearer, { routeToken }, RENEW_RELEASE_TIMEOUT_MS)
   if (result.statusCode !== 200) throw new Error(`Antigravity route renewal HTTP ${result.statusCode}`)
   if (JSON.parse(result.text)?.ok !== true) throw new Error('Antigravity route renewal rejected')
+  return true
 }

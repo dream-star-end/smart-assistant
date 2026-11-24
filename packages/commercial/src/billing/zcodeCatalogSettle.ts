@@ -75,11 +75,19 @@ export async function publishZcodeCatalogSettle(args: {
   modelId: string;
   sessionId: string | null;
   traceId: string | null;
+  turnKey?: string | null;
+  parentTurnKey?: string | null;
+  parentSessionId?: string | null;
+  delegateAgentId?: string | null;
   persist?: (
     requestId: string,
     userId: string,
     costCredits: string,
     sessionId?: string | null,
+    parentSessionId?: string | null,
+    delegateAgentId?: string | null,
+    turnKey?: string | null,
+    parentTurnKey?: string | null,
   ) => Promise<unknown>;
   publish: (event: ZcodeCostChargedEvent) => void;
   onPersistError?: (error: unknown) => void;
@@ -91,12 +99,30 @@ export async function publishZcodeCatalogSettle(args: {
       : null;
   if (persistCredits !== null && args.persist) {
     try {
-      await args.persist(
-        args.requestId,
-        args.userId,
-        persistCredits.toString(),
-        args.sessionId,
-      );
+      if (
+        args.turnKey ||
+        args.parentTurnKey ||
+        args.parentSessionId ||
+        args.delegateAgentId
+      ) {
+        await args.persist(
+          args.requestId,
+          args.userId,
+          persistCredits.toString(),
+          args.sessionId,
+          args.parentSessionId ?? null,
+          args.delegateAgentId ?? null,
+          args.turnKey ?? null,
+          args.parentTurnKey ?? null,
+        );
+      } else {
+        await args.persist(
+          args.requestId,
+          args.userId,
+          persistCredits.toString(),
+          args.sessionId,
+        );
+      }
     } catch (error) {
       args.onPersistError?.(error);
     }

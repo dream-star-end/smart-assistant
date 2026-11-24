@@ -57,6 +57,7 @@ import {
   isAntigravityAuxUpstreamModel,
   refreshWaivedAntigravityUsage,
   resolveAntigravityBillableTarget,
+  settleLateAntigravityRelayUsage,
   sumAntigravityRelayUsage,
 } from '../billing/antigravitySettle.js'
 import type { PricingCache } from '../billing/pricing.js'
@@ -168,6 +169,18 @@ export interface AntigravityRelayDeps {
   totalsCost?: (route: AntigravityRelayRoute, totals: AntigravityUsageTotals) => bigint | null
   /** After a call's row is written: fold it into a turn that already settled as waived. */
   refreshWaived?: (route: AntigravityRelayRoute) => Promise<void>
+  /** After a call's row is written: bill incremental delta if parent turn already settled as success. */
+  settleLateUsage?: (route: AntigravityRelayRoute) => Promise<void>
+  appendCostCredits?: (
+    requestId: string,
+    rawUserId: string,
+    costCredits: string,
+    sessionId?: string | null,
+    parentSessionId?: string | null,
+    delegateAgentId?: string | null,
+    turnKey?: string | null,
+    parentTurnKey?: string | null,
+  ) => Promise<unknown>
   now?: () => number
 }
 
@@ -543,6 +556,18 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         pricing: deps.pricing,
         requestId: route.requestId,
         userId: route.userId,
+      })
+    })
+  const settleLateUsage =
+    deps.settleLateUsage ??
+    (async (route: AntigravityRelayRoute) => {
+      if (!deps.pricing) return
+      await settleLateAntigravityRelayUsage({
+        pool: getPool(),
+        pricing: deps.pricing,
+        requestId: route.requestId,
+        userId: route.userId,
+        appendCostCredits: deps.appendCostCredits,
       })
     })
   const estimateCost =
@@ -940,8 +965,10 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         if (reservation) {
           reservation.slot.recorded = accumulateRecordedUsage(reservation.slot.recorded, row)
         }
-        // A Stop may have settled the turn while this call was still streaming (OCV5-451).
+        // A Stop may have settled the turn while this call was still streaming (OCV5-451);
+        // or an orphaned worker finished streaming after success settle (OCV5-887).
         void refreshWaived(route).catch(() => {})
+        void settleLateUsage(route).catch(() => {})
         if (tap.retired) {
           if (!res.headersSent) {
             // Discard held upstream bytes and their encoding headers.

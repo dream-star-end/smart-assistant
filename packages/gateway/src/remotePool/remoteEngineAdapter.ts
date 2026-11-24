@@ -387,14 +387,20 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
         onStallDetected: (alert) => {
           if (finalized) return
           const runtime = lookupRemoteSwarmRuntimeForSession(sessionKeyForSwarm)
-          if (!runtime) return
+          if (!runtime) {
+            swarmWatcher?.rollbackStallAlert(alert)
+            return
+          }
           try {
             const posted = runtime.postGatewayStallAlert(sessionKeyForSwarm, alert)
             if (posted) {
               swarmWatcher?.kick()
+            } else {
+              swarmWatcher?.rollbackStallAlert(alert)
             }
           } catch {
-            // Fail closed on lock timeout or symlink rejection without crashing watcher.
+            // Roll back alert budget on `.board.lock` contention so transient lock busy never wastes 1/3 quota.
+            swarmWatcher?.rollbackStallAlert(alert)
           }
         },
       })

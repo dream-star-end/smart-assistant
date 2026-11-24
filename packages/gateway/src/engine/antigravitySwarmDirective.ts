@@ -230,6 +230,55 @@ export function listLiveAntigravitySwarmMonitors(opts: {
 }
 
 /**
+ * Returns true if this Antigravity session has at least one live (non-killed)
+ * core worker in its persisted swarm roster (`members.json`). Used to preserve
+ * swarm continuity across automatic crash/OOM checkpoint recovery turns whose
+ * legacy `turn_recovery_jobs.request_json` omitted `swarmMode` (OCV5-887).
+ */
+export function hasLiveCoreAntigravitySwarmWorkers(opts: {
+  sessionKey: string
+  isRemote: boolean
+  conversationId?: string
+  antigravityRootDir?: string
+  remoteSwarmRootBase?: string
+}): boolean {
+  let roster: Record<string, unknown> | null = null
+  if (opts.isRemote) {
+    const loc = remoteSwarmLocationForSession(opts.sessionKey, opts.remoteSwarmRootBase)
+    roster = readBoundedRegularJsonNoSymlink(loc.brainDir, [
+      loc.swarmId,
+      '.system_generated',
+      'swarm',
+      'members.json',
+    ])
+  } else {
+    const convId = opts.conversationId?.trim()
+    if (!convId || !CONVERSATION_ID_RE.test(convId)) return false
+    const brainDir = antigravitySessionBrainDir(opts.antigravityRootDir ?? antigravityRoot(), opts.sessionKey)
+    roster = readBoundedRegularJsonNoSymlink(brainDir, [
+      convId,
+      '.system_generated',
+      'swarm',
+      'members.json',
+    ])
+  }
+  const members = roster?.members
+  if (!members || typeof members !== 'object' || Array.isArray(members)) return false
+  for (const [name, raw] of Object.entries(members as Record<string, unknown>)) {
+    const clean = name.trim()
+    if (!clean || clean.toLowerCase() === 'coordinator') continue
+    if (isSafeLegacyAuxiliaryName(clean)) continue
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const rec = raw as Record<string, unknown>
+    if (rec.killed === true) continue
+    const phase = typeof rec.phase === 'string' ? rec.phase.trim().toUpperCase() : ''
+    if (phase === 'KILLED' || phase === 'STOPPED') continue
+    return true
+  }
+  return false
+}
+
+/**
  * Returns true if this Antigravity session already has a persisted swarm roster
  * (`members.json`) on disk for the active local conversation or remote session.
  */
