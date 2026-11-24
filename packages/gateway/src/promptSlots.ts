@@ -81,6 +81,7 @@ import {
   type DelegateModelSectionInput,
 } from './delegateModelCatalogPrompt.js'
 import type { FrozenProjectContextDigests } from './runContextPersist.js'
+import { resolveEngineToolsPromptDialect } from './engine/promptDialect.js'
 
 // ── 平台静态 prompt 文案的个人版 fallback 常量(见文件头「文案通道边界」)──
 //
@@ -1268,16 +1269,14 @@ export function buildToolsSlot(
     )
   }
   if (promptEngineOf(ctx.provider) !== 'ccb') {
-    const isAgy = ctx.provider === 'antigravity'
-    const webTools = isAgy ? '`search_web` / Bash `oc-web extract <url>`' : '`WebSearch` / `WebFetch` / Bash `oc-web extract <url>`'
-    const fileRecovery = isAgy ? '`read_file`/`edit_file` 失败先重新 `read_file` 或 `oc_glob` 拿最新内容再试' : 'Read/Edit 失败先重新 Read 或 Glob 拿最新内容再试'
+    const { webSearchTools, fileRecoveryHint } = resolveEngineToolsPromptDialect(ctx.provider)
     lines.push('', '## 联网检索纪律', '',
-      `需要外部/实时事实(新闻、行情、政策、网页、文献、统计数字)时**先真的去检索**(${webTools}),不要凭记忆作答。**中文主题优先中文检索**,结果标注来源 URL 与数据时间;一条路径失败就换路径、关键词或语言再试。`,
+      `需要外部/实时事实(新闻、行情、政策、网页、文献、统计数字)时**先真的去检索**(${webSearchTools}),不要凭记忆作答。**中文主题优先中文检索**,结果标注来源 URL 与数据时间;一条路径失败就换路径、关键词或语言再试。`,
       '- **全部失败或结果不相关时,如实告诉用户"未能检索到可靠来源"**并说明已尝试的路径;若仍要给判断,必须标注"以下为基于既有知识的粗略判断,未经联网核实"。**严禁**把记忆里的数字或时效性结论当作已核实的调研结果,不得伪造来源或链接。',
       '', '## 工具失败自恢复', '',
       '仅在工具已经返回失败后按错误类型恢复;不要为每个任务预检环境、自动安装依赖或修改网关/沙箱配置。',
       '- 不要原样重复同一个失败调用:先读错误,改变方法、参数、工具或路径后最多再试一次;也不要因此停下任务,确实需要用户输入时才提问。',
-      `- 退出码 127 先用 \`command -v <命令>\` 确认,优先改用平台原生工具或已安装替代品,不静默安装;${fileRecovery};长任务超时就拆小步或改为后台执行并轮询;权限拒绝时不要绕过沙箱、提权或放宽权限,改用允许的目录/工具,仍不可行就说明限制。`)
+      `- 退出码 127 先用 \`command -v <命令>\` 确认,优先改用平台原生工具或已安装替代品,不静默安装;${fileRecoveryHint};长任务超时就拆小步或改为后台执行并轮询;权限拒绝时不要绕过沙箱、提权或放宽权限,改用允许的目录/工具,仍不可行就说明限制。`)
   }
   lines.push('', '## 会话工作区边界', '',
     '未绑项目的对话各有自己的工作目录 `/home/agent/.openclaude/workspace/sessions/<会话id>/`(即你的当前工作目录),绑了项目的对话用项目目录;不属于当前对话的 `workspace/sessions/*` 目录都是用户的**其它对话**。',
