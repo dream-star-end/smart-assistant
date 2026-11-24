@@ -17,7 +17,7 @@ import { join, resolve } from 'node:path'
 import type { ChannelContext } from '@openclaude/plugin-sdk'
 import type { OutboundMessage } from '@openclaude/protocol'
 import { resolveGatewayListen } from './gatewayBind.js'
-import { type AgentDef, paths, getClientSession, turnDispatchInboxStats } from '@openclaude/storage'
+import { type AgentDef, paths, getClientSession, readAgentsConfig, readConfig, turnDispatchInboxStats } from '@openclaude/storage'
 import { readV3MasterSinkConfig } from './v3MasterSink.js'
 import { isHiddenSystemAgentId } from './agentVisibility.js'
 import { WebSocketServer } from 'ws'
@@ -72,7 +72,8 @@ import {
   recoverTurnDispatchInboxOnBoot,
   resolveInboxTerminalAck,
 } from './turnDispatchInbox.js'
-import { localExecutionRejectCode } from './modelCatalogClient.js'
+import { getModelCatalogClient, localExecutionRejectCode, type LocalCatalogView } from './modelCatalogClient.js'
+import { healConfigModelPointers } from './configPointerSelfHeal.js'
 import {
   resolveLocalExecutionIfEnforced,
   localExecutionOverride,
@@ -84,6 +85,8 @@ import { handedOffDelegateRetryDelay, retryHandedOffDelegateNotifies } from './d
 
 export interface GatewayLifecycleHost {
   _activeSendToAgentCallbacks: Gateway['_activeSendToAgentCallbacks']
+  _agentsConfigCache: Gateway['_agentsConfigCache']
+  _agentsConfigMtime: Gateway['_agentsConfigMtime']
   _armNotifyRetryScheduler: Gateway['_armNotifyRetryScheduler']
   _containerPreview: Gateway['_containerPreview']
   _delegateJobs: Gateway['_delegateJobs']
@@ -149,6 +152,7 @@ export interface GatewayLifecycleHost {
   log: Gateway['log']
   rateLimiter: Gateway['rateLimiter']
   refreshClaudeOAuthIfNeeded: Gateway['refreshClaudeOAuthIfNeeded']
+  router: Gateway['router']
   sessions: Gateway['sessions']
   shutdown: Gateway['shutdown']
   webhookRouter: Gateway['webhookRouter']
@@ -156,6 +160,66 @@ export interface GatewayLifecycleHost {
 }
 
 const logTimingStops = new WeakMap<object, () => void>()
+const catalogHealStops = new WeakMap<object, () => void>()
+
+export type GatewayConfigHealTarget = Pick<
+  GatewayLifecycleHost,
+  '_agentsConfigCache' | '_agentsConfigMtime' | 'deps' | 'log' | 'router' | 'sessions'
+>
+
+/**
+ * Run `healConfigModelPointers` and immediately publish any healed `openclaude.json`
+ * and `agents.yaml` into the live Gateway, Router, SessionManager, and Cron config ref
+ * so subsequent turns route using the healed default model without requiring a restart.
+ */
+export async function applyConfigPointerSelfHealToGateway(
+  host: GatewayConfigHealTarget,
+  catalog: LocalCatalogView,
+  opts?: {
+    isStopped?: () => boolean
+    configPath?: string
+    agentsYamlPath?: string
+    collaborationConfigPath?: string
+    readFreshConfig?: () => Promise<Gateway['deps']['config'] | null>
+    readFreshAgents?: () => Promise<Gateway['deps']['agentsConfig'] | null>
+  },
+) {
+  const report = await healConfigModelPointers({
+    catalog,
+    ...(opts?.configPath ? { configPath: opts.configPath } : {}),
+    ...(opts?.agentsYamlPath ? { agentsYamlPath: opts.agentsYamlPath } : {}),
+    ...(opts?.collaborationConfigPath
+      ? { collaborationConfigPath: opts.collaborationConfigPath }
+      : {}),
+    log: (event, fields) => host.log.info(event, fields),
+  }).catch((err) => {
+    host.log.warn('config pointer self-heal failed', { error: String(err) })
+    return null
+  })
+  if (!report || opts?.isStopped?.()) return report
+  if (report.changedFiles.includes('openclaude.json')) {
+    const freshConfig = await (opts?.readFreshConfig ? opts.readFreshConfig() : readConfig()).catch(
+      () => null,
+    )
+    if (freshConfig && !opts?.isStopped?.()) {
+      if (freshConfig.provider === undefined) delete host.deps.config.provider
+      Object.assign(host.deps.config, freshConfig)
+      host.sessions.updateConfig(host.deps.config)
+    }
+  }
+  if (report.changedFiles.includes('agents.yaml')) {
+    const freshAgents = await (
+      opts?.readFreshAgents ? opts.readFreshAgents() : readAgentsConfig()
+    ).catch(() => null)
+    if (freshAgents && !opts?.isStopped?.()) {
+      host.deps.agentsConfig = freshAgents
+      host._agentsConfigCache = null
+      host._agentsConfigMtime = 0
+      host.router.reload(freshAgents)
+    }
+  }
+  return report
+}
 
 export async function start(this: GatewayLifecycleHost): Promise<void> {
   const { config } = this.deps
@@ -913,9 +977,46 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
 
   // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
   this.bootAutoResume().catch((err) => this.log.error('auto-resume boot failed', undefined, err))
+
+  // OCV5-883: Idempotent startup & catalog-refresh model pointer self-heal (fail-open, single-flight).
+  const catalogClient = getModelCatalogClient()
+  if (catalogClient.configured) {
+    let healRunning = false
+    let pendingView: LocalCatalogView | null = null
+    let stopped = false
+    const schedulePointerHeal = (view: LocalCatalogView): void => {
+      if (stopped) return
+      pendingView = view
+      if (healRunning) return
+      healRunning = true
+      void (async () => {
+        try {
+          while (!stopped && pendingView) {
+            const nextView = pendingView
+            pendingView = null
+            const report = await applyConfigPointerSelfHealToGateway(this, nextView, {
+              isStopped: () => stopped,
+            })
+            void report
+          }
+        } finally {
+          healRunning = false
+        }
+      })()
+    }
+    const unsub = catalogClient.onCatalogUpdated((view) => schedulePointerHeal(view))
+    catalogHealStops.set(this, () => {
+      stopped = true
+      pendingView = null
+      unsub()
+    })
+    void catalogClient.getView().then((view) => schedulePointerHeal(view)).catch(() => {})
+  }
 }
 
 export async function _doShutdown(this: GatewayLifecycleHost, exit: boolean): Promise<void> {
+  catalogHealStops.get(this)?.()
+  catalogHealStops.delete(this)
   logTimingStops.get(this)?.()
   logTimingStops.delete(this)
   this.log.info('shutting down')

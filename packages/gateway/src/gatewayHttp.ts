@@ -27,7 +27,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join, resolve, sep } from 'node:path'
 import { checkLocalBridge } from './localBridgeAuth.js'
 import { resolveOpenedPath } from './openedPath.js'
-import { readConfig, writeConfig } from '@openclaude/storage'
+import { updateConfig } from '@openclaude/storage'
 import { checkToken, verifyJwt } from './auth.js'
 import { httpRequestsTotal, httpRequestDuration } from './metrics.js'
 import { isFileAllowed, isFileBlocked } from './gatewayFilePolicy.js'
@@ -695,19 +695,26 @@ export async function _refreshToken(
     }
 
     const tokens = (await tokenRes.json()) as any
-    const config = await readConfig()
-    if (config) {
-      const refreshed = {
-        accessToken: tokens.access_token,
-        refreshToken: tokens.refresh_token ?? oauth.refreshToken,
-        expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-        scope: tokens.scope ?? oauth.scope,
-      }
-      if (providerKey === 'claude') config.auth.claudeOAuth = refreshed
-      else (config.auth as any)[`${providerKey}OAuth`] = refreshed
-      await writeConfig(config)
-      this.deps.config = config
-      this.sessions.updateConfig(config)
+    const refreshed = {
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token ?? oauth.refreshToken,
+      expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+      scope: tokens.scope ?? oauth.scope,
+    }
+    let updatedConfig: typeof this.deps.config | null = null
+    try {
+      const res = await updateConfig((config) => {
+        if (providerKey === 'claude') config.auth.claudeOAuth = refreshed
+        else (config.auth as any)[`${providerKey}OAuth`] = refreshed
+      })
+      updatedConfig = res.config
+    } catch (err: any) {
+      if (err?.code !== 'ENOENT') throw err
+    }
+    if (updatedConfig) {
+      if (updatedConfig.provider === undefined) delete this.deps.config.provider
+      Object.assign(this.deps.config, updatedConfig)
+      this.sessions.updateConfig(this.deps.config)
       this.log.info('oauth token refreshed', {
         provider: providerKey,
         expiresInSec: tokens.expires_in,

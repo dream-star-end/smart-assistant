@@ -188,3 +188,21 @@ export {
   type CronJobsWithMetaReader,
   type SessionOriginCronItem,
 } from './routes/sessionBackgroundRoute.js'
+export {
+  gcCronOccurrenceTapes,
+  gcDelegateInflightSurface,
+  gcRetryQueueQuarantine,
+  gcStaleBakFiles,
+  runRuntimeHygieneGc,
+  type RuntimeHygieneGcOptions,
+  type RuntimeHygieneGcReport,
+} from './runtimeHygieneGc.js'
+export {
+  DEPRECATED_PROVIDERS,
+  LEGACY_MODEL_POINTER_ALIASES,
+  healConfigModelPointers,
+  resolveHealedModelPointer,
+  resolveHealedProvider,
+  type HealConfigModelPointersOptions,
+  type ConfigPointerSelfHealReport,
+} from './configPointerSelfHeal.js'

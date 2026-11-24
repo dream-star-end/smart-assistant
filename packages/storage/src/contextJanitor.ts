@@ -14,9 +14,9 @@
  *   5. Persist last 10 hygiene run receipts in `context-hygiene-history.json` (0600)
  */
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 import {
@@ -25,7 +25,11 @@ import {
   listArchivedMemories,
   listArchivedSkills,
 } from './contextArchive.js'
-import { createMemoryDirForAgentDir } from './memoryDir.js'
+import {
+  createMemoryDirForAgentDir,
+  MEMORY_SOFT_WARN_BYTES,
+  MemoryBoundaryError,
+} from './memoryDir.js'
 import { cleanupArchival, decayAccess } from './memoryLifecycle.js'
 import { acquireFileLock } from './memoryShared.js'
 import { isMemoryExpired, memoryCalendarDate } from './memoryTtl.js'
@@ -99,6 +103,12 @@ export interface ContextHygieneRunRecord {
   mergedMemorySources?: number
   /** Plain-language summary of what background auto-consolidation did. */
   semanticSummary?: string
+  /** Whether MEMORY.md index was compacted (or would be compacted in dryRun). */
+  memoryIndexCompacted?: boolean
+  /** Bytes freed by compacting MEMORY.md index. */
+  memoryIndexBytesSaved?: number
+  /** Count of broken memory/*.md links removed from MEMORY.md. */
+  memoryIndexBrokenLinksRemoved?: number
 }
 
 export interface ContextHealthReport {
@@ -162,6 +172,10 @@ export interface RunContextJanitorInput {
   decayArchival?: boolean
   /** When provided, ONLY delete these exact archival IDs (empty array = delete none). */
   pruneArchivalIds?: readonly string[]
+  /** Compact bloated/drifted MEMORY.md index during L1 hygiene (defaults to true). */
+  compactMemoryIndex?: boolean
+  /** Byte budget threshold for compacting MEMORY.md index (defaults to 6 KiB). */
+  memoryIndexMaxBytes?: number
   today?: string
   nowMs?: number
 }
@@ -899,6 +913,8 @@ export async function runContextJanitor(
     Math.floor(input.maxSkillHistoryVersions ?? MAX_SKILL_HISTORY_VERSIONS),
   )
   const runDecayArchival = input.decayArchival !== false
+  const compactMemoryIndex = input.compactMemoryIndex !== false
+  const memoryIndexMaxBytes = input.memoryIndexMaxBytes ?? MEMORY_SOFT_WARN_BYTES
 
   const runId = `hyg-${randomUUID().slice(0, 12)}`
   const batchId = `hygiene-${new Date(nowMs).toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}-${randomUUID().slice(0, 6)}`
@@ -911,6 +927,9 @@ export async function runContextJanitor(
     let archivalDecayed = 0
     let archivalCleaned = 0
     let bytesFreed = 0
+    let memoryIndexCompacted = false
+    let memoryIndexBytesSaved = 0
+    let memoryIndexBrokenLinksRemoved = 0
     const archivedMemoryFiles: string[] = []
     const archivedSkillNames: string[] = []
     const errors: string[] = []
@@ -943,6 +962,53 @@ export async function runContextJanitor(
         }
       } catch (err) {
         errors.push(`expired_memories: ${(err as Error)?.message ?? String(err)}`)
+      }
+    }
+
+    // 1b. Compact bloated/drifted MEMORY.md index (CAS-protected on live write, zero-write on dryRun)
+    if (compactMemoryIndex) {
+      try {
+        const memdir = createMemoryDirForAgentDir(input.agentDir, input.agentId)
+        const idxPath = memdir.indexPath()
+        let idxStat: Awaited<ReturnType<typeof lstat>> | null = null
+        try {
+          idxStat = await lstat(idxPath)
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err
+        }
+        if (idxStat) {
+          if (idxStat.isSymbolicLink() || !idxStat.isFile()) {
+            throw new MemoryBoundaryError('unsafe MEMORY.md (symlink or non-file)')
+          }
+          const idxBuf = await readFile(idxPath)
+          const expectedIndexSha256 = createHash('sha256').update(idxBuf).digest('hex')
+          const compactRes = await memdir.compactIndexIfNeeded({
+            maxBytes: memoryIndexMaxBytes,
+            expectedIndexSha256,
+            dryRun,
+          })
+          if (compactRes.conflict) {
+            errors.push('memory_index_compact: concurrent_modification_conflict')
+          } else if (dryRun) {
+            const wouldChange =
+              compactRes.needed &&
+              (compactRes.bytesSaved > 0 ||
+                compactRes.brokenLinksRemoved > 0 ||
+                compactRes.oversizedLinesCompacted > 0 ||
+                compactRes.afterBytes !== compactRes.beforeBytes)
+            memoryIndexCompacted = wouldChange
+            memoryIndexBytesSaved = compactRes.bytesSaved
+            memoryIndexBrokenLinksRemoved = compactRes.brokenLinksRemoved
+            bytesFreed += compactRes.bytesSaved
+          } else if (compactRes.compacted) {
+            memoryIndexCompacted = true
+            memoryIndexBytesSaved = compactRes.bytesSaved
+            memoryIndexBrokenLinksRemoved = compactRes.brokenLinksRemoved
+            bytesFreed += compactRes.bytesSaved
+          }
+        }
+      } catch (err) {
+        errors.push(`memory_index_compact: ${(err as Error)?.message ?? String(err)}`)
       }
     }
 
@@ -1095,6 +1161,9 @@ export async function runContextJanitor(
       archivedMemoryFiles,
       archivedSkillNames,
       errors,
+      memoryIndexCompacted,
+      memoryIndexBytesSaved,
+      memoryIndexBrokenLinksRemoved,
     }
 
     if (!dryRun) {

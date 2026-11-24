@@ -15,13 +15,14 @@
  *  - W1: Exact UTF-8 byte budgets (`MAX_CLUSTER_BYTES = 12_288`, `MAX_SKILL_METADATA_BYTES = 16_384`).
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { lstat, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { lstat, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { join, sep } from 'node:path'
 import {
   MEMORY_FILE_RE,
   type MemoryType,
   type SkillUsageDbLike,
   appendContextHygieneRun,
+  applyOversizedMemoryDistill,
   applySemanticMemoryMerge,
   archiveUserSkill,
   classifySkillTier,
@@ -37,6 +38,10 @@ import {
 
 export const MAX_CLUSTER_BYTES = 12_288
 export const MAX_CLUSTER_CHARS = MAX_CLUSTER_BYTES
+export const OVERSIZED_DISTILL_MIN_BYTES = 12 * 1024
+export const OVERSIZED_DISTILL_MAX_PROMPT_BYTES = 100 * 1024
+export const OVERSIZED_DISTILL_TARGET_MAX_CHARS = 6_000
+export const MAX_OVERSIZED_DISTILL_PER_RUN = 2
 export const MAX_SKILL_METADATA_BYTES = 16_384
 export const MAX_SKILL_METADATA_CHARS = MAX_SKILL_METADATA_BYTES
 export const MAX_MERGED_CONTENT_CHARS = 8_000
@@ -128,6 +133,43 @@ export const L2_SKILL_DEDUP_SCHEMA: Record<string, unknown> = {
   },
 }
 
+/** B6: Explicit CCB `--json-schema` for L2 oversized single-file memory distillation. */
+export const L2_OVERSIZED_DISTILL_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['distill'],
+  properties: {
+    distill: {
+      type: 'array',
+      maxItems: 1,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: [
+          'slug',
+          'distilledTitle',
+          'distilledDescription',
+          'distilledType',
+          'distilledContent',
+          'reason',
+        ],
+        properties: {
+          slug: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$' },
+          distilledTitle: { type: 'string', minLength: 1, maxLength: 120 },
+          distilledDescription: { type: 'string', minLength: 1, maxLength: 240 },
+          distilledType: { type: 'string', enum: ['user', 'feedback', 'project', 'reference'] },
+          distilledContent: {
+            type: 'string',
+            minLength: 1,
+            maxLength: OVERSIZED_DISTILL_TARGET_MAX_CHARS,
+          },
+          reason: { type: 'string', minLength: 1, maxLength: 200 },
+        },
+      },
+    },
+  },
+}
+
 export type SkillVisibilityScope = readonly string[] | 'all' | ReadonlySet<string>
 
 export interface SemanticConsolidationState {
@@ -146,6 +188,8 @@ export interface CoreMemoryFileEntry {
   description: string
   body: string
   rawContent: string
+  /** Raw UTF-8 byte size of the on-disk file (distinct from JSON-serialized `bytes`). */
+  rawBytes: number
   sha256: string
   bytes: number
   chars: number
@@ -193,6 +237,8 @@ export interface SemanticConsolidationOptions {
   isStillAuthorized?: () => Promise<boolean>
   /** B7: Hard cap on total LLM calls in a single run (defaults to MAX_L2_CALLS_PER_RUN = 4). */
   maxCallsPerRun?: number
+  /** Optional test seam for oversized memory distillation apply primitive. */
+  applyDistill?: typeof applyOversizedMemoryDistill
   sessionsDb?: SkillUsageDbLike
   nowMs?: number
   force?: boolean
@@ -208,6 +254,7 @@ export interface SemanticConsolidationResult {
   mergedMemoryGroups: number
   mergedMemorySources: number
   supersededMemoriesArchived: number
+  distilledOversizedMemories: number
   duplicateSkillsArchived: number
   semanticSummary: string
   errors: string[]
@@ -299,24 +346,42 @@ function parseSimpleFrontmatter(raw: string): {
 
 /**
  * Read regular non-symlink `memory/*.md` files (never touches CLAUDE.md or user.md).
+ * B2/B11: Verifies `agentDir` and `memory/` are non-symlink directories whose realpaths
+ * stay strictly inside `realAgentDir`, and skips any symlink or boundary-escaping file.
  * B10: Runs full-content `scanMemoryContent` before any file can enter an LLM prompt!
  */
 export async function loadCoreMemoryFiles(agentDir: string): Promise<CoreMemoryFileEntry[]> {
   const memDir = join(agentDir, 'memory')
-  let entries: string[]
+  let realMemDir: string
   try {
-    entries = await readdir(memDir)
+    const agentStat = await lstat(agentDir)
+    if (agentStat.isSymbolicLink() || !agentStat.isDirectory()) return []
+    const memStat = await lstat(memDir)
+    if (memStat.isSymbolicLink() || !memStat.isDirectory()) return []
+    const realAgentDir = await realpath(agentDir)
+    realMemDir = await realpath(memDir)
+    const realAgentPrefix = realAgentDir.endsWith(sep) ? realAgentDir : `${realAgentDir}${sep}`
+    if (!realMemDir.startsWith(realAgentPrefix)) return []
   } catch {
     return []
   }
+  let entries: string[]
+  try {
+    entries = await readdir(realMemDir)
+  } catch {
+    return []
+  }
+  const realMemPrefix = realMemDir.endsWith(sep) ? realMemDir : `${realMemDir}${sep}`
   const results: CoreMemoryFileEntry[] = []
   for (const file of entries.sort()) {
     if (!MEMORY_FILE_RE.test(file)) continue
-    const fullPath = join(memDir, file)
+    const fullPath = join(realMemDir, file)
     try {
       const st = await lstat(fullPath)
       if (st.isSymbolicLink() || !st.isFile()) continue
-      const rawContent = await readFile(fullPath, 'utf8')
+      const realFull = await realpath(fullPath)
+      if (!realFull.startsWith(realMemPrefix)) continue
+      const rawContent = await readFile(realFull, 'utf8')
       // B10: Scan FULL file content before allowing it into L2 LLM prompt!
       if (!scanMemoryContent(rawContent).ok) continue
       const parsed = parseSimpleFrontmatter(rawContent)
@@ -327,6 +392,7 @@ export async function loadCoreMemoryFiles(agentDir: string): Promise<CoreMemoryF
         continue
       }
       const slug = file.slice(0, -3)
+      const rawBytes = Buffer.byteLength(rawContent, 'utf8')
       const docJsonBytes = Buffer.byteLength(
         JSON.stringify({
           slug,
@@ -345,6 +411,7 @@ export async function loadCoreMemoryFiles(agentDir: string): Promise<CoreMemoryF
         description: parsed.description,
         body: parsed.body,
         rawContent,
+        rawBytes,
         sha256: sha256Hex(rawContent),
         bytes: docJsonBytes,
         chars: rawContent.length,
@@ -412,6 +479,24 @@ export function clusterMemoryFiles(
     }
   }
   return clusters
+}
+
+/**
+ * Select oversized Core memories (>= `minBytes` UTF-8 raw file bytes), sorted
+ * largest-first so the worst context-bloat offenders are distilled first.
+ */
+export function selectOversizedMemories(
+  files: readonly CoreMemoryFileEntry[],
+  minBytes = OVERSIZED_DISTILL_MIN_BYTES,
+): CoreMemoryFileEntry[] {
+  return files
+    .map((entry) => ({
+      entry,
+      size: Buffer.byteLength(entry.rawContent, 'utf8'),
+    }))
+    .filter((item) => item.size >= minBytes)
+    .sort((a, b) => b.size - a.size || a.entry.slug.localeCompare(b.entry.slug))
+    .map((item) => item.entry)
 }
 
 async function readFreshSkillDiskState(
@@ -509,9 +594,11 @@ export function shouldRunSemanticConsolidation(params: {
   nowMs: number
   memoryCount: number
   eligibleSkillCount: number
+  oversizedMemoryCount?: number
   force?: boolean
 }): { run: boolean; reason: string } {
-  if (params.memoryCount < 2 && params.eligibleSkillCount < 2) {
+  const oversizedCount = params.oversizedMemoryCount ?? 0
+  if (params.memoryCount < 2 && params.eligibleSkillCount < 2 && oversizedCount < 1) {
     return { run: false, reason: 'insufficient_assets' }
   }
   if (params.force) return { run: true, reason: 'forced' }
@@ -519,6 +606,9 @@ export function shouldRunSemanticConsolidation(params: {
   const elapsed = params.nowMs - lastRunAt
   if (lastRunAt > 0 && elapsed < SEMANTIC_MIN_DEBOUNCE_MS) {
     return { run: false, reason: 'debounced' }
+  }
+  if (oversizedCount >= 1) {
+    return { run: true, reason: 'oversized_memory_threshold' }
   }
   const newMemories = Math.max(0, params.memoryCount - (params.state.lastMemoryCount ?? 0))
   if (params.memoryCount >= SEMANTIC_MEMORY_COUNT_TRIGGER) {
@@ -785,10 +875,268 @@ function validateMemoryClusterProposal(
   return { schemaValid: true, mergeGroups, archiveSuperseded }
 }
 
+function sliceUtf8Head(text: string, maxBytes: number): string {
+  if (maxBytes <= 0 || text.length === 0) return ''
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
+  let lo = 0
+  let hi = text.length
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    const end =
+      mid > 0 &&
+      mid < text.length &&
+      text.charCodeAt(mid - 1) >= 0xd800 &&
+      text.charCodeAt(mid - 1) <= 0xdbff
+        ? mid - 1
+        : mid
+    if (Buffer.byteLength(text.slice(0, end), 'utf8') <= maxBytes) {
+      lo = mid
+    } else {
+      hi = mid - 1
+    }
+  }
+  let end = lo
+  if (
+    end > 0 &&
+    end < text.length &&
+    text.charCodeAt(end - 1) >= 0xd800 &&
+    text.charCodeAt(end - 1) <= 0xdbff
+  ) {
+    end -= 1
+  }
+  while (end > 0 && Buffer.byteLength(text.slice(0, end), 'utf8') > maxBytes) {
+    end -= 1
+    if (end > 0 && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) {
+      end -= 1
+    }
+  }
+  return text.slice(0, end)
+}
+
+function sliceUtf8Tail(text: string, maxBytes: number): string {
+  if (maxBytes <= 0 || text.length === 0) return ''
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
+  let lo = 0
+  let hi = text.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    const start =
+      mid > 0 &&
+      mid < text.length &&
+      text.charCodeAt(mid) >= 0xdc00 &&
+      text.charCodeAt(mid) <= 0xdfff
+        ? mid + 1
+        : mid
+    if (Buffer.byteLength(text.slice(start), 'utf8') <= maxBytes) {
+      hi = mid
+    } else {
+      lo = mid + 1
+    }
+  }
+  let start = lo
+  if (
+    start > 0 &&
+    start < text.length &&
+    text.charCodeAt(start) >= 0xdc00 &&
+    text.charCodeAt(start) <= 0xdfff
+  ) {
+    start += 1
+  }
+  while (start < text.length && Buffer.byteLength(text.slice(start), 'utf8') > maxBytes) {
+    start += 1
+    if (
+      start < text.length &&
+      text.charCodeAt(start) >= 0xdc00 &&
+      text.charCodeAt(start) <= 0xdfff
+    ) {
+      start += 1
+    }
+  }
+  return text.slice(start)
+}
+
+/**
+ * Deterministically bound an oversized memory body to <= `maxBytes` UTF-8 bytes:
+ * keeps head 60% + tail 35% + middle omission notice + markdown section outline
+ * so the LLM sees both initial framing and latest conclusions without overflowing context.
+ */
+export function boundOversizedBodyForPrompt(
+  body: string,
+  maxBytes = OVERSIZED_DISTILL_MAX_PROMPT_BYTES,
+): { text: string; truncated: boolean; omittedBytes: number } {
+  const totalBytes = Buffer.byteLength(body, 'utf8')
+  if (totalBytes <= maxBytes) {
+    return { text: body, truncated: false, omittedBytes: 0 }
+  }
+  const headBudget = Math.floor(maxBytes * 0.6)
+  const tailBudget = Math.floor(maxBytes * 0.35)
+  const head = sliceUtf8Head(body, headBudget)
+  const tail = sliceUtf8Tail(body, tailBudget)
+  const headBytes = Buffer.byteLength(head, 'utf8')
+  const tailBytes = Buffer.byteLength(tail, 'utf8')
+  const omittedBytes = Math.max(0, totalBytes - headBytes - tailBytes)
+  const middleBudget = Math.max(0, maxBytes - headBytes - tailBytes)
+
+  const headings: string[] = []
+  const seenHeadings = new Set<string>()
+  for (const match of body.matchAll(/^#{1,6}\s+(.+)$/gm)) {
+    const line = match[0].trim().slice(0, 100)
+    if (!seenHeadings.has(line)) {
+      seenHeadings.add(line)
+      headings.push(line)
+      if (headings.length >= 40) break
+    }
+  }
+
+  const noticeLine = `\n\n[... OMITTED ${omittedBytes} UTF-8 bytes from middle; full original is losslessly archived on disk ...]\n`
+  let middle = ''
+  if (middleBudget > 0) {
+    let candidate = noticeLine
+    if (headings.length > 0) {
+      const outlineLines: string[] = ['[Section outline across full note:]']
+      for (const h of headings) {
+        const nextBlock = `${candidate}${outlineLines.join('\n')}\n- ${h}\n\n`
+        if (Buffer.byteLength(nextBlock, 'utf8') > middleBudget) break
+        outlineLines.push(`- ${h}`)
+      }
+      if (outlineLines.length > 1) {
+        candidate = `${candidate}${outlineLines.join('\n')}\n\n`
+      } else {
+        candidate = `${candidate}\n`
+      }
+    } else {
+      candidate = `${candidate}\n`
+    }
+    middle =
+      Buffer.byteLength(candidate, 'utf8') <= middleBudget
+        ? candidate
+        : sliceUtf8Head(noticeLine, middleBudget)
+  }
+
+  let combined = `${head}${middle}${tail}`
+  if (Buffer.byteLength(combined, 'utf8') > maxBytes) {
+    combined = sliceUtf8Head(combined, maxBytes)
+  }
+  return { text: combined, truncated: true, omittedBytes }
+}
+
+export function buildOversizedDistillPrompt(
+  entry: CoreMemoryFileEntry,
+  maxPromptBytes = OVERSIZED_DISTILL_MAX_PROMPT_BYTES,
+): string {
+  const bounded = boundOversizedBodyForPrompt(entry.body, maxPromptBytes)
+  const payload = {
+    slug: entry.slug,
+    type: entry.type,
+    name: entry.name,
+    description: entry.description,
+    rawBytes: entry.rawBytes,
+    truncatedInPrompt: bounded.truncated,
+    omittedBytes: bounded.omittedBytes,
+    body: bounded.text,
+  }
+  return [
+    'You are a careful, high-precision long-term memory distiller.',
+    'The single Core memory note below is oversized and bloats future prompt context.',
+    'The full original file will be archived losslessly on disk before replacement.',
+    `Distill it into ONE concise evergreen hot summary (markdown body <= ${OVERSIZED_DISTILL_TARGET_MAX_CHARS} chars) preserving all durable conclusions, hard constraints, dates, paths, identifiers, and latest state.`,
+    'Remove verbose logs, raw dumps, superseded drafts, and repetitive prose.',
+    'If the note cannot be safely distilled or should be left unchanged, return `{"distill":[]}`.',
+    'Return STRICT JSON ONLY with schema:',
+    `{"distill":[{"slug":"${entry.slug}","distilledTitle":"short title","distilledDescription":"one-line search hook","distilledType":"user|feedback|project|reference","distilledContent":"concise markdown body <= ${OVERSIZED_DISTILL_TARGET_MAX_CHARS} chars","reason":"short reason"}]}`,
+    '',
+    'Oversized memory note JSON:',
+    JSON.stringify(payload),
+  ].join('\n')
+}
+
+interface ValidatedOversizedDistill {
+  slug: string
+  distilledTitle: string
+  distilledDescription: string
+  distilledType: MemoryType
+  distilledContent: string
+  reason: string
+}
+
+function validateOversizedDistillProposal(
+  parsed: Record<string, unknown>,
+  entry: CoreMemoryFileEntry,
+): {
+  schemaValid: boolean
+  item: ValidatedOversizedDistill | null
+  rejectReason?: string
+} {
+  if (!Object.prototype.hasOwnProperty.call(parsed, 'distill')) {
+    return { schemaValid: false, item: null }
+  }
+  const rawDistill = parsed.distill
+  let candidate: unknown = null
+  if (rawDistill === null) {
+    return { schemaValid: true, item: null }
+  }
+  if (Array.isArray(rawDistill)) {
+    if (rawDistill.length > 1) return { schemaValid: false, item: null }
+    if (rawDistill.length === 0) return { schemaValid: true, item: null }
+    candidate = rawDistill[0]
+  } else if (typeof rawDistill === 'object') {
+    candidate = rawDistill
+  } else {
+    return { schemaValid: false, item: null }
+  }
+
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    return { schemaValid: false, item: null }
+  }
+  const d = candidate as Record<string, unknown>
+  const slug = typeof d.slug === 'string' ? d.slug.trim().replace(/\.md$/i, '') : ''
+  if (!SLUG_RE.test(slug) || slug !== entry.slug) {
+    return { schemaValid: true, item: null, rejectReason: 'slug_mismatch' }
+  }
+  const rawTitle = typeof d.distilledTitle === 'string' ? d.distilledTitle.trim() : ''
+  const rawDesc = typeof d.distilledDescription === 'string' ? d.distilledDescription.trim() : ''
+  if (!rawTitle || rawTitle.length > 120 || /[\r\n]/.test(rawTitle)) {
+    return { schemaValid: true, item: null, rejectReason: 'invalid_title' }
+  }
+  if (!rawDesc || rawDesc.length > 240 || /[\r\n]/.test(rawDesc)) {
+    return { schemaValid: true, item: null, rejectReason: 'invalid_description' }
+  }
+  if (typeof d.distilledType !== 'string' || !ALLOWED_TYPES.has(d.distilledType as MemoryType)) {
+    return { schemaValid: true, item: null, rejectReason: 'invalid_type' }
+  }
+  const distilledContent = typeof d.distilledContent === 'string' ? d.distilledContent.trim() : ''
+  if (!distilledContent || distilledContent.length > OVERSIZED_DISTILL_TARGET_MAX_CHARS) {
+    return { schemaValid: true, item: null, rejectReason: 'invalid_content_length' }
+  }
+  if (
+    !scanMemoryContent(rawTitle).ok ||
+    !scanMemoryContent(rawDesc).ok ||
+    !scanMemoryContent(distilledContent).ok
+  ) {
+    return { schemaValid: true, item: null, rejectReason: 'unsafe_content' }
+  }
+  const reason =
+    typeof d.reason === 'string' && d.reason.trim()
+      ? d.reason.trim().slice(0, 200)
+      : 'oversized_memory_distill'
+  return {
+    schemaValid: true,
+    item: {
+      slug,
+      distilledTitle: rawTitle,
+      distilledDescription: rawDesc,
+      distilledType: d.distilledType as MemoryType,
+      distilledContent,
+      reason,
+    },
+  }
+}
+
 function buildHumanSemanticSummary(counts: {
   mergedMemoryGroups: number
   mergedMemorySources: number
   supersededMemoriesArchived: number
+  distilledOversizedMemories: number
   duplicateSkillsArchived: number
 }): string {
   const parts: string[] = []
@@ -799,6 +1147,9 @@ function buildHumanSemanticSummary(counts: {
   }
   if (counts.supersededMemoriesArchived > 0) {
     parts.push(`收纳 ${counts.supersededMemoriesArchived} 条已过时记忆`)
+  }
+  if (counts.distilledOversizedMemories > 0) {
+    parts.push(`精简蒸馏 ${counts.distilledOversizedMemories} 篇超长记忆`)
   }
   if (counts.duplicateSkillsArchived > 0) {
     parts.push(`收纳 ${counts.duplicateSkillsArchived} 个重复或久未使用的技能`)
@@ -823,6 +1174,7 @@ export async function runSemanticConsolidation(
       mergedMemoryGroups: 0,
       mergedMemorySources: 0,
       supersededMemoriesArchived: 0,
+      distilledOversizedMemories: 0,
       duplicateSkillsArchived: 0,
       semanticSummary: '',
       errors: [],
@@ -837,6 +1189,7 @@ export async function runSemanticConsolidation(
   const allowSharedSkills = opts.allowSharedSkillMaintenance ?? opts.agentId === 'main'
   const state = await readConsolidationState(opts.agentDir)
   const memoryFiles = await loadCoreMemoryFiles(opts.agentDir)
+  const oversizedMemories = selectOversizedMemories(memoryFiles)
   const eligibleSkills = allowSharedSkills
     ? await loadEligibleUserSkillsMetadata(opts.skillsDir, opts.sessionsDb)
     : []
@@ -846,6 +1199,7 @@ export async function runSemanticConsolidation(
     nowMs,
     memoryCount: memoryFiles.length,
     eligibleSkillCount: eligibleSkills.length,
+    oversizedMemoryCount: oversizedMemories.length,
     force: opts.force,
   })
   if (!gate.run) {
@@ -857,6 +1211,7 @@ export async function runSemanticConsolidation(
       mergedMemoryGroups: 0,
       mergedMemorySources: 0,
       supersededMemoriesArchived: 0,
+      distilledOversizedMemories: 0,
       duplicateSkillsArchived: 0,
       semanticSummary: '',
       errors: [],
@@ -869,6 +1224,7 @@ export async function runSemanticConsolidation(
   let mergedMemoryGroups = 0
   let mergedMemorySources = 0
   let supersededMemoriesArchived = 0
+  let distilledOversizedMemories = 0
   let duplicateSkillsArchived = 0
   let bytesFreed = 0
   let callsUsed = 0
@@ -876,6 +1232,7 @@ export async function runSemanticConsolidation(
   let stoppedEarly = false
   const archivedMemoryFiles: string[] = []
   const archivedSkillNames: string[] = []
+  const phaseAConsumedSlugs = new Set<string>()
 
   const checkAuthorized = async (): Promise<boolean> => {
     if (!opts.isStillAuthorized) return true
@@ -889,11 +1246,22 @@ export async function runSemanticConsolidation(
     }
   }
 
-  // Phase A: Cluster-by-cluster Core memory semantic merge (<=12 KiB UTF-8 per cluster)
+  // Phase A: Cluster-by-cluster Core memory semantic merge (<=12 KiB UTF-8 per cluster).
+  // B11: Reserve call budget for Phase A2 when oversized memories exist so large cluster
+  // counts cannot permanently starve single-file distillation under the global maxCalls cap.
+  const reservedForDistill =
+    oversizedMemories.length > 0
+      ? Math.min(
+          oversizedMemories.length,
+          MAX_OVERSIZED_DISTILL_PER_RUN,
+          Math.max(1, Math.floor(maxCalls / 2)),
+        )
+      : 0
+  const phaseAMaxCalls = Math.max(0, maxCalls - reservedForDistill)
   const allMergeGroups: SemanticMemoryMergeGroup[] = []
   const allSuperseded: SemanticArchiveSuperseded[] = []
   for (const cluster of clusters) {
-    if (stoppedEarly || callsUsed >= maxCalls) break
+    if (stoppedEarly || callsUsed >= phaseAMaxCalls) break
     if (!(await checkAuthorized())) {
       stoppedEarly = true
       break
@@ -956,9 +1324,99 @@ export async function runSemanticConsolidation(
       bytesFreed += Math.max(0, mergeResult.bytesSaved)
       for (const entry of mergeResult.archivedEntries) {
         archivedMemoryFiles.push(entry.file)
+        phaseAConsumedSlugs.add(entry.file.replace(/\.md$/i, ''))
+      }
+      for (const group of mergeResult.mergedGroups) {
+        phaseAConsumedSlugs.add(group.targetFile.replace(/\.md$/i, ''))
+        for (const src of group.sourceFiles) {
+          phaseAConsumedSlugs.add(src.replace(/\.md$/i, ''))
+        }
       }
     } catch (err) {
       errors.push(`apply_merge_${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  // Phase A2: Oversized single-file memory distillation (>=12 KiB UTF-8, B6 + B7 + B8 + B10)
+  const applyDistill = opts.applyDistill ?? applyOversizedMemoryDistill
+  const oversizedCandidates = oversizedMemories
+    .filter((entry) => !phaseAConsumedSlugs.has(entry.slug))
+    .slice(0, MAX_OVERSIZED_DISTILL_PER_RUN)
+  for (const entry of oversizedCandidates) {
+    if (stoppedEarly || callsUsed >= maxCalls) break
+    if (!(await checkAuthorized())) {
+      stoppedEarly = true
+      break
+    }
+    callsUsed += 1
+    const res = await callModelWithAbortableTimeout(
+      opts.runModel,
+      {
+        attemptId: randomUUID(),
+        agentId: opts.agentId,
+        userId,
+        model,
+        prompt: buildOversizedDistillPrompt(entry),
+        outputSchema: L2_OVERSIZED_DISTILL_SCHEMA,
+      },
+      timeoutMs,
+    )
+    if (!res.ok) {
+      errors.push(`oversized_${entry.slug}_${res.error}`)
+      if (res.timedOut) {
+        stoppedEarly = true
+        break
+      }
+      continue
+    }
+    const parsed = parseModelJsonObject(res.output)
+    if (!parsed) {
+      errors.push(`oversized_${entry.slug}_invalid_json`)
+      continue
+    }
+    const validated = validateOversizedDistillProposal(parsed, entry)
+    if (!validated.schemaValid) {
+      errors.push(`oversized_${entry.slug}_schema_mismatch`)
+      continue
+    }
+    if (!validated.item) {
+      if (validated.rejectReason) {
+        opts.log?.('semantic_oversized_distill_rejected', {
+          agentId: opts.agentId,
+          file: entry.file,
+          reason: validated.rejectReason,
+        })
+      }
+      continue
+    }
+    try {
+      const distillRes = await applyDistill({
+        agentDir: opts.agentDir,
+        file: entry.file,
+        expectedSourceSha256: entry.sha256,
+        distilledTitle: validated.item.distilledTitle,
+        distilledDescription: validated.item.distilledDescription,
+        distilledType: validated.item.distilledType,
+        distilledContent: validated.item.distilledContent,
+        reason: validated.item.reason,
+        batchId,
+        actor: 'auto-dream-semantic',
+      })
+      if (distillRes.ok) {
+        distilledOversizedMemories += 1
+        bytesFreed += Math.max(0, distillRes.bytesSaved)
+        archivedMemoryFiles.push(distillRes.archivedEntry?.file ?? entry.file)
+      } else {
+        opts.log?.('semantic_oversized_distill_skipped', {
+          agentId: opts.agentId,
+          file: entry.file,
+          reason: distillRes.reason ?? 'skipped',
+        })
+      }
+    } catch (err) {
+      errors.push(
+        `apply_distill_${entry.slug}_${err instanceof Error ? err.message : String(err)}`,
+      )
     }
   }
 
@@ -1045,6 +1503,7 @@ export async function runSemanticConsolidation(
     mergedMemoryGroups,
     mergedMemorySources,
     supersededMemoriesArchived,
+    distilledOversizedMemories,
     duplicateSkillsArchived,
   })
   const hasChanges = Boolean(semanticSummary)
@@ -1092,6 +1551,7 @@ export async function runSemanticConsolidation(
     mergedMemoryGroups,
     mergedMemorySources,
     supersededMemoriesArchived,
+    distilledOversizedMemories,
     duplicateSkillsArchived,
     errorCount: errors.length,
   })
@@ -1103,6 +1563,7 @@ export async function runSemanticConsolidation(
     mergedMemoryGroups,
     mergedMemorySources,
     supersededMemoriesArchived,
+    distilledOversizedMemories,
     duplicateSkillsArchived,
     semanticSummary,
     errors,

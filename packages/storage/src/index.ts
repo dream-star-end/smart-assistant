@@ -60,5 +60,6 @@ export * from './sessionUploadReferences.js'
 
 // Context governance: reversible archive, local skill usage & L1 janitor.
 export * from './contextArchive.js'
+export * from './memoryDistill.js'
 export * from './skillUsageLocal.js'
 export * from './contextJanitor.js'

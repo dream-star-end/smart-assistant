@@ -589,7 +589,12 @@ export async function handleMemoryFile(
         topMatchKey: safe,
         metadata: { source: 'ui' },
       }).catch(() => {})
-      this.sendJson(res, 200, { ok: true, file: safe, version: r.version })
+      this.sendJson(res, 200, {
+        ok: true,
+        file: safe,
+        version: r.version,
+        ...(r.warning ? { warning: r.warning } : {}),
+      })
       return
     }
     // 版本冲突结构对齐 user 路由:{ error, conflict:{ text, version } }。三态 union 用 'conflict' in r 判别。
