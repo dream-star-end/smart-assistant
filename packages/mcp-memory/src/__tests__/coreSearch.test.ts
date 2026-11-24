@@ -13,7 +13,12 @@ const {
   handleSessionSearch,
   hasStrongCoreMemoryHit,
 } = await import('../memoryTools.js')
-const { writeMemoryTurnPolicy, clearMemoryTurnPolicy } = await import('@openclaude/storage')
+const {
+  archiveMemoryFiles,
+  writeMemoryTurnPolicy,
+  clearMemoryTurnPolicy,
+  paths,
+} = await import('@openclaude/storage')
 
 test('中文相关短查询可召回，覆盖率不足的长查询与无关查询都 No match', async () => {
   const dir = join(home, 'agents', 'main', 'memory')
@@ -446,4 +451,49 @@ test('dedup probe skips on strong hit and ignores expired memories', async () =>
   })
   assert.equal(live.hit, true)
   assert.match(live.path ?? '', /live\.md/)
+})
+
+test('归档兜底命中返回 outcome=hit 与 archived_fallback_hit，弱词法匹配附带归档提示消除遮蔽', async () => {
+  const agentId = 'archived-fallback-telemetry'
+  const agentDir = paths.agentDir(agentId)
+  const memDir = join(agentDir, 'memory')
+  mkdirSync(memDir, { recursive: true })
+  writeFileSync(
+    join(memDir, 'archived-runbook.md'),
+    '---\nname: archived-runbook\ndescription: 量子退火调度手册\ntype: project\n---\n量子退火调度手册要求优先校验队列权重。\n',
+  )
+  const archived = await archiveMemoryFiles(agentDir, ['archived-runbook.md'], {
+    reason: 'expired_ttl',
+    actor: 'test',
+  })
+  assert.equal(archived.archived.length, 1)
+
+  // (a) hits.length === 0 && archivedHits.length > 0 -> outcome='hit', policyReason='archived_fallback_hit'
+  const fallbackRes = await handleCoreSearch({
+    agentId,
+    query: '量子退火调度手册',
+  })
+  assert.match(fallbackRes.content[0].text, /Archived memories that match this topic/)
+  assert.match(fallbackRes.content[0].text, /archived-runbook\.md/)
+  assert.equal(fallbackRes.telemetry?.outcome, 'hit')
+  assert.equal(fallbackRes.telemetry?.policyReason, 'archived_fallback_hit')
+  assert.equal(fallbackRes.telemetry?.resultCount, 1)
+  assert.equal(fallbackRes.telemetry?.topMatchKey, 'archived-runbook.md')
+
+  // (b) hits.length > 0 && weakLexicalFallback === true -> appends archived match + policyReason='weak_lexical_with_archived'
+  writeFileSync(
+    join(memDir, 'active-note.md'),
+    '---\nname: active-note\ndescription: 量子退火调度手册草案\ntype: project\n---\n量子退火调度手册草案仅包含初稿。\n',
+  )
+  const weakRes = await handleCoreSearch({
+    agentId,
+    query: '量子退火调度手册',
+    _forceWeakLexicalFallback: true,
+  })
+  assert.match(weakRes.content[0].text, /^Found 1 safe Core matches/)
+  assert.match(weakRes.content[0].text, /Archived memories that also match this topic/)
+  assert.match(weakRes.content[0].text, /archived-runbook\.md/)
+  assert.equal(weakRes.telemetry?.outcome, 'hit')
+  assert.equal(weakRes.telemetry?.policyReason, 'weak_lexical_with_archived')
+  assert.equal(weakRes.telemetry?.resultCount, 1)
 })

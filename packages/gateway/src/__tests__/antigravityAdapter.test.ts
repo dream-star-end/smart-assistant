@@ -2204,6 +2204,192 @@ describe('Antigravity prompt state hardening (OCV5-781 audit)', () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  test('slotHashes diff tracks exact changedSlots and falls back to legacy_untracked for legacy state files (OCV5-885)', async () => {
+    const {
+      buildAntigravityPromptInputsKey,
+      buildAntigravitySlotHashes,
+      decideAntigravityPromptElision,
+      writeAntigravityPromptState,
+    } = await import('../engine/antigravityPromptState.js')
+    const {
+      buildResumedEnvelopeInputsKey,
+      buildResumedEnvelopeSlotHashes,
+      decideResumedEnvelopeElision,
+      writeResumedEnvelopeState,
+    } = await import('../engine/resumedEnvelopeDedup.js')
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-agy-slothash-'))
+    try {
+      const agyRoot = path.join(dir, 'antigravity')
+      const convDir = path.join(agyRoot, 'conversations')
+      await mkdir(convDir, { recursive: true })
+      const convId = '22222222-3333-4444-8555-666666666666'
+      const sessionKey = 'agent:main:webchat:dm:slot-diff'
+
+      const baseArgs = {
+        agentId: 'main',
+        cwd: '/work',
+        cwdSource: 'agent_home',
+        availableMcpTools: ['tool_a'],
+        applied: [
+          { name: 'SOUL', bytes: 10, sha256: '1'.repeat(64) },
+          { name: 'TOOLS', bytes: 20, sha256: '2'.repeat(64) },
+        ],
+      }
+      const key1 = buildAntigravityPromptInputsKey(baseArgs)
+      const hashes1 = buildAntigravitySlotHashes(baseArgs)
+
+      // 1. Legacy state file WITHOUT slotHashes -> inputs_changed returns ['legacy_untracked']
+      writeAntigravityPromptState(agyRoot, {
+        v: 1,
+        sessionKey,
+        conversationId: convId,
+        inputsKey: key1,
+        injectedAfterBaseline: 0,
+        updatedAt: Date.now(),
+      })
+      const changedArgs = {
+        ...baseArgs,
+        applied: [
+          { name: 'SOUL', bytes: 10, sha256: '1'.repeat(64) },
+          { name: 'TOOLS', bytes: 25, sha256: '3'.repeat(64) },
+          { name: 'PROJECT', bytes: 15, sha256: '4'.repeat(64) },
+        ],
+      }
+      const key2 = buildAntigravityPromptInputsKey(changedArgs)
+      const hashes2 = buildAntigravitySlotHashes(changedArgs)
+      assert.deepEqual(
+        decideAntigravityPromptElision({
+          openClaudeHome: dir,
+          antigravityRootDir: agyRoot,
+          conversationsDir: convDir,
+          sessionKey,
+          requestedConversationId: convId,
+          inputsKey: key2,
+          slotHashes: hashes2,
+          env: {},
+        }),
+        { elide: false, reason: 'inputs_changed', changedSlots: ['legacy_untracked'] },
+      )
+
+      // 2. State file WITH slotHashes -> exact added/modified slot names
+      writeAntigravityPromptState(agyRoot, {
+        v: 1,
+        sessionKey,
+        conversationId: convId,
+        inputsKey: key1,
+        slotHashes: hashes1,
+        injectedAfterBaseline: 0,
+        updatedAt: Date.now(),
+      })
+      assert.deepEqual(
+        decideAntigravityPromptElision({
+          openClaudeHome: dir,
+          antigravityRootDir: agyRoot,
+          conversationsDir: convDir,
+          sessionKey,
+          requestedConversationId: convId,
+          inputsKey: key2,
+          slotHashes: hashes2,
+          env: {},
+        }),
+        { elide: false, reason: 'inputs_changed', changedSlots: ['PROJECT', 'TOOLS'] },
+      )
+
+      // 3. Same backward-compatible + exact diff contract in resumedEnvelopeDedup
+      const envArgs1 = {
+        engine: 'cursor' as const,
+        preamble: 'p',
+        agentId: 'main',
+        cwd: '/work',
+        availableMcpTools: ['a'],
+        applied: [
+          { name: 'SOUL', bytes: 10, sha256: 'a'.repeat(64) },
+          { name: 'USER', bytes: 10, sha256: 'b'.repeat(64) },
+        ],
+      }
+      const envArgs2 = {
+        ...envArgs1,
+        applied: [
+          { name: 'SOUL', bytes: 10, sha256: 'c'.repeat(64) },
+        ],
+      }
+      const envKey1 = buildResumedEnvelopeInputsKey(envArgs1)
+      const envKey2 = buildResumedEnvelopeInputsKey(envArgs2)
+      const envHashes1 = buildResumedEnvelopeSlotHashes(envArgs1)
+      const envHashes2 = buildResumedEnvelopeSlotHashes(envArgs2)
+      writeResumedEnvelopeState(dir, {
+        v: 1,
+        engine: 'cursor',
+        sessionKey,
+        resumeId: 'res-1',
+        inputsKey: envKey1,
+        updatedAt: Date.now(),
+      })
+      assert.deepEqual(
+        decideResumedEnvelopeElision({
+          openClaudeHome: dir,
+          engine: 'cursor',
+          sessionKey,
+          requestedResumeId: 'res-1',
+          inputsKey: envKey2,
+          slotHashes: envHashes2,
+          env: {},
+        }),
+        { elide: false, reason: 'inputs_changed', changedSlots: ['legacy_untracked'] },
+      )
+      writeResumedEnvelopeState(dir, {
+        v: 1,
+        engine: 'cursor',
+        sessionKey,
+        resumeId: 'res-1',
+        inputsKey: envKey1,
+        slotHashes: envHashes1,
+        updatedAt: Date.now(),
+      })
+      assert.deepEqual(
+        decideResumedEnvelopeElision({
+          openClaudeHome: dir,
+          engine: 'cursor',
+          sessionKey,
+          requestedResumeId: 'res-1',
+          inputsKey: envKey2,
+          slotHashes: envHashes2,
+          env: {},
+        }),
+        { elide: false, reason: 'inputs_changed', changedSlots: ['SOUL', 'USER'] },
+      )
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('antigravityAdapter emits prompt_context_decision and context_compacted into context eval buffer (OCV5-885)', async () => {
+    const {
+      _peekPendingContextEvalEventsForTests,
+      _resetContextEvalBufferForTests,
+    } = await import('../v3ToolFailureReporter.js')
+    _resetContextEvalBufferForTests()
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const hugeInput = `oversized-turn-payload-${'x'.repeat(ANTIGRAVITY_MAX_PROMPT_BYTES + 10_000)}`
+      await runTurn(h, 'stream-text.ndjson', { input: hugeInput })
+      const buffered = _peekPendingContextEvalEventsForTests()
+      const decisionEv = buffered.find((e) => e.eventKind === 'prompt_context_decision')
+      const compactEv = buffered.find((e) => e.eventKind === 'context_compacted')
+      assert.ok(decisionEv, 'must record prompt_context_decision in context eval buffer')
+      assert.equal(decisionEv!.decision, 'full_inject')
+      assert.equal(decisionEv!.reason, 'fresh_conversation')
+      assert.ok(compactEv, 'must record context_compacted when prepareBoundedPrompt compacts input')
+      assert.equal(compactEv!.compactionScope, 'launch_prompt')
+      assert.equal(compactEv!.compactionStrategy, 'file_reference')
+      assert.ok((compactEv!.beforeBytes ?? 0) > (compactEv!.afterBytes ?? 0))
+    } finally {
+      _resetContextEvalBufferForTests()
+      await h.restore()
+    }
+  })
 })
 
 describe('Antigravity pre-spawn interrupt (OCV5-788)', () => {

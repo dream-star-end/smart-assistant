@@ -1674,6 +1674,65 @@ describe('T2 Wave 2 增量复核残余收口 — B1/B2/B8/B11 真实反例实证
     assert.equal(existsSync(join(agentDirMig, 'MEMORY.md.pre-memdir.bak')), false)
     assert.deepEqual(await readdir(outsideMig), [])
   })
+
+  it('OCV5-885: cleanupArchival 精确统计 UTF-8 bytesFreed 且 auto 非 dryRun 累加进 bytesFreed', async () => {
+    const { cleanupArchival, resetLifecycleState } = await import('../memoryLifecycle.js')
+    const { getSessionsDb, closeSessionsDb } = await import('../sessionsDb.js')
+    closeSessionsDb()
+    resetLifecycleState()
+
+    const agentId = 'janitor-bytes-freed-agent'
+    const agentDir = join(testHome, 'agents', agentId)
+    await mkdir(join(agentDir, 'memory'), { recursive: true })
+
+    const db = await getSessionsDb()
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS archival (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        tags TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        access_count INTEGER NOT NULL DEFAULT 0,
+        last_accessed TEXT DEFAULT ''
+      );
+    `)
+    const oldContentA = '归档字节统计验证-中文多字节内容-A'
+    const oldContentB = '归档字节统计验证-中文多字节内容-B-extra'
+    const expectedA = Buffer.byteLength(oldContentA, 'utf8')
+    const expectedB = Buffer.byteLength(oldContentB, 'utf8')
+
+    // 1. Direct cleanupArchival returns exact UTF-8 byte count
+    db.prepare(
+      `INSERT INTO archival (id, agent_id, content, tags, created_at, updated_at, access_count, last_accessed)
+       VALUES (?, ?, ?, '', '2020-01-01 00:00:00', '2020-01-01 00:00:00', 0, '')`,
+    ).run('arc-utf8-direct', agentId, oldContentA)
+    const directRes = await cleanupArchival({ agentId, minAccessCount: 0, minAgeDays: 60, maxDeletes: 50 })
+    assert.equal(directRes.deletedCount, 1)
+    assert.deepEqual(directRes.deletedIds, ['arc-utf8-direct'])
+    assert.equal(directRes.bytesFreed, expectedA)
+
+    // 2. runContextJanitor (mode='auto', dryRun=false, default sessionsDb path) accumulates cleaned.bytesFreed
+    db.prepare(
+      `INSERT INTO archival (id, agent_id, content, tags, created_at, updated_at, access_count, last_accessed)
+       VALUES (?, ?, ?, '', '2020-01-01 00:00:00', '2020-01-01 00:00:00', 0, '')`,
+    ).run('arc-utf8-janitor', agentId, oldContentB)
+    const liveRun = await runContextJanitor({
+      agentId,
+      agentDir,
+      dryRun: false,
+      mode: 'auto',
+      archiveExpiredMemories: false,
+      compactMemoryIndex: false,
+      archiveColdSkills: false,
+      pruneSkillHistory: false,
+      decayArchival: true,
+    })
+    assert.equal(liveRun.archivalCleaned, 1)
+    assert.equal(liveRun.bytesFreed, expectedB)
+    assert.equal(liveRun.errors.length, 0)
+  })
 })
 
 

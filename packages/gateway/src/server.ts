@@ -66,6 +66,7 @@ import {
   paths,
   readAgentsConfig,
   readConfig,
+  runRuntimeHygieneGc,
   syncMarketplaceHub,
 } from '@openclaude/storage'
 import {
@@ -752,6 +753,7 @@ export class Gateway {
     this.autoDream = new AutoDreamService({
       runModel: (input) => this._runAutoDreamModel(input),
       notifyResult: (report) => postInboxMessage(formatAutoDreamReceipt(report)),
+      runRuntimeGc: (nowMs) => runRuntimeHygieneGc({ nowMs, inflightSurface: this._delegateInflightSurface, log: (e, f) => this.log.info(e, f) }),
       log: (event, fields) => this.log.info(event, fields),
     })
     const optimizerClient = new AutoDreamOptimizerClient()

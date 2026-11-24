@@ -1,4 +1,8 @@
-import { ANTIGRAVITY_AUX_UPSTREAM_MODELS } from '@openclaude/protocol'
+import {
+  ANTIGRAVITY_AUX_UPSTREAM_MODELS,
+  antigravityAllowedUpstreamModels,
+  antigravityCanonicalModelForUpstream,
+} from '@openclaude/protocol'
 import { antigravityOwnerProtectedSql } from './antigravityRouteAuthority.js'
 /**
  * Antigravity turn settlement (OCV5-415 P2).
@@ -79,18 +83,31 @@ export interface AntigravityUsageBucket {
   monitoringCalls?: number
 }
 
+export class MissingAntigravityModelPricingError extends Error {
+  readonly modelId: string
+  constructor(modelId: string) {
+    super(`missing pricing for Antigravity swarm member model: ${modelId}`)
+    this.name = 'MissingAntigravityModelPricingError'
+    this.modelId = modelId
+  }
+}
+
 export interface AntigravityUsageTotals {
   /** Primary (route model) tokens — and legacy rows lacking upstream_model. */
   promptTokens: bigint
   candidatesTokens: bigint
   thoughtsTokens: bigint
   cachedTokens: bigint
-  /** Total relay calls across all buckets (primary + aux). */
+  /** Total relay calls across all buckets (primary + aux + extraModels). */
   calls: number
-  /** Server-observed HTTP 200 retirement banner, persisted as relay status 410. */
+  /** Server-observed HTTP 200 retirement banner on the primary route model, persisted as relay status 410. */
   retired?: boolean
   /** Auxiliary-model calls (ANTIGRAVITY_AUX_UPSTREAM_MODELS, billed at light-model rate). */
   aux?: AntigravityUsageBucket
+  /** Per-model billable buckets for local native swarm members using a different built-in Antigravity model (OCV5-879). */
+  extraModels?: Record<string, AntigravityUsageBucket>
+  /** Observational count of HTTP 410 retirement-banner calls on extra swarm member models (never waives primary delivery, never charged). */
+  retiredExtraModels?: Record<string, number>
 }
 
 export const EMPTY_ANTIGRAVITY_USAGE: AntigravityUsageTotals = Object.freeze({
@@ -108,6 +125,48 @@ export function isAntigravityAuxUpstreamModel(upstreamModel: string | null | und
     upstreamModel.length > 0 &&
     (ANTIGRAVITY_AUX_UPSTREAM_MODELS as readonly string[]).includes(upstreamModel)
   )
+}
+
+export type AntigravityBillableTarget =
+  | { bucket: 'primary'; modelId: string }
+  | { bucket: 'aux'; modelId: 'aux' }
+  | { bucket: 'model'; modelId: string }
+
+/**
+ * Resolve which billing & cooldown bucket a forwarded Antigravity generate call
+ * belongs to, strictly from server-observed `(routeModelId, upstreamModel)`.
+ */
+export function resolveAntigravityBillableTarget(
+  routeModelId: string,
+  upstreamModel: string | null | undefined,
+): AntigravityBillableTarget {
+  if (isAntigravityAuxUpstreamModel(upstreamModel)) {
+    return { bucket: 'aux', modelId: 'aux' }
+  }
+  if (!upstreamModel || antigravityAllowedUpstreamModels(routeModelId).includes(upstreamModel)) {
+    return { bucket: 'primary', modelId: routeModelId }
+  }
+  const canonical = antigravityCanonicalModelForUpstream(upstreamModel)
+  if (canonical) {
+    return canonical === routeModelId
+      ? { bucket: 'primary', modelId: routeModelId }
+      : { bucket: 'model', modelId: canonical }
+  }
+  return { bucket: 'primary', modelId: routeModelId }
+}
+
+/** True iff every billable extra member model present in `totals` has authoritative pricing. */
+export function hasAllAntigravityExtraPricing(
+  totals: AntigravityUsageTotals,
+  pricingLookup?: Pick<PricingCache, 'get'> | null,
+): boolean {
+  if (!totals.extraModels) return true
+  for (const [modelId, bucket] of Object.entries(totals.extraModels)) {
+    if (!bucket || bucket.calls <= 0) continue
+    const found = pricingLookup?.get(modelId) ?? null
+    if (found === null) return false
+  }
+  return true
 }
 
 function minBigInt(a: bigint, b: bigint): bigint {
@@ -170,29 +229,40 @@ export async function sumAntigravityRelayUsage(
 ): Promise<AntigravityUsageTotals> {
   const res = await pool.query<{
     bucket?: string | null
+    route_model_id?: string | null
+    upstream_model?: string | null
     prompt: string | null
     candidates: string | null
     thoughts: string | null
     cached: string | null
+    billable_prompt?: string | null
+    billable_candidates?: string | null
+    billable_thoughts?: string | null
+    billable_cached?: string | null
     calls: string
+    billable_calls?: string | null
+    retired_calls?: string | null
     monitoring_calls?: string | null
     retired: boolean | null
   }>(
-    `SELECT CASE
-              WHEN COALESCE(upstream_model, '') = ANY($3::text[]) THEN 'aux'
-              ELSE 'primary'
-            END AS bucket,
+    `SELECT route_model_id,
+            COALESCE(upstream_model, '') AS upstream_model,
             SUM(prompt_tokens)::text AS prompt, SUM(candidates_tokens)::text AS candidates,
             SUM(thoughts_tokens)::text AS thoughts, SUM(cached_tokens)::text AS cached,
+            COALESCE(SUM(prompt_tokens) FILTER (WHERE status_code <> 410), 0)::text AS billable_prompt,
+            COALESCE(SUM(candidates_tokens) FILTER (WHERE status_code <> 410), 0)::text AS billable_candidates,
+            COALESCE(SUM(thoughts_tokens) FILTER (WHERE status_code <> 410), 0)::text AS billable_thoughts,
+            COALESCE(SUM(cached_tokens) FILTER (WHERE status_code <> 410), 0)::text AS billable_cached,
             COUNT(*)::text AS calls,
-            COUNT(*) FILTER (WHERE COALESCE(request_type, '') = $4)::text AS monitoring_calls,
+            COUNT(*) FILTER (WHERE status_code <> 410)::text AS billable_calls,
+            COUNT(*) FILTER (WHERE status_code = 410)::text AS retired_calls,
+            COUNT(*) FILTER (WHERE COALESCE(request_type, '') = $3)::text AS monitoring_calls,
             BOOL_OR(status_code = 410) AS retired
        FROM antigravity_relay_usage WHERE request_id = $1 AND user_id = $2
-      GROUP BY 1`,
+      GROUP BY 1, 2`,
     [
       requestId,
       userId.toString(),
-      [...ANTIGRAVITY_AUX_UPSTREAM_MODELS],
       ANTIGRAVITY_MONITORING_REQUEST_TYPE,
     ],
   )
@@ -206,7 +276,6 @@ export async function sumAntigravityRelayUsage(
     retired: false,
   }
   for (const row of res.rows) {
-    const bucket = row.bucket ?? 'primary'
     const prompt = BigInt(row.prompt ?? '0')
     const candidates = BigInt(row.candidates ?? '0')
     const thoughts = BigInt(row.thoughts ?? '0')
@@ -214,8 +283,14 @@ export async function sumAntigravityRelayUsage(
     const calls = Number(row.calls ?? '0')
     const monitoringCalls = Number(row.monitoring_calls ?? '0')
     totals.calls += calls
-    if (row.retired === true) totals.retired = true
-    if (bucket === 'aux') {
+    const target: AntigravityBillableTarget =
+      row.upstream_model === undefined && row.bucket !== undefined
+        ? row.bucket === 'aux'
+          ? { bucket: 'aux', modelId: 'aux' }
+          : { bucket: 'primary', modelId: row.route_model_id ?? '' }
+        : resolveAntigravityBillableTarget(row.route_model_id ?? '', row.upstream_model)
+    if (target.bucket === 'aux') {
+      if (row.retired === true) totals.retired = true
       const prev = totals.aux
       const nextMonitoringCalls = (prev?.monitoringCalls ?? 0) + monitoringCalls
       totals.aux = {
@@ -226,7 +301,59 @@ export async function sumAntigravityRelayUsage(
         calls: (prev?.calls ?? 0) + calls,
         ...(nextMonitoringCalls > 0 ? { monitoringCalls: nextMonitoringCalls } : {}),
       }
+    } else if (target.bucket === 'model') {
+      const retiredCalls =
+        row.retired_calls !== undefined && row.retired_calls !== null
+          ? Number(row.retired_calls)
+          : row.retired === true
+            ? calls
+            : 0
+      const billableCalls =
+        row.billable_calls !== undefined && row.billable_calls !== null
+          ? Number(row.billable_calls)
+          : Math.max(0, calls - retiredCalls)
+      const billablePrompt =
+        row.billable_prompt !== undefined && row.billable_prompt !== null
+          ? BigInt(row.billable_prompt)
+          : row.retired === true && billableCalls === 0
+            ? 0n
+            : prompt
+      const billableCandidates =
+        row.billable_candidates !== undefined && row.billable_candidates !== null
+          ? BigInt(row.billable_candidates)
+          : row.retired === true && billableCalls === 0
+            ? 0n
+            : candidates
+      const billableThoughts =
+        row.billable_thoughts !== undefined && row.billable_thoughts !== null
+          ? BigInt(row.billable_thoughts)
+          : row.retired === true && billableCalls === 0
+            ? 0n
+            : thoughts
+      const billableCached =
+        row.billable_cached !== undefined && row.billable_cached !== null
+          ? BigInt(row.billable_cached)
+          : row.retired === true && billableCalls === 0
+            ? 0n
+            : cached
+      if (retiredCalls > 0) {
+        if (!totals.retiredExtraModels) totals.retiredExtraModels = {}
+        totals.retiredExtraModels[target.modelId] =
+          (totals.retiredExtraModels[target.modelId] ?? 0) + retiredCalls
+      }
+      if (billableCalls > 0) {
+        if (!totals.extraModels) totals.extraModels = {}
+        const prev = totals.extraModels[target.modelId]
+        totals.extraModels[target.modelId] = {
+          promptTokens: (prev?.promptTokens ?? 0n) + billablePrompt,
+          candidatesTokens: (prev?.candidatesTokens ?? 0n) + billableCandidates,
+          thoughtsTokens: (prev?.thoughtsTokens ?? 0n) + billableThoughts,
+          cachedTokens: (prev?.cachedTokens ?? 0n) + billableCached,
+          calls: (prev?.calls ?? 0) + billableCalls,
+        }
+      }
     } else {
+      if (row.retired === true) totals.retired = true
       totals.promptTokens += prompt
       totals.candidatesTokens += candidates
       totals.thoughtsTokens += thoughts
@@ -266,14 +393,65 @@ function computeAntigravityBreakdown(
   const auxPricing = auxUsage ? resolveAntigravityAuxPricing(pricing, pricingLookup) : null
   const primaryScaled = scaledTokenCost(primaryUsage, pricing)
   const auxScaled = auxUsage && auxPricing ? scaledTokenCost(auxUsage, auxPricing) : 0n
-  const totalScaled = primaryScaled + auxScaled
+  let extraScaled = 0n
+  let extraCalls = 0
+  let extraInputTokens = 0n
+  let extraOutputTokens = 0n
+  let extraCacheReadTokens = 0n
+  const extraModels: Array<{
+    modelId: string
+    calls: number
+    usage: TokenUsage
+    costCredits: bigint
+    pricing: ModelPricing
+  }> = []
+  if (totals.extraModels) {
+    for (const modelId of Object.keys(totals.extraModels).sort()) {
+      const bucket = totals.extraModels[modelId]
+      if (!bucket || bucket.calls <= 0) continue
+      const lookedUp = pricingLookup?.get(modelId) ?? null
+      if (lookedUp === null) {
+        throw new MissingAntigravityModelPricingError(modelId)
+      }
+      const usage = mapAntigravityUsage(bucket)
+      const scaled = scaledTokenCost(usage, lookedUp)
+      extraScaled += scaled
+      extraCalls += bucket.calls
+      extraInputTokens += BigInt(usage.input_tokens)
+      extraOutputTokens += BigInt(usage.output_tokens)
+      extraCacheReadTokens += BigInt(usage.cache_read_tokens)
+      extraModels.push({
+        modelId,
+        calls: bucket.calls,
+        usage,
+        costCredits: ceilScaledCredits(scaled),
+        pricing: lookedUp,
+      })
+    }
+  }
+  let retiredExtraCalls = 0
+  if (totals.retiredExtraModels) {
+    for (const n of Object.values(totals.retiredExtraModels)) {
+      if (typeof n === 'number' && n > 0) retiredExtraCalls += n
+    }
+  }
+  const totalScaled = primaryScaled + auxScaled + extraScaled
   const costCredits = ceilScaledCredits(totalScaled)
-  const billableUsage: TokenUsage = auxUsage
+  const hasSecondary = Boolean(auxUsage) || extraModels.length > 0
+  const billableUsage: TokenUsage = hasSecondary
     ? {
-        input_tokens: BigInt(primaryUsage.input_tokens) + BigInt(auxUsage.input_tokens),
-        output_tokens: BigInt(primaryUsage.output_tokens) + BigInt(auxUsage.output_tokens),
+        input_tokens:
+          BigInt(primaryUsage.input_tokens) +
+          BigInt(auxUsage?.input_tokens ?? 0n) +
+          extraInputTokens,
+        output_tokens:
+          BigInt(primaryUsage.output_tokens) +
+          BigInt(auxUsage?.output_tokens ?? 0n) +
+          extraOutputTokens,
         cache_read_tokens:
-          BigInt(primaryUsage.cache_read_tokens) + BigInt(auxUsage.cache_read_tokens),
+          BigInt(primaryUsage.cache_read_tokens) +
+          BigInt(auxUsage?.cache_read_tokens ?? 0n) +
+          extraCacheReadTokens,
         cache_write_tokens: 0n,
       }
     : primaryUsage
@@ -281,11 +459,24 @@ function computeAntigravityBreakdown(
     primaryUsage,
     auxUsage,
     auxPricing,
+    extraModels,
+    extraCalls,
+    retiredExtraCalls,
+    extraOutputTokens,
     primaryCostCredits: ceilScaledCredits(primaryScaled),
     auxCostCredits: ceilScaledCredits(auxScaled),
     costCredits,
     billableUsage,
   }
+}
+
+export function antigravityUsageCostOrNull(
+  totals: AntigravityUsageTotals,
+  pricing: ModelPricing,
+  pricingLookup?: Pick<PricingCache, 'get'> | null,
+): bigint | null {
+  if (!hasAllAntigravityExtraPricing(totals, pricingLookup)) return null
+  return computeAntigravityBreakdown(totals, pricing, pricingLookup).costCredits
 }
 
 export function antigravityUsageCost(
@@ -314,14 +505,18 @@ export function planAntigravitySettle(args: {
   const usage = breakdown.billableUsage
   const effectiveStatus = args.totals.retired ? 'error' : args.engineStatus
   const engineOk = effectiveStatus === 'success'
-  const primaryCalls = Math.max(0, args.totals.calls - (args.totals.aux?.calls ?? 0))
+  const primaryCalls = Math.max(
+    0,
+    args.totals.calls - (args.totals.aux?.calls ?? 0) - breakdown.extraCalls - breakdown.retiredExtraCalls,
+  )
+  const nonAuxCalls = primaryCalls + breakdown.extraCalls
+  const nonAuxOutputTokens = BigInt(breakdown.primaryUsage.output_tokens) + breakdown.extraOutputTokens
   const hasOutput =
-    primaryCalls > 0
-      ? BigInt(breakdown.primaryUsage.output_tokens) > 0n
-      : BigInt(usage.output_tokens) > 0n
+    nonAuxCalls > 0 ? nonAuxOutputTokens > 0n : BigInt(usage.output_tokens) > 0n
   const waivedNoOutput = engineOk && !hasOutput && cost_credits > 0n
   const costCredits = engineOk && !waivedNoOutput ? cost_credits : 0n
-  const hasBreakdown = Boolean(breakdown.auxUsage)
+  const hasBreakdown =
+    Boolean(breakdown.auxUsage) || breakdown.extraModels.length > 0 || breakdown.retiredExtraCalls > 0
   const monitoringCalls = args.totals.aux?.monitoringCalls ?? 0
   const snapshotJson = JSON.stringify({
     ...snapshot,
@@ -338,6 +533,34 @@ export function planAntigravitySettle(args: {
             cost_credits: breakdown.primaryCostCredits.toString(),
           },
         }
+      : {}),
+    ...(breakdown.extraModels.length > 0
+      ? {
+          antigravity_models: Object.fromEntries(
+            breakdown.extraModels.map((m) => [
+              m.modelId,
+              {
+                calls: m.calls,
+                input_tokens: BigInt(m.usage.input_tokens).toString(),
+                output_tokens: BigInt(m.usage.output_tokens).toString(),
+                cache_read_tokens: BigInt(m.usage.cache_read_tokens).toString(),
+                cost_credits: m.costCredits.toString(),
+                pricing: {
+                  model_id: m.pricing.model_id,
+                  input_per_mtok: m.pricing.input_per_mtok.toString(),
+                  output_per_mtok: m.pricing.output_per_mtok.toString(),
+                  cache_read_per_mtok: m.pricing.cache_read_per_mtok.toString(),
+                  cache_write_per_mtok: m.pricing.cache_write_per_mtok.toString(),
+                  multiplier: m.pricing.multiplier,
+                  source: 'catalog',
+                },
+              },
+            ]),
+          ),
+        }
+      : {}),
+    ...(breakdown.retiredExtraCalls > 0 && args.totals.retiredExtraModels
+      ? { antigravity_retired_models: args.totals.retiredExtraModels }
       : {}),
     ...(breakdown.auxUsage && breakdown.auxPricing && args.totals.aux
       ? {
@@ -400,6 +623,7 @@ export async function settleAntigravityTurn(args: {
   const pricing = args.pricing.get(args.modelId)
   if (pricing === null) return null
   const totals = await sumAntigravityRelayUsage(args.pool, args.requestId, args.userId)
+  if (!hasAllAntigravityExtraPricing(totals, args.pricing)) return null
   const plan = planAntigravitySettle({
     engineStatus: args.engineStatus,
     totals,
@@ -476,6 +700,10 @@ export async function refreshWaivedAntigravityUsage(args: {
       return false
     }
     const totals = await sumAntigravityRelayUsage(client, args.requestId, args.userId)
+    if (!hasAllAntigravityExtraPricing(totals, args.pricing)) {
+      await client.query('ROLLBACK')
+      return false
+    }
     if (totals.calls === Number(row.snapshot.antigravity_calls)) {
       await client.query('ROLLBACK')
       return false

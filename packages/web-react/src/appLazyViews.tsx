@@ -95,12 +95,25 @@ export const QuickAskWindow = createRetryableLazy(() =>
   import("./components/chat/QuickAskWindow").then((m) => ({ default: m.QuickAskWindow })),
 );
 
+let lazyCentersPrefetchScheduled = false;
+
+/** 测试辅助：重置懒块预取一次守卫。 */
+export function _resetLazyCentersPrefetchForTest(): void {
+  lazyCentersPrefetchScheduled = false;
+}
+
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
-// loading 瞬间。首屏渲染完成后在浏览器空闲期预取这些懒块——Vite 对同一 specifier
-// 的动态 import 去重,预取后 React.lazy 解析即命中,首开零延迟;弱网下预取失败静默,
-// 行为退化为按需加载,不比没有预取更差。
-export function prefetchLazyCentersOnIdle(): void {
+// loading 瞬间。确认登录后（或 demo 工作区）在浏览器空闲期预取这些懒块——Vite 对同一
+// specifier 的动态 import 去重,预取后 React.lazy 解析即命中,首开零延迟;匿名访问首页
+// （Landing / AuthGate）不调用本函数,避免额外拉取 8+ 个登录后中心大块;弱网下预取失败静默。
+export function prefetchLazyCentersOnIdle(): () => void {
+  if (lazyCentersPrefetchScheduled) return () => {};
+  lazyCentersPrefetchScheduled = true;
+  let fired = false;
+  let cancelled = false;
   const prefetch = () => {
+    if (cancelled || fired) return;
+    fired = true;
     // 省流量模式 / 2G 下不在后台下完全部中心(shell 审计 S-16);API 缺席的浏览器照常预取。
     if (!shouldPrefetchCenters(readNetworkInformation())) return;
     void import("./components/AgentPicker").catch(() => {});
@@ -123,10 +136,23 @@ export function prefetchLazyCentersOnIdle(): void {
     }
   };
   if (typeof requestIdleCallback === "function") {
-    requestIdleCallback(prefetch, { timeout: 8000 });
-  } else {
-    setTimeout(prefetch, 3000);
+    const id = requestIdleCallback(prefetch, { timeout: 8000 });
+    return () => {
+      cancelled = true;
+      if (!fired) {
+        lazyCentersPrefetchScheduled = false;
+        if (typeof cancelIdleCallback === "function") cancelIdleCallback(id);
+      }
+    };
   }
+  const timer = setTimeout(prefetch, 3000);
+  return () => {
+    cancelled = true;
+    if (!fired) {
+      lazyCentersPrefetchScheduled = false;
+      clearTimeout(timer);
+    }
+  };
 }
 
 /** 全屏懒块加载态（营销首页 chunk 下载期）——与启动续期 splash 同视觉,不割裂。*/

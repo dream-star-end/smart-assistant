@@ -1,0 +1,124 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-11-24T09:37:43.721Z",
+  "thresholds": {
+    "maxTotalBytes": 44000,
+    "maxTotalGrowthRatio": 0.05,
+    "maxSlotGrowthRatio": 0.15,
+    "minSlotGrowthBytes": 256
+  },
+  "fixtures": {
+    "webchat_first_turn": {
+      "totalBytes": 13318,
+      "tokensEstimate": 3985,
+      "staticPrefixBytes": 10905,
+      "slots": {
+        "INTELLIGENT_UI": 1193,
+        "AGENTS": 5693,
+        "MEMORY": 1897,
+        "TOOLS": 2094,
+        "ENV": 254,
+        "SOUL": 354,
+        "AGENTS_DYNAMIC": 678,
+        "SKILLS": 379,
+        "MEMORY_INDEX": 686
+      }
+    },
+    "webchat_resumed_turn": {
+      "totalBytes": 16336,
+      "tokensEstimate": 4939,
+      "staticPrefixBytes": 13590,
+      "slots": {
+        "INTELLIGENT_UI": 1193,
+        "AGENTS": 6982,
+        "MEMORY": 1897,
+        "TOOLS": 3490,
+        "ENV": 254,
+        "SOUL": 354,
+        "AGENTS_DYNAMIC": 678,
+        "SKILLS": 379,
+        "MEMORY_INDEX": 686,
+        "REPO": 326
+      }
+    },
+    "wechat_turn": {
+      "totalBytes": 13535,
+      "tokensEstimate": 4062,
+      "staticPrefixBytes": null,
+      "slots": {
+        "ENV": 254,
+        "SOUL": 354,
+        "AGENTS": 7834,
+        "SKILLS": 379,
+        "MEMORY": 2585,
+        "TOOLS": 2094
+      }
+    },
+    "research_turn": {
+      "totalBytes": 17315,
+      "tokensEstimate": 5267,
+      "staticPrefixBytes": 10905,
+      "slots": {
+        "INTELLIGENT_UI": 1193,
+        "AGENTS": 5693,
+        "MEMORY": 1897,
+        "TOOLS": 2094,
+        "ENV": 254,
+        "SOUL": 354,
+        "AGENTS_DYNAMIC": 678,
+        "SKILLS": 379,
+        "MEMORY_INDEX": 686,
+        "RESEARCH": 3990
+      }
+    },
+    "project_memory_full": {
+      "totalBytes": 17459,
+      "tokensEstimate": 5118,
+      "staticPrefixBytes": 10905,
+      "slots": {
+        "INTELLIGENT_UI": 1193,
+        "AGENTS": 5693,
+        "MEMORY": 1897,
+        "TOOLS": 2094,
+        "ENV": 254,
+        "SOUL": 354,
+        "PROJECT": 1975,
+        "AGENTS_DYNAMIC": 678,
+        "SKILLS": 593,
+        "MEMORY_INDEX": 686,
+        "PROJECT_MEMORY": 1938
+      }
+    }
+  },
+  "subEvals": {
+    "coreMemory": {
+      "minPrecisionAt3": 1,
+      "minMrr": 1,
+      "minNoMatchAccuracy": 1,
+      "maxAvgHitsRatio": 0.4
+    },
+    "skillShadow": {
+      "minCases": 40,
+      "routes": {
+        "existing_keyword_fallback": {
+          "minRecallAt3": 0.375,
+          "minRecallAt5": 0.45
+        },
+        "zh_lexical": {
+          "minRecallAt3": 0.55,
+          "minRecallAt5": 0.625
+        },
+        "char_ngram": {
+          "minRecallAt3": 0.725,
+          "minRecallAt5": 0.725
+        },
+        "bm25_multiquery": {
+          "minRecallAt3": 0.75,
+          "minRecallAt5": 0.8
+        }
+      }
+    }
+  },
+  "waivers": [],
+  "replayReceipts": []
+}

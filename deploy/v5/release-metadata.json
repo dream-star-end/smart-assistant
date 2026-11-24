@@ -205,7 +205,8 @@
     "0345_commercial_user_site_collaborators",
     "0346_commercial_perf_timeline_and_live_snapshot",
     "0347_commercial_perf_timeline_and_live_snapshot_indexes",
-    "0348_commercial_pending_browser_handoffs"
+    "0348_commercial_pending_browser_handoffs",
+    "0349_commercial_context_eval_observability"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

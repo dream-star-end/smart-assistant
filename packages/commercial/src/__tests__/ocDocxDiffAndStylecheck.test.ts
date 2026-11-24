@@ -717,4 +717,56 @@ describe("oc-stylecheck (OCV5-865)", () => {
       rmSync(work, { recursive: true, force: true });
     }
   });
+
+  test("catches Chinese engineering/research AI clichés and reports legitimate technical terms in advisory_hits without strict fail (OCV5-878)", () => {
+    const work = mkdtempSync(join(tmpdir(), "oc-stylecheck-ocv5-878-"));
+    try {
+      // 1. Hard engineering/research AI clichés must fail --strict
+      const aiCoinageMd = join(work, "ai-coinage.md");
+      writeFileSync(
+        aiCoinageMd,
+        [
+          "# 系统方案总结",
+          "本架构实现了逻辑闭合与全链路闭环，完成工程兑现与价值兑现。",
+          "方法通过多维协同与范式跃迁打通底层逻辑，提供了有力支撑。",
+        ].join("\n"),
+        "utf8",
+      );
+      const coinageRes = runPy(OC_STYLECHECK, [aiCoinageMd, "--strict"]);
+      assert.equal(coinageRes.status, 1, "engineering AI clichés must fail strict mode");
+      const coinageReport = JSON.parse(coinageRes.stdout);
+      assert.equal(coinageReport.passed, false);
+      const hardPhrases = coinageReport.cliche_hits.map((h: any) => h.phrase);
+      for (const expected of ["逻辑闭合", "全链路闭环", "工程兑现", "价值兑现", "多维协同", "范式跃迁", "底层逻辑", "提供了有力支撑"]) {
+        assert.ok(hardPhrases.includes(expected), `expected hard cliché hit '${expected}', got: ${JSON.stringify(hardPhrases)}`);
+      }
+      // 已被同行硬套话覆盖的 闭合/闭环/兑现 不重复刷入 advisory_hits
+      assert.deepEqual(coinageReport.advisory_hits, []);
+
+      // 2. Legitimate control-theory / math phrasing only triggers advisory_hits and passes --strict
+      const techMd = join(work, "control-theory.md");
+      writeFileSync(
+        techMd,
+        [
+          "# 控制系统稳定性分析",
+          "依据奈奎斯特稳定性判据，闭合回路在相位裕度大于 45 度时保持稳定。",
+          "与基线相比，改进后的滤波器使输出信噪比显著提升 3.2 dB。",
+        ].join("\n"),
+        "utf8",
+      );
+      const techRes = runPy(OC_STYLECHECK, [techMd, "--strict"]);
+      assert.equal(techRes.status, 0, `legitimate technical terms must pass strict mode: ${techRes.stdout}\n${techRes.stderr}`);
+      const techReport = JSON.parse(techRes.stdout);
+      assert.equal(techReport.passed, true);
+      assert.equal(techReport.score, 100);
+      assert.deepEqual(techReport.cliche_hits, []);
+      const advPhrases = techReport.advisory_hits.map((h: any) => h.phrase);
+      assert.ok(advPhrases.includes("判据"), `expected '判据' in advisory_hits, got: ${JSON.stringify(techReport.advisory_hits)}`);
+      assert.ok(advPhrases.includes("闭合"), `expected '闭合' in advisory_hits, got: ${JSON.stringify(techReport.advisory_hits)}`);
+      assert.ok(advPhrases.includes("显著提升"), `expected '显著提升' in advisory_hits, got: ${JSON.stringify(techReport.advisory_hits)}`);
+      assert.ok(techReport.advisory_hits.every((h: any) => h.source === "advisory"));
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
 });

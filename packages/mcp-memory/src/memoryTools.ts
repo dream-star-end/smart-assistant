@@ -396,6 +396,8 @@ export async function handleCoreSearch(args: {
   today?: string
   /** Test seam for the authenticated master relay; omitted by the CLI. */
   semanticOptions?: CoreMemorySemanticOptions
+  /** Test seam: exercise weak lexical fallback archived supplement path directly. */
+  _forceWeakLexicalFallback?: boolean
 }): Promise<MemoryToolResult> {
   const denied = await memorySearchPolicyError('core')
   if (denied) return denied
@@ -426,8 +428,10 @@ export async function handleCoreSearch(args: {
   let weakLexicalFallback = false
   let hits: CoreHit[]
   if (semanticFiles === null) {
-    if (strongLexicalHits.length > 0) hits = strongLexicalHits
-    else {
+    if (strongLexicalHits.length > 0) {
+      hits = strongLexicalHits
+      if (args._forceWeakLexicalFallback) weakLexicalFallback = true
+    } else {
       const weakEligible = lexicalHits.filter((hit) =>
         coverageAtLeastHalf(hit.matchedCharacters, totalTermCharacters),
       )
@@ -481,9 +485,11 @@ export async function handleCoreSearch(args: {
         ),
       ]
       return toolOk(archivedLines.join('\n'), {
-        outcome: 'no_match',
+        outcome: 'hit',
+        policyReason: 'archived_fallback_hit',
         retrievalMode,
-        resultCount: 0,
+        resultCount: archivedHits.length,
+        topMatchKey: archivedHits[0]?.target,
       })
     }
     return toolOk(`No safe Core memories match "${query}".`, {
@@ -492,11 +498,19 @@ export async function handleCoreSearch(args: {
       resultCount: 0,
     })
   }
+  // Eliminate weak-match shadowing: when only weak lexical fallback hits exist,
+  // also check archived memories so relevant auto-archived items remain discoverable.
+  const archivedSupplement = weakLexicalFallback
+    ? await searchArchivedMemories(paths.agentDir(args.agentId), query, 3).catch(() => [])
+    : []
+  const weakArchivedPolicyReason =
+    archivedSupplement.length > 0 ? 'weak_lexical_with_archived' : undefined
   if (!page.length)
     return toolOk(
       `Found ${hits.length} safe Core matches for "${query}", but offset ${offset} is past the last result.`,
       {
         outcome: 'hit',
+        ...(weakArchivedPolicyReason ? { policyReason: weakArchivedPolicyReason } : {}),
         retrievalMode,
         resultCount: hits.length,
         topMatchKey: hits[0]?.path,
@@ -511,8 +525,18 @@ export async function handleCoreSearch(args: {
   if (offset + page.length < hits.length)
     lines.push(`More matches available: rerun with --offset ${offset + page.length}.`)
   lines.push('Excerpts are bounded; use Read with offset/limit on the path for complete content.')
+  if (archivedSupplement.length > 0) {
+    lines.push(
+      '',
+      'Archived memories that also match this topic (previously auto-archived; can be restored anytime via Archived Records or `/api/agents/:id/memory/archive/restore`):',
+      ...archivedSupplement.map(
+        (h) => `- **${h.title}** (${h.target}) — ${h.snippet || h.description || h.reason} (id: ${h.id})`,
+      ),
+    )
+  }
   return toolOk(lines.join('\n'), {
     outcome: 'hit',
+    ...(weakArchivedPolicyReason ? { policyReason: weakArchivedPolicyReason } : {}),
     retrievalMode,
     resultCount: hits.length,
     topMatchKey: hits[0]?.path,

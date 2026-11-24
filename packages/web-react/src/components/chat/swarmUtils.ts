@@ -129,13 +129,25 @@ export function humanizeSwarmModel(raw?: string): string {
   const s = raw.trim();
   if (!s) return "";
   const cleaned = s.replace(/^antigravity-/i, "");
-  if (/gemini-4-neon/i.test(cleaned)) return "Gemini 4 Neon";
-  if (/gemini-4-carbon/i.test(cleaned)) return "Gemini 4 Carbon";
-  if (/gemini-4-hydrogen/i.test(cleaned)) return "Gemini 4 Hydrogen";
-  if (/orchestrator-neon/i.test(cleaned)) return "Orchestrator Neon";
-  if (/orchestrator-carbon/i.test(cleaned)) return "Orchestrator Carbon";
-  if (/claude-opus/i.test(cleaned)) return "Claude Opus";
-  if (/claude-sonnet/i.test(cleaned)) return "Claude Sonnet";
+  const effortMatch = /-(low|medium|high|xhigh)$/i.exec(cleaned);
+  const effortLabel = effortMatch
+    ? effortMatch[1]!.toLowerCase() === "xhigh"
+      ? "XHigh"
+      : effortMatch[1]![0]!.toUpperCase() + effortMatch[1]!.slice(1).toLowerCase()
+    : "";
+  const suffix = effortLabel ? ` · ${effortLabel}` : "";
+  if (/gemini-pro-orchestrator-neon|orchestrator-neon/i.test(cleaned)) return "Orchestrator Neon";
+  if (/gemini-pro-orchestrator|orchestrator-carbon/i.test(cleaned)) return "Orchestrator Carbon";
+  if (/gemini-4-neon/i.test(cleaned)) return `Gemini 4 Neon${suffix}`;
+  if (/gemini-4-carbon/i.test(cleaned)) return `Gemini 4 Carbon${suffix}`;
+  if (/gemini-4-hydrogen/i.test(cleaned)) return `Gemini 4 Hydrogen${suffix}`;
+  if (/gemini-4-argon/i.test(cleaned)) return `Gemini 4 Argon${suffix}`;
+  if (/gemini-3\.8-flash/i.test(cleaned)) return `Gemini 3.8 Flash${suffix}`;
+  if (/claude-opus-5[-.]5/i.test(cleaned)) return `Claude Opus 5.5${suffix}`;
+  if (/claude-sonnet-5[-.]5/i.test(cleaned)) return `Claude Sonnet 5.5${suffix}`;
+  if (/claude-opus/i.test(cleaned)) return `Claude Opus${suffix}`;
+  if (/claude-sonnet/i.test(cleaned)) return `Claude Sonnet${suffix}`;
+  if (/gpt-oss-120b/i.test(cleaned)) return "GPT-OSS 120B";
   return cleaned
     .split(/[-_]+/)
     .map((part) => (part ? part[0]!.toUpperCase() + part.slice(1) : ""))

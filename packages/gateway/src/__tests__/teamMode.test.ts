@@ -301,4 +301,87 @@ describe('buildTeamPreamble', () => {
       assert.match(simpleLine, /无需工具查证或文件产出的常规单一交付物.*两日游行程.*清单.*直接回答交付,不组队、不送审/)
     }
   })
+
+  it('执行策略文案不强绑 CCB 专属 TodoWrite/Read 工具名', () => {
+    const p = buildTeamPreamble({ ...base, cursorEngine: false })
+    assert.doesNotMatch(p, /\bTodoWrite\b/)
+    assert.match(p, /复杂任务先列拆解计划/)
+    assert.match(p, /读取回传路径文件（如 `Read`\/`read_file`）/)
+  })
+})
+
+describe('OCV5-882 Antigravity & Box family grouping', () => {
+  it('modelFamily 正确归并 Antigravity 与 Box 模型到 google/anthropic/openai', () => {
+    for (const id of [
+      'antigravity-gemini-4-carbon',
+      'antigravity-gemini-4-hydrogen',
+      'antigravity-gemini-4-neon',
+      'antigravity-orchestrator-carbon',
+      'antigravity-orchestrator-neon',
+      'gemini-3-pro',
+    ]) {
+      assert.equal(modelFamily(id), 'google', id)
+    }
+    for (const id of [
+      'antigravity-claude-opus-5.5',
+      'antigravity-claude-sonnet-5.5',
+      'box-claude-opus-5-5',
+    ]) {
+      assert.equal(modelFamily(id), 'anthropic', id)
+    }
+    for (const id of ['box-gpt-6-astra-pro', 'gpt-6.2-astra']) {
+      assert.equal(modelFamily(id), 'openai', id)
+    }
+  })
+
+  it('pickDeliberationPanel 绝不把两款 Gemini 4 当跨家族,且能选中现役强模型家族代表', () => {
+    const modern = view([
+      row('antigravity-gemini-4-neon', 'antigravity'),
+      row('antigravity-gemini-4-carbon', 'antigravity'),
+      row('antigravity-gemini-4-hydrogen', 'antigravity'),
+      row('antigravity-orchestrator-neon', 'antigravity'),
+      row('box-claude-opus-5-5', 'ccb'),
+      row('gpt-6.2-astra', 'codex'),
+      row('deepseek-v4-flash', 'ccb'),
+    ])
+    const panelForGpt = pickDeliberationPanel(modern, { excludeModel: 'gpt-6.2-astra' })
+    assert.deepEqual(
+      panelForGpt.map((p) => p.modelId),
+      ['antigravity-gemini-4-neon', 'box-claude-opus-5-5', 'deepseek-v4-flash'],
+    )
+    assert.equal(panelForGpt.filter((p) => p.family === 'google').length, 1)
+
+    const panelForGemini = pickDeliberationPanel(modern, {
+      excludeModel: 'antigravity-gemini-4-carbon',
+    })
+    assert.deepEqual(
+      panelForGemini.map((p) => p.modelId),
+      ['gpt-6.2-astra', 'box-claude-opus-5-5', 'deepseek-v4-flash'],
+    )
+    assert.equal(
+      panelForGemini.some((p) => p.family === 'google'),
+      false,
+      'Gemini 队长时 panel 不得再塞任何 google 家族成员',
+    )
+  })
+
+  it('pickReviewerModel 绝不让 Gemini 审 Gemini,且避开同家族 Box/Antigravity 模型', () => {
+    const modern = view([
+      row('antigravity-gemini-4-neon', 'antigravity'),
+      row('antigravity-gemini-4-carbon', 'antigravity'),
+      row('antigravity-orchestrator-neon', 'antigravity'),
+      row('box-claude-opus-5-5', 'ccb'),
+      row('box-gpt-6-astra-pro', 'codex'),
+    ])
+    const r1 = pickReviewerModel(modern, { leaderModel: 'antigravity-gemini-4-neon' })
+    assert.equal(r1, 'box-claude-opus-5-5')
+    assert.notEqual(modelFamily(r1!), 'google')
+
+    const r2 = pickReviewerModel(modern, {
+      leaderModel: 'antigravity-gemini-4-carbon',
+      avoidModels: ['box-claude-opus-5-5'],
+    })
+    assert.equal(r2, 'box-gpt-6-astra-pro')
+    assert.notEqual(modelFamily(r2!), 'google')
+  })
 })

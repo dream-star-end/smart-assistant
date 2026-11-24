@@ -39,6 +39,8 @@ import { isMemoryExpired, memoryCalendarDate } from './memoryTtl.js'
 import { paths } from './paths.js'
 
 export const MEMDIR_INDEX_MARKER = '<!-- oc-memdir-index v1 -->'
+export const MEMORY_SOFT_WARN_BYTES = 6 * 1024
+export const MEMORY_HARD_LIMIT_BYTES = 16 * 1024
 export { MEMORY_FILE_RE, parseMemoryFrontmatter } from './memoryFrontmatter.js'
 
 // 单条记忆的四类语义:user(用户画像,一般走 user.md)/ feedback(纠偏)/
@@ -60,8 +62,12 @@ export type MemoryAutoAddResult =
   | { ok: true; created: string[] }
   | { ok: false; error: string; reason: 'exists' | 'forbidden' | 'index_mutated' | 'invalid' }
 
-type WriteResult =
-  | { ok: true; version: string }
+export interface MemoryWriteOptions {
+  allowOversized?: boolean
+}
+
+export type WriteResult =
+  | { ok: true; version: string; warning?: string }
   | { ok: false; conflict: { current: string; version: string } }
   | { ok: false; error: string }
 
@@ -125,11 +131,75 @@ export interface ExclusiveMemoryLockOptions {
   timeoutMs?: number
   /** Extra directories under the trusted agent root (e.g. `memory-archive`) that must also be non-symlink and contained if present. */
   checkDirs?: readonly string[]
+  /** When true, skip lazy legacy §-blob migration inside the lock (used by read-then-CAS maintenance such as index compaction). */
+  skipMigrate?: boolean
+}
+
+export interface CompactMemoryIndexOptions {
+  maxBytes?: number
+  maxLineChars?: number
+  expectedIndexSha256?: string
+  dryRun?: boolean
+}
+
+export interface CompactMemoryIndexResult {
+  needed: boolean
+  compacted: boolean
+  conflict?: boolean
+  beforeBytes: number
+  afterBytes: number
+  bytesSaved: number
+  brokenLinksRemoved: number
+  oversizedLinesCompacted: number
 }
 
 /** sha256 前 16 位十六进制:内容指纹,用于乐观并发 version。空串也可算(确定值)。 */
 function sha16(s: string): string {
   return createHash('sha256').update(s).digest('hex').slice(0, 16)
+}
+
+function sha256Hex(s: string | Buffer): string {
+  return createHash('sha256').update(s).digest('hex')
+}
+
+function memoryTooLargeError(bytes: number): string {
+  return `memory file too large (${bytes} bytes > ${MEMORY_HARD_LIMIT_BYTES} bytes); move long content to workspace/ or archival and keep concise conclusions + path pointers in Core memory`
+}
+
+function memorySoftWarnMessage(bytes: number): string {
+  return `memory file size (${bytes} bytes) exceeds soft limit (${MEMORY_SOFT_WARN_BYTES} bytes); consider moving details to workspace/ or archival and keeping concise conclusions in Core memory`
+}
+
+const STANDARD_INDEX_ROW_RE =
+  /^- \[[^\]\r\n]+\]\(memory\/([A-Za-z0-9][A-Za-z0-9_-]{0,63}\.md)\)(?: — [^\r\n]*)?$/
+
+const INDEX_LINK_END_RE = /\]\(memory\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.md\)/
+
+function clampRowToMaxUtf8Bytes(row: string, maxRowBytes: number): string {
+  if (Buffer.byteLength(row, 'utf8') <= maxRowBytes) return row
+  const linkMatch = INDEX_LINK_END_RE.exec(row)
+  if (!linkMatch) return row
+  const linkEnd = linkMatch.index + linkMatch[0].length
+  const linkPrefix = row.slice(0, linkEnd)
+  const rest = row.slice(linkEnd)
+  if (!rest.startsWith(' — ')) return linkPrefix
+  const prefixBytes = Buffer.byteLength(linkPrefix, 'utf8')
+  if (prefixBytes >= maxRowBytes) return linkPrefix
+  const minWithSep = prefixBytes + Buffer.byteLength(' — …', 'utf8')
+  if (minWithSep > maxRowBytes) return linkPrefix
+  const hook = rest.slice(3)
+  const hookBudget =
+    maxRowBytes - prefixBytes - Buffer.byteLength(' — ', 'utf8') - Buffer.byteLength('…', 'utf8')
+  let acc = ''
+  let used = 0
+  for (const ch of hook) {
+    const chBytes = Buffer.byteLength(ch, 'utf8')
+    if (used + chBytes > hookBudget) break
+    acc += ch
+    used += chBytes
+  }
+  const trimmed = acc.trimEnd()
+  return trimmed ? `${linkPrefix} — ${trimmed}…` : linkPrefix
 }
 
 const normalizeEol = normalizeMemoryEol
@@ -383,13 +453,20 @@ export class MemoryDir {
    * `reconcileIndex` so callers can rebuild MEMORY.md while still holding the lock.
    */
   async withExclusiveMemoryLock<T>(
-    fn: (ctx: { dirPath: string; indexPath: string; reconcileIndex: () => Promise<string> }) => Promise<T>,
+    fn: (ctx: {
+      dirPath: string
+      indexPath: string
+      reconcileIndex: () => Promise<string>
+      compactIndexIfNeeded: (opts?: CompactMemoryIndexOptions) => Promise<CompactMemoryIndexResult>
+    }) => Promise<T>,
     timeoutOrOptions: number | ExclusiveMemoryLockOptions = 5_000,
   ): Promise<T> {
     const timeoutMs =
       typeof timeoutOrOptions === 'number' ? timeoutOrOptions : (timeoutOrOptions.timeoutMs ?? 5_000)
     const checkDirs =
       typeof timeoutOrOptions === 'number' ? [] : (timeoutOrOptions.checkDirs ?? [])
+    const skipMigrate =
+      typeof timeoutOrOptions === 'number' ? false : timeoutOrOptions.skipMigrate === true
 
     // Fail-closed BEFORE touching lockfiles, WAL recovery, or legacy migration
     await this.assertSafeMemoryBoundary(checkDirs)
@@ -404,11 +481,14 @@ export class MemoryDir {
         // Re-verify inside the exclusive lock (TOCTOU guard) BEFORE WAL recovery / migration
         await this.assertSafeMemoryBoundary(checkDirs)
         await this.recoverBatchLocked()
-        await this.ensureMigratedLocked()
+        if (!skipMigrate) {
+          await this.ensureMigratedLocked()
+        }
         return await fn({
           dirPath: this.dirPath(),
           indexPath: this.indexPath(),
           reconcileIndex: () => this.reconcileIndexLocked(),
+          compactIndexIfNeeded: (opts) => this.compactIndexLocked(opts),
         })
       })
     } finally {
@@ -593,28 +673,53 @@ export class MemoryDir {
 
   // ── 列表 / 读 / 写 / 删 ──────────────────────────────────────────────
 
-  /** 锁内目录快照；调用方负责先完成迁移/批恢复。 */
+  /** 锁内目录快照；调用方负责先完成迁移/批恢复。B11: 拒绝 symlink 目录/条目与越界 realpath。 */
   private async listLocked(): Promise<MemoryFileMeta[]> {
+    const rootResolved = dirname(resolve(this.indexPath()))
+    const dirResolved = resolve(this.dirPath())
+    if (dirResolved !== rootResolved && !dirResolved.startsWith(rootResolved + sep)) {
+      return []
+    }
+    let realRoot: string
+    let realDir: string
+    try {
+      const rootStat = await lstat(rootResolved)
+      if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) return []
+      realRoot = await realpath(rootResolved)
+      const dirStat = await lstat(dirResolved)
+      if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return []
+      realDir = await realpath(dirResolved)
+      if (realDir !== realRoot && !realDir.startsWith(realRoot + sep)) return []
+    } catch {
+      return []
+    }
     let names: string[] = []
     try {
-      names = await readdir(this.dirPath())
+      names = await readdir(realDir)
     } catch {
       return []
     }
     const out: MemoryFileMeta[] = []
     for (const name of names) {
-      if (!MEMORY_FILE_RE.test(name)) continue
-      const full = join(this.dirPath(), name)
-      let st: Awaited<ReturnType<typeof stat>>
+      if (!MEMORY_FILE_RE.test(name) || basename(name) !== name) continue
+      const full = join(realDir, name)
+      let st: Awaited<ReturnType<typeof lstat>>
       try {
-        st = await stat(full)
+        st = await lstat(full)
       } catch {
         continue
       }
-      if (!st.isFile()) continue
+      if (st.isSymbolicLink() || !st.isFile()) continue
+      let realFull: string
+      try {
+        realFull = await realpath(full)
+      } catch {
+        continue
+      }
+      if (!realFull.startsWith(realDir + sep)) continue
       let raw = ''
       try {
-        raw = await readFile(full, 'utf-8')
+        raw = await readFile(realFull, 'utf-8')
       } catch {
         continue
       }
@@ -675,9 +780,18 @@ export class MemoryDir {
    *  - expectedVersion=undefined:兼容旧调用,last-writer-wins。
    *  写盘后锁内 reconcile 索引,保证新增/编辑文件的索引行在位。
    */
-  async write(file: string, content: string, expectedVersion?: string | null): Promise<WriteResult> {
+  async write(
+    file: string,
+    content: string,
+    expectedVersion?: string | null,
+    opts?: MemoryWriteOptions,
+  ): Promise<WriteResult> {
     if (!MEMORY_FILE_RE.test(file) || basename(file) !== file) {
       return { ok: false, error: `invalid memory file name: ${file}` }
+    }
+    const byteLength = Buffer.byteLength(content, 'utf8')
+    if (byteLength > MEMORY_HARD_LIMIT_BYTES && !opts?.allowOversized) {
+      return { ok: false, error: memoryTooLargeError(byteLength) }
     }
     const scan = scanMemoryContent(content)
     if (!scan.ok) return { ok: false, error: `rejected: ${scan.reason}` }
@@ -703,7 +817,13 @@ export class MemoryDir {
       }
       await this.atomicWrite(full, content)
       await this.reconcileIndexLocked()
-      return { ok: true as const, version: sha16(content) }
+      const warning =
+        byteLength > MEMORY_SOFT_WARN_BYTES && byteLength <= MEMORY_HARD_LIMIT_BYTES
+          ? memorySoftWarnMessage(byteLength)
+          : undefined
+      return warning
+        ? { ok: true as const, version: sha16(content), warning }
+        : { ok: true as const, version: sha16(content) }
     })
   }
 
@@ -767,6 +887,7 @@ export class MemoryDir {
   async applyBatchCas(input: {
     upserts: readonly MemoryBatchUpsert[]
     deletes: readonly MemoryBatchDelete[]
+    allowOversized?: boolean
   }): Promise<MemoryBatchResult> {
     const seen = new Set<string>()
     for (const row of input.upserts) {
@@ -775,6 +896,10 @@ export class MemoryDir {
       }
       if (seen.has(row.file)) return { ok: false, error: `duplicate memory file: ${row.file}` }
       seen.add(row.file)
+      const byteLength = Buffer.byteLength(row.content, 'utf8')
+      if (byteLength > MEMORY_HARD_LIMIT_BYTES && !input.allowOversized) {
+        return { ok: false, error: memoryTooLargeError(byteLength) }
+      }
       const scan = scanMemoryContent(row.content)
       if (!scan.ok) return { ok: false, error: `rejected: ${scan.reason}` }
       if (row.expectedVersion !== null && typeof row.expectedVersion !== 'string') {
@@ -893,6 +1018,7 @@ export class MemoryDir {
     creates: readonly { file: string; content: string }[]
     /** Test seam: freeze the TTL calendar day (YYYY-MM-DD). */
     today?: string
+    allowOversized?: boolean
   }): Promise<MemoryAutoAddResult> {
     const today = input.today ?? memoryCalendarDate()
     const seen = new Set<string>()
@@ -908,11 +1034,19 @@ export class MemoryDir {
         return { ok: false, error: `duplicate memory file: ${row.file}`, reason: 'invalid' }
       }
       seen.add(row.file)
+      const rawBytes = Buffer.byteLength(row.content, 'utf8')
+      if (rawBytes > MEMORY_HARD_LIMIT_BYTES && !input.allowOversized) {
+        return { ok: false, error: memoryTooLargeError(rawBytes), reason: 'invalid' }
+      }
       const content = stampAutoMemoryFrontmatter(row.content, today, {
         warn: ttlWarn,
         context: row.file,
         fallbackName: row.file.replace(/\.md$/i, ''),
       })
+      const stampedBytes = Buffer.byteLength(content, 'utf8')
+      if (stampedBytes > MEMORY_HARD_LIMIT_BYTES && !input.allowOversized) {
+        return { ok: false, error: memoryTooLargeError(stampedBytes), reason: 'invalid' }
+      }
       const scan = scanMemoryContent(content)
       if (!scan.ok) return { ok: false, error: `rejected: ${scan.reason}`, reason: 'invalid' }
       stampedCreates.push({ file: row.file, content })
@@ -1025,13 +1159,322 @@ export class MemoryDir {
     })
   }
 
-  private indexRow(meta: { file: string; name: string; description: string }): string {
-    // 整行 ≤ 150 字符:先算前缀,余量给钩子;超出截断加省略号。
-    const prefix = `- [${meta.name}](memory/${meta.file}) — `
-    const budget = Math.max(0, 150 - prefix.length)
-    let hook = (meta.description || meta.name || '').replace(/\n/g, ' ').trim()
-    if (hook.length > budget) hook = `${hook.slice(0, Math.max(0, budget - 1)).trimEnd()}…`
+  private indexRow(meta: { file: string; name: string; description: string }, maxLineChars = 150): string {
+    // 整行 ≤ maxLineChars 字符:先算前缀,余量给钩子;超出截断加省略号。
+    const safeName = (meta.name || meta.file.replace(/\.md$/i, '')).replace(/[\r\n]+/g, ' ').trim()
+    const prefix = `- [${safeName}](memory/${meta.file}) — `
+    const budget = Math.max(0, maxLineChars - prefix.length)
+    if (budget === 0) {
+      const linkPart = `](memory/${meta.file})`
+      const maxNameLen = Math.max(1, maxLineChars - 3 - linkPart.length)
+      const clampedName =
+        safeName.length > maxNameLen
+          ? `${safeName.slice(0, Math.max(1, maxNameLen - 1)).trimEnd()}…`
+          : safeName
+      return `- [${clampedName}${linkPart}`
+    }
+    let hook = (meta.description || safeName || '').replace(/[\r\n]+/g, ' ').trim()
+    if (hook.length > budget) {
+      hook = budget > 1 ? `${hook.slice(0, budget - 1).trimEnd()}…` : ''
+    }
     return prefix + hook
+  }
+
+  private planCompactIndex(
+    rawBuf: Buffer,
+    files: MemoryFileMeta[],
+    maxBytes: number,
+    maxLineChars: number,
+  ): {
+    needed: boolean
+    beforeBytes: number
+    afterBytes: number
+    bytesSaved: number
+    brokenLinksRemoved: number
+    oversizedLinesCompacted: number
+    rawText: string
+    nextText: string
+  } {
+    const rawText = rawBuf.toString('utf8')
+    const beforeBytes = rawBuf.byteLength
+    const normalized = normalizeEol(rawText)
+    // Legacy unmigrated §-blob: do not treat as a drifted memdir index
+    if (normalized.trim() !== '' && !normalized.includes(MEMDIR_INDEX_MARKER)) {
+      return {
+        needed: false,
+        beforeBytes,
+        afterBytes: beforeBytes,
+        bytesSaved: 0,
+        brokenLinksRemoved: 0,
+        oversizedLinesCompacted: 0,
+        rawText,
+        nextText: rawText,
+      }
+    }
+
+    const byFile = new Map(files.map((f) => [f.file, f]))
+    const out: string[] = [MEMDIR_INDEX_MARKER]
+    const referenced = new Set<string>()
+    let brokenLinksRemoved = 0
+    let oversizedLinesCompacted = 0
+    let hasOversizedLine = false
+    let hasNonStandardOrDup = false
+    let markerCount = 0
+    let firstNonEmptySeen = false
+
+    for (const line of normalized.split('\n')) {
+      const t = line.trim()
+      if (t === '') continue
+      if (!firstNonEmptySeen) {
+        firstNonEmptySeen = true
+        if (t !== MEMDIR_INDEX_MARKER) hasNonStandardOrDup = true
+      }
+      if (t === MEMDIR_INDEX_MARKER) {
+        markerCount += 1
+        if (markerCount > 1) hasNonStandardOrDup = true
+        continue
+      }
+      if (t.length > maxLineChars || line.length > maxLineChars) {
+        hasOversizedLine = true
+      }
+      const m = line.match(/\]\(memory\/([^)]+)\)/)
+      if (!m) {
+        hasNonStandardOrDup = true
+        continue
+      }
+      const f = m[1]!
+      if (!MEMORY_FILE_RE.test(f) || !byFile.has(f)) {
+        brokenLinksRemoved += 1
+        continue
+      }
+      if (referenced.has(f)) {
+        hasNonStandardOrDup = true
+        continue
+      }
+      referenced.add(f)
+      const meta = byFile.get(f)!
+      if (t.length > maxLineChars) {
+        oversizedLinesCompacted += 1
+        out.push(this.indexRow(meta, maxLineChars))
+      } else if (STANDARD_INDEX_ROW_RE.test(t)) {
+        out.push(t)
+      } else {
+        hasNonStandardOrDup = true
+        out.push(this.indexRow(meta, maxLineChars))
+      }
+    }
+
+    let missingFilesAdded = 0
+    for (const meta of files) {
+      if (referenced.has(meta.file)) continue
+      out.push(this.indexRow(meta, maxLineChars))
+      referenced.add(meta.file)
+      missingFilesAdded += 1
+    }
+
+    let nextText = `${out.join('\n')}\n`
+    let afterBytes = Buffer.byteLength(nextText, 'utf8')
+
+    if (afterBytes > maxBytes && out.length > 1) {
+      const markerBytes = Buffer.byteLength(`${MEMDIR_INDEX_MARKER}\n`, 'utf8')
+      const rowCount = out.length - 1
+      const targetRowBytes = Math.max(48, Math.floor((maxBytes - markerBytes) / rowCount) - 1)
+      let tightened = false
+      for (let i = 1; i < out.length; i++) {
+        const prev = out[i]!
+        const clamped = clampRowToMaxUtf8Bytes(prev, targetRowBytes)
+        if (clamped !== prev) {
+          out[i] = clamped
+          oversizedLinesCompacted += 1
+          tightened = true
+        }
+      }
+      if (tightened) {
+        nextText = `${out.join('\n')}\n`
+        afterBytes = Buffer.byteLength(nextText, 'utf8')
+      }
+    }
+
+    const needed =
+      beforeBytes > maxBytes ||
+      hasOversizedLine ||
+      hasNonStandardOrDup ||
+      brokenLinksRemoved > 0 ||
+      missingFilesAdded > 0
+
+    if (!needed || nextText === rawText) {
+      return {
+        needed,
+        beforeBytes,
+        afterBytes: beforeBytes,
+        bytesSaved: 0,
+        brokenLinksRemoved: 0,
+        oversizedLinesCompacted: 0,
+        rawText,
+        nextText: rawText,
+      }
+    }
+
+    return {
+      needed,
+      beforeBytes,
+      afterBytes,
+      bytesSaved: Math.max(0, beforeBytes - afterBytes),
+      brokenLinksRemoved,
+      oversizedLinesCompacted,
+      rawText,
+      nextText,
+    }
+  }
+
+  private async compactIndexLocked(
+    opts: CompactMemoryIndexOptions = {},
+  ): Promise<CompactMemoryIndexResult> {
+    const maxBytes = Math.max(256, Math.floor(opts.maxBytes ?? MEMORY_SOFT_WARN_BYTES))
+    const maxLineChars = Math.max(40, Math.floor(opts.maxLineChars ?? 150))
+    const expectedIndexSha256 = opts.expectedIndexSha256?.trim().toLowerCase() || undefined
+
+    let rawBuf: Buffer
+    try {
+      rawBuf = await readFile(this.indexPath())
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        return {
+          needed: false,
+          compacted: false,
+          beforeBytes: 0,
+          afterBytes: 0,
+          bytesSaved: 0,
+          brokenLinksRemoved: 0,
+          oversizedLinesCompacted: 0,
+        }
+      }
+      throw err
+    }
+
+    if (expectedIndexSha256) {
+      const actualSha256 = sha256Hex(rawBuf)
+      if (actualSha256 !== expectedIndexSha256) {
+        return {
+          needed: true,
+          compacted: false,
+          conflict: true,
+          beforeBytes: rawBuf.byteLength,
+          afterBytes: rawBuf.byteLength,
+          bytesSaved: 0,
+          brokenLinksRemoved: 0,
+          oversizedLinesCompacted: 0,
+        }
+      }
+    }
+
+    const files = await this.listLocked()
+    const plan = this.planCompactIndex(rawBuf, files, maxBytes, maxLineChars)
+    if (!plan.needed || plan.nextText === plan.rawText) {
+      return {
+        needed: plan.needed,
+        compacted: false,
+        beforeBytes: plan.beforeBytes,
+        afterBytes: plan.beforeBytes,
+        bytesSaved: 0,
+        brokenLinksRemoved: 0,
+        oversizedLinesCompacted: 0,
+      }
+    }
+
+    await this.writeIndexText(plan.nextText)
+    return {
+      needed: true,
+      compacted: true,
+      beforeBytes: plan.beforeBytes,
+      afterBytes: plan.afterBytes,
+      bytesSaved: plan.bytesSaved,
+      brokenLinksRemoved: plan.brokenLinksRemoved,
+      oversizedLinesCompacted: plan.oversizedLinesCompacted,
+    }
+  }
+
+  /**
+   * Compact and normalize `MEMORY.md` when oversized, drifted, or containing
+   * broken/duplicate links or missing active files.
+   * - `dryRun: true`: strictly read-only (no lock, no disk writes).
+   * - Write path: runs under `withExclusiveMemoryLock` with optional CAS check
+   *   against `expectedIndexSha256` to prevent clobbering concurrent edits.
+   */
+  async compactIndexIfNeeded(
+    opts: CompactMemoryIndexOptions = {},
+  ): Promise<CompactMemoryIndexResult> {
+    const maxBytes = Math.max(256, Math.floor(opts.maxBytes ?? MEMORY_SOFT_WARN_BYTES))
+    const maxLineChars = Math.max(40, Math.floor(opts.maxLineChars ?? 150))
+    const expectedIndexSha256 = opts.expectedIndexSha256?.trim().toLowerCase() || undefined
+    const dryRun = opts.dryRun === true
+
+    if (dryRun) {
+      await this.assertSafeMemoryBoundary()
+      let rawBuf: Buffer
+      try {
+        rawBuf = await readFile(this.indexPath())
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+          return {
+            needed: false,
+            compacted: false,
+            beforeBytes: 0,
+            afterBytes: 0,
+            bytesSaved: 0,
+            brokenLinksRemoved: 0,
+            oversizedLinesCompacted: 0,
+          }
+        }
+        throw err
+      }
+      if (expectedIndexSha256 && sha256Hex(rawBuf) !== expectedIndexSha256) {
+        return {
+          needed: true,
+          compacted: false,
+          conflict: true,
+          beforeBytes: rawBuf.byteLength,
+          afterBytes: rawBuf.byteLength,
+          bytesSaved: 0,
+          brokenLinksRemoved: 0,
+          oversizedLinesCompacted: 0,
+        }
+      }
+      const files = await this.listLocked()
+      const plan = this.planCompactIndex(rawBuf, files, maxBytes, maxLineChars)
+      return {
+        needed: plan.needed,
+        compacted: false,
+        beforeBytes: plan.beforeBytes,
+        afterBytes: plan.afterBytes,
+        bytesSaved: plan.bytesSaved,
+        brokenLinksRemoved: plan.brokenLinksRemoved,
+        oversizedLinesCompacted: plan.oversizedLinesCompacted,
+      }
+    }
+
+    // Avoid creating lockfiles or empty MEMORY.md if index does not exist yet
+    try {
+      await lstat(this.indexPath())
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        return {
+          needed: false,
+          compacted: false,
+          beforeBytes: 0,
+          afterBytes: 0,
+          bytesSaved: 0,
+          brokenLinksRemoved: 0,
+          oversizedLinesCompacted: 0,
+        }
+      }
+      throw err
+    }
+
+    return this.withExclusiveMemoryLock(
+      () => this.compactIndexLocked({ maxBytes, maxLineChars, expectedIndexSha256 }),
+      { skipMigrate: true },
+    )
   }
 
   /**

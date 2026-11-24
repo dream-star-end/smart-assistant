@@ -83,11 +83,7 @@ import { capMarketplaceToolsets, mergeOnDemandToolsets } from './toolsetIntent.j
 import { projectCcbExecutionDescriptor } from './subprocessRunner.js'
 import { readV3CodexRelayConfig, V3_CODEX_RELAY_PREFIX } from './v3CodexRelay.js'
 import { resolveEngine } from './engine/registry.js'
-import {
-  applyAntigravitySwarmTurnDirective,
-  hasHistoricalAntigravitySwarm,
-  listLiveAntigravitySwarmMonitors,
-} from './engine/antigravitySwarmDirective.js'
+import { prepareAntigravitySwarmInboundDirective } from './engine/antigravitySwarmDirective.js'
 import {
   prepareRemoteSwarmInboundTurn,
   recordRemoteSwarmLeaderStreamEvent,
@@ -578,11 +574,11 @@ export async function dispatchInbound(
     const safeWorkspaceMode = parseSessionWorkspaceMode((frame as any)._workspaceMode) ?? undefined
     // 团队模式(v5 轻量组队):turn 级 flag,仅 main 队长生效。ws 帧无 typebox runtime
     // 校验(JSON cast),用 === true 防御(与 _frameRequestId 同模式)。
-    const teamMode = (frame as any).teamMode === true
+    const rawTeamMode = (frame as any).teamMode === true
     const swarmMode = (frame as any).swarmMode === true
     const inboundCollabMode = normalizeCollabMode({
       collabMode: (frame as { collabMode?: unknown }).collabMode,
-      teamMode,
+      teamMode: rawTeamMode,
     })
 
     // v5 codex route 消费链(A1):master bridge 注入的 `__oc_codex_route` →
@@ -1681,13 +1677,20 @@ export async function dispatchInbound(
 
         finalText = lines.join('\n')
       }
+      // Antigravity swarm mode (OCV5-809/835/842/882 mutex): hoisted above advisor/teamMode.
+      const effectiveModelForSwarm = safeModelForRouting ?? agent.model ?? this.deps.config.defaults.model
+      const isAntigravityTurn = turnAuthority?.engine === 'antigravity' || (typeof effectiveModelForSwarm === 'string' && isAntigravityEngineModel(effectiveModelForSwarm))
+      const isRemoteAntigravity = isAntigravityTurn && (isRemoteDriverExecutionBackend(turnAuthority?.executionBackend) || (typeof effectiveModelForSwarm === 'string' && effectiveModelForSwarm.endsWith('-remote')))
+      const swarmRequested = swarmMode || Boolean(parseSwarmSlashCommand(rawUserText)?.matched)
+      const isAntigravitySwarmActive = isAntigravityTurn && swarmRequested
+      const teamMode = inboundCollabMode === 'team' && !isAntigravitySwarmActive
       const requestedAdvisorModel =
         typeof (frame as { advisorModel?: unknown }).advisorModel === 'string'
           ? (frame as { advisorModel: string }).advisorModel.trim()
           : ''
       let frozenAdvisorModel = requestedAdvisorModel
       let advisorTurnAllowed = false
-      if (inboundCollabMode === 'advisor' && agent.id === 'main' && !adapter) {
+      if (inboundCollabMode === 'advisor' && !isAntigravitySwarmActive && agent.id === 'main' && !adapter) {
         const freeze = requestedAdvisorModel
           ? await this._freezeAdvisorTurn(requestedAdvisorModel)
           : { ok: false as const, error: 'advisorModel required' }
@@ -1796,11 +1799,7 @@ export async function dispatchInbound(
         })
         finalText = teamPreamble + finalText
       }
-      // Antigravity swarm mode (OCV5-809 local + OCV5-835 remote parity + OCV5-842/P0-2 off-toggle guard).
-      const effectiveModelForSwarm = safeModelForRouting ?? agent.model ?? this.deps.config.defaults.model
-      const isAntigravityTurn = turnAuthority?.engine === 'antigravity' || (typeof effectiveModelForSwarm === 'string' && isAntigravityEngineModel(effectiveModelForSwarm))
-      const isRemoteAntigravity = isAntigravityTurn && (isRemoteDriverExecutionBackend(turnAuthority?.executionBackend) || (typeof effectiveModelForSwarm === 'string' && effectiveModelForSwarm.endsWith('-remote')))
-      const swarmRequested = swarmMode || Boolean(parseSwarmSlashCommand(rawUserText)?.matched)
+      // Antigravity swarm runtime & directive injection (variables hoisted above advisor/teamMode).
       const activeRemoteSwarmRuntime = await prepareRemoteSwarmInboundTurn({
         sessionKey, isRemoteAntigravity, effectiveModel: effectiveModelForSwarm, swarmRequested,
         effort: safeEffortLevel ?? undefined, workspaceCwd: session.workspaceCwd || agent.cwd || process.cwd(),
@@ -1809,10 +1808,10 @@ export async function dispatchInbound(
       const boundSwarmConversationId = isAntigravityTurn && !isRemoteAntigravity
         ? (session.ccbSessionId ?? session.runner?.nativeSessionId ?? this.sessions.resolveAntigravitySwarmTarget?.(frame.peer.id)?.conversationId ?? undefined)
         : undefined
-      const swarmDirectiveResult = applyAntigravitySwarmTurnDirective({
-        finalText, rawUserText, isAntigravityTurn, isRemoteAntigravity, swarmMode,
-        hasHistoricalSwarm: isAntigravityTurn ? hasHistoricalAntigravitySwarm({ sessionKey, isRemote: isRemoteAntigravity, conversationId: boundSwarmConversationId }) : false,
-        liveMonitorNames: isAntigravityTurn && swarmRequested ? listLiveAntigravitySwarmMonitors({ sessionKey, isRemote: isRemoteAntigravity, conversationId: boundSwarmConversationId }) : [],
+      const { result: swarmDirectiveResult, compactionCtx: antigravitySwarmCompactionCtx } = await prepareAntigravitySwarmInboundDirective({
+        finalText, rawUserText, sessionKey, isAntigravityTurn, isRemoteAntigravity, swarmMode, swarmRequested, boundSwarmConversationId,
+        routeAllowedModelsRaw: (frame as any)._antigravitySwarmAllowedModels,
+        loadLocalCatalogModels: async () => (await getLocalCatalogView()).models,
       })
       finalText = swarmDirectiveResult.text
       if (swarmDirectiveResult.mode === 'on') {
@@ -1845,7 +1844,8 @@ export async function dispatchInbound(
       // engine persist 之前完成,走正常归因/drain)。此处只 stash 两个服务端权威快照,
       // 供 _runDelegateTask 的审查门与审查任务书包装读取:
       session._teamModeTurn = teamMode && agent.id === 'main' && !adapter
-      session._collabModeTurn = agent.id === 'main' && !adapter ? inboundCollabMode : 'solo'
+      session._collabModeTurn =
+        agent.id === 'main' && !adapter && !isAntigravitySwarmActive ? inboundCollabMode : 'solo'
       const inboundConfigVersion = collabConfigVersionOf({
         mode: advisorTurnAllowed ? 'advisor' : session._collabModeTurn,
         advisorModel: frozenAdvisorModel,
@@ -2411,6 +2411,9 @@ export async function dispatchInbound(
         grokRoute: safeGrokRoute,
         zcodeRoute: safeZcodeRoute,
         antigravityRoute: safeAntigravityRoute,
+        ...(antigravitySwarmCompactionCtx
+          ? { antigravitySwarmCompaction: antigravitySwarmCompactionCtx }
+          : {}),
         serviceTier: turnReadOnly ? null : safeServiceTier,
         ...(automaticRetryState ? { automaticRetryState } : {}),
         ...(inboundRecovery?.automatic === true &&

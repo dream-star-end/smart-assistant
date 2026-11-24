@@ -240,6 +240,25 @@ export class ModelCatalogClient {
   private lkgLoaded = false
   /** 旧 LKG 没有单价字段时只强拉一次,避免每 TTL 打满量。 */
   private pricingUpgradeAttempted = false
+  private readonly catalogUpdateListeners = new Set<(view: LocalCatalogView) => void>()
+
+  /** Subscribe to committed catalog snapshot updates (fresh fetch or cold LKG verification). */
+  onCatalogUpdated(listener: (view: LocalCatalogView) => void): () => void {
+    this.catalogUpdateListeners.add(listener)
+    return () => {
+      this.catalogUpdateListeners.delete(listener)
+    }
+  }
+
+  private notifyCatalogUpdated(view: LocalCatalogView): void {
+    for (const listener of this.catalogUpdateListeners) {
+      try {
+        listener(view)
+      } catch {
+        // fail-open: subscriber errors must never disrupt catalog resolution
+      }
+    }
+  }
 
   private readonly env: NodeJS.ProcessEnv
   private readonly fetcher: typeof undiciRequest
@@ -532,6 +551,7 @@ export class ModelCatalogClient {
         // epoch 相等就沿用快照,补价按「没拿到字段」fail-closed。
         // 禁止为了拿 1.000 去破坏「epoch 未变不重拉全量」的新鲜度契约。
         this.snapshot = { view: cached.view, verifiedAt: this.now() }
+        if (!current) this.notifyCatalogUpdated(cached.view)
         return cached.view
       }
       if (
@@ -582,6 +602,7 @@ export class ModelCatalogClient {
         this.agentOverridesVerifiedAt = this.now()
         this.forceFullFetch = false
         this.persistLkg(view)
+        this.notifyCatalogUpdated(view)
       }
       return view
     })().finally(() => {

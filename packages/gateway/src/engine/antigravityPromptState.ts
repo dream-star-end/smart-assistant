@@ -98,6 +98,8 @@ export interface AntigravityInjectedContextState {
   sessionKey: string
   conversationId: string
   inputsKey: string
+  /** Per-slot SHA256 hashes captured when full platform context was injected. */
+  slotHashes?: Record<string, string>
   /** Inclusive pre-spawn `MAX(idx)` of the turn that injected full context. */
   injectedAfterBaseline: number
   updatedAt: number
@@ -119,6 +121,8 @@ export type AntigravityPromptElideReason =
 export interface AntigravityPromptElideDecision {
   elide: boolean
   reason: AntigravityPromptElideReason
+  /** Exact slots/inputs that changed when `reason === 'inputs_changed'`; `['legacy_untracked']` for older cache files. */
+  changedSlots?: string[]
 }
 
 function sha256Hex(text: string): string {
@@ -145,6 +149,70 @@ export function resolveAntigravityDedupMode(
   const normalized = raw?.trim().toLowerCase()
   if (normalized === 'off' || normalized === '0' || normalized === 'false') return 'off'
   return 'on'
+}
+
+export function buildAntigravitySlotHashes(
+  args: AntigravityPromptInputsKeyArgs,
+): Record<string, string> {
+  const hashes: Record<string, string> = {}
+  for (const slot of args.applied) {
+    if (!INSTRUCTION_SLOT_NAMES.has(slot.name)) continue
+    if (slot.name === 'AGENTS') {
+      const staticSha = args.agentsStaticFingerprint ?? slot.meta?.static_sha256
+      hashes.AGENTS = staticSha ?? sha256Hex(JSON.stringify([slot.sha256, slot.meta ?? null]))
+    } else if (slot.name === 'AGENTS_STATIC') {
+      hashes.AGENTS = slot.sha256
+    } else {
+      hashes[slot.name] = slot.meta
+        ? sha256Hex(JSON.stringify([slot.sha256, slot.meta]))
+        : slot.sha256
+    }
+  }
+  hashes.MCP_TOOLS = sha256Hex(JSON.stringify([...args.availableMcpTools].sort()))
+  hashes.CWD = sha256Hex(JSON.stringify([args.cwd, args.cwdSource, args.sessionRepoOverlay ?? null]))
+  if (args.memoryInstructionsFingerprint) {
+    hashes.MEMORY_INSTRUCTIONS = args.memoryInstructionsFingerprint
+  }
+  if (args.identityCompatFingerprint) {
+    hashes.IDENTITY_COMPAT = args.identityCompatFingerprint
+  }
+  if (args.repoSnapshot != null) {
+    hashes.REPO_SNAPSHOT = sha256Hex(JSON.stringify(args.repoSnapshot))
+  }
+  if (args.intelligentUi) {
+    hashes.INTELLIGENT_UI_CONFIG = sha256Hex(JSON.stringify(args.intelligentUi))
+  }
+  if (args.promptPolicyFingerprint) {
+    hashes.PROMPT_POLICY = args.promptPolicyFingerprint
+  }
+  if (args.frozenProjectContext != null) {
+    hashes.FROZEN_PROJECT_CONTEXT = sha256Hex(JSON.stringify(args.frozenProjectContext))
+  }
+  if (args.skillEvalMode || args.skillEvalExclude || args.skillEvalDraft != null) {
+    hashes.SKILL_EVAL = sha256Hex(
+      JSON.stringify([Boolean(args.skillEvalMode), args.skillEvalExclude ?? null, args.skillEvalDraft ?? null]),
+    )
+  }
+  return hashes
+}
+
+function normalizeSlotHashes(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === 'string') out[k] = v
+  }
+  return out
+}
+
+function diffSlotHashes(
+  prior: Record<string, string> | undefined,
+  current: Record<string, string> | undefined,
+): string[] {
+  if (!prior || !current) return ['legacy_untracked']
+  const names = new Set([...Object.keys(prior), ...Object.keys(current)])
+  const changed = [...names].filter((name) => prior[name] !== current[name]).sort()
+  return changed.length > 0 ? changed : ['inputs_meta']
 }
 
 export function buildAntigravityPromptInputsKey(args: AntigravityPromptInputsKeyArgs): string {
@@ -210,7 +278,16 @@ export function readAntigravityPromptState(
     ) {
       return null
     }
-    return parsed as AntigravityInjectedContextState
+    const slotHashes = normalizeSlotHashes(parsed.slotHashes)
+    return {
+      v: 1,
+      sessionKey: parsed.sessionKey,
+      conversationId: parsed.conversationId,
+      inputsKey: parsed.inputsKey,
+      ...(slotHashes ? { slotHashes } : {}),
+      injectedAfterBaseline: parsed.injectedAfterBaseline,
+      updatedAt: parsed.updatedAt,
+    }
   } catch {
     return null
   }
@@ -408,6 +485,7 @@ export function decideAntigravityPromptElision(args: {
   sessionKey: string
   requestedConversationId: string | null
   inputsKey: string | null
+  slotHashes?: Record<string, string> | null
   env?: NodeJS.ProcessEnv
 }): AntigravityPromptElideDecision {
   if (resolveAntigravityDedupMode(args.openClaudeHome, args.env) === 'off') {
@@ -427,7 +505,11 @@ export function decideAntigravityPromptElision(args: {
     return { elide: false, reason: 'conversation_changed' }
   }
   if (prior.inputsKey !== args.inputsKey) {
-    return { elide: false, reason: 'inputs_changed' }
+    return {
+      elide: false,
+      reason: 'inputs_changed',
+      changedSlots: diffSlotHashes(prior.slotHashes, args.slotHashes ?? undefined),
+    }
   }
   const historyCheck = inspectConversationSinceInjection(
     args.conversationsDir,

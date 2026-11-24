@@ -23,9 +23,12 @@ import { createPassiveRelayTiming } from './passiveRelayTiming.js'
  */
 import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { antigravityAllowedUpstreamModels } from '@openclaude/protocol'
+import { antigravitySwarmAllowedUpstreamModels } from '@openclaude/protocol'
 import { type Dispatcher, request } from 'undici'
-import { reportAntigravityModelOutcome } from '../account-pool/antigravityModelCooldown.js'
+import {
+  antigravityModelCoolingUntil,
+  reportAntigravityModelOutcome,
+} from '../account-pool/antigravityModelCooldown.js'
 import {
   AntigravityOAuthError,
   getFreshAntigravityAccessToken,
@@ -50,8 +53,10 @@ import {
   ANTIGRAVITY_MONITORING_REQUEST_TYPE,
   type AntigravityUsageTotals,
   antigravityUsageCost,
+  antigravityUsageCostOrNull,
   isAntigravityAuxUpstreamModel,
   refreshWaivedAntigravityUsage,
+  resolveAntigravityBillableTarget,
   sumAntigravityRelayUsage,
 } from '../billing/antigravitySettle.js'
 import type { PricingCache } from '../billing/pricing.js'
@@ -149,6 +154,8 @@ export interface AntigravityRelayDeps {
   ) => Promise<void>
   /** Per-(account, catalog model) 5xx strikes; see antigravityModelCooldown. */
   reportModelOutcome?: (accountId: bigint, modelId: string, ok: boolean) => Promise<void>
+  /** Check if a swarm member model is currently in cooldown on the bound account. */
+  modelCoolingUntil?: typeof antigravityModelCoolingUntil
   recordUsage?: (row: AntigravityUsageRow) => Promise<void>
   meteredCost?: (route: AntigravityRelayRoute) => Promise<bigint | null>
   /** Conservative cost of one generate call before it runs; null = pricing missing. */
@@ -157,8 +164,8 @@ export interface AntigravityRelayDeps {
     bodyBytes: number,
     upstreamModel?: string,
   ) => bigint | null
-  /** Cost of the summed in-process usage, rounded once like settlement (not per call). */
-  totalsCost?: (route: AntigravityRelayRoute, totals: AntigravityUsageTotals) => bigint
+  /** Cost of the summed in-process usage, rounded once like settlement (null = pricing missing). */
+  totalsCost?: (route: AntigravityRelayRoute, totals: AntigravityUsageTotals) => bigint | null
   /** After a call's row is written: fold it into a turn that already settled as waived. */
   refreshWaived?: (route: AntigravityRelayRoute) => Promise<void>
   now?: () => number
@@ -422,14 +429,15 @@ function accumulateRecordedUsage(
   prev: AntigravityUsageTotals,
   row: Pick<
     AntigravityUsageRow,
-    'upstreamModel' | 'requestType' | 'promptTokens' | 'candidatesTokens' | 'thoughtsTokens' | 'cachedTokens'
+    'routeModelId' | 'upstreamModel' | 'requestType' | 'statusCode' | 'promptTokens' | 'candidatesTokens' | 'thoughtsTokens' | 'cachedTokens'
   >,
 ): AntigravityUsageTotals {
   const prompt = BigInt(row.promptTokens)
   const candidates = BigInt(row.candidatesTokens)
   const thoughts = BigInt(row.thoughtsTokens)
   const cached = BigInt(row.cachedTokens)
-  if (isAntigravityAuxUpstreamModel(row.upstreamModel)) {
+  const target = resolveAntigravityBillableTarget(row.routeModelId, row.upstreamModel)
+  if (target.bucket === 'aux') {
     const a = prev.aux
     const monitoringCalls =
       (a?.monitoringCalls ?? 0) + (row.requestType === ANTIGRAVITY_MONITORING_REQUEST_TYPE ? 1 : 0)
@@ -443,6 +451,33 @@ function accumulateRecordedUsage(
         cachedTokens: (a?.cachedTokens ?? 0n) + cached,
         calls: (a?.calls ?? 0) + 1,
         ...(monitoringCalls > 0 ? { monitoringCalls } : {}),
+      },
+    }
+  }
+  if (target.bucket === 'model') {
+    if (row.statusCode === 410) {
+      return {
+        ...prev,
+        calls: prev.calls + 1,
+        retiredExtraModels: {
+          ...prev.retiredExtraModels,
+          [target.modelId]: (prev.retiredExtraModels?.[target.modelId] ?? 0) + 1,
+        },
+      }
+    }
+    const existing = prev.extraModels?.[target.modelId]
+    return {
+      ...prev,
+      calls: prev.calls + 1,
+      extraModels: {
+        ...prev.extraModels,
+        [target.modelId]: {
+          promptTokens: (existing?.promptTokens ?? 0n) + prompt,
+          candidatesTokens: (existing?.candidatesTokens ?? 0n) + candidates,
+          thoughtsTokens: (existing?.thoughtsTokens ?? 0n) + thoughts,
+          cachedTokens: (existing?.cachedTokens ?? 0n) + cached,
+          calls: (existing?.calls ?? 0) + 1,
+        },
       },
     }
   }
@@ -489,6 +524,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       }))
   const reportOutcome = deps.reportOutcome ?? reportAntigravityOutcome
   const reportModelOutcome = deps.reportModelOutcome ?? reportAntigravityModelOutcome
+  const modelCoolingUntil = deps.modelCoolingUntil ?? antigravityModelCoolingUntil
   const recordUsage = deps.recordUsage ?? recordAntigravityRelayUsage
   const meteredCost =
     deps.meteredCost ??
@@ -496,7 +532,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       const pricing = deps.pricing?.get(route.modelId) ?? null
       if (pricing === null) return null
       const totals = await sumAntigravityRelayUsage(getPool(), route.requestId, route.userId)
-      return antigravityUsageCost(totals, pricing, deps.pricing ?? undefined)
+      return antigravityUsageCostOrNull(totals, pricing, deps.pricing ?? undefined)
     })
   const refreshWaived =
     deps.refreshWaived ??
@@ -516,11 +552,12 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       bodyBytes: number,
       upstreamModel?: string,
     ) => {
+      const target = resolveAntigravityBillableTarget(route.modelId, upstreamModel)
       const pricing = deps.pricing?.get(route.modelId) ?? null
       if (pricing === null) return null
       const promptTokens = BigInt(Math.ceil(bodyBytes / 4))
       const candidatesTokens = BigInt(RESERVED_OUTPUT_TOKENS)
-      if (isAntigravityAuxUpstreamModel(upstreamModel)) {
+      if (target.bucket === 'aux') {
         return antigravityUsageCost(
           {
             promptTokens: 0n,
@@ -540,6 +577,20 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
           deps.pricing ?? undefined,
         )
       }
+      if (target.bucket === 'model') {
+        const targetPricing = deps.pricing?.get(target.modelId) ?? null
+        if (targetPricing === null) return null
+        return antigravityUsageCost(
+          {
+            promptTokens,
+            candidatesTokens,
+            thoughtsTokens: 0n,
+            cachedTokens: 0n,
+            calls: 1,
+          },
+          targetPricing,
+        )
+      }
       // ~4 bytes per token of JSON body is generous for prompts (cached parts
       // are billed lower, so this over-reserves).
       return antigravityUsageCost(
@@ -557,9 +608,10 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
     deps.totalsCost ??
     ((route: AntigravityRelayRoute, totals: AntigravityUsageTotals) => {
       const pricing = deps.pricing?.get(route.modelId) ?? null
-      return pricing === null
-        ? 0n
-        : antigravityUsageCost(totals, pricing, deps.pricing ?? undefined)
+      if (pricing === null) {
+        return totals.extraModels && Object.keys(totals.extraModels).length > 0 ? null : 0n
+      }
+      return antigravityUsageCostOrNull(totals, pricing, deps.pricing ?? undefined)
     })
 
   return async (req, res, ctx) => {
@@ -639,6 +691,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
     }
     let upstreamModel = ''
     let requestType: string | null = null
+    let cooldownModelId = route.modelId
     let reservation: {
       slot: InflightSlot
       auxSlot: AuxInflightSlot | null
@@ -678,12 +731,24 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       }
       upstreamModel = typeof payload.model === 'string' ? payload.model : ''
       requestType = typeof payload.requestType === 'string' ? payload.requestType : null
-      if (!antigravityAllowedUpstreamModels(route.modelId).includes(upstreamModel)) {
+      if (!antigravitySwarmAllowedUpstreamModels(route.modelId, route.allowedModelIds).includes(upstreamModel)) {
         stage('model_rejected', { statusCode: 403 })
         error(res, 403, 'ANTIGRAVITY_MODEL_NOT_ALLOWED', requestId)
         return
       }
-      const isAuxLane = isAntigravityAuxUpstreamModel(upstreamModel)
+      const billableTarget = resolveAntigravityBillableTarget(route.modelId, upstreamModel)
+      if (billableTarget.bucket === 'model') {
+        cooldownModelId = billableTarget.modelId
+        const memberCooling = await modelCoolingUntil(route.accountId, billableTarget.modelId).catch(
+          () => null,
+        )
+        if (memberCooling !== null) {
+          stage('model_cooling_down', { statusCode: 503 })
+          error(res, 503, 'ANTIGRAVITY_MODEL_COOLING_DOWN', requestId)
+          return
+        }
+      }
+      const isAuxLane = billableTarget.bucket === 'aux'
       stage('precheck_started')
       let spent: bigint | null
       try {
@@ -727,6 +792,10 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       // The first call only needs budget left (serial behaviour, overspend is
       // clamped at settlement); every concurrent call must fit with the others.
       const local = slot.recorded.calls > 0 ? totalsCost(route, slot.recorded) : 0n
+      if (local === null) {
+        error(res, 503, 'ANTIGRAVITY_PRICING_UNAVAILABLE', requestId)
+        return
+      }
       const committed = (spent > local ? spent : local) + slot.reserved
       if (
         committed >= route.budgetCredits ||
@@ -800,7 +869,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       if (generate && !isAntigravityAuxUpstreamModel(upstreamModel)) {
         const modelOk = classified.kind === 'success'
         if (modelOk || classified.kind === 'upstream_error') {
-          void reportModelOutcome(route.accountId, route.modelId, modelOk).catch(() => {})
+          void reportModelOutcome(route.accountId, cooldownModelId, modelOk).catch(() => {})
         }
       }
       }

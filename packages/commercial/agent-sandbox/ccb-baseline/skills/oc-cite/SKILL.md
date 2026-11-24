@@ -48,6 +48,12 @@ oc-cite fix --manifest manifest.json --docs <docId,docId>
 - `retracted=true` → 文献已撤稿 → **不得**作为正面证据;生医/临床/政策类报告里命中即必须拦截并提示用户。
 - 只有 `resolved=true 且 retracted!=true` 的文献才可进"已验证参考文献"。
 - 撤稿状态 `null` 表示未查到撤稿信息(非"确认未撤稿");高风险领域需谨慎。
+- **防「真 DOI + 假论断 / 张冠李戴」核验(硬规则)**:拿到 `oc-cite verify` 返回的 `record.title` / `authors` / `year` 后,**必须逐一核对是否与正文拟引用的那篇论文匹配**;若发现 DOI 真实存在但指向另一篇论文(张冠李戴),或原文并不支持正文主张(真 DOI + 假论断),必须**立即拦截并修正或撤下该引用**,禁止仅凭 `resolved=true` 放行。
+
+## A/B 级引用证据分级规范(与 `research-assistant` 对齐)
+
+- **A 级(全文逐字核验)**:已过 `oc-cite verify` 校验真实未撤稿,**且**经本地原文/PDF 通过 `oc-ingest` 入库与 `oc-litrag` 检索 verbatim quote 核对具体方法、参数、实验条件与结果 → 可精确引述技术细节与定量数据。
+- **B 级(仅元数据/摘要核验)**:仅过 `oc-cite verify` 核实题录元数据或摘要,未核查全文 → **只可引述概括性结论**,严禁臆测论文内部参数、算法实现细节,或把室内/仿真实验写成外场实测。
 
 ## 引用格式
 

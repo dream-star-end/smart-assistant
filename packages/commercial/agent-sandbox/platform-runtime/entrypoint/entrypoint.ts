@@ -525,6 +525,8 @@ const PLATFORM_LINKED_CLIS = [
   "oc-muse",
   "oc-site",
   "oc-stylecheck",
+  "oc-review",
+  "oc-docxcheck",
   // 基线本机插件的命令（OCV5-383）：plugin.json components.bin[].name，经 plugin-exec 启动。
   "ths",
 ] as const;
@@ -599,6 +601,34 @@ for (const cliName of PLATFORM_LINKED_CLIS) {
   } catch (platformLinkErr) {
     console.error(
       `[entrypoint] WARN: ${cliName} PATH link setup failed (non-fatal): ${(platformLinkErr as Error).message}`,
+    );
+  }
+}
+
+// 镜像已内置 `/usr/local/bin/<cli>` 兜底副本但日常随 platform-bundle 热更的 CLI（OCV5-886）：
+// 仅在 `/home/agent/.local/bin` 建立指向热包的软链，确保 Codex `bash -lc` 被 `/etc/profile`
+// 重置 PATH 后仍优先解析到热包新版（如 `oc-docx check` / `oc_docx_paper_qa.py`），不覆写镜像文件。
+const USER_BUNDLE_OVERRIDE_CLIS = ["oc-docx", "oc-artifact-qa", "oc-web-context"] as const;
+for (const cliName of USER_BUNDLE_OVERRIDE_CLIS) {
+  const source = join(PLATFORM_BIN_DIR, cliName);
+  const userCommandLink = join(USER_PLATFORM_BIN_DIR, cliName);
+  try {
+    if (!existsSync(source)) continue;
+    mkdirSync(USER_PLATFORM_BIN_DIR, { recursive: true });
+    try {
+      const target = lstatSync(userCommandLink);
+      if (!target.isSymbolicLink() || readlinkSync(userCommandLink) !== source) {
+        console.error(
+          `[entrypoint] WARN: reserved ${userCommandLink} already exists with an unexpected target; preserved`,
+        );
+      }
+    } catch (linkErr) {
+      if ((linkErr as NodeJS.ErrnoException).code !== "ENOENT") throw linkErr;
+      symlinkSync(source, userCommandLink);
+    }
+  } catch (userLinkErr) {
+    console.error(
+      `[entrypoint] WARN: ${cliName} user PATH link setup failed (non-fatal): ${(userLinkErr as Error).message}`,
     );
   }
 }

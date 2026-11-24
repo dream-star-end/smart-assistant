@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 
-import { openContentReviewStore, setContentReviewStoreForTests } from '../contentReviewStore.js'
+import { contentReviewDbPath, getContentReviewStore, openContentReviewStore, setContentReviewStoreForTests } from '../contentReviewStore.js'
 import { appealStrikeId, shouldBanForStrikes, violationInbox } from '../contentReviewNotice.js'
 
 import {
@@ -228,5 +228,116 @@ describe('jev content review', () => {
     const notice = violationInbox({ strikeId: '41', excerpt: 'sample', activeCount: 3 })
     assert.equal(appealStrikeId(notice.bodyMd), '41')
     assert.match(notice.title, /封禁/)
+  })
+
+  it('OCV5-877: contentReviewDbPath never treats OC_SESSIONS_STORE mode keywords (pg/sqlite/memory) as relative paths', () => {
+    assert.equal(
+      contentReviewDbPath({ OC_SESSIONS_STORE: 'pg', OPENCLAUDE_HOME: '/var/lib/oc-v5' }),
+      '/var/lib/oc-v5/content-reviews.db',
+    )
+    assert.equal(
+      contentReviewDbPath({ OC_SESSIONS_STORE: 'PG', OPENCLAUDE_HOME: '/var/lib/oc-v5' }),
+      '/var/lib/oc-v5/content-reviews.db',
+    )
+    assert.equal(
+      contentReviewDbPath({ OC_SESSIONS_STORE: 'sqlite', OPENCLAUDE_HOME: '/var/lib/oc-v5' }),
+      '/var/lib/oc-v5/content-reviews.db',
+    )
+    assert.equal(
+      contentReviewDbPath({ OC_SESSIONS_STORE: 'memory', OPENCLAUDE_HOME: '/var/lib/oc-v5' }),
+      '/var/lib/oc-v5/content-reviews.db',
+    )
+    assert.equal(
+      contentReviewDbPath({ OC_SESSIONS_STORE: 'postgres://u:p@127.0.0.1/db', OPENCLAUDE_HOME: '/var/lib/oc-v5' }),
+      '/var/lib/oc-v5/content-reviews.db',
+    )
+    assert.equal(
+      contentReviewDbPath({ OC_SESSIONS_STORE: 'sessions.db', OPENCLAUDE_HOME: '/var/lib/oc-v5' }),
+      '/var/lib/oc-v5/content-reviews.db',
+    )
+    assert.equal(
+      contentReviewDbPath({ OC_SESSIONS_STORE: '/var/lib/openclaude/sessions.db', OPENCLAUDE_HOME: '/var/lib/oc-v5' }),
+      '/var/lib/openclaude/content-reviews.db',
+    )
+    assert.equal(
+      contentReviewDbPath({
+        OC_CONTENT_REVIEW_DB: '/custom/review.db',
+        OC_SESSIONS_STORE: '/var/lib/openclaude/sessions.db',
+      }),
+      '/custom/review.db',
+    )
+  })
+
+  it('OCV5-877 / OCV5-881: migrates legacy CWD content-reviews.db preserving IDs/bans and fails closed on split-brain', () => {
+    const prevCwd = process.cwd()
+    const legacyDir = mkdtempSync(join(tmpdir(), 'oc-review-legacy-cwd-'))
+    const homeDir = mkdtempSync(join(tmpdir(), 'oc-review-home-'))
+    const env: NodeJS.ProcessEnv = { OC_SESSIONS_STORE: 'pg', OPENCLAUDE_HOME: homeDir }
+
+    try {
+      // 1. Pre-upgrade: old code wrote ./content-reviews.db inside CWD for user A (id=1) + session ban
+      const legacyStore = openContentReviewStore(join(legacyDir, 'content-reviews.db'))
+      const rowA = legacyStore.insert({
+        userId: 'user-A',
+        sessionKey: 'agent:main:webchat:dm:sess-A',
+        textHash: 'hash-A',
+        excerpt: 'excerpt-A',
+        choice: 'policy_violation',
+        confidence: 0.99,
+        thresholdMet: true,
+      })
+      assert.equal(rowA.id, 1)
+      legacyStore.ban(rowA.id, 'admin:1')
+      legacyStore.close()
+
+      // 2. Upgrade: getContentReviewStore migrates legacy CWD DB into OPENCLAUDE_HOME preserving id=1 & ban
+      process.chdir(legacyDir)
+      setContentReviewStoreForTests(null)
+      const upgraded = getContentReviewStore(env)
+      const fetchedA = upgraded.get(1)
+      assert.equal(fetchedA?.userId, 'user-A')
+      assert.equal(fetchedA?.textHash, 'hash-A')
+      assert.equal(upgraded.isBanned('user-A', 'agent:main:webchat:dm:sess-A'), true)
+
+      // New insert for user B MUST NOT reuse id=1
+      const rowB = upgraded.insert({
+        userId: 'user-B',
+        sessionKey: 'agent:main:webchat:dm:sess-B',
+        textHash: 'hash-B',
+        excerpt: 'excerpt-B',
+        choice: 'policy_violation',
+        confidence: 0.95,
+        thresholdMet: true,
+      })
+      assert.equal(rowB.id, 2)
+      assert.equal(upgraded.get(1)?.userId, 'user-A')
+      upgraded.close()
+
+      // 3. Subsequent restart while legacy file still sits untouched in read-only CWD succeeds cleanly
+      setContentReviewStoreForTests(null)
+      const restarted = getContentReviewStore(env)
+      assert.equal(restarted.get(1)?.userId, 'user-A')
+      assert.equal(restarted.get(2)?.userId, 'user-B')
+      restarted.close()
+
+      // 4. Split-brain: if legacy DB later gets a diverging write (e.g. concurrent dual-writer), fail closed
+      const rogueLegacy = openContentReviewStore(join(legacyDir, 'content-reviews.db'))
+      rogueLegacy.insert({
+        userId: 'user-C',
+        sessionKey: 'agent:main:webchat:dm:sess-C',
+        textHash: 'hash-C',
+        excerpt: 'excerpt-C',
+        choice: 'policy_violation',
+        confidence: 0.98,
+        thresholdMet: true,
+      })
+      rogueLegacy.close()
+
+      setContentReviewStoreForTests(null)
+      assert.throws(() => getContentReviewStore(env), /content_review_split_brain/)
+    } finally {
+      setContentReviewStoreForTests(null)
+      process.chdir(prevCwd)
+    }
   })
 })

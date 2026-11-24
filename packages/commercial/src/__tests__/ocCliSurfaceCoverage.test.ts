@@ -290,6 +290,7 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     check: scriptProbe('oc-docx.py', ['check', '--help'], { code: 0, stdout: /--expect-formulas/ }),
     scrub: scriptProbe('oc-docx.py', ['scrub', '--help'], { code: 0, stdout: /--keep-author/ }),
     diff: scriptProbe('oc-docx.py', ['diff', '--help'], { code: 0, stdout: /--out-highlighted/ }),
+    extract: scriptProbe('oc-docx.py', ['extract', '--help'], { code: 0, stdout: /--latex/ }),
   },
   'oc-stylecheck': {
     check: scriptProbe('oc-stylecheck.py', ['--help'], { code: 0, stdout: /--style-file/ }),
@@ -568,6 +569,7 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
   'oc-review': {
     schema: reviewProbe(['schema'], 0, /ReviewFile/),
     collate: reviewProbe(['collate'], 2, /collate --dir/),
+    ledger: reviewProbe(['ledger'], 2, /ledger <init\|record\|show>/),
   },
   'oc-system': {
     skill: scriptProbe('oc-system.py', ['skill', 'preferences'], { code: 0, stdout: /用户偏好设置/ }),

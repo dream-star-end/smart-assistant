@@ -49,9 +49,12 @@ import {
   ZCODE_HOSTED_PERMISSION_MODE,
   ANTIGRAVITY_ENGINE_MODEL_IDS,
   antigravityAllowedUpstreamModels,
+  antigravityCanonicalModelForUpstream,
   antigravityCliModelId,
   antigravityDirectoryUpstreamModels,
+  antigravitySwarmAllowedUpstreamModels,
   isAntigravityEngineModel,
+  isAntigravitySwarmMemberModel,
 } from '../engineModels.js'
 
 describe('GPT-5.6 / GPT-6 engine model authority', () => {
@@ -771,5 +774,58 @@ describe('Orchestrator Neon account-verified CLI model authority (OCV5-803)', ()
     assert.equal(antigravityAllowedUpstreamModels('antigravity-orchestrator-carbon').includes('gemini-pro-orchestrator-neon'), false)
     assert.equal(isAntigravityEngineModel('antigravity-orchestrator-neon'), true)
     assert.equal(isAntigravityEngineModel('gemini-pro-orchestrator-neon'), false)
+  })
+})
+
+describe('OCV5-879: Antigravity swarm upstream reverse-mapping and allowlist union', () => {
+  test('antigravityCanonicalModelForUpstream maps every built-in CLI id uniquely and excludes aux/worker/unknown', () => {
+    assert.equal(antigravityCanonicalModelForUpstream('gemini-4-neon-xhigh'), 'antigravity-gemini-4-neon')
+    assert.equal(antigravityCanonicalModelForUpstream('gemini-4-carbon-low'), 'antigravity-gemini-4-carbon')
+    assert.equal(antigravityCanonicalModelForUpstream('gemini-4-hydrogen-medium'), 'antigravity-gemini-4-hydrogen')
+    assert.equal(antigravityCanonicalModelForUpstream('gemini-pro-orchestrator'), 'antigravity-orchestrator-carbon')
+    assert.equal(antigravityCanonicalModelForUpstream('gemini-pro-orchestrator-neon'), 'antigravity-orchestrator-neon')
+    assert.equal(antigravityCanonicalModelForUpstream('claude-opus-5-5-high'), 'antigravity-claude-opus-5.5')
+    assert.equal(antigravityCanonicalModelForUpstream('claude-sonnet-5-5-medium'), 'antigravity-claude-sonnet-5.5')
+    assert.equal(antigravityCanonicalModelForUpstream('gpt-oss-120b-medium'), 'antigravity-gpt-oss-120b')
+    assert.equal(antigravityCanonicalModelForUpstream('gemini-3.5-flash-lite'), null)
+    assert.equal(antigravityCanonicalModelForUpstream('gemini-flash-worker-agy'), null)
+    assert.equal(antigravityCanonicalModelForUpstream('gpt-6.2-astra'), null)
+    assert.equal(antigravityCanonicalModelForUpstream(undefined), null)
+  })
+
+  test('antigravitySwarmAllowedUpstreamModels preserves strict isolation without extras, unions non-orchestrator models, and blocks ambiguous orchestrator extra members', () => {
+    assert.equal(isAntigravitySwarmMemberModel('antigravity-gemini-4-neon'), true)
+    assert.equal(isAntigravitySwarmMemberModel('antigravity-claude-opus-5.5'), true)
+    assert.equal(isAntigravitySwarmMemberModel('antigravity-orchestrator-carbon'), false)
+    assert.equal(isAntigravitySwarmMemberModel('antigravity-orchestrator-neon'), false)
+    assert.equal(isAntigravitySwarmMemberModel('gpt-6.2-astra'), false)
+
+    assert.deepEqual(
+      antigravitySwarmAllowedUpstreamModels('antigravity-gemini-4-hydrogen'),
+      antigravityAllowedUpstreamModels('antigravity-gemini-4-hydrogen'),
+    )
+    // Non-orchestrator primary: orchestrator extras are excluded so gemini-flash-worker-agy is never admitted ambiguously
+    const union = antigravitySwarmAllowedUpstreamModels('antigravity-gemini-4-hydrogen', [
+      'antigravity-gemini-4-neon',
+      'antigravity-orchestrator-carbon', // excluded
+      'gpt-6.2-astra', // ignored
+    ])
+    assert.ok(union.includes('gemini-4-hydrogen-high'))
+    assert.ok(union.includes('gemini-4-neon-xhigh'))
+    assert.equal(union.includes('gemini-pro-orchestrator'), false)
+    assert.equal(union.includes('gemini-flash-worker-agy'), false)
+    assert.ok(union.includes('gemini-3.5-flash-lite'))
+    assert.equal(union.includes('claude-opus-5-5-high'), false)
+    assert.equal(union.includes('gpt-6.2-astra'), false)
+
+    // Orchestrator primary keeps its own worker uniquely while admitting standard non-orchestrator members (never the sibling orchestrator)
+    const orchUnion = antigravitySwarmAllowedUpstreamModels('antigravity-orchestrator-carbon', [
+      'antigravity-gemini-4-neon',
+      'antigravity-orchestrator-neon', // excluded
+    ])
+    assert.ok(orchUnion.includes('gemini-pro-orchestrator'))
+    assert.ok(orchUnion.includes('gemini-flash-worker-agy'))
+    assert.ok(orchUnion.includes('gemini-4-neon-xhigh'))
+    assert.equal(orchUnion.includes('gemini-pro-orchestrator-neon'), false)
   })
 })

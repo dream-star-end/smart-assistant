@@ -1094,6 +1094,67 @@ export class DelegateInflightSurfaceStore {
     return dropped + this.sweepTombstones(now)
   }
 
+  /**
+   * Prune stale terminal rows older than `maxAgeMs` (default 24h) and optionally
+   * truncate the SQLite WAL. Never touches active non-terminal rows. Fail-open on
+   * SQLITE_BUSY or I/O errors.
+   */
+  pruneStaleTerminalRows(
+    opts: { maxAgeMs?: number; nowMs?: number; dryRun?: boolean } = {},
+  ): { deleted: number; checkpointed: boolean } {
+    if (this.closed) return { deleted: 0, checkpointed: false }
+    const maxAgeMs = opts.maxAgeMs ?? 24 * 3600_000
+    const nowMs = opts.nowMs ?? this.now()
+    const cutoff = nowMs - maxAgeMs
+    const dryRun = opts.dryRun === true
+    const matchedIds = new Set<string>()
+    for (const [jobId, row] of this.byJob.entries()) {
+      if (isDelegateTerminalState(row.state) && row.updatedAt < cutoff) {
+        matchedIds.add(jobId)
+      }
+    }
+    if (this.db) {
+      try {
+        const dbRows = this.db
+          .prepare(
+            `SELECT job_id FROM inflight_delegate_surface
+             WHERE state IN (${TERMINAL_SQL}) AND updated_at < ?`,
+          )
+          .all(cutoff) as Array<{ job_id: string }>
+        for (const row of dbRows) {
+          if (row.job_id) matchedIds.add(row.job_id)
+        }
+        if (!dryRun && dbRows.length > 0) {
+          this.db
+            .prepare(
+              `DELETE FROM inflight_delegate_surface
+               WHERE state IN (${TERMINAL_SQL}) AND updated_at < ?`,
+            )
+            .run(cutoff)
+        }
+      } catch (err) {
+        this.noteWriteError(err, { phase: 'prune-stale-terminal' })
+        return { deleted: 0, checkpointed: false }
+      }
+    }
+    if (dryRun) return { deleted: matchedIds.size, checkpointed: false }
+    for (const jobId of matchedIds) {
+      this.byJob.delete(jobId)
+      this.pendingPersistJobs.delete(jobId)
+      this.droppedJobs.delete(jobId)
+    }
+    let checkpointed = false
+    if (this.db) {
+      try {
+        const res = this.db.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy?: number }> | undefined
+        checkpointed = Array.isArray(res) && res.length > 0 ? Number(res[0]?.busy ?? 0) === 0 : true
+      } catch (err) {
+        this.noteWriteError(err, { phase: 'prune-wal-checkpoint' })
+      }
+    }
+    return { deleted: matchedIds.size, checkpointed }
+  }
+
   private enforceTerminalCap(userId: string, sessionId: string): void {
     if (!sessionId) return
     const terminals = [...this.byJob.values()].filter((row) => {

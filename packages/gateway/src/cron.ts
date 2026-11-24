@@ -47,7 +47,7 @@ import {
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
-import { type AgentDef, type OpenClaudeConfig, paths, readAgentsConfig } from '@openclaude/storage'
+import { type AgentDef, type OpenClaudeConfig, gcCronOccurrenceTapes, paths, readAgentsConfig } from '@openclaude/storage'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { createLogger } from './logger.js'
 import type { SessionManager } from './sessionManager.js'
@@ -2902,21 +2902,19 @@ export class CronScheduler {
     })
   }
 
-  // Delete output files older than 7 days
+  // Delete output files and terminal occurrence tapes older than 7 days
   private async _cleanupOldOutputs(): Promise<void> {
     const dir = paths.cronOutputsDir
-    if (!existsSync(dir)) return
-    const cutoff = Date.now() - 7 * 24 * 3600_000
-    try {
-      const files = await readdir(dir)
-      for (const f of files) {
-        const fp = join(dir, f)
-        const s = await stat(fp)
-        if (s.mtimeMs < cutoff) {
-          await unlink(fp)
+    if (existsSync(dir)) {
+      const cutoff = Date.now() - 7 * 24 * 3600_000
+      try {
+        for (const f of await readdir(dir)) {
+          const fp = join(dir, f)
+          if ((await stat(fp)).mtimeMs < cutoff) await unlink(fp)
         }
-      }
-    } catch {}
+      } catch {}
+    }
+    await gcCronOccurrenceTapes().catch(() => {})
   }
 }
 

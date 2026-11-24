@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
@@ -34,6 +35,7 @@ import type { SessionStreamEvent } from './engine/engineEvents.js'
 const USER_CHANNELS = new Set(['webchat', 'wechat', 'telegram'])
 const SCAN_THROTTLE_MS = 10 * 60_000
 const JANITOR_THROTTLE_MS = 6 * 60 * 60_000
+const JANITOR_RETRY_BACKOFF_MS = 5 * 60_000
 const MAX_MEMORY_FILES = 50
 const MAX_MEMORY_CHARS = 30_000
 const MAX_MEMORY_FILE_CHARS = 8_000
@@ -263,6 +265,8 @@ export interface AutoDreamDeps {
   hasStrongCoreHit?: typeof findStrongLexicalMemory
   /** Test seam for L1 deterministic context janitor. Production uses runContextJanitor. */
   runJanitor?: typeof runContextJanitor
+  /** Optional zero-LLM runtime hygiene GC hook (invoked for 'main' under the 6h L1 throttle). */
+  runRuntimeGc?: (nowMs: number) => Promise<void | { errors?: readonly string[] }>
   /** Test seam for L2 semantic auto-consolidation. Production uses runSemanticConsolidation. */
   runSemanticConsolidator?: typeof runSemanticConsolidation
   /** Optional dedicated model runner for L2 semantic consolidation (defaults to runModel). */
@@ -330,9 +334,14 @@ export class AutoDreamService {
   private readonly log: (event: string, fields: Record<string, unknown>) => void
   private readonly hasStrongCoreHit: typeof findStrongLexicalMemory
   private readonly runJanitor: typeof runContextJanitor
+  private readonly hasCustomRunJanitor: boolean
+  private readonly runRuntimeGc: (nowMs: number) => Promise<void | { errors?: readonly string[] }>
   private readonly runSemanticConsolidator: typeof runSemanticConsolidation
   private readonly runSemanticModel: (input: AutoDreamModelRun) => Promise<string>
-  private readonly lastJanitorAtByAgent = new Map<string, number>()
+  private readonly nextJanitorAtByAgent = new Map<string, number>()
+  private readonly janitorInFlightByAgent = new Set<string>()
+  private nextRuntimeGcAt: number | undefined
+  private runtimeGcInFlight = false
 
   constructor(deps: AutoDreamDeps) {
     this.policyClient = deps.policyClient ?? new AutoDreamPolicyClient()
@@ -341,20 +350,34 @@ export class AutoDreamService {
     this.now = deps.now ?? Date.now
     this.log = deps.log ?? (() => {})
     this.hasStrongCoreHit = deps.hasStrongCoreHit ?? findStrongLexicalMemory
+    this.hasCustomRunJanitor = deps.runJanitor !== undefined
     this.runJanitor = deps.runJanitor ?? runContextJanitor
+    this.runRuntimeGc = deps.runRuntimeGc ?? (async () => {})
     this.runSemanticConsolidator = deps.runSemanticConsolidator ?? runSemanticConsolidation
     this.runSemanticModel = deps.runSemanticModel ?? deps.runModel
   }
 
   async maybeSchedule(trigger: AutoDreamTrigger): Promise<void> {
     if (!USER_CHANNELS.has(trigger.channel)) return
+    // OCV5-883: Zero-LLM-cost L1 hygiene runs independently of paid Auto-Dream
+    // policy/mode and even when policyClient.get() fails.
+    await this.maybeRunL1Hygiene(trigger.agentId)
     await this.reconcileStaleRun(trigger.agentId).catch((err) => {
       this.log('auto_dream_stale_reconcile_failed', {
         agentId: trigger.agentId,
         error: safeError(err),
       })
     })
-    const policy = await this.policyClient.get()
+    let policy: AutoDreamPolicy
+    try {
+      policy = await this.policyClient.get()
+    } catch (err) {
+      this.log('auto_dream_policy_fetch_failed', {
+        agentId: trigger.agentId,
+        error: safeError(err),
+      })
+      return
+    }
     if (!policy.enabled || policy.mode !== 'legacy_memory_v1') return
     try {
       await this.maybeRun(trigger, policy)
@@ -364,6 +387,15 @@ export class AutoDreamService {
         error: safeError(err),
       })
     }
+  }
+
+  /**
+   * Zero-LLM-cost L1 deterministic hygiene (Context Janitor + main-agent runtime GC).
+   * Completely decoupled from paid Auto-Dream policy and strictly fail-open.
+   */
+  async maybeRunL1Hygiene(agentId: string): Promise<void> {
+    await this.maybeRunJanitor(agentId)
+    await this.maybeRunRuntimeGc(agentId)
   }
 
   /** Identity-bound container API projection; stale paid attempts converge to a visible failure. */
@@ -377,6 +409,8 @@ export class AutoDreamService {
   }
 
   private async reconcileStaleRun(agentId: string): Promise<void> {
+    const statePath = paths.agentAutoDreamState(agentId)
+    if (!existsSync(statePath)) return
     let lock: KernelFileLock
     try {
       lock = await acquireKernelFileLock(paths.agentAutoDreamLock(agentId))
@@ -384,7 +418,6 @@ export class AutoDreamService {
       return
     }
     try {
-      const statePath = paths.agentAutoDreamState(agentId)
       const state = await readState(statePath)
       if (state.status !== 'running') return
       const startedAt = parseTime(state.startedAt)
@@ -482,9 +515,6 @@ export class AutoDreamService {
       await lock.release().catch(() => {})
     }
 
-    // OCV5-840: zero-LLM-cost L1 deterministic cleanup runs on its own throttle
-    // window outside the Auto-Dream lock (fail-open, never blocks main cadence).
-    await this.maybeRunJanitor(trigger.agentId)
     if (!shouldProceedToModel) return
 
     // Non-paid bounded snapshot work happens before lastAttemptAt is advanced.
@@ -859,18 +889,30 @@ export class AutoDreamService {
 
   private async maybeRunJanitor(agentId: string): Promise<void> {
     const now = this.now()
-    const lastAt = this.lastJanitorAtByAgent.get(agentId)
-    if (lastAt !== undefined && now - lastAt < JANITOR_THROTTLE_MS) return
-    this.lastJanitorAtByAgent.set(agentId, now)
+    if (this.janitorInFlightByAgent.has(agentId)) return
+    const nextAllowedAt = this.nextJanitorAtByAgent.get(agentId)
+    if (nextAllowedAt !== undefined && now < nextAllowedAt) return
+
+    // B2: Only the primary 'main' agent may run shared user-skill cold archival.
+    const allowSharedSkills = agentId === 'main'
+    const agentDir = paths.agentDir(agentId)
+    if (
+      !this.hasCustomRunJanitor &&
+      !existsSync(agentDir) &&
+      (!allowSharedSkills || !existsSync(paths.sharedSkillsDir))
+    ) {
+      return
+    }
+
+    this.janitorInFlightByAgent.add(agentId)
     try {
-      // B2: Only the primary 'main' agent may run shared user-skill cold archival.
-      const allowSharedSkills = agentId === 'main'
       const record = await this.runJanitor({
         agentId,
-        agentDir: paths.agentDir(agentId),
+        agentDir,
         skillsDir: paths.sharedSkillsDir,
         mode: 'auto',
         archiveExpiredMemories: true,
+        compactMemoryIndex: true,
         archiveColdSkills: allowSharedSkills,
         coldSkillDays: 60,
         maxColdSkillsPerRun: 10,
@@ -879,12 +921,21 @@ export class AutoDreamService {
         today: memoryCalendarDate(new Date(now)),
         nowMs: now,
       })
-      if (
+      const didWork =
         record.expiredMemoriesArchived > 0 ||
         record.coldSkillsArchived > 0 ||
         record.skillHistoriesPruned > 0 ||
-        record.archivalCleaned > 0
-      ) {
+        record.archivalCleaned > 0 ||
+        Boolean(record.memoryIndexCompacted)
+      const hasLockBusyError =
+        Array.isArray(record.errors) &&
+        record.errors.some((e) => /lock|busy|timeout|ebusy|eagain/i.test(e))
+      if (!didWork && hasLockBusyError) {
+        this.nextJanitorAtByAgent.set(agentId, now + JANITOR_RETRY_BACKOFF_MS)
+      } else {
+        this.nextJanitorAtByAgent.set(agentId, now + JANITOR_THROTTLE_MS)
+      }
+      if (didWork) {
         this.log('auto_dream_janitor_completed', {
           agentId,
           expiredMemoriesArchived: record.expiredMemoriesArchived,
@@ -892,14 +943,53 @@ export class AutoDreamService {
           skillHistoriesPruned: record.skillHistoriesPruned,
           archivalDecayed: record.archivalDecayed,
           archivalCleaned: record.archivalCleaned,
+          memoryIndexCompacted: record.memoryIndexCompacted ?? false,
+          memoryIndexBytesSaved: record.memoryIndexBytesSaved ?? 0,
+          memoryIndexBrokenLinksRemoved: record.memoryIndexBrokenLinksRemoved ?? 0,
           bytesFreed: record.bytesFreed,
         })
       }
     } catch (err) {
+      // Short retry backoff on incomplete/lock-busy failure instead of blocking for 6h.
+      this.nextJanitorAtByAgent.set(agentId, now + JANITOR_RETRY_BACKOFF_MS)
       this.log('auto_dream_janitor_failed', {
         agentId,
         error: safeError(err),
       })
+    } finally {
+      this.janitorInFlightByAgent.delete(agentId)
+    }
+  }
+
+  private async maybeRunRuntimeGc(agentId: string): Promise<void> {
+    if (agentId !== 'main') return
+    const now = this.now()
+    if (this.runtimeGcInFlight) return
+    if (this.nextRuntimeGcAt !== undefined && now < this.nextRuntimeGcAt) return
+    this.runtimeGcInFlight = true
+    try {
+      const report = await this.runRuntimeGc(now)
+      const errors = Array.isArray(report?.errors) ? report.errors : []
+      if (errors.length > 0) {
+        this.nextRuntimeGcAt = now + JANITOR_RETRY_BACKOFF_MS
+        this.log('auto_dream_runtime_gc_partial_errors', {
+          agentId,
+          level: 'warn',
+          errorCount: errors.length,
+          errors: errors.slice(0, 5),
+        })
+      } else {
+        this.nextRuntimeGcAt = now + JANITOR_THROTTLE_MS
+      }
+    } catch (err) {
+      this.nextRuntimeGcAt = now + JANITOR_RETRY_BACKOFF_MS
+      this.log('auto_dream_runtime_gc_failed', {
+        agentId,
+        level: 'warn',
+        error: safeError(err),
+      })
+    } finally {
+      this.runtimeGcInFlight = false
     }
   }
 
