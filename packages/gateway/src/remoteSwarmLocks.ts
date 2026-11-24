@@ -19,6 +19,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   unlinkSync,
@@ -26,6 +27,7 @@ import {
   writeSync,
 } from 'node:fs'
 import { join, sep } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 
 export interface RemoteSwarmLocation {
   readonly brainDir: string
@@ -167,7 +169,12 @@ export function appendBoardLineNoSymlink(swarmDir: string, line: string): void {
   }
 }
 
-export function readBoardPostsFromDisk(swarmDir: string): BoardPostRecord[] {
+export const DEFAULT_MAX_REMOTE_BOARD_READ_BYTES = 2 * 1024 * 1024
+
+export function readBoardPostsFromDisk(
+  swarmDir: string,
+  maxBytes: number = DEFAULT_MAX_REMOTE_BOARD_READ_BYTES,
+): BoardPostRecord[] {
   const boardPath = join(swarmDir, 'board.jsonl')
   let fd: number | null = null
   let raw = ''
@@ -184,7 +191,23 @@ export function readBoardPostsFromDisk(swarmDir: string): BoardPostRecord[] {
     if (!fst.isFile() || fst.dev !== lst.dev || fst.ino !== lst.ino) {
       throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
     }
-    raw = readFileSync(fd, 'utf8')
+    if (fst.size <= 0) return []
+    const cap = Math.max(4096, maxBytes)
+    if (fst.size <= cap) {
+      raw = readFileSync(fd, 'utf8')
+    } else {
+      const startOffset = fst.size - cap
+      const buf = Buffer.allocUnsafe(cap)
+      let offset = 0
+      while (offset < cap) {
+        const n = readSync(fd, buf, offset, cap - offset, startOffset + offset)
+        if (n <= 0) break
+        offset += n
+      }
+      const chunk = buf.subarray(0, offset).toString('utf8')
+      const nl = chunk.indexOf('\n')
+      raw = nl >= 0 ? chunk.slice(nl + 1) : ''
+    }
   } catch (err: any) {
     if (err?.code === 'ENOENT') return []
     if (err?.code === 'ELOOP') throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
@@ -227,6 +250,169 @@ export function readBoardPostsFromDisk(swarmDir: string): BoardPostRecord[] {
     }
   }
   return posts
+}
+
+function parseSingleBoardLine(trimmed: string, fallbackSeq: number): BoardPostRecord | null {
+  if (!trimmed) return null
+  try {
+    const obj = JSON.parse(trimmed) as Record<string, unknown>
+    if (!obj || typeof obj !== 'object') return null
+    const seq =
+      typeof obj.seq === 'number' && Number.isFinite(obj.seq) ? Math.floor(obj.seq) : fallbackSeq
+    return {
+      seq,
+      agent: typeof obj.agent === 'string' && obj.agent.trim() ? obj.agent.trim() : 'unknown',
+      channel: typeof obj.channel === 'string' && obj.channel.trim() ? obj.channel.trim() : 'main',
+      text: typeof obj.text === 'string' ? obj.text : '',
+      time: typeof obj.time === 'string' ? obj.time : formatBoardTimestamp(),
+      ...(typeof obj.kind === 'string' ? { kind: obj.kind } : {}),
+      ...(typeof obj.request_id === 'string' ? { request_id: obj.request_id } : {}),
+      ...(obj.control && typeof obj.control === 'object' && !Array.isArray(obj.control)
+        ? { control: obj.control as Record<string, unknown> }
+        : {}),
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * B10: Cursor-aware bounded board reader.
+ * Never skips unread posts earlier than the 2 MiB display tail: when `sinceSeq`
+ * precedes the tail window, scans forward in 256 KiB chunks from byte 0 until
+ * `maxPosts` (or `maxBytes`) contiguous unread posts are collected, returning
+ * `hasMore: true` so the caller processes every post in exact `seq` order.
+ */
+export function readBoardPostsSinceSeq(
+  swarmDir: string,
+  sinceSeq: number,
+  opts?: {
+    maxPosts?: number
+    maxBytes?: number
+    filter?: (post: BoardPostRecord) => boolean
+  },
+): { posts: BoardPostRecord[]; hasMore: boolean; headSeq: number; lastScannedSeq: number } {
+  const dirStat = lstatSync(swarmDir)
+  if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+    throw new Error('SWARM_DIR_SYMLINK_REJECTED')
+  }
+  const boardPath = join(swarmDir, 'board.jsonl')
+  const maxPosts = Math.max(1, opts?.maxPosts ?? 256)
+  const maxBytes = Math.max(16 * 1024, opts?.maxBytes ?? 2 * 1024 * 1024)
+  const matchesFilter = opts?.filter ?? (() => true)
+  let fd: number | null = null
+  try {
+    const lst = lstatSync(boardPath)
+    if (lst.isSymbolicLink() || !lst.isFile()) throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
+    const flags =
+      fsConstants.O_RDONLY |
+      (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0)
+    fd = openSync(boardPath, flags)
+    const fst = fstatSync(fd)
+    if (!fst.isFile() || fst.dev !== lst.dev || fst.ino !== lst.ino) {
+      throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
+    }
+    if (fst.size <= 0) return { posts: [], hasMore: false, headSeq: 0, lastScannedSeq: sinceSeq }
+
+    const readSlice = (start: number, len: number): Buffer => {
+      const buf = Buffer.allocUnsafe(len)
+      let off = 0
+      while (off < len) {
+        const n = readSync(fd!, buf, off, len - off, start + off)
+        if (n <= 0) break
+        off += n
+      }
+      return buf.subarray(0, off)
+    }
+
+    // Read tail slice first to obtain authoritative headSeq and check fast path.
+    const tailLen = Math.min(fst.size, Math.min(maxBytes, 512 * 1024))
+    const tailStart = fst.size - tailLen
+    const tailRaw = readSlice(tailStart, tailLen).toString('utf8')
+    const tailBody = tailStart > 0 ? (tailRaw.indexOf('\n') >= 0 ? tailRaw.slice(tailRaw.indexOf('\n') + 1) : '') : tailRaw
+    const tailPosts: BoardPostRecord[] = []
+    let lineIdx = 0
+    for (const line of tailBody.split('\n')) {
+      lineIdx += 1
+      const parsed = parseSingleBoardLine(line.trim(), lineIdx)
+      if (parsed) tailPosts.push(parsed)
+    }
+    const headSeq = tailPosts.reduce((m, p) => Math.max(m, p.seq), 0)
+    if (tailStart === 0 || (tailPosts.length > 0 && sinceSeq >= tailPosts[0]!.seq - 1)) {
+      const collected: BoardPostRecord[] = []
+      let hasMore = false
+      let lastScannedSeq = sinceSeq
+      for (const p of tailPosts) {
+        if (p.seq <= sinceSeq) continue
+        if (!matchesFilter(p)) {
+          if (p.seq > lastScannedSeq) lastScannedSeq = p.seq
+          continue
+        }
+        if (collected.length >= maxPosts) {
+          hasMore = true
+          break
+        }
+        collected.push(p)
+        if (p.seq > lastScannedSeq) lastScannedSeq = p.seq
+      }
+      return { posts: collected, hasMore, headSeq, lastScannedSeq }
+    }
+
+    // Slow/early cursor precedes the tail window: stream forward in 256 KiB chunks from byte 0.
+    const CHUNK = 256 * 1024
+    const decoder = new StringDecoder('utf8')
+    let carry = ''
+    let pos = 0
+    let approxLine = 0
+    let collectedBytes = 0
+    const collected: BoardPostRecord[] = []
+    let hasMore = false
+    let highestSeenSeq = headSeq
+    let lastScannedSeq = sinceSeq
+
+    outer: while (pos < fst.size) {
+      const len = Math.min(CHUNK, fst.size - pos)
+      const chunk = readSlice(pos, len)
+      if (chunk.length === 0) break
+      pos += chunk.length
+      const text = carry + decoder.write(chunk) + (pos >= fst.size ? decoder.end() : '')
+      const lines = text.split('\n')
+      carry = pos < fst.size ? (lines.pop() ?? '') : ''
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        approxLine += 1
+        const parsed = parseSingleBoardLine(trimmed, approxLine)
+        if (!parsed) continue
+        if (parsed.seq > highestSeenSeq) highestSeenSeq = parsed.seq
+        if (parsed.seq <= sinceSeq) continue
+        if (!matchesFilter(parsed)) {
+          if (parsed.seq > lastScannedSeq) lastScannedSeq = parsed.seq
+          continue
+        }
+        if (collected.length >= maxPosts || (collected.length > 0 && collectedBytes + trimmed.length > maxBytes)) {
+          hasMore = true
+          break outer
+        }
+        collected.push(parsed)
+        collectedBytes += trimmed.length
+        if (parsed.seq > lastScannedSeq) lastScannedSeq = parsed.seq
+      }
+    }
+    return { posts: collected, hasMore, headSeq: highestSeenSeq, lastScannedSeq }
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return { posts: [], hasMore: false, headSeq: 0, lastScannedSeq: sinceSeq }
+    if (err?.code === 'ELOOP') throw new Error('SWARM_BOARD_SYMLINK_REJECTED')
+    throw err
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 }
 
 function lockErrorCodes(lockFileName: '.board.lock' | '.roster.lock') {

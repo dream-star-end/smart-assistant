@@ -1637,3 +1637,98 @@ test('W3 auditor R1 regressions: telemetry sync/async fence (no double count), d
     await rm(brainDir, { recursive: true, force: true })
   }
 })
+
+test('OCV5-887: >64KB transcript step, mid-turn GENERIC status, native string workspace, >2MB board totalPosts, and turnWorkerUsageDelta', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-887-watcher-'))
+  try {
+    const { swarmDir } = await writeSwarmFixture(brainDir)
+    // Native CLI writes `workspace` as a path string + `workspace_mode`
+    await writeFile(
+      path.join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'OCV5-887 验证',
+        members: {
+          coordinator: { conversation_id: COORD_CONV, role: 'coordinator', killed: false },
+          parser: {
+            conversation_id: WORKER_CONV,
+            role: 'worker',
+            killed: false,
+            workspace: '/repo/.worktrees/parser',
+            workspace_mode: 'branch',
+          },
+        },
+      }),
+    )
+
+    // 1. Mid-turn truncated GENERIC step (without planner DONE in tail) stays working instead of false waiting
+    const midTurnTail = parseMemberTranscriptTail(
+      `${JSON.stringify({ step_index: 7, type: 'GENERIC', status: 'DONE', created_at: '2026-11-24T01:00:00Z' })}\n`,
+    )
+    assert.equal(midTurnTail.status, 'working')
+    assert.equal(midTurnTail.stepCount, 8)
+
+    // 2. >64KB (~120KB) single-line JSONL step in transcript.jsonl is read intact via adaptive 2MB tail
+    const workerTranscript = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs', 'transcript.jsonl')
+    const hugeOutput = 'X'.repeat(120 * 1024)
+    await writeFile(
+      workerTranscript,
+      `${[
+        JSON.stringify({
+          step_index: 0,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-24T01:00:00.000Z',
+          usage: { input_tokens: 500, output_tokens: 100 },
+        }),
+        JSON.stringify({
+          step_index: 12,
+          type: 'ERROR_MESSAGE',
+          status: 'ERROR',
+          content: `fatal crash after big tool output: ${hugeOutput}`,
+          created_at: '2026-11-24T02:00:10.000Z',
+          usage: { input_tokens: 3000, output_tokens: 700, cache_read_input_tokens: 200 },
+        }),
+      ].join('\n')}\n`,
+    )
+
+    // 3. >2MB board.jsonl preserves monotonic totalPosts from headSeq
+    const filler = '讨论板正文填充'.repeat(300)
+    const boardLines: string[] = []
+    let bytes = 0
+    let seq = 1
+    while (bytes < 2.2 * 1024 * 1024) {
+      const line = `${JSON.stringify({ seq, agent: 'parser', channel: 'main', text: filler })}\n`
+      boardLines.push(line)
+      bytes += Buffer.byteLength(line, 'utf8')
+      seq += 1
+    }
+    const expectedTotalPosts = seq - 1
+    await writeFile(path.join(swarmDir, 'board.jsonl'), boardLines.join(''))
+
+    const watcher = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: COORD_CONV,
+      pollMs: 60_000,
+      seedBaselineOnStart: true,
+      now: () => Date.parse('2026-11-24T02:00:01.000Z'),
+      onSnapshot: () => {},
+    })
+    watcher.start()
+    watcher.activateTurnSwarm()
+    const finalSnap = watcher.stopAndReadFinal('completed')
+    assert.ok(finalSnap)
+    assert.equal(finalSnap.totalPosts, expectedTotalPosts)
+    const parserMember = finalSnap.members.find((m) => m.name === 'parser')
+    assert.ok(parserMember)
+    assert.equal(parserMember.stepCount, 13, '120KB line must not reset stepCount to 0')
+    assert.equal(parserMember.failed, true)
+    assert.equal(parserMember.workspace, 'branch')
+    assert.ok(parserMember.workspacePath?.endsWith('parser'))
+
+    // Only step_index 12 fell inside turn window (>= 02:00:00Z), excluding prior-turn step_index 0 (01:00:00Z)!
+    const delta = watcher.turnWorkerUsageDelta()
+    assert.deepEqual(delta, { inputTokens: 3000, outputTokens: 700, cacheReadTokens: 200, thinkingTokens: 0 })
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})

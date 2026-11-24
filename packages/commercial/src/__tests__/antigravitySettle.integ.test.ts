@@ -33,7 +33,16 @@ import {
   recordAntigravityTurn,
   refreshWaivedAntigravityUsage,
   settleAntigravityTurnRecord,
+  settleLateAntigravityRelayUsage,
 } from '../billing/antigravitySettle.js'
+import {
+  runAntigravityTurnReconcileTick,
+  settleDurableAntigravityBilling,
+} from '../billing/durableAntigravityBilling.js'
+import { serializeBillingPricing } from '../billing/persistedBillingPricing.js'
+import { startInflightJournal } from '../billing/proxyBilling.js'
+import { createPgSessionsBackend } from '../db/pgSessionsBackend.js'
+import { LOSSLESS_TURN_TAPE_VERSION } from '@openclaude/protocol'
 import type { ModelPricing, PricingCache } from '../billing/pricing.js'
 import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
@@ -1316,5 +1325,567 @@ describe('P0-2a real PG aux/monitoring settlement attribution & legacy compatibi
       }),
       false,
     )
+  })
+
+  test('OCV5-887 durable tape billing settles disconnected swarm turns, backfills raced live WS turnKey, waives crashed/interrupted unknown reconciles, and bills late worker streams via CAS delta row', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const uid = await user(5_000n)
+
+    // 1. Disconnected WS: durable `engine: 'antigravity'` frame settles turn, writes turn_key, and folds cost component
+    const req1 = rid()
+    const tk1 = createHash('sha256').update(`tk1:${req1}`).digest('hex')
+    const folded: Array<{ reqId: string; credits: string; turnKey: string | null | undefined }> = []
+    await recordAntigravityTurn(getPool(), {
+      requestId: req1,
+      userId: uid,
+      modelId: MODEL,
+      sessionId: 's-durable-1',
+      traceId: null,
+    })
+    await usageRow(req1, uid, 100_000, 20_000) // 100k*120 + 20k*150 = 15M/1M = 15 credits
+    const d1 = await settleDurableAntigravityBilling(
+      {
+        pgPool: getPool(),
+        pricing,
+        expireRouteForRequest: async () => {},
+        appendCostCredits: async (rId, _u, credits, _s, _ps, _da, tKey) => {
+          folded.push({ reqId: rId, credits, turnKey: tKey ?? '' })
+        },
+      },
+      uid,
+      {
+        engine: 'antigravity',
+        requestId: req1,
+        engineSessionId: `oceng-${'1'.repeat(48)}`,
+        status: 'success',
+        durationMs: 1_000,
+        turnKey: tk1,
+      },
+    )
+    assert.equal(d1, 'committed')
+    assert.equal(await balance(uid), 4_985n)
+    assert.deepEqual(folded, [{ reqId: req1, credits: '15', turnKey: tk1 }])
+    const ur1 = await query<{ turn_key: string | null; cost_credits: string }>(
+      'SELECT turn_key, cost_credits::text FROM usage_records WHERE request_id = $1',
+      [req1],
+    )
+    assert.equal(ur1.rows[0]?.turn_key, tk1)
+    assert.equal(ur1.rows[0]?.cost_credits, '15')
+
+    // 2. Late orphaned worker stream finishes AFTER parent turn settled as 'success':
+    //    parent row stays immutable (OCV5-451 preserved), while exact delta (6 credits) settles once under CAS lateRequestId!
+    await usageRow(req1, uid, 50_000, 0) // +50k*120 = +6 credits -> cumulative 21, delta = 6
+    const [lateA, lateB] = await Promise.all([
+      settleLateAntigravityRelayUsage({
+        pool: getPool(),
+        pricing,
+        requestId: req1,
+        userId: uid,
+        appendCostCredits: async (rId, _u, credits, _s, _ps, _da, tKey) => {
+          folded.push({ reqId: rId, credits, turnKey: tKey ?? '' })
+        },
+      }),
+      settleLateAntigravityRelayUsage({
+        pool: getPool(),
+        pricing,
+        requestId: req1,
+        userId: uid,
+        appendCostCredits: async (rId, _u, credits, _s, _ps, _da, tKey) => {
+          folded.push({ reqId: rId, credits, turnKey: tKey ?? '' })
+        },
+      }),
+    ])
+    assert.equal(Number(lateA) + Number(lateB), 1, 'concurrent late stream settle must commit once via CAS')
+    assert.equal(await balance(uid), 4_979n) // 4985 - 6 = 4979
+    // Parent usage_records row MUST remain 15 credits (OCV5-451 invariant!)
+    const parentAfterLate = await query<{ cost_credits: string }>(
+      'SELECT cost_credits::text FROM usage_records WHERE request_id = $1',
+      [req1],
+    )
+    assert.equal(parentAfterLate.rows[0]?.cost_credits, '15')
+    assert.equal(folded.length, 2)
+    assert.equal(folded[1]?.credits, '6')
+    assert.equal(folded[1]?.turnKey, tk1)
+
+    // 3. Raced live WS settled without turnKey before tape finalize -> durable settle backfills turn_key & folds once without double debit
+    const req2 = rid()
+    const tk2 = createHash('sha256').update(`tk2:${req2}`).digest('hex')
+    await recordAntigravityTurn(getPool(), {
+      requestId: req2,
+      userId: uid,
+      modelId: MODEL,
+      sessionId: 's-durable-2',
+      traceId: null,
+    })
+    await usageRow(req2, uid, 100_000, 20_000) // 15 credits
+    await settleAntigravityTurnRecord({
+      pool: getPool(),
+      pricing,
+      requestId: req2,
+      userId: uid,
+      engineStatus: 'success',
+    })
+    assert.equal(await balance(uid), 4_964n)
+    const d2 = await settleDurableAntigravityBilling(
+      {
+        pgPool: getPool(),
+        pricing,
+        expireRouteForRequest: async () => {},
+        appendCostCredits: async (rId, _u, credits, _s, _ps, _da, tKey) => {
+          folded.push({ reqId: rId, credits, turnKey: tKey ?? '' })
+        },
+      },
+      uid,
+      {
+        engine: 'antigravity',
+        requestId: req2,
+        engineSessionId: `oceng-${'2'.repeat(48)}`,
+        status: 'success',
+        durationMs: 1_000,
+        turnKey: tk2,
+      },
+    )
+    assert.equal(d2, 'already_committed')
+    assert.equal(await balance(uid), 4_964n, 'must not double-charge when live WS raced ahead')
+    const ur2 = await query<{ turn_key: string | null }>(
+      'SELECT turn_key FROM usage_records WHERE request_id = $1',
+      [req2],
+    )
+    assert.equal(ur2.rows[0]?.turn_key, tk2, 'must backfill turn_key onto usage_records')
+    assert.equal(folded[folded.length - 1]?.turnKey, tk2)
+
+    // 4. Stale reconciler (`engineStatus: 'unknown'`) inspects turn_dispatches outcome:
+    //    crashed / interrupted dispatches waive at 0 credits instead of overcharging as RECONCILED,
+    //    and >6h stale manual_reconcile no longer strands antigravity_turns forever!
+    const reqCrash = rid()
+    await recordAntigravityTurn(getPool(), {
+      requestId: reqCrash,
+      userId: uid,
+      modelId: MODEL,
+      sessionId: 's-crash-reconcile',
+      traceId: null,
+    })
+    await usageRow(reqCrash, uid, 500_000, 100_000) // would be 75 credits if wrongly charged!
+    await query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id, user_id, session_id, client_message_id, agent_id, model, request_hash,
+          billing_request_id, status, outcome, owner_id, lease_epoch, lease_until, admitted_at)
+       VALUES ($1, $2, 's-crash-reconcile', $3, 'main', $4, 'h1', $5,
+               'terminal', 'crashed', 'm1', 1, NOW() - INTERVAL '7 hours', NOW() - INTERVAL '7 hours')`,
+      [randomUUID(), uid.toString(), `cm-${reqCrash.slice(-8)}`, MODEL, reqCrash],
+    )
+    await query(
+      "UPDATE antigravity_turns SET updated_at = NOW() - INTERVAL '1 hour' WHERE request_id = $1",
+      [reqCrash],
+    )
+    const tickRes = await runAntigravityTurnReconcileTick({
+      pgPool: getPool(),
+      pricing,
+      minAgeMs: 5_000,
+      expireRouteForRequest: async () => {},
+    })
+    assert.ok(tickRes.settled >= 1)
+    assert.equal(await balance(uid), 4_964n, 'crashed dispatch must be waived at 0 credits by reconciler')
+    assert.equal(await turnStatus(reqCrash), 'settled')
+    const crashUr = await query<{ cost_credits: string; snapshot: Record<string, unknown> }>(
+      'SELECT cost_credits::text, price_snapshot AS snapshot FROM usage_records WHERE request_id = $1',
+      [reqCrash],
+    )
+    assert.equal(crashUr.rows[0]?.cost_credits, '0')
+    assert.equal(crashUr.rows[0]?.snapshot.antigravity_terminal_code, 'ENGINE_ERROR')
+  })
+
+  test('OCV5-887 R2 blockers B2/B3/B4/B5/B11: executed_error waive, late-stream reconciler sweep, delegate 1.5x frozen pricing & 2x price-hike immunity, clamped-0 real appendCostCredits, and foreign requestId zero side-effect fence', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    await query(
+      `INSERT INTO sessions_store_migration_state
+         (singleton, authority, generation, cutover_id, source_digest, completed_at)
+       VALUES (true, 'pg_authoritative', 1, 'test', 'test', 1)
+       ON CONFLICT (singleton) DO UPDATE
+         SET authority = 'pg_authoritative', generation = 1, cutover_id = 'test', source_digest = 'test', completed_at = 1`,
+    )
+    const sessionsBackend = createPgSessionsBackend(getPool(), { expectedGeneration: 1 })
+    const realAppendCostCredits = (
+      rId: string,
+      rawUid: string,
+      cost: string,
+      sessId?: string | null,
+      parentSessId?: string | null,
+      delAgent?: string | null,
+      tKey?: string | null,
+      pTurnKey?: string | null,
+    ) =>
+      sessionsBackend.appendCostCredits(
+        rId,
+        rawUid.startsWith('c:') ? rawUid : `c:${rawUid}`,
+        cost,
+        sessId,
+        parentSessId,
+        delAgent,
+        tKey,
+        pTurnKey,
+      )
+
+    const uidA = await user(1_000n)
+    const uidB = await user(0n) // zero wallet balance to prove B5 clamped-0 actual debit!
+
+    // B11: Foreign / unknown requestId MUST return immediately with ZERO expireRouteForRequest calls!
+    const foreignReq = rid()
+    await recordAntigravityTurn(getPool(), {
+      requestId: foreignReq,
+      userId: uidA,
+      modelId: MODEL,
+      sessionId: 's-b11',
+      traceId: null,
+    })
+    let expiredCalls = 0
+    await settleDurableAntigravityBilling(
+      {
+        pgPool: getPool(),
+        pricing,
+        expireRouteForRequest: async () => {
+          expiredCalls += 1
+        },
+      },
+      uidB, // wrong tenant!
+      {
+        engine: 'antigravity',
+        requestId: foreignReq,
+        engineSessionId: `oceng-${'9'.repeat(48)}`,
+        status: 'success',
+        durationMs: 500,
+      },
+    )
+    assert.equal(expiredCalls, 0, 'B11: foreign tenant must never trigger route expiry')
+
+    // B2: Real turnDispatchReconciler writes outcome='executed_error' -> reconciler MUST waive at 0 credits!
+    //     And an open `status='accepted'` dispatch MUST stay pending (not prematurely charged)!
+    const reqExecErr = rid()
+    await recordAntigravityTurn(getPool(), {
+      requestId: reqExecErr,
+      userId: uidA,
+      modelId: MODEL,
+      sessionId: 's-b2-exec-err',
+      traceId: null,
+    })
+    await usageRow(reqExecErr, uidA, 200_000, 40_000) // 30 credits if wrongly charged
+    await query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id, user_id, session_id, client_message_id, agent_id, model, request_hash,
+          billing_request_id, status, outcome, failure_code, owner_id, lease_epoch, lease_until, admitted_at)
+       VALUES ($1, $2, 's-b2-exec-err', $3, 'main', $4, 'h-b2', $5,
+               'terminal', 'executed_error', 'SERVICE_RESTART', 'm1', 1, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour')`,
+      [randomUUID(), uidA.toString(), `cm-${reqExecErr.slice(-8)}`, MODEL, reqExecErr],
+    )
+    await query("UPDATE antigravity_turns SET updated_at = NOW() - INTERVAL '1 hour' WHERE request_id = $1", [reqExecErr])
+
+    const reqOpen = rid()
+    await recordAntigravityTurn(getPool(), {
+      requestId: reqOpen,
+      userId: uidA,
+      modelId: MODEL,
+      sessionId: 's-b2-open',
+      traceId: null,
+    })
+    await usageRow(reqOpen, uidA, 100_000, 10_000)
+    await query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id, user_id, session_id, client_message_id, agent_id, model, request_hash,
+          billing_request_id, status, outcome, owner_id, lease_epoch, lease_until, admitted_at)
+       VALUES ($1, $2, 's-b2-open', $3, 'main', $4, 'h-b2o', $5,
+               'accepted', NULL, 'm1', 1, NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '7 hours')`,
+      [randomUUID(), uidA.toString(), `cm-${reqOpen.slice(-8)}`, MODEL, reqOpen],
+    )
+    await query("UPDATE antigravity_turns SET updated_at = NOW() - INTERVAL '1 hour' WHERE request_id = $1", [reqOpen])
+
+    await runAntigravityTurnReconcileTick({
+      pgPool: getPool(),
+      pricing,
+      minAgeMs: 5_000,
+      expireRouteForRequest: async () => {},
+    })
+    assert.equal(await balance(uidA), 1_000n, 'B2: executed_error waived 0 and open dispatch left pending')
+    assert.equal(await turnStatus(reqExecErr), 'settled')
+    assert.equal(await turnStatus(reqOpen), 'pending', 'B2: non-terminal dispatch must remain pending')
+
+    // B4(a): Delegate Antigravity frozen 2.000x multiplier in request_finalize_journal + B4(b) 3x live price hike on late stream!
+    const reqDel = rid()
+    const tkParent = createHash('sha256').update(`parent:${reqDel}`).digest('hex')
+    await sessionsBackend.upsertClientSession({
+      id: 's-b4-parent',
+      userId: `c:${uidA}`,
+      agentId: 'main',
+      title: 'B4',
+      pinned: false,
+      createdAt: Date.now(),
+      lastAt: Date.now(),
+      updatedAt: Date.now(),
+      messages: [{ id: 'cm-b4', role: 'user', text: 'go', ts: Date.now() }],
+    })
+    const tapeBytes = Buffer.from(
+      JSON.stringify({
+        sessionId: 's-b4-parent',
+        agentId: 'main',
+        turnIndex: 1,
+        status: 'completed',
+        turnKey: tkParent,
+        clientMessageId: 'cm-b4',
+        text: 'done',
+        createdAt: Date.now(),
+      }),
+    )
+    const tapeHash = createHash('sha256').update(tapeBytes).digest('hex')
+    const baseTape = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      sessionId: 's-b4-parent',
+      agentId: 'main',
+      turnIndex: 1,
+      status: 'completed' as const,
+      turnKey: tkParent,
+      tapeId: tkParent,
+      tapeSha256: tapeHash,
+      totalBytes: tapeBytes.length,
+      partCount: 1,
+      createdAt: Date.now(),
+    }
+    await sessionsBackend.stageLosslessTurnTapePart(
+      `c:${uidA}`,
+      { ...baseTape, action: 'part', partIndex: 0, partSha256: tapeHash, data: tapeBytes.toString('base64') },
+      tapeBytes,
+    )
+    await sessionsBackend.finalizeLosslessTurnTape(`c:${uidA}`, { ...baseTape, action: 'finalize' })
+
+    const frozen2x = { ...PRICING, multiplier: '2.000' } as ModelPricing
+    await startInflightJournal(getPool(), {
+      requestId: reqDel,
+      userId: uidA,
+      containerId: null,
+      model: MODEL,
+      precheckCredits: 100n,
+      ctxJson: {
+        source: 'delegate_antigravity',
+        model: MODEL,
+        delegateAgentId: 'auditor',
+        parentSessionId: 's-b4-parent',
+        parentTurnKey: tkParent,
+        billingPricing: serializeBillingPricing(frozen2x),
+      },
+    })
+    await recordAntigravityTurn(getPool(), {
+      requestId: reqDel,
+      userId: uidA,
+      modelId: MODEL,
+      sessionId: 's-b4-child',
+      traceId: null,
+    })
+    await usageRow(reqDel, uidA, 100_000, 20_000) // base=15 -> frozen 2.000x = 30 credits!
+    const delOut = await settleDurableAntigravityBilling(
+      {
+        pgPool: getPool(),
+        pricing, // live pricing is 1.000x (15), journal frozen is 2.000x (30)!
+        expireRouteForRequest: async () => {},
+        appendCostCredits: realAppendCostCredits,
+      },
+      uidA,
+      {
+        engine: 'antigravity',
+        requestId: reqDel,
+        engineSessionId: `oceng-${'4'.repeat(48)}`,
+        status: 'success',
+        durationMs: 800,
+        parentTurnKey: tkParent,
+        parentSessionId: 's-b4-parent',
+        delegateAgentId: 'auditor',
+      },
+    )
+    assert.equal(delOut, 'committed')
+    assert.equal(await balance(uidA), 970n, 'B4(a): delegate must debit frozen 2.000x rate (30), not live 1.000x (15)')
+    const jState = await query<{ state: string }>('SELECT state FROM request_finalize_journal WHERE request_id = $1', [reqDel])
+    assert.equal(jState.rows[0]?.state, 'committed')
+
+    // B3 + B4(b): Simulate a late stream row that missed initial settle (interleaved before COMMIT),
+    // AND hike live catalog price 3x (`multiplier: '3.000'`). Reconciler tick MUST sweep the late row
+    // and price ONLY the late delta at the frozen 2.000x rate (+50k in = base 6 * 2.000x = 12 credits, NOT 3x*(15+6)-30 = 33)!
+    await usageRow(reqDel, uidA, 50_000, 0)
+    const hiked3xPricing = {
+      get: (id: string) => (id === MODEL ? ({ ...PRICING, multiplier: '3.000' } as ModelPricing) : null),
+    } as unknown as PricingCache
+    const lateTick = await runAntigravityTurnReconcileTick({
+      pgPool: getPool(),
+      pricing: hiked3xPricing,
+      minAgeMs: 5_000,
+      expireRouteForRequest: async () => {},
+      appendCostCredits: realAppendCostCredits,
+    })
+    assert.equal(lateTick.lateSettled, 1, 'B3: reconciler tick must sweep missed post-SUM/pre-COMMIT late stream')
+    assert.equal(await balance(uidA), 958n, 'B4(b): late delta must charge frozen 2x delta (12), never reprice history at 3x')
+
+    // B5: Wallet balance=0 (uidB): live WS settles without turnKey (nominal cost_credits=15, actual debited=0, ledger_id=NULL)
+    //     and parks a keyless pending_usage_patches row (cost_credits='0', turn_key=NULL).
+    //     Durable settle MUST upgrade keyless pending & fold ACTUAL 0 credits (NEVER nominal 15!) into turn_tape_cost_components!
+    const reqClamp = rid()
+    const tkClamp = createHash('sha256').update(`clamp:${reqClamp}`).digest('hex')
+    await sessionsBackend.upsertClientSession({
+      id: 's-b5-clamp',
+      userId: `c:${uidB}`,
+      agentId: 'main',
+      title: 'B5',
+      pinned: false,
+      createdAt: Date.now(),
+      lastAt: Date.now(),
+      updatedAt: Date.now(),
+      messages: [{ id: 'cm-b5', role: 'user', text: 'go', ts: Date.now() }],
+    })
+    await recordAntigravityTurn(getPool(), {
+      requestId: reqClamp,
+      userId: uidB,
+      modelId: MODEL,
+      sessionId: 's-b5-clamp',
+      traceId: null,
+    })
+    await usageRow(reqClamp, uidB, 100_000, 20_000) // nominal 15, wallet=0 -> clamped debited=0!
+    const liveClamp = await settleAntigravityTurnRecord({
+      pool: getPool(),
+      pricing,
+      requestId: reqClamp,
+      userId: uidB,
+      engineStatus: 'success',
+    })
+    assert.ok(liveClamp)
+    assert.equal(liveClamp.settled.debitedCredits, 0n)
+    // Simulate keyless pending_usage_patches parked before tape finalize
+    await realAppendCostCredits(reqClamp, uidB.toString(), '0', 's-b5-clamp', null, null, null, null)
+
+    const clampTapeBytes = Buffer.from(
+      JSON.stringify({
+        sessionId: 's-b5-clamp',
+        agentId: 'main',
+        turnIndex: 1,
+        status: 'completed',
+        turnKey: tkClamp,
+        clientMessageId: 'cm-b5',
+        text: 'clamped ok',
+        createdAt: Date.now(),
+      }),
+    )
+    const clampHash = createHash('sha256').update(clampTapeBytes).digest('hex')
+    const clampBase = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      sessionId: 's-b5-clamp',
+      agentId: 'main',
+      turnIndex: 1,
+      status: 'completed' as const,
+      turnKey: tkClamp,
+      tapeId: tkClamp,
+      tapeSha256: clampHash,
+      totalBytes: clampTapeBytes.length,
+      partCount: 1,
+      createdAt: Date.now(),
+    }
+    await sessionsBackend.stageLosslessTurnTapePart(
+      `c:${uidB}`,
+      { ...clampBase, action: 'part', partIndex: 0, partSha256: clampHash, data: clampTapeBytes.toString('base64') },
+      clampTapeBytes,
+    )
+    await sessionsBackend.finalizeLosslessTurnTape(`c:${uidB}`, { ...clampBase, action: 'finalize' })
+
+    const repairClamp = await settleDurableAntigravityBilling(
+      {
+        pgPool: getPool(),
+        pricing,
+        expireRouteForRequest: async () => {},
+        appendCostCredits: realAppendCostCredits,
+      },
+      uidB,
+      {
+        engine: 'antigravity',
+        requestId: reqClamp,
+        engineSessionId: `oceng-${'5'.repeat(48)}`,
+        status: 'success',
+        durationMs: 600,
+        turnKey: tkClamp,
+      },
+    )
+    assert.equal(repairClamp, 'already_committed')
+    const compRes = await query<{ cost_credits: string }>(
+      'SELECT cost_credits::text FROM turn_tape_cost_components WHERE user_id = $1 AND request_id = $2',
+      [`c:${uidB}`, reqClamp],
+    )
+    assert.equal(compRes.rows[0]?.cost_credits, '0', 'B5: folded tape cost component must equal actual debit 0, never nominal 15')
+
+    // R2 final closure proofs:
+    // (a) B4①: Already-aborted delegate journal MUST NOT charge when a late `success` tape arrives!
+    const reqAbortedDel = rid()
+    await startInflightJournal(getPool(), {
+      requestId: reqAbortedDel,
+      userId: uidA,
+      containerId: null,
+      model: MODEL,
+      precheckCredits: 100n,
+      ctxJson: {
+        source: 'delegate_antigravity',
+        model: MODEL,
+        billingPricing: serializeBillingPricing(PRICING),
+      },
+    })
+    await query("UPDATE request_finalize_journal SET state = 'aborted' WHERE request_id = $1", [reqAbortedDel])
+    await recordAntigravityTurn(getPool(), {
+      requestId: reqAbortedDel,
+      userId: uidA,
+      modelId: MODEL,
+      sessionId: 's-b4-aborted',
+      traceId: null,
+    })
+    await usageRow(reqAbortedDel, uidA, 100_000, 20_000) // would be 15 credits if wrongly settled!
+    const abortedOut = await settleDurableAntigravityBilling(
+      { pgPool: getPool(), pricing, expireRouteForRequest: async () => {} },
+      uidA,
+      {
+        engine: 'antigravity',
+        requestId: reqAbortedDel,
+        engineSessionId: `oceng-${'6'.repeat(48)}`,
+        status: 'success',
+        durationMs: 400,
+      },
+    )
+    assert.equal(abortedOut, 'waived', 'B4①: aborted delegate journal must return waived without debiting')
+    assert.equal(await balance(uidA), 958n, 'B4①: balance must stay completely untouched')
+
+    // (b) B3 R2: Mixed HTTP 200 + HTTP 429 in parent (`antigravity_calls = 2`), followed by a late HTTP 200:
+    //     total rows = 3 > 2, so reconciler MUST select and bill the late HTTP 200 row!
+    const reqMixed = rid()
+    await recordAntigravityTurn(getPool(), {
+      requestId: reqMixed,
+      userId: uidA,
+      modelId: MODEL,
+      sessionId: 's-b3-mixed',
+      traceId: null,
+    })
+    await usageRow(reqMixed, uidA, 100_000, 20_000) // HTTP 200 (15 credits)
+    await query(
+      `INSERT INTO antigravity_relay_usage
+         (call_id, request_id, user_id, route_model_id, upstream_model, request_type, status_code,
+          prompt_tokens, candidates_tokens, thoughts_tokens, cached_tokens)
+       VALUES (gen_random_uuid(), $1, $2, $3, 'gemini-3.8-flash-low', 'agent', 429, 0, 0, 0, 0)`,
+      [reqMixed, uidA.toString(), MODEL],
+    )
+    await settleAntigravityTurnRecord({
+      pool: getPool(),
+      pricing,
+      requestId: reqMixed,
+      userId: uidA,
+      engineStatus: 'success',
+    })
+    assert.equal(await balance(uidA), 943n) // 958 - 15 = 943 (parent accounted_calls = 2)
+    // Late HTTP 200 arrives (total rows = 3, HTTP<400 rows = 2 == parent accounted_calls = 2!)
+    await usageRow(reqMixed, uidA, 50_000, 0) // +6 credits
+    const mixedTick = await runAntigravityTurnReconcileTick({
+      pgPool: getPool(),
+      pricing,
+      minAgeMs: 5_000,
+      expireRouteForRequest: async () => {},
+    })
+    assert.equal(mixedTick.lateSettled, 1, 'B3 R2: mixed 200+429 turn must still sweep late 200 row')
+    assert.equal(await balance(uidA), 937n) // 943 - 6 = 937
   })
 })

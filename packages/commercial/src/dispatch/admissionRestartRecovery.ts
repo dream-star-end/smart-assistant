@@ -16,7 +16,7 @@ import { enqueueAutomaticRecoveryJob, lockRecoveryRoot } from './turnRecoverySto
 export const ADMISSION_RESTART_UNEXECUTED = 'admission_restart_unexecuted'
 const REQUEST_FIELDS = [
   'type', 'idempotencyKey', 'channel', 'peer', 'agentId', 'replyToId', 'effortLevel',
-  'model', 'modelSwitchId', 'contextTier', 'serviceTier', 'teamMode', 'collabMode',
+  'model', 'modelSwitchId', 'contextTier', 'serviceTier', 'teamMode', 'swarmMode', 'collabMode',
   'advisorModel', 'collabConfigVersion', 'conversationMode', 'clientMessageId', 'ts',
 ] as const
 const CONTENT_FIELDS = ['text', 'displayText', 'media', 'replyTo', 'imageEdit'] as const

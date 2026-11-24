@@ -678,6 +678,27 @@ export async function startEgress(): Promise<void> {
     logger: log,
     clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
     pricing,
+    appendCostCredits: (
+      requestId,
+      rawUserId,
+      costCredits,
+      sessionId,
+      parentSessionId,
+      delegateAgentId,
+      turnKey,
+      parentTurnKey,
+    ) =>
+      costSink.enqueueDurable({
+        kind: "persist",
+        requestId,
+        uid: rawUserId,
+        costCredits,
+        sessionId: sessionId ?? null,
+        parentSessionId: parentSessionId ?? null,
+        delegateAgentId: delegateAgentId ?? null,
+        turnKey: turnKey ?? null,
+        parentTurnKey: parentTurnKey ?? null,
+      }),
   });
 
   const forward = makeForwarder({ controlBaseUrl });

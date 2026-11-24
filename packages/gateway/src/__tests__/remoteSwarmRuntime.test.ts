@@ -2202,4 +2202,210 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
       await rt.shutdownAll()
     }
   })
+
+  it('OCV5-887: workspace:"branch" teardown deletes merged swarm/* git branch and >2MB board.jsonl reads tail without throwing', async () => {
+    const agyRoot = makeTempDir('oc-remote-swarm-branch-del-')
+    const repo = initTempGitRepo()
+    const sess = 'agent:main:webchat:dm:branch-cleanup-887'
+    let workerDone = false
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn() {
+          workerDone = true
+          return { text: 'ok' }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+    try {
+      rt.registerSession({ sessionKey: sess, model: 'antigravity-gemini-4-neon-remote', workspaceCwd: repo })
+      await rt.handleToolCall({
+        sessionKey: sess,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'brancher', brief: 'branch check', workspace: 'branch' },
+      })
+      const deadline = Date.now() + 3_000
+      while (!workerDone && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20))
+
+      const branchesBefore = execFileSync('git', ['-C', repo, 'branch', '--list', 'swarm/*'], { encoding: 'utf8' }).trim()
+      assert.ok(branchesBefore.includes('swarm/'), `expected swarm/* branch before kill, got: ${branchesBefore}`)
+
+      await rt.handleToolCall({
+        sessionKey: sess,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'kill', name: 'brancher' },
+      })
+      const branchesAfter = execFileSync('git', ['-C', repo, 'branch', '--list', 'swarm/*'], { encoding: 'utf8' }).trim()
+      assert.equal(branchesAfter, '', 'merged swarm/* git branch must be deleted on worker kill')
+
+      // Seed >2.2MB board.jsonl where post #2 mentions @early-worker BEFORE the 2MB tail,
+      // followed by >2.2MB of unrelated chatter: B10 requires @early-worker to execute #2 once (never skip!)
+      let earlyMentionsHandled = 0
+      const rtEarly = new RemoteSwarmRuntime({
+        rootBase: agyRoot,
+        executor: {
+          async runWorkerTurn(input) {
+            if (input.workerName === 'early-worker' && input.prompt.includes('EARLY_TASK_SEQ_2')) {
+              earlyMentionsHandled += 1
+            }
+            return { text: 'early task done' }
+          },
+          async releaseWorkerSession() {},
+        },
+      })
+      const earlySess = 'agent:main:webchat:dm:b10-early-unread'
+      rtEarly.registerSession({ sessionKey: earlySess, model: 'antigravity-gemini-4-neon-remote', workspaceCwd: repo })
+      const earlyLoc = rtEarly.locationFor(earlySess)
+      mkdirSync(earlyLoc.swarmDir, { recursive: true })
+      writeFileSync(
+        join(earlyLoc.swarmDir, 'members.json'),
+        JSON.stringify({
+          runtime: 'remote',
+          title: 'B10 test',
+          workspace_cwd: repo,
+          channels: { main: { topic: 'main' } },
+          members: {
+            coordinator: { conversation_id: earlyLoc.swarmId, role: 'coordinator', model: 'm', phase: 'RUNNING', wake_mode: 'mentions', wait_since: 0, last_read_seq: 1, killed: false, channels: ['main'] },
+            'early-worker': { conversation_id: '33333333-3333-4333-8333-333333333333', role: 'worker', model: 'm', phase: 'WAITING', wake_mode: 'mentions', wait_since: 0, last_read_seq: 1, killed: false, channels: ['main'] },
+          },
+        }),
+      )
+      const filler = '无关讨论内容填充'.repeat(350)
+      const lines: string[] = [
+        `${JSON.stringify({ seq: 1, agent: 'coordinator', channel: 'main', text: 'init', time: '2026-11-24 10:00:00' })}\n`,
+        `${JSON.stringify({ seq: 2, agent: 'coordinator', channel: 'main', text: '@early-worker 请执行 EARLY_TASK_SEQ_2', time: '2026-11-24 10:00:01' })}\n`,
+      ]
+      let seq = 3
+      let bytes = 0
+      while (bytes < 2.3 * 1024 * 1024) {
+        const line = `${JSON.stringify({ seq, agent: 'coordinator', channel: 'main', text: filler, time: '2026-11-24 10:00:02' })}\n`
+        lines.push(line)
+        bytes += Buffer.byteLength(line, 'utf8')
+        seq += 1
+      }
+      writeFileSync(join(earlyLoc.swarmDir, 'board.jsonl'), lines.join(''), 'utf8')
+
+      // B10: read_board from since=0 with small limit reports truncated=true accurately
+      const boardRes = await rtEarly.handleToolCall({
+        sessionKey: earlySess,
+        callerMember: 'coordinator',
+        tool: 'read_board',
+        args: { since: 0, limit: 5 },
+      })
+      assert.equal(boardRes.truncated, true)
+      assert.equal(boardRes.head_seq, seq - 1)
+
+      // Wake early-worker (via a post at the end): it MUST scan from last_read_seq=1 and handle seq=2!
+      await rtEarly.handleToolCall({
+        sessionKey: earlySess,
+        callerMember: 'coordinator',
+        tool: 'post_message',
+        args: { text: '@early-worker ping' },
+      })
+      const earlyDeadline = Date.now() + 4_000
+      while (earlyMentionsHandled === 0 && Date.now() < earlyDeadline) {
+        await new Promise((r) => setTimeout(r, 25))
+      }
+      assert.equal(earlyMentionsHandled, 1, 'early @mention before 2MB tail must be processed once, never skipped')
+      await rtEarly.shutdownAll()
+
+      // B10 R2 counterexamples:
+      // (1) 3 posts ~750B each, since=0, limit=10, maxBytes=1024 -> delivers [#1], last_read_seq=1 (NEVER skips #1,#2!)
+      // (2) 600 posts where only #591 matches channel='special' -> delivers [#591] without touching main last_read_seq!
+      const rtB10 = new RemoteSwarmRuntime({
+        rootBase: agyRoot,
+        executor: {
+          async runWorkerTurn() { return { text: 'ok' } },
+          async releaseWorkerSession() {},
+        },
+      })
+      const b10Sess = 'agent:main:webchat:dm:b10-r2-exact'
+      rtB10.registerSession({ sessionKey: b10Sess, model: 'antigravity-gemini-4-neon-remote', workspaceCwd: repo })
+      const b10Loc = rtB10.locationFor(b10Sess)
+      mkdirSync(b10Loc.swarmDir, { recursive: true })
+      writeFileSync(
+        join(b10Loc.swarmDir, 'members.json'),
+        JSON.stringify({
+          runtime: 'remote',
+          title: 'B10 R2',
+          workspace_cwd: repo,
+          channels: { main: { topic: 'main' }, special: { topic: 'special' } },
+          members: {
+            coordinator: { conversation_id: b10Loc.swarmId, role: 'coordinator', model: 'm', phase: 'RUNNING', wake_mode: 'mentions', wait_since: 0, last_read_seq: 0, killed: false, channels: ['main', 'special'] },
+          },
+        }),
+      )
+      writeFileSync(
+        join(b10Loc.swarmDir, 'board.jsonl'),
+        [1, 2, 3]
+          .map((s) => `${JSON.stringify({ seq: s, agent: 'coordinator', channel: 'main', text: `P${s}:${'x'.repeat(700)}`, time: '2026-11-24 10:00:00' })}\n`)
+          .join(''),
+        'utf8',
+      )
+      const page1 = (await rtB10.handleToolCall({
+        sessionKey: b10Sess,
+        callerMember: 'coordinator',
+        tool: 'read_board',
+        args: { since: 0, limit: 10, maxBytes: 1024 },
+      })) as { posts: Array<{ seq: number }>; next_since: number; truncated: boolean }
+      assert.deepEqual(page1.posts.map((p) => p.seq), [1], 'B10(1): must deliver #1 first in chronological order')
+      assert.equal(page1.next_since, 1)
+      assert.equal(page1.truncated, true)
+      const afterPage1Roster = JSON.parse(readFileSync(join(b10Loc.swarmDir, 'members.json'), 'utf8')) as {
+        members: Record<string, { last_read_seq: number }>
+      }
+      assert.equal(afterPage1Roster.members.coordinator?.last_read_seq, 1, 'B10(1): last_read_seq must advance to 1, NEVER 3')
+
+      // Counterexample (2): 600 posts, only #591 is in `special` channel
+      const chLines: string[] = []
+      for (let s = 1; s <= 600; s += 1) {
+        chLines.push(
+          `${JSON.stringify({ seq: s, agent: 'coordinator', channel: s === 591 ? 'special' : 'main', text: `msg-${s}`, time: '2026-11-24 10:00:00' })}\n`,
+        )
+      }
+      writeFileSync(join(b10Loc.swarmDir, 'board.jsonl'), chLines.join(''), 'utf8')
+      const chRes = (await rtB10.handleToolCall({
+        sessionKey: b10Sess,
+        callerMember: 'coordinator',
+        tool: 'read_board',
+        args: { since: 0, limit: 10, channel: 'special' },
+      })) as { posts: Array<{ seq: number }>; head_seq: number }
+      assert.deepEqual(chRes.posts.map((p) => p.seq), [591], 'B10(2): channel filter must find #591 across 600 posts')
+      assert.equal(chRes.head_seq, 600)
+      await rtB10.shutdownAll()
+
+      // B6: Unmerged swarm/* branch whose worktree directory was already removed MUST NOT be force-deleted by reconcile!
+      const unmergedBranch = 'swarm/deadbeef-unmerged-worker'
+      const unmergedWtPath = join(repo, '.oc-swarm-worktrees', 'deadbeef-unmerged-worker')
+      execFileSync('git', ['-C', repo, 'worktree', 'add', '-b', unmergedBranch, unmergedWtPath, 'HEAD'])
+      writeFileSync(join(unmergedWtPath, 'valuable.txt'), 'unmerged work\n')
+      execFileSync('git', ['-C', unmergedWtPath, 'add', '.'])
+      execFileSync('git', ['-C', unmergedWtPath, 'commit', '-m', 'unmerged worker commit'])
+      execFileSync('git', ['-C', repo, 'worktree', 'remove', '--force', unmergedWtPath])
+      assert.equal(existsSync(unmergedWtPath), false)
+
+      const deadLocSwarm = join(agyRoot, 'remote-swarms', 'deadbeef-1111-4222-8333-444444444444', '.system_generated', 'swarm')
+      mkdirSync(deadLocSwarm, { recursive: true })
+      writeFileSync(
+        join(deadLocSwarm, 'members.json'),
+        JSON.stringify({
+          runtime: 'remote',
+          title: 'dead unmerged',
+          workspace_cwd: repo,
+          members: {
+            coordinator: { role: 'coordinator', killed: true },
+            w1: { role: 'worker', killed: true, workspace: { mode: 'branch', path: unmergedWtPath, branch: unmergedBranch } },
+          },
+        }),
+      )
+      reconcileRemoteSwarmOnBoot({ rootBase: agyRoot, workspaceRoots: [repo] })
+      const survivingBranches = execFileSync('git', ['-C', repo, 'branch', '--list', unmergedBranch], { encoding: 'utf8' }).trim()
+      assert.ok(survivingBranches.includes(unmergedBranch), 'unmerged swarm/* branch must survive boot reconcile even when worktree dir is absent')
+    } finally {
+      await rt.shutdownAll()
+    }
+  })
 })

@@ -251,6 +251,7 @@ import { settleDurableCodexBilling } from "./billing/durableCodexBilling.js";
 import { makeModelSwitchCostService } from './billing/modelSwitchCostTarget.js';
 import { isCursorDurableBilling, settleDurableCursorBilling } from "./billing/durableCursorBilling.js";
 import { parseZeroChargeCutoff, startCursorAuditReconciler } from "./billing/cursorAuditReconciler.js";
+import { isAntigravityDurableBilling, settleDurableAntigravityBilling, startAntigravityTurnReconciler } from "./billing/durableAntigravityBilling.js";
 import { type ContainerPreviewBridgeHandler } from "./ws/containerPreviewBridge.js";
 import { type DirectContainerPreviewService } from "./ws/directContainerPreview.js";
 import {
@@ -990,43 +991,27 @@ export async function registerCommercial(
   ) =>
     appendCostCredits(
       requestId,
-      // 防双前缀:当前调用方都传裸 uid,但 guard 住将来复用误传 c: 前缀的情况(Codex 次要建议)。
       rawUserId.startsWith(MASTER_USER_PREFIX) ? rawUserId : MASTER_USER_PREFIX + rawUserId,
-      costCredits,
-      sessionId,
-      parentSessionId,
-      delegateAgentId,
-      turnKey,
-      parentTurnKey,
+      costCredits, sessionId, parentSessionId, delegateAgentId, turnKey, parentTurnKey,
     );
-  // Tape engine_billings settlement entry shared by the finalize sync path and
-  // the held settlement job. Codex/grok frames carry no discriminator and go
-  // through the journal finalizer; `engine:'cursor'` frames (2026-09-02 fix for
-  // the missing credits badge when the user WS was gone at turn end) settle
-  // against cursor_external_usage_audit via the durable cursor path.
-  const durableCursorBillingDeps = () => ({
+  const makeDurableEngineBillingDeps = (subsys: string) => ({
     pgPool: getPool(),
+    preCheckRedis,
     pricing,
-    logger: rootLogger.child({ subsys: "durableCursorBilling" }),
+    logger: rootLogger.child({ subsys }),
     appendCostCredits: appendCostCreditsForUser,
-    broadcastToUser: (uid: bigint, payload: Record<string, unknown>) =>
-      bridgeBroadcastRef.current(uid, payload),
+    broadcastToUser: (uid: bigint, payload: Record<string, unknown>) => bridgeBroadcastRef.current(uid, payload),
   });
+  const durableCursorBillingDeps = () => makeDurableEngineBillingDeps("durableCursorBilling");
+  const durableAntigravityBillingDeps = () => makeDurableEngineBillingDeps("durableAntigravityBilling");
   const settleTapeEngineBilling = async (
     userId: bigint,
     billing: import("@openclaude/protocol").DurableCodexBilling,
   ): Promise<void> => {
-    if (isCursorDurableBilling(billing)) {
-      await settleDurableCursorBilling(durableCursorBillingDeps(), userId, billing);
-      return;
-    }
+    if (isCursorDurableBilling(billing)) return void (await settleDurableCursorBilling(durableCursorBillingDeps(), userId, billing));
+    if (isAntigravityDurableBilling(billing)) return void (await settleDurableAntigravityBilling(durableAntigravityBillingDeps(), userId, billing));
     await settleDurableCodexBilling(
-      {
-        pgPool: getPool(),
-        preCheckRedis,
-        pricing,
-        logger: rootLogger.child({ subsys: "durableCodexBilling" }),
-      },
+      { pgPool: getPool(), preCheckRedis, pricing, logger: rootLogger.child({ subsys: "durableCodexBilling" }) },
       userId,
       billing,
     );
@@ -2335,10 +2320,7 @@ export async function registerCommercial(
     });
   }
 
-  // Cursor pending-audit reconciler(2026-09-02):兜底 cursor_external_usage_audit 长期
-  // pending 的行(live WS 帧丢失 + 旧 gateway tape 无 engine_billings),从 finalized tape
-  // 重建 usage 走 durable cursor settle。cutoff 之前的历史行只补 usage_records/cost
-  // component、0 扣款(运营决策)。cutoff 缺省 = 进程启动时刻(保守:宁少扣不多扣)。
+  // Cursor pending-audit & Antigravity stale-turn reconcilers.
   if (runtimeChannel === "v5" && process.env.COMMERCIAL_CURSOR_AUDIT_RECONCILER_DISABLED !== "1") {
     leaderBundle.add({
       name: "cursorAuditReconciler",
@@ -2356,10 +2338,20 @@ export async function registerCommercial(
           intervalMs,
           runOnStart: true,
         }));
-        rootLogger.info("cursorAuditReconciler started", {
-          intervalMs,
-          zeroChargeBefore: zeroChargeBefore.toISOString(),
-        });
+        rootLogger.info("cursorAuditReconciler started", { intervalMs, zeroChargeBefore: zeroChargeBefore.toISOString() });
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+  if (runtimeChannel === "v5" && !cfg.COMMERCIAL_ANTIGRAVITY_RECONCILER_DISABLED) {
+    leaderBundle.add({
+      name: "antigravityTurnReconciler",
+      domain: "shared",
+      start: () => {
+        const rawInterval = cfg.COMMERCIAL_ANTIGRAVITY_RECONCILER_INTERVAL_MS;
+        const intervalMs = typeof rawInterval === "number" && rawInterval >= 5000 ? rawInterval : 60_000;
+        const h = trackScheduler("antigravityTurnReconciler", "shared", startAntigravityTurnReconciler({ ...durableAntigravityBillingDeps(), intervalMs, runOnStart: true }));
+        rootLogger.info("antigravityTurnReconciler started", { intervalMs });
         return { stop: () => h.stop() };
       },
     });

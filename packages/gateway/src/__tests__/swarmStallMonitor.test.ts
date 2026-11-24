@@ -351,7 +351,9 @@ test('OCV5-848: AntigravitySwarmWatcher triggers stall alert even when disk file
 
     // 2. Advance virtual clock past 3 min while disk statSignature stays completely unchanged
     fakeNow += 185_000
-    await new Promise((r) => setTimeout(r, 60))
+    for (let i = 0; i < 12 && alerts.length === 0; i += 1) {
+      await new Promise((r) => setTimeout(r, 25))
+    }
     await Promise.all(pendingWrites)
 
     assert.equal(alerts.length, 1, 'should fire stall alert even with unchanged disk statSig')
@@ -848,4 +850,36 @@ test('OCV5-863: normalizeSwarmToolName strips mcp_openclaude-memory_ prefix and 
     ),
     true,
   )
+})
+
+test('OCV5-887: stuck working member alerts coordinator after workingStallThresholdMs and rollbackAlert restores budget on lock failure', () => {
+  const mon = new SwarmStallMonitor({
+    stallThresholdMs: 60_000,
+    workingStallThresholdMs: 120_000,
+    retryCooldownMs: 180_000,
+    maxAlerts: 3,
+  })
+  const frozenWorking = makeSnapshot({
+    members: [
+      makeMember({ name: 'coordinator', role: 'coordinator', status: 'working', activity: '等待讨论板消息', waitingOnBoard: true }),
+      makeMember({ name: 'worker-a', role: 'worker', status: 'working', activity: '运行命令', stepCount: 4, toolCalls: 2 }),
+    ],
+  })
+  assert.equal(mon.evaluate(frozenWorking, 0), null)
+  // Quiet for 90s (< 120s workingStallThresholdMs) -> no alert yet
+  assert.equal(mon.evaluate(frozenWorking, 90_000), null)
+  // Frozen at exact same stepCount/toolCalls/activity for 120s -> alerts @coordinator
+  const alert1 = mon.evaluate(frozenWorking, 120_000)
+  assert.ok(alert1)
+  assert.equal(alert1.reason, 'working_member_stalled')
+  assert.equal(alert1.target, 'coordinator')
+  assert.equal(alert1.attempt, 1)
+  assert.ok(alert1.message.includes('`worker-a`'))
+  assert.ok(!alert1.message.includes('@worker-a'))
+
+  // Simulate board lock contention: rollbackAlert restores budget & removes false cooldown!
+  mon.rollbackAlert(alert1)
+  const retriedNextTick = mon.evaluate(frozenWorking, 125_000)
+  assert.ok(retriedNextTick, 'rolled-back alert must retry on next tick without waiting 3m cooldown')
+  assert.equal(retriedNextTick.attempt, 1)
 })

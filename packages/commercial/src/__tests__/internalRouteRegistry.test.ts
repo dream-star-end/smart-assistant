@@ -276,13 +276,20 @@ describe('internalRouteRegistry — dispatchInternal 挂载', () => {
       /context\.kind === 'delegate'[\s\S]{0,200}hasInflightDelegateGrokBilling/,
       'grok relay 不再对 delegate 路由校验计费 journal(mint 后不准入即可白跑)',
     )
-    const antigravityGateIdx = source.indexOf('const delegateAntigravityRouteHandler')
-    assert.ok(antigravityGateIdx >= 0 && antigravityGateIdx < start, 'delegateAntigravityRouteHandler 装配点丢失')
+    const antigravityGateIdx = source.indexOf('const allowDelegateAntigravityMint')
+    assert.ok(antigravityGateIdx >= 0 && antigravityGateIdx < start, 'allowDelegateAntigravityMint 装配点丢失')
     assert.match(
       source.slice(antigravityGateIdx, antigravityGateIdx + 400),
-      /OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"/,
-      'delegate antigravity-route 挂载的 selfhost 门控被改动(注册表 selfhostOnly 标记随之失真)',
+      /OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"[\s\S]{0,160}const delegateAntigravityRouteHandler = antigravityRouteRuntime\.makeDelegateHandler\(\)/,
+      'delegate antigravity-route mint/release 的 selfhost 门控或 handler 装配被改动',
     )
+    assert.match(
+      dispatch,
+      /allowDelegateAntigravityMint\s*\?\s*isDelegateAntigravityRoutePath\(path\)\s*:\s*path === DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH/,
+      'dispatchInternal 必须对 mint/release 保持 selfhost 门控且双版挂载 renew(OCV5-887 B8)',
+    )
+    const renewEntry = registryEntries.find((e) => e.path === DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH)
+    assert.equal(renewEntry?.selfhostOnly, undefined, 'renew 已对商业版开放,注册表不得保留 selfhostOnly')
     const remoteLaneHandler = await readFile(
       new URL('../http/internalDelegateRemoteLane.ts', import.meta.url),
       'utf8',

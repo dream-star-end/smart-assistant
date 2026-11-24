@@ -24,6 +24,7 @@ import {
   filterAvailableLocalSwarmModels,
   formatAvailableLocalSwarmModelsHint,
   hasHistoricalAntigravitySwarm,
+  hasLiveCoreAntigravitySwarmWorkers,
   listLiveAntigravitySwarmMonitors,
   prepareAntigravitySwarmInboundDirective,
   reconcileAntigravitySwarmDirectiveAfterCompaction,
@@ -1079,4 +1080,57 @@ test('OCV5-882 R2 residuals: efficiency-guard prefix upgrades cleanly and off_wi
     afterAdapter.endsWith(`\n<current_user_message>\n${userStartsWithOffDirective}\n</current_user_message>`),
     'user body starting with exact off-directive quote must survive checkpoint + fresh_conversation verbatim',
   )
+})
+
+test('OCV5-887: hasLiveCoreAntigravitySwarmWorkers detects live core workers for legacy checkpoint recovery and ignores killed/aux members', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'oc-swarm-live-core-'))
+  try {
+    const sessionKey = 'agent:main:webchat:dm:checkpoint-swarm-recover'
+    const brainDir = antigravitySessionBrainDir(root, sessionKey)
+    const swarmDir = path.join(brainDir, VALID_CONV_ID, '.system_generated', 'swarm')
+    await mkdir(swarmDir, { recursive: true })
+
+    // Only coordinator + killed worker + monitor -> false
+    await writeFile(
+      path.join(swarmDir, 'members.json'),
+      JSON.stringify({
+        members: {
+          coordinator: { role: 'coordinator', killed: false },
+          'worker-1': { role: 'worker', killed: true },
+          monitor: { role: 'monitor', killed: false },
+        },
+      }),
+    )
+    assert.equal(
+      hasLiveCoreAntigravitySwarmWorkers({
+        sessionKey,
+        isRemote: false,
+        conversationId: VALID_CONV_ID,
+        antigravityRootDir: root,
+      }),
+      false,
+    )
+
+    // Live core worker present -> true
+    await writeFile(
+      path.join(swarmDir, 'members.json'),
+      JSON.stringify({
+        members: {
+          coordinator: { role: 'coordinator', killed: false },
+          'worker-1': { role: 'worker', killed: false },
+        },
+      }),
+    )
+    assert.equal(
+      hasLiveCoreAntigravitySwarmWorkers({
+        sessionKey,
+        isRemote: false,
+        conversationId: VALID_CONV_ID,
+        antigravityRootDir: root,
+      }),
+      true,
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })

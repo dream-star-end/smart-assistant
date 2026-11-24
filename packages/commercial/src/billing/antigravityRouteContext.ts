@@ -382,16 +382,34 @@ export async function expireAntigravityRelayRoute(token: string): Promise<void> 
  * a reconnected bridge that never saw the token; a closed bridge no longer expires routes,
  * because the container keeps running the turn across browser reconnects.
  */
-export async function expireAntigravityRelayRouteForRequest(requestId: string): Promise<void> {
+export async function expireAntigravityRelayRouteForRequest(
+  requestId: string,
+  expectedUserId?: bigint,
+): Promise<void> {
   if (!REQUEST_ID_RE.test(requestId)) return
   if (kv) {
     const key = await kv.get(requestKey(requestId))
     if (key === EXPIRED_MARK) return
+    if (expectedUserId !== undefined) {
+      if (!key || !key.startsWith(KV_PREFIX) || key.startsWith(`${KV_PREFIX}req:`)) return
+      const raw = await kv.get(key)
+      if (!raw) return
+      try {
+        const parsed = JSON.parse(raw) as { userId?: unknown }
+        if (String(parsed.userId ?? '') !== expectedUserId.toString()) return
+      } catch {
+        return
+      }
+    }
     await kv.set(requestKey(requestId), EXPIRED_MARK, ttlSeconds(ANTIGRAVITY_RELAY_MAX_LIFETIME_MS))
     if (key?.startsWith(KV_PREFIX) && !key.startsWith(`${KV_PREFIX}req:`)) await kv.del(key)
     return
   }
-  for (const [token, row] of routes) if (row.requestId === requestId) routes.delete(token)
+  for (const [token, row] of routes) {
+    if (row.requestId !== requestId) continue
+    if (expectedUserId !== undefined && row.userId !== expectedUserId) continue
+    routes.delete(token)
+  }
 }
 
 export function _resetAntigravityRelayRoutesForTests(): void {

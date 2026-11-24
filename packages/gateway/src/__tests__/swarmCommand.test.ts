@@ -121,6 +121,7 @@ describe("injectSwarmDirective", () => {
       assert.equal(snap?.totalPosts, 3);
       assert.equal(snap?.posts[1]?.agent, "human");
       assert.equal(snap?.posts[2]?.seq, 3);
+      assert.match(snap?.posts[1]?.time ?? "", /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
     } finally {
       rmSync(brainDir, { recursive: true, force: true });
     }

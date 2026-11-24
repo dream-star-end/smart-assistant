@@ -52,6 +52,7 @@ import {
 import {
   abandonAntigravityTurn,
   settleAntigravityTurnRecord,
+  settleLateAntigravityRelayUsage,
 } from './antigravitySettle.js'
 import {
   expireAntigravityRelayRoute,
@@ -559,6 +560,14 @@ export function createDelegateEngineBillingRuntime(
             usageId: done.settled.usageId,
             settlementClaimId: claimId,
           })
+          if (engineStatus === 'success') {
+            await settleLateAntigravityRelayUsage({
+              pool,
+              pricing: settlePricing,
+              requestId,
+              userId,
+            }).catch(() => {})
+          }
         } catch (err) {
           // A DB/settle failure is not a waiver: hand finalizing back to
           // inflight so the container's durable settle retry can finish. The

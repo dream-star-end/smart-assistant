@@ -225,7 +225,6 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v5',
     egressForwardException: true,
-    selfhostOnly: true,
     sources: ['gateway/src/delegateAntigravityRoute.ts', 'commercial/src/http/internalDelegateAntigravityRoute.ts'],
   },
   {
