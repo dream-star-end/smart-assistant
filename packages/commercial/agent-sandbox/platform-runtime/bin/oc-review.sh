@@ -9,10 +9,12 @@ SELF_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "help" ]; then
   cat <<'EOF'
 usage: oc-review schema
-       oc-review collate --dir <dir> [--out <summary.md>]
+       oc-review collate --dir <dir> [--out <summary.md>] [--ledger <decision-ledger.json>] [--round <n>] [--strict]
+       oc-review ledger <init|record|show> --file <path> [...]
 EOF
   exit 0
 fi
 
+export OC_CALLER_CWD="$PWD"
 cd /opt/openclaude
 exec npx --no-install tsx packages/gateway/src/ocReviewCli.ts "$@"

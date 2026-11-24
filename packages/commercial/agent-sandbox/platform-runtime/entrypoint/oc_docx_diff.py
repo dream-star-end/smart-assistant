@@ -718,6 +718,122 @@ def _scan_omml_and_garbled(docx_path: Path) -> dict[str, Any]:
     }
 
 
+_STRUCT_FIG_CAP_RE = re.compile(r"^(?:图|Fig\.?|Figure)\s*([A-Za-z]?\d+(?:[-.]\d+)*)(.*)$", re.I)
+_STRUCT_TAB_CAP_RE = re.compile(r"^(?:表|Tab\.?|Table)\s*([A-Za-z]?\d+(?:[-.]\d+)*)(.*)$", re.I)
+_STRUCT_CAP_VERB_ZH_RE = re.compile(
+    r"^\s*(?:所示|显示|展示|给出|表明|说明|反映|绘制|描绘|可见|对比|比较|总结|列出|汇总|中|内|为|是|的|和|与|及|至|到|分别)"
+)
+_STRUCT_CAP_VERB_EN_RE = re.compile(
+    r"^\s+(?:shows|illustrates|presents|depicts|compares|summarizes|demonstrates|displays|plots|lists|reports|is|are|was|were)\b",
+    re.I,
+)
+_STRUCT_REF_HEADING_RE = re.compile(
+    r"^(?:第?\s*[0-9一二三四五六七八九十.]+\s*[章部分、.\s]*)?(?:参考文献|references|bibliography|works\s+cited)\s*$",
+    re.I,
+)
+
+
+def _is_struct_caption(text: str, style_name: str, pat: re.Pattern[str]) -> bool:
+    s = text.strip()
+    m = pat.match(s)
+    if not m:
+        return False
+    rest = m.group(2)
+    if "caption" in style_name.lower() or "题注" in style_name:
+        return True
+    if re.match(r"^\s*[:：.\-—]", rest):
+        return True
+    if _STRUCT_CAP_VERB_ZH_RE.match(rest) or _STRUCT_CAP_VERB_EN_RE.match(rest):
+        return False
+    return len(s) <= 140 and (not rest or rest[0].isspace())
+
+
+def _collect_structure_metrics(doc: Any, qn: Any) -> dict[str, Any]:
+    headings = 0
+    figure_captions = 0
+    table_captions = 0
+    references = 0
+    in_references = False
+    ref_heading_level = 1
+
+    for p in doc.paragraphs:
+        text = _paragraph_visible_text(p, qn).strip()
+        style_name = (p.style.name or "") if p.style is not None else ""
+        p_pr = p._p.find(qn("w:pPr"))
+        outline_lvl = None
+        m_head = re.match(r"^(?:Heading|标题)\s*([1-6])$", style_name.strip(), re.I)
+        if m_head:
+            outline_lvl = int(m_head.group(1))
+        elif p_pr is not None:
+            ol = p_pr.find(qn("w:outlineLvl"))
+            if ol is not None and (ol.get(qn("w:val")) or "").isdigit():
+                lvl = int(ol.get(qn("w:val"))) + 1
+                if 1 <= lvl <= 6:
+                    outline_lvl = lvl
+
+        is_ref_heading = bool(_STRUCT_REF_HEADING_RE.match(text))
+        if outline_lvl is not None and text:
+            headings += 1
+        if is_ref_heading:
+            in_references = True
+            ref_heading_level = outline_lvl or 1
+            continue
+        if in_references and outline_lvl is not None and outline_lvl <= ref_heading_level:
+            in_references = False
+
+        if in_references:
+            if not text:
+                continue
+            if re.match(r"^\[\d+\]", text) or (p_pr is not None and p_pr.find(qn("w:numPr")) is not None):
+                references += 1
+            continue
+
+        if _is_struct_caption(text, style_name, _STRUCT_FIG_CAP_RE):
+            figure_captions += 1
+        elif _is_struct_caption(text, style_name, _STRUCT_TAB_CAP_RE):
+            table_captions += 1
+
+    table_shapes = [{"rows": len(tbl.rows), "cols": len(tbl.columns)} for tbl in doc.tables]
+    omml_count = len(doc.element.findall(f".//{{{M_NS}}}oMath"))
+    return {
+        "headings": headings,
+        "tables": len(doc.tables),
+        "table_shapes": table_shapes,
+        "omml_count": omml_count,
+        "figure_captions": figure_captions,
+        "table_captions": table_captions,
+        "references": references,
+    }
+
+
+def _evaluate_structure_conservation(
+    base_metrics: dict[str, Any],
+    rev_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    scalar_keys = ("headings", "tables", "omml_count", "figure_captions", "table_captions", "references")
+    deltas = {k: int(rev_metrics[k]) - int(base_metrics[k]) for k in scalar_keys}
+    warnings: list[str] = []
+    for k in scalar_keys:
+        if deltas[k] < 0:
+            warnings.append(f"{k} decreased: {base_metrics[k]} -> {rev_metrics[k]} (delta {deltas[k]})")
+    base_shapes = base_metrics["table_shapes"]
+    rev_shapes = rev_metrics["table_shapes"]
+    for idx in range(min(len(base_shapes), len(rev_shapes))):
+        b_sh = base_shapes[idx]
+        r_sh = rev_shapes[idx]
+        if r_sh["cols"] < b_sh["cols"]:
+            warnings.append(f"table #{idx + 1} columns decreased: {b_sh['cols']} -> {r_sh['cols']}")
+        if r_sh["rows"] < b_sh["rows"]:
+            warnings.append(f"table #{idx + 1} rows decreased: {b_sh['rows']} -> {r_sh['rows']}")
+    return {
+        "base": base_metrics,
+        "revised": rev_metrics,
+        "deltas": deltas,
+        "warnings": warnings,
+        "passed": len(warnings) == 0,
+    }
+
+
 def diff_docx_impl(
     base_file: Path,
     revised_file: Path,
@@ -730,12 +846,17 @@ def diff_docx_impl(
     render_pdf_garbled_scan: Callable[[Path], dict[str, Any]],
     render_error_cls: type[Exception],
     render_check: bool | None = None,
+    strict_structure: bool = False,
 ) -> dict[str, Any]:
     if revised_file != clean_out:
         shutil.copy2(revised_file, clean_out)
 
     base_doc = Document(base_file)
     rev_doc = Document(revised_file)
+    structure_conservation = _evaluate_structure_conservation(
+        _collect_structure_metrics(base_doc, qn),
+        _collect_structure_metrics(rev_doc, qn),
+    )
 
     base_keys = [_paragraph_compare_key(p, qn) for p in base_doc.paragraphs]
     rev_keys = [_paragraph_compare_key(p, qn) for p in rev_doc.paragraphs]
@@ -959,6 +1080,7 @@ def diff_docx_impl(
         },
         "changes": changes,
         "omml_check": omml_check,
+        "structure_conservation": structure_conservation,
         "zip_integrity_ok": zip_ok,
-        "passed": zip_ok and omml_passed,
+        "passed": zip_ok and omml_passed and (structure_conservation["passed"] if strict_structure else True),
     }

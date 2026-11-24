@@ -20,6 +20,17 @@ oc-docx convert report.md --reference-doc /path/to/reference.docx \
 
 Keep equations as LaTeX `$...$` / `$$...$$`; Pandoc/Quarto converts them to native editable OMML.
 
+### Single-source metrics binding (prevent A-vs-B drift)
+
+Never hand-transcribe simulation or experiment numbers into prose. Export metrics to `metrics.json` from scripts, reference them in `.md/.qmd` via `{{metric:key.path|.2f}}` (also supports `|fmt:.2%`, `|scale:100|.1f`, or frontmatter `metrics: metrics.json`), and expand deterministically during conversion:
+
+```bash
+oc-docx convert report.md --metrics metrics.json \
+  -o /home/agent/.openclaude/generated/report-draft.docx
+```
+
+Missing keys, `null`/`NaN`/`Inf`, or invalid paths fail closed so figures, tables, and prose stay strictly synchronized.
+
 Use `build` when the document has no equations/cross-references but needs a polished cover, header/footer, theme, callouts, code blocks, quotes, or styled tables:
 
 ```yaml
@@ -48,6 +59,41 @@ Supported blocks: `paragraph`, `bullets`, `numbered`, `code`, `table`, `quote`, 
 
 ```bash
 oc-docx build content.yaml -o /home/agent/.openclaude/generated/report-draft.docx
+```
+
+## Scientific static pre-check gate (`oc-docx check`)
+
+Before review or delivery, always run `oc-docx check` (add `--expect-formulas` whenever the source contains equations):
+
+```bash
+oc-docx check /home/agent/.openclaude/generated/report-draft.docx --expect-formulas
+```
+
+This deterministically blocks residual placeholders (`[需核查]`, `TODO`, `{{...}}`, `[[claim:...]]`), broken figure/table/equation/reference cross-references, corrupted OMML equations, and LibreOffice trailing Chinese punctuation loss, and prints `symbol_table` for symbol consistency review.
+
+## Lossless reading of existing DOCX (`oc-docx extract --latex`)
+
+When reading or reviewing an existing `.docx`, **never** dump plain text that strips equations. Always extract with OMML-to-LaTeX fidelity and table structure preserved; for large documents, inspect `--toc` first and read per `--section` to avoid 20MB context overflow:
+
+```bash
+oc-docx extract paper.docx --latex
+oc-docx extract paper.docx --toc
+oc-docx extract paper.docx --section "3" --latex
+```
+
+## Highlighted revision dual-delivery, structure conservation, and anti-AI style check
+
+When revising an existing `.docx`, produce both clean and yellow-highlighted revision copies, verify `structure_conservation` (to prevent accidentally dropping headings, table columns, or equations; pass `--strict-structure` for hard gating), and run `oc-stylecheck`:
+
+```bash
+oc-docx diff --base old.docx --revised new.docx \
+  --out-clean /home/agent/.openclaude/generated/clean.docx \
+  --out-highlighted /home/agent/.openclaude/generated/marked.docx
+
+oc-stylecheck /home/agent/.openclaude/generated/clean.docx
+# Optionally enforce user style prohibitions:
+oc-stylecheck /home/agent/.openclaude/generated/clean.docx \
+  --style-file /home/agent/.openclaude/research/style/profile.md
 ```
 
 ## Mandatory render and visual inspection
@@ -96,9 +142,10 @@ Scrub changes metadata/`rsid`, not visible layout, so it does not require anothe
 ## Delivery
 
 ```bash
-oc-docx convert ... -o "$OUT.docx"
+oc-docx convert ... [--metrics metrics.json] -o "$OUT.docx"
 oc-docx check "$OUT.docx" --expect-formulas   # when the source contains $...$
 # VERDICT!=PASS → edit source and convert again, at most 2 rounds, then fail explicitly
+oc-stylecheck "$OUT.docx"                     # optional --style-file for user prohibitions
 oc-docx scrub ...
 oc-artifact-qa deliver --input "$FINAL.docx"
 # If L0 FAIL: retry generation once with a new filename; second FAIL → tell the user the failures[].message. Never print that path.
@@ -106,4 +153,4 @@ oc-artifact-qa deliver --input "$FINAL.docx"
 
 Print **only** the FINAL absolute path, on its own line. Do not wrap it in a fenced code block. Never invent URLs, ports, tokens, or curl fallbacks. Do not print `.deliver.json` sidecars. Two or more deliverables → `oc-artifact-qa pack --out /home/agent/.openclaude/generated/<stem>.zip -- file1 file2` and print the zip path only.
 
-Return the absolute path of the cleaned final DOCX and any requested source file. Do not deliver internal QA images unless requested. Use only the documented `oc-docx`/`oc-docxcheck`/`oc-artifact-qa` commands.
+Return the absolute path of the cleaned final DOCX and any requested source or highlighted revision file. Do not deliver internal QA images unless requested. Use only the documented `oc-docx`/`oc-docxcheck`/`oc-stylecheck`/`oc-artifact-qa` commands.

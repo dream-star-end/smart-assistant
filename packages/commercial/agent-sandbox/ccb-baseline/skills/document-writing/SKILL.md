@@ -34,6 +34,16 @@ oc-docx convert report.qmd -o /home/agent/.openclaude/generated/report-draft.doc
 oc-docx convert report.md --reference-doc /path/to/reference.docx -o /home/agent/.openclaude/generated/report-draft.docx
 ```
 
+### 仿真数据单源绑定（防改 A 坏 B）
+
+实验/仿真数值必须由脚本统一导出为 `metrics.json`，源稿 `.md/.qmd` 用模板占位符引用（如 `{{metric:key.path|.2f}}`、`{{metric:key.path|fmt:.2%}}`、`{{metric:key.path|scale:100|.1f}}`，或在 frontmatter 声明 `metrics: metrics.json`），**严禁手抄实验数字**导致正文与图表脱节：
+
+```bash
+oc-docx convert report.md --metrics metrics.json -o /home/agent/.openclaude/generated/report-draft.docx
+```
+
+缺失 key、值为 `null`/`NaN`/`Inf` 或路径非法时会 fail-closed 直接报错退出，避免带错数成稿。
+
 ### 结构化 YAML/JSON：封面、主题和精排组件
 
 没有公式/交叉引用，但强调封面、页眉页脚、主题、callout、代码块或表格精排时使用：
@@ -79,7 +89,47 @@ sections:
 oc-docx build content.yaml -o /home/agent/.openclaude/generated/report-draft.docx
 ```
 
-## 2. 强制逐页质量闭环
+## 2. 科研静态预检门禁（`oc-docx check`）
+
+交付或送审前必跑静态门禁（源稿含公式时加 `--expect-formulas`）：
+
+```bash
+oc-docx check /home/agent/.openclaude/generated/report-draft.docx --expect-formulas
+```
+
+自动拦截以下硬伤并输出 `symbol_table`（数学符号定义覆盖表）供复核：
+- 正文/表格/脚注残余占位符：`[需核查]`、`[待补]`、`TODO`、`FIXME`、`{{...}}`（含未展开的 `{{metric:...}}`）、`[[claim:...]]`；
+- 图/表/式/参考文献交叉引用断号、重复题注编号或异常跳号；
+- 原生 OMML 公式缺失/乱码；
+- LibreOffice 渲染吞掉中文段尾标点（`pdf_punctuation_loss`）。
+
+## 3. 保真读稿与审阅已有 DOCX（`oc-docx extract --latex`）
+
+读取或审阅已有 `.docx` 时**严禁直接裸抽纯文本丢公式**；必须使用保真抽取无损还原 OMML 为 LaTeX + Markdown 表格 + 标题层级：
+
+```bash
+oc-docx extract paper.docx --latex
+# 大文档避免 20MB 炸链：先取目录索引，再按节切片读取
+oc-docx extract paper.docx --toc
+oc-docx extract paper.docx --section "3" --latex
+```
+
+## 4. 标黄修订双交付、结构守恒与去 AI 味
+
+基于旧稿改稿修订时，必须产出「干净版 + 标黄修订版」双交付，并核查 `structure_conservation`（防误删章节、表格列、公式或参考文献；需硬拦截时加 `--strict-structure`），随后运行确定性风格体检：
+
+```bash
+oc-docx diff --base old.docx --revised new.docx \
+  --out-clean /home/agent/.openclaude/generated/clean.docx \
+  --out-highlighted /home/agent/.openclaude/generated/marked.docx
+
+oc-stylecheck /home/agent/.openclaude/generated/clean.docx
+# 若存在用户风格画像，叠加自定义禁忌词
+oc-stylecheck /home/agent/.openclaude/generated/clean.docx \
+  --style-file /home/agent/.openclaude/research/style/profile.md
+```
+
+## 5. 强制逐页质量闭环
 
 QA 目录必须位于 vision 可信根，固定使用：
 
@@ -105,7 +155,7 @@ find "$QA" -maxdepth 1 -type f -name 'vision-page-*.jpg' -print | sort -V
 
 任何一页有问题：修改源 `.qmd/.md/.yaml/.json`，重新生成、render、inspect，并从第一页重新逐页检查。`inspect` 的自动警告不能替代视觉检查。
 
-## 3. 隐私清理与最终验证
+## 6. 隐私清理与最终验证
 
 默认不写 `author: OpenClaude`。只有用户明确指定作者时才保留作者属性：
 
@@ -126,12 +176,13 @@ unzip -p /home/agent/.openclaude/generated/report.docx word/document.xml | grep 
 
 scrub 只清理元数据和 `rsid`，不改变可见版式；因此通过视觉质检后无需因 scrub 重渲染，但最终 ZIP/结构/OMML 必须复验。
 
-## 4. 交付
+## 7. 交付
 
 ```bash
-oc-docx convert ... -o "$OUT.docx"
-oc-docx check "$OUT.docx" --expect-formulas   # 源含 $ 时
+oc-docx convert ... [--metrics metrics.json] -o "$OUT.docx"
+oc-docx check "$OUT.docx" --expect-formulas   # 源含 $ 时；拦截占位符/断号引用/OMML/行尾标点丢失
 # VERDICT!=PASS → 改源再 convert，最多 2 轮，然后失败明示
+oc-stylecheck "$OUT.docx"                     # 可叠加 --style-file 去 AI 味体检
 oc-docx scrub ...
 oc-artifact-qa deliver --input "$FINAL.docx"
 # L0 FAIL → 同一生成命令最多再跑 1 次（换输出文件名）；第二次仍 FAIL → 把 failures[].message 告诉用户，禁止再打印该路径
@@ -139,8 +190,8 @@ oc-artifact-qa deliver --input "$FINAL.docx"
 
 只打印 FINAL 绝对路径，单独成行；禁止放进 fenced code；禁止发明 URL/端口/token。不要把 `.deliver.json` sidecar 当交付物。≥2 个交付文件先 `oc-artifact-qa pack --out /home/agent/.openclaude/generated/<stem>.zip -- f1 f2`，只打印 zip 路径。
 
-最终只交付清理后的 `.docx`（以及用户需要的源文件）。不要把 QA PNG/JPEG 当正式附件，除非用户明确要求。
+最终只交付清理后的 `.docx`（以及用户需要的源文件/标黄修订版）。不要把 QA PNG/JPEG 当正式附件，除非用户明确要求。
 
 ## 工具调用纪律
 
-只调用本 skill 给出的 `oc-docx` / `oc-docxcheck` / `oc-artifact-qa` / 本地校验命令；绝不自行拼 `curl`、URL、端口或 token。命令失败时读清错误并修正输入/路径，不能用 HTML 改扩展名兜底。
+只调用本 skill 给出的 `oc-docx` / `oc-docxcheck` / `oc-stylecheck` / `oc-artifact-qa` / 本地校验命令；绝不自行拼 `curl`、URL、端口或 token。命令失败时读清错误并修正输入/路径，不能用 HTML 改扩展名兜底。

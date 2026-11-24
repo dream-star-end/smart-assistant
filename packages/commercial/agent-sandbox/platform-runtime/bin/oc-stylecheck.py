@@ -50,6 +50,33 @@ BUILTIN_ZH_CLICHES: tuple[str, ...] = (
     "奠定了坚实基础",
     "注入了新的活力",
     "展现出巨大的潜力",
+    "逻辑闭合",
+    "完整闭合",
+    "全面闭合",
+    "价值兑现",
+    "性能兑现",
+    "工程兑现",
+    "全链路闭环",
+    "深度赋能",
+    "多维协同",
+    "范式跃迁",
+    "核心抓手",
+    "底层逻辑",
+    "破局之道",
+    "全面打通",
+    "形成有机整体",
+    "具有重要理论与实践意义",
+    "为后续研究奠定了基础",
+    "提供了有力支撑",
+)
+
+BUILTIN_ZH_ADVISORY_TERMS: tuple[str, ...] = (
+    "闭合",
+    "判据",
+    "兑现",
+    "闭环",
+    "显著提升",
+    "跃升",
 )
 
 BUILTIN_EN_CLICHES: tuple[str, ...] = (
@@ -154,18 +181,21 @@ def load_custom_terms(style_file: Path) -> list[str]:
     return terms
 
 
+def _compile_phrase_pattern(phrase: str) -> re.Pattern[str]:
+    if re.search(r"[A-Za-z]", phrase) and not re.search(r"[\u4e00-\u9fff]", phrase):
+        return re.compile(rf"(?<![A-Za-z]){re.escape(phrase)}(?![A-Za-z])", re.I)
+    return re.compile(re.escape(phrase), re.I)
+
+
 def _find_phrase_hits(
     lines: list[str],
     phrases: list[tuple[str, str, str]],
 ) -> list[dict[str, Any]]:
     hits: list[dict[str, Any]] = []
-    compiled: list[tuple[str, str, str, re.Pattern[str]]] = []
-    for phrase, lang, source in phrases:
-        if re.search(r"[A-Za-z]", phrase) and not re.search(r"[\u4e00-\u9fff]", phrase):
-            pat = re.compile(rf"(?<![A-Za-z]){re.escape(phrase)}(?![A-Za-z])", re.I)
-        else:
-            pat = re.compile(re.escape(phrase), re.I)
-        compiled.append((phrase, lang, source, pat))
+    compiled: list[tuple[str, str, str, re.Pattern[str]]] = [
+        (phrase, lang, source, _compile_phrase_pattern(phrase))
+        for phrase, lang, source in phrases
+    ]
 
     for line_no, line in enumerate(lines, start=1):
         if not line.strip():
@@ -181,6 +211,40 @@ def _find_phrase_hits(
                         "snippet": line.strip()[:160],
                     }
                 )
+    return hits
+
+
+def _find_advisory_hits(
+    lines: list[str],
+    advisory_terms: tuple[str, ...],
+    hard_phrases: list[tuple[str, str, str]],
+) -> list[dict[str, Any]]:
+    """语境提醒词扫描：若某次出现已被同行硬套话覆盖则不重复上报，且不导致 passed=false。"""
+    hard_patterns = [_compile_phrase_pattern(phrase) for phrase, _, _ in hard_phrases]
+    advisory_patterns = [(term, _compile_phrase_pattern(term)) for term in advisory_terms]
+    hits: list[dict[str, Any]] = []
+    for line_no, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        hard_spans: list[tuple[int, int]] = []
+        for pat in hard_patterns:
+            for m in pat.finditer(line):
+                hard_spans.append((m.start(), m.end()))
+        for term, pat in advisory_patterns:
+            for m in pat.finditer(line):
+                start, end = m.start(), m.end()
+                if any(hs <= start and end <= he for hs, he in hard_spans):
+                    continue
+                hits.append(
+                    {
+                        "line": line_no,
+                        "phrase": term,
+                        "lang": "zh",
+                        "source": "advisory",
+                        "snippet": line.strip()[:160],
+                    }
+                )
+                break
     return hits
 
 
@@ -230,6 +294,7 @@ def run_stylecheck(
             phrase_specs.append((term, lang, "custom"))
 
     cliche_hits = _find_phrase_hits(lines, phrase_specs)
+    advisory_hits = _find_advisory_hits(lines, BUILTIN_ZH_ADVISORY_TERMS, phrase_specs)
     warnings: list[str] = []
     if dash_warning:
         warnings.append(
@@ -255,6 +320,7 @@ def run_stylecheck(
             "hits": dash_hits,
         },
         "cliche_hits": cliche_hits,
+        "advisory_hits": advisory_hits,
         "custom_terms_loaded": custom_terms,
         "score": score,
         "warnings": warnings,

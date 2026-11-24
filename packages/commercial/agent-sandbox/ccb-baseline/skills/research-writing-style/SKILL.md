@@ -26,8 +26,12 @@ tags: [research, writing, personalization, style]
    - 句式偏好(长短句、主动/被动、是否用第一人称"我们")
    - 结构偏好(段落组织、是否爱用小标题/编号)
    - 禁忌(用户明确不喜欢的措辞)
-3. **few-shot 写作**:写作时把 `profile.md` + 1~2 段最贴的 sample 作为 few-shot 注入,产出对齐风格的文本;再过 scientific-writing 去 AI 味。
-4. **更新**:用户给反馈("这里不像我")→ 更新 profile.md,下次生效。
+3. **few-shot 写作 + 确定性风格门禁闭环**:写作时把 `profile.md` + 1~2 段最贴的 sample 作为 few-shot 注入,产出对齐风格的文本;完成后把 `profile.md` 直接接入 `oc-stylecheck` 确定性风格门禁,让个人禁忌词与内置去 AI 味规则自动生效:
+   ```bash
+   oc-stylecheck <draft.md|report.docx> --style-file /home/agent/.openclaude/research/style/profile.md
+   ```
+   `profile.md` 中在「禁忌」段落或以 `禁用词:` / `避免:` 写明的个人禁忌词会被 `oc-stylecheck --style-file` 自动加载并精确标出行号。
+4. **更新**:用户给反馈("这里不像我"/新增禁用词)→ 更新 `profile.md`,下次 few-shot 与 `oc-stylecheck --style-file` 同步生效。
 
 ## 规则
 

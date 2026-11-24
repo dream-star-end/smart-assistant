@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import copy
 import difflib
+import errno
 import io
 import json
 import os
@@ -51,6 +52,16 @@ VISION_COPY_MAX_BYTES = 4_500_000
 VISION_COPY_MAX_EDGE = 1600
 # 本 CLI 无 sibling 引用，SELF_ROOT 仅立“工具单文件独立、禁相对 sibling 裸调用”不变量（测试固化）。
 SELF_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _import_helper(module_name: str) -> Any:
+    for candidate_dir in (SELF_ROOT / "entrypoint", Path("/usr/local/lib/openclaude")):
+        if (candidate_dir / f"{module_name}.py").is_file():
+            dir_str = str(candidate_dir)
+            if dir_str not in sys.path:
+                sys.path.insert(0, dir_str)
+            break
+    return __import__(module_name)
 
 
 class ConfigError(ValueError):
@@ -217,61 +228,109 @@ def _clean_converted_docx(output: Path, *, strip_empty_toc: bool) -> None:
             os.replace(temp_out, output)
 
 
+def _atomic_move(src: Path, dst: Path) -> None:
+    try:
+        os.replace(src, dst)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        tmp = dst.parent / f".{dst.name}.{os.getpid()}.tmp"
+        try:
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+        finally:
+            tmp.unlink(missing_ok=True)
+        src.unlink(missing_ok=True)
+
+
+def _has_frontmatter_metrics(source: Path) -> bool:
+    try:
+        with source.open("r", encoding="utf-8", errors="ignore") as f:
+            if f.readline().strip() != "---":
+                return False
+            seen = 0
+            for _ in range(4000):
+                line = f.readline()
+                seen += len(line)
+                if not line or line.strip() in {"---", "..."} or seen > 262_144:
+                    return False
+                if re.match(r"^\s*metrics\s*:", line):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _verify_zip_size_limits(source: Path, max_m: int = 32 * 1024 * 1024, max_t: int = 64 * 1024 * 1024) -> str | None:
+    try:
+        total = 0
+        with zipfile.ZipFile(source, "r") as zf:
+            for info in zf.infolist():
+                if info.file_size > max_m:
+                    return f"DOCX member {info.filename!r} exceeds size limit {max_m}"
+                m_read = 0
+                with zf.open(info, "r") as s:
+                    while chunk := s.read(65536):
+                        m_read += len(chunk); total += len(chunk)
+                        if m_read > max_m or total > max_t:
+                            return f"DOCX decompressed size exceeds resource limit ({max_t} bytes)"
+    except zipfile.BadZipFile:
+        return None
+    return None
+
+
 def convert_docx(
-    input_path: str | Path,
-    output_path: str | Path | None,
-    *,
-    engine: str | None,
-    reference_doc: str | Path | None,
-    use_reference: bool,
-    toc: bool = False,
-    number_sections: bool = False,
+    input_path: str | Path, output_path: str | Path | None, *, engine: str | None,
+    reference_doc: str | Path | None, use_reference: bool, toc: bool = False,
+    number_sections: bool = False, metrics: str | Path | None = None,
 ) -> Path:
     source = _resolve_existing_file(input_path, "输入文件")
-    extension = source.suffix.lower()
-    selected_engine = engine or ("quarto" if extension == ".qmd" else "pandoc")
+    selected_engine = engine or ("quarto" if source.suffix.lower() == ".qmd" else "pandoc")
     output = _resolve_output(output_path or source.with_suffix(".docx"))
-
-    reference: Path | None = None
-    if use_reference:
-        reference = _resolve_existing_file(reference_doc or DEFAULT_REFERENCE_DOC, "reference doc")
-
-    if selected_engine == "pandoc":
-        command = [
-            _which("pandoc"),
-            str(source),
-            "--standalone",
-            "--from=markdown+tex_math_dollars+pipe_tables+raw_html+fenced_divs+footnotes+definition_lists",
-            "--to=docx",
-            "--output",
-            str(output),
-        ]
-        if toc:
-            command.append("--toc")
-        if number_sections:
-            command.append("--number-sections")
-        if reference:
-            command.extend(["--reference-doc", str(reference)])
-        subprocess.run(command, check=True)
-    elif selected_engine == "quarto":
-        render_name = output.name
-        rendered = source.parent / render_name
-        if rendered != output:
-            render_name = f".oc-docx-{source.stem}-{os.getpid()}.docx"
-            rendered = source.parent / render_name
-        rendered.unlink(missing_ok=True)
-        command = [_which("quarto"), "render", source.name, "--to", "docx", "--output", render_name]
-        if reference:
-            command.extend(["-M", f"reference-doc={reference}"])
+    reference = _resolve_existing_file(reference_doc or DEFAULT_REFERENCE_DOC, "reference doc") if use_reference else None
+    ctx, effective_source = None, source
+    if metrics is not None or _has_frontmatter_metrics(source):
         try:
-            subprocess.run(command, cwd=source.parent, check=True)
+            ctx = _import_helper("oc_docx_paper_qa").prepare_metrics_source(source, metrics)
+            effective_source, _ = ctx.__enter__()
+        except (ImportError, ValueError) as exc:
+            raise ConfigError(f"metrics 单源绑定失败：{exc}") from exc
+    try:
+        if selected_engine == "pandoc":
+            command = [
+                _which("pandoc"), str(effective_source), "--standalone",
+                "--from=markdown+tex_math_dollars+pipe_tables+raw_html+fenced_divs+footnotes+definition_lists",
+                "--to=docx", "--resource-path", f"{source.parent}{os.pathsep}.", "--output", str(output),
+            ]
+            if toc:
+                command.append("--toc")
+            if number_sections:
+                command.append("--number-sections")
+            if reference:
+                command.extend(["--reference-doc", str(reference)])
+            subprocess.run(command, check=True)
+        elif selected_engine == "quarto":
+            render_name = output.name
+            rendered = effective_source.parent / render_name
             if rendered != output:
-                os.replace(rendered, output)
-        finally:
-            if rendered != output:
-                rendered.unlink(missing_ok=True)
-    else:
-        raise ValueError(f"无效引擎：{selected_engine}")
+                render_name = f".oc-docx-{effective_source.stem}-{os.getpid()}.docx"
+                rendered = effective_source.parent / render_name
+            rendered.unlink(missing_ok=True)
+            command = [_which("quarto"), "render", effective_source.name, "--to", "docx", "--output", render_name]
+            if reference:
+                command.extend(["-M", f"reference-doc={reference}"])
+            try:
+                subprocess.run(command, cwd=effective_source.parent, check=True)
+                if rendered != output:
+                    _atomic_move(rendered, output)
+            finally:
+                if rendered != output:
+                    rendered.unlink(missing_ok=True)
+        else:
+            raise ValueError(f"无效引擎：{selected_engine}")
+    finally:
+        if ctx is not None:
+            ctx.__exit__(None, None, None)
 
     if not output.is_file() or output.stat().st_size == 0:
         raise RuntimeError(f"DOCX 未生成：{output}")
@@ -1209,6 +1268,7 @@ def _convert_command(args: argparse.Namespace) -> int:
         use_reference=not args.no_reference_doc,
         toc=bool(args.toc),
         number_sections=bool(args.number_sections),
+        metrics=args.metrics,
     )
     print(output)
     return 0
@@ -1550,7 +1610,7 @@ def _check_render_readback(
     required_text: list[str],
     *,
     render_check: bool | None = None,
-) -> None:
+) -> str:
     import re
     import tempfile
 
@@ -1558,15 +1618,15 @@ def _check_render_readback(
     report["render_garbled_hits"] = []
     report["render_garbled_check_executed"] = False
     source_anchors = _extract_non_omml_garbled_anchors(source) if should_scan_garbled else None
+    rendered_text = ""
     try:
         with tempfile.TemporaryDirectory(prefix="oc-docx-check-") as temporary:
             rendered = render_docx(source, temporary, emit_pdf=True)
             pages = [Path(item) for item in rendered.get("pages") or []]
             if not pages:
                 _check_add_failure(report, "libreoffice-render", "render produced no page PNGs")
-                return
+                return ""
             pdf = rendered.get("pdf")
-            rendered_text = ""
             pdftotext_bin = shutil.which("pdftotext")
             if pdf and pdftotext_bin:
                 text_out = Path(temporary) / "rendered.txt"
@@ -1630,6 +1690,7 @@ def _check_render_readback(
                 _check_add_failure(report, "empty-render", "all rendered pages look blank")
     except RenderError as error:
         _check_add_failure(report, "libreoffice-render", str(error))
+    return rendered_text
 
 
 def check_docx(
@@ -1641,8 +1702,13 @@ def check_docx(
     render_dir: str | Path | None = None,
     vision: bool = False,
     render_check: bool | None = None,
+    paper_check: bool = True,
 ) -> dict[str, Any]:
-    report = inspect_docx(input_path, render_dir)
+    source = _resolve_existing_file(input_path, "DOCX")
+    limit_err = _verify_zip_size_limits(source)
+    if limit_err is not None:
+        return {"input": str(source), "zip_integrity_ok": False, "warnings": [], "failures": [{"code": "package-resource-limit", "message": limit_err}], "passed": False, "verdict": "FAIL"}
+    report = inspect_docx(source, render_dir)
     report["failures"] = []
     report["passed"] = False
     report["verdict"] = "FAIL"
@@ -1651,7 +1717,7 @@ def check_docx(
     if report.get("non_empty_paragraph_count", 0) == 0 and report.get("table_count", 0) == 0:
         _check_add_failure(report, "empty-document", "document has no visible paragraphs or tables")
         report["warnings"] = [item for item in report.get("warnings", []) if "没有可见内容" not in item]
-    source = _resolve_existing_file(input_path, "DOCX")
+    document = None
     try:
         document, numbering, media = _parse_docx_xml(source)
         _check_omml_and_structure(
@@ -1666,7 +1732,19 @@ def check_docx(
         _check_add_failure(report, "docx-xml", f"cannot parse document.xml: {error}")
     if vision:
         report.setdefault("warnings", []).append("vision sampling is optional and was not executed")
-    _check_render_readback(source, report, required_text or [], render_check=render_check)
+    rendered_text = _check_render_readback(source, report, required_text or [], render_check=render_check)
+    if paper_check and document is not None:
+        try:
+            qa_mod = _import_helper("oc_docx_paper_qa")
+        except ImportError:
+            report.setdefault("warnings", []).append("paper static QA helper unavailable; skipped")
+        else:
+            paper_qa = qa_mod.run_paper_static_checks(source, document, rendered_text=rendered_text or None)
+            report["paper_qa"] = paper_qa
+            for item in paper_qa.get("failures", []):
+                _check_add_failure(report, item["code"], item["message"])
+            for item in paper_qa.get("warnings", []):
+                report.setdefault("warnings", []).append(f"[{item['code']}] {item['message']}")
     if render_dir and not report.get("render_pairing_ok", True):
         _check_add_failure(report, "render-pairing", "render directory page pairing failed")
     report["passed"] = len(report["failures"]) == 0
@@ -1685,6 +1763,7 @@ def _check_command(args: argparse.Namespace) -> int:
         render_dir=args.render_dir,
         vision=bool(args.vision),
         render_check=args.render_check,
+        paper_check=bool(getattr(args, "paper_check", True)),
     )
     if args.json:
         output = _resolve_output(args.json)
@@ -1707,34 +1786,22 @@ def diff_docx(
     out_highlighted_path: str | Path,
     *,
     render_check: bool | None = None,
+    strict_structure: bool = False,
 ) -> dict[str, Any]:
     _load_docx_dependencies()
-    for candidate_dir in (
-        Path(__file__).resolve().parent.parent / "entrypoint",
-        Path("/usr/local/lib/openclaude"),
-    ):
-        if (candidate_dir / "oc_docx_diff.py").is_file():
-            dir_str = str(candidate_dir)
-            if dir_str not in sys.path:
-                sys.path.insert(0, dir_str)
-            break
-    from oc_docx_diff import diff_docx_impl
-
-    base_file = _resolve_existing_file(base_path, "基准 DOCX")
-    revised_file = _resolve_existing_file(revised_path, "修订 DOCX")
-    clean_out = _resolve_output(out_clean_path)
-    hl_out = _resolve_output(out_highlighted_path)
+    diff_docx_impl = _import_helper("oc_docx_diff").diff_docx_impl
     return diff_docx_impl(
-        base_file,
-        revised_file,
-        clean_out,
-        hl_out,
+        _resolve_existing_file(base_path, "基准 DOCX"),
+        _resolve_existing_file(revised_path, "修订 DOCX"),
+        _resolve_output(out_clean_path),
+        _resolve_output(out_highlighted_path),
         Document=Document,
         OxmlElement=OxmlElement,
         qn=qn,
         render_pdf_garbled_scan=_render_pdf_garbled_scan,
         render_error_cls=RenderError,
         render_check=render_check,
+        strict_structure=strict_structure,
     )
 
 
@@ -1745,6 +1812,7 @@ def _diff_command(args: argparse.Namespace) -> int:
         args.out_clean,
         args.out_highlighted,
         render_check=args.render_check,
+        strict_structure=bool(args.strict_structure),
     )
     if args.json:
         output = _resolve_output(args.json)
@@ -1752,6 +1820,22 @@ def _diff_command(args: argparse.Namespace) -> int:
         report["report_file"] = str(output)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["passed"] else 1
+
+
+def _extract_command(args: argparse.Namespace) -> int:
+    try:
+        qa_mod = _import_helper("oc_docx_paper_qa")
+    except ImportError as exc:
+        raise RuntimeError(f"缺少 oc_docx_paper_qa helper，无法执行 extract：{exc}") from exc
+    res = qa_mod.extract_docx(
+        args.input, latex=bool(args.latex), toc_only=bool(args.toc), section=args.section, max_chars=args.max_chars
+    )
+    body = json.dumps(res, ensure_ascii=False, indent=2) if args.json else str(res["markdown"])
+    if args.out:
+        _resolve_output(args.out).write_text(body, encoding="utf-8")
+    else:
+        sys.stdout.write(body if body.endswith("\n") else body + "\n")
+    return 0
 
 
 def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1762,6 +1846,7 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-reference-doc", action="store_true", help="不使用默认 reference.docx")
     parser.add_argument("--toc", action="store_true", help="插入 Word 目录字段（默认关闭，避免未更新的静态 Table of Contents 占位行）")
     parser.add_argument("--number-sections", action="store_true", help="由 Pandoc 自动为标题添加编号（默认关闭，避免与正文已有章节号冲突）")
+    parser.add_argument("--metrics", help="仿真指标 JSON 路径，用于在临时目录展开 {{metric:...}} 单源绑定")
     parser.add_argument("-o", "--output", help="输出 DOCX；默认与输入同目录同名")
     parser.add_argument("input", help="输入 .md/.markdown/.qmd")
 
@@ -1837,6 +1922,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="跳过渲染期 ¿/□ 乱码扫描",
     )
+    check.add_argument("--no-paper-check", dest="paper_check", action="store_false", default=True, help="跳过科研静态预检（占位符/交叉引用/符号表/标点丢失）")
     check.set_defaults(func=_check_command)
     scrub = subparsers.add_parser(
         "scrub",
@@ -1871,14 +1957,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="跳过 LibreOffice + pdftotext 渲染期乱码扫描",
     )
+    diff.add_argument("--strict-structure", action="store_true", help="结构守恒告警（章节/表格/公式/题注/参考文献减少或表列缩水）时置 passed=false 并退出 1")
     diff.add_argument("--json", help="保存 Diff 与 OMML 检查报告 JSON")
     diff.set_defaults(func=_diff_command)
+    extract = subparsers.add_parser(
+        "extract",
+        help="高保真抽取 DOCX 为 Markdown（原生 OMML 无损转 LaTeX，支持目录与按节切片）",
+        description="高保真抽取 DOCX 为 Markdown，保留标题层级、段落锚点、表格、脚注与 OMML->LaTeX 公式",
+    )
+    extract.add_argument("input", help="输入 DOCX")
+    latex_grp = extract.add_mutually_exclusive_group()
+    latex_grp.add_argument("--latex", dest="latex", action="store_true", default=True, help="将 OMML 公式无损转换为 LaTeX（默认开启）")
+    latex_grp.add_argument("--no-latex", dest="latex", action="store_false", help="以纯可读文本输出 OMML 公式")
+    extract.add_argument("--toc", action="store_true", help="仅返回章节目录及各节字数/公式数/表数")
+    extract.add_argument("--section", help="按章节序号或标题关键字切片读取")
+    extract.add_argument("--max-chars", type=int, help="最大字符数截断并标记 truncated=true")
+    extract.add_argument("--json", action="store_true", help="输出结构化 JSON")
+    extract.add_argument("-o", "--out", help="输出文件路径（默认 stdout）")
+    extract.set_defaults(func=_extract_command)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     actual = list(sys.argv[1:] if argv is None else argv)
-    commands = {"convert", "build", "render", "inspect", "check", "scrub", "diff"}
+    commands = {"convert", "build", "render", "inspect", "check", "scrub", "diff", "extract"}
     if actual and actual[0] not in commands and actual[0] not in {"-h", "--help"}:
         actual.insert(0, "convert")
     parser = build_parser()
