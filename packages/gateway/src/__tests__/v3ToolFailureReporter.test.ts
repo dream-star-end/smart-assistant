@@ -25,9 +25,15 @@ import {
   TURN_OBSERVATION_PATH,
   ToolFailureReportError,
   type ToolCallRollupPayload,
+  _peekPendingContextEvalEventsForTests,
   _resetAdvertisedToolAuditSchemaHintForTests,
+  _resetContextEvalBufferForTests,
+  CONTEXT_EVAL_TRACED_ORPHAN_AGE_MS,
+  MAX_CONTEXT_EVENTS_BATCH_BYTES,
   buildToolFailureReportPayload,
   buildTurnObservationPayload,
+  chunkContextEvalEvents,
+  enqueueContextEvalEvent,
   isToolFailureAuditEnabled,
   makeToolFailureReporter,
   projectRollupToLegacy,
@@ -41,6 +47,7 @@ import {
 
 afterEach(() => {
   _resetAdvertisedToolAuditSchemaHintForTests()
+  _resetContextEvalBufferForTests()
 })
 
 async function readQueuePayloadEventually<T>(file: string): Promise<T> {
@@ -783,5 +790,256 @@ describe('v3ToolFailureReporter', () => {
     )
     assert.equal((bodies[0] as ToolCallRollupPayload).counts[0].errorClass, 'empty_output')
     assert.equal((bodies[1] as ToolCallRollupPayload).counts[0].errorClass, 'other')
+  })
+
+  test('context eval buffer is bounded to 64 entries and attaches matching events to turn.completed observation', async () => {
+    for (let i = 0; i < 70; i += 1) {
+      enqueueContextEvalEvent({
+        eventId: `ctx-cap-${i}`,
+        eventKind: 'prompt_context_decision',
+        sessionKey: 'agent:main:webchat:dm:other',
+        agentId: 'main',
+        decision: 'full_inject',
+        reason: 'fresh_conversation',
+        observedAt: 1_780_000_000_000 + i,
+      })
+    }
+    assert.equal(_peekPendingContextEvalEventsForTests().length, 64)
+    assert.equal(_peekPendingContextEvalEventsForTests()[0]!.eventId, 'ctx-cap-6')
+
+    _resetContextEvalBufferForTests()
+    const traceId = 'b'.repeat(32)
+    enqueueContextEvalEvent({
+      eventId: 'ctx-turn-1',
+      eventKind: 'prompt_context_decision',
+      sessionKey: 'agent:main:webchat:dm:s-ctx',
+      agentId: 'main',
+      traceId,
+      engine: 'antigravity',
+      decision: 'full_inject',
+      reason: 'inputs_changed',
+      changedSlots: ['SOUL', 'TOOLS'],
+      totalBytes: 12000,
+      tokensEstimate: 3000,
+      observedAt: 1_780_000_000_100,
+    })
+    enqueueContextEvalEvent({
+      eventId: 'ctx-turn-2',
+      eventKind: 'context_compacted',
+      sessionKey: 'agent:main:webchat:dm:s-ctx',
+      agentId: 'main',
+      traceId,
+      engine: 'antigravity',
+      compactionScope: 'launch_prompt',
+      compactionStrategy: 'history_suffix',
+      beforeBytes: 200000,
+      afterBytes: 90000,
+      droppedEntries: 5,
+      observedAt: 1_780_000_000_200,
+    })
+
+    tmp = await mkdtemp(join(tmpdir(), 'oc-turn-ctx-events-'))
+    const listeners = new Map<string, (ev: unknown) => void>()
+    const sentBodies: Array<Record<string, unknown>> = []
+    const reporter = makeToolFailureReporter({
+      config: { masterBaseUrl: 'http://master', containerToken: 'tok' },
+      queueDir: tmp,
+      eventBus: {
+        on(event: string, cb: (ev: unknown) => void) { listeners.set(event, cb) },
+        off(event: string) { listeners.delete(event) },
+      } as any,
+      drainIntervalMs: 60_000,
+      fetchImpl: async (_input, init) => {
+        sentBodies.push(JSON.parse(String(init.body)))
+        return new Response('{}', { status: 200 })
+      },
+    })
+    reporter.start()
+    listeners.get('turn.completed')!({
+      id: 'turn-with-ctx-1',
+      type: 'turn.completed',
+      schemaVersion: 1,
+      timestamp: 1_780_000_000_300,
+      agentId: 'main',
+      sessionKey: 'agent:main:webchat:dm:s-ctx',
+      turnIndex: 1,
+      traceId,
+      usage: { inputTokens: 10, outputTokens: 20, model: 'gpt-5.6-sol' },
+      toolCalls: 1,
+      durationMs: 300,
+    } as TurnCompletedEvent)
+    for (let i = 0; i < 50 && sentBodies.length === 0; i += 1) {
+      await new Promise((r) => setTimeout(r, 15))
+    }
+    reporter.stop()
+    assert.equal(sentBodies.length, 1)
+    const sent = sentBodies[0] as { eventId: string; contextEvents?: Array<{ eventId: string; eventKind: string }> }
+    assert.equal(sent.eventId, 'turn-with-ctx-1')
+    assert.equal(sent.contextEvents?.length, 2)
+    assert.deepEqual(
+      sent.contextEvents?.map((e) => e.eventId),
+      ['ctx-turn-1', 'ctx-turn-2'],
+    )
+    assert.equal(_peekPendingContextEvalEventsForTests().length, 0)
+  })
+
+  test('sendTurnObservation 4-quadrant compat: strips contextEvents on HTTP 400 and retries base observation once', async () => {
+    const payload = buildTurnObservationPayload(
+      {
+        id: 'turn-compat-1',
+        type: 'turn.completed',
+        schemaVersion: 1,
+        timestamp: 1_780_000_000_000,
+        agentId: 'main',
+        sessionKey: 'agent:main:webchat:dm:s1',
+        turnIndex: 1,
+        traceId: 'c'.repeat(32),
+        usage: { inputTokens: 1, outputTokens: 2, model: 'gpt-5.6-sol' },
+        toolCalls: 2,
+        durationMs: 250,
+      } as TurnCompletedEvent,
+      [
+        {
+          eventId: 'ctx-compat-1',
+          eventKind: 'prompt_context_decision',
+          decision: 'elide_resumed',
+          reason: 'elided',
+          observedAt: 1_780_000_000_000,
+        },
+      ],
+    )
+    const bodies: Array<Record<string, unknown>> = []
+    await sendTurnObservation(
+      payload,
+      { masterBaseUrl: 'http://master', containerToken: 'tok' },
+      {
+        fetchImpl: async (_input, init) => {
+          const parsed = JSON.parse(String(init.body)) as Record<string, unknown>
+          bodies.push(parsed)
+          // Simulate an older commercial master whose validate() rejects unknown key `contextEvents`
+          if ('contextEvents' in parsed) {
+            return new Response(JSON.stringify({ error: { code: 'INVALID_BODY' } }), { status: 400 })
+          }
+          return new Response(JSON.stringify({ ok: true, duplicate: false }), { status: 200 })
+        },
+      },
+    )
+    assert.equal(bodies.length, 2)
+    assert.ok('contextEvents' in bodies[0]!)
+    assert.equal('contextEvents' in bodies[1]!, false)
+    assert.equal(bodies[1]!.eventId, 'turn-compat-1')
+    assert.equal(bodies[1]!.durationMs, 250)
+  })
+
+  test('sendTurnObservation NEVER resends fake durationMs=0 turn when contextOnly=true gets HTTP 400 (Blocker #1)', async () => {
+    let calls = 0
+    await assert.rejects(
+      () =>
+        sendTurnObservation(
+          {
+            schemaVersion: 1,
+            eventId: 'ctx-batch-old-master',
+            sessionKey: 'agent:main:webchat:dm:s1',
+            agentId: 'main',
+            durationMs: 0,
+            toolCalls: 0,
+            timestamp: 1_780_000_000_000,
+            contextOnly: true,
+            contextEvents: [
+              {
+                eventId: 'ctx-orphan-1',
+                eventKind: 'context_compacted',
+                compactionScope: 'session',
+                compactionStrategy: 'checkpoint_reset',
+                observedAt: 1_780_000_000_000,
+              },
+            ],
+          },
+          { masterBaseUrl: 'http://master', containerToken: 'tok' },
+          {
+            fetchImpl: async () => {
+              calls += 1
+              return new Response(JSON.stringify({ error: { code: 'INVALID_BODY' } }), { status: 400 })
+            },
+          },
+        ),
+      (err) => err instanceof ToolFailureReportError && err.retryable === false && err.status === 400,
+    )
+    assert.equal(calls, 1, 'contextOnly=true must NOT retry stripped durationMs=0 payload against old master')
+  })
+
+  test('traced events wait 120s before orphan flush and UTF-8 >16 KiB contextEvents split into contextOnly chunks (Blockers #1 & #4)', async () => {
+    const t0 = 1_780_000_000_000
+    let fakeNow = t0
+    const traceId = 'd'.repeat(32)
+    enqueueContextEvalEvent({
+      eventId: 'untraced-orphan',
+      eventKind: 'context_compacted',
+      sessionKey: 'agent:main:webchat:dm:orphan',
+      agentId: 'main',
+      compactionScope: 'session',
+      compactionStrategy: 'checkpoint_reset',
+      observedAt: t0,
+    })
+    enqueueContextEvalEvent({
+      eventId: 'traced-inflight',
+      eventKind: 'prompt_context_decision',
+      sessionKey: 'agent:main:webchat:dm:longturn',
+      agentId: 'main',
+      traceId,
+      decision: 'elide_resumed',
+      reason: 'elided',
+      observedAt: t0,
+    })
+
+    tmp = await mkdtemp(join(tmpdir(), 'oc-turn-ctx-orphan-'))
+    const sent: Array<Record<string, unknown>> = []
+    const reporter = makeToolFailureReporter({
+      config: { masterBaseUrl: 'http://master', containerToken: 'tok' },
+      queueDir: tmp,
+      now: () => fakeNow,
+      eventBus: { on() {}, off() {} } as any,
+      drainIntervalMs: 60_000,
+      fetchImpl: async (_input, init) => {
+        sent.push(JSON.parse(String(init.body)))
+        return new Response('{}', { status: 200 })
+      },
+    })
+
+    // At +30s: untraced orphan flushes with contextOnly=true, traced event stays buffered (<120s)
+    fakeNow = t0 + 30_000
+    await reporter.drainOnce()
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0]!.contextOnly, true)
+    assert.equal((sent[0]!.contextEvents as Array<{ eventId: string }>)[0]!.eventId, 'untraced-orphan')
+    assert.equal(_peekPendingContextEvalEventsForTests().length, 1)
+    assert.equal(_peekPendingContextEvalEventsForTests()[0]!.eventId, 'traced-inflight')
+
+    // At +125s (>120s): traced event finally flushes as contextOnly=true
+    fakeNow = t0 + CONTEXT_EVAL_TRACED_ORPHAN_AGE_MS + 5_000
+    await reporter.drainOnce()
+    assert.equal(sent.length, 2)
+    assert.equal(sent[1]!.contextOnly, true)
+    assert.equal((sent[1]!.contextEvents as Array<{ eventId: string }>)[0]!.eventId, 'traced-inflight')
+
+    // UTF-8 byte budget chunking: 12 bulky events (~2.2 KiB each = ~26 KiB) must split into <= 16 KiB chunks
+    const bulky = Array.from({ length: 12 }, (_, i) => ({
+      eventId: `bulky-${i}`,
+      eventKind: 'prompt_context_decision' as const,
+      sessionKey: 'agent:main:webchat:dm:bulky',
+      agentId: 'main',
+      changedSlots: Array.from({ length: 32 }, (_, s) => `SLOT_NAME_WITH_PADDING_${String(s).padStart(2, '0')}_${'x'.repeat(30)}`),
+      observedAt: t0 + i,
+    }))
+    const chunks = chunkContextEvalEvents(bulky)
+    assert.ok(chunks.length >= 2, `expected >=2 chunks for ~26 KiB payload, got ${chunks.length}`)
+    for (const chunk of chunks) {
+      assert.ok(chunk.length <= 16)
+      assert.ok(
+        Buffer.byteLength(JSON.stringify(chunk), 'utf8') <= MAX_CONTEXT_EVENTS_BATCH_BYTES,
+        'each chunk must fit within 16 KiB UTF-8 budget',
+      )
+    }
+    assert.equal(chunks.reduce((n, c) => n + c.length, 0), 12)
   })
 })

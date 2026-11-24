@@ -171,6 +171,67 @@ def health() -> dict[str, Any]:
     return {"ok": all(v.get("ok", True) is not False for v in checks.values()), "checks": checks}
 
 
+def _load_paper_qa() -> Any | None:
+    try:
+        for candidate_dir in (SELF_ROOT / "entrypoint", Path("/usr/local/lib/openclaude")):
+            if (candidate_dir / "oc_docx_paper_qa.py").is_file():
+                dir_str = str(candidate_dir)
+                if dir_str not in sys.path:
+                    sys.path.insert(0, dir_str)
+                break
+        import oc_docx_paper_qa
+
+        return oc_docx_paper_qa
+    except Exception:
+        return None
+
+
+def parse_docx_smart(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    """Use oc_docx_omml for OMML-bearing DOCX (fail-closed on resource limits); keep MarkItDown for plain DOCX."""
+    file_path = str(payload.get("file_path", ""))
+    qa = _load_paper_qa()
+    if qa is None:
+        return run_py(MARK_PY, MARK_CODE, payload, timeout=120)
+
+    try:
+        has_omml = qa.docx_has_omml(file_path)
+    except qa.DocxResourceLimitError as exc:
+        return {"ok": False, "extractor": "oc_docx_omml", "error": str(exc)}
+    except Exception:
+        return run_py(MARK_PY, MARK_CODE, payload, timeout=120)
+
+    def _run_omml() -> dict[str, Any] | None:
+        try:
+            res = qa.extract_docx(file_path, latex=True, max_chars=max_chars)
+            markdown = str(res.get("markdown") or "")
+            if not markdown.strip():
+                return None
+            return {
+                "ok": True,
+                "extractor": "oc_docx_omml",
+                "markdown": markdown,
+                "chars": int(res.get("chars") or len(markdown)),
+                "truncated": bool(res.get("truncated")),
+                "formulas": int(res.get("total_formulas") or 0),
+            }
+        except qa.DocxResourceLimitError as exc:
+            return {"ok": False, "extractor": "oc_docx_omml", "error": str(exc)}
+        except Exception:
+            return None
+
+    if has_omml:
+        omml_out = _run_omml()
+        if omml_out is not None:
+            return omml_out
+        return run_py(MARK_PY, MARK_CODE, payload, timeout=120)
+
+    # No OMML formulas: preserve legacy MarkItDown path; fallback to oc_docx_omml only if MarkItDown env is absent.
+    if MARK_PY.exists():
+        return run_py(MARK_PY, MARK_CODE, payload, timeout=120)
+    omml_out = _run_omml()
+    return omml_out if omml_out is not None else run_py(MARK_PY, MARK_CODE, payload, timeout=120)
+
+
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help", "help"):
         sys.stdout.write(
@@ -200,6 +261,8 @@ def main() -> None:
         elif kind in {"text", "txt", "md", "markdown", "json", "csv", "xml"} or suffix in {"txt", "md", "markdown", "json", "csv", "xml"}:
             payload["kind"] = "text" if suffix not in {"html", "htm"} else "html"
             out = run_py(TRAF_PY, TRAF_CODE, payload, timeout=90)
+        elif (kind == "docx" or suffix == "docx") and Path(str(payload.get("file_path", ""))).is_file():
+            out = parse_docx_smart(payload, max_chars)
         else:
             out = run_py(MARK_PY, MARK_CODE, payload, timeout=120)
     elif op == "browser_extract_url":

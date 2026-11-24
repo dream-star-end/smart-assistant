@@ -486,7 +486,7 @@ describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
     assert.match(src, /const SYSTEM_PLATFORM_BIN_DIR = "\/usr\/local\/bin"/);
     assert.match(
       src,
-      /const PLATFORM_LINKED_CLIS = \[\s*"oc-plugin",\s*"oc-ocr",\s*"oc-h3",\s*"oc-video",\s*"oc-cursor",\s*"oc-task",\s*"oc-memory",\s*"oc-browser",\s*"oc-muse",\s*"oc-site",\s*"oc-stylecheck",\s*(?:\/\/[^\n]*\s*)?"ths",\s*\] as const/,
+      /const PLATFORM_LINKED_CLIS = \[\s*"oc-plugin",\s*"oc-ocr",\s*"oc-h3",\s*"oc-video",\s*"oc-cursor",\s*"oc-task",\s*"oc-memory",\s*"oc-browser",\s*"oc-muse",\s*"oc-site",\s*"oc-stylecheck",\s*"oc-review",\s*"oc-docxcheck",\s*(?:\/\/[^\n]*\s*)?"ths",\s*\] as const/,
     );
     assert.match(src, /const source = join\(PLATFORM_BIN_DIR, cliName\)/);
     assert.match(src, /const userLink = join\(USER_PLATFORM_BIN_DIR, cliName\)/);
@@ -520,6 +520,11 @@ describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
     assert.ok(
       validateOnlyIdx > 0 && validateExitIdx > validateOnlyIdx && platformLinkIdx > validateExitIdx,
       "platform CLI 链接写入必须位于 validate-only 早退之后",
+    );
+    assert.match(
+      src,
+      /const USER_BUNDLE_OVERRIDE_CLIS = \["oc-docx", "oc-artifact-qa", "oc-web-context"\] as const/,
+      "Codex bash -lc 重置 PATH 后仍须通过 ~/.local/bin 软链命中热包新版 oc-docx 等工具",
     );
   });
 

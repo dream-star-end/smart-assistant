@@ -476,7 +476,7 @@ test(
       journalDir,
       finance,
       worker,
-      observationOptions: { authorizeTimeoutMs: 600 },
+      observationOptions: { authorizeTimeoutMs: 3_000 },
     })
 
     const socketPath = join(sandbox, 'relay.sock')
@@ -502,7 +502,7 @@ test(
       executionRoot: containerExecRoot,
       hostFactory,
       call: (path, body) => remotePoolControlRequest(path, body, socketPath),
-      toolAuthorizeTimeoutMs: 600,
+      toolAuthorizeTimeoutMs: 3_000,
     })
 
     const masterPayloads: V3MasterSinkWirePayload[] = []
@@ -601,7 +601,8 @@ test(
         now: issuedAt,
       })
 
-      // Use a short 600ms turn lease TTL so we can directly observe whether `this.expiry` fires after settlement!
+      // Use a bounded 20s turn lease TTL (covering ~7-12s cold tsx MCP startup under parallel gate load)
+      // while still waiting past `expiresAt` to directly observe that `this.expiry` was cleared on settlement!
       const tickets = makeSignedTickets({
         kp,
         keyId,
@@ -609,7 +610,7 @@ test(
         canonicalModel,
         authorityTurnId,
         issuedAt,
-        leaseTtlMs: 6000,
+        leaseTtlMs: 20_000,
       })
 
       const liveEvents: Array<Record<string, unknown>> = []

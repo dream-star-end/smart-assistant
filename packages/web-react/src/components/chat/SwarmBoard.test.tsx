@@ -10,7 +10,7 @@ import { PinnedSwarmDock } from "./PinnedSwarmDock";
 import { SwarmBoardDrawer } from "./SwarmBoardDrawer";
 import { SwarmInlineCard } from "./SwarmInlineCard";
 import { isAntigravityModelForUi } from "./swarmDetect";
-import { extractSwarmSnapshotFromMessage, latestSwarmSnapshot } from "./swarmUtils";
+import { extractSwarmSnapshotFromMessage, humanizeSwarmModel, latestSwarmSnapshot } from "./swarmUtils";
 
 afterEach(cleanup);
 
@@ -881,5 +881,16 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     expect(within(drawer).getByTestId("swarm-abort-confirm")).toBeTruthy();
     fireEvent.click(within(drawer).getByTestId("swarm-abort-confirm-btn"));
     expect(onStopSwarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("OCV5-879: humanizeSwarmModel renders all built-in Antigravity models and effort levels clearly", () => {
+    expect(humanizeSwarmModel("gemini-4-neon-xhigh")).toBe("Gemini 4 Neon · XHigh");
+    expect(humanizeSwarmModel("gemini-4-carbon-low")).toBe("Gemini 4 Carbon · Low");
+    expect(humanizeSwarmModel("gemini-4-hydrogen-medium")).toBe("Gemini 4 Hydrogen · Medium");
+    expect(humanizeSwarmModel("gemini-pro-orchestrator")).toBe("Orchestrator Carbon");
+    expect(humanizeSwarmModel("gemini-pro-orchestrator-neon")).toBe("Orchestrator Neon");
+    expect(humanizeSwarmModel("claude-opus-5-5-high")).toBe("Claude Opus 5.5 · High");
+    expect(humanizeSwarmModel("claude-sonnet-5-5-low")).toBe("Claude Sonnet 5.5 · Low");
+    expect(humanizeSwarmModel("gpt-oss-120b-medium")).toBe("GPT-OSS 120B");
   });
 });

@@ -179,8 +179,9 @@ def inspect_pdf_structure(pdf: Path, report: dict[str, Any]) -> int:
         count = len(reader.pages)
         if count < 1:
             add_issue(report, "failures", "pdf-empty", "PDF has no pages")
-        report["facts"]["pageCount"] = count
-        report["facts"]["metadata"] = {
+        facts = report.setdefault("facts", {})
+        facts["pageCount"] = count
+        facts["metadata"] = {
             str(key): str(value) for key, value in (reader.metadata or {}).items()
         }
         return count
@@ -641,6 +642,7 @@ def deliver_check(path: Path) -> dict[str, Any]:
         "passed": False,
         "verdict": "FAIL",
         "input": {"path": str(path), "bytes": 0, "sha256": "", "kind": "file"},
+        "facts": {},
         "failures": [],
         "warnings": [],
     }

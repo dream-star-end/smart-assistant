@@ -200,4 +200,79 @@ describe('ccb-baseline skills ↔ manifest', () => {
     assert.match(body, /service_role/)
     assert.match(body, /ROW LEVEL SECURITY/i)
   })
+
+  it('locks OCV5-878 research paper QA loop contracts across baseline and codex skills', () => {
+    const docWritingZh = readFileSync(join(skillsDir, 'document-writing', 'SKILL.md'), 'utf8')
+    const docWritingEn = readFileSync(
+      join(here, '..', '..', 'agent-sandbox', 'platform-runtime', 'codex-skills', 'document-writing', 'SKILL.md'),
+      'utf8',
+    )
+    for (const body of [docWritingZh, docWritingEn]) {
+      assert.match(body, /oc-docx convert .*--metrics metrics\.json/)
+      assert.match(body, /\{\{metric:/)
+      assert.match(body, /oc-docx check .*--expect-formulas/)
+      assert.match(body, /oc-docx extract .*--latex/)
+      assert.match(body, /--toc/)
+      assert.match(body, /--section/)
+      assert.match(body, /oc-docx diff --base/)
+      assert.match(body, /--out-highlighted/)
+      assert.match(body, /structure_conservation/)
+      assert.match(body, /oc-stylecheck/)
+      assert.match(body, /oc-docx scrub/)
+      assert.match(body, /oc-docx inspect/)
+      assert.match(body, /oc-artifact-qa deliver/)
+    }
+
+    const sciWriting = readFileSync(join(skillsDir, 'scientific-writing', 'SKILL.md'), 'utf8')
+    assert.match(sciWriting, /A 级/)
+    assert.match(sciWriting, /B 级/)
+    assert.match(sciWriting, /verbatim quote/)
+    assert.match(sciWriting, /metrics\.json/)
+    assert.match(sciWriting, /\{\{metric:/)
+    assert.match(sciWriting, /逻辑闭合/)
+    assert.match(sciWriting, /价值兑现/)
+    assert.match(sciWriting, /oc-stylecheck/)
+    assert.match(sciWriting, /\[需核查\]/)
+    assert.match(sciWriting, /oc-docx check/)
+
+    const ocCite = readFileSync(join(skillsDir, 'oc-cite', 'SKILL.md'), 'utf8')
+    assert.match(ocCite, /A 级/)
+    assert.match(ocCite, /B 级/)
+    assert.match(ocCite, /oc-ingest/)
+    assert.match(ocCite, /oc-litrag/)
+    assert.match(ocCite, /record\.title/)
+    assert.match(ocCite, /张冠李戴/)
+
+    const review = readFileSync(join(skillsDir, 'multi-model-review', 'SKILL.md'), 'utf8')
+    assert.match(review, /oc-docx extract .*--latex/)
+    assert.match(review, /oc-docx check/)
+    assert.match(review, /oc-cite verify/)
+    assert.match(review, /oc-stylecheck/)
+    assert.match(review, /P0/)
+    assert.match(review, /decision-ledger\.json/)
+    assert.match(
+      review,
+      /oc-review ledger init --file \/home\/agent\/\.openclaude\/generated\/review-<ts>\/decision-ledger\.json/,
+    )
+    assert.match(
+      review,
+      /oc-review ledger record --file \/home\/agent\/\.openclaude\/generated\/review-<ts>\/decision-ledger\.json/,
+    )
+    assert.match(
+      review,
+      /oc-review ledger show --file \/home\/agent\/\.openclaude\/generated\/review-<ts>\/decision-ledger\.json/,
+    )
+    assert.match(
+      review,
+      /oc-review collate[\s\S]*--ledger \/home\/agent\/\.openclaude\/generated\/review-<ts>\/decision-ledger\.json/,
+    )
+    assert.doesNotMatch(review, /(?:--file|--ledger)\s+decision-ledger\.json/)
+    assert.match(review, /PASS_READY/)
+
+    const style = readFileSync(join(skillsDir, 'research-writing-style', 'SKILL.md'), 'utf8')
+    assert.match(
+      style,
+      /oc-stylecheck .*--style-file \/home\/agent\/\.openclaude\/research\/style\/profile\.md/,
+    )
+  })
 })

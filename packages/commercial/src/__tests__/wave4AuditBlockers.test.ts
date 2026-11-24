@@ -239,6 +239,32 @@ function createFakeBrowserHandoffsPgPool() {
         return r ? { rows: [r], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
       if (s.startsWith('UPDATE pending_browser_handoffs')) {
+        if (s.includes("SET status = 'expired'")) {
+          if (s.includes('WHERE id = $1')) {
+            const [id, userId, nowIso] = params as [string, string, string]
+            const row = rows.get(id)
+            if (
+              !row ||
+              row.user_id !== userId ||
+              row.status !== 'pending' ||
+              new Date(row.expires_at).getTime() > new Date(nowIso).getTime()
+            ) {
+              return { rows: [], rowCount: 0 }
+            }
+            row.status = 'expired'
+            return { rows: [], rowCount: 1 }
+          }
+          const [nowIso] = params as [string]
+          const nowMs = new Date(nowIso).getTime()
+          let count = 0
+          for (const row of rows.values()) {
+            if (row.status === 'pending' && new Date(row.expires_at).getTime() <= nowMs) {
+              row.status = 'expired'
+              count += 1
+            }
+          }
+          return { rows: [], rowCount: count }
+        }
         const [desiredStatus, nowIso, note, id, userId] = params as [
           string,
           string,
@@ -1246,5 +1272,47 @@ describe('B8 + N2: Sleeping taskboard warnings & Office preview error sanitizati
     } finally {
       await srv.close()
     }
+  })
+
+  it('OCV5-881: PgBrowserHandoffStore marks expired pending rows as expired on resolve() and expireStale()', async () => {
+    const pool = createFakeBrowserHandoffsPgPool()
+    let clock = Date.parse('2026-11-24T00:00:00.000Z')
+    const store = new PgBrowserHandoffStore({ pool: pool as never, now: () => clock })
+
+    const recA = await store.create({
+      id: 'bh-expire-a',
+      userId: '42',
+      sessionId: 'wsess-1111111111111111',
+      title: 'Login A',
+      url: 'https://example.com/a',
+      reason: 'Need login',
+      ttlMs: 10_000,
+    })
+    const recB = await store.create({
+      id: 'bh-expire-b',
+      userId: '42',
+      sessionId: 'wsess-1111111111111111',
+      title: 'Login B',
+      url: 'https://example.com/b',
+      reason: 'Need 2FA',
+      ttlMs: 10_000,
+    })
+    assert.equal(recA.status, 'pending')
+    assert.equal(recB.status, 'pending')
+
+    // Advance past TTL: resolve() throws EXPIRED and persists status='expired'
+    clock += 20_000
+    await assert.rejects(
+      () => store.resolve({ id: 'bh-expire-a', userId: '42', decision: 'approve', nowMs: clock }),
+      (err: unknown) => err instanceof Error && 'code' in err && (err as { code: string }).code === 'EXPIRED',
+    )
+    const afterResolveA = await store.getById('bh-expire-a')
+    assert.equal(afterResolveA?.status, 'expired')
+
+    // expireStale() sweeps remaining expired pending rows without touching already-expired ones
+    const swept = await store.expireStale(clock)
+    assert.equal(swept, 1)
+    const afterSweepB = await store.getById('bh-expire-b')
+    assert.equal(afterSweepB?.status, 'expired')
   })
 })

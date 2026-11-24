@@ -1707,4 +1707,46 @@ describe('OCV5-841 Wave 2 T2 Blocker Counter-Examples (B2/B3/B4/B5/B6/B7/B8/B10/
       activeBackend.getEngineContextMessages = origGetEngineContextMessages
     }
   })
+
+  it('OCV5-886: skips pre-turn auto-compact on Box-native / pre-expiry deferred CCB sessions to preserve warm cache', async () => {
+    const host = makeFakeLifecycleHost()
+    const baseNow = 1_730_000_000_000
+    const boxSession = makeFakeSession({
+      providerTag: 'ccb',
+      model: 'box-claude-sonnet-5',
+    })
+    recordSessionContextWatermark(boxSession.sessionKey, {
+      engine: 'ccb',
+      usedTokens: 167_000,
+      windowTokens: 200_000,
+      nowMs: baseNow,
+    })
+    markSelfClientTurnForAutoCompact(boxSession)
+    const r1 = await maybeAutoCompactBeforeTurn(host, boxSession, 'ordinary next', () => {}, {
+      nowMs: baseNow,
+      executionDescriptor: { contextOwner: 'box-native-v1' },
+    })
+    assert.deepEqual(r1, { compacted: false, reason: 'box_native_owned' })
+
+    const timer = setTimeout(() => {}, 60_000)
+    timer.unref?.()
+    try {
+      const armedSession = makeFakeSession({
+        providerTag: 'ccb',
+        _idlePreExpiryTimer: timer,
+      })
+      recordSessionContextWatermark(armedSession.sessionKey, {
+        engine: 'ccb',
+        usedTokens: 170_000,
+        windowTokens: 200_000,
+        nowMs: baseNow,
+      })
+      const r2 = await maybeAutoCompactBeforeTurn(host, armedSession, 'ordinary next', () => {}, {
+        nowMs: baseNow,
+      })
+      assert.deepEqual(r2, { compacted: false, reason: 'box_native_owned' })
+    } finally {
+      clearTimeout(timer)
+    }
+  })
 })

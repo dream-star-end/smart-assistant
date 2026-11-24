@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { _internals as codexInternals } from '../codexLaunchOverrides.js'
 import { _internals as cursorInternals } from '../engine/cursorAdapter.js'
 import { type PlatformPromptKey, _internals, getPlatformPrompt } from '../platformPrompts.js'
-import { _platformPromptFallbacks } from '../promptSlots.js'
+import { _platformPromptFallbacks, buildToolsSlot, selectPromptBlocks } from '../promptSlots.js'
 
 const KEYS: PlatformPromptKey[] = [
   'platform-capabilities',
@@ -407,6 +407,58 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.ok(!prompt.includes('提问一律走 `ask_user`'))
     assert.ok(prompt.includes('present_task_approval'))
     assert.ok(prompt.includes('不要让用户去打开任务面板'))
+  })
+  it('Antigravity / other 引擎走 fenced options 选择卡,禁止原生 ask_question 且不含其它引擎提问工具(OCV5-882)', () => {
+    assert.equal(
+      readFileSync(join(dir, 'platform-capabilities.md'), 'utf8'),
+      _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK,
+    )
+    const otherPrompt = selectPromptBlocks(
+      _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK,
+      'other',
+      'webchat',
+    )
+    assert.ok(otherPrompt.includes('Antigravity / Grok / ZCode'))
+    assert.ok(otherPrompt.includes('禁止调用原生 `ask_question`'))
+    assert.ok(otherPrompt.includes('fenced `options` 代码块'))
+    assert.ok(otherPrompt.includes('一条回复最多 4 个 options 块'))
+    assert.ok(!otherPrompt.includes('AskUserQuestion'))
+    assert.ok(!otherPrompt.includes('request_user_input'))
+    assert.ok(!otherPrompt.includes('present_options'))
+    assert.ok(!otherPrompt.includes('<!-- oc-engine:'))
+
+    const ccbPrompt = selectPromptBlocks(
+      _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK,
+      'ccb',
+      'webchat',
+    )
+    assert.ok(!ccbPrompt.includes('Antigravity / Grok / ZCode'))
+    assert.ok(!ccbPrompt.includes('ask_question'))
+  })
+  it('Antigravity TOOLS slot 使用原生工具名,其余非 CCB 引擎保持原样(OCV5-882)', () => {
+    const agyTools = buildToolsSlot({ provider: 'antigravity' }).content
+    assert.ok(agyTools.includes('`search_web`'))
+    assert.ok(agyTools.includes('`oc-web extract <url>`'))
+    assert.ok(agyTools.includes('`read_file`/`edit_file`'))
+    assert.ok(agyTools.includes('`oc_glob`'))
+    assert.ok(!agyTools.includes('WebSearch'))
+    assert.ok(!agyTools.includes('WebFetch'))
+    assert.ok(!agyTools.includes('Read/Edit'))
+    assert.ok(!agyTools.includes('Glob'))
+
+    const codexTools = buildToolsSlot({ provider: 'codex' }).content
+    assert.ok(codexTools.includes('WebSearch'))
+    assert.ok(codexTools.includes('WebFetch'))
+    assert.ok(codexTools.includes('Read/Edit'))
+  })
+  it('委派契约示例使用现役 gpt-6.2 且视频回退 oc-h3 仅在已开通 MiniMax 媒体服务时尝试(OCV5-882)', () => {
+    const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
+    assert.ok(prompt.includes('(`gpt-6.2` 不是 `gpt-6.2-astra`,缺省用绑定型号)'))
+    assert.ok(
+      prompt.includes(
+        '仅在当前实例已开通 MiniMax 媒体服务时再按 `skill_view("minimax-media")` 尝试 `oc-h3`（若返回 503/未配置则直接如实告知）',
+      ),
+    )
   })
   it('htmlpreview 无缝嵌入的写法(主题变量、套件类、CDN、文件桥)覆盖按需指南、基线与平台 skill', () => {
     const sources = {

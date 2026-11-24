@@ -132,6 +132,8 @@ export interface AgentSession {
   _turnReadOnly?: boolean
   /** Set and cleared only while owning session.lock. */
   _turnServiceTier?: ServiceTier | null
+  /** Set and cleared only while owning session.lock (OCV5-882). */
+  _antigravitySwarmCompaction?: import('./engine/antigravitySwarmDirective.js').AntigravitySwarmCompactionContext
   /** Active turn's fail-safe tape finalizer. The outer liveness watchdog uses
    * this instead of emitting an unpersisted error and abandoning the parser. */
   _persistActiveTurn?: (

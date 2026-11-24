@@ -32,6 +32,17 @@ const HAS_PILLOW = (() => {
   }
 })()
 
+const HAS_PYPDF = (() => {
+  try {
+    execFileSync(process.env.PYTHON ?? '/usr/bin/python3', ['-c', 'from pypdf import PdfReader'], {
+      stdio: 'ignore',
+    })
+    return true
+  } catch {
+    return false
+  }
+})()
+
 function run(args: string[], env: NodeJS.ProcessEnv): Promise<RunResult> {
   return new Promise((done, reject) => {
     const child = spawn(process.env.PYTHON ?? '/usr/bin/python3', [CLI, ...args], {
@@ -380,6 +391,56 @@ describe('oc-artifact-qa', () => {
       const result = await run(['deliver', '--input', input], {})
       assert.equal(result.code, 0, result.stderr || result.stdout)
       assert.match(result.stdout.trim().split('\n').pop() ?? '', /^PASS$/)
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
+  test('deliver: minimum legal PDF PASS with facts.pageCount >= 1 and no facts KeyError (OCV5-878)', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'oc-artifact-qa-deliver-pdf-'))
+    try {
+      const input = join(work, 'ok.pdf')
+      execFileSync(process.env.PYTHON ?? '/usr/bin/python3', [
+        '-c',
+        [
+          'import sys',
+          'pad = b"%" + (b"0123456789" * 220) + b"\\n"',
+          'header = b"%PDF-1.4\\n" + pad',
+          'objs = [',
+          '    b"1 0 obj\\n<< /Type /Catalog /Pages 2 0 R >>\\nendobj\\n",',
+          '    b"2 0 obj\\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\\nendobj\\n",',
+          '    b"3 0 obj\\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\\nendobj\\n",',
+          '    b"4 0 obj\\n<< /Length 0 >>\\nstream\\n\\nendstream\\nendobj\\n",',
+          ']',
+          'buf = bytearray(header)',
+          'offsets = [0]',
+          'for obj in objs:',
+          '    offsets.append(len(buf))',
+          '    buf.extend(obj)',
+          'xref_pos = len(buf)',
+          'buf.extend(f"xref\\n0 {len(offsets)}\\n".encode("ascii"))',
+          'buf.extend(b"0000000000 65535 f \\n")',
+          'for off in offsets[1:]:',
+          '    buf.extend(f"{off:010d} 00000 n \\n".encode("ascii"))',
+          'buf.extend(f"trailer\\n<< /Size {len(offsets)} /Root 1 0 R >>\\nstartxref\\n{xref_pos}\\n%%EOF\\n".encode("ascii"))',
+          'open(sys.argv[1], "wb").write(buf)',
+        ].join('\n'),
+        input,
+      ])
+      assert.ok(readFileSync(input).byteLength >= 2048)
+      const env: NodeJS.ProcessEnv = HAS_PYPDF ? {} : { PYTHONPATH: fakePdfEnvironment(work).site }
+      const result = await run(['deliver', '--input', input], env)
+      assert.equal(result.code, 0, result.stderr || result.stdout)
+      const lines = result.stdout.trim().split('\n')
+      assert.equal(lines[lines.length - 1], 'PASS')
+      const report = JSON.parse(lines.slice(0, -1).join('\n'))
+      assert.equal(report.passed, true)
+      assert.ok(report.facts && report.facts.pageCount >= 1, `expected facts.pageCount >= 1: ${JSON.stringify(report)}`)
+      assert.equal(report.failures.length, 0)
+      assert.equal(JSON.stringify(report.failures).includes("cannot parse PDF: 'facts'"), false)
+      const sidecar = JSON.parse(readFileSync(join(work, 'ok.deliver.json'), 'utf8'))
+      assert.equal(sidecar.passed, true)
+      assert.ok(sidecar.facts.pageCount >= 1)
     } finally {
       rmSync(work, { recursive: true, force: true })
     }

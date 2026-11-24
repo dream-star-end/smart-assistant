@@ -91,12 +91,13 @@ export function createAntigravityBridgeHooks(deps: {
     requestId: string
     modelId: string
     budgetCredits: bigint
+    allowedModelIds?: readonly string[]
   }) => ReturnType<typeof admitAntigravityTurn>
   expireAntigravityRoute: (token: string) => Promise<void>
   expireAntigravityRouteForRequest: (requestId: string) => Promise<void>
 } {
   return {
-    admitAntigravityTurn: ({ containerId, userId, requestId, modelId, budgetCredits }) =>
+    admitAntigravityTurn: ({ containerId, userId, requestId, modelId, budgetCredits, allowedModelIds }) =>
       admitAntigravityTurn(
         {
           containerId,
@@ -105,6 +106,7 @@ export function createAntigravityBridgeHooks(deps: {
           modelId,
           budgetCredits,
           relayPort: deps.relayPort,
+          ...(allowedModelIds && allowedModelIds.length > 0 ? { allowedModelIds } : {}),
         },
         { clientSecret: deps.clientSecret },
       ),

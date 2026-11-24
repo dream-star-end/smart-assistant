@@ -282,3 +282,70 @@ test('real spawn, enforce: CCB gets the session snapshot path; shadow gets none'
   const src = readFileSync(new URL('../subprocessRunner.ts', import.meta.url), 'utf8')
   assert.equal(src.split('OPENCLAUDE_CONTEXT_FREEZE_FILE: this._ccbContextFreezeFile,').length - 1, 1)
 })
+
+test('slotHashes persisted and legacy cache without slotHashes falls back to legacy_untracked on fresh_inputs', async () => {
+  const { _peekPendingContextEvalEventsForTests, _resetContextEvalBufferForTests } = await import(
+    '../v3ToolFailureReporter.js'
+  )
+  _resetContextEvalBufferForTests()
+  const sessionKey = key()
+  const first = build('p1', { SOUL: 's1', TOOLS: 't1' })
+  freeze.applyPromptFreeze({ home: HOME, sessionKey, mode: 'enforce', inputsKey: 'k1', fresh: first })
+  const stored = freeze.readFrozenPrompt(HOME, sessionKey)
+  assert.ok(stored?.record.slotHashes, 'new records must persist slotHashes')
+  assert.equal(stored!.record.slotHashes!.SOUL, first.applied[0]!.sha256)
+
+  // Added/removed/modified slot diff via slotHashes
+  const next = build('p2', { SOUL: 's1', TOOLS: 't2', RESEARCH: 'r1' })
+  const diffed = freeze.applyPromptFreeze({ home: HOME, sessionKey, mode: 'enforce', inputsKey: 'k2', fresh: next })
+  assert.equal(diffed.decision, 'fresh_inputs')
+  assert.deepEqual(diffed.changedSlots, ['RESEARCH', 'TOOLS'])
+
+  // Simulate legacy on-disk record lacking `slotHashes` and with unchanged/empty applied
+  const legacyKey = key()
+  const legacyBuild = build('legacy-prompt', {})
+  freeze.writeFrozenPrompt(HOME, {
+    v: 1,
+    sessionKey: legacyKey,
+    inputsKey: 'old-key',
+    builtAt: Date.now(),
+    mode: 'enforce',
+    ...legacyBuild,
+  })
+  const legacyRead = freeze.readFrozenPrompt(HOME, legacyKey)
+  assert.equal(legacyRead?.record.slotHashes, undefined)
+  const legacyDecision = freeze.applyPromptFreeze({
+    home: HOME,
+    sessionKey: legacyKey,
+    mode: 'enforce',
+    inputsKey: 'new-key',
+    fresh: build('legacy-prompt-2', {}),
+  })
+  assert.equal(legacyDecision.decision, 'fresh_inputs')
+  assert.deepEqual(legacyDecision.changedSlots, ['legacy_untracked'])
+
+  // Canonical decision enum alignment (Blocker #6)
+  assert.equal(freeze.promptFreezeEvalDecision({ decision: 'reuse', reused: true }), 'prompt_freeze_reuse')
+  assert.equal(freeze.promptFreezeEvalDecision({ decision: 'fresh_first', reused: false }), 'prompt_freeze_fresh_first')
+  assert.equal(freeze.promptFreezeEvalDecision({ decision: 'fresh_inputs', reused: false }), 'prompt_freeze_fresh_inputs')
+  assert.equal(freeze.promptFreezeEvalDecision({ decision: 'fresh_ttl', reused: false }), 'prompt_freeze_expired')
+
+  // Real SubprocessRunner records canonical prompt_context_decision values into context eval buffer
+  process.env.OC_PROMPT_FREEZE = 'enforce'
+  try {
+    const sk = key()
+    writeMemoryIndex('- [z](memory/z.md) — obs')
+    await spawnPrompt(runner(sk))
+    await spawnPrompt(runner(sk))
+    const events = _peekPendingContextEvalEventsForTests().filter((e) => e.sessionKey === sk)
+    assert.equal(events.length, 2)
+    assert.equal(events[0]!.eventKind, 'prompt_context_decision')
+    assert.equal(events[0]!.decision, 'prompt_freeze_fresh_first')
+    assert.equal(events[0]!.reason, 'fresh_first')
+    assert.equal(events[1]!.decision, 'prompt_freeze_reuse')
+    assert.equal(events[1]!.reason, 'reuse')
+  } finally {
+    delete process.env.OC_PROMPT_FREEZE
+    _resetContextEvalBufferForTests()
+  }
+})

@@ -27,7 +27,7 @@ import { basename, join, resolve } from 'node:path'
 import { shouldServeInline, uploadQuotaExceeded, uploadQuotaMessage } from '@openclaude/protocol'
 import { resolveOpenedPath } from './openedPath.js'
 import { localSessionDir, remoteReservationRemainder, remoteSessionDir, sumUploadReservationBytes } from './uploadChunkStore.js'
-import { paths, readConfig, searchSessions, writeConfig } from '@openclaude/storage'
+import { paths, readConfig, searchSessions, updateConfig } from '@openclaude/storage'
 import {
   ADVISOR_CONSULT_PARENT_REASON,
   advisorConsultParentGate,
@@ -1578,22 +1578,29 @@ export async function handleOAuthCallback(
       token_type?: string
     }
 
-    // Save to config (keyed by provider)
-    const config = await readConfig()
-    if (config) {
-      const oauthData = {
-        accessToken: tokens.access_token,
-        refreshToken: tokens.refresh_token ?? '',
-        expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-        scope: tokens.scope ?? prov.scopes,
-      }
-      if (providerKey === 'claude') {
-        config.auth.claudeOAuth = oauthData
-        config.auth.mode = 'subscription'
-      }
-      await writeConfig(config)
-      this.deps.config = config
-      this.sessions.updateConfig(config)
+    // Save to config (keyed by provider) under the shared openclaude.json lock transaction
+    const oauthData = {
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token ?? '',
+      expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+      scope: tokens.scope ?? prov.scopes,
+    }
+    let updatedConfig: typeof this.deps.config | null = null
+    try {
+      const res = await updateConfig((config) => {
+        if (providerKey === 'claude') {
+          config.auth.claudeOAuth = oauthData
+          config.auth.mode = 'subscription'
+        }
+      })
+      updatedConfig = res.config
+    } catch (err: any) {
+      if (err?.code !== 'ENOENT') throw err
+    }
+    if (updatedConfig) {
+      if (updatedConfig.provider === undefined) delete this.deps.config.provider
+      Object.assign(this.deps.config, updatedConfig)
+      this.sessions.updateConfig(this.deps.config)
       this.log.info('oauth tokens saved', { provider: providerKey })
     }
 

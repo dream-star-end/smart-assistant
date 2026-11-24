@@ -177,16 +177,37 @@ describe("协议文案", () => {
     assert.match(CORE_UI_PROTOCOL, /合法 JSON 对象\([^)\n]*引号用「」或“”,不要用英文双引号\)/);
   });
 
-  test("常驻只有加载入口，完整协议按需提供且索引不内联schema", () => {
+  test("智能 UI 常驻为轻量触发目录（不内联字段 schema，完整协议按需加载）", () => {
     assert.match(INTELLIGENT_UI_PROMPT, /oc-system skill ui/);
-    assert.match(INPUT_PREDICTION_PROMPT, /oc-system skill input-prediction/);
-    for (const index of [INTELLIGENT_UI_PROMPT, INPUT_PREDICTION_PROMPT]) {
-      assert.doesNotMatch(index, /"type"\s*:|```ui|\"columns\"|\"formula\"/);
-    }
+    assert.doesNotMatch(INTELLIGENT_UI_PROMPT, /"type"\s*:|```ui|"columns"|"formula"/);
+    assert.ok(Buffer.byteLength(INTELLIGENT_UI_PROMPT) < 1_000, `INTELLIGENT_UI_PROMPT too large: ${Buffer.byteLength(INTELLIGENT_UI_PROMPT)}`);
     assert.ok(Buffer.byteLength(INTELLIGENT_UI_PROMPT) < Buffer.byteLength(CORE_UI_PROTOCOL));
+    const catalogTypes = [...INTELLIGENT_UI_PROMPT.matchAll(/`([a-z_]+(?:\/[a-z_]+)+)`/g)]
+      .flatMap((m) => m[1]!.split("/"));
+    assert.ok(catalogTypes.length >= 15, `expected core component catalog, got: ${catalogTypes.join(",")}`);
+    for (const required of ["table", "chart", "compare", "steps", "calculator", "deliverables", "citations", "runbook"]) {
+      assert.ok(catalogTypes.includes(required), `missing core trigger type ${required}`);
+    }
+    const cliOnly = new Set(pluginUiTypes());
+    for (const t of catalogTypes) {
+      assert.ok(!cliOnly.has(t), `INTELLIGENT_UI_PROMPT must not list plugin type ${t}`);
+      assert.match(CORE_UI_PROTOCOL, new RegExp(`"type":"${t}"`), `catalog type ${t} missing in ui.md`);
+    }
   });
 
-  test("输入预测:示例块是合法 JSON、类型 next、要求放在最后;完整正文按需加载", () => {
+  test("输入预测常驻极简内联格式（免首轮 Bash）且保留按需完整正文", () => {
+    assert.match(INPUT_PREDICTION_PROMPT, /oc-system skill input-prediction/);
+    assert.doesNotMatch(INPUT_PREDICTION_PROMPT, /"columns"|"formula"/);
+    assert.ok(Buffer.byteLength(INPUT_PREDICTION_PROMPT) < Buffer.byteLength(PREDICTION_PROTOCOL));
+    const inline = /```ui\n(\{[^\n]*\})\n```/.exec(INPUT_PREDICTION_PROMPT);
+    assert.ok(inline, "INPUT_PREDICTION_PROMPT should inline a single-line next block example");
+    const parsed = JSON.parse(inline[1]!) as { type?: unknown; text?: unknown };
+    assert.equal(parsed.type, "next");
+    assert.ok(typeof parsed.text === "string" && parsed.text.trim().length > 0);
+    assert.match(INPUT_PREDICTION_PROMPT, /最后一个块/);
+    assert.match(INPUT_PREDICTION_PROMPT, /≤30字/);
+    assert.match(INPUT_PREDICTION_PROMPT, /猜不出/);
+
     const m = /```ui\n(\{[^\n]*\})\n```/.exec(PREDICTION_PROTOCOL);
     assert.ok(m);
     assert.equal((JSON.parse(m[1]!) as { type: string }).type, "next");

@@ -139,6 +139,41 @@ export type ToolFailureReportPayload =
   | ToolFailureReportPayloadV4
   | ToolFailureReportPayloadV5
 
+export type ContextEvalEventKind = 'context_compacted' | 'prompt_context_decision'
+
+export interface ContextEvalWireEvent {
+  eventId: string
+  eventKind: ContextEvalEventKind
+  sessionKey?: string
+  agentId?: string
+  traceId?: string
+  turnIndex?: number
+  engine?: string
+  model?: string
+  compactionScope?: string
+  compactionStrategy?: string
+  beforeBytes?: number
+  afterBytes?: number
+  beforeTokens?: number
+  afterTokens?: number
+  droppedEntries?: number
+  decision?: string
+  reason?: string
+  changedSlots?: string[]
+  staticPrefixSha256?: string
+  totalBytes?: number
+  tokensEstimate?: number
+  degradedSteps?: string[]
+  observedAt: number
+}
+
+export type ContextEvalEventInput = Omit<ContextEvalWireEvent, 'eventId' | 'observedAt'> & {
+  eventId?: string
+  observedAt?: number
+  sessionKey: string
+  agentId: string
+}
+
 export interface TurnObservationPayload {
   schemaVersion: 1
   eventId: string
@@ -151,6 +186,243 @@ export interface TurnObservationPayload {
   runtimeSourceCommit?: string
   runtimeBootHash?: string
   timestamp: number
+  /** When true, carries only `contextEvents` (orphan/overflow); master must not write turn_runtime_observations/turn_traces. */
+  contextOnly?: boolean
+  contextEvents?: ContextEvalWireEvent[]
+}
+
+const MAX_PENDING_CONTEXT_EVAL_EVENTS = 64
+const MAX_CONTEXT_EVENTS_PER_TURN = 16
+/** Hard UTF-8 serialized byte budget for a single `contextEvents` array (16 KiB) to stay safely under 32/64 KiB body caps. */
+export const MAX_CONTEXT_EVENTS_BATCH_BYTES = 16_384
+const MAX_CONTEXT_SLOTS = 32
+const MAX_CONTEXT_STEPS = 32
+const CONTEXT_EVAL_ORPHAN_AGE_MS = 15_000
+/** Traced events wait 120s before orphan flush so long-running turns can merge them onto `turn.completed`. */
+export const CONTEXT_EVAL_TRACED_ORPHAN_AGE_MS = 120_000
+
+const pendingContextEvalEvents: ContextEvalWireEvent[] = []
+
+function optionalBoundedString(value: unknown, max: number): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  return trimmed.length <= max ? trimmed : trimmed.slice(0, max)
+}
+
+function optionalNonNegInt(value: unknown, max = 1_000_000_000): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  const n = Math.trunc(value)
+  if (n < 0) return 0
+  return Math.min(n, max)
+}
+
+function optionalStringList(value: unknown, maxItems: number, maxLen: number): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const out: string[] = []
+  for (const item of value) {
+    if (out.length >= maxItems) break
+    const s = optionalBoundedString(item, maxLen)
+    if (s) out.push(s)
+  }
+  return out
+}
+
+/**
+ * Buffer a privacy-safe context compaction or prompt context decision event.
+ * Bounded to 64 in-memory entries (FIFO drop-oldest) and drained onto the
+ * matching turn's `TurnObservationPayload.contextEvents` (or flushed as a
+ * standalone turn observation for out-of-turn compactions).
+ */
+export function enqueueContextEvalEvent(input: ContextEvalEventInput): ContextEvalWireEvent {
+  const eventId =
+    optionalBoundedString(input.eventId, 128) ?? `ctx-${randomBytes(12).toString('hex')}`
+  const sessionKey = safeString(input.sessionKey, 'unknown', 512)
+  const agentId = safeString(input.agentId, 'unknown', 128)
+  const traceId =
+    typeof input.traceId === 'string' && /^[0-9a-f]{32}$/.test(input.traceId)
+      ? input.traceId
+      : undefined
+  const staticPrefixSha256 =
+    typeof input.staticPrefixSha256 === 'string' && /^[0-9a-f]{12,64}$/.test(input.staticPrefixSha256)
+      ? input.staticPrefixSha256
+      : undefined
+  const engineName = optionalBoundedString(input.engine, 64)
+  const modelName = optionalBoundedString(input.model, 128)
+  const compactionScope = optionalBoundedString(input.compactionScope, 64)
+  const compactionStrategy = optionalBoundedString(input.compactionStrategy, 64)
+  const decision = optionalBoundedString(input.decision, 64)
+  const reason = optionalBoundedString(input.reason, 64)
+  const turnIndex = optionalNonNegInt(input.turnIndex, 1_000_000)
+  const beforeBytes = optionalNonNegInt(input.beforeBytes)
+  const afterBytes = optionalNonNegInt(input.afterBytes)
+  const beforeTokens = optionalNonNegInt(input.beforeTokens)
+  const afterTokens = optionalNonNegInt(input.afterTokens)
+  const droppedEntries = optionalNonNegInt(input.droppedEntries, 1_000_000)
+  const totalBytes = optionalNonNegInt(input.totalBytes)
+  const tokensEstimate = optionalNonNegInt(input.tokensEstimate)
+  const changedSlots = optionalStringList(input.changedSlots, MAX_CONTEXT_SLOTS, 64)
+  const degradedSteps = optionalStringList(input.degradedSteps, MAX_CONTEXT_STEPS, 64)
+  const observedAt =
+    typeof input.observedAt === 'number' && Number.isSafeInteger(input.observedAt) && input.observedAt > 0
+      ? input.observedAt
+      : Date.now()
+
+  const wire: ContextEvalWireEvent = {
+    eventId,
+    eventKind: input.eventKind,
+    sessionKey,
+    agentId,
+    ...(traceId ? { traceId } : {}),
+    ...(turnIndex !== undefined ? { turnIndex } : {}),
+    ...(engineName ? { engine: engineName } : {}),
+    ...(modelName ? { model: modelName } : {}),
+    ...(compactionScope ? { compactionScope } : {}),
+    ...(compactionStrategy ? { compactionStrategy } : {}),
+    ...(beforeBytes !== undefined ? { beforeBytes } : {}),
+    ...(afterBytes !== undefined ? { afterBytes } : {}),
+    ...(beforeTokens !== undefined ? { beforeTokens } : {}),
+    ...(afterTokens !== undefined ? { afterTokens } : {}),
+    ...(droppedEntries !== undefined ? { droppedEntries } : {}),
+    ...(decision ? { decision } : {}),
+    ...(reason ? { reason } : {}),
+    ...(changedSlots !== undefined ? { changedSlots } : {}),
+    ...(staticPrefixSha256 ? { staticPrefixSha256 } : {}),
+    ...(totalBytes !== undefined ? { totalBytes } : {}),
+    ...(tokensEstimate !== undefined ? { tokensEstimate } : {}),
+    ...(degradedSteps !== undefined ? { degradedSteps } : {}),
+    observedAt,
+  }
+  if (Buffer.byteLength(JSON.stringify(wire), 'utf8') > 8_192) {
+    if (wire.changedSlots && wire.changedSlots.length > 8) wire.changedSlots = wire.changedSlots.slice(0, 8)
+    if (wire.degradedSteps && wire.degradedSteps.length > 8) wire.degradedSteps = wire.degradedSteps.slice(0, 8)
+  }
+  while (pendingContextEvalEvents.length >= MAX_PENDING_CONTEXT_EVAL_EVENTS) {
+    pendingContextEvalEvents.shift()
+  }
+  pendingContextEvalEvents.push(wire)
+  return wire
+}
+
+/** Split context eval events into bounded chunks respecting both item cap (<=16) and UTF-8 byte cap (<=16 KiB). */
+export function chunkContextEvalEvents(
+  events: readonly ContextEvalWireEvent[],
+  maxItems = MAX_CONTEXT_EVENTS_PER_TURN,
+  maxBytes = MAX_CONTEXT_EVENTS_BATCH_BYTES,
+): ContextEvalWireEvent[][] {
+  if (events.length === 0) return []
+  const itemLimit = Math.max(1, Math.min(MAX_CONTEXT_EVENTS_PER_TURN, Math.trunc(maxItems)))
+  const byteLimit = Math.max(256, Math.trunc(maxBytes))
+  const chunks: ContextEvalWireEvent[][] = []
+  let current: ContextEvalWireEvent[] = []
+  let currentBytes = 2 // "[]"
+  for (const ev of events) {
+    const evBytes = Buffer.byteLength(JSON.stringify(ev), 'utf8')
+    const sepBytes = current.length > 0 ? 1 : 0
+    if (
+      current.length > 0 &&
+      (current.length >= itemLimit || currentBytes + sepBytes + evBytes > byteLimit)
+    ) {
+      chunks.push(current)
+      current = []
+      currentBytes = 2
+    }
+    current.push(ev)
+    currentBytes += (current.length > 1 ? 1 : 0) + evBytes
+  }
+  if (current.length > 0) chunks.push(current)
+  return chunks
+}
+
+function buildContextOnlyPayload(
+  chunk: ContextEvalWireEvent[],
+  defaults?: { sessionKey?: string; agentId?: string; traceId?: string; model?: string; timestamp?: number },
+): TurnObservationPayload {
+  const runtime = runtimeIdentity()
+  const head = chunk[0]!
+  const traceId = head.traceId ?? defaults?.traceId
+  const model = head.model ?? defaults?.model
+  return {
+    schemaVersion: 1,
+    eventId: `ctx-batch-${randomBytes(12).toString('hex')}`,
+    sessionKey: head.sessionKey ?? defaults?.sessionKey ?? 'unknown',
+    agentId: head.agentId ?? defaults?.agentId ?? 'unknown',
+    ...(traceId ? { traceId } : {}),
+    ...(model ? { model } : {}),
+    durationMs: 0,
+    toolCalls: 0,
+    ...(runtime.sourceCommit ? { runtimeSourceCommit: runtime.sourceCommit } : {}),
+    ...(runtime.bootHash ? { runtimeBootHash: runtime.bootHash } : {}),
+    timestamp: head.observedAt ?? defaults?.timestamp ?? Date.now(),
+    contextOnly: true,
+    contextEvents: chunk,
+  }
+}
+
+/** Drain up to `maxCount` buffered events matching `(traceId | sessionKey)`. */
+export function drainPendingContextEvalEvents(
+  match: { sessionKey: string; traceId?: string },
+  maxCount = MAX_PENDING_CONTEXT_EVAL_EVENTS,
+): ContextEvalWireEvent[] {
+  const limit = Math.max(1, Math.min(MAX_PENDING_CONTEXT_EVAL_EVENTS, Math.trunc(maxCount)))
+  const matched: ContextEvalWireEvent[] = []
+  let writeIdx = 0
+  for (let i = 0; i < pendingContextEvalEvents.length; i += 1) {
+    const ev = pendingContextEvalEvents[i]!
+    const matchesTrace = Boolean(match.traceId && ev.traceId === match.traceId)
+    const matchesSession =
+      ev.sessionKey === match.sessionKey &&
+      (!match.traceId || !ev.traceId || ev.traceId === match.traceId)
+    if (matched.length < limit && (matchesTrace || matchesSession)) {
+      matched.push(ev)
+    } else {
+      pendingContextEvalEvents[writeIdx++] = ev
+    }
+  }
+  pendingContextEvalEvents.length = writeIdx
+  return matched
+}
+
+function drainOrphanContextEvalPayloads(
+  nowMs: number,
+  minAgeMs: number,
+  tracedMinAgeMs = CONTEXT_EVAL_TRACED_ORPHAN_AGE_MS,
+): TurnObservationPayload[] {
+  if (pendingContextEvalEvents.length === 0) return []
+  const eligible: ContextEvalWireEvent[] = []
+  let writeIdx = 0
+  for (const ev of pendingContextEvalEvents) {
+    const threshold = ev.traceId ? tracedMinAgeMs : minAgeMs
+    if (nowMs - ev.observedAt >= threshold) {
+      eligible.push(ev)
+    } else {
+      pendingContextEvalEvents[writeIdx++] = ev
+    }
+  }
+  pendingContextEvalEvents.length = writeIdx
+  if (eligible.length === 0) return []
+  const grouped = new Map<string, ContextEvalWireEvent[]>()
+  for (const ev of eligible) {
+    const key = JSON.stringify([ev.sessionKey ?? 'unknown', ev.agentId ?? 'unknown', ev.traceId ?? ''])
+    const list = grouped.get(key)
+    if (list) list.push(ev)
+    else grouped.set(key, [ev])
+  }
+  const payloads: TurnObservationPayload[] = []
+  for (const events of grouped.values()) {
+    for (const chunk of chunkContextEvalEvents(events)) {
+      payloads.push(buildContextOnlyPayload(chunk))
+    }
+  }
+  return payloads
+}
+
+export function _resetContextEvalBufferForTests(): void {
+  pendingContextEvalEvents.length = 0
+}
+
+export function _peekPendingContextEvalEventsForTests(): readonly ContextEvalWireEvent[] {
+  return [...pendingContextEvalEvents]
 }
 
 export interface ToolCallRollupCount {
@@ -489,8 +761,17 @@ export async function sendTurnObservation(
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? ATTEMPT_TIMEOUT_MS)
   const fetchImpl = opts.fetchImpl ?? fetch
   try {
-    const res = await postReport(TURN_OBSERVATION_PATH, payload, cfg, fetchImpl, controller.signal)
+    let res = await postReport(TURN_OBSERVATION_PATH, payload, cfg, fetchImpl, controller.signal)
     if (res.ok) return
+    // Rolling-upgrade 4-quadrant compatibility: old commercial masters reject unknown
+    // `contextEvents` / `contextOnly` with HTTP 400.
+    // - For `contextOnly: true` carriers, NEVER resend a fake durationMs=0 turn; drop as non-retryable 400.
+    // - For real completed turns, strip `contextEvents` and retry the base turn observation once.
+    if (res.status === 400 && payload.contextOnly !== true && payload.contextEvents && payload.contextEvents.length > 0) {
+      const { contextEvents: _stripped, contextOnly: _co, ...legacyPayload } = payload
+      res = await postReport(TURN_OBSERVATION_PATH, legacyPayload, cfg, fetchImpl, controller.signal)
+      if (res.ok) return
+    }
     throw new ToolFailureReportError(
       `turn observation returned HTTP ${res.status}`,
       retryableStatus(res.status, true),
@@ -526,8 +807,15 @@ function runtimeIdentity(): { sourceCommit?: string; bootHash?: string } {
   return runtimeIdentityCache
 }
 
-export function buildTurnObservationPayload(ev: TurnCompletedEvent): TurnObservationPayload {
+export function buildTurnObservationPayload(
+  ev: TurnCompletedEvent,
+  contextEvents?: readonly ContextEvalWireEvent[],
+): TurnObservationPayload {
   const runtime = runtimeIdentity()
+  const boundedContextEvents =
+    contextEvents && contextEvents.length > 0
+      ? chunkContextEvalEvents(contextEvents)[0]
+      : undefined
   return {
     schemaVersion: 1,
     eventId: safeString(ev.id, createHash('sha256').update(JSON.stringify(ev)).digest('hex'), 128),
@@ -540,6 +828,7 @@ export function buildTurnObservationPayload(ev: TurnCompletedEvent): TurnObserva
     ...(runtime.sourceCommit ? { runtimeSourceCommit: runtime.sourceCommit } : {}),
     ...(runtime.bootHash ? { runtimeBootHash: runtime.bootHash } : {}),
     timestamp: Number.isFinite(ev.timestamp) ? Math.max(0, Math.trunc(ev.timestamp)) : Date.now(),
+    ...(boundedContextEvents ? { contextEvents: boundedContextEvents } : {}),
   }
 }
 
@@ -847,7 +1136,26 @@ export function makeToolFailureReporter(deps: {
   }
 
   function onTurnCompleted(ev: TurnCompletedEvent): void {
-    enqueueTurn(buildTurnObservationPayload(ev))
+    const sessionKey = safeString(ev.sessionKey, 'unknown', 512)
+    const traceId = ev.traceId && /^[0-9a-f]{32}$/.test(ev.traceId) ? ev.traceId : undefined
+    const matched = drainPendingContextEvalEvents({
+      sessionKey,
+      ...(traceId ? { traceId } : {}),
+    })
+    const chunks = chunkContextEvalEvents(matched)
+    enqueueTurn(buildTurnObservationPayload(ev, chunks[0]))
+    if (chunks.length > 1) {
+      const defaults = {
+        sessionKey,
+        agentId: safeString(ev.agentId, 'unknown', 128),
+        ...(traceId ? { traceId } : {}),
+        ...(ev.usage.model ? { model: safeString(ev.usage.model, 'unknown', 128) } : {}),
+        timestamp: Number.isFinite(ev.timestamp) ? Math.max(0, Math.trunc(ev.timestamp)) : now(),
+      }
+      for (const overflowChunk of chunks.slice(1)) {
+        enqueueTurn(buildContextOnlyPayload(overflowChunk, defaults))
+      }
+    }
   }
 
   function onToolCalled(ev: ToolCalledEvent): void {
@@ -890,6 +1198,14 @@ export function makeToolFailureReporter(deps: {
     dropped: number
   }> {
     await ensureDir()
+    const orphanPayloads = drainOrphanContextEvalPayloads(
+      now(),
+      CONTEXT_EVAL_ORPHAN_AGE_MS,
+      CONTEXT_EVAL_TRACED_ORPHAN_AGE_MS,
+    )
+    for (const orphan of orphanPayloads) {
+      await enqueue('turn', orphan)
+    }
     const stats = { considered: 0, sent: 0, retried: 0, dropped: 0 }
     const files = (await Promise.all([
       readdir(dir).then((names) => names
@@ -995,6 +1311,10 @@ export function makeToolFailureReporter(deps: {
     if (shutdownPromise) return shutdownPromise
     stopListening()
     const flush = (async () => {
+      const orphanPayloads = drainOrphanContextEvalPayloads(now(), 0, 0)
+      for (const orphan of orphanPayloads) {
+        enqueueTurn(orphan)
+      }
       await flushRollup()
       await rollupFlushChain
       await enqueueChain

@@ -101,6 +101,8 @@ export interface AntigravityAccountPick {
   email: string
   /** How user affinity chose it (absent without a userId). */
   affinity?: AffinityAction
+  /** Directory availability snapshot read during pick (used to intersect local swarm member models). */
+  availableModels?: AntigravityModelAvailability | null
 }
 
 /** Affinity key of the Antigravity subscription pool (one binding per user). */
@@ -159,7 +161,11 @@ export async function pickAntigravityAccount(
   const tier = (r: typeof usable[number]): number => r.status === 'cooldown' ? 3 : r.health_score < 80 ? 2 : isAntigravityUltra(r.paid_tier) ? 0 : 1
   usable.sort((a, b) => tier(a) - tier(b))
   if (deps.userId === undefined || deps.userId === null) {
-    return { accountId: BigInt(usable[0].id), email: usable[0].email }
+    return {
+      accountId: BigInt(usable[0].id),
+      email: usable[0].email,
+      availableModels: usable[0].available_models,
+    }
   }
   // Per-account caps (docs §6): an account at its in-flight or per-minute cap is
   // left out for this turn only (spill); when every account is capped, use them anyway.
@@ -234,7 +240,12 @@ export async function pickAntigravityAccount(
     row = usable.find((r) => r.id === id) ?? preferred
   }
   const action: AffinityAction | undefined = resolved ? (row.id === resolved.member.id ? resolved.action : 'spill') : undefined
-  return { accountId: BigInt(row.id), email: row.email, ...(action ? { affinity: action } : {}) }
+  return {
+    accountId: BigInt(row.id),
+    email: row.email,
+    availableModels: row.available_models,
+    ...(action ? { affinity: action } : {}),
+  }
 }
 
 /** Map an Antigravity outcome to the shared pool outcome (model_unavailable excluded). */

@@ -138,6 +138,7 @@ import {
   recordAntigravityTurn,
   settleAntigravityTurnRecord,
 } from "../billing/antigravitySettle.js";
+import { resolveLocalSwarmAllowedAntigravityModels } from "../billing/antigravityRouteContext.js";
 import {
   abortInsertedZcodeAudit,
   applyZcodeFinalizeOutcome,
@@ -177,6 +178,7 @@ import {
   isServiceTier,
   isZcodeEngineModel,
   isAntigravityEngineModel,
+  parseSwarmSlashCommand,
   isClientMessageId,
   formatMessageReplyPrompt,
   projectContextWindowForCursorTier,
@@ -1128,12 +1130,14 @@ export interface UserChatBridgeDeps {
     requestId: string;
     modelId: string;
     budgetCredits: bigint;
+    allowedModelIds?: readonly string[];
   }) => Promise<{
     token: string;
     baseUrl: string;
     accessToken: string;
     accessTokenExpiresAt: string;
     idToken: string | null;
+    allowedModelIds?: readonly string[];
   }>;
   /** Drop a minted Antigravity relay token after the turn settles or aborts. */
   expireAntigravityRoute?: (token: string) => void | Promise<void>;
@@ -5979,6 +5983,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sanitizedParsed,
               "__oc_antigravity_route",
             );
+            const hasClientAntigravitySwarmAllowedModels = Object.prototype.hasOwnProperty.call(
+              sanitizedParsed,
+              "_antigravitySwarmAllowedModels",
+            );
             const hasClientWorkspaceMode = Object.prototype.hasOwnProperty.call(
               sanitizedParsed,
               "_workspaceMode",
@@ -5996,6 +6004,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               hasClientGrokRoute ||
               hasClientZcodeRoute ||
               hasClientAntigravityRoute ||
+              hasClientAntigravitySwarmAllowedModels ||
               hasClientWorkspaceMode ||
               hasClientCreditBudget ||
               teamModeMain
@@ -6019,6 +6028,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (hasClientAntigravityRoute) {
                 const { __oc_antigravity_route: _discard, ...withoutAntigravityRoute } = sanitizedParsed;
                 sanitizedParsed = withoutAntigravityRoute;
+              }
+              if (hasClientAntigravitySwarmAllowedModels) {
+                const { _antigravitySwarmAllowedModels: _discard, ...withoutSwarmAllowed } = sanitizedParsed;
+                sanitizedParsed = withoutSwarmAllowed;
               }
               if (hasClientWorkspaceMode) {
                 const { _workspaceMode: _discard, ...withoutWorkspaceMode } = sanitizedParsed;
@@ -6424,6 +6437,34 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               return;
             }
+            const rawSwarmText =
+              parsedCapture.content && typeof parsedCapture.content === "object"
+                && typeof (parsedCapture.content as { text?: unknown }).text === "string"
+                ? (parsedCapture.content as { text: string }).text
+                : "";
+            const isLocalSwarmTurn =
+              parsedCapture.swarmMode === true || Boolean(parseSwarmSlashCommand(rawSwarmText)?.matched);
+            const catalogSnapshot = authorityDeps?.catalog.peek() ?? null;
+            const swarmAllowedModelIds = isLocalSwarmTurn
+              ? resolveLocalSwarmAllowedAntigravityModels({
+                  primaryModelId: antigravityModelId,
+                  isAllowedForUser: modelCheckerHandle ? (id) => modelCheckerHandle.isAllowed(id) : null,
+                  isCatalogRoutableLocal: catalogSnapshot
+                    ? (id) => {
+                        if (!catalogSnapshot.isRoutable(id) || !catalogSnapshot.isAntigravityModel(id)) {
+                          return false;
+                        }
+                        const desc = catalogSnapshot.resolve(id);
+                        return (
+                          desc !== null
+                          && desc.canonicalModel === id
+                          && desc.placement !== "remote_pool"
+                        );
+                      }
+                    : null,
+                  hasPricing: deps.pricing ? (id) => deps.pricing!.get(id) !== null : null,
+                })
+              : undefined;
             let minted: Awaited<ReturnType<NonNullable<typeof deps.admitAntigravityTurn>>>;
             try {
               minted = await deps.admitAntigravityTurn({
@@ -6432,6 +6473,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 requestId,
                 modelId: antigravityModelId,
                 budgetCredits: spendable,
+                ...(swarmAllowedModelIds ? { allowedModelIds: swarmAllowedModelIds } : {}),
               });
             } catch (err) {
               logCapture?.error('user-chat-bridge: Antigravity admission failed', {
@@ -6485,6 +6527,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 accessTokenExpiresAt: minted.accessTokenExpiresAt,
                 ...(minted.idToken ? { idToken: minted.idToken } : {}),
               },
+              ...(isLocalSwarmTurn
+                ? { _antigravitySwarmAllowedModels: minted.allowedModelIds ?? [antigravityModelId] }
+                : {}),
               ...authorityFields,
               ...dispatchAuthorityField(dispatchRecord),
             };

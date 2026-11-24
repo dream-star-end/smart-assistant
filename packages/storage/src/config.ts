@@ -1,4 +1,4 @@
-import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { paths } from './paths.js'
@@ -134,9 +134,53 @@ export async function readConfig(): Promise<OpenClaudeConfig | null> {
   }
 }
 
-export async function writeConfig(cfg: OpenClaudeConfig): Promise<void> {
-  await mkdir(dirname(paths.config), { recursive: true })
-  await writeFile(paths.config, JSON.stringify(cfg, null, 2), { mode: 0o600 })
+async function writeConfigUnlocked(cfg: OpenClaudeConfig, target = paths.config): Promise<void> {
+  await mkdir(dirname(target), { recursive: true })
+  const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`
+  try {
+    await writeFile(tmp, JSON.stringify(cfg, null, 2), { mode: 0o600 })
+    await chmod(tmp, 0o600).catch(() => {})
+    await rename(tmp, target)
+    await chmod(target, 0o600).catch(() => {})
+  } finally {
+    await rm(tmp, { force: true }).catch(() => {})
+  }
+}
+
+export async function writeConfig(cfg: OpenClaudeConfig, configPath?: string): Promise<void> {
+  const target = configPath ?? paths.config
+  const lock = await acquireKernelFileLock(`${target}.lock`)
+  try {
+    await writeConfigUnlocked(cfg, target)
+  } finally {
+    await lock.release()
+  }
+}
+
+/**
+ * Cross-process transactional update for `openclaude.json`.
+ * Acquires `${configPath}.lock`, re-reads the latest JSON inside the lock,
+ * invokes `update(cfg)` in place, and atomically writes back (0600 temp+rename)
+ * only when the serialized document actually changed.
+ */
+export async function updateConfig<T>(
+  update: (cfg: OpenClaudeConfig) => T | Promise<T>,
+  configPath?: string,
+): Promise<{ config: OpenClaudeConfig; result: T }> {
+  const target = configPath ?? paths.config
+  const lock = await acquireKernelFileLock(`${target}.lock`)
+  try {
+    const raw = await readFile(target, 'utf-8')
+    const config = JSON.parse(raw) as OpenClaudeConfig
+    const before = JSON.stringify(config)
+    const result = await update(config)
+    if (JSON.stringify(config) !== before) {
+      await writeConfigUnlocked(config, target)
+    }
+    return { config, result }
+  } finally {
+    await lock.release()
+  }
 }
 
 // ──────── agents.yaml ────────

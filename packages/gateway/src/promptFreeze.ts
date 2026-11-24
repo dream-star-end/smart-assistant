@@ -28,6 +28,51 @@ import {
 import { join } from 'node:path'
 import type { PromptSlotApplied } from './promptSlots.js'
 import type { FrozenProjectContextDigests } from './runContextPersist.js'
+import { enqueueContextEvalEvent, type ContextEvalEventInput } from './v3ToolFailureReporter.js'
+
+/** Layer-compliant bridge (gateway-runtime L3 → gateway-master-client L2) for engine telemetry callers. */
+export function recordContextEvalEvent(event: ContextEvalEventInput): void {
+  enqueueContextEvalEvent(event)
+}
+
+export type PromptFreezeEvalDecision =
+  | 'prompt_freeze_reuse'
+  | 'prompt_freeze_fresh_first'
+  | 'prompt_freeze_fresh_inputs'
+  | 'prompt_freeze_expired'
+
+/** Canonical scorecard decision enum aligned across promptFreeze & context-release-scorecard (Blocker #6). */
+export function promptFreezeEvalDecision(
+  outcome: Pick<PromptFreezeOutcome, 'decision' | 'reused'>,
+): PromptFreezeEvalDecision {
+  if (outcome.reused) return 'prompt_freeze_reuse'
+  if (outcome.decision === 'fresh_first') return 'prompt_freeze_fresh_first'
+  if (outcome.decision === 'fresh_ttl') return 'prompt_freeze_expired'
+  return 'prompt_freeze_fresh_inputs'
+}
+
+/** Build and enqueue a privacy-safe `prompt_context_decision` telemetry event for a promptFreeze outcome. */
+export function recordPromptFreezeEvalEvent(args: {
+  sessionKey: string
+  agentId: string
+  inputs: Pick<PromptFreezeInputs, 'provider' | 'model'>
+  outcome: PromptFreezeOutcome
+}): void {
+  const chosenBytes = Buffer.byteLength(args.outcome.chosen.content, 'utf8')
+  enqueueContextEvalEvent({
+    eventKind: 'prompt_context_decision',
+    sessionKey: args.sessionKey,
+    agentId: args.agentId,
+    engine: args.inputs.provider,
+    model: args.inputs.model,
+    decision: promptFreezeEvalDecision(args.outcome),
+    reason: args.outcome.decision,
+    changedSlots: args.outcome.changedSlots,
+    staticPrefixSha256: args.outcome.chosen.contentSha256,
+    totalBytes: chosenBytes,
+    tokensEstimate: Math.ceil(chosenBytes / 4),
+  })
+}
 
 export type PromptFreezeMode = 'off' | 'shadow' | 'enforce'
 
@@ -143,9 +188,36 @@ export interface FrozenPromptRecord extends FrozenPromptBuild {
   sessionKey: string
   inputsKey: string
   builtAt: number
+  /** Per-slot SHA256 map persisted for backward-compatible changedSlots diffing. */
+  slotHashes?: Record<string, string>
   /** Mode that wrote the record. A shadow record never ran its content when
    *  it was kept on reuse, so enforce does not adopt it as a baseline. */
   mode?: PromptFreezeMode
+}
+
+export function buildPromptFreezeSlotHashes(applied: readonly PromptSlotApplied[]): Record<string, string> {
+  const hashes: Record<string, string> = {}
+  for (const slot of applied) {
+    hashes[slot.name] = slot.sha256
+  }
+  return hashes
+}
+
+function normalizePromptFreezeSlotHashes(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === 'string') out[k] = v
+  }
+  return out
+}
+
+function diffPromptFreezeSlotHashes(
+  prior: Record<string, string>,
+  current: Record<string, string>,
+): string[] {
+  const names = new Set([...Object.keys(prior), ...Object.keys(current)])
+  return [...names].filter((name) => prior[name] !== current[name]).sort()
 }
 
 function recordName(sessionKey: string): string {
@@ -191,7 +263,11 @@ export function readFrozenPrompt(
   ) {
     return undefined
   }
-  return { record: parsed, lastUsedAt: mtimeMs(path) }
+  const slotHashes = normalizePromptFreezeSlotHashes(parsed.slotHashes)
+  return {
+    record: slotHashes ? { ...parsed, slotHashes } : parsed,
+    lastUsedAt: mtimeMs(path),
+  }
 }
 
 let lastPruneAt = 0
@@ -326,7 +402,21 @@ export function applyPromptFreeze(input: {
     mode: input.mode,
   })
   const sameContent = stored?.record.contentSha256 === input.fresh.contentSha256
-  const changedSlots = stored ? changedPromptSlots(stored.record.applied, input.fresh.applied) : []
+  const freshSlotHashes = buildPromptFreezeSlotHashes(input.fresh.applied)
+  let changedSlots: string[] = []
+  if (stored) {
+    if (stored.record.slotHashes) {
+      changedSlots = diffPromptFreezeSlotHashes(stored.record.slotHashes, freshSlotHashes)
+    } else {
+      const fromApplied = changedPromptSlots(stored.record.applied, input.fresh.applied)
+      changedSlots =
+        fromApplied.length > 0
+          ? fromApplied
+          : decision === 'fresh_inputs'
+            ? ['legacy_untracked']
+            : []
+    }
+  }
   const ccbPath = ccbContextFreezePath(input.home, input.sessionKey)
   if (decision !== 'reuse') {
     writeFrozenPrompt(
@@ -336,6 +426,7 @@ export function applyPromptFreeze(input: {
         sessionKey: input.sessionKey,
         inputsKey: input.inputsKey,
         builtAt: now,
+        slotHashes: freshSlotHashes,
         mode: input.mode,
         ...input.fresh,
       },

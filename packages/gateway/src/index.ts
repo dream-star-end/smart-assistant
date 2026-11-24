@@ -188,3 +188,19 @@ export {
   type CronJobsWithMetaReader,
   type SessionOriginCronItem,
 } from './routes/sessionBackgroundRoute.js'
+export {
+  DEPRECATED_PROVIDERS,
+  LEGACY_MODEL_POINTER_ALIASES,
+  gcCronOccurrenceTapes,
+  gcDelegateInflightSurface,
+  gcRetryQueueQuarantine,
+  gcStaleBakFiles,
+  healConfigModelPointers,
+  resolveHealedModelPointer,
+  resolveHealedProvider,
+  runRuntimeHygieneGc,
+  type ConfigPointerSelfHealReport,
+  type HealConfigModelPointersOptions,
+  type RuntimeHygieneGcOptions,
+  type RuntimeHygieneGcReport,
+} from '@openclaude/storage'

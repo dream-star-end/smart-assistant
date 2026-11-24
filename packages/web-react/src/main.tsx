@@ -1,6 +1,6 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { App, prefetchLazyCentersOnIdle } from './App'
+import { App } from './App'
 import { LazyBoundary } from './components/ChunkErrorBoundary'
 import { ToastProvider, TooltipProvider } from './components/ui'
 import { createRetryableLazy } from './components/ui/retryableLazy'
@@ -43,8 +43,4 @@ void waitForEntryStyles().then(() => {
 
   // PWA:仅生产 + 安全上下文注册(见 registerSW)。放渲染之后,不阻塞首屏。
   registerServiceWorker()
-
-  // UX 体验对冲:空闲期预取四大中心懒块(见 App.tsx 注释),首开零延迟。
-  // 法务静态页不承载工作区,跳过预取,省流量。
-  if (!legalKind) prefetchLazyCentersOnIdle()
 })
