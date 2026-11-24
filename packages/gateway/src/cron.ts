@@ -47,10 +47,9 @@ import {
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
-import { type AgentDef, type OpenClaudeConfig, paths, readAgentsConfig } from '@openclaude/storage'
+import { type AgentDef, type OpenClaudeConfig, gcCronOccurrenceTapes, paths, readAgentsConfig } from '@openclaude/storage'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { createLogger } from './logger.js'
-import { gcCronOccurrenceTapes } from './runtimeHygieneGc.js'
 import type { SessionManager } from './sessionManager.js'
 import { isHiddenSystemAgentId } from './agentVisibility.js'
 import {

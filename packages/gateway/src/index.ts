@@ -189,20 +189,18 @@ export {
   type SessionOriginCronItem,
 } from './routes/sessionBackgroundRoute.js'
 export {
+  DEPRECATED_PROVIDERS,
+  LEGACY_MODEL_POINTER_ALIASES,
   gcCronOccurrenceTapes,
   gcDelegateInflightSurface,
   gcRetryQueueQuarantine,
   gcStaleBakFiles,
-  runRuntimeHygieneGc,
-  type RuntimeHygieneGcOptions,
-  type RuntimeHygieneGcReport,
-} from './runtimeHygieneGc.js'
-export {
-  DEPRECATED_PROVIDERS,
-  LEGACY_MODEL_POINTER_ALIASES,
   healConfigModelPointers,
   resolveHealedModelPointer,
   resolveHealedProvider,
-  type HealConfigModelPointersOptions,
+  runRuntimeHygieneGc,
   type ConfigPointerSelfHealReport,
-} from './configPointerSelfHeal.js'
+  type HealConfigModelPointersOptions,
+  type RuntimeHygieneGcOptions,
+  type RuntimeHygieneGcReport,
+} from '@openclaude/storage'

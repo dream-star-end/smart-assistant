@@ -18,12 +18,15 @@ import type { Stats } from 'node:fs'
 import { lstat, open, readdir, readFile, realpath, unlink } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import Database from 'better-sqlite3'
-import { paths } from '@openclaude/storage'
+import { paths } from './paths.js'
 
-import {
-  resolveDelegateInflightSurfaceDbPath,
-  type DelegateInflightSurfaceStore,
-} from './delegateInflightSurface.js'
+export interface DelegateInflightSurfacePruner {
+  pruneStaleTerminalRows(opts?: {
+    maxAgeMs?: number
+    nowMs?: number
+    dryRun?: boolean
+  }): { deleted: number; checkpointed: boolean }
+}
 
 const DAY_MS = 24 * 3600_000
 
@@ -673,7 +676,7 @@ export async function gcRetryQueueQuarantine(
 // ---------------------------------------------------------------------------
 
 export interface GcDelegateInflightSurfaceOptions {
-  inflightSurface?: Pick<DelegateInflightSurfaceStore, 'pruneStaleTerminalRows'> | null
+  inflightSurface?: DelegateInflightSurfacePruner | null
   dbPath?: string
   homeDir?: string
   maxAgeMs?: number
@@ -714,10 +717,7 @@ export async function gcDelegateInflightSurface(
   }
 
   const dbPath =
-    opts.dbPath ??
-    (opts.homeDir
-      ? join(opts.homeDir, 'delegate-inflight-surface.db')
-      : resolveDelegateInflightSurfaceDbPath())
+    opts.dbPath ?? join(opts.homeDir ?? paths.home, 'delegate-inflight-surface.db')
   const dbParent = dirname(dbPath)
   const dbRoot = opts.homeDir ?? dbParent
 
@@ -938,7 +938,7 @@ export interface RuntimeHygieneGcOptions {
   homeDir?: string
   nowMs?: number
   dryRun?: boolean
-  inflightSurface?: Pick<DelegateInflightSurfaceStore, 'pruneStaleTerminalRows'> | null
+  inflightSurface?: DelegateInflightSurfacePruner | null
   inflightSurfaceDbPath?: string
   cronTapes?: Omit<GcCronOccurrenceTapesOptions, 'homeDir' | 'nowMs' | 'dryRun'>
   retryQuarantine?: Omit<GcRetryQueueQuarantineOptions, 'homeDir' | 'nowMs' | 'dryRun'>

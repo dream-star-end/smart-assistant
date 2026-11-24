@@ -58,8 +58,54 @@ export * from './contextSource.js'
 
 export * from './sessionUploadReferences.js'
 
-// Context governance: reversible archive, local skill usage & L1 janitor.
+// Context governance: reversible archive, local skill usage, L1 janitor, runtime GC & config self-heal.
 export * from './contextArchive.js'
-export * from './memoryDistill.js'
+export {
+  MAX_DISTILLED_MEMORY_BYTES,
+  applyOversizedMemoryDistill,
+  type ApplyOversizedMemoryDistillInput,
+  type ApplyOversizedMemoryDistillResult,
+} from './memoryDistill.js'
 export * from './skillUsageLocal.js'
 export * from './contextJanitor.js'
+export {
+  DEFAULT_BAK_WHITELIST,
+  DEFAULT_CRON_TAPE_MAX_AGE_MS,
+  DEFAULT_INFLIGHT_SURFACE_MAX_AGE_MS,
+  DEFAULT_RETRY_QUARANTINE_MAX_AGE_MS,
+  DEFAULT_RETRY_QUARANTINE_MAX_BYTES,
+  DEFAULT_STALE_BAK_MAX_AGE_MS,
+  gcCronOccurrenceTapes,
+  gcDelegateInflightSurface,
+  gcRetryQueueQuarantine,
+  gcStaleBakFiles,
+  runRuntimeHygieneGc,
+  verifySafeSubdirWithinRoot,
+  type DelegateInflightSurfacePruner,
+  type GcCronOccurrenceTapesOptions,
+  type GcCronOccurrenceTapesReport,
+  type GcDelegateInflightSurfaceOptions,
+  type GcDelegateInflightSurfaceReport,
+  type GcRetryQueueQuarantineOptions,
+  type GcRetryQueueQuarantineReport,
+  type GcStaleBakFilesOptions,
+  type GcStaleBakFilesReport,
+  type RuntimeHygieneGcOptions,
+  type RuntimeHygieneGcReport,
+  type SafeSubdirResult,
+} from './runtimeHygieneGc.js'
+export {
+  DEPRECATED_PROVIDERS,
+  LEGACY_MODEL_POINTER_ALIASES,
+  healConfigModelPointers,
+  resolveHealedModelPointer,
+  resolveHealedProvider,
+  type ConfigPointerHealFileName,
+  type ConfigPointerMigration,
+  type ConfigPointerSelfHealReport,
+  type HealConfigModelPointersOptions,
+  type HealedModelPointerResult,
+  type HealedProviderResult,
+  type ModelCatalogHealModel,
+  type ModelCatalogHealView,
+} from './configPointerSelfHeal.js'

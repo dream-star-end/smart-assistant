@@ -20,15 +20,30 @@
 import { randomBytes } from 'node:crypto'
 import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
-import { acquireKernelFileLock, paths } from '@openclaude/storage'
+import { isCollaborationMode } from '@openclaude/protocol'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 
-import {
-  COLLAB_CONFIG_FORMAT,
-  CollaborationConfigError,
-  parseCollaborationConfigDoc,
-} from './advisorConfigStore.js'
-import type { LocalCatalogModel, LocalCatalogView } from './modelCatalogClient.js'
+import { acquireKernelFileLock } from './kernelFileLock.js'
+import { paths } from './paths.js'
+
+const COLLAB_CONFIG_FORMAT = 1 as const
+const CCB_ADVISOR_PROFILE_VERSION = 'ccb-advisor-v1' as const
+const SESSION_ID_RE = /^[A-Za-z0-9:_-]{1,128}$/
+
+const ENGINE_COMPAT_PROVIDERS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze({
+  codex: new Set(['codex-native']),
+})
+
+export interface ModelCatalogHealModel {
+  readonly engine: string
+  readonly providerId: string | null
+}
+
+export interface ModelCatalogHealView {
+  canonicalize(modelId: string): string
+  isRoutable(modelId: string): boolean
+  resolve(modelId: string): ModelCatalogHealModel | null
+}
 
 export const LEGACY_MODEL_POINTER_ALIASES: Readonly<Record<string, string>> = Object.freeze({
   'gpt-6.1-sol': 'gpt-6.2-sol',
@@ -49,14 +64,12 @@ export const DEPRECATED_PROVIDERS: ReadonlySet<string> = new Set([
   'z.ai',
 ])
 
-export type ModelCatalogHealView = Pick<LocalCatalogView, 'canonicalize' | 'isRoutable' | 'resolve'>
-
 export interface HealedModelPointerResult {
   changed: boolean
   from: string
   to: string
   reason: 'unchanged' | 'catalog_canonicalized' | 'legacy_alias' | 'unroutable_kept'
-  resolvedModel: LocalCatalogModel | null
+  resolvedModel: ModelCatalogHealModel | null
 }
 
 export interface HealedProviderResult {
@@ -188,15 +201,15 @@ export function resolveHealedModelPointer(
   }
 }
 
-function providerMatchesModel(normProvider: string, model: LocalCatalogModel): boolean {
+function providerMatchesModel(normProvider: string, model: ModelCatalogHealModel): boolean {
   if (model.providerId && model.providerId.trim().toLowerCase() === normProvider) return true
-  const engine = model.engine.toLowerCase()
-  if (engine === normProvider) return true
-  if (engine === 'codex' && normProvider === 'codex-native') return true
+  const modelEngine = model.engine.toLowerCase()
+  if (modelEngine === normProvider) return true
+  if (ENGINE_COMPAT_PROVIDERS[modelEngine]?.has(normProvider)) return true
   return false
 }
 
-function preferredProviderForModel(model: LocalCatalogModel | null): string | undefined {
+function preferredProviderForModel(model: ModelCatalogHealModel | null): string | undefined {
   const candidate = model?.providerId?.trim()
   if (!candidate) return undefined
   if (DEPRECATED_PROVIDERS.has(candidate.toLowerCase())) return undefined
@@ -518,6 +531,78 @@ function applyCollaborationRawHealInPlace(
   return migrations
 }
 
+/**
+ * Strict contract validation for `collaboration-config.json` matching `AdvisorConfigStore`
+ * (`parseCollaborationConfigDoc`) without coupling L2 storage to L3 gateway-advisor.
+ */
+function validateCollaborationConfigDoc(raw: unknown): { rev: number } {
+  if (!isPlainObject(raw)) {
+    throw new Error('collaboration config is not an object')
+  }
+  if (raw.format !== COLLAB_CONFIG_FORMAT) {
+    throw new Error('unsupported collaboration config format')
+  }
+  if (!Number.isInteger(raw.rev) || (raw.rev as number) < 0) {
+    throw new Error('collaboration config rev invalid')
+  }
+  if (!isCollaborationMode(raw.defaultMode)) {
+    throw new Error('defaultMode invalid')
+  }
+  if (
+    raw.defaultAdvisorModel !== null &&
+    raw.defaultAdvisorModel !== undefined &&
+    (typeof raw.defaultAdvisorModel !== 'string' || raw.defaultAdvisorModel.length > 64)
+  ) {
+    throw new Error('defaultAdvisorModel invalid')
+  }
+  if (!isPlainObject(raw.sessions)) {
+    throw new Error('sessions map invalid')
+  }
+  for (const [id, value] of Object.entries(raw.sessions)) {
+    if (!SESSION_ID_RE.test(id)) throw new Error(`session id invalid: ${id}`)
+    if (!isPlainObject(value)) throw new Error(`session ${id} invalid`)
+    if (!isCollaborationMode(value.mode)) throw new Error(`session ${id} mode invalid`)
+    if (
+      value.advisorModel !== null &&
+      value.advisorModel !== undefined &&
+      typeof value.advisorModel !== 'string'
+    ) {
+      throw new Error(`session ${id} advisorModel invalid`)
+    }
+    if (typeof value.updatedAt !== 'number' || !Number.isFinite(value.updatedAt)) {
+      throw new Error(`session ${id} updatedAt invalid`)
+    }
+  }
+  if (raw.provenEngines !== undefined && raw.provenEngines !== null) {
+    if (!Array.isArray(raw.provenEngines)) throw new Error('provenEngines invalid')
+    for (const item of raw.provenEngines) {
+      if (typeof item !== 'string' || !item.trim() || item.length > 32) {
+        throw new Error('provenEngines invalid')
+      }
+    }
+  }
+  if (raw.provenCcbModels !== undefined && raw.provenCcbModels !== null) {
+    if (!Array.isArray(raw.provenCcbModels)) throw new Error('provenCcbModels invalid')
+    for (const item of raw.provenCcbModels) {
+      if (!isPlainObject(item)) throw new Error('provenCcbModels invalid')
+      if (typeof item.modelId !== 'string' || !item.modelId.trim() || item.modelId.length > 64) {
+        throw new Error('provenCcbModels invalid')
+      }
+      if (
+        typeof item.providerId !== 'string' ||
+        !item.providerId.trim() ||
+        item.providerId.length > 64
+      ) {
+        throw new Error('provenCcbModels invalid')
+      }
+      if (item.profileVersion !== CCB_ADVISOR_PROFILE_VERSION) {
+        throw new Error('provenCcbModels invalid')
+      }
+    }
+  }
+  return { rev: raw.rev as number }
+}
+
 async function healCollaborationConfig(
   collabPath: string,
   catalog: ModelCatalogHealView,
@@ -553,18 +638,14 @@ async function healCollaborationConfig(
       return
     }
 
-    // Validate full document contract via parseCollaborationConfigDoc (fail closed on corrupt),
+    // Validate full document contract (fail closed on corrupt),
     // but mutate `rawObj` directly in place so unknown top-level & session extension fields
     // are never stripped by whitelist projection.
-    let validatedDoc
+    let validatedDoc: { rev: number }
     try {
-      validatedDoc = parseCollaborationConfigDoc(rawObj)
+      validatedDoc = validateCollaborationConfigDoc(rawObj)
     } catch (err) {
-      if (err instanceof CollaborationConfigError) {
-        report.errors.push(`collaboration-config.json corrupt: ${err.message}`)
-      } else {
-        report.errors.push(`collaboration-config.json validate: ${formatErr(err)}`)
-      }
+      report.errors.push(`collaboration-config.json corrupt: ${formatErr(err)}`)
       return
     }
     if (!isPlainObject(rawObj)) {
@@ -583,7 +664,7 @@ async function healCollaborationConfig(
     rawObj.format = COLLAB_CONFIG_FORMAT
     rawObj.rev = validatedDoc.rev + 1
     try {
-      parseCollaborationConfigDoc(rawObj)
+      validateCollaborationConfigDoc(rawObj)
     } catch (err) {
       report.errors.push(`collaboration-config.json post-heal validation: ${formatErr(err)}`)
       return

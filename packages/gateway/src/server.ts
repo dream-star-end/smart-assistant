@@ -3,7 +3,6 @@ import { getSystemHelpRelay, installSystemHelpRelay } from './systemHelpRelay.js
 import { handleSystemHelpLocal } from './systemHelpHttp.js'
 import { createGatewayRemoteSwarmRuntime, handleGatewayRemoteSwarmHttp, interruptGatewayRemoteSwarmSession, reconcileGatewayRemoteSwarmOnBoot, setDefaultRemoteSwarmRuntimeFactory, type RemoteSwarmRuntime } from './remoteSwarmLocal.js'
 import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
-import { runRuntimeHygieneGc } from './runtimeHygieneGc.js'
 export { runSessionPreheat, validateEnginePreheatBody } from './sessionPreheat.js'
 export type { EnginePreheatBody, EnginePreheatValidation, SessionPreheatHost } from './sessionPreheat.js'
 import type { GatewayHttpIo } from './routes/httpIo.js'
@@ -67,6 +66,7 @@ import {
   paths,
   readAgentsConfig,
   readConfig,
+  runRuntimeHygieneGc,
   syncMarketplaceHub,
 } from '@openclaude/storage'
 import {

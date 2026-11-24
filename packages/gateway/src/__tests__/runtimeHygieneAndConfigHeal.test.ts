@@ -3,28 +3,26 @@ import { mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from '
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
-import { acquireKernelFileLock } from '@openclaude/storage'
+import {
+  DEPRECATED_PROVIDERS,
+  LEGACY_MODEL_POINTER_ALIASES,
+  acquireKernelFileLock,
+  gcCronOccurrenceTapes,
+  gcDelegateInflightSurface,
+  gcRetryQueueQuarantine,
+  gcStaleBakFiles,
+  healConfigModelPointers,
+  resolveHealedModelPointer,
+  runRuntimeHygieneGc,
+  verifySafeSubdirWithinRoot,
+  type ModelCatalogHealView,
+} from '@openclaude/storage'
 import Database from 'better-sqlite3'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 
 import { AdvisorConfigStore } from '../advisorConfigStore.js'
 import { DelegateInflightSurfaceStore } from '../delegateInflightSurface.js'
 import type { LocalCatalogModel } from '../modelCatalogClient.js'
-import {
-  DEPRECATED_PROVIDERS,
-  LEGACY_MODEL_POINTER_ALIASES,
-  healConfigModelPointers,
-  resolveHealedModelPointer,
-  type ModelCatalogHealView,
-} from '../configPointerSelfHeal.js'
-import {
-  gcCronOccurrenceTapes,
-  gcDelegateInflightSurface,
-  gcRetryQueueQuarantine,
-  gcStaleBakFiles,
-  runRuntimeHygieneGc,
-  verifySafeSubdirWithinRoot,
-} from '../runtimeHygieneGc.js'
 
 const DAY_MS = 24 * 3600_000
 

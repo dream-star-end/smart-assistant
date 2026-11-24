@@ -17,7 +17,7 @@ import { join, resolve } from 'node:path'
 import type { ChannelContext } from '@openclaude/plugin-sdk'
 import type { OutboundMessage } from '@openclaude/protocol'
 import { resolveGatewayListen } from './gatewayBind.js'
-import { type AgentDef, paths, getClientSession, readAgentsConfig, readConfig, turnDispatchInboxStats } from '@openclaude/storage'
+import { type AgentDef, paths, getClientSession, healConfigModelPointers, readAgentsConfig, readConfig, turnDispatchInboxStats } from '@openclaude/storage'
 import { readV3MasterSinkConfig } from './v3MasterSink.js'
 import { isHiddenSystemAgentId } from './agentVisibility.js'
 import { WebSocketServer } from 'ws'
@@ -73,7 +73,6 @@ import {
   resolveInboxTerminalAck,
 } from './turnDispatchInbox.js'
 import { getModelCatalogClient, localExecutionRejectCode, type LocalCatalogView } from './modelCatalogClient.js'
-import { healConfigModelPointers } from './configPointerSelfHeal.js'
 import {
   resolveLocalExecutionIfEnforced,
   localExecutionOverride,
