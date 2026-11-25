@@ -88,7 +88,7 @@ assertRejectedDispatchFailureHelper(
 for (const marker of [
   'getExecutors: () => availableExecutors(uidToCronOriginExecutors.get(input.uid.toString()))',
   'if (admit.kind === "already_owned") return { kind: "in_flight" };',
-  'forwardInboundFrame(frameData, frameIsBinary, frameLength, dispatchRecord)',
+  'forwardInboundFrame(frameData, frameIsBinary, frameLength, dispatchRecord, onWireOutcome)',
 ]) {
   if (!bridgeSource.includes(marker)) {
     throw new Error(`[session-unavailable-rootfix] missing bridge invariant: ${marker}`)
