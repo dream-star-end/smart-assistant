@@ -160,6 +160,7 @@ function rawUsageFromCounters(raw: Readonly<Record<string, number>>): RawUsageCo
     cacheCreation: pickUsageCounter(raw, [
       'cache_creation_input_tokens',
       'cacheWriteInputTokens',
+      'cacheWriteTokens',
       'cache_write_tokens',
       'cacheCreationTokens',
     ]),
@@ -653,6 +654,13 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
           isCumulative ||
           Object.prototype.hasOwnProperty.call(payload.rawCounters, 'cachedInputTokens')
         const rawCounters = rawUsageFromCounters(payload.rawCounters)
+        if (payload.scopeId === 'resume_replay') {
+          if (isCumulative) {
+            turnStartBaseline = { ...rawCounters }
+            this._threadCumulativeBaseline = { ...rawCounters }
+          }
+          return
+        }
         if (isCumulative) {
           latestCumulativeRaw = rawCounters
         }
@@ -1051,25 +1059,13 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
               this.emit('session_id', remoteV4ResumeId(this.executionBackend.operationId, nativeId))
             },
             onAdmittedBaseline: (countersBaseline) => {
-              // B04: Hydrate authoritative thread cumulative baseline from relay admission
-              // (finance.bindNativeThread) so a freshly-instantiated adapter resuming an existing
-              // Codex thread never counts historical thread tokens toward this turn's budget guard.
+              // B04: Adopt the authoritative thread cumulative baseline returned by relay
+              // admission (`finance.bindNativeThread`) so a freshly-instantiated or migrated
+              // adapter resuming a long Codex thread never counts historical thread tokens
+              // toward this turn's budget guard.
               const admittedRaw = rawUsageFromCounters(countersBaseline)
-              turnStartBaseline = {
-                rawInput: Math.max(turnStartBaseline.rawInput, admittedRaw.rawInput),
-                output: Math.max(turnStartBaseline.output, admittedRaw.output),
-                cacheRead: Math.max(turnStartBaseline.cacheRead, admittedRaw.cacheRead),
-                cacheCreation: Math.max(turnStartBaseline.cacheCreation, admittedRaw.cacheCreation),
-              }
-              this._threadCumulativeBaseline = {
-                rawInput: Math.max(this._threadCumulativeBaseline.rawInput, admittedRaw.rawInput),
-                output: Math.max(this._threadCumulativeBaseline.output, admittedRaw.output),
-                cacheRead: Math.max(this._threadCumulativeBaseline.cacheRead, admittedRaw.cacheRead),
-                cacheCreation: Math.max(
-                  this._threadCumulativeBaseline.cacheCreation,
-                  admittedRaw.cacheCreation,
-                ),
-              }
+              turnStartBaseline = { ...admittedRaw }
+              this._threadCumulativeBaseline = { ...admittedRaw }
             },
             onSubmitted: () => {
               resolveSubmitted()
@@ -1240,15 +1236,28 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
   }
 
   /**
+   * Explicitly hydrate the cumulative thread usage baseline (e.g. from authoritative resume state)
+   * so the next turn's budget guard subtracts historical usage immediately on a fresh adapter.
+   */
+  setResumeUsageBaseline(countersBaseline: Readonly<Record<string, number>>): void {
+    this._threadCumulativeBaseline = rawUsageFromCounters(countersBaseline)
+  }
+
+  /**
    * Controlled migration helper: rebinds this adapter to `nextNativeId` (either a bare
    * native session id or a `remotev4:<oldOperationId>:<nativeId>` token from a prior lane)
    * without weakening the default strict `isResumeIdCompatible` / `setResumeSessionId` checks.
    */
-  allowMigratedResume(nextNativeId: string): string {
+  allowMigratedResume(
+    nextNativeId: string,
+    baselineCounters?: Readonly<Record<string, number>>,
+  ): string {
     const portable = extractPortableNativeSessionId(nextNativeId)
     remotePoolNeed(portable !== null, 'REMOTE_MIGRATED_RESUME_ID_INVALID')
     this._nativeId = portable
-    this._threadCumulativeBaseline = { ...ZERO_RAW_USAGE }
+    this._threadCumulativeBaseline = baselineCounters
+      ? rawUsageFromCounters(baselineCounters)
+      : { ...ZERO_RAW_USAGE }
     return remoteV4ResumeId(this.executionBackend.operationId, portable)
   }
 

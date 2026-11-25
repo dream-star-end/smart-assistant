@@ -26,6 +26,7 @@ import { SYSTEM_HELP_CAPABILITY, SYSTEM_HELP_BOOTSTRAP_FIELD, takeSystemHelpBoot
 import type { SystemHelpIdentityScope } from '../system-assistant/helpGrant.js'
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
 import { applyTeamLeaderForwarding, resolveBridgeTeamLeaderModel } from "./teamModeForwarding.js";
+import { resolveRemotePoolBackendAndSeal } from "./userChatBridgeRemotePoolSeal.js";
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
  *
@@ -824,9 +825,16 @@ export interface UserChatBridgeDeps {
   cc5BackendSelector?: (input: { uid: number; containerId: number; sessionKey: string;
     canonicalModel: string; engine: string; placement: "local" | "remote_pool" }) =>
     Promise<RemoteExecutionBackend | undefined>;
-  crossPoolFallbackSelector?: (args: { uid: number; containerId: number; sessionKey: string; canonicalModel: string; engine: string; cause: unknown; expectedSecurityEpoch?: number }) =>
-    Promise<{ executionBackend?: RemoteExecutionBackend; fallbackPool: "local_pool" | "remote_pool"; resolvedCanonicalModel?: string; migrationGrant?: AuthorityPoolMigrationGrant } | null>;
-  returnToRemoteGrantResolver?: (args: { uid: number; containerId: number; sessionKey: string; canonicalModel: string; engine: string; executionBackend: RemoteExecutionBackend }) => Promise<AuthorityPoolMigrationGrant | null>;
+  crossPoolFallbackSelector?: (args: {
+    uid: number; containerId: number; sessionKey: string; canonicalModel: string; engine: string; cause: unknown; expectedSecurityEpoch?: number;
+    validateTargetSignable?: (target: { canonicalModel: string; logicalModel: string; engine: string; fallbackPool: "local_pool" }) => Promise<boolean>;
+    beforeCommit?: (prepared: { fallbackPool: "local_pool"; resolvedCanonicalModel: string; logicalModel: string; migrationGrant: AuthorityPoolMigrationGrant }) => Promise<boolean>;
+  }) => Promise<{ executionBackend?: RemoteExecutionBackend; fallbackPool: "local_pool" | "remote_pool"; resolvedCanonicalModel?: string; migrationGrant?: AuthorityPoolMigrationGrant } | null>;
+  returnToRemoteGrantResolver?: (args: {
+    uid: number; containerId: number; sessionKey: string; canonicalModel: string; engine: string; executionBackend: RemoteExecutionBackend; expectedSecurityEpoch?: number;
+    beforeCommit?: (prepared: { migrationGrant: AuthorityPoolMigrationGrant }) => Promise<boolean>;
+    onBlocked?: (code: string) => void;
+  }) => Promise<AuthorityPoolMigrationGrant | null>;
   /** Composition supplies the verified selfhost default; explicit env 0 rolls back. */
   containerLinkEnabled?: boolean;
   containerLinkHeartbeatMs?: number;
@@ -3081,48 +3089,30 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           "sign_boundary_epoch_changed",
         );
       }
-      let executionBackend: RemoteExecutionBackend | undefined;
-      let execToSign = args.exec, poolMigration: AuthorityPoolMigrationGrant | undefined;
-      try {
-        if (args.exec.placement === "remote_pool") {
-          if (!args.turn?.sessionKey || !deps.cc5BackendSelector || containerId === undefined) throw new Error("REMOTE_LANE_UNAVAILABLE");
-          executionBackend = await deps.cc5BackendSelector({ uid: Number(uid), containerId,
-            sessionKey: args.turn.sessionKey, canonicalModel: args.exec.canonicalModel,
-            engine: args.exec.engine, placement: args.exec.placement });
-          if (!executionBackend) throw new Error("REMOTE_LANE_UNAVAILABLE");
-          if (deps.returnToRemoteGrantResolver) poolMigration = (await deps.returnToRemoteGrantResolver({ uid: Number(uid), containerId, sessionKey: args.turn.sessionKey, canonicalModel: args.exec.canonicalModel, engine: args.exec.engine, executionBackend }).catch(() => null)) ?? undefined;
-        }
-      } catch (err) {
-        const fb = args.turn?.sessionKey && containerId !== undefined && deps.crossPoolFallbackSelector
-          ? await deps.crossPoolFallbackSelector({ uid: Number(uid), containerId, sessionKey: args.turn.sessionKey, canonicalModel: args.exec.canonicalModel, engine: args.exec.engine, cause: err, expectedSecurityEpoch: args.exec.securityEpoch }).catch(() => null)
-          : null;
-        let fallbackAccepted = false;
-        if (fb && fb.fallbackPool === "local_pool") {
-          if (fb.resolvedCanonicalModel && authorityDeps) {
-            const localExec = await resolveTurnExecution(authorityDeps.catalog, fb.resolvedCanonicalModel).catch(() => null);
-            if (localExec && localExec.placement === "local" && localExec.engine === args.exec.engine && localExec.securityEpoch === args.exec.securityEpoch) {
-              execToSign = localExec; executionBackend = undefined; poolMigration = fb.migrationGrant; fallbackAccepted = true;
-            }
-          } else if (!fb.resolvedCanonicalModel) { executionBackend = undefined; poolMigration = fb.migrationGrant; fallbackAccepted = true; }
-        } else if (fb?.executionBackend) { executionBackend = fb.executionBackend; poolMigration = fb.migrationGrant; fallbackAccepted = true; }
-        if (!fallbackAccepted) {
-          args.log?.warn("user-chat-bridge: remote lane unavailable", { model: args.exec.canonicalModel, cause: err instanceof Error ? (err.cause instanceof Error ? err.cause.message : err.message) : String(err) });
-          if (err instanceof Error && ["REMOTE_NODE_MEMORY_EXHAUSTED", "REMOTE_NODE_TASKS_EXHAUSTED"].includes((err as Error & { code?: string }).code ?? "")) {
-            const active = Number((err as Error & { activeSessions?: unknown }).activeSessions);
-            return await reject((err as Error & { code: string }).code,
-              `远端节点${(err as Error & { code?: string }).code === "REMOTE_NODE_TASKS_EXHAUSTED" ? "进程/线程额度不足" : "内存不足"}，当前底座已有 ${Number.isSafeInteger(active) && active >= 0 ? active : 0} 个会话在跑`,
-              (err as Error & { code: string }).code.toLowerCase());
-          }
-          return await reject("REMOTE_NATIVE_UNAVAILABLE", "remote node unavailable for this chat, retry shortly", "remote_native_binding_rejected");
-        }
-      }
       // 注意:**不**在这里查 `cleaned`。调用方在 seal 之后紧接着就有自己的 cleaned 分支
       // (带各自完整的补偿),在这里提前 return null 会让"已拒(补偿过)"与"桥关了
       // (还没补偿)"两种 null 语义混在一起 —— 正是漏账最爱的那种歧义。
-      return {
-        model: execToSign.canonicalModel,
-        [MODEL_AUTHORITY_FIELD]: signAuthorityBundle(execToSign, args.billingRequestId, args.authorityTurnId, executionBackend, poolMigration),
-      };
+      return await resolveRemotePoolBackendAndSeal({
+        uid: Number(uid),
+        containerId,
+        sessionKey: args.turn?.sessionKey,
+        exec: args.exec,
+        billingRequestId: args.billingRequestId,
+        authorityTurnId: args.authorityTurnId,
+        log: args.log,
+        cc5BackendSelector: deps.cc5BackendSelector,
+        crossPoolFallbackSelector: deps.crossPoolFallbackSelector,
+        returnToRemoteGrantResolver: deps.returnToRemoteGrantResolver,
+        resolveLocalExec: authorityDeps
+          ? (canonicalModel) => resolveTurnExecution(authorityDeps.catalog, canonicalModel)
+          : undefined,
+        isModelAllowed: modelCheckerHandle
+          ? (canonicalModel) => modelCheckerHandle.isAllowed(canonicalModel)
+          : undefined,
+        readEpochAtSign,
+        signAuthorityBundle,
+        reject,
+      });
     };
 
     /**

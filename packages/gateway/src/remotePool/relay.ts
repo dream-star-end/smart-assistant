@@ -63,7 +63,7 @@ const CONTENT_BLOB_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const CONTENT_MIME_RE = /^[a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*$/i
 const TEXT_ONLY_REMOTE_DRIVERS = new Set(['antigravity'])
 
-function validateRemoteTurnContentBlocks(raw: unknown): RemoteDriverTurnContentBlock[] {
+export function validateRemoteTurnContentBlocks(raw: unknown): RemoteDriverTurnContentBlock[] {
   remotePoolNeed(Array.isArray(raw) && raw.length > 0 && raw.length <= 64, 'REMOTE_CONTENT_BLOCK_INVALID')
   const out: RemoteDriverTurnContentBlock[] = []
   for (const item of raw) {
@@ -78,27 +78,33 @@ function validateRemoteTurnContentBlocks(raw: unknown): RemoteDriverTurnContentB
       )
       out.push({ type: 'text', text: b.text })
     } else if (b.type === 'image') {
+      // B02 defense-in-depth: remote drivers cannot access the source container filesystem, so
+      // raw `path` blocks must never cross the relay boundary (must be materialized before dispatch).
+      // Reject malformed/traversal paths as REMOTE_CONTENT_BLOCK_INVALID first, and valid raw paths
+      // as REMOTE_IMAGE_PATH_UNSUPPORTED.
+      if (b.path !== undefined) {
+        remotePoolNeed(
+          typeof b.path === 'string' &&
+            b.path.length > 0 &&
+            b.path.startsWith('/') &&
+            !b.path.includes('\u0000') &&
+            !b.path.split('/').includes('..'),
+          'REMOTE_CONTENT_BLOCK_INVALID',
+        )
+        throw new Error('REMOTE_IMAGE_PATH_UNSUPPORTED')
+      }
       remotePoolNeed(
         Object.keys(b).every(
-          (k) => k === 'type' || k === 'mimeType' || k === 'data' || k === 'blobId' || k === 'path',
+          (k) => k === 'type' || k === 'mimeType' || k === 'data' || k === 'blobId',
         ) &&
           typeof b.mimeType === 'string' &&
           b.mimeType.length <= 128 &&
           CONTENT_MIME_RE.test(b.mimeType) &&
           (b.data === undefined || (typeof b.data === 'string' && b.data.length > 0 && !b.data.includes('\u0000'))) &&
-          (b.blobId === undefined || (typeof b.blobId === 'string' && CONTENT_BLOB_ID_RE.test(b.blobId))) &&
-          (b.path === undefined ||
-            (typeof b.path === 'string' &&
-              b.path.length > 0 &&
-              b.path.length <= 1024 &&
-              !b.path.includes('\u0000') &&
-              !b.path.includes('..'))),
+          (b.blobId === undefined || (typeof b.blobId === 'string' && CONTENT_BLOB_ID_RE.test(b.blobId))),
         'REMOTE_CONTENT_BLOCK_INVALID',
       )
       if (b.data === undefined) {
-        if (b.path !== undefined) {
-          throw new Error('REMOTE_IMAGE_PATH_UNSUPPORTED')
-        }
         throw new Error(
           b.blobId !== undefined ? 'REMOTE_IMAGE_BLOB_UNRESOLVED' : 'REMOTE_CONTENT_BLOCK_INVALID',
         )
@@ -1012,7 +1018,13 @@ export class RemotePoolRelay {
     this.publish({ kind: 'turn_settled', receipt, outcome })
   }
 
-  private admit(v: Record<string, unknown>): Promise<{ ready: true; seq: number; nativeSessionId: string }> {
+  private admit(v: Record<string, unknown>): Promise<{
+    ready: true
+    seq: number
+    nativeSessionId: string
+    countersBaseline?: Readonly<Record<string, number>>
+    threadUsageBaseline?: Readonly<Record<string, number>>
+  }> {
     remotePoolNeed(!this.admitting, 'REMOTE_ADMIT_CONCURRENT')
     const run = this.admitTurn(v)
     this.admitting = run.then(
@@ -1024,7 +1036,13 @@ export class RemotePoolRelay {
     })
   }
 
-  private async admitTurn(v: Record<string, unknown>): Promise<{ ready: true; seq: number; nativeSessionId: string }> {
+  private async admitTurn(v: Record<string, unknown>): Promise<{
+    ready: true
+    seq: number
+    nativeSessionId: string
+    countersBaseline?: Readonly<Record<string, number>>
+    threadUsageBaseline?: Readonly<Record<string, number>>
+  }> {
     remotePoolNeed(!this.active && !this.starting && !this.revoked, 'REMOTE_ADMIT_BUSY_OR_CLOSED')
     remotePoolNeed(
       typeof v.authority === 'string' && typeof v.lease === 'string' && typeof v.turnKey === 'string' && /^[a-f0-9]{64}$/.test(v.turnKey),
@@ -1254,7 +1272,12 @@ export class RemotePoolRelay {
       ready: true,
       seq: this.outputSeq,
       nativeSessionId: this.nativeSessionId,
-      ...(this.countersBaseline !== null ? { countersBaseline: this.countersBaseline } : {}),
+      ...(this.countersBaseline !== null
+        ? {
+            countersBaseline: this.countersBaseline,
+            threadUsageBaseline: this.countersBaseline,
+          }
+        : {}),
     }
     } catch (err) {
       clearTimeout(this.expiry)

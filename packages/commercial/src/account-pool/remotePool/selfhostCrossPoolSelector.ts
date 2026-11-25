@@ -25,6 +25,7 @@ import {
   INFERENCE_SERVICE_TIERS,
   checkCapabilitySuperset,
   resolveLogicalModelId,
+  type AuthoritativeRollingCheckpoint,
   type AuthorityEngineKind,
   type DriverCapabilityManifest,
   type InferenceEngineFamily,
@@ -42,7 +43,10 @@ import {
   PgSessionAuthorityStateStore,
   type PgTransactionPool,
 } from '../../db/threeLayerStateStore.js'
-import { assertNoPendingRemoteBillingForSession } from './placement.js'
+import {
+  assertNoPendingRemoteBillingForSession,
+  type ExcludeCurrentPreparedBinding,
+} from './placement.js'
 import {
   PRE_DISPATCH_RETRYABLE_ERROR_CODES,
   UnifiedPlacementRouter,
@@ -125,6 +129,30 @@ export interface CrossPoolFallbackMigrationGrant {
   readonly continuityTier: ResumeLadderTier
 }
 
+export interface ContinuityVerificationInput {
+  readonly uid: number
+  readonly containerId: number
+  readonly sessionKey: string
+  readonly fromPoolKind: 'remote_pool' | 'local_container'
+  readonly toPoolKind: 'remote_pool' | 'local_container'
+  readonly sourcePlacementEpoch: number
+  readonly targetPlacementEpoch: number
+  readonly checkpoint: AuthoritativeRollingCheckpoint
+}
+
+export type ContinuityVerificationResult =
+  | {
+      readonly applied: true
+      readonly checkpointId: string
+    }
+  | {
+      readonly applied: false
+    }
+
+export type ContinuityAppliedVerifier = (
+  input: ContinuityVerificationInput,
+) => Promise<ContinuityVerificationResult>
+
 export interface SelfhostCrossPoolFallbackInput {
   readonly uid: number
   readonly containerId: number
@@ -135,6 +163,33 @@ export interface SelfhostCrossPoolFallbackInput {
   readonly expectedSecurityEpoch?: number
   readonly requiredCapabilities?: RequiredTurnCapabilities
   readonly dispatched?: boolean
+  /**
+   * B01 Stage-1 pre-sign validation hook: runs BEFORE `beginPlacementMigration` so any
+   * target descriptor rejection leaves PG completely untouched.
+   */
+  readonly validateTargetSignable?: (target: {
+    readonly canonicalModel: string
+    readonly logicalModel: string
+    readonly engine: AuthorityEngineKind
+    readonly fallbackPool: 'local_pool'
+  }) => Promise<boolean>
+  /**
+   * B01 Stage-2 pre-commit verification hook: runs AFTER `beginPlacementMigration` and
+   * BEFORE `commitPlacementMigration`. Returning `false` or throwing triggers explicit
+   * `abortPlacementMigration` so PG `placementEpoch` never advances on sign/epoch failure.
+   */
+  readonly beforeCommit?: (prepared: {
+    readonly fallbackPool: 'local_pool'
+    readonly resolvedCanonicalModel: string
+    readonly logicalModel: string
+    readonly migrationGrant: CrossPoolFallbackMigrationGrant
+  }) => Promise<boolean>
+  /**
+   * B01: Optional continuity proof hook. `tape_rebuilt` is ONLY published when an unacked
+   * rolling checkpoint exists at the current source epoch AND this verifier returns
+   * `{ applied: true, checkpointId }`; otherwise `cold_degraded` is published honestly.
+   */
+  readonly verifyContinuityApplied?: ContinuityAppliedVerifier
 }
 
 export interface SelfhostReturnToRemoteInput {
@@ -144,6 +199,22 @@ export interface SelfhostReturnToRemoteInput {
   readonly canonicalModel: string
   readonly engine: string
   readonly executionBackend: RemoteExecutionBackend
+  readonly expectedSecurityEpoch?: number
+  /**
+   * B01 Stage-2 pre-commit hook: validates epoch/signing BEFORE committing return-to-remote.
+   * Returning `false` or throwing aborts the migration and leaves PG on `local_container`.
+   */
+  readonly beforeCommit?: (prepared: {
+    readonly migrationGrant: CrossPoolFallbackMigrationGrant
+  }) => Promise<boolean>
+  /** Notifies caller when an active `local_container` return is fail-closed blocked (e.g. B06). */
+  readonly onBlocked?: (code: string) => void
+  /**
+   * B01: Optional continuity proof hook. `tape_rebuilt` is ONLY published when an unacked
+   * rolling checkpoint exists at the current source epoch AND this verifier returns
+   * `{ applied: true, checkpointId }`; otherwise `cold_degraded` is published honestly.
+   */
+  readonly verifyContinuityApplied?: ContinuityAppliedVerifier
 }
 
 export interface SelfhostCrossPoolFallbackResult {
@@ -151,7 +222,9 @@ export interface SelfhostCrossPoolFallbackResult {
   readonly executionBackend: RemoteExecutionBackend | undefined
   readonly resolvedCanonicalModel: string
   readonly logicalModel: string
-  readonly migrationGrant: CrossPoolFallbackMigrationGrant
+  readonly migrationGrant?: CrossPoolFallbackMigrationGrant
+  readonly reusedExistingLocalPlacement?: boolean
+  readonly placementEpoch?: number
 }
 
 export interface SelfhostCrossPoolSelectorDeps {
@@ -164,7 +237,9 @@ export interface SelfhostCrossPoolSelectorDeps {
     readonly uid: number
     readonly sessionKey: string
     readonly operationId?: string | null
+    readonly excludeCurrentPreparedBinding?: ExcludeCurrentPreparedBinding
   }) => Promise<boolean>
+  readonly verifyContinuityApplied?: ContinuityAppliedVerifier
   readonly router?: UnifiedPlacementRouter
   readonly now?: () => number
 }
@@ -277,6 +352,8 @@ export function createSelfhostCrossPoolFallbackSelector(
     if (deps.selfhost !== true) return null
     if (input.dispatched === true) return null
     if (!deps.catalogCache || !authorityStore) return null
+    // B06: Fail closed if neither an explicit pendingBillingChecker nor an authoritative PG pool is wired.
+    if (!deps.pendingBillingChecker && !deps.pool) return null
     if (!isPreDispatchRemotePoolFailure(input.cause)) return null
     if (
       !Number.isSafeInteger(input.uid) ||
@@ -345,41 +422,92 @@ export function createSelfhostCrossPoolFallbackSelector(
     }
 
     // N01: Authoritative pool-binding gate. Distinguish three states strictly:
-    //  1) Read failure -> fail-closed (return null)
-    //  2) Configured (hasConfiguredBindings === true), even if all bindings are disabled ->
-    //     pass activeBindingReader to UnifiedPlacementRouter so disabled bindings REJECT!
-    //  3) Unconfigured (0 rows for logicalModel) -> fall through to strict catalog+superset gate.
-    let activeBindingReader: LogicalModelBindingReader | undefined = deps.bindingStore
+    //  1) Read failure -> fail-closed (return null, never touch PG epoch)
+    //  2) Configured (`status === 'configured'`, `totalCount > 0`) ->
+    //     - If `enabledBindings.length === 0` (all explicitly disabled): REJECT immediately!
+    //     - Otherwise pass `activeBindingReader` with enabled bindings to UnifiedPlacementRouter.
+    //  3) Unconfigured (`status === 'unconfigured'`, `totalCount === 0`) ->
+    //     fall through to strict catalog + capability superset gate.
+    let activeBindingReader: LogicalModelBindingReader | undefined
     let localBindingDriverId: string | undefined
     if (deps.bindingStore) {
       try {
-        const res = await deps.bindingStore.resolveBindingsForModel(logicalModel)
-        const localBinding = res.bindings.find(
-          (b) => b.enabled && b.poolKind === 'local_pool',
-        )
-        localBindingDriverId = localBinding?.driverId
+        if (typeof deps.bindingStore.inspectLogicalModelBindings === 'function') {
+          const inspected = await deps.bindingStore.inspectLogicalModelBindings(logicalModel)
+          if (inspected.status === 'configured' && inspected.enabledBindings.length === 0) {
+            return null
+          }
+          activeBindingReader = {
+            resolveBindingsForModel: async () => ({
+              resolved: inspected.resolved,
+              bindings: inspected.enabledBindings,
+            }),
+          }
+          localBindingDriverId = inspected.enabledBindings.find(
+            (b) => b.enabled && b.poolKind === 'local_pool',
+          )?.driverId
+        } else {
+          const res = await deps.bindingStore.resolveBindingsForModel(logicalModel)
+          activeBindingReader = {
+            resolveBindingsForModel: async () => res,
+          }
+          localBindingDriverId = res.bindings.find(
+            (b) => b.enabled && b.poolKind === 'local_pool',
+          )?.driverId
+        }
       } catch {
         return null
       }
     } else if (implicitBindingStore) {
       try {
-        const state = await implicitBindingStore.resolveBindingsStateForModel(logicalModel)
-        if (state.hasConfiguredBindings) {
+        const inspected = await implicitBindingStore.inspectLogicalModelBindings(logicalModel)
+        if (inspected.status === 'configured') {
+          if (inspected.enabledBindings.length === 0) {
+            return null
+          }
           activeBindingReader = {
             resolveBindingsForModel: async () => ({
-              resolved: state.resolved,
-              bindings: state.bindings,
+              resolved: inspected.resolved,
+              bindings: inspected.enabledBindings,
             }),
           }
-          const localBinding = state.bindings.find(
+          localBindingDriverId = inspected.enabledBindings.find(
             (b) => b.enabled && b.poolKind === 'local_pool',
-          )
-          localBindingDriverId = localBinding?.driverId
+          )?.driverId
         }
       } catch {
         // Fail closed on authoritative binding-store read errors (N01).
         return null
       }
+    }
+
+    // B06: Read authoritative pointer & verify NO unsettled remote billing journal or unreleased
+    // remote binding exists BEFORE concluding this session can fall back to local_pool.
+    let existingPointer: Awaited<ReturnType<PgSessionAuthorityStateStore['getEnginePointer']>>
+    try {
+      existingPointer = await authorityStore.getEnginePointer(input.uid, input.sessionKey)
+    } catch {
+      return null
+    }
+
+    try {
+      if (deps.pendingBillingChecker) {
+        const hasPending = await deps.pendingBillingChecker({
+          uid: input.uid,
+          sessionKey: input.sessionKey,
+          operationId: existingPointer?.operationId ?? null,
+        })
+        if (hasPending) return null
+      } else if (deps.pool) {
+        await assertNoPendingRemoteBillingForSession(
+          deps.pool,
+          input.uid,
+          input.sessionKey,
+          existingPointer?.operationId ?? null,
+        )
+      }
+    } catch {
+      return null
     }
 
     const localDriverId = resolveCandidateLocalDriverId(engineFamily, localBindingDriverId)
@@ -421,16 +549,22 @@ export function createSelfhostCrossPoolFallbackSelector(
         ...(activeBindingReader ? { bindingStore: activeBindingReader } : {}),
       })
 
-    const routeRes = await router.routeTurn({
-      rawModelId: logicalModel,
-      sessionKey: input.sessionKey,
-      tenantId: String(input.uid),
-      requiredCapabilities: required,
-      poolPreference: 'pin_local',
-      currentPoolKind: 'remote_pool',
-      currentDriverId: engineFamily,
-      candidates: [localCandidate],
-    })
+    const alreadyOnLocal = existingPointer?.poolKind === 'local_container'
+    let routeRes: Awaited<ReturnType<UnifiedPlacementRouter['routeTurn']>>
+    try {
+      routeRes = await router.routeTurn({
+        rawModelId: logicalModel,
+        sessionKey: input.sessionKey,
+        tenantId: String(input.uid),
+        requiredCapabilities: required,
+        poolPreference: 'pin_local',
+        currentPoolKind: alreadyOnLocal ? 'local_pool' : 'remote_pool',
+        currentDriverId: alreadyOnLocal ? localDriverId : engineFamily,
+        candidates: [localCandidate],
+      })
+    } catch {
+      return null
+    }
 
     if (!routeRes.ok || routeRes.selected.poolKind !== 'local_pool') {
       return null
@@ -443,6 +577,12 @@ export function createSelfhostCrossPoolFallbackSelector(
     ) {
       return null
     }
+    if (
+      typeof snapshot.billingPricingFor === 'function' &&
+      snapshot.billingPricingFor(resolvedLocalDesc.canonicalModel) === null
+    ) {
+      return null
+    }
     try {
       if (resolveLogicalModelId(resolvedLocalDesc.canonicalModel).logicalModel !== logicalModel) {
         return null
@@ -451,50 +591,96 @@ export function createSelfhostCrossPoolFallbackSelector(
       return null
     }
 
-    // Authoritative PG placement epoch migration CAS (remote_pool -> local_container).
-    const existingPointer = await authorityStore.getEnginePointer(input.uid, input.sessionKey)
-
-    // B06: Unconditionally verify NO unsettled remote billing journal exists for this
-    // user/session/operation BEFORE authorizing cross-pool fallback or advancing PG epoch.
-    try {
-      if (deps.pendingBillingChecker) {
-        const hasPending = await deps.pendingBillingChecker({
-          uid: input.uid,
-          sessionKey: input.sessionKey,
-          operationId: existingPointer?.operationId ?? null,
+    // B01 Stage 1: Validate target descriptor signability BEFORE any PG mutation or local reuse.
+    if (input.validateTargetSignable) {
+      try {
+        const signable = await input.validateTargetSignable({
+          canonicalModel: resolvedLocalDesc.canonicalModel,
+          logicalModel,
+          engine: authEngine,
+          fallbackPool: 'local_pool',
         })
-        if (hasPending) return null
-      } else if (deps.pool) {
-        await assertNoPendingRemoteBillingForSession(
-          deps.pool,
-          input.uid,
-          input.sessionKey,
-          existingPointer?.operationId ?? null,
-        )
+        if (!signable) return null
+      } catch {
+        return null
       }
+    }
+
+    // B01: If the authoritative pointer is ALREADY active on `local_container` for this engine
+    // (remote remained unavailable across consecutive turns), reuse the existing local placement
+    // directly without starting a redundant same-pool migration or bumping placementEpoch.
+    // If PG committed an earlier remote->local fallback at placementEpoch >= 2 whose first frame
+    // was never installed on the container (`nativeSessionId === null`), re-issue an idempotent
+    // epoch-scoped migrationGrant so a container still holding the remote runner can transition
+    // safely without loosening `CC5_BACKEND_SCOPE_CHANGED`. Once a local turn has completed
+    // (`nativeSessionId !== null`), omit the grant for pure local continuation.
+    if (existingPointer && existingPointer.poolKind === 'local_container') {
+      if (existingPointer.migrationState !== 'active' || existingPointer.engine !== authEngine) {
+        return null
+      }
+      const needsIdempotentGrantRedelivery =
+        existingPointer.placementEpoch >= 2 && existingPointer.nativeSessionId === null
+      const redeliveredGrant: CrossPoolFallbackMigrationGrant | undefined =
+        needsIdempotentGrantRedelivery
+          ? Object.freeze({
+              migrationId: `reissue-local-e${existingPointer.placementEpoch}-${input.uid}`,
+              placementEpoch: existingPointer.placementEpoch,
+              allowBackendTransition: true as const,
+              continuityTier: 'cold_degraded' as const,
+            })
+          : undefined
+      return Object.freeze({
+        fallbackPool: 'local_pool' as const,
+        executionBackend: undefined,
+        resolvedCanonicalModel: resolvedLocalDesc.canonicalModel,
+        logicalModel,
+        reusedExistingLocalPlacement: true as const,
+        placementEpoch: existingPointer.placementEpoch,
+        migrationGrant: redeliveredGrant,
+      })
+    }
+
+    const expectedPlacementEpoch = existingPointer?.placementEpoch ?? 1
+
+    // B01: Honest continuityTier — publish `tape_rebuilt` ONLY when an unacked rolling
+    // checkpoint exists for the EXACT current source epoch AND `verifyContinuityApplied`
+    // explicitly confirms `{ applied: true, checkpointId }`. Never fabricate `tape_rebuilt`
+    // solely from peeking a PG checkpoint row.
+    let rollingCheckpoint: Awaited<ReturnType<PgSessionAuthorityStateStore['peekRollingCheckpoint']>>
+    try {
+      rollingCheckpoint = await authorityStore.peekRollingCheckpoint(
+        input.uid,
+        input.sessionKey,
+        expectedPlacementEpoch,
+      )
     } catch {
       return null
     }
-
-    // B01: Determine honest continuityTier based on real persisted recovery evidence
-    // (rolling checkpoint / pointer history) instead of unconditionally claiming `tape_rebuilt`.
-    let hasPersistedRecoveryContext = false
-    try {
-      const checkpoint = await authorityStore.peekRollingCheckpoint(input.uid, input.sessionKey)
-      if (checkpoint !== null) {
-        hasPersistedRecoveryContext = true
+    let continuityTier: ResumeLadderTier = 'cold_degraded'
+    const continuityVerifier = input.verifyContinuityApplied ?? deps.verifyContinuityApplied
+    if (rollingCheckpoint !== null && continuityVerifier) {
+      try {
+        const verified = await continuityVerifier({
+          uid: input.uid,
+          containerId: input.containerId,
+          sessionKey: input.sessionKey,
+          fromPoolKind: existingPointer?.poolKind === 'local_container' ? 'local_container' : 'remote_pool',
+          toPoolKind: 'local_container',
+          sourcePlacementEpoch: expectedPlacementEpoch,
+          targetPlacementEpoch: expectedPlacementEpoch + 1,
+          checkpoint: rollingCheckpoint,
+        })
+        if (
+          verified.applied === true &&
+          verified.checkpointId === rollingCheckpoint.checkpointGeneration
+        ) {
+          continuityTier = 'tape_rebuilt'
+        }
+      } catch {
+        continuityTier = 'cold_degraded'
       }
-    } catch {
-      hasPersistedRecoveryContext = false
     }
-    if (!hasPersistedRecoveryContext && existingPointer && existingPointer.history.length > 0) {
-      hasPersistedRecoveryContext = true
-    }
-    const continuityTier: ResumeLadderTier = hasPersistedRecoveryContext
-      ? 'tape_rebuilt'
-      : 'cold_degraded'
 
-    const expectedPlacementEpoch = existingPointer?.placementEpoch ?? 1
     const fromPlacement: PlacementDescriptor = {
       poolKind: existingPointer?.poolKind ?? 'remote_pool',
       engine: existingPointer?.engine ?? authEngine,
@@ -511,6 +697,7 @@ export function createSelfhostCrossPoolFallbackSelector(
       containerId: String(input.containerId),
     }
 
+    // B01 Stage 2: CAS begin -> pre-commit sign/epoch verification -> commit (or explicit abort).
     const begun = await authorityStore.beginPlacementMigration({
       userId: input.uid,
       sessionKey: input.sessionKey,
@@ -521,6 +708,38 @@ export function createSelfhostCrossPoolFallbackSelector(
     })
     if (!begun.applied) return null
 
+    const preparedGrant: CrossPoolFallbackMigrationGrant = Object.freeze({
+      migrationId: begun.migration.migrationId,
+      placementEpoch: begun.migration.toEpoch,
+      allowBackendTransition: true as const,
+      continuityTier,
+    })
+
+    if (input.beforeCommit) {
+      let commitApproved = false
+      try {
+        commitApproved = await input.beforeCommit({
+          fallbackPool: 'local_pool',
+          resolvedCanonicalModel: resolvedLocalDesc.canonicalModel,
+          logicalModel,
+          migrationGrant: preparedGrant,
+        })
+      } catch {
+        commitApproved = false
+      }
+      if (!commitApproved) {
+        await authorityStore
+          .abortPlacementMigration({
+            migrationId: begun.migration.migrationId,
+            reason: 'target_sign_validation_rejected',
+            userId: input.uid,
+            sessionKey: input.sessionKey,
+          })
+          .catch(() => {})
+        return null
+      }
+    }
+
     const committed = await authorityStore
       .commitPlacementMigration({
         migrationId: begun.migration.migrationId,
@@ -529,6 +748,19 @@ export function createSelfhostCrossPoolFallbackSelector(
         continuityTier,
       })
       .catch(async () => {
+        // B01: If PG commit landed before the ack was lost, read back the authoritative
+        // migration/pointer state instead of blindly aborting and dropping the grant!
+        const readBack = await authorityStore
+          .getPlacementMigration(begun.migration.migrationId)
+          .catch(() => null)
+        if (readBack && readBack.state === 'committed') {
+          const ptr = await authorityStore
+            .getEnginePointer(input.uid, input.sessionKey)
+            .catch(() => null)
+          if (ptr && ptr.poolKind === 'local_container' && ptr.migrationState === 'active') {
+            return { applied: true as const, migration: readBack, pointer: ptr }
+          }
+        }
         await authorityStore
           .abortPlacementMigration({
             migrationId: begun.migration.migrationId,
@@ -572,14 +804,17 @@ export function createSelfhostCrossPoolFallbackSelector(
 /**
  * B01: Return-to-remote migration grant resolver for selfhost V5.
  * When a session previously fell back to `local_container` and remote pool recovers for a
- * subsequent turn on the remote model, atomically transitions PG pointer `local_container` ->
- * `remote_pool` (epoch N -> N+1) and issues a signed `CrossPoolFallbackMigrationGrant` so the
- * container gateway permits resuming the session on the recovered remote lane without forcing a
- * brand-new chat. Returns `null` when the session is NOT currently on `local_container` (zero
- * overhead / zero weakening of fail-closed locks for ordinary sessions).
+ * subsequent turn on the remote model, verifies unsettled billing (B06), validates signability
+ * via `beforeCommit` BEFORE committing, atomically transitions PG pointer `local_container` ->
+ * `remote_pool` (epoch N -> N+1), and issues a signed `CrossPoolFallbackMigrationGrant`.
+ * Returns `null` when the session is NOT currently on `local_container` (zero weakening of
+ * fail-closed locks for ordinary sessions).
  */
 export function createSelfhostReturnToRemoteGrantResolver(
-  deps: Pick<SelfhostCrossPoolSelectorDeps, 'pool' | 'selfhost' | 'authorityStore' | 'pendingBillingChecker'>,
+  deps: Pick<
+    SelfhostCrossPoolSelectorDeps,
+    'pool' | 'selfhost' | 'authorityStore' | 'pendingBillingChecker' | 'verifyContinuityApplied'
+  >,
 ): (input: SelfhostReturnToRemoteInput) => Promise<CrossPoolFallbackMigrationGrant | null> {
   const authorityStore =
     deps.authorityStore ?? (deps.pool ? new PgSessionAuthorityStateStore(deps.pool) : undefined)
@@ -588,6 +823,7 @@ export function createSelfhostReturnToRemoteGrantResolver(
     input: SelfhostReturnToRemoteInput,
   ): Promise<CrossPoolFallbackMigrationGrant | null> => {
     if (deps.selfhost !== true || !authorityStore) return null
+    if (!deps.pendingBillingChecker && !deps.pool) return null
     if (
       !Number.isSafeInteger(input.uid) ||
       input.uid <= 0 ||
@@ -600,44 +836,107 @@ export function createSelfhostReturnToRemoteGrantResolver(
     const authEngine = input.engine as AuthorityEngineKind
     const engineFamily = ENGINE_FAMILY_BY_AUTHORITY[authEngine]
 
-    const existingPointer = await authorityStore.getEnginePointer(input.uid, input.sessionKey)
+    let existingPointer: Awaited<ReturnType<PgSessionAuthorityStateStore['getEnginePointer']>>
+    try {
+      existingPointer = await authorityStore.getEnginePointer(input.uid, input.sessionKey)
+    } catch {
+      return null
+    }
     if (!existingPointer || existingPointer.poolKind !== 'local_container') {
       return null
     }
 
-    // B06 defense-in-depth: never authorize return-to-remote while an unsettled remote journal exists.
+    const backendDriverId =
+      'driverId' in input.executionBackend &&
+      typeof input.executionBackend.driverId === 'string' &&
+      input.executionBackend.driverId.trim().length > 0
+        ? input.executionBackend.driverId.trim()
+        : engineFamily
+    const backendProfileId =
+      'profileId' in input.executionBackend &&
+      typeof input.executionBackend.profileId === 'string' &&
+      input.executionBackend.profileId.trim().length > 0
+        ? input.executionBackend.profileId.trim()
+        : undefined
+    const backendGeneration =
+      'generation' in input.executionBackend &&
+      typeof input.executionBackend.generation === 'string' &&
+      input.executionBackend.generation.trim().length > 0
+        ? input.executionBackend.generation.trim()
+        : undefined
+    const excludeCurrentPreparedBinding: ExcludeCurrentPreparedBinding | undefined =
+      backendGeneration && backendProfileId
+        ? {
+            operationId: input.executionBackend.operationId,
+            generation: backendGeneration,
+            profileId: backendProfileId,
+          }
+        : undefined
+
+    // B06 + B01: Verify NO unsettled billing journal and NO other unreleased remote binding exists.
+    // Excuse ONLY the exact (operationId, generation, profileId) row prepared for this turn by
+    // cc5BackendSelector/ensureLane when checking `state <> 'released'`; never skip billing journals.
     try {
       if (deps.pendingBillingChecker) {
         const hasPending = await deps.pendingBillingChecker({
           uid: input.uid,
           sessionKey: input.sessionKey,
           operationId: existingPointer.operationId ?? null,
+          ...(excludeCurrentPreparedBinding ? { excludeCurrentPreparedBinding } : {}),
         })
-        if (hasPending) return null
+        if (hasPending) {
+          input.onBlocked?.('REMOTE_OPERATION_BILLING_PENDING')
+          return null
+        }
       } else if (deps.pool) {
         await assertNoPendingRemoteBillingForSession(
           deps.pool,
           input.uid,
           input.sessionKey,
           existingPointer.operationId ?? null,
+          excludeCurrentPreparedBinding ? { excludeCurrentPreparedBinding } : undefined,
         )
       }
     } catch {
+      input.onBlocked?.('REMOTE_OPERATION_BILLING_PENDING')
       return null
     }
 
-    let hasPersistedRecoveryContext = existingPointer.history.length > 0
-    if (!hasPersistedRecoveryContext) {
+    let rollingCheckpoint: Awaited<ReturnType<PgSessionAuthorityStateStore['peekRollingCheckpoint']>>
+    try {
+      rollingCheckpoint = await authorityStore.peekRollingCheckpoint(
+        input.uid,
+        input.sessionKey,
+        existingPointer.placementEpoch,
+      )
+    } catch {
+      input.onBlocked?.('AUTHORITY_CHECKPOINT_READ_FAILED')
+      return null
+    }
+    let continuityTier: ResumeLadderTier = 'cold_degraded'
+    const continuityVerifier = input.verifyContinuityApplied ?? deps.verifyContinuityApplied
+    if (rollingCheckpoint !== null && continuityVerifier) {
       try {
-        hasPersistedRecoveryContext =
-          (await authorityStore.peekRollingCheckpoint(input.uid, input.sessionKey)) !== null
+        const verified = await continuityVerifier({
+          uid: input.uid,
+          containerId: input.containerId,
+          sessionKey: input.sessionKey,
+          fromPoolKind: 'local_container',
+          toPoolKind: 'remote_pool',
+          sourcePlacementEpoch: existingPointer.placementEpoch,
+          targetPlacementEpoch: existingPointer.placementEpoch + 1,
+          checkpoint: rollingCheckpoint,
+        })
+        if (
+          verified.applied === true &&
+          verified.checkpointId === rollingCheckpoint.checkpointGeneration
+        ) {
+          continuityTier = 'tape_rebuilt'
+        }
       } catch {
-        hasPersistedRecoveryContext = false
+        continuityTier = 'cold_degraded'
       }
     }
-    const continuityTier: ResumeLadderTier = hasPersistedRecoveryContext
-      ? 'tape_rebuilt'
-      : 'cold_degraded'
 
     const fromPlacement: PlacementDescriptor = {
       poolKind: 'local_container',
@@ -649,9 +948,10 @@ export function createSelfhostReturnToRemoteGrantResolver(
     const toPlacement: PlacementDescriptor = {
       poolKind: 'remote_pool',
       engine: authEngine,
-      driverId: engineFamily,
+      driverId: backendDriverId,
       placementEpoch: existingPointer.placementEpoch + 1,
       operationId: input.executionBackend.operationId,
+      ...(backendProfileId ? { profileId: backendProfileId } : {}),
     }
 
     const begun = await authorityStore.beginPlacementMigration({
@@ -662,7 +962,38 @@ export function createSelfhostReturnToRemoteGrantResolver(
       toPlacement,
       reason: 'remote_pool_recovered_return_from_local',
     })
-    if (!begun.applied) return null
+    if (!begun.applied) {
+      input.onBlocked?.('RETURN_TO_REMOTE_MIGRATION_CONFLICT')
+      return null
+    }
+
+    const preparedGrant: CrossPoolFallbackMigrationGrant = Object.freeze({
+      migrationId: begun.migration.migrationId,
+      placementEpoch: begun.migration.toEpoch,
+      allowBackendTransition: true as const,
+      continuityTier,
+    })
+
+    if (input.beforeCommit) {
+      let commitApproved = false
+      try {
+        commitApproved = await input.beforeCommit({ migrationGrant: preparedGrant })
+      } catch {
+        commitApproved = false
+      }
+      if (!commitApproved) {
+        await authorityStore
+          .abortPlacementMigration({
+            migrationId: begun.migration.migrationId,
+            reason: 'return_to_remote_sign_validation_rejected',
+            userId: input.uid,
+            sessionKey: input.sessionKey,
+          })
+          .catch(() => {})
+        input.onBlocked?.('RETURN_TO_REMOTE_SIGN_REJECTED')
+        return null
+      }
+    }
 
     const committed = await authorityStore
       .commitPlacementMigration({
@@ -671,6 +1002,7 @@ export function createSelfhostReturnToRemoteGrantResolver(
         sessionKey: input.sessionKey,
         continuityTier,
         operationId: input.executionBackend.operationId,
+        ...(backendProfileId ? { profileId: backendProfileId } : {}),
       })
       .catch(async () => {
         await authorityStore
@@ -693,6 +1025,7 @@ export function createSelfhostReturnToRemoteGrantResolver(
           sessionKey: input.sessionKey,
         })
         .catch(() => {})
+      input.onBlocked?.('RETURN_TO_REMOTE_COMMIT_FAILED')
       return null
     }
 

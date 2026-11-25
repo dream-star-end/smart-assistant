@@ -32,7 +32,10 @@ import {
   type ResolvedLogicalModelId,
   type TurnPoolPreference,
 } from '@openclaude/protocol'
-import type { ResolvedModelPoolBindings } from '../../db/threeLayerStateStore.js'
+import type {
+  InspectedModelPoolBindings,
+  ResolvedModelPoolBindings,
+} from '../../db/threeLayerStateStore.js'
 import { rankWRH } from '../policy/select.js'
 
 export type RouterPoolPreference =
@@ -92,6 +95,7 @@ const PREFERRED_POOL_BY_PREFERENCE: Readonly<
 
 export interface LogicalModelBindingReader {
   resolveBindingsForModel(rawModelId: string): Promise<ResolvedModelPoolBindings>
+  inspectLogicalModelBindings?(rawModelId: string): Promise<InspectedModelPoolBindings>
 }
 
 export interface PoolCandidateDescriptor {

@@ -56,6 +56,7 @@ class InMemoryThreeLayerPgPool implements PgTransactionPool {
   private readonly lockQueues = new Map<string, Promise<void>>()
   beforeOnConflictUpsert?: (db: MockDbState, key: string) => void
   onAdvisoryLockAcquired?: (lockKey: string, count: number) => Promise<void> | void
+  failBindingReads = false
 
   advanceClock(ms: number): void {
     this.state.clockMs += ms
@@ -279,12 +280,16 @@ class InMemoryThreeLayerPgPool implements PgTransactionPool {
       row.active_migration_id = null
       row.pool_kind = params[3]
       row.engine = params[4]
-      row.native_session_id = params[5]
+      if (params[12] === true) row.native_session_id = params[5]
       row.operation_id = params[6]
       row.profile_id = params[7]
-      row.capsule_id = params[8]
-      row.prompt_cache_meta_json = params[9] === null ? null : JSON.parse(String(params[9]))
-      row.usage_baseline_json = params[10] === null ? null : JSON.parse(String(params[10]))
+      if (params[13] === true) row.capsule_id = params[8]
+      if (params[14] === true) {
+        row.prompt_cache_meta_json = params[9] === null ? null : JSON.parse(String(params[9]))
+      }
+      if (params[15] === true) {
+        row.usage_baseline_json = params[10] === null ? null : JSON.parse(String(params[10]))
+      }
       row.updated_at = this.nowIso(db)
       return { rows: [JSON.parse(JSON.stringify(row))], rowCount: 1 }
     }
@@ -334,8 +339,16 @@ class InMemoryThreeLayerPgPool implements PgTransactionPool {
     if (sql.includes('FROM session_rolling_checkpoints') && sql.startsWith('SELECT')) {
       const uid = String(params[0])
       const sKey = String(params[1])
+      const hasEpochFilter = sql.includes('placement_epoch = $3')
+      const expectedEpoch = hasEpochFilter ? Number(params[2]) : undefined
       const rows = [...db.checkpoints.values()]
-        .filter((r) => r.user_id === uid && r.session_key === sKey && r.acked_at === null)
+        .filter(
+          (r) =>
+            r.user_id === uid &&
+            r.session_key === sKey &&
+            r.acked_at === null &&
+            (!hasEpochFilter || Number(r.placement_epoch) === expectedEpoch),
+        )
         .sort((a, b) => {
           const cmp = String(b.created_at).localeCompare(String(a.created_at))
           if (cmp !== 0) return cmp
@@ -433,7 +446,14 @@ class InMemoryThreeLayerPgPool implements PgTransactionPool {
     }
 
     if (sql.includes('FROM model_logical_pool_bindings') && sql.startsWith('SELECT')) {
-      let rows = [...db.bindings.values()].filter((r) => r.enabled === true)
+      if (this.failBindingReads) {
+        throw new Error('MOCK_PG_BINDING_READ_ERROR')
+      }
+      const enabledOnly = sql.includes('enabled = TRUE')
+      let rows = [...db.bindings.values()]
+      if (enabledOnly) {
+        rows = rows.filter((r) => r.enabled === true)
+      }
       if (sql.includes('WHERE logical_model_id = $1')) {
         rows = rows.filter((r) => r.logical_model_id === params[0])
       }
@@ -765,6 +785,11 @@ describe('OCV5-890 Wave 1B: PgSessionAuthorityStateStore', () => {
     assert.equal(peeked?.checkpointGeneration, cp2.checkpointGeneration)
     assert.equal(peeked?.summary, 'latest checkpoint')
 
+    // B01: expectedEpoch filter matches current epoch and rejects stale/mismatched epoch.
+    const peekedEpoch1 = await store.peekRollingCheckpoint(10, 'sess-cp', 1)
+    assert.equal(peekedEpoch1?.checkpointGeneration, cp2.checkpointGeneration)
+    assert.equal(await store.peekRollingCheckpoint(10, 'sess-cp', 2), null)
+
     // Wrong generation fails CAS.
     assert.equal(
       await store.ackRollingCheckpoint({
@@ -936,6 +961,27 @@ describe('OCV5-890 Wave 1B: PgSessionAuthorityStateStore', () => {
     if (staleAfterCommit.applied) assert.fail('expected stale epoch after commit to fail')
     assert.equal(staleAfterCommit.currentEpoch, 2)
     assert.equal(staleAfterCommit.reason, 'epoch_mismatch')
+
+    // B01: Commit with omitted nativeSessionId/capsuleId/promptCacheMeta/usageBaseline MUST preserve existing values.
+    const began3 = await store.beginPlacementMigration({
+      userId: 99,
+      sessionKey: 'sess-mig',
+      expectedPlacementEpoch: 2,
+      fromPlacement: REMOTE_PLACEMENT,
+      toPlacement: { ...LOCAL_PLACEMENT, placementEpoch: 3 },
+    })
+    if (!began3.applied) assert.fail('expected third beginPlacementMigration to apply')
+    const committed3 = await store.commitPlacementMigration({
+      migrationId: began3.migration.migrationId,
+      continuityTier: 'cold_degraded',
+    })
+    if (!committed3.applied) assert.fail('expected third commitPlacementMigration to apply')
+    assert.equal(committed3.pointer.placementEpoch, 3)
+    assert.equal(committed3.pointer.poolKind, 'local_container')
+    assert.equal(committed3.pointer.nativeSessionId, 'codex-thread-2')
+    assert.equal(committed3.pointer.capsuleId, sha256Hex('cap-2'))
+    assert.deepEqual(committed3.pointer.promptCacheMeta, { affinityKey: 's-0123456789abcdef' })
+    assert.deepEqual(committed3.pointer.usageBaseline, { inputTokens: 1200, outputTokens: 300 })
   })
 
   it('serializes empty-row first upsertEnginePointer with beginPlacementMigration via shared advisory lock and enforces ON CONFLICT WHERE guard (Warning #4)', async () => {
@@ -1130,6 +1176,62 @@ describe('OCV5-890 Wave 1B: PgLogicalModelBindingStore', () => {
     assert.deepEqual(
       afterDisable.map((b) => b.driverId),
       ['local-ccb', 'remote-cc-primary'],
+    )
+  })
+
+  it('N01: inspectLogicalModelBindings strictly distinguishes unconfigured vs configured-all-disabled vs read failure', async () => {
+    const pool = new InMemoryThreeLayerPgPool()
+    const store = new PgLogicalModelBindingStore(pool)
+
+    // 1) Never configured -> status: 'unconfigured', totalCount: 0
+    const unconfigured = await store.inspectLogicalModelBindings('claude-opus-4-7')
+    assert.equal(unconfigured.status, 'unconfigured')
+    assert.equal(unconfigured.totalCount, 0)
+    assert.equal(unconfigured.enabledBindings.length, 0)
+    assert.equal(unconfigured.hasConfiguredBindings, false)
+
+    // 2) Configured with enabled + disabled bindings -> status: 'configured'
+    await store.upsertPoolBinding({
+      logicalModelId: 'claude-opus-4-7',
+      poolKind: 'local_pool',
+      driverId: 'local-cc',
+      canonicalModelId: 'claude-opus-4-7',
+      priority: 1,
+      capabilities: SAMPLE_CAPS,
+      enabled: true,
+    })
+    await store.upsertPoolBinding({
+      logicalModelId: 'claude-opus-4-7',
+      poolKind: 'remote_pool',
+      driverId: 'remote-cc',
+      canonicalModelId: 'claude-opus-4-7-remote',
+      priority: 2,
+      capabilities: SAMPLE_CAPS,
+      enabled: false,
+    })
+    const partial = await store.inspectLogicalModelBindings('claude-opus-4-7')
+    assert.equal(partial.status, 'configured')
+    assert.equal(partial.totalCount, 2)
+    assert.equal(partial.enabledBindings.length, 1)
+    assert.equal(partial.enabledBindings[0]!.driverId, 'local-cc')
+    assert.equal(partial.hasConfiguredBindings, true)
+
+    // 3) Disable the last enabled binding -> status remains 'configured' (totalCount: 2, enabledBindings: [])
+    assert.equal(
+      await store.setPoolBindingEnabled('claude-opus-4-7', 'local_pool', 'local-cc', false),
+      true,
+    )
+    const allDisabled = await store.inspectLogicalModelBindings('claude-opus-4-7')
+    assert.equal(allDisabled.status, 'configured')
+    assert.equal(allDisabled.totalCount, 2)
+    assert.equal(allDisabled.enabledBindings.length, 0)
+    assert.equal(allDisabled.hasConfiguredBindings, true)
+
+    // 4) Underlying DB read failure MUST propagate (never silently return 'unconfigured')
+    pool.failBindingReads = true
+    await assert.rejects(
+      () => store.inspectLogicalModelBindings('claude-opus-4-7'),
+      /MOCK_PG_BINDING_READ_ERROR/,
     )
   })
 })

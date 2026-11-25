@@ -50,6 +50,13 @@ import type {
   ToolBrokerServer,
 } from '../execEnv/index.js'
 import {
+  DurableSettlementCoordinator,
+  type LookupAuthoritativeSettlementFn,
+  type PendingSettlementOutbox,
+  type PendingSettlementRecord,
+  type PendingSettlementRecoveryReport,
+} from './durableSettlementStore.js'
+import {
   type AbandonResult,
   type BuildDriverCapabilityManifestOptions,
   CreditBudgetGuard,
@@ -59,8 +66,6 @@ import {
   type DriverTerminalStatus,
   type DriverTurnRequest,
   InferencePoolDriverError,
-  type PendingSettlementOutbox,
-  type PendingSettlementRecord,
   type StopLaneResult,
   type TurnSettlementInfo,
   assertAdmitEligibility,
@@ -232,8 +237,12 @@ export interface RemotePoolV5DriverOptions {
   readonly onSettleReceipt?: (
     receipt: TurnReceiptV5,
     settlement: TurnSettlementInfo,
-  ) => Promise<void> | void
+  ) => Promise<TurnReceiptV5 | void> | TurnReceiptV5 | void
   readonly pendingSettlementOutbox?: PendingSettlementOutbox
+  readonly settlementWalDir?: string
+  readonly allowEphemeralSettlementOutboxForTests?: boolean
+  readonly authoritativeSettleIdempotent?: boolean
+  readonly lookupAuthoritativeSettlement?: LookupAuthoritativeSettlementFn
   readonly probeAuthoritativeSettlement?: (billingRequestId: string) => Promise<boolean> | boolean
   readonly clock?: () => number
   readonly initialLaneGeneration?: number
@@ -358,19 +367,15 @@ export class RemotePoolV5Driver implements InferencePoolDriver {
   ) => string
   private readonly onAdmitJournal?: RemotePoolV5DriverOptions['onAdmitJournal']
   private readonly onAbandonJournal?: RemotePoolV5DriverOptions['onAbandonJournal']
-  private readonly onSettleReceipt?: RemotePoolV5DriverOptions['onSettleReceipt']
-  private readonly pendingSettlementOutbox?: PendingSettlementOutbox
-  private readonly probeAuthoritativeSettlement?: (
-    billingRequestId: string,
-  ) => Promise<boolean> | boolean
+  private readonly settlementCoordinator: DurableSettlementCoordinator
+  private readonly allowEphemeralSettlementOutboxForTests: boolean
+  private readonly authoritativeSettleIdempotent: boolean
   private readonly clock: () => number
 
   private laneGeneration: number
   private readonly admissions = new Map<string, RemoteAdmissionRecord>()
   private readonly activeByTurnId = new Map<string, RemoteAdmissionRecord>()
   private readonly operationToLease = new Map<string, string>()
-  private readonly pendingSettlements = new Map<string, PendingSettlementRecord>()
-  private readonly settlementInFlight = new Map<string, Promise<TurnReceiptV5>>()
 
   constructor(opts: RemotePoolV5DriverOptions) {
     this.manifest = validateDriverCapabilityManifest(opts.manifest)
@@ -392,9 +397,16 @@ export class RemotePoolV5Driver implements InferencePoolDriver {
     this.resolveUpstreamModel = opts.resolveUpstreamModel
     this.onAdmitJournal = opts.onAdmitJournal
     this.onAbandonJournal = opts.onAbandonJournal
-    this.onSettleReceipt = opts.onSettleReceipt
-    this.pendingSettlementOutbox = opts.pendingSettlementOutbox
-    this.probeAuthoritativeSettlement = opts.probeAuthoritativeSettlement
+    this.settlementCoordinator = new DurableSettlementCoordinator({
+      pendingSettlementOutbox: opts.pendingSettlementOutbox,
+      settlementWalDir: opts.settlementWalDir,
+      onSettleReceipt: opts.onSettleReceipt,
+      lookupAuthoritativeSettlement: opts.lookupAuthoritativeSettlement,
+      probeAuthoritativeSettlement: opts.probeAuthoritativeSettlement,
+    })
+    this.allowEphemeralSettlementOutboxForTests =
+      opts.allowEphemeralSettlementOutboxForTests === true
+    this.authoritativeSettleIdempotent = opts.authoritativeSettleIdempotent === true
     this.clock = opts.clock ?? (() => Date.now())
     this.laneGeneration = Math.max(1, Math.floor(opts.initialLaneGeneration ?? 1))
   }
@@ -585,6 +597,27 @@ export class RemotePoolV5Driver implements InferencePoolDriver {
       )
     }
 
+    // B07: Billing-enabled turns MUST have a durable pending-settlement store (`settlementWalDir`
+    // or a durable `pendingSettlementOutbox`) AND either an authoritative lookup/probe or an
+    // explicitly certified atomic idempotent writer before burning the post-dispatch fence.
+    if (this.settlementCoordinator.hasWriter && !this.allowEphemeralSettlementOutboxForTests) {
+      if (!this.settlementCoordinator.isDurable) {
+        throw new InferencePoolDriverError(
+          'DURABLE_SETTLEMENT_STORE_REQUIRED',
+          'DURABLE_SETTLEMENT_STORE_REQUIRED: settlementWalDir or durable pendingSettlementOutbox is required before dispatching a billable turn',
+        )
+      }
+      if (
+        !this.settlementCoordinator.hasAuthoritativeLookup &&
+        !this.authoritativeSettleIdempotent
+      ) {
+        throw new InferencePoolDriverError(
+          'DURABLE_SETTLEMENT_AUTHORITY_REQUIRED',
+          'DURABLE_SETTLEMENT_AUTHORITY_REQUIRED: lookupAuthoritativeSettlement/probeAuthoritativeSettlement or authoritativeSettleIdempotent=true is required before dispatching a billable turn',
+        )
+      }
+    }
+
     // Atomically burn the post-dispatch fence BEFORE returning the consumer async iterable.
     record.dispatched = true
 
@@ -647,6 +680,20 @@ export class RemotePoolV5Driver implements InferencePoolDriver {
     })()
   }
 
+  private markAdmissionSettled(
+    admissionId: string,
+    receipt: TurnReceiptV5,
+    record?: RemoteAdmissionRecord,
+  ): void {
+    const target = record ?? this.admissions.get(admissionId)
+    if (!target) return
+    target.settledOnce = true
+    target.settled = true
+    target.settledReceipt = receipt
+    target.pendingSettlement = null
+    target.activeExecutionPromise = null
+  }
+
   private async settlePendingRecord(
     pending: PendingSettlementRecord,
     record?: RemoteAdmissionRecord,
@@ -654,65 +701,42 @@ export class RemotePoolV5Driver implements InferencePoolDriver {
     if (record?.settledOnce && record.settledReceipt) {
       return record.settledReceipt
     }
-    const existingInFlight = this.settlementInFlight.get(pending.admissionId)
-    if (existingInFlight) {
-      return await existingInFlight
-    }
-    const attempt = (async () => {
-      let alreadySettled = false
-      if (this.probeAuthoritativeSettlement) {
-        alreadySettled = Boolean(await this.probeAuthoritativeSettlement(pending.billingRequestId))
-      }
-      if (!alreadySettled && this.onSettleReceipt) {
-        await this.onSettleReceipt(pending.receipt, pending.settlement)
-      }
-      if (record) {
-        record.settledOnce = true
-        record.settled = true
-        record.settledReceipt = pending.receipt
-        record.pendingSettlement = null
-      }
-      this.pendingSettlements.delete(pending.admissionId)
-      await this.pendingSettlementOutbox?.delete(pending.admissionId)
-      return pending.receipt
-    })()
-    this.settlementInFlight.set(pending.admissionId, attempt)
-    try {
-      return await attempt
-    } finally {
-      if (this.settlementInFlight.get(pending.admissionId) === attempt) {
-        this.settlementInFlight.delete(pending.admissionId)
-      }
-    }
+    const outcome = await this.settlementCoordinator.settlePending(pending, (receipt) => {
+      this.markAdmissionSettled(pending.admissionId, receipt, record)
+    })
+    return outcome.receipt
   }
 
-  async retryPendingSettlement(admissionId: string): Promise<TurnReceiptV5 | null> {
-    const record = this.admissions.get(admissionId)
+  async listPendingSettlements(): Promise<readonly PendingSettlementRecord[]> {
+    return await this.settlementCoordinator.listPending()
+  }
+
+  async retrySettlement(admissionIdOrBillingKey: string): Promise<TurnReceiptV5 | null> {
+    const record = this.admissions.get(admissionIdOrBillingKey)
     if (record?.settledOnce && record.settledReceipt) {
       return record.settledReceipt
     }
     const pending =
       record?.pendingSettlement ??
-      this.pendingSettlements.get(admissionId) ??
-      (await this.pendingSettlementOutbox?.get(admissionId)) ??
-      null
+      (await this.settlementCoordinator.findPending(admissionIdOrBillingKey))
     if (!pending) return record?.settledReceipt ?? null
-    return await this.settlePendingRecord(pending, record)
+    return await this.settlePendingRecord(pending, record ?? this.admissions.get(pending.admissionId))
+  }
+
+  async retryPendingSettlement(admissionId: string): Promise<TurnReceiptV5 | null> {
+    return await this.retrySettlement(admissionId)
+  }
+
+  async recoverPendingSettlements(): Promise<PendingSettlementRecoveryReport> {
+    return await this.settlementCoordinator.recoverPendingSettlements((pending, receipt) => {
+      this.markAdmissionSettled(pending.admissionId, receipt)
+    })
   }
 
   async reconcilePendingSettlements(): Promise<readonly TurnReceiptV5[]> {
-    const byId = new Map<string, PendingSettlementRecord>()
-    for (const [id, rec] of this.pendingSettlements) {
-      byId.set(id, rec)
-    }
-    if (this.pendingSettlementOutbox) {
-      const persisted = await this.pendingSettlementOutbox.list()
-      for (const rec of persisted) {
-        byId.set(rec.admissionId, rec)
-      }
-    }
+    const pendingList = await this.settlementCoordinator.listPending()
     const settled: TurnReceiptV5[] = []
-    for (const pending of byId.values()) {
+    for (const pending of pendingList) {
       const record = this.admissions.get(pending.admissionId)
       settled.push(await this.settlePendingRecord(pending, record))
     }
@@ -722,20 +746,27 @@ export class RemotePoolV5Driver implements InferencePoolDriver {
   async waitForSettlement(admissionId: string): Promise<TurnReceiptV5 | null> {
     const record = this.admissions.get(admissionId)
     if (!record) {
-      return await this.retryPendingSettlement(admissionId)
+      return await this.retrySettlement(admissionId)
+    }
+    if (record.settledOnce && record.settledReceipt) {
+      return record.settledReceipt
     }
     if (record.activeExecutionPromise) {
       try {
         return await record.activeExecutionPromise
       } catch (err) {
+        if (record.settledOnce && record.settledReceipt) {
+          return record.settledReceipt
+        }
         if (!record.settled && record.pendingSettlement !== null) {
-          return await this.retryPendingSettlement(admissionId)
+          record.activeExecutionPromise = null
+          return await this.retrySettlement(admissionId)
         }
         throw err
       }
     }
     if (!record.settled && record.pendingSettlement !== null) {
-      return await this.retryPendingSettlement(admissionId)
+      return await this.retrySettlement(admissionId)
     }
     return record.settledReceipt
   }
@@ -1266,30 +1297,40 @@ export class RemotePoolV5Driver implements InferencePoolDriver {
         finalizedAt: nowIso(),
       })
 
+      let finalReceipt: TurnReceiptV5 = receipt
       if (!record.settledOnce) {
-        const pending: PendingSettlementRecord = Object.freeze({
-          admissionId: record.admissionId,
-          turnId: req.turnId,
-          billingRequestId: req.requestId,
-          receipt,
-          settlement: Object.freeze({
+        if (this.settlementCoordinator.hasWriter || this.settlementCoordinator.isDurable) {
+          const pending: PendingSettlementRecord = Object.freeze({
             admissionId: record.admissionId,
             operationId: record.operationId,
-            terminalStatus,
-            cumulativeCreditsFen: budgetGuard.cumulativeCreditsFen,
-            budgetExceeded: budgetGuard.budgetExceeded,
-          }),
-        })
-        record.pendingSettlement = pending
-        this.pendingSettlements.set(record.admissionId, pending)
-        await this.pendingSettlementOutbox?.put(pending)
-        await this.settlePendingRecord(pending, record)
+            turnId: req.turnId,
+            billingRequestId: req.requestId,
+            billingIdempotencyKey: req.requestId,
+            receipt,
+            settlement: Object.freeze({
+              admissionId: record.admissionId,
+              operationId: record.operationId,
+              terminalStatus,
+              cumulativeCreditsFen: budgetGuard.cumulativeCreditsFen,
+              budgetExceeded: budgetGuard.budgetExceeded,
+            }),
+            status: 'pending' as const,
+            createdAt: nowIso(),
+          })
+          record.pendingSettlement = pending
+          await this.settlementCoordinator.persistPending(pending)
+          finalReceipt = await this.settlePendingRecord(pending, record)
+        } else {
+          this.markAdmissionSettled(record.admissionId, receipt, record)
+        }
+      } else if (record.settledReceipt) {
+        finalReceipt = record.settledReceipt
       }
 
       emitConsumerEvent({
         kind: 'billing_receipt',
         turnId: req.turnId,
-        receipt,
+        receipt: finalReceipt,
         seq: ++seq,
         ts: nowIso(),
       })
@@ -1298,13 +1339,13 @@ export class RemotePoolV5Driver implements InferencePoolDriver {
         kind: 'turn_terminal',
         turnId: req.turnId,
         terminalId,
-        status: receipt.status,
-        ...(receipt.errorCode === undefined ? {} : { errorCode: receipt.errorCode }),
+        status: finalReceipt.status,
+        ...(finalReceipt.errorCode === undefined ? {} : { errorCode: finalReceipt.errorCode }),
         seq: ++seq,
         ts: nowIso(),
       })
 
-      return receipt
+      return finalReceipt
     } catch (err) {
       backgroundError = err
       throw err

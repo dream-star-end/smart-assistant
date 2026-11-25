@@ -55,6 +55,11 @@ import {
   ScopedCapabilityTokenError,
   type ScopedCapabilityTokenAuthority,
 } from './scopedCapabilityToken.js'
+import {
+  ToolBrokerDiskSpillStore,
+  type DiskSpillReadResult,
+  type VerifiedSpillBlobPayload,
+} from './toolBrokerDiskSpill.js'
 
 export const TOOL_BROKER_DEFAULT_MAX_CONCURRENCY = 8
 export const TOOL_BROKER_DEFAULT_MAX_INLINE_PAYLOAD_BYTES = 256 * 1024
@@ -95,6 +100,7 @@ export interface SpilledBlobRefOutput {
   readonly sha256: string
   readonly mimeType: string
   readonly bytes: number
+  readonly byteLength?: number
 }
 
 export interface DetachedApprovalCard {
@@ -165,6 +171,31 @@ export type ToolSpillBlobFn = (
   readonly bytes?: number
 }>
 
+export type ToolReadSpilledBlobFn = (
+  blobId: string,
+  expectedSha256?: string,
+) =>
+  | Promise<{ readonly bytes: Uint8Array; readonly mimeType: string; readonly sha256?: string } | null>
+  | { readonly bytes: Uint8Array; readonly mimeType: string; readonly sha256?: string }
+  | null
+
+export interface ToolBrokerDurableWalAdapter {
+  readonly durable: true
+  writeAttempt(record: DiskWalAttemptRecord): 'created' | 'exists'
+  writeResult(record: DiskWalResultRecord): void
+  readAttempt(idempotencyKey: string): DiskWalAttemptRecord | null
+  readResult(idempotencyKey: string): DiskWalResultRecord | null
+  writeSpilledBlob?(
+    blobId: string,
+    bytes: Uint8Array,
+    meta: { readonly sha256: string; readonly mimeType: string; readonly byteLength: number },
+  ): void
+  readSpilledBlob?(
+    blobId: string,
+    expectedSha256?: string,
+  ): { readonly bytes: Uint8Array; readonly mimeType: string; readonly sha256?: string } | null
+}
+
 export interface ToolBrokerServerOptions {
   readonly channelKind?: ExecEnvChannelKind
   readonly leaseManager?: ExecEnvLeaseManager
@@ -183,10 +214,13 @@ export interface ToolBrokerServerOptions {
   readonly maxConcurrentToolCalls?: number
   readonly maxInlinePayloadBytes?: number
   readonly spillBlob?: ToolSpillBlobFn
+  readonly readSpilledBlob?: ToolReadSpilledBlobFn
   readonly walDir?: string
+  readonly durableWalAdapter?: ToolBrokerDurableWalAdapter
   /**
-   * B13: By default, non-readOnly (side-effecting) tools require a persistent `walDir` so
-   * crashes/restarts never re-execute side effects. Explicit opt-in only for ephemeral unit tests.
+   * B13: By default, non-readOnly (side-effecting) tools require a persistent `walDir` or
+   * `durableWalAdapter` so crashes/restarts never re-execute side effects. Explicit opt-in only
+   * for ephemeral unit tests.
    */
   readonly allowEphemeralSideEffects?: boolean
   readonly clock?: () => number
@@ -201,7 +235,7 @@ interface WalEntry {
   receipt?: ToolBrokerResultEnvelope
 }
 
-interface DiskWalAttemptRecord {
+export interface DiskWalAttemptRecord {
   readonly schemaVersion: 1
   readonly idempotencyKey: string
   readonly callId: string
@@ -212,7 +246,7 @@ interface DiskWalAttemptRecord {
   readonly createdAtMs: number
 }
 
-interface DiskWalResultRecord {
+export interface DiskWalResultRecord {
   readonly schemaVersion: 1
   readonly idempotencyKey: string
   readonly callId: string
@@ -412,7 +446,10 @@ export class ToolBrokerServer implements ToolBrokerTransport {
   private readonly approvalHandler?: ToolApprovalHandler
   private readonly onDetachedApprovalCard?: (card: DetachedApprovalCard) => void
   private readonly spillBlob?: ToolSpillBlobFn
+  private readonly readSpilledBlob?: ToolReadSpilledBlobFn
   private readonly walDir?: string
+  private readonly durableWalAdapter?: ToolBrokerDurableWalAdapter
+  private readonly diskSpillStore?: ToolBrokerDiskSpillStore
   private readonly allowEphemeralSideEffects: boolean
   private readonly clock: () => number
 
@@ -420,7 +457,10 @@ export class ToolBrokerServer implements ToolBrokerTransport {
   private readonly policies = new Map<string, ExecutionPolicyEnvelope>()
   private readonly wal = new Map<string, WalEntry>()
   private readonly inFlight = new Map<string, InFlightCall>()
-  private readonly fallbackSpillStore = new Map<string, { bytes: Uint8Array; mimeType: string }>()
+  private readonly fallbackSpillStore = new Map<
+    string,
+    { bytes: Uint8Array; mimeType: string; sha256: string; byteLength: number }
+  >()
   private readonly semaphore: AsyncSemaphore
   private peakConcurrency = 0
 
@@ -453,6 +493,7 @@ export class ToolBrokerServer implements ToolBrokerTransport {
       Math.floor(opts.maxInlinePayloadBytes ?? TOOL_BROKER_DEFAULT_MAX_INLINE_PAYLOAD_BYTES),
     )
     this.spillBlob = opts.spillBlob
+    this.readSpilledBlob = opts.readSpilledBlob
     if (typeof opts.walDir === 'string' && opts.walDir.trim().length > 0) {
       const resolvedWalDir = resolve(opts.walDir)
       mkdirSync(resolvedWalDir, { recursive: true, mode: 0o700 })
@@ -464,10 +505,34 @@ export class ToolBrokerServer implements ToolBrokerTransport {
         )
       }
       this.walDir = resolvedWalDir
+      this.diskSpillStore = new ToolBrokerDiskSpillStore(resolvedWalDir)
+    }
+    if (opts.durableWalAdapter?.durable === true) {
+      this.durableWalAdapter = opts.durableWalAdapter
     }
     this.allowEphemeralSideEffects = opts.allowEphemeralSideEffects === true
     this.clock = opts.clock ?? (() => Date.now())
     this.semaphore = new AsyncSemaphore(this.maxConcurrentToolCalls)
+  }
+
+  get hasDurableWal(): boolean {
+    return this.walDir !== undefined || this.durableWalAdapter !== undefined
+  }
+
+  get hasDurableSpillStorage(): boolean {
+    // B13: Reject unpaired external spillBlob override (writer without matching reader),
+    // which would otherwise write to external storage while public reads hit a different store.
+    if (this.spillBlob !== undefined) {
+      return this.readSpilledBlob !== undefined
+    }
+    if (this.walDir !== undefined) return true
+    if (
+      typeof this.durableWalAdapter?.writeSpilledBlob === 'function' &&
+      typeof this.durableWalAdapter?.readSpilledBlob === 'function'
+    ) {
+      return true
+    }
+    return false
   }
 
   registerTool(def: RegisteredToolDefinition): void {
@@ -510,120 +575,154 @@ export class ToolBrokerServer implements ToolBrokerTransport {
     return this.policies.get(leaseId) ?? this.defaultPolicy ?? null
   }
 
-  getSpilledBlob(blobId: string): { readonly bytes: Uint8Array; readonly mimeType: string } | null {
-    const cached = this.fallbackSpillStore.get(blobId)
-    if (cached) return cached
-    if (this.walDir === undefined || !SAFE_WAL_KEY_RE.test(blobId)) {
-      return null
-    }
-    const spillDir = join(this.walDir, 'spilled')
-    const metaPath = join(spillDir, `${blobId}.meta.json`)
-    const binPath = join(spillDir, `${blobId}.bin`)
-    const metaFile = readRegularJsonFileSync<{
-      readonly sha256?: unknown
-      readonly mimeType?: unknown
-      readonly bytes?: unknown
-    }>(metaPath)
-    if (!metaFile.exists || metaFile.corrupt || !metaFile.data) {
-      return null
-    }
-    const expectedSha = metaFile.data.sha256
-    const mimeType = metaFile.data.mimeType
-    const expectedBytes = metaFile.data.bytes
-    if (
-      typeof expectedSha !== 'string' ||
-      !/^[a-f0-9]{64}$/.test(expectedSha) ||
-      typeof mimeType !== 'string' ||
-      mimeType.length === 0 ||
-      typeof expectedBytes !== 'number'
-    ) {
-      return null
-    }
-    let fd: number | undefined
-    try {
-      const link = lstatSync(binPath)
-      if (!link.isFile() || link.isSymbolicLink()) return null
-      fd = openSync(binPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
-      const raw = readFileSync(fd)
-      if (raw.byteLength !== expectedBytes) return null
-      const actualSha = createHash('sha256').update(raw).digest('hex')
-      if (actualSha !== expectedSha) return null
-      const entry = { bytes: new Uint8Array(raw), mimeType }
-      this.fallbackSpillStore.set(blobId, entry)
-      return entry
-    } catch {
-      return null
-    } finally {
-      if (fd !== undefined) {
-        try {
-          closeSync(fd)
-        } catch {}
+  getSpilledBlob(
+    blobIdOrSha256: string,
+  ): {
+    readonly bytes: Uint8Array
+    readonly mimeType: string
+    readonly sha256?: string
+    readonly byteLength?: number
+  } | null {
+    if (this.diskSpillStore !== undefined) {
+      const diskRes = this.diskSpillStore.readAndVerifySync({ blobId: blobIdOrSha256 })
+      if (!diskRes.ok) {
+        return null
+      }
+      return {
+        bytes: diskRes.bytes,
+        mimeType: diskRes.mimeType,
+        sha256: diskRes.sha256,
+        byteLength: diskRes.byteLength,
       }
     }
+    if (typeof this.durableWalAdapter?.readSpilledBlob === 'function') {
+      const stored = this.durableWalAdapter.readSpilledBlob(blobIdOrSha256)
+      if (!stored) return null
+      const actualSha = createHash('sha256').update(stored.bytes).digest('hex')
+      if (stored.sha256 !== undefined && actualSha !== stored.sha256) return null
+      return {
+        bytes: new Uint8Array(stored.bytes),
+        mimeType: stored.mimeType,
+        sha256: actualSha,
+        byteLength: stored.bytes.byteLength,
+      }
+    }
+    return this.fallbackSpillStore.get(blobIdOrSha256) ?? null
   }
 
-  private persistSpilledBlobToDiskSync(
-    blobId: string,
-    bytes: Uint8Array,
-    sha256: string,
-    mimeType: string,
-  ): void {
-    if (this.walDir === undefined) return
-    const spillDir = join(this.walDir, 'spilled')
-    mkdirSync(spillDir, { recursive: true, mode: 0o700 })
-    const st = lstatSync(spillDir)
-    if (!st.isDirectory() || st.isSymbolicLink()) {
+  readSpilledBlobVerified(blobIdOrRef: string | SpilledBlobRefOutput): VerifiedSpillBlobPayload {
+    const query: {
+      readonly blobId: string
+      readonly sha256?: string
+      readonly expectedBytes?: number
+      readonly fallbackMimeType?: string
+    } =
+      typeof blobIdOrRef === 'string'
+        ? { blobId: blobIdOrRef }
+        : {
+            blobId: blobIdOrRef.blobId,
+            sha256: blobIdOrRef.sha256,
+            expectedBytes: blobIdOrRef.byteLength ?? blobIdOrRef.bytes,
+            fallbackMimeType: blobIdOrRef.mimeType,
+          }
+    if (this.diskSpillStore !== undefined) {
+      const diskRes: DiskSpillReadResult = this.diskSpillStore.readAndVerifySync(query)
+      if (!diskRes.ok) {
+        throw new ToolBrokerPolicyError(diskRes.errorCode, diskRes.message)
+      }
+      return {
+        blobId: diskRes.blobId,
+        sha256: diskRes.sha256,
+        mimeType: diskRes.mimeType,
+        bytes: diskRes.bytes,
+        byteLength: diskRes.byteLength,
+      }
+    }
+    if (typeof this.durableWalAdapter?.readSpilledBlob === 'function') {
+      const stored = this.durableWalAdapter.readSpilledBlob(query.blobId, query.sha256)
+      if (!stored) {
+        throw new ToolBrokerPolicyError(
+          'TOOL_SPILLED_BLOB_MISSING',
+          `Spilled blob "${query.blobId}" not found in durable WAL adapter spill store`,
+        )
+      }
+      return this.verifySpillBytesOrThrow(query, stored)
+    }
+    const mem = this.fallbackSpillStore.get(query.blobId)
+    if (!mem) {
       throw new ToolBrokerPolicyError(
-        'TOOL_WAL_DIR_INVALID',
-        `Spill directory path is not a regular directory: ${spillDir}`,
+        'TOOL_SPILLED_BLOB_MISSING',
+        `Spilled blob "${query.blobId}" not found in memory spill store`,
       )
     }
-    const binPath = join(spillDir, `${blobId}.bin`)
-    const tmpBin = join(spillDir, `.${blobId}.${randomUUID()}.bin.tmp`)
-    const metaPath = join(spillDir, `${blobId}.meta.json`)
-    const tmpMeta = join(spillDir, `.${blobId}.${randomUUID()}.meta.tmp`)
+    return this.verifySpillBytesOrThrow(query, mem)
+  }
 
-    const writeAtomic = (tmpPath: string, finalPath: string, data: Uint8Array | Buffer): void => {
-      let fd: number | undefined
-      try {
-        fd = openSync(
-          tmpPath,
-          fsConstants.O_CREAT |
-            fsConstants.O_EXCL |
-            fsConstants.O_WRONLY |
-            (fsConstants.O_NOFOLLOW ?? 0),
-          0o600,
+  async readSpilledBlobVerifiedAsync(
+    blobIdOrRef: string | SpilledBlobRefOutput,
+  ): Promise<VerifiedSpillBlobPayload> {
+    const query: {
+      readonly blobId: string
+      readonly sha256?: string
+      readonly expectedBytes?: number
+      readonly fallbackMimeType?: string
+    } =
+      typeof blobIdOrRef === 'string'
+        ? { blobId: blobIdOrRef }
+        : {
+            blobId: blobIdOrRef.blobId,
+            sha256: blobIdOrRef.sha256,
+            expectedBytes: blobIdOrRef.byteLength ?? blobIdOrRef.bytes,
+            fallbackMimeType: blobIdOrRef.mimeType,
+          }
+    if (this.readSpilledBlob !== undefined) {
+      const stored = await this.readSpilledBlob(query.blobId, query.sha256)
+      if (!stored) {
+        throw new ToolBrokerPolicyError(
+          'TOOL_SPILLED_BLOB_MISSING',
+          `Spilled blob "${query.blobId}" not found in configured readSpilledBlob store`,
         )
-        let offset = 0
-        while (offset < data.byteLength) {
-          offset += writeSync(fd, data, offset, data.byteLength - offset)
-        }
-        fsyncSync(fd)
-      } catch (err) {
-        try {
-          unlinkSync(tmpPath)
-        } catch {}
-        throw err
-      } finally {
-        if (fd !== undefined) {
-          try {
-            closeSync(fd)
-          } catch {}
-        }
       }
-      renameSync(tmpPath, finalPath)
+      return this.verifySpillBytesOrThrow(query, stored)
     }
+    return this.readSpilledBlobVerified(blobIdOrRef)
+  }
 
-    writeAtomic(tmpBin, binPath, bytes)
-    writeAtomic(
-      tmpMeta,
-      metaPath,
-      Buffer.from(
-        JSON.stringify({ sha256, mimeType, bytes: bytes.byteLength }),
-        'utf8',
-      ),
-    )
-    fsyncDirSync(spillDir)
+  private verifySpillBytesOrThrow(
+    query: {
+      readonly blobId: string
+      readonly sha256?: string
+      readonly expectedBytes?: number
+      readonly fallbackMimeType?: string
+    },
+    stored: { readonly bytes: Uint8Array; readonly mimeType: string; readonly sha256?: string },
+  ): VerifiedSpillBlobPayload {
+    if (query.expectedBytes !== undefined && stored.bytes.byteLength !== query.expectedBytes) {
+      throw new ToolBrokerPolicyError(
+        'TOOL_SPILLED_BLOB_CORRUPT',
+        `Spilled blob "${query.blobId}" byte length mismatch: expected ${query.expectedBytes}, got ${stored.bytes.byteLength}`,
+      )
+    }
+    const actualSha = createHash('sha256').update(stored.bytes).digest('hex')
+    if (stored.sha256 !== undefined && actualSha !== stored.sha256) {
+      throw new ToolBrokerPolicyError(
+        'TOOL_SPILLED_BLOB_CORRUPT',
+        `Spilled blob "${query.blobId}" metadata SHA-256 mismatch`,
+      )
+    }
+    if (query.sha256 !== undefined && actualSha !== query.sha256) {
+      throw new ToolBrokerPolicyError(
+        'TOOL_SPILLED_BLOB_CORRUPT',
+        `Spilled blob "${query.blobId}" SHA-256 mismatch`,
+      )
+    }
+    return {
+      blobId: query.blobId,
+      sha256: actualSha,
+      mimeType: stored.mimeType || query.fallbackMimeType || 'application/octet-stream',
+      bytes: new Uint8Array(stored.bytes),
+      byteLength: stored.bytes.byteLength,
+    }
   }
 
   get observedPeakConcurrency(): number {
@@ -991,7 +1090,7 @@ export class ToolBrokerServer implements ToolBrokerTransport {
       })
     }
 
-    const preCheckReplay = this.checkExistingWal(
+    const preCheckReplay = await this.checkExistingWal(
       idempotencyKey,
       expectedArgsSha256,
       call,
@@ -1024,8 +1123,54 @@ export class ToolBrokerServer implements ToolBrokerTransport {
         this.peakConcurrency = this.semaphore.currentActive
       }
 
-      // Atomic pre-side-effect fencing re-validation (B12): after approval & semaphore wait,
-      // immediately BEFORE writing WAL attempt or invoking handler, re-verify lease & fencingToken.
+      // Re-check WAL atomically BEFORE final synchronous fencing check and attempt creation.
+      const postAcquireReplay = await this.checkExistingWal(
+        idempotencyKey,
+        expectedArgsSha256,
+        call,
+        approvalStatus,
+        makeResult,
+      )
+      if (postAcquireReplay !== null) {
+        return postAcquireReplay
+      }
+
+      // B13: Side-effecting tools MUST NOT execute without a persistent WAL (`walDir` or
+      // `durableWalAdapter`) AND durable paired spill storage (to prevent dangling spilled receipts
+      // after restart) unless explicitly opted into ephemeral test mode.
+      if (
+        toolDef.readOnly !== true &&
+        !this.hasDurableWal &&
+        !this.allowEphemeralSideEffects
+      ) {
+        return makeResult({
+          idempotencyKey,
+          status: 'denied',
+          isError: true,
+          errorCode: 'TOOL_BROKER_DURABLE_WAL_REQUIRED',
+          errorMessage: `Side-effecting tool "${call.canonicalName}" requires a persistent WAL (walDir or durableWalAdapter) before execution`,
+          approvalStatus,
+        })
+      }
+
+      if (
+        toolDef.readOnly !== true &&
+        !this.hasDurableSpillStorage &&
+        !this.allowEphemeralSideEffects
+      ) {
+        return makeResult({
+          idempotencyKey,
+          status: 'denied',
+          isError: true,
+          errorCode: 'TOOL_BROKER_DURABLE_SPILL_REQUIRED',
+          errorMessage: `Side-effecting tool "${call.canonicalName}" requires durable paired spilled payload storage (walDir, paired spillBlob+readSpilledBlob, or durableWalAdapter writeSpilledBlob+readSpilledBlob)`,
+          approvalStatus,
+        })
+      }
+
+      // Atomic pre-side-effect fencing re-validation (B12 / R2): runs synchronously AFTER
+      // all async approval/semaphore/WAL replay awaits and IMMEDIATELY BEFORE writing the
+      // durable attempt marker or invoking the handler (zero `await`s in between).
       if (this.leaseManager && (this.requireFencingToken || call.fencingToken !== undefined)) {
         if (!call.fencingToken) {
           return makeResult({
@@ -1053,39 +1198,9 @@ export class ToolBrokerServer implements ToolBrokerTransport {
         }
       }
 
-      // Re-check WAL atomically right before creating the durable attempt marker.
-      const postAcquireReplay = this.checkExistingWal(
-        idempotencyKey,
-        expectedArgsSha256,
-        call,
-        approvalStatus,
-        makeResult,
-      )
-      if (postAcquireReplay !== null) {
-        return postAcquireReplay
-      }
-
-      // B13: Side-effecting tools MUST NOT execute without a persistent WAL directory unless
-      // explicitly opted into ephemeral test mode.
-      if (
-        toolDef.readOnly !== true &&
-        this.walDir === undefined &&
-        !this.allowEphemeralSideEffects
-      ) {
-        return makeResult({
-          idempotencyKey,
-          status: 'denied',
-          isError: true,
-          errorCode: 'TOOL_BROKER_DURABLE_WAL_REQUIRED',
-          errorMessage: `Side-effecting tool "${call.canonicalName}" requires a persistent walDir before execution`,
-          approvalStatus,
-        })
-      }
-
-      // Persist durable disk WAL attempt (O_CREAT | O_EXCL | O_NOFOLLOW | O_WRONLY + fsync + dir fsync)
-      // BEFORE running any side-effect handler.
-      if (this.walDir !== undefined) {
-        const attemptStatus = this.writeDiskWalAttemptSync({
+      // Persist durable WAL attempt BEFORE running any side-effect handler.
+      if (this.hasDurableWal) {
+        const attemptStatus = this.writeDurableWalAttemptSync({
           schemaVersion: 1,
           idempotencyKey,
           callId: call.callId,
@@ -1096,7 +1211,7 @@ export class ToolBrokerServer implements ToolBrokerTransport {
           createdAtMs: this.clock(),
         })
         if (attemptStatus === 'exists') {
-          const raced = this.checkExistingWal(
+          const raced = await this.checkExistingWal(
             idempotencyKey,
             expectedArgsSha256,
             call,
@@ -1169,27 +1284,53 @@ export class ToolBrokerServer implements ToolBrokerTransport {
         if (this.spillBlob) {
           const spilled = await this.spillBlob(serialized.bytes, serialized.mimeType)
           spilledBlobId = spilled.blobId
+          const byteLength = spilled.bytes ?? serialized.bytes.byteLength
           const ref: SpilledBlobRefOutput = {
             type: 'blob_ref',
             blobId: spilled.blobId,
             sha256: spilled.sha256 ?? computedSha256,
             mimeType: spilled.mimeType ?? serialized.mimeType,
-            bytes: spilled.bytes ?? serialized.bytes.byteLength,
+            bytes: byteLength,
+            byteLength,
+          }
+          finalOutput = ref
+        } else if (this.diskSpillStore !== undefined) {
+          const persisted = this.diskSpillStore.persistSync(serialized.bytes, serialized.mimeType)
+          spilledBlobId = persisted.blobId
+          const ref: SpilledBlobRefOutput = {
+            type: 'blob_ref',
+            blobId: persisted.blobId,
+            sha256: persisted.sha256,
+            mimeType: persisted.mimeType,
+            bytes: persisted.bytes,
+            byteLength: persisted.byteLength,
+          }
+          finalOutput = ref
+        } else if (typeof this.durableWalAdapter?.writeSpilledBlob === 'function') {
+          const blobId = `blob_${computedSha256}`
+          const byteLength = serialized.bytes.byteLength
+          this.durableWalAdapter.writeSpilledBlob(blobId, serialized.bytes, {
+            sha256: computedSha256,
+            mimeType: serialized.mimeType,
+            byteLength,
+          })
+          spilledBlobId = blobId
+          const ref: SpilledBlobRefOutput = {
+            type: 'blob_ref',
+            blobId,
+            sha256: computedSha256,
+            mimeType: serialized.mimeType,
+            bytes: byteLength,
+            byteLength,
           }
           finalOutput = ref
         } else {
-          const blobId = `blob_${computedSha256.slice(0, 24)}`
-          if (this.walDir !== undefined) {
-            this.persistSpilledBlobToDiskSync(
-              blobId,
-              serialized.bytes,
-              computedSha256,
-              serialized.mimeType,
-            )
-          }
+          const blobId = `blob_${computedSha256}`
           this.fallbackSpillStore.set(blobId, {
             bytes: serialized.bytes,
             mimeType: serialized.mimeType,
+            sha256: computedSha256,
+            byteLength: serialized.bytes.byteLength,
           })
           spilledBlobId = blobId
           const ref: SpilledBlobRefOutput = {
@@ -1198,6 +1339,7 @@ export class ToolBrokerServer implements ToolBrokerTransport {
             sha256: computedSha256,
             mimeType: serialized.mimeType,
             bytes: serialized.bytes.byteLength,
+            byteLength: serialized.bytes.byteLength,
           }
           finalOutput = ref
         }
@@ -1211,8 +1353,8 @@ export class ToolBrokerServer implements ToolBrokerTransport {
         replayStatus: 'executed',
         approvalStatus,
       })
-      if (this.walDir !== undefined) {
-        this.writeDiskWalResultSync({
+      if (this.hasDurableWal) {
+        this.writeDurableWalResultSync({
           schemaVersion: 1,
           idempotencyKey,
           callId: call.callId,
@@ -1255,8 +1397,8 @@ export class ToolBrokerServer implements ToolBrokerTransport {
         approvalStatus,
       })
       if (walEntry !== null) {
-        if (this.walDir !== undefined) {
-          this.writeDiskWalResultSync({
+        if (this.hasDurableWal) {
+          this.writeDurableWalResultSync({
             schemaVersion: 1,
             idempotencyKey,
             callId: call.callId,
@@ -1279,7 +1421,123 @@ export class ToolBrokerServer implements ToolBrokerTransport {
     }
   }
 
-  private checkExistingWal(
+  private async verifyReplayedSpilledReceipt(
+    receipt: ToolBrokerResultEnvelope,
+  ): Promise<
+    | { readonly ok: true }
+    | {
+        readonly ok: false
+        readonly errorCode: 'TOOL_SPILLED_BLOB_MISSING' | 'TOOL_SPILLED_BLOB_CORRUPT'
+        readonly message: string
+      }
+  > {
+    const replayBlobId = receipt.spilledBlobId
+    if (typeof replayBlobId !== 'string' || replayBlobId.length === 0) {
+      return { ok: true }
+    }
+    const outRef =
+      receipt.output !== null &&
+      typeof receipt.output === 'object' &&
+      (receipt.output as Partial<SpilledBlobRefOutput>).type === 'blob_ref'
+        ? (receipt.output as Partial<SpilledBlobRefOutput>)
+        : null
+    const expectedSha = typeof outRef?.sha256 === 'string' ? outRef.sha256 : undefined
+    const expectedBytes =
+      typeof outRef?.byteLength === 'number'
+        ? outRef.byteLength
+        : typeof outRef?.bytes === 'number'
+          ? outRef.bytes
+          : undefined
+    const fallbackMimeType = typeof outRef?.mimeType === 'string' ? outRef.mimeType : undefined
+
+    if (this.readSpilledBlob !== undefined) {
+      try {
+        const stored = await this.readSpilledBlob(replayBlobId, expectedSha)
+        if (!stored) {
+          return {
+            ok: false,
+            errorCode: 'TOOL_SPILLED_BLOB_MISSING',
+            message: `Persisted spilled blob "${replayBlobId}" is missing from readSpilledBlob store`,
+          }
+        }
+        this.verifySpillBytesOrThrow(
+          { blobId: replayBlobId, sha256: expectedSha, expectedBytes, fallbackMimeType },
+          stored,
+        )
+        return { ok: true }
+      } catch (err) {
+        if (err instanceof ToolBrokerPolicyError && err.code === 'TOOL_SPILLED_BLOB_CORRUPT') {
+          return { ok: false, errorCode: 'TOOL_SPILLED_BLOB_CORRUPT', message: err.message }
+        }
+        return {
+          ok: false,
+          errorCode: 'TOOL_SPILLED_BLOB_MISSING',
+          message: err instanceof Error ? err.message : String(err),
+        }
+      }
+    }
+
+    if (this.spillBlob !== undefined) {
+      // B13: External spill writer without matching reader cannot verify persisted bytes;
+      // only permitted in explicit ephemeral test mode.
+      if (this.allowEphemeralSideEffects) {
+        return { ok: true }
+      }
+      return {
+        ok: false,
+        errorCode: 'TOOL_SPILLED_BLOB_MISSING',
+        message: `Spilled blob "${replayBlobId}" cannot be verified because external spillBlob lacks a paired readSpilledBlob reader`,
+      }
+    }
+
+    if (this.diskSpillStore !== undefined) {
+      const verified = this.diskSpillStore.readAndVerifySync({
+        blobId: replayBlobId,
+        sha256: expectedSha,
+        expectedBytes,
+        fallbackMimeType,
+      })
+      if (!verified.ok) {
+        return { ok: false, errorCode: verified.errorCode, message: verified.message }
+      }
+      return { ok: true }
+    }
+
+    if (typeof this.durableWalAdapter?.readSpilledBlob === 'function') {
+      try {
+        const stored = this.durableWalAdapter.readSpilledBlob(replayBlobId, expectedSha)
+        if (!stored) {
+          return {
+            ok: false,
+            errorCode: 'TOOL_SPILLED_BLOB_MISSING',
+            message: `Persisted spilled blob "${replayBlobId}" is missing from durable WAL adapter`,
+          }
+        }
+        this.verifySpillBytesOrThrow(
+          { blobId: replayBlobId, sha256: expectedSha, expectedBytes, fallbackMimeType },
+          stored,
+        )
+        return { ok: true }
+      } catch (err) {
+        if (err instanceof ToolBrokerPolicyError && err.code === 'TOOL_SPILLED_BLOB_CORRUPT') {
+          return { ok: false, errorCode: 'TOOL_SPILLED_BLOB_CORRUPT', message: err.message }
+        }
+        return {
+          ok: false,
+          errorCode: 'TOOL_SPILLED_BLOB_MISSING',
+          message: err instanceof Error ? err.message : String(err),
+        }
+      }
+    }
+
+    return {
+      ok: false,
+      errorCode: 'TOOL_SPILLED_BLOB_MISSING',
+      message: `No durable spill store configured to verify replayed blob "${replayBlobId}"`,
+    }
+  }
+
+  private async checkExistingWal(
     idempotencyKey: string,
     expectedArgsSha256: string,
     call: ToolBrokerInvokeRequest,
@@ -1290,7 +1548,7 @@ export class ToolBrokerServer implements ToolBrokerTransport {
         'schemaVersion' | 'leaseId' | 'turnId' | 'callId' | 'idempotencyKey' | 'durationMs'
       > & { idempotencyKey?: string },
     ) => ToolBrokerResultEnvelope,
-  ): ToolBrokerResultEnvelope | null {
+  ): Promise<ToolBrokerResultEnvelope | null> {
     const existingWal = this.wal.get(idempotencyKey)
     if (existingWal) {
       if (existingWal.argsSchemaSha256 !== expectedArgsSha256) {
@@ -1316,6 +1574,60 @@ export class ToolBrokerServer implements ToolBrokerTransport {
       })
     }
 
+    if (this.durableWalAdapter !== undefined) {
+      const adapterResult = this.durableWalAdapter.readResult(idempotencyKey)
+      if (adapterResult !== null) {
+        if (adapterResult.argsSchemaSha256 !== expectedArgsSha256) {
+          throw new ToolBrokerPolicyError(
+            'TOOL_IDEMPOTENCY_ARGS_CONFLICT',
+            `Persisted WAL receipt for "${idempotencyKey}" has mismatched argsSchemaSha256`,
+          )
+        }
+        const spillCheck = await this.verifyReplayedSpilledReceipt(adapterResult.receipt)
+        if (!spillCheck.ok) {
+          return makeResult({
+            idempotencyKey,
+            status: 'error',
+            isError: true,
+            errorCode: spillCheck.errorCode,
+            errorMessage: spillCheck.message,
+            replayStatus: 'unknown_effect_fenced',
+            approvalStatus,
+          })
+        }
+        this.wal.set(idempotencyKey, {
+          idempotencyKey,
+          leaseId: adapterResult.leaseId,
+          callId: adapterResult.callId,
+          argsSchemaSha256: adapterResult.argsSchemaSha256,
+          state: 'completed',
+          receipt: adapterResult.receipt,
+        })
+        return {
+          ...adapterResult.receipt,
+          replayStatus: 'cached_receipt',
+        }
+      }
+      const adapterAttempt = this.durableWalAdapter.readAttempt(idempotencyKey)
+      if (adapterAttempt !== null) {
+        if (adapterAttempt.argsSchemaSha256 !== expectedArgsSha256) {
+          throw new ToolBrokerPolicyError(
+            'TOOL_IDEMPOTENCY_ARGS_CONFLICT',
+            `Persisted WAL attempt for "${idempotencyKey}" has mismatched argsSchemaSha256`,
+          )
+        }
+        return makeResult({
+          idempotencyKey,
+          status: 'error',
+          isError: true,
+          errorCode: 'UNKNOWN_EFFECT_FENCED',
+          errorMessage: `Persisted WAL attempt for ${call.callId} (${idempotencyKey}) has no committed result; refusing fail-closed replay`,
+          replayStatus: 'unknown_effect_fenced',
+          approvalStatus,
+        })
+      }
+    }
+
     if (this.walDir !== undefined) {
       const safeKey = walSafeKey(idempotencyKey)
       const resultPath = join(this.walDir, `${safeKey}.result.json`)
@@ -1338,21 +1650,17 @@ export class ToolBrokerServer implements ToolBrokerTransport {
             `Persisted WAL receipt for "${idempotencyKey}" has mismatched argsSchemaSha256`,
           )
         }
-        // B13: When replaying a spilled receipt without an external spillBlob store, verify the
-        // persisted disk spill payload is readable and hash-intact before returning cached_receipt.
-        const replayBlobId = resultFile.data.receipt.spilledBlobId
-        if (
-          typeof replayBlobId === 'string' &&
-          replayBlobId.length > 0 &&
-          !this.spillBlob &&
-          this.getSpilledBlob(replayBlobId) === null
-        ) {
+        // B13: Verify persisted spilled payload (canonical `<walDir>/spill/<sha256>.bin` or
+        // legacy `<walDir>/spilled/<legacyBlobId>.bin`) matches receipt SHA-256 and byte length
+        // before returning cached_receipt.
+        const spillCheck = await this.verifyReplayedSpilledReceipt(resultFile.data.receipt)
+        if (!spillCheck.ok) {
           return makeResult({
             idempotencyKey,
             status: 'error',
             isError: true,
-            errorCode: 'TOOL_SPILLED_BLOB_MISSING',
-            errorMessage: `Persisted spilled output blob "${replayBlobId}" for ${idempotencyKey} is missing or corrupted`,
+            errorCode: spillCheck.errorCode,
+            errorMessage: spillCheck.message,
             replayStatus: 'unknown_effect_fenced',
             approvalStatus,
           })
@@ -1398,6 +1706,21 @@ export class ToolBrokerServer implements ToolBrokerTransport {
     }
 
     return null
+  }
+
+  private writeDurableWalAttemptSync(record: DiskWalAttemptRecord): 'created' | 'exists' {
+    if (this.durableWalAdapter !== undefined) {
+      return this.durableWalAdapter.writeAttempt(record)
+    }
+    return this.writeDiskWalAttemptSync(record)
+  }
+
+  private writeDurableWalResultSync(record: DiskWalResultRecord): void {
+    if (this.durableWalAdapter !== undefined) {
+      this.durableWalAdapter.writeResult(record)
+      return
+    }
+    this.writeDiskWalResultSync(record)
   }
 
   private writeDiskWalAttemptSync(record: DiskWalAttemptRecord): 'created' | 'exists' {

@@ -135,27 +135,52 @@ interface BillingJournalQueryable {
   query(sql: string, params?: unknown[]): Promise<{ readonly rows: readonly unknown[] }>
 }
 
+export interface ExcludeCurrentPreparedBinding {
+  readonly operationId: string
+  readonly generation: string
+  readonly profileId: string
+}
+
 async function assertNoPendingBillingJournal(
   client: BillingJournalQueryable,
   uidStr: string,
-  operationId: string | null,
+  operationIds: string | readonly string[] | null,
   sessionKey?: string | null,
 ): Promise<void> {
+  const normalizedOpIds =
+    typeof operationIds === 'string'
+      ? operationIds.trim().length > 0
+        ? [operationIds.trim()]
+        : []
+      : Array.isArray(operationIds)
+        ? [...new Set(operationIds.map((id) => id.trim()).filter((id) => id.length > 0))]
+        : []
   const pendingJournal = await client.query(
-    `SELECT 1 FROM request_finalize_journal
-      WHERE user_id = $1
-        AND ctx->>'remoteNativeBillingRecovery' = ANY($2::text[])
+    `SELECT 1 FROM request_finalize_journal j
+      WHERE j.user_id = $1
+        AND j.ctx->>'remoteNativeBillingRecovery' = ANY($2::text[])
+        AND j.state IN ('inflight', 'finalizing')
         AND (
-          ($3::text IS NOT NULL AND (
-            ctx#>>'{remoteNative,scope,operationId}' = $3
-            OR ctx#>>'{remoteDriverV4,scope,operationId}' = $3
+          (cardinality($3::text[]) > 0 AND (
+            j.ctx#>>'{remoteNative,scope,operationId}' = ANY($3::text[])
+            OR j.ctx#>>'{remoteDriverV4,scope,operationId}' = ANY($3::text[])
           ))
           OR ($4::text IS NOT NULL AND (
-            ctx#>>'{remoteNative,scope,sessionKey}' = $4
-            OR ctx#>>'{remoteDriverV4,scope,sessionKey}' = $4
+            j.ctx#>>'{remoteNative,scope,sessionKey}' = $4
+            OR j.ctx#>>'{remoteDriverV4,scope,sessionKey}' = $4
+            OR EXISTS (
+              SELECT 1
+                FROM remote_agent_bindings b
+               WHERE b.uid = $1
+                 AND b.session_key = $4
+                 AND b.operation_id::text = COALESCE(
+                   j.ctx#>>'{remoteDriverV4,scope,operationId}',
+                   j.ctx#>>'{remoteNative,scope,operationId}',
+                   j.ctx->>'operationId'
+                 )
+            )
           ))
         )
-        AND state IN ('inflight', 'finalizing')
       LIMIT 1`,
     [
       uidStr,
@@ -164,7 +189,7 @@ async function assertNoPendingBillingJournal(
         CODEX_REMOTE_BILLING_RECOVERY_VERSION,
         REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION,
       ],
-      operationId,
+      normalizedOpIds,
       sessionKey ?? null,
     ],
   )
@@ -178,8 +203,59 @@ export async function assertNoPendingRemoteBillingForSession(
   uid: number | string | bigint,
   sessionKey: string,
   operationId?: string | null,
+  options?: {
+    readonly excludeCurrentPreparedBinding?: ExcludeCurrentPreparedBinding
+  },
 ): Promise<void> {
-  await assertNoPendingBillingJournal(client, String(uid), operationId ?? null, sessionKey)
+  const uidStr = String(uid)
+  const exclude = options?.excludeCurrentPreparedBinding
+  const hasValidExclude =
+    exclude !== undefined &&
+    typeof exclude.operationId === 'string' &&
+    exclude.operationId.trim().length > 0 &&
+    typeof exclude.generation === 'string' &&
+    exclude.generation.trim().length > 0 &&
+    typeof exclude.profileId === 'string' &&
+    exclude.profileId.trim().length > 0
+
+  // B06 + B01: Query ALL non-released bindings directly (zero LIMIT truncation).
+  // Only excuse the exact (operation_id, generation, profile_id/profile_name) triple prepared
+  // for this turn when in ('preparing', 'running'); any other non-released row fails closed.
+  const activeBindingsRes = await client.query(
+    `SELECT operation_id::text AS operation_id,
+            generation::text AS generation,
+            profile_id::text AS profile_id,
+            recovery_spec#>>'{spec,manifest,profileId}' AS profile_name,
+            state
+       FROM remote_agent_bindings
+      WHERE uid = $1
+        AND session_key = $2
+        AND state <> 'released'`,
+    [uidStr, sessionKey],
+  )
+  for (const raw of activeBindingsRes.rows) {
+    const row = raw as {
+      operation_id?: unknown
+      generation?: unknown
+      profile_id?: unknown
+      profile_name?: unknown
+      state?: unknown
+    }
+    const matchesCurrentPrepared =
+      hasValidExclude &&
+      (row.state === 'preparing' || row.state === 'running') &&
+      String(row.operation_id ?? '') === exclude.operationId.trim() &&
+      String(row.generation ?? '') === exclude.generation.trim() &&
+      (String(row.profile_id ?? '') === exclude.profileId.trim() ||
+        String(row.profile_name ?? '') === exclude.profileId.trim())
+    if (!matchesCurrentPrepared) {
+      throw new Error('REMOTE_LANE_STOP_UNPROVEN')
+    }
+  }
+
+  // Never skip unsettled billing journal verification for ANY operation (including current or
+  // arbitrarily old historical bindings resolved via EXISTS over remote_agent_bindings).
+  await assertNoPendingBillingJournal(client, uidStr, operationId ?? null, sessionKey)
 }
 
 export async function placeRemoteDriverLane(
@@ -492,16 +568,14 @@ export async function placeRemoteDriverLane(
             migratedFromProfileId = sticky.profile_id
             effectiveSticky = undefined
           } else if (!selectedRow) {
-            // B06: Check unsettled billing BEFORE reporting profile/capacity unavailability so
-            // cross-pool fallback never treats a billing-pending session as eligible for local takeover.
-            if (priorStickyOperationId) {
-              await assertNoPendingBillingJournal(
-                client,
-                uidStr,
-                priorStickyOperationId,
-                effectiveSessionKey,
-              )
-            }
+            // B06: Unconditionally check unsettled billing BEFORE reporting profile/capacity
+            // unavailability so cross-pool fallback never treats a billing-pending session as eligible.
+            await assertNoPendingBillingJournal(
+              client,
+              uidStr,
+              priorStickyOperationId ?? null,
+              effectiveSessionKey,
+            )
             if (reverifyProfiles.has(sticky.profile_id)) {
               throw new Error('REMOTE_DRIVER_REVERIFY_REQUIRED')
             }
@@ -536,14 +610,12 @@ export async function placeRemoteDriverLane(
           )
           selectedRow = eligible.find((r) => String(r.profile_id) === ranked[0]?.profileId)
           if (!selectedRow) {
-            if (priorStickyOperationId) {
-              await assertNoPendingBillingJournal(
-                client,
-                uidStr,
-                priorStickyOperationId,
-                effectiveSessionKey,
-              )
-            }
+            await assertNoPendingBillingJournal(
+              client,
+              uidStr,
+              priorStickyOperationId ?? null,
+              effectiveSessionKey,
+            )
             if (fullProfiles.size > 0) throw exhausted([...fullProfiles])
             if (reverifyProfiles.size > 0) throw new Error('REMOTE_DRIVER_REVERIFY_REQUIRED')
             if (staleProfiles.size > 0) throw new Error('REMOTE_DRIVER_PROBE_STALE')
@@ -556,17 +628,15 @@ export async function placeRemoteDriverLane(
         verifiedProbe = info.snapshot
         activeFingerprint = info.fingerprint
 
-        // B06: Unconditionally guard the prior sticky operation's billing settlement
+        // B06: Unconditionally guard prior unsettled billing for this session/operation
         // before admitting or creating any new operation, even when allowStickyFailover
         // cleared effectiveSticky to migrate onto another profile.
-        if (priorStickyOperationId) {
-          await assertNoPendingBillingJournal(
-            client,
-            uidStr,
-            priorStickyOperationId,
-            effectiveSessionKey,
-          )
-        }
+        await assertNoPendingBillingJournal(
+          client,
+          uidStr,
+          priorStickyOperationId ?? null,
+          effectiveSessionKey,
+        )
         if (effectiveSticky) {
           selectedRow._sticky = effectiveSticky
         }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
@@ -12,6 +12,11 @@ import {
   type ToolStreamFrame,
 } from '@openclaude/protocol'
 import { issueRebindAuthToken } from '../containerLinkBrokerTransport.js'
+import type {
+  DiskWalAttemptRecord,
+  DiskWalResultRecord,
+  ToolBrokerDurableWalAdapter,
+} from '../toolBroker.js'
 import {
   BoundedDeltaStreamBuffer,
   ContainerLinkToolBrokerHost,
@@ -35,6 +40,13 @@ import {
 } from '../index.js'
 
 const registriesToDispose: ExecEnvJobRegistry[] = []
+const tempWalDirsToRemove: string[] = []
+
+function makeTempWalDir(prefix = 'oc-tool-broker-test-wal-'): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  tempWalDirsToRemove.push(dir)
+  return dir
+}
 
 function makeRegistry(opts?: ConstructorParameters<typeof ExecEnvJobRegistry>[0]): ExecEnvJobRegistry {
   const reg = new ExecEnvJobRegistry(opts)
@@ -77,6 +89,10 @@ afterEach(async () => {
   while (registriesToDispose.length > 0) {
     const reg = registriesToDispose.pop()!
     await reg.disposeAll()
+  }
+  while (tempWalDirsToRemove.length > 0) {
+    const dir = tempWalDirsToRemove.pop()!
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 
@@ -502,7 +518,7 @@ describe('Layer 3 Unified ToolBrokerServer (7 Gates: R8/R9/R10/R11, WAL, Concurr
     const broker = new ToolBrokerServer({
       leaseManager: leaseMgr,
       capabilityAuthority: capAuth,
-      allowEphemeralSideEffects: true,
+      walDir: makeTempWalDir(),
       detachedFallbackAfterMs: 40,
       onDetachedApprovalCard: (card) => detachedCards.push(card),
       approvalHandler: async (req, signal) => {
@@ -738,13 +754,14 @@ describe('Layer 3 Unified ToolBrokerServer (7 Gates: R8/R9/R10/R11, WAL, Concurr
     const broker = new ToolBrokerServer({
       maxConcurrentToolCalls: 4,
       maxInlinePayloadBytes: 128,
-      allowEphemeralSideEffects: true,
+      walDir: makeTempWalDir(),
       spillBlob: async (bytes, mimeType) => {
         const sha256 = createHash('sha256').update(bytes).digest('hex')
         const blobId = `spilled_${sha256.slice(0, 12)}`
         spilledBlobs.set(blobId, { bytes: new Uint8Array(bytes), mimeType, sha256 })
         return { blobId, sha256, mimeType, bytes: bytes.byteLength }
       },
+      readSpilledBlob: (blobId) => spilledBlobs.get(blobId) ?? null,
     })
 
     let sideEffectRuns = 0
@@ -863,7 +880,7 @@ describe('Layer 3 ContainerLinkBrokerTransport (Multiplexed End-to-End Invoke, S
     const broker = new ToolBrokerServer({
       leaseManager: leaseMgr,
       channelKind: 'ws_tunnel',
-      allowEphemeralSideEffects: true,
+      walDir: makeTempWalDir(),
     })
 
     broker.registerTool({
@@ -1004,7 +1021,7 @@ describe('Layer 3 ContainerLinkBrokerTransport (Multiplexed End-to-End Invoke, S
       leaseManager: leaseMgr,
       requireFencingToken: true,
       maxConcurrentToolCalls: 1,
-      allowEphemeralSideEffects: true,
+      walDir: makeTempWalDir(),
       approvalHandler: async () => {
         await new Promise<void>((resolve) => {
           hooks.releaseApproval = resolve
@@ -1441,8 +1458,12 @@ describe('Layer 3 B13 — Cross-Process Persistent Disk WAL in ToolBrokerServer'
       assert.ok(res1.spilledBlobId)
       const ref1 = res1.output as SpilledBlobRefOutput
       assert.equal(ref1.type, 'blob_ref')
+      assert.equal(ref1.bytes, 1024)
+      assert.equal(ref1.byteLength, 1024)
+      const expectedSpillPath = join(walDir, 'spill', `${ref1.sha256}.bin`)
+      assert.equal(existsSync(expectedSpillPath), true, 'large output must be persisted to <walDir>/spill/<sha256>.bin')
 
-      // Restarted independent broker2 reads cached receipt AND recovers exact persisted spill bytes
+      // Restarted independent broker2 reads cached receipt AND recovers exact persisted spill bytes with SHA-256 verification
       const broker2 = new ToolBrokerServer({ walDir, maxInlinePayloadBytes: 128 })
       broker2.registerTool({
         canonicalName: 'emit_large_side_effect',
@@ -1465,9 +1486,13 @@ describe('Layer 3 B13 — Cross-Process Persistent Disk WAL in ToolBrokerServer'
         createHash('sha256').update(recovered.bytes).digest('hex'),
         ref1.sha256,
       )
+      const verifiedPayload = broker2.readSpilledBlobVerified(res2.output as SpilledBlobRefOutput)
+      assert.equal(verifiedPayload.sha256, ref1.sha256)
+      assert.equal(verifiedPayload.byteLength, 1024)
+      assert.equal(Buffer.from(verifiedPayload.bytes).toString('utf8'), largePayload)
 
-      // Deleting persisted spill blob makes fresh broker3 fail closed (never return dangling receipt)
-      rmSync(join(walDir, 'spilled', `${res2.spilledBlobId!}.bin`), { force: true })
+      // Corrupting 1 byte of <walDir>/spill/<sha256>.bin makes fresh broker3 fail closed with TOOL_SPILLED_BLOB_CORRUPT
+      writeFileSync(expectedSpillPath, Buffer.from(`X${'Z'.repeat(1023)}`, 'utf8'))
       const broker3 = new ToolBrokerServer({ walDir, maxInlinePayloadBytes: 128 })
       broker3.registerTool({
         canonicalName: 'emit_large_side_effect',
@@ -1480,11 +1505,289 @@ describe('Layer 3 B13 — Cross-Process Persistent Disk WAL in ToolBrokerServer'
       })
       const res3 = await broker3.invoke(call)
       assert.equal(res3.status, 'error')
-      assert.equal(res3.errorCode, 'TOOL_SPILLED_BLOB_MISSING')
+      assert.equal(res3.isError, true)
+      assert.equal(res3.errorCode, 'TOOL_SPILLED_BLOB_CORRUPT')
       assert.equal(res3.replayStatus, 'unknown_effect_fenced')
+      assert.equal(spillToolRuns, 1)
+      assert.throws(
+        () => broker3.readSpilledBlobVerified(ref1),
+        (err: unknown) =>
+          err instanceof ToolBrokerPolicyError && err.code === 'TOOL_SPILLED_BLOB_CORRUPT',
+      )
+
+      // Deleting persisted spill blob makes fresh broker4 fail closed with TOOL_SPILLED_BLOB_MISSING
+      rmSync(expectedSpillPath, { force: true })
+      const broker4 = new ToolBrokerServer({ walDir, maxInlinePayloadBytes: 128 })
+      broker4.registerTool({
+        canonicalName: 'emit_large_side_effect',
+        readOnly: false,
+        inputSchema: schema,
+        handler: () => {
+          spillToolRuns += 1
+          return largePayload
+        },
+      })
+      const res4 = await broker4.invoke(call)
+      assert.equal(res4.status, 'error')
+      assert.equal(res4.isError, true)
+      assert.equal(res4.errorCode, 'TOOL_SPILLED_BLOB_MISSING')
+      assert.equal(res4.replayStatus, 'unknown_effect_fenced')
       assert.equal(spillToolRuns, 1)
     } finally {
       rmSync(walDir, { recursive: true, force: true })
     }
+  })
+
+  it('B13-R2(b): reads back legacy spilled/<24hex>.bin receipts with full SHA-256 verification (zero handler replay) and fails closed on 1-byte corruption', async () => {
+    const schema = { type: 'object', properties: { tag: { type: 'string' } }, required: ['tag'] }
+    const legacyPayload = 'L'.repeat(1024)
+    const legacyBytes = Buffer.from(legacyPayload, 'utf8')
+    const fullSha256 = createHash('sha256').update(legacyBytes).digest('hex')
+    const legacyBlobId = `blob_${fullSha256.slice(0, 24)}`
+
+    const call = makeCallEnvelope({
+      leaseId: 'lease-legacy-spill',
+      turnId: 'turn-legacy-1',
+      callId: 'call-legacy-large',
+      canonicalName: 'legacy_large_tool',
+      arguments: { tag: 'old-writer' },
+      inputSchema: schema,
+    })
+
+    const seedLegacyWalDir = (dir: string, payloadBytes: Buffer) => {
+      const legacyDir = join(dir, 'spilled')
+      mkdirSync(legacyDir, { recursive: true })
+      writeFileSync(join(legacyDir, `${legacyBlobId}.bin`), payloadBytes)
+      writeFileSync(
+        join(legacyDir, `${legacyBlobId}.meta.json`),
+        JSON.stringify({
+          sha256: fullSha256,
+          mimeType: 'text/plain; charset=utf-8',
+          bytes: legacyBytes.byteLength,
+        }),
+      )
+      const legacyResult: DiskWalResultRecord = {
+        schemaVersion: 1,
+        idempotencyKey: call.idempotencyKey,
+        callId: call.callId,
+        toolName: call.canonicalName,
+        argsSchemaSha256: call.argsSha256,
+        leaseId: call.leaseId,
+        brainGen: null,
+        finalizedAtMs: Date.now(),
+        receipt: {
+          schemaVersion: 1,
+          leaseId: call.leaseId,
+          turnId: call.turnId,
+          callId: call.callId,
+          idempotencyKey: call.idempotencyKey,
+          status: 'ok',
+          spilledBlobId: legacyBlobId,
+          replayStatus: 'executed',
+          approvalStatus: 'not_required',
+          durationMs: 5,
+          output: {
+            type: 'blob_ref',
+            blobId: legacyBlobId,
+            sha256: fullSha256,
+            mimeType: 'text/plain; charset=utf-8',
+            bytes: legacyBytes.byteLength,
+          },
+        },
+      }
+      writeFileSync(join(dir, `${call.idempotencyKey}.result.json`), JSON.stringify(legacyResult))
+    }
+
+    // 1. Intact legacy spilled/<24hex>.bin -> new reader verifies full SHA-256 & returns cached_receipt (handlerRuns = 0!)
+    const walDirIntact = makeTempWalDir('ocv5-b13-legacy-ok-')
+    seedLegacyWalDir(walDirIntact, legacyBytes)
+    let intactHandlerRuns = 0
+    const newReader = new ToolBrokerServer({ walDir: walDirIntact, maxInlinePayloadBytes: 128 })
+    newReader.registerTool({
+      canonicalName: 'legacy_large_tool',
+      readOnly: false,
+      inputSchema: schema,
+      handler: () => {
+        intactHandlerRuns += 1
+        return 'MUST_NEVER_RE_RUN'
+      },
+    })
+
+    const replayed = await newReader.invoke(call)
+    assert.equal(replayed.status, 'ok')
+    assert.equal(replayed.replayStatus, 'cached_receipt')
+    assert.equal(intactHandlerRuns, 0, 'legacy receipt replay MUST NEVER re-run handler')
+    const recoveredById = newReader.getSpilledBlob(legacyBlobId)
+    assert.ok(recoveredById !== null)
+    assert.equal(Buffer.from(recoveredById.bytes).toString('utf8'), legacyPayload)
+    assert.equal(recoveredById.sha256, fullSha256)
+    const verifiedLegacy = newReader.readSpilledBlobVerified(replayed.output as SpilledBlobRefOutput)
+    assert.equal(verifiedLegacy.sha256, fullSha256)
+    assert.equal(Buffer.from(verifiedLegacy.bytes).toString('utf8'), legacyPayload)
+
+    // 2. 1-byte tampered legacy spilled/<24hex>.bin -> fail-closed TOOL_SPILLED_BLOB_CORRUPT, handlerRuns = 0!
+    const walDirCorrupt = makeTempWalDir('ocv5-b13-legacy-corrupt-')
+    seedLegacyWalDir(walDirCorrupt, Buffer.from(`X${'L'.repeat(1023)}`, 'utf8'))
+    let corruptHandlerRuns = 0
+    const corruptReader = new ToolBrokerServer({ walDir: walDirCorrupt, maxInlinePayloadBytes: 128 })
+    corruptReader.registerTool({
+      canonicalName: 'legacy_large_tool',
+      readOnly: false,
+      inputSchema: schema,
+      handler: () => {
+        corruptHandlerRuns += 1
+        return 'MUST_NEVER_RE_RUN'
+      },
+    })
+
+    const corruptReplay = await corruptReader.invoke(call)
+    assert.equal(corruptReplay.status, 'error')
+    assert.equal(corruptReplay.isError, true)
+    assert.equal(corruptReplay.errorCode, 'TOOL_SPILLED_BLOB_CORRUPT')
+    assert.equal(corruptReplay.replayStatus, 'unknown_effect_fenced')
+    assert.equal(corruptHandlerRuns, 0, 'corrupt legacy spill MUST NEVER re-run handler')
+  })
+
+  it('B13-R2(c): rejects durableWalAdapter-only without durable spill storage before handler, and recovers verified large blobs across restart when durable spill storage is provided', async () => {
+    const schema = { type: 'object', properties: { op: { type: 'string' } }, required: ['op'] }
+    const attempts = new Map<string, DiskWalAttemptRecord>()
+    const results = new Map<string, DiskWalResultRecord>()
+    const blobs = new Map<string, { bytes: Uint8Array; mimeType: string; sha256: string }>()
+
+    const walOnlyAdapter: ToolBrokerDurableWalAdapter = {
+      durable: true,
+      writeAttempt: (rec) => {
+        if (attempts.has(rec.idempotencyKey)) return 'exists'
+        attempts.set(rec.idempotencyKey, rec)
+        return 'created'
+      },
+      writeResult: (rec) => {
+        results.set(rec.idempotencyKey, rec)
+      },
+      readAttempt: (k) => attempts.get(k) ?? null,
+      readResult: (k) => results.get(k) ?? null,
+    }
+
+    // 1. durableWalAdapter-only (no walDir, no durable spill read/write) -> fail-closed BEFORE handler runs!
+    let rejectedRuns = 0
+    const incompleteBroker = new ToolBrokerServer({
+      durableWalAdapter: walOnlyAdapter,
+      maxInlinePayloadBytes: 128,
+    })
+    incompleteBroker.registerTool({
+      canonicalName: 'adapter_large_op',
+      readOnly: false,
+      inputSchema: schema,
+      handler: () => {
+        rejectedRuns += 1
+        return 'A'.repeat(512)
+      },
+    })
+    const denied = await incompleteBroker.invoke(
+      makeCallEnvelope({
+        leaseId: 'lease-adapter-no-spill',
+        turnId: 'turn-1',
+        callId: 'call-adapter-denied',
+        canonicalName: 'adapter_large_op',
+        arguments: { op: 'write' },
+        inputSchema: schema,
+      }),
+    )
+    assert.equal(denied.status, 'denied')
+    assert.equal(denied.errorCode, 'TOOL_BROKER_DURABLE_SPILL_REQUIRED')
+    assert.equal(rejectedRuns, 0, 'handler MUST NOT run when durableWalAdapter lacks durable spill storage')
+
+    // 2. durableWalAdapter WITH durable spill read/write -> persists & verifies across independent broker restart!
+    const fullAdapter: ToolBrokerDurableWalAdapter = {
+      ...walOnlyAdapter,
+      writeSpilledBlob: (blobId, bytes, meta) => {
+        blobs.set(blobId, {
+          bytes: new Uint8Array(bytes),
+          mimeType: meta.mimeType,
+          sha256: meta.sha256,
+        })
+      },
+      readSpilledBlob: (blobId) => blobs.get(blobId) ?? null,
+    }
+
+    const largeText = 'M'.repeat(600)
+    let adapterRuns = 0
+    const callOk = makeCallEnvelope({
+      leaseId: 'lease-adapter-full',
+      turnId: 'turn-1',
+      callId: 'call-adapter-ok',
+      canonicalName: 'adapter_large_op',
+      arguments: { op: 'write_large' },
+      inputSchema: schema,
+    })
+
+    const broker1 = new ToolBrokerServer({
+      durableWalAdapter: fullAdapter,
+      maxInlinePayloadBytes: 128,
+    })
+    broker1.registerTool({
+      canonicalName: 'adapter_large_op',
+      readOnly: false,
+      inputSchema: schema,
+      handler: () => {
+        adapterRuns += 1
+        return largeText
+      },
+    })
+
+    const res1 = await broker1.invoke(callOk)
+    assert.equal(res1.status, 'ok')
+    assert.equal(res1.replayStatus, 'executed')
+    assert.equal(adapterRuns, 1)
+    assert.ok(res1.spilledBlobId)
+    const ref1 = res1.output as SpilledBlobRefOutput
+
+    // Independent restarted broker2 sharing fullAdapter replays cached_receipt and reads verified bytes
+    const broker2 = new ToolBrokerServer({
+      durableWalAdapter: fullAdapter,
+      maxInlinePayloadBytes: 128,
+    })
+    broker2.registerTool({
+      canonicalName: 'adapter_large_op',
+      readOnly: false,
+      inputSchema: schema,
+      handler: () => {
+        adapterRuns += 1
+        return largeText
+      },
+    })
+
+    const res2 = await broker2.invoke(callOk)
+    assert.equal(res2.status, 'ok')
+    assert.equal(res2.replayStatus, 'cached_receipt')
+    assert.equal(adapterRuns, 1)
+    const verified = broker2.readSpilledBlobVerified(res2.output as SpilledBlobRefOutput)
+    assert.equal(verified.sha256, ref1.sha256)
+    assert.equal(Buffer.from(verified.bytes).toString('utf8'), largeText)
+
+    // Tampering adapter spill bytes makes fresh broker3 fail closed with TOOL_SPILLED_BLOB_CORRUPT
+    blobs.set(res2.spilledBlobId!, {
+      bytes: Buffer.from(`X${'M'.repeat(599)}`, 'utf8'),
+      mimeType: ref1.mimeType,
+      sha256: ref1.sha256,
+    })
+    const broker3 = new ToolBrokerServer({
+      durableWalAdapter: fullAdapter,
+      maxInlinePayloadBytes: 128,
+    })
+    broker3.registerTool({
+      canonicalName: 'adapter_large_op',
+      readOnly: false,
+      inputSchema: schema,
+      handler: () => {
+        adapterRuns += 1
+        return largeText
+      },
+    })
+    const res3 = await broker3.invoke(callOk)
+    assert.equal(res3.status, 'error')
+    assert.equal(res3.errorCode, 'TOOL_SPILLED_BLOB_CORRUPT')
+    assert.equal(res3.replayStatus, 'unknown_effect_fenced')
+    assert.equal(adapterRuns, 1)
   })
 })

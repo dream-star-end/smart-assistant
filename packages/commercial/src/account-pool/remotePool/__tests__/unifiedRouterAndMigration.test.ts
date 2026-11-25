@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { describe, it } from 'node:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, it } from 'node:test'
 import {
   DEFAULT_POOL_FALLBACK_POLICY,
   computeCacheAffinityKey,
@@ -47,6 +50,7 @@ import {
   type MigrationCredentialLeasePort,
   type MigrationDriverPort,
   type MigrationExecEnvPort,
+  type PendingCredentialReconciliationStore,
 } from '../migrationCoordinator.js'
 import {
   PRE_DISPATCH_RETRYABLE_ERROR_CODES,
@@ -54,6 +58,20 @@ import {
   poolCandidateKey,
   type PoolCandidateDescriptor,
 } from '../unifiedPlacementRouter.js'
+
+const tempReconcileDirs: string[] = []
+
+function makeTempReconcileDir(prefix = 'ocv5-mig-reconcile-'): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  tempReconcileDirs.push(dir)
+  return dir
+}
+
+afterEach(() => {
+  while (tempReconcileDirs.length > 0) {
+    rmSync(tempReconcileDirs.pop()!, { recursive: true, force: true })
+  }
+})
 
 function sha256(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex')
@@ -906,6 +924,7 @@ describe('MigrationCoordinator — Local -> Remote -> Local seamless handoff, de
       execEnv,
       credentialLeases,
       drivers,
+      reconciliationWalDir: makeTempReconcileDir(),
     })
 
     return {
@@ -1113,6 +1132,7 @@ describe('MigrationCoordinator — Local -> Remote -> Local seamless handoff, de
 
     const coordinator = new MigrationCoordinator({
       authorityStore,
+      reconciliationWalDir: makeTempReconcileDir(),
       capsuleStore: {
         async exportCapsule() {
           return { ok: false, reason: 'unused' }
@@ -1216,6 +1236,7 @@ describe('MigrationCoordinator — Local -> Remote -> Local seamless handoff, de
 
     const coordinator = new MigrationCoordinator({
       authorityStore,
+      reconciliationWalDir: makeTempReconcileDir(),
       capsuleStore: {
         async exportCapsule() {
           return {
@@ -1348,6 +1369,7 @@ describe('MigrationCoordinator — Local -> Remote -> Local seamless handoff, de
     const h1 = createHarness()
     const coordAbortThrows = new MigrationCoordinator({
       authorityStore: storeAbortThrows,
+      reconciliationWalDir: makeTempReconcileDir(),
       capsuleStore: {
         async exportCapsule() {
           return { ok: false, reason: 'skip' }
@@ -1426,6 +1448,7 @@ describe('MigrationCoordinator — Local -> Remote -> Local seamless handoff, de
     let rebindCalls = 0
     const coordRebindThrows = new MigrationCoordinator({
       authorityStore: store2,
+      reconciliationWalDir: makeTempReconcileDir(),
       capsuleStore: {
         async exportCapsule() {
           return { ok: false, reason: 'skip' }
@@ -1512,6 +1535,7 @@ describe('MigrationCoordinator — Local -> Remote -> Local seamless handoff, de
     let rollbackAttempted = false
     const coordAckLost = new MigrationCoordinator({
       authorityStore: storeAckLost,
+      reconciliationWalDir: makeTempReconcileDir(),
       capsuleStore: {
         async exportCapsule() {
           return {
@@ -1775,7 +1799,193 @@ describe('legacyRetirement — Phase 3 readiness gate & read-only historical bil
 })
 
 describe('OCV5-890 B08-R2: MigrationCoordinator preserves target credential lease when commit outcome is unknown', () => {
-  it('does NOT revoke issued target candidate lease when PG commit succeeded, ack was lost, and immediate readback fails', async () => {
+  it('fails closed before PG begin when durable reconciliation store is missing, and aborts cleanly before PG commit if intent persistence fails', async () => {
+    const localPlacement: PlacementDescriptor = {
+      poolKind: 'local_container',
+      engine: 'ccb',
+      driverId: 'local-cc',
+      placementEpoch: 1,
+      containerId: 'cid-req-1',
+    }
+    const remotePlacement: PlacementDescriptor = {
+      poolKind: 'remote_pool',
+      engine: 'ccb',
+      driverId: 'cc',
+      placementEpoch: 2,
+      profileId: 'prof-req-1',
+      operationId: '66666666-6666-4666-8666-666666666666',
+    }
+
+    // 1. No reconciliationWalDir & no pendingReconciliationStore -> rejected BEFORE beginPlacementMigration
+    const storeNoWal = new InMemoryAuthorityStore(localPlacement)
+    let beginCalls = 0
+    const origBegin = storeNoWal.beginPlacementMigration.bind(storeNoWal)
+    storeNoWal.beginPlacementMigration = async (cas) => {
+      beginCalls += 1
+      return await origBegin(cas)
+    }
+    const noWalCoord = new MigrationCoordinator({
+      authorityStore: storeNoWal,
+      capsuleStore: {
+        async exportCapsule() {
+          return { ok: false, reason: 'unused' }
+        },
+        async importCapsule() {
+          return { ok: false, reason: 'unused' }
+        },
+        async degradeToTranscript() {
+          return { ok: false, reason: 'unused' }
+        },
+      },
+      execEnv: {
+        async quiesce() {
+          return { quiesced: true, activeToolCalls: 0 }
+        },
+        async exportAttachmentDigest() {
+          return {
+            leaseId: 'exec-req-1',
+            channelKind: 'uds_jsonrpc',
+            workspaceTreeSha256: sha256('wt'),
+            policyDigest: sha256('pol'),
+            toolCatalogSha256: sha256('cat'),
+            attachedAt: '2026-11-25T10:00:00.000Z',
+          }
+        },
+        async rebindBrain(args) {
+          return { ok: true, brainGen: args.nextBrainGen, fencingToken: args.nextFencingToken }
+        },
+      },
+      credentialLeases: {
+        async issueLease() {
+          throw new Error('must_not_issue_without_reconciliation_store')
+        },
+        async revokeLease() {
+          return true
+        },
+      },
+      drivers: {
+        async stopLane() {
+          return { stopped: true, reachable: true }
+        },
+        async prewarm() {
+          return { ready: true }
+        },
+      },
+    })
+    const noWalRes = await noWalCoord.handoff({
+      userId: 42,
+      tenantId: '42',
+      sessionKey: 'sess-req-1',
+      sessionId: 'sid-req-1',
+      expectedPlacementEpoch: 1,
+      fromPlacement: localPlacement,
+      toPlacement: remotePlacement,
+      settledToolsProven: true,
+      execEnvLeaseId: 'exec-req-1',
+      currentBrainGen: 1,
+    })
+    assert.ok(!noWalRes.ok)
+    assert.equal(noWalRes.code, 'MIGRATION_RECONCILIATION_STORE_REQUIRED')
+    assert.equal(beginCalls, 0)
+
+    // 2. Pre-commit reconciliation intent persistence throws -> NEVER calls commitPlacementMigration, safely rolls back!
+    const storePersistFail = new InMemoryAuthorityStore(localPlacement)
+    let commitCalls = 0
+    storePersistFail.commitPlacementMigration = async () => {
+      commitCalls += 1
+      throw new Error('must_never_commit_when_intent_persist_fails')
+    }
+    const revokedOnAbort: string[] = []
+    const failingStore: PendingCredentialReconciliationStore = {
+      put() {
+        throw new Error('DISK_ENOSPC_INTENT_WRITE')
+      },
+      get: () => null,
+      delete: () => {},
+      list: () => [],
+    }
+    const persistFailCoord = new MigrationCoordinator({
+      authorityStore: storePersistFail,
+      pendingReconciliationStore: failingStore,
+      capsuleStore: {
+        async exportCapsule() {
+          return { ok: false, reason: 'skip' }
+        },
+        async importCapsule() {
+          return { ok: false, reason: 'skip' }
+        },
+        async degradeToTranscript() {
+          return { ok: false, reason: 'skip' }
+        },
+      },
+      execEnv: {
+        async quiesce() {
+          return { quiesced: true, activeToolCalls: 0 }
+        },
+        async exportAttachmentDigest() {
+          return {
+            leaseId: 'exec-req-2',
+            channelKind: 'uds_jsonrpc',
+            workspaceTreeSha256: sha256('wt2'),
+            policyDigest: sha256('pol2'),
+            toolCatalogSha256: sha256('cat2'),
+            attachedAt: '2026-11-25T10:00:00.000Z',
+          }
+        },
+        async rebindBrain(args) {
+          return { ok: true, brainGen: args.nextBrainGen, fencingToken: args.nextFencingToken }
+        },
+      },
+      credentialLeases: {
+        async issueLease(req) {
+          return Object.freeze({
+            leaseId: 'cred-candidate-abort-on-persist-fail',
+            tenantId: req.tenantId,
+            profileId: req.profileId,
+            engine: req.engine,
+            mountKind: req.mountKind,
+            noRefreshToken: true as const,
+            issuedAt: '2026-11-25T10:00:00.000Z',
+            expiresAt: '2026-11-25T10:15:00.000Z',
+          })
+        },
+        async revokeLease(id) {
+          revokedOnAbort.push(id)
+          return true
+        },
+      },
+      drivers: {
+        async stopLane() {
+          return { stopped: true, reachable: true }
+        },
+        async prewarm() {
+          return { ready: true }
+        },
+      },
+    })
+    const persistFailRes = await persistFailCoord.handoff({
+      userId: 42,
+      tenantId: '42',
+      sessionKey: 'sess-req-2',
+      sessionId: 'sid-req-2',
+      expectedPlacementEpoch: 1,
+      fromPlacement: localPlacement,
+      toPlacement: remotePlacement,
+      settledToolsProven: true,
+      execEnvLeaseId: 'exec-req-2',
+      currentBrainGen: 1,
+      allowColdFallback: true,
+    })
+    assert.ok(!persistFailRes.ok)
+    assert.equal(persistFailRes.code, 'MIGRATION_RECONCILIATION_PERSIST_FAILED')
+    assert.equal(persistFailRes.rolledBack, true)
+    assert.equal(commitCalls, 0, 'PG commit MUST NEVER run if pre-commit reconciliation intent failed to persist')
+    assert.deepEqual(revokedOnAbort, ['cred-candidate-abort-on-persist-fail'])
+    assert.equal(storePersistFail.pointer.placementEpoch, 1)
+  })
+
+  it('uses real disk reconciliationWalDir across restarted coordinators: retains committed record on first source-revoke failure, keeps target executable, and deletes only after convergence', async () => {
+    const reconciliationWalDir = makeTempReconcileDir('ocv5-b08-disk-commit-')
     const localPlacement: PlacementDescriptor = {
       poolKind: 'local_container',
       engine: 'ccb',
@@ -1809,8 +2019,10 @@ describe('OCV5-890 B08-R2: MigrationCoordinator preserves target credential leas
       return await originalGetMig(migrationId)
     }
 
+    const activeCredentials = new Set<string>(['cred-source-old-b08-r2'])
     const revokedLeases: string[] = []
     const issuedLeases: string[] = []
+    let failSourceRevokeOnce = true
     let activeBrainGen = 1
     let activeToken = 'ft-b08-r2-gen-1'
     const attachmentBase: ExecEnvAttachmentSnapshot = Object.freeze({
@@ -1822,74 +2034,83 @@ describe('OCV5-890 B08-R2: MigrationCoordinator preserves target credential leas
       attachedAt: '2026-11-25T10:00:00.000Z',
     })
 
-    const coordinator = new MigrationCoordinator({
-      authorityStore,
-      capsuleStore: {
-        async exportCapsule() {
-          return {
-            ok: true,
-            capsuleRef: {
-              capsuleId: 'cap-b08-r2',
-              engine: 'ccb',
-              portability: 'portable',
-              placementEpoch: 1,
-              totalBytes: 64,
-              fileCount: 1,
-              manifestBlobId: 'blob-cap-b08-r2',
-              createdAt: '2026-11-25T10:00:00.000Z',
-            },
-          }
+    const makeCoordinator = () =>
+      new MigrationCoordinator({
+        authorityStore,
+        reconciliationWalDir,
+        capsuleStore: {
+          async exportCapsule() {
+            return {
+              ok: true,
+              capsuleRef: {
+                capsuleId: 'cap-b08-r2',
+                engine: 'ccb',
+                portability: 'portable',
+                placementEpoch: 1,
+                totalBytes: 64,
+                fileCount: 1,
+                manifestBlobId: 'blob-cap-b08-r2',
+                createdAt: '2026-11-25T10:00:00.000Z',
+              },
+            }
+          },
+          async importCapsule() {
+            return { ok: true, nativeSessionId: 'native-target-b08-r2', continuityTier: 'hot_native' }
+          },
+          async degradeToTranscript() {
+            return { ok: false, reason: 'unused' }
+          },
         },
-        async importCapsule() {
-          return { ok: true, nativeSessionId: 'native-target-b08-r2', continuityTier: 'hot_native' }
+        execEnv: {
+          async quiesce() {
+            return { quiesced: true, activeToolCalls: 0 }
+          },
+          async exportAttachmentDigest() {
+            return attachmentBase
+          },
+          async rebindBrain(args) {
+            activeBrainGen = args.nextBrainGen
+            activeToken = args.nextFencingToken
+            return { ok: true, brainGen: activeBrainGen, fencingToken: activeToken, attachment: attachmentBase }
+          },
         },
-        async degradeToTranscript() {
-          return { ok: false, reason: 'unused' }
+        credentialLeases: {
+          async issueLease(req) {
+            const leaseId = 'cred-target-b08-r2-must-survive'
+            issuedLeases.push(leaseId)
+            activeCredentials.add(leaseId)
+            return Object.freeze({
+              leaseId,
+              tenantId: req.tenantId,
+              profileId: req.profileId,
+              engine: req.engine,
+              mountKind: req.mountKind,
+              noRefreshToken: true as const,
+              issuedAt: '2026-11-25T10:00:00.000Z',
+              expiresAt: '2026-11-25T10:15:00.000Z',
+            })
+          },
+          async revokeLease(leaseId) {
+            if (leaseId === 'cred-source-old-b08-r2' && failSourceRevokeOnce) {
+              failSourceRevokeOnce = false
+              throw new Error('SOURCE_REVOKE_TRANSIENT_TIMEOUT')
+            }
+            revokedLeases.push(leaseId)
+            activeCredentials.delete(leaseId)
+            return true
+          },
         },
-      },
-      execEnv: {
-        async quiesce() {
-          return { quiesced: true, activeToolCalls: 0 }
+        drivers: {
+          async stopLane() {
+            return { stopped: true, reachable: true, dualProofVerified: true }
+          },
+          async prewarm() {
+            return { ready: true, prewarmedKey: 'home-b08-r2' }
+          },
         },
-        async exportAttachmentDigest() {
-          return attachmentBase
-        },
-        async rebindBrain(args) {
-          activeBrainGen = args.nextBrainGen
-          activeToken = args.nextFencingToken
-          return { ok: true, brainGen: activeBrainGen, fencingToken: activeToken, attachment: attachmentBase }
-        },
-      },
-      credentialLeases: {
-        async issueLease(req) {
-          const leaseId = 'cred-target-b08-r2-must-survive'
-          issuedLeases.push(leaseId)
-          return Object.freeze({
-            leaseId,
-            tenantId: req.tenantId,
-            profileId: req.profileId,
-            engine: req.engine,
-            mountKind: req.mountKind,
-            noRefreshToken: true as const,
-            issuedAt: '2026-11-25T10:00:00.000Z',
-            expiresAt: '2026-11-25T10:15:00.000Z',
-          })
-        },
-        async revokeLease(leaseId) {
-          revokedLeases.push(leaseId)
-          return true
-        },
-      },
-      drivers: {
-        async stopLane() {
-          return { stopped: true, reachable: true, dualProofVerified: true }
-        },
-        async prewarm() {
-          return { ready: true, prewarmedKey: 'home-b08-r2' }
-        },
-      },
-    })
+      })
 
+    const coordinator = makeCoordinator()
     const res = await coordinator.handoff({
       userId: 42,
       tenantId: '42',
@@ -1902,11 +2123,13 @@ describe('OCV5-890 B08-R2: MigrationCoordinator preserves target credential leas
       execEnvLeaseId: 'exec-lease-b08-r2',
       currentBrainGen: 1,
       currentFencingToken: 'ft-b08-r2-gen-1',
+      previousCredentialLeaseId: 'cred-source-old-b08-r2',
     })
 
-    assert.equal(res.ok, false)
+    assert.ok(!res.ok)
     assert.equal(res.code, 'MIGRATION_COMMIT_CONFLICT')
     assert.equal(res.rolledBack, false, 'PG actually committed so rollback must NOT report true')
+    assert.equal(res.recoveryRequired, true)
     assert.equal(issuedLeases.length, 1)
     assert.deepEqual(
       revokedLeases,
@@ -1914,11 +2137,222 @@ describe('OCV5-890 B08-R2: MigrationCoordinator preserves target credential leas
       'target candidate credential lease MUST NOT be revoked when PG commit outcome is unknown and abort did not apply',
     )
     assert.equal(activeBrainGen, 2, 'ExecEnv must remain on target brainGen=2 instead of split-braining backward')
+    assert.equal(res.preservedCandidateLease?.leaseId, 'cred-target-b08-r2-must-survive')
 
-    // Subsequent authoritative readback confirms PG committed to epoch=2 AND target lease is still intact!
-    const laterMig = await authorityStore.getPlacementMigration(res.migrationId!)
-    assert.equal(laterMig?.state, 'committed')
-    assert.equal(authorityStore.pointer.placementEpoch, 2)
-    assert.equal(authorityStore.pointer.poolKind, 'remote_pool')
+    // Restart #1 from real disk reconciliationWalDir: reads committed, 1st source revoke throws ->
+    // MUST RETAIN record on disk (`stillPending: true`, `fullyConverged: false`) while target remains active!
+    const restarted1 = makeCoordinator()
+    assert.equal((await restarted1.listPendingCredentialReconciliations()).length, 1)
+    const partial = await restarted1.reconcilePendingCredentialCleanup(res.migrationId!)
+    assert.ok(partial !== null && partial.status === 'committed')
+    assert.equal(partial.targetCredentialPreserved, true)
+    assert.equal(partial.sourceCredentialRevoked, false)
+    assert.equal(partial.fullyConverged, false)
+    assert.equal(partial.stillPending, true)
+    assert.equal(activeCredentials.has('cred-target-b08-r2-must-survive'), true)
+    assert.equal(
+      (await restarted1.listPendingCredentialReconciliations()).length,
+      1,
+      'pending record MUST NOT be deleted when source credential revocation failed',
+    )
+
+    // Restart #2 from real disk reconciliationWalDir: source revoke succeeds -> record deleted, target STILL active!
+    const restarted2 = makeCoordinator()
+    const converged = await restarted2.reconcilePendingCredentialCleanup(res.migrationId!)
+    assert.ok(converged !== null && converged.status === 'committed')
+    assert.equal(converged.targetCredentialPreserved, true)
+    assert.equal(converged.targetCredentialLease?.leaseId, 'cred-target-b08-r2-must-survive')
+    assert.equal(converged.sourceCredentialRevoked, true)
+    assert.equal(converged.fullyConverged, true)
+    assert.equal(converged.stillPending, false)
+    assert.equal(converged.pointer?.placementEpoch, 2)
+    assert.equal(converged.pointer?.poolKind, 'remote_pool')
+
+    assert.deepEqual(revokedLeases, ['cred-source-old-b08-r2'])
+    assert.equal(activeCredentials.has('cred-target-b08-r2-must-survive'), true)
+    assert.equal(activeCredentials.has('cred-source-old-b08-r2'), false)
+    assert.equal((await restarted2.listPendingCredentialReconciliations()).length, 0)
+
+    const executeTargetTurnWithCredential = (leaseId: string, brainGen: number) => {
+      if (!activeCredentials.has(leaseId)) throw new Error('CREDENTIAL_LEASE_REVOKED')
+      if (brainGen !== activeBrainGen) throw new Error('EXEC_FENCING_TOKEN_STALE')
+      return { ok: true, executedOn: authorityStore.pointer.poolKind }
+    }
+    assert.deepEqual(
+      executeTargetTurnWithCredential(converged.targetCredentialLease!.leaseId, activeBrainGen),
+      { ok: true, executedOn: 'remote_pool' },
+    )
+  })
+
+  it('uses real disk reconciliationWalDir on aborted recovery: persists partial progress when target revoke succeeds but source ExecEnv restore fails, then finishes remaining step on restart', async () => {
+    const reconciliationWalDir = makeTempReconcileDir('ocv5-b08-disk-abort-')
+    const localPlacement: PlacementDescriptor = {
+      poolKind: 'local_container',
+      engine: 'ccb',
+      driverId: 'local-cc',
+      placementEpoch: 1,
+      containerId: 'cid-100',
+    }
+    const remotePlacement: PlacementDescriptor = {
+      poolKind: 'remote_pool',
+      engine: 'ccb',
+      driverId: 'cc',
+      placementEpoch: 2,
+      profileId: 'prof-target-b08-abort',
+      operationId: '88888888-8888-4888-8888-888888888888',
+    }
+    const authorityStore = new InMemoryAuthorityStore(localPlacement)
+    let pgDown = true
+    let failSourceRestoreOnce = true
+    const origGetMig = authorityStore.getPlacementMigration.bind(authorityStore)
+    const origAbort = authorityStore.abortPlacementMigration.bind(authorityStore)
+
+    authorityStore.commitPlacementMigration = async () => {
+      // PG dropped connection BEFORE committing (migration remains in 'migrating')
+      throw new Error('PG_NETWORK_PARTITION_BEFORE_COMMIT')
+    }
+    authorityStore.getPlacementMigration = async (migrationId) => {
+      if (pgDown) throw new Error('PG_STILL_UNREACHABLE')
+      return await origGetMig(migrationId)
+    }
+    authorityStore.abortPlacementMigration = async (cas) => {
+      if (pgDown) throw new Error('PG_STILL_UNREACHABLE')
+      return await origAbort(cas)
+    }
+
+    const activeCredentials = new Set<string>(['cred-source-abort-test'])
+    const revokedLeases: string[] = []
+    let activeBrainGen = 1
+    let activePlacement: PlacementDescriptor = localPlacement
+
+    const makeCoordinator = () =>
+      new MigrationCoordinator({
+        authorityStore,
+        reconciliationWalDir,
+        capsuleStore: {
+          async exportCapsule() {
+            return { ok: false, reason: 'skip' }
+          },
+          async importCapsule() {
+            return { ok: false, reason: 'skip' }
+          },
+          async degradeToTranscript() {
+            return { ok: false, reason: 'skip' }
+          },
+        },
+        execEnv: {
+          async quiesce() {
+            return { quiesced: true, activeToolCalls: 0 }
+          },
+          async exportAttachmentDigest() {
+            return {
+              leaseId: 'exec-lease-b08-abort',
+              channelKind: 'uds_jsonrpc',
+              workspaceTreeSha256: sha256('wt-abort'),
+              policyDigest: sha256('pol-abort'),
+              toolCatalogSha256: sha256('cat-abort'),
+              attachedAt: '2026-11-25T10:00:00.000Z',
+            }
+          },
+          async rebindBrain(args) {
+            if (args.targetPlacement.poolKind === 'local_container' && failSourceRestoreOnce) {
+              failSourceRestoreOnce = false
+              throw new Error('EXEC_ENV_SOURCE_RESTORE_TRANSIENT_FAILURE')
+            }
+            activeBrainGen = args.nextBrainGen
+            activePlacement = args.targetPlacement
+            return { ok: true, brainGen: args.nextBrainGen, fencingToken: args.nextFencingToken }
+          },
+        },
+        credentialLeases: {
+          async issueLease(req) {
+            const leaseId = 'cred-target-abort-deferred'
+            activeCredentials.add(leaseId)
+            return Object.freeze({
+              leaseId,
+              tenantId: req.tenantId,
+              profileId: req.profileId,
+              engine: req.engine,
+              mountKind: req.mountKind,
+              noRefreshToken: true as const,
+              issuedAt: '2026-11-25T10:00:00.000Z',
+              expiresAt: '2026-11-25T10:15:00.000Z',
+            })
+          },
+          async revokeLease(leaseId) {
+            revokedLeases.push(leaseId)
+            activeCredentials.delete(leaseId)
+            return true
+          },
+        },
+        drivers: {
+          async stopLane() {
+            return { stopped: true, reachable: true }
+          },
+          async prewarm() {
+            return { ready: true }
+          },
+        },
+      })
+
+    const coordinator = makeCoordinator()
+    const res = await coordinator.handoff({
+      userId: 42,
+      tenantId: '42',
+      sessionKey: 'sess-b08-abort',
+      sessionId: 'sid-b08-abort',
+      expectedPlacementEpoch: 1,
+      fromPlacement: localPlacement,
+      toPlacement: remotePlacement,
+      settledToolsProven: true,
+      execEnvLeaseId: 'exec-lease-b08-abort',
+      currentBrainGen: 1,
+      previousCredentialLeaseId: 'cred-source-abort-test',
+      allowColdFallback: true,
+    })
+
+    assert.ok(!res.ok)
+    assert.equal(res.rolledBack, false)
+    assert.deepEqual(revokedLeases, [], 'must NOT revoke target lease while PG abort is unconfirmed')
+
+    // Restart #1 while PG is still unreachable -> stays unknown, revokes nothing, keeps disk record
+    const restartedWhileDown = makeCoordinator()
+    const stillUnknown = await restartedWhileDown.reconcilePendingCredentialCleanup(res.migrationId!)
+    assert.equal(stillUnknown?.status, 'unknown')
+    assert.deepEqual(revokedLeases, [])
+    assert.equal((await restartedWhileDown.listPendingCredentialReconciliations()).length, 1)
+
+    // PG comes back online -> Restart #2 CAS-aborts PG & revokes target lease, but source ExecEnv restore fails ->
+    // MUST persist partial progress (`targetLeaseRevoked: true, sourceExecEnvRestored: false`) and RETAIN disk record!
+    pgDown = false
+    const restartedPartial = makeCoordinator()
+    const partialAbort = await restartedPartial.reconcilePendingCredentialCleanup(res.migrationId!)
+    assert.ok(partialAbort !== null && partialAbort.status === 'aborted')
+    assert.equal(partialAbort.targetCredentialRevoked, true)
+    assert.equal(partialAbort.sourceExecEnvRestored, false)
+    assert.equal(partialAbort.fullyConverged, false)
+    assert.equal(partialAbort.stillPending, true)
+    assert.deepEqual(revokedLeases, ['cred-target-abort-deferred'])
+    const persistedPartial = await restartedPartial.getPendingCredentialReconciliation(res.migrationId!)
+    assert.equal(persistedPartial?.pgDecision, 'aborted')
+    assert.equal(persistedPartial?.targetLeaseRevoked, true)
+    assert.equal(persistedPartial?.sourceExecEnvRestored, false)
+
+    // Restart #3 finishes ONLY the missing source ExecEnv restore (zero duplicate target revoke) & deletes disk record!
+    const restartedFinal = makeCoordinator()
+    const converged = await restartedFinal.reconcilePendingCredentialCleanup(res.migrationId!)
+    assert.ok(converged !== null && converged.status === 'aborted')
+    assert.equal(converged.targetCredentialRevoked, true)
+    assert.equal(converged.sourceExecEnvRestored, true)
+    assert.equal(converged.sourceCredentialPreserved, true)
+    assert.equal(converged.fullyConverged, true)
+    assert.equal(converged.stillPending, false)
+    assert.deepEqual(revokedLeases, ['cred-target-abort-deferred'])
+    assert.equal(activeCredentials.has('cred-source-abort-test'), true)
+    assert.equal(activeCredentials.has('cred-target-abort-deferred'), false)
+    assert.equal(converged.restoredSourceLease?.brainGen, 3)
+    assert.equal(activeBrainGen, 3)
+    assert.equal(activePlacement.poolKind, 'local_container')
+    assert.equal((await restartedFinal.listPendingCredentialReconciliations()).length, 0)
   })
 })

@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import {
   type ExecutionPolicyEnvelope,
@@ -36,6 +39,13 @@ import {
 } from '../index.js'
 
 const registriesToDispose: ExecEnvJobRegistry[] = []
+const tempSettlementWalDirs: string[] = []
+
+function makeTempSettlementWalDir(prefix = 'ocv5-settlement-wal-'): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  tempSettlementWalDirs.push(dir)
+  return dir
+}
 
 function makeJobRegistry(): ExecEnvJobRegistry {
   const reg = new ExecEnvJobRegistry({ envId: 'env-test-pool', killGraceMs: 80 })
@@ -46,6 +56,9 @@ function makeJobRegistry(): ExecEnvJobRegistry {
 afterEach(async () => {
   while (registriesToDispose.length > 0) {
     await registriesToDispose.pop()!.disposeAll()
+  }
+  while (tempSettlementWalDirs.length > 0) {
+    rmSync(tempSettlementWalDirs.pop()!, { recursive: true, force: true })
   }
 })
 
@@ -608,6 +621,8 @@ describe('OCV5-890 Wave 2 — Symmetric Dual-Pool Inference Drivers (LocalPoolDr
       }),
       estimateCreditsFen,
       clock: fixedClock,
+      settlementWalDir: makeTempSettlementWalDir(),
+      authoritativeSettleIdempotent: true,
       onSettleReceipt: (_receipt, settlement) => {
         localSettlements.push(settlement)
       },
@@ -647,6 +662,8 @@ describe('OCV5-890 Wave 2 — Symmetric Dual-Pool Inference Drivers (LocalPoolDr
       }),
       estimateCreditsFen,
       clock: fixedClock,
+      settlementWalDir: makeTempSettlementWalDir(),
+      authoritativeSettleIdempotent: true,
       onSettleReceipt: (_receipt, settlement) => {
         remoteSettlements.push(settlement)
       },
@@ -1149,6 +1166,8 @@ describe('OCV5-890 Wave 2 — Symmetric Dual-Pool Inference Drivers (LocalPoolDr
         models: [triplet],
       }),
       clock: fixedClock,
+      settlementWalDir: makeTempSettlementWalDir(),
+      authoritativeSettleIdempotent: true,
       onSettleReceipt: (receipt, info) => {
         localSettlements.push({ receipt, info })
       },
@@ -1181,6 +1200,8 @@ describe('OCV5-890 Wave 2 — Symmetric Dual-Pool Inference Drivers (LocalPoolDr
         models: [triplet],
       }),
       clock: fixedClock,
+      settlementWalDir: makeTempSettlementWalDir(),
+      authoritativeSettleIdempotent: true,
       onSettleReceipt: (receipt, info) => {
         remoteSettlements.push({ receipt, info })
       },
@@ -1452,7 +1473,368 @@ describe('OCV5-890 Wave 2 — Symmetric Dual-Pool Inference Drivers (LocalPoolDr
         } else {
           assert.equal(getAttempts(), 2)
         }
+
+        // Calling waitForSettlement again AFTER recovery must return the settled receipt (never re-throw stale rejected promise)
+        const afterRecovery = await driver.waitForSettlement(adm.admissionId)
+        assert.equal(afterRecovery?.receiptDigest, recovered.receiptDigest)
+        assert.equal(ledger.size, 1)
       }
+    }
+  })
+
+  it('B07-R2(b): disk settlementWalDir recovers pending settlements across restarted driver instances via lookupAuthoritativeSettlement (exact-once ledger)', async () => {
+    const triplet = makeCapabilityTriplet()
+
+    for (const mode of ['fail_before_write', 'lost_ack_after_write'] as const) {
+      for (const kind of ['local', 'remote'] as const) {
+        const walDir = mkdtempSync(join(tmpdir(), `ocv5-b07-wal-${kind}-${mode}-`))
+        try {
+          const ledger = new Map<string, TurnReceiptV5>()
+          let settleCalls = 0
+          const reqId = `req-b07-disk-${kind}-${mode}`
+          const turnId = `turn-b07-disk-${kind}-${mode}`
+
+          const onSettleReceipt = async (receipt: TurnReceiptV5) => {
+            settleCalls += 1
+            if (settleCalls === 1) {
+              if (mode === 'lost_ack_after_write') {
+                ledger.set(receipt.requestId, receipt)
+              }
+              throw new Error(`DISK_SETTLE_TRANSIENT_${mode}`)
+            }
+            ledger.set(receipt.requestId, receipt)
+          }
+
+          const lookupAuthoritativeSettlement = (billingKey: string) => {
+            const existing = ledger.get(billingKey)
+            return existing ? { settled: true, receipt: existing } : { settled: false }
+          }
+
+          const makeDriver = () => {
+            if (kind === 'local') {
+              const adapter = new MockEngineAdapter(async (params) => {
+                await new Promise((r) => setTimeout(r, 5))
+                params.onEvent({ kind: 'block', block: { kind: 'text', text: 'persisted' } as any })
+                return makeSuccessSummary({
+                  inputTokens: 150,
+                  outputTokens: 45,
+                  cacheReadTokens: 0,
+                  cacheCreationTokens: 0,
+                })
+              })
+              return new LocalPoolDriver({
+                adapter,
+                manifest: buildLocalDriverCapabilityManifest({
+                  engineFamily: 'codex',
+                  authorityEngine: 'codex',
+                  driverId: 'local-codex-v5',
+                  driverVersion: '5.0.0',
+                  models: [triplet],
+                }),
+                settlementWalDir: walDir,
+                lookupAuthoritativeSettlement,
+                onSettleReceipt,
+              })
+            }
+            const mockRemote = makeMockRemoteBridge(async function* () {
+              yield { kind: 'text_delta', channel: 'answer', delta: 'persisted' }
+              yield {
+                kind: 'terminal',
+                status: 'success',
+                usage: { inputTokens: 150, outputTokens: 45, cacheReadTokens: 0, cacheWriteTokens: 0 },
+              }
+            })
+            return new RemotePoolV5Driver({
+              bridge: mockRemote.bridge,
+              manifest: buildRemoteDriverCapabilityManifest({
+                engineFamily: 'codex',
+                authorityEngine: 'codex',
+                driverId: 'remote-codex-v5',
+                driverVersion: '5.0.0',
+                models: [triplet],
+              }),
+              settlementWalDir: walDir,
+              lookupAuthoritativeSettlement,
+              onSettleReceipt,
+            })
+          }
+
+          // Driver instance 1 dispatches, subscriber detaches early, first settle write fails
+          const driver1 = makeDriver()
+          const adm = await driver1.admit(makeTurnRequest({ turnId, requestId: reqId }))
+          const iter = driver1.dispatch(adm.admissionId)[Symbol.asyncIterator]()
+          let sawDispatched = false
+          while (!sawDispatched) {
+            const step = await iter.next()
+            assert.equal(step.done, false)
+            if (step.value.kind === 'turn_dispatched') sawDispatched = true
+          }
+          await iter.return?.()
+          await new Promise((r) => setTimeout(r, 30))
+
+          assert.equal(settleCalls, 1)
+          const pendingBeforeRestart = await driver1.listPendingSettlements()
+          assert.equal(pendingBeforeRestart.length, 1)
+          assert.equal(pendingBeforeRestart[0]!.billingIdempotencyKey, reqId)
+
+          // Simulate full process restart: brand new driver2 reads from the SAME settlementWalDir
+          const driver2 = makeDriver()
+          const report = await driver2.recoverPendingSettlements()
+          assert.equal(report.failed.length, 0)
+          assert.equal(report.settled.length, 1)
+          assert.equal(report.settled[0]!.requestId, reqId)
+          assert.equal(ledger.size, 1, `${kind}/${mode}: authoritative ledger must have exactly 1 entry`)
+          assert.equal((await driver2.listPendingSettlements()).length, 0)
+
+          if (mode === 'lost_ack_after_write') {
+            assert.equal(report.adoptedFromLedger, 1)
+            assert.equal(report.replayedToLedger, 0)
+            assert.equal(settleCalls, 1, 'already-written ledger record must NEVER be charged twice')
+          } else {
+            assert.equal(report.adoptedFromLedger, 0)
+            assert.equal(report.replayedToLedger, 1)
+            assert.equal(settleCalls, 2)
+          }
+
+          // Calling retrySettlement after convergence is a safe no-op with zero extra writes
+          const noop = await driver2.retrySettlement(reqId)
+          assert.equal(noop, null)
+          assert.equal(ledger.size, 1)
+        } finally {
+          rmSync(walDir, { recursive: true, force: true })
+        }
+      }
+    }
+  })
+
+  it('B07-R2(c): rejects billable dispatch without durable outbox, retains pending record when recovery lacks writer, and publishes authoritative returned receipt', async () => {
+    const triplet = makeCapabilityTriplet()
+
+    // 1. Default construction with onSettleReceipt and NO settlementWalDir/pendingSettlementOutbox
+    //    MUST fail closed with DURABLE_SETTLEMENT_STORE_REQUIRED BEFORE executing adapter/bridge!
+    let localRan = 0
+    let remoteRan = 0
+    const ephemeralLocal = new LocalPoolDriver({
+      adapter: new MockEngineAdapter(async () => {
+        localRan += 1
+        return makeSuccessSummary({
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+        })
+      }),
+      manifest: buildLocalDriverCapabilityManifest({
+        engineFamily: 'codex',
+        authorityEngine: 'codex',
+        driverId: 'local-codex-v5',
+        driverVersion: '5.0.0',
+        models: [triplet],
+      }),
+      onSettleReceipt: () => {},
+    })
+    const ephemeralRemoteBridge = makeMockRemoteBridge(async function* () {
+      remoteRan += 1
+      yield { kind: 'terminal', status: 'success' }
+    })
+    const ephemeralRemote = new RemotePoolV5Driver({
+      bridge: ephemeralRemoteBridge.bridge,
+      manifest: buildRemoteDriverCapabilityManifest({
+        engineFamily: 'codex',
+        authorityEngine: 'codex',
+        driverId: 'remote-codex-v5',
+        driverVersion: '5.0.0',
+        models: [triplet],
+      }),
+      onSettleReceipt: () => {},
+    })
+
+    for (const [label, driver] of [
+      ['local', ephemeralLocal],
+      ['remote', ephemeralRemote],
+    ] as const) {
+      const adm = await driver.admit(makeTurnRequest({ turnId: `turn-ephem-${label}` }))
+      assert.throws(() => driver.dispatch(adm.admissionId), /DURABLE_SETTLEMENT_STORE_REQUIRED/)
+    }
+    assert.equal(localRan, 0, 'local adapter must not run when durable settlement outbox is missing')
+    assert.equal(remoteRan, 0, 'remote bridge must not run when durable settlement outbox is missing')
+
+    // 2. Recovery instance WITHOUT onSettleReceipt (no writer) when authoritative ledger says NOT settled:
+    //    MUST preserve pending record on disk (pending=1, replayed=0, skippedNoWriter=1)!
+    for (const kind of ['local', 'remote'] as const) {
+      const walDir = makeTempSettlementWalDir(`ocv5-b07-nowriter-${kind}-`)
+      const ledger = new Map<string, TurnReceiptV5>()
+      let writerCalls = 0
+      const reqId = `req-nowriter-${kind}`
+
+      const makeInstance = (withWriter: boolean) => {
+        const writer = withWriter
+          ? async (receipt: TurnReceiptV5) => {
+              writerCalls += 1
+              if (writerCalls === 1) throw new Error('FIRST_WRITE_FAILED')
+              ledger.set(receipt.requestId, receipt)
+            }
+          : undefined
+        if (kind === 'local') {
+          return new LocalPoolDriver({
+            adapter: new MockEngineAdapter(async () =>
+              makeSuccessSummary({
+                inputTokens: 50,
+                outputTokens: 10,
+                cacheReadTokens: 0,
+                cacheCreationTokens: 0,
+              }),
+            ),
+            manifest: buildLocalDriverCapabilityManifest({
+              engineFamily: 'codex',
+              authorityEngine: 'codex',
+              driverId: 'local-codex-v5',
+              driverVersion: '5.0.0',
+              models: [triplet],
+            }),
+            settlementWalDir: walDir,
+            lookupAuthoritativeSettlement: (k) =>
+              ledger.has(k) ? { settled: true, receipt: ledger.get(k)! } : { settled: false },
+            ...(writer ? { onSettleReceipt: writer } : {}),
+          })
+        }
+        const bridgeMock = makeMockRemoteBridge(async function* () {
+          yield {
+            kind: 'terminal',
+            status: 'success',
+            usage: { inputTokens: 50, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0 },
+          }
+        })
+        return new RemotePoolV5Driver({
+          bridge: bridgeMock.bridge,
+          manifest: buildRemoteDriverCapabilityManifest({
+            engineFamily: 'codex',
+            authorityEngine: 'codex',
+            driverId: 'remote-codex-v5',
+            driverVersion: '5.0.0',
+            models: [triplet],
+          }),
+          settlementWalDir: walDir,
+          lookupAuthoritativeSettlement: (k) =>
+            ledger.has(k) ? { settled: true, receipt: ledger.get(k)! } : { settled: false },
+          ...(writer ? { onSettleReceipt: writer } : {}),
+        })
+      }
+
+      const writerDriver = makeInstance(true)
+      const adm = await writerDriver.admit(
+        makeTurnRequest({ turnId: `turn-nowriter-${kind}`, requestId: reqId }),
+      )
+      const iter = writerDriver.dispatch(adm.admissionId)[Symbol.asyncIterator]()
+      while (true) {
+        const step = await iter.next()
+        if (step.done || step.value.kind === 'turn_dispatched') break
+      }
+      await iter.return?.()
+      await new Promise((r) => setTimeout(r, 25))
+      assert.equal(writerCalls, 1)
+      assert.equal(ledger.size, 0)
+
+      // Restart WITHOUT writer -> MUST NOT report replayed and MUST NOT delete pending record!
+      const noWriterRecovery = makeInstance(false)
+      const noWriterReport = await noWriterRecovery.recoverPendingSettlements()
+      assert.equal(noWriterReport.replayedToLedger, 0)
+      assert.equal(noWriterReport.adoptedFromLedger, 0)
+      assert.equal(noWriterReport.skippedNoWriter, 1)
+      assert.equal(noWriterReport.settled.length, 0)
+      assert.equal(noWriterReport.failed.length, 1)
+      assert.equal(noWriterReport.failed[0]!.code, 'writer_unavailable')
+      assert.equal((await noWriterRecovery.listPendingSettlements()).length, 1)
+      assert.equal(ledger.size, 0)
+
+      // Restart WITH writer -> settles once and clears pending record
+      const withWriterRecovery = makeInstance(true)
+      const okReport = await withWriterRecovery.recoverPendingSettlements()
+      assert.equal(okReport.replayedToLedger, 1)
+      assert.equal(okReport.skippedNoWriter, 0)
+      assert.equal(okReport.failed.length, 0)
+      assert.equal(ledger.size, 1)
+      assert.equal((await withWriterRecovery.listPendingSettlements()).length, 0)
+    }
+
+    // 3. Authoritative returned TurnReceiptV5 (different from local candidate receipt) MUST be
+    //    published in billing_receipt event AND returned by waitForSettlement() for BOTH drivers!
+    for (const kind of ['local', 'remote'] as const) {
+      const walDir = makeTempSettlementWalDir(`ocv5-b07-auth-receipt-${kind}-`)
+      const reqId = `req-auth-receipt-${kind}`
+      const authHolder: { receipt: TurnReceiptV5 | null } = { receipt: null }
+
+      const buildAuthoritativeOverride = (candidate: TurnReceiptV5): TurnReceiptV5 => {
+        const auth: TurnReceiptV5 = {
+          ...candidate,
+          usage: {
+            inputTokens: 999,
+            outputTokens: 333,
+            cacheReadTokens: 11,
+            cacheWriteTokens: 22,
+          },
+          receiptDigest: remoteCanonicalSha256({ authoritativeOverride: reqId }),
+        }
+        authHolder.receipt = auth
+        return auth
+      }
+
+      const driver =
+        kind === 'local'
+          ? new LocalPoolDriver({
+              adapter: new MockEngineAdapter(async () =>
+                makeSuccessSummary({
+                  inputTokens: 100,
+                  outputTokens: 20,
+                  cacheReadTokens: 0,
+                  cacheCreationTokens: 0,
+                }),
+              ),
+              manifest: buildLocalDriverCapabilityManifest({
+                engineFamily: 'codex',
+                authorityEngine: 'codex',
+                driverId: 'local-codex-v5',
+                driverVersion: '5.0.0',
+                models: [triplet],
+              }),
+              settlementWalDir: walDir,
+              authoritativeSettleIdempotent: true,
+              onSettleReceipt: (candidate) => buildAuthoritativeOverride(candidate),
+            })
+          : new RemotePoolV5Driver({
+              bridge: makeMockRemoteBridge(async function* () {
+                yield {
+                  kind: 'terminal',
+                  status: 'success',
+                  usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0 },
+                }
+              }).bridge,
+              manifest: buildRemoteDriverCapabilityManifest({
+                engineFamily: 'codex',
+                authorityEngine: 'codex',
+                driverId: 'remote-codex-v5',
+                driverVersion: '5.0.0',
+                models: [triplet],
+              }),
+              settlementWalDir: walDir,
+              authoritativeSettleIdempotent: true,
+              onSettleReceipt: (candidate) => buildAuthoritativeOverride(candidate),
+            })
+
+      const adm = await driver.admit(
+        makeTurnRequest({ turnId: `turn-auth-receipt-${kind}`, requestId: reqId }),
+      )
+      const events = await collectEvents(driver.dispatch(adm.admissionId))
+      const billingEv = events.find((e) => e.kind === 'billing_receipt')
+      assert.ok(billingEv && billingEv.kind === 'billing_receipt')
+      assert.ok(authHolder.receipt !== null)
+      assert.equal(billingEv.receipt.receiptDigest, authHolder.receipt.receiptDigest)
+      assert.equal(billingEv.receipt.usage.inputTokens, 999)
+      assert.equal(billingEv.receipt.usage.outputTokens, 333)
+
+      const waited = await driver.waitForSettlement(adm.admissionId)
+      assert.equal(waited?.receiptDigest, authHolder.receipt.receiptDigest)
+      assert.equal(waited?.usage.inputTokens, 999)
     }
   })
 })

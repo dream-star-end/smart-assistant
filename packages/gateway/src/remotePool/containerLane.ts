@@ -74,6 +74,12 @@ import { lookupRemoteSwarmMcpContext } from '../remoteSwarmRuntime.js'
 import { SubprocessRunner } from '../subprocessRunner.js'
 import { RemoteObservationGate } from './observationGate.js'
 import {
+  DEFAULT_MAX_IMAGE_BYTES,
+  inferImageMimeFromPath,
+  materializeRemoteTurnContentBlocks,
+  resolveTrustedMediaRoots,
+} from './remoteMediaMaterializer.js'
+import {
   assertRemotePoolBinding,
   remotePoolBackendOf,
   remotePoolNeed,
@@ -115,7 +121,7 @@ const DEFAULT_EXECUTION_ROOT = '/home/agent/.openclaude/.cc5-native-tools'
 const LEASE_RENEW_RETRY_MS = 60_000
 const EXEC_ENV_IDENT_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const TEXT_ONLY_REMOTE_DRIVERS = new Set(['antigravity'])
-const DEFAULT_MAX_IMAGE_BYTES = 12 * 1024 * 1024
+const inferredMimeBlocks = new WeakSet<RemoteDriverTurnContentBlock>()
 
 function normalizeRemoteServiceTier(
   tier: unknown,
@@ -142,16 +148,16 @@ function extractRemoteTurnContent(
         block.source && typeof block.source === 'object' && !Array.isArray(block.source)
           ? (block.source as Record<string, unknown>)
           : undefined
-      const rawMime =
-        typeof block.mimeType === 'string'
+      const explicitMime =
+        typeof block.mimeType === 'string' && block.mimeType.length > 0
           ? block.mimeType
-          : typeof block.media_type === 'string'
+          : typeof block.media_type === 'string' && block.media_type.length > 0
             ? block.media_type
-            : typeof source?.media_type === 'string'
+            : typeof source?.media_type === 'string' && source.media_type.length > 0
               ? source.media_type
-              : typeof source?.mimeType === 'string'
+              : typeof source?.mimeType === 'string' && source.mimeType.length > 0
                 ? source.mimeType
-                : 'image/png'
+                : undefined
       const data =
         typeof block.data === 'string' && block.data.length > 0
           ? block.data
@@ -161,18 +167,27 @@ function extractRemoteTurnContent(
       const blobId =
         typeof block.blobId === 'string' && block.blobId.length > 0 ? block.blobId : undefined
       const path =
-        typeof block.path === 'string' && block.path.length > 0 ? block.path : undefined
+        typeof block.path === 'string' && block.path.length > 0
+          ? block.path
+          : typeof source?.path === 'string' && source.path.length > 0
+            ? source.path
+            : undefined
+      const rawMime = explicitMime ?? (path ? inferImageMimeFromPath(path) : 'image/png')
       remotePoolNeed(
         rawMime.length > 0 && (data !== undefined || blobId !== undefined || path !== undefined),
         block.type === 'image' ? 'REMOTE_CONTENT_BLOCK_INVALID' : 'REMOTE_IMAGE_BLOB_UNRESOLVED',
       )
-      blocks.push({
+      const normalizedBlock: RemoteDriverTurnContentBlock = {
         type: 'image',
         mimeType: rawMime,
         ...(data ? { data } : {}),
         ...(blobId ? { blobId } : {}),
         ...(path ? { path } : {}),
-      })
+      }
+      if (explicitMime === undefined && path !== undefined) {
+        inferredMimeBlocks.add(normalizedBlock)
+      }
+      blocks.push(normalizedBlock)
     }
   }
   return blocks.some((b) => b.type === 'image') ? blocks : undefined
@@ -503,14 +518,16 @@ export class RemotePoolRelayClient {
       'REMOTE_ADMIT_UNKNOWN',
     )
     let countersBaseline: Readonly<Record<string, number>> | undefined
+    const rawBaseline =
+      reply.countersBaseline ?? reply.threadUsageBaseline ?? reply.baselineUsage
     if (
-      reply.countersBaseline &&
-      typeof reply.countersBaseline === 'object' &&
-      !Array.isArray(reply.countersBaseline)
+      rawBaseline &&
+      typeof rawBaseline === 'object' &&
+      !Array.isArray(rawBaseline)
     ) {
       const parsed: Record<string, number> = {}
       let hasAny = false
-      for (const [k, v] of Object.entries(reply.countersBaseline as Record<string, unknown>)) {
+      for (const [k, v] of Object.entries(rawBaseline as Record<string, unknown>)) {
         if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
           parsed[k] = Math.trunc(v)
           hasAny = true
@@ -672,6 +689,7 @@ export interface RemoteContainerLaneOptions {
   readonly blobResolver?: (
     blobId: string,
   ) => Promise<{ readonly mimeType: string; readonly data: string }>
+  readonly trustedMediaRoots?: readonly string[]
   readonly maxImageBytes?: number
   readonly observationOptions?: {
     readonly testFaultBypassObservation?: boolean
@@ -1210,79 +1228,19 @@ export class RemoteContainerLane {
   private async resolveTurnContentBlocks(
     blocks: readonly RemoteDriverTurnContentBlock[],
   ): Promise<RemoteDriverTurnContentBlock[]> {
-    const maxBytes = this.laneOptions.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES
-    let totalImageBytes = 0
-    const out: RemoteDriverTurnContentBlock[] = []
-    for (const block of blocks) {
-      if (block.type === 'text') {
-        out.push({ type: 'text', text: block.text })
-        continue
-      }
-      if (typeof block.data === 'string' && block.data.length > 0) {
-        totalImageBytes += Buffer.byteLength(block.data, 'utf8')
-        remotePoolNeed(totalImageBytes <= maxBytes, 'REMOTE_IMAGE_PAYLOAD_TOO_LARGE')
-        out.push({ type: 'image', mimeType: block.mimeType, data: block.data })
-      } else if (typeof block.path === 'string' && block.path.length > 0) {
-        // B02: Never forward container-local filesystem paths raw to remote drivers (CC rejects
-        // path with CC_CONTENT_INVALID; Codex misinterprets path as a remote-host file). Always
-        // materialize trusted local file bytes into inline base64 data BEFORE dispatch.
-        remotePoolNeed(
-          !block.path.includes('\u0000') && !block.path.includes('..'),
-          'REMOTE_IMAGE_PATH_UNREADABLE',
-        )
-        let rawBytes: Buffer
-        let fd: number | undefined
-        try {
-          const link = lstatSync(block.path)
-          remotePoolNeed(link.isFile() && !link.isSymbolicLink(), 'REMOTE_IMAGE_PATH_UNREADABLE')
-          fd = openSync(block.path, constants.O_RDONLY | constants.O_NOFOLLOW)
-          const meta = fstatSync(fd)
-          remotePoolNeed(
-            meta.isFile() && meta.ino === link.ino && meta.dev === link.dev && meta.size > 0,
-            'REMOTE_IMAGE_PATH_UNREADABLE',
-          )
-          remotePoolNeed(meta.size <= maxBytes, 'REMOTE_IMAGE_PAYLOAD_TOO_LARGE')
-          rawBytes = readFileSync(fd)
-        } catch (err) {
-          if (err instanceof Error && err.message === 'REMOTE_IMAGE_PAYLOAD_TOO_LARGE') throw err
-          throw new Error('REMOTE_IMAGE_PATH_UNREADABLE')
-        } finally {
-          if (fd !== undefined) {
-            try {
-              closeSync(fd)
-            } catch {}
-          }
-        }
-        const b64 = rawBytes.toString('base64')
-        totalImageBytes += Buffer.byteLength(b64, 'utf8')
-        remotePoolNeed(totalImageBytes <= maxBytes, 'REMOTE_IMAGE_PAYLOAD_TOO_LARGE')
-        out.push({ type: 'image', mimeType: block.mimeType, data: b64 })
-      } else if (typeof block.blobId === 'string' && block.blobId.length > 0) {
-        const resolver = this.laneOptions.blobResolver
-        remotePoolNeed(typeof resolver === 'function', 'REMOTE_IMAGE_BLOB_UNRESOLVED')
-        let resolved: { readonly mimeType: string; readonly data: string } | undefined
-        try {
-          resolved = await resolver(block.blobId)
-        } catch {
-          throw new Error('REMOTE_IMAGE_BLOB_UNRESOLVED')
-        }
-        remotePoolNeed(
-          resolved !== undefined &&
-            typeof resolved.mimeType === 'string' &&
-            resolved.mimeType.length > 0 &&
-            typeof resolved.data === 'string' &&
-            resolved.data.length > 0 &&
-            !resolved.data.includes('\u0000'),
-          'REMOTE_IMAGE_BLOB_UNRESOLVED',
-        )
-        totalImageBytes += Buffer.byteLength(resolved.data, 'utf8')
-        remotePoolNeed(totalImageBytes <= maxBytes, 'REMOTE_IMAGE_PAYLOAD_TOO_LARGE')
-        out.push({ type: 'image', mimeType: resolved.mimeType, data: resolved.data })
-      } else {
-        throw new Error('REMOTE_IMAGE_BLOB_UNRESOLVED')
-      }
-    }
-    return out
+    const repoSnap = this.opts.sessionId ? this.opts.getRepoSnapshot?.(this.opts.sessionId) : null
+    const trustedMediaRoots = resolveTrustedMediaRoots({
+      trustedMediaRoots: this.laneOptions.trustedMediaRoots,
+      agentBaseDir: this.opts.agentBaseDir,
+      promptCwd: this.resolvedPromptCwd,
+      repoWorkspaceDir: repoSnap?.workspaceDir ?? undefined,
+    })
+    return await materializeRemoteTurnContentBlocks(blocks, {
+      trustedMediaRoots,
+      maxImageBytes: this.laneOptions.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES,
+      blobResolver: this.laneOptions.blobResolver,
+      isInferredMimeBlock: (block) => inferredMimeBlocks.has(block),
+    })
   }
 
   async executeTurn(

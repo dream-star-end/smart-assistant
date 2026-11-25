@@ -24,6 +24,20 @@
  */
 import { createHash, randomUUID } from 'node:crypto'
 import {
+  closeSync,
+  constants as fsConstants,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs'
+import { join, resolve } from 'node:path'
+import {
   computeStickyHomeKey,
   validatePlacementDescriptor,
   type AuthorityEngineKind,
@@ -234,12 +248,84 @@ export interface MigrationDrainCoordinatorPort {
   ): Promise<MigrationDrainResult>
 }
 
+export type PendingMigrationPgDecision = 'pending' | 'unknown' | 'committed' | 'aborted'
+
+export interface PendingCredentialReconciliationRecord {
+  readonly migrationId: string
+  readonly userId: number | bigint
+  readonly sessionKey: string
+  readonly fromEpoch: number
+  readonly toEpoch: number
+  readonly fromPlacement: PlacementDescriptor
+  readonly toPlacement: PlacementDescriptor
+  readonly execEnvLeaseId: string
+  readonly targetCredentialLease: CredentialLeaseHandle | null
+  readonly sourceCredentialLeaseId: string | null
+  readonly currentBrainGen: number
+  readonly currentFencingToken?: string
+  readonly targetBrainGen: number | null
+  readonly targetFencingToken: string | null
+  readonly pgDecision: PendingMigrationPgDecision
+  readonly sourceLeaseRevoked: boolean
+  readonly targetLeaseRevoked: boolean
+  readonly sourceQuiesced?: boolean
+  readonly sourceExecEnvRestored: boolean
+  readonly reason: string
+  readonly recordedAt: string
+}
+
+export interface PendingCredentialReconciliationStore {
+  put(record: PendingCredentialReconciliationRecord): Promise<void> | void
+  get(
+    migrationId: string,
+  ): Promise<PendingCredentialReconciliationRecord | null> | PendingCredentialReconciliationRecord | null
+  delete(migrationId: string): Promise<void> | void
+  list(): Promise<readonly PendingCredentialReconciliationRecord[]> | readonly PendingCredentialReconciliationRecord[]
+}
+
+export type CredentialReconciliationOutcome =
+  | {
+      readonly migrationId: string
+      readonly status: 'committed'
+      readonly targetCredentialPreserved: true
+      readonly targetCredentialLease: CredentialLeaseHandle | null
+      readonly sourceCredentialRevoked: boolean
+      readonly fullyConverged: boolean
+      readonly stillPending: boolean
+      readonly migration: PlacementMigrationRecord | null
+      readonly pointer: SessionEnginePointer | null
+    }
+  | {
+      readonly migrationId: string
+      readonly status: 'aborted'
+      readonly targetCredentialRevoked: boolean
+      readonly sourceExecEnvRestored: boolean
+      readonly sourceCredentialPreserved: true
+      readonly fullyConverged: boolean
+      readonly stillPending: boolean
+      readonly restoredSourceLease?: {
+        readonly brainGen: number
+        readonly fencingToken: string
+      }
+      readonly migration: PlacementMigrationRecord | null
+    }
+  | {
+      readonly migrationId: string
+      readonly status: 'unknown'
+      readonly stillPending: true
+      readonly targetCredentialPreserved: true
+      readonly reason: string
+    }
+
 export interface MigrationCoordinatorDeps {
   readonly authorityStore: MigrationAuthorityStorePort
   readonly capsuleStore: MigrationCapsulePort
   readonly execEnv: MigrationExecEnvPort
   readonly credentialLeases: MigrationCredentialLeasePort
   readonly drivers: MigrationDriverPort
+  readonly reconciliationWalDir?: string
+  readonly pendingReconciliationStore?: PendingCredentialReconciliationStore
+  readonly allowEphemeralReconciliationForTests?: boolean
   readonly drainCoordinator?: MigrationDrainCoordinatorPort
   readonly drainPool?: unknown
   readonly control?: Partial<PoolMigrationControl>
@@ -294,6 +380,8 @@ export interface MigrationHandoffSuccess {
 
 export type MigrationHandoffErrorCode =
   | 'MIGRATION_UNSETTLED_TOOLS_IN_FLIGHT'
+  | 'MIGRATION_RECONCILIATION_STORE_REQUIRED'
+  | 'MIGRATION_RECONCILIATION_PERSIST_FAILED'
   | 'MIGRATION_EPOCH_CONFLICT'
   | 'MIGRATION_SOURCE_STOP_FAILED'
   | 'MIGRATION_CREDENTIAL_LEASE_FAILED'
@@ -314,6 +402,8 @@ export interface MigrationHandoffFailure {
     readonly brainGen: number
     readonly fencingToken: string
   }
+  readonly preservedCandidateLease?: CredentialLeaseHandle
+  readonly pendingCredentialReconciliation?: PendingCredentialReconciliationRecord
   readonly migrationId?: string
   readonly conflictReason?: 'epoch_mismatch' | 'already_migrating'
   readonly activeMigrationId?: string | null
@@ -338,9 +428,258 @@ export interface MigrationPrewarmResult {
 
 const DEFAULT_CREDENTIAL_TTL_MS = 15 * 60_000
 const DEFAULT_DRAIN_TIMEOUT_MS = 60_000
+const SAFE_RECONCILE_ID_RE = /^[A-Za-z0-9._-]{1,128}$/
+const RECONCILE_FILE_SUFFIX = '.reconcile.json'
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+function fsyncDirSync(dirPath: string): void {
+  let dirFd: number | undefined
+  try {
+    const flags = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0)
+    dirFd = openSync(dirPath, flags)
+    fsyncSync(dirFd)
+  } finally {
+    if (dirFd !== undefined) closeSync(dirFd)
+  }
+}
+
+function writeAllSync(fd: number, buf: Buffer): void {
+  let offset = 0
+  while (offset < buf.length) {
+    offset += writeSync(fd, buf, offset, buf.length - offset)
+  }
+}
+
+function safeReconcileFilename(migrationId: string): string {
+  const safe = SAFE_RECONCILE_ID_RE.test(migrationId)
+    ? migrationId
+    : createHash('sha256').update(migrationId, 'utf8').digest('hex')
+  return `${safe}${RECONCILE_FILE_SUFFIX}`
+}
+
+interface SerializedReconciliationRecord {
+  readonly schemaVersion: 1
+  readonly migrationId: string
+  readonly userIdType: 'bigint' | 'number'
+  readonly userIdValue: string
+  readonly sessionKey: string
+  readonly fromEpoch: number
+  readonly toEpoch: number
+  readonly fromPlacement: PlacementDescriptor
+  readonly toPlacement: PlacementDescriptor
+  readonly execEnvLeaseId: string
+  readonly targetCredentialLease: CredentialLeaseHandle | null
+  readonly sourceCredentialLeaseId: string | null
+  readonly currentBrainGen: number
+  readonly currentFencingToken?: string
+  readonly targetBrainGen: number | null
+  readonly targetFencingToken: string | null
+  readonly pgDecision: PendingMigrationPgDecision
+  readonly sourceLeaseRevoked: boolean
+  readonly targetLeaseRevoked: boolean
+  readonly sourceQuiesced?: boolean
+  readonly sourceExecEnvRestored: boolean
+  readonly reason: string
+  readonly recordedAt: string
+}
+
+function serializeReconciliationRecord(
+  rec: PendingCredentialReconciliationRecord,
+): SerializedReconciliationRecord {
+  return {
+    schemaVersion: 1,
+    migrationId: rec.migrationId,
+    userIdType: typeof rec.userId === 'bigint' ? 'bigint' : 'number',
+    userIdValue: String(rec.userId),
+    sessionKey: rec.sessionKey,
+    fromEpoch: rec.fromEpoch,
+    toEpoch: rec.toEpoch,
+    fromPlacement: rec.fromPlacement,
+    toPlacement: rec.toPlacement,
+    execEnvLeaseId: rec.execEnvLeaseId,
+    targetCredentialLease: rec.targetCredentialLease,
+    sourceCredentialLeaseId: rec.sourceCredentialLeaseId,
+    currentBrainGen: rec.currentBrainGen,
+    ...(rec.currentFencingToken === undefined
+      ? {}
+      : { currentFencingToken: rec.currentFencingToken }),
+    targetBrainGen: rec.targetBrainGen,
+    targetFencingToken: rec.targetFencingToken,
+    pgDecision: rec.pgDecision,
+    sourceLeaseRevoked: rec.sourceLeaseRevoked,
+    targetLeaseRevoked: rec.targetLeaseRevoked,
+    sourceQuiesced: rec.sourceQuiesced ?? !rec.sourceExecEnvRestored,
+    sourceExecEnvRestored: rec.sourceExecEnvRestored,
+    reason: rec.reason,
+    recordedAt: rec.recordedAt,
+  }
+}
+
+function deserializeReconciliationRecord(raw: unknown): PendingCredentialReconciliationRecord | null {
+  if (raw === null || typeof raw !== 'object') return null
+  const obj = raw as Record<string, unknown>
+  if (
+    typeof obj.migrationId !== 'string' ||
+    typeof obj.userIdValue !== 'string' ||
+    typeof obj.sessionKey !== 'string' ||
+    typeof obj.execEnvLeaseId !== 'string' ||
+    typeof obj.fromEpoch !== 'number' ||
+    typeof obj.toEpoch !== 'number' ||
+    typeof obj.currentBrainGen !== 'number' ||
+    obj.fromPlacement === null ||
+    typeof obj.fromPlacement !== 'object' ||
+    obj.toPlacement === null ||
+    typeof obj.toPlacement !== 'object'
+  ) {
+    return null
+  }
+  const userId: number | bigint =
+    obj.userIdType === 'bigint' ? BigInt(obj.userIdValue) : Number(obj.userIdValue)
+  const pgDecision: PendingMigrationPgDecision =
+    obj.pgDecision === 'committed' ||
+    obj.pgDecision === 'aborted' ||
+    obj.pgDecision === 'unknown' ||
+    obj.pgDecision === 'pending'
+      ? obj.pgDecision
+      : 'unknown'
+  return Object.freeze({
+    migrationId: obj.migrationId,
+    userId,
+    sessionKey: obj.sessionKey,
+    fromEpoch: obj.fromEpoch,
+    toEpoch: obj.toEpoch,
+    fromPlacement: obj.fromPlacement as PlacementDescriptor,
+    toPlacement: obj.toPlacement as PlacementDescriptor,
+    execEnvLeaseId: obj.execEnvLeaseId,
+    targetCredentialLease:
+      obj.targetCredentialLease === null || typeof obj.targetCredentialLease !== 'object'
+        ? null
+        : (obj.targetCredentialLease as CredentialLeaseHandle),
+    sourceCredentialLeaseId:
+      typeof obj.sourceCredentialLeaseId === 'string' ? obj.sourceCredentialLeaseId : null,
+    currentBrainGen: obj.currentBrainGen,
+    ...(typeof obj.currentFencingToken === 'string'
+      ? { currentFencingToken: obj.currentFencingToken }
+      : {}),
+    targetBrainGen: typeof obj.targetBrainGen === 'number' ? obj.targetBrainGen : null,
+    targetFencingToken: typeof obj.targetFencingToken === 'string' ? obj.targetFencingToken : null,
+    pgDecision,
+    sourceLeaseRevoked: obj.sourceLeaseRevoked === true,
+    targetLeaseRevoked: obj.targetLeaseRevoked === true,
+    sourceQuiesced:
+      typeof obj.sourceQuiesced === 'boolean'
+        ? obj.sourceQuiesced
+        : obj.sourceExecEnvRestored !== true,
+    sourceExecEnvRestored: obj.sourceExecEnvRestored === true,
+    reason: typeof obj.reason === 'string' ? obj.reason : 'reconciliation_pending',
+    recordedAt: typeof obj.recordedAt === 'string' ? obj.recordedAt : new Date(0).toISOString(),
+  })
+}
+
+export class FilePendingCredentialReconciliationStore
+  implements PendingCredentialReconciliationStore
+{
+  readonly walDir: string
+
+  constructor(walDir: string) {
+    const resolved = resolve(walDir)
+    mkdirSync(resolved, { recursive: true, mode: 0o700 })
+    const st = lstatSync(resolved)
+    if (!st.isDirectory() || st.isSymbolicLink()) {
+      throw new Error(`MIGRATION_RECONCILIATION_WAL_DIR_INVALID:${resolved}`)
+    }
+    this.walDir = resolved
+  }
+
+  put(record: PendingCredentialReconciliationRecord): void {
+    const finalPath = join(this.walDir, safeReconcileFilename(record.migrationId))
+    const tmpPath = join(this.walDir, `.${randomUUID()}.reconcile.tmp`)
+    const payload = Buffer.from(JSON.stringify(serializeReconciliationRecord(record)), 'utf8')
+    const flags =
+      fsConstants.O_CREAT |
+      fsConstants.O_EXCL |
+      fsConstants.O_WRONLY |
+      (fsConstants.O_NOFOLLOW ?? 0)
+    let fd: number | undefined
+    try {
+      fd = openSync(tmpPath, flags, 0o600)
+      writeAllSync(fd, payload)
+      fsyncSync(fd)
+      closeSync(fd)
+      fd = undefined
+      renameSync(tmpPath, finalPath)
+      fsyncDirSync(this.walDir)
+    } catch (err) {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd)
+        } catch {}
+      }
+      try {
+        unlinkSync(tmpPath)
+      } catch {}
+      throw err
+    }
+  }
+
+  get(migrationId: string): PendingCredentialReconciliationRecord | null {
+    const directPath = join(this.walDir, safeReconcileFilename(migrationId))
+    const direct = this.readFileSync(directPath)
+    if (direct && direct.migrationId === migrationId) return direct
+    for (const rec of this.list()) {
+      if (rec.migrationId === migrationId) return rec
+    }
+    return null
+  }
+
+  delete(migrationId: string): void {
+    const directPath = join(this.walDir, safeReconcileFilename(migrationId))
+    try {
+      unlinkSync(directPath)
+      fsyncDirSync(this.walDir)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        throw err
+      }
+    }
+  }
+
+  list(): readonly PendingCredentialReconciliationRecord[] {
+    const out: PendingCredentialReconciliationRecord[] = []
+    for (const entry of readdirSync(this.walDir)) {
+      if (!entry.endsWith(RECONCILE_FILE_SUFFIX)) continue
+      const parsed = this.readFileSync(join(this.walDir, entry))
+      if (parsed) out.push(parsed)
+    }
+    return out
+  }
+
+  private readFileSync(filePath: string): PendingCredentialReconciliationRecord | null {
+    let st: ReturnType<typeof lstatSync>
+    try {
+      st = lstatSync(filePath)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null
+      throw err
+    }
+    if (!st.isFile() || st.isSymbolicLink()) return null
+    let fd: number | undefined
+    try {
+      fd = openSync(filePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+      return deserializeReconciliationRecord(JSON.parse(readFileSync(fd, 'utf8')))
+    } catch {
+      return null
+    } finally {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd)
+        } catch {}
+      }
+    }
+  }
 }
 
 function buildMonotonicFencingToken(
@@ -368,9 +707,15 @@ export class MigrationCoordinator implements PoolMigrationControl {
   private readonly execEnv: MigrationExecEnvPort
   private readonly credentialLeases: MigrationCredentialLeasePort
   private readonly drivers: MigrationDriverPort
+  private readonly pendingReconciliationStore?: PendingCredentialReconciliationStore
+  private readonly allowEphemeralReconciliationForTests: boolean
   private readonly drainCoordinator?: MigrationDrainCoordinatorPort
   private readonly drainPool?: unknown
   private readonly now: () => number
+  private readonly pendingCredentialReconciliations = new Map<
+    string,
+    PendingCredentialReconciliationRecord
+  >()
   private draining = false
 
   constructor(deps: MigrationCoordinatorDeps) {
@@ -379,6 +724,17 @@ export class MigrationCoordinator implements PoolMigrationControl {
     this.execEnv = deps.execEnv
     this.credentialLeases = deps.credentialLeases
     this.drivers = deps.drivers
+    if (deps.pendingReconciliationStore) {
+      this.pendingReconciliationStore = deps.pendingReconciliationStore
+    } else if (
+      typeof deps.reconciliationWalDir === 'string' &&
+      deps.reconciliationWalDir.trim().length > 0
+    ) {
+      this.pendingReconciliationStore = new FilePendingCredentialReconciliationStore(
+        deps.reconciliationWalDir,
+      )
+    }
+    this.allowEphemeralReconciliationForTests = deps.allowEphemeralReconciliationForTests === true
     this.drainCoordinator = deps.drainCoordinator
     this.drainPool = deps.drainPool
     this.now = deps.now ?? Date.now
@@ -387,6 +743,26 @@ export class MigrationCoordinator implements PoolMigrationControl {
     this.preserveStickyHome = deps.control?.preserveStickyHome ?? true
     this.requireCapsuleForWarmHandoff = deps.control?.requireCapsuleForWarmHandoff ?? false
     this.drainTimeoutMs = Math.max(50, Math.floor(deps.control?.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS))
+  }
+
+  get hasDurableReconciliationStore(): boolean {
+    return this.pendingReconciliationStore !== undefined
+  }
+
+  private async persistPendingReconciliation(
+    record: PendingCredentialReconciliationRecord,
+  ): Promise<void> {
+    if (this.pendingReconciliationStore) {
+      await this.pendingReconciliationStore.put(record)
+    }
+    this.pendingCredentialReconciliations.set(record.migrationId, record)
+  }
+
+  private async deletePendingReconciliation(migrationId: string): Promise<void> {
+    if (this.pendingReconciliationStore) {
+      await this.pendingReconciliationStore.delete(migrationId)
+    }
+    this.pendingCredentialReconciliations.delete(migrationId)
   }
 
   get isDraining(): boolean {
@@ -409,6 +785,26 @@ export class MigrationCoordinator implements PoolMigrationControl {
 
     const fromPlacement = validatePlacementDescriptor(args.fromPlacement)
     const toPlacement = validatePlacementDescriptor(args.toPlacement)
+
+    // B08: Any credential-bearing handoff MUST have a durable reconciliation store
+    // (`reconciliationWalDir` or `pendingReconciliationStore`) before mutating PG or issuing leases.
+    const involvesCredentials =
+      toPlacement.profileId !== undefined || args.previousCredentialLeaseId !== undefined
+    if (
+      involvesCredentials &&
+      !this.hasDurableReconciliationStore &&
+      !this.allowEphemeralReconciliationForTests
+    ) {
+      return Object.freeze({
+        ok: false as const,
+        code: 'MIGRATION_RECONCILIATION_STORE_REQUIRED' as const,
+        reason:
+          'reconciliationWalDir or pendingReconciliationStore is required for credential-bearing migration handoff',
+        placementEpoch: args.expectedPlacementEpoch,
+        rolledBack: false,
+      })
+    }
+
     const stickyHomeKey =
       args.stickyHomeKey ??
       (this.preserveStickyHome
@@ -446,8 +842,43 @@ export class MigrationCoordinator implements PoolMigrationControl {
     const migrationId = migration.migrationId
     let candidateLease: CredentialLeaseHandle | null = null
     let quiesced = false
+    let commitAttempted = false
+    let intentPersisted = false
     let reboundToBrainGen: number | null = null
     let reboundFencingToken: string | null = null
+
+    const buildReconciliationRecord = (params: {
+      readonly pgDecision: PendingMigrationPgDecision
+      readonly sourceLeaseRevoked: boolean
+      readonly targetLeaseRevoked: boolean
+      readonly sourceExecEnvRestored: boolean
+      readonly reason: string
+    }): PendingCredentialReconciliationRecord =>
+      Object.freeze({
+        migrationId,
+        userId: args.userId,
+        sessionKey: args.sessionKey,
+        fromEpoch: migration.fromEpoch,
+        toEpoch: migration.toEpoch,
+        fromPlacement,
+        toPlacement,
+        execEnvLeaseId: args.execEnvLeaseId,
+        targetCredentialLease: candidateLease,
+        sourceCredentialLeaseId: args.previousCredentialLeaseId ?? null,
+        currentBrainGen: args.currentBrainGen,
+        ...(args.currentFencingToken === undefined
+          ? {}
+          : { currentFencingToken: args.currentFencingToken }),
+        targetBrainGen: reboundToBrainGen,
+        targetFencingToken: reboundFencingToken,
+        pgDecision: params.pgDecision,
+        sourceLeaseRevoked: params.sourceLeaseRevoked,
+        targetLeaseRevoked: params.targetLeaseRevoked,
+        sourceQuiesced: quiesced,
+        sourceExecEnvRestored: params.sourceExecEnvRestored,
+        reason: params.reason,
+        recordedAt: new Date(this.now()).toISOString(),
+      })
 
     const abortAndFail = async (
       code: MigrationHandoffErrorCode,
@@ -455,24 +886,10 @@ export class MigrationCoordinator implements PoolMigrationControl {
       opts?: { readonly commitOutcomeUnknown?: boolean; readonly alreadyAbortedInPg?: boolean },
     ): Promise<MigrationHandoffFailure> => {
       let pgAborted = opts?.alreadyAbortedInPg === true
-      // B08: NEVER revoke candidate credentials or flip ExecEnv before confirming PG actually
-      // aborted! If commitOutcomeUnknown is true, PG may have committed to target; revoking the
-      // target lease first would strand the committed target placement without credentials.
-      if (!pgAborted && opts?.commitOutcomeUnknown !== true) {
-        try {
-          const abortRes = await this.authorityStore.abortPlacementMigration({
-            migrationId,
-            userId: args.userId,
-            sessionKey: args.sessionKey,
-            reason: `${code}:${abortReason}`,
-          })
-          pgAborted = abortRes.applied === true
-        } catch {
-          pgAborted = false
-        }
-      } else if (!pgAborted && opts?.commitOutcomeUnknown === true) {
-        // Attempt PG abort ONLY if migration is still 'migrating' (abortPlacementMigration uses
-        // WHERE state = 'migrating', so it returns applied=false if PG already committed!).
+      // B08: ALWAYS confirm authoritative PG abort BEFORE revoking target candidate credentials
+      // or flipping ExecEnv! `abortPlacementMigration` uses CAS `WHERE state = 'migrating'`, so
+      // it returns `applied=false` if PG already committed or is unreachable.
+      if (!pgAborted) {
         try {
           const abortRes = await this.authorityStore.abortPlacementMigration({
             migrationId,
@@ -486,14 +903,16 @@ export class MigrationCoordinator implements PoolMigrationControl {
         }
       }
 
-      if (candidateLease !== null && (opts?.commitOutcomeUnknown !== true || pgAborted)) {
+      // B08: NEVER revoke candidateLease unless PG abort is explicitly confirmed (`pgAborted === true`).
+      let targetLeaseRevoked = candidateLease === null
+      if (candidateLease !== null && pgAborted) {
         try {
-          await this.credentialLeases.revokeLease(
+          targetLeaseRevoked = await this.credentialLeases.revokeLease(
             candidateLease.leaseId,
             `migration_aborted:${code}`,
           )
         } catch {
-          // Best-effort cleanup of candidate lease during confirmed rollback.
+          targetLeaseRevoked = false
         }
       }
 
@@ -502,7 +921,7 @@ export class MigrationCoordinator implements PoolMigrationControl {
 
       if (!quiesced && reboundToBrainGen === null) {
         execEnvRestored = true
-      } else if (opts?.commitOutcomeUnknown && !pgAborted) {
+      } else if (!pgAborted && (opts?.commitOutcomeUnknown === true || commitAttempted)) {
         // PG commit status is unconfirmed and abort did not apply; do NOT split-brain by flipping ExecEnv.
         execEnvRestored = false
       } else {
@@ -536,7 +955,32 @@ export class MigrationCoordinator implements PoolMigrationControl {
         }
       }
 
-      const rolledBack = pgAborted && execEnvRestored
+      // B08: Delete durable reconciliation record ONLY when PG abort, target lease revocation,
+      // AND source ExecEnv restoration are ALL authoritatively confirmed! Otherwise retain/update it.
+      let pendingReconciliation: PendingCredentialReconciliationRecord | undefined
+      const needsDeferredReconciliation =
+        !pgAborted || !targetLeaseRevoked || !execEnvRestored
+      if (!needsDeferredReconciliation) {
+        if (intentPersisted) {
+          await this.deletePendingReconciliation(migrationId)
+        }
+      } else if (
+        intentPersisted ||
+        candidateLease !== null ||
+        opts?.commitOutcomeUnknown === true ||
+        commitAttempted
+      ) {
+        pendingReconciliation = buildReconciliationRecord({
+          pgDecision: pgAborted ? 'aborted' : 'unknown',
+          sourceLeaseRevoked: false,
+          targetLeaseRevoked,
+          sourceExecEnvRestored: execEnvRestored,
+          reason: `${code}:${abortReason}`,
+        })
+        await this.persistPendingReconciliation(pendingReconciliation)
+      }
+
+      const rolledBack = pgAborted && execEnvRestored && targetLeaseRevoked
       return Object.freeze({
         ok: false as const,
         code,
@@ -545,6 +989,10 @@ export class MigrationCoordinator implements PoolMigrationControl {
         rolledBack,
         ...(rolledBack ? {} : { recoveryRequired: true }),
         ...(restoredSourceLease === undefined ? {} : { restoredSourceLease }),
+        ...(pendingReconciliation === undefined
+          ? {}
+          : { pendingCredentialReconciliation: pendingReconciliation }),
+        ...(!pgAborted && candidateLease !== null ? { preservedCandidateLease: candidateLease } : {}),
         migrationId,
       })
     }
@@ -796,7 +1244,29 @@ export class MigrationCoordinator implements PoolMigrationControl {
       notifyContextRebuilt = true
     }
 
+    // Step 5b (B08): Durably register reconciliation intent BEFORE invoking irreversible PG commit.
+    // Never swallow persistence errors: if durable intent write fails, abort safely BEFORE PG commit!
+    if (this.hasDurableReconciliationStore || candidateLease !== null || args.previousCredentialLeaseId) {
+      const intentRecord = buildReconciliationRecord({
+        pgDecision: 'pending',
+        sourceLeaseRevoked: !args.previousCredentialLeaseId,
+        targetLeaseRevoked: candidateLease === null,
+        sourceExecEnvRestored: false,
+        reason: 'pre_commit_intent',
+      })
+      try {
+        await this.persistPendingReconciliation(intentRecord)
+        intentPersisted = true
+      } catch (err) {
+        return abortAndFail(
+          'MIGRATION_RECONCILIATION_PERSIST_FAILED',
+          `reconciliation_intent_persist_failed:${errorMessage(err)}`,
+        )
+      }
+    }
+
     // Step 6: Atomic commit & revoke previous credential lease (read-back authoritative state on unknown error)
+    commitAttempted = true
     let commitRes: CommitPlacementMigrationResult | null = null
     let commitErr: unknown = null
     try {
@@ -886,6 +1356,24 @@ export class MigrationCoordinator implements PoolMigrationControl {
       } catch {
         previousCredentialRevoked = false
       }
+    }
+
+    // B08: Delete durable reconciliation record ONLY when source credential cleanup (if any) succeeded!
+    // If revoking the old source lease failed, retain the committed reconciliation record for retry.
+    if (!args.previousCredentialLeaseId || previousCredentialRevoked) {
+      if (intentPersisted) {
+        await this.deletePendingReconciliation(migrationId)
+      }
+    } else if (intentPersisted) {
+      await this.persistPendingReconciliation(
+        buildReconciliationRecord({
+          pgDecision: 'committed',
+          sourceLeaseRevoked: false,
+          targetLeaseRevoked: false,
+          sourceExecEnvRestored: false,
+          reason: `source_lease_revoke_pending:${migrationId}`,
+        }),
+      )
     }
 
     return Object.freeze({
@@ -985,6 +1473,302 @@ export class MigrationCoordinator implements PoolMigrationControl {
       this.draining = false
       throw err
     }
+  }
+
+  async getPendingCredentialReconciliation(
+    migrationId: string,
+  ): Promise<PendingCredentialReconciliationRecord | null> {
+    const inMem = this.pendingCredentialReconciliations.get(migrationId)
+    if (inMem) return inMem
+    if (this.pendingReconciliationStore) {
+      return (await this.pendingReconciliationStore.get(migrationId)) ?? null
+    }
+    return null
+  }
+
+  async listPendingCredentialReconciliations(): Promise<
+    readonly PendingCredentialReconciliationRecord[]
+  > {
+    const byId = new Map<string, PendingCredentialReconciliationRecord>()
+    for (const [id, rec] of this.pendingCredentialReconciliations) {
+      byId.set(id, rec)
+    }
+    if (this.pendingReconciliationStore) {
+      for (const rec of await this.pendingReconciliationStore.list()) {
+        byId.set(rec.migrationId, rec)
+      }
+    }
+    return [...byId.values()]
+  }
+
+  /**
+   * B08: Deferred authoritative credential & ExecEnv reconciliation for migrations that ended
+   * in an unknown commit state (`commitOutcomeUnknown`), failed PG abort confirmation, or had
+   * partial cleanup failures.
+   *
+   * Step-by-step state tracking guarantees a pending record is deleted ONLY after EVERY required
+   * cleanup action for the authoritative PG decision is confirmed:
+   * - Authoritative state `committed`: preserves target credential lease intact and revokes ONLY
+   *   the old source credential lease; if source revocation fails, retains the persisted record!
+   * - Authoritative state `aborted` (or `migrating` cleanly aborted via CAS): revokes candidate
+   *   target credential lease AND restores source ExecEnv with monotonic gen; if either fails,
+   *   persists partial progress and retains the record until both succeed!
+   * - Still unreachable/unknown: performs ZERO destructive revocation and retains the record.
+   */
+  async reconcilePendingCredentialCleanup(
+    migrationId: string,
+  ): Promise<CredentialReconciliationOutcome | null> {
+    const pending = await this.getPendingCredentialReconciliation(migrationId)
+    if (!pending) return null
+
+    const finalizeCommitted = async (
+      committedMigration: PlacementMigrationRecord | null,
+    ): Promise<CredentialReconciliationOutcome> => {
+      let sourceLeaseRevoked = pending.sourceLeaseRevoked || !pending.sourceCredentialLeaseId
+      if (pending.sourceCredentialLeaseId && !sourceLeaseRevoked) {
+        try {
+          sourceLeaseRevoked = await this.credentialLeases.revokeLease(
+            pending.sourceCredentialLeaseId,
+            `migration_committed_reconciled:${migrationId}`,
+          )
+        } catch {
+          sourceLeaseRevoked = false
+        }
+      }
+      let pointer: SessionEnginePointer | null = null
+      if (typeof this.authorityStore.getEnginePointer === 'function') {
+        try {
+          pointer = await this.authorityStore.getEnginePointer(pending.userId, pending.sessionKey)
+        } catch {
+          pointer = null
+        }
+      }
+
+      const fullyConverged = sourceLeaseRevoked
+      if (fullyConverged) {
+        await this.deletePendingReconciliation(migrationId)
+      } else {
+        await this.persistPendingReconciliation(
+          Object.freeze({
+            ...pending,
+            pgDecision: 'committed' as const,
+            sourceLeaseRevoked: false,
+          }),
+        )
+      }
+
+      return Object.freeze({
+        migrationId,
+        status: 'committed' as const,
+        targetCredentialPreserved: true as const,
+        targetCredentialLease: pending.targetCredentialLease,
+        sourceCredentialRevoked: sourceLeaseRevoked,
+        fullyConverged,
+        stillPending: !fullyConverged,
+        migration: committedMigration,
+        pointer,
+      })
+    }
+
+    const finalizeAborted = async (
+      abortedMigration: PlacementMigrationRecord | null,
+    ): Promise<CredentialReconciliationOutcome> => {
+      let targetLeaseRevoked = pending.targetLeaseRevoked || pending.targetCredentialLease === null
+      if (pending.targetCredentialLease !== null && !targetLeaseRevoked) {
+        try {
+          targetLeaseRevoked = await this.credentialLeases.revokeLease(
+            pending.targetCredentialLease.leaseId,
+            `migration_aborted_reconciled:${migrationId}`,
+          )
+        } catch {
+          targetLeaseRevoked = false
+        }
+      }
+
+      // B08: NEVER infer sourceExecEnvRestored from `targetBrainGen === null`:
+      // if source was quiesced (or unknown), we MUST restore source ExecEnv with a monotonic
+      // rollbackBrainGen before deleting the reconciliation record.
+      const needsSourceRestore =
+        pending.sourceQuiesced !== false || pending.targetBrainGen !== null
+      let sourceExecEnvRestored = pending.sourceExecEnvRestored || !needsSourceRestore
+      let restoredSourceLease:
+        | { readonly brainGen: number; readonly fencingToken: string }
+        | undefined
+      if (needsSourceRestore && !sourceExecEnvRestored) {
+        const rollbackBrainGen =
+          Math.max(pending.currentBrainGen, pending.targetBrainGen ?? pending.currentBrainGen) + 1
+        const rollbackFencingToken = buildMonotonicFencingToken(
+          migrationId,
+          Math.max(pending.toEpoch, pending.fromEpoch),
+          rollbackBrainGen,
+        )
+        const prevToken = pending.targetFencingToken ?? pending.currentFencingToken
+        try {
+          const restoreRes = await this.execEnv.rebindBrain({
+            leaseId: pending.execEnvLeaseId,
+            sessionKey: pending.sessionKey,
+            nextBrainGen: rollbackBrainGen,
+            nextFencingToken: rollbackFencingToken,
+            ...(prevToken === undefined ? {} : { previousFencingToken: prevToken }),
+            targetPlacement: pending.fromPlacement,
+          })
+          if (restoreRes.ok) {
+            sourceExecEnvRestored = true
+            restoredSourceLease = Object.freeze({
+              brainGen: restoreRes.brainGen,
+              fencingToken: restoreRes.fencingToken,
+            })
+          }
+        } catch {
+          sourceExecEnvRestored = false
+        }
+      }
+
+      const fullyConverged = targetLeaseRevoked && sourceExecEnvRestored
+      if (fullyConverged) {
+        await this.deletePendingReconciliation(migrationId)
+      } else {
+        await this.persistPendingReconciliation(
+          Object.freeze({
+            ...pending,
+            pgDecision: 'aborted' as const,
+            targetLeaseRevoked,
+            sourceExecEnvRestored,
+          }),
+        )
+      }
+
+      return Object.freeze({
+        migrationId,
+        status: 'aborted' as const,
+        targetCredentialRevoked: targetLeaseRevoked,
+        sourceExecEnvRestored,
+        sourceCredentialPreserved: true as const,
+        fullyConverged,
+        stillPending: !fullyConverged,
+        ...(restoredSourceLease === undefined ? {} : { restoredSourceLease }),
+        migration: abortedMigration,
+      })
+    }
+
+    // Fast path when PG decision was already authoritatively established in a prior step/attempt.
+    if (pending.pgDecision === 'committed') {
+      let observed: PlacementMigrationRecord | null = null
+      if (typeof this.authorityStore.getPlacementMigration === 'function') {
+        try {
+          observed = await this.authorityStore.getPlacementMigration(migrationId)
+        } catch {
+          observed = null
+        }
+      }
+      return await finalizeCommitted(observed)
+    }
+    if (pending.pgDecision === 'aborted') {
+      let observed: PlacementMigrationRecord | null = null
+      if (typeof this.authorityStore.getPlacementMigration === 'function') {
+        try {
+          observed = await this.authorityStore.getPlacementMigration(migrationId)
+        } catch {
+          observed = null
+        }
+      }
+      return await finalizeAborted(observed)
+    }
+
+    if (typeof this.authorityStore.getPlacementMigration !== 'function') {
+      return Object.freeze({
+        migrationId,
+        status: 'unknown' as const,
+        stillPending: true as const,
+        targetCredentialPreserved: true as const,
+        reason: 'authority_store_readback_unsupported',
+      })
+    }
+
+    let observed: PlacementMigrationRecord | null
+    try {
+      observed = await this.authorityStore.getPlacementMigration(migrationId)
+    } catch (err) {
+      return Object.freeze({
+        migrationId,
+        status: 'unknown' as const,
+        stillPending: true as const,
+        targetCredentialPreserved: true as const,
+        reason: `authority_readback_error:${errorMessage(err)}`,
+      })
+    }
+
+    if (observed === null) {
+      return Object.freeze({
+        migrationId,
+        status: 'unknown' as const,
+        stillPending: true as const,
+        targetCredentialPreserved: true as const,
+        reason: 'authority_migration_record_not_found',
+      })
+    }
+
+    if (observed.state === 'committed') {
+      return await finalizeCommitted(observed)
+    }
+
+    if (observed.state === 'aborted') {
+      return await finalizeAborted(observed)
+    }
+
+    // Still 'migrating' in PG -> attempt CAS abort (`WHERE state = 'migrating'`).
+    try {
+      const abortRes = await this.authorityStore.abortPlacementMigration({
+        migrationId,
+        userId: pending.userId,
+        sessionKey: pending.sessionKey,
+        reason: `reconcile_abort:${pending.reason}`,
+      })
+      if (abortRes.applied) {
+        return await finalizeAborted(abortRes.migration)
+      }
+    } catch (err) {
+      return Object.freeze({
+        migrationId,
+        status: 'unknown' as const,
+        stillPending: true as const,
+        targetCredentialPreserved: true as const,
+        reason: `authority_abort_error:${errorMessage(err)}`,
+      })
+    }
+
+    // CAS abort did not apply -> migration transitioned concurrently; re-read authoritative state.
+    try {
+      const rechecked = await this.authorityStore.getPlacementMigration(migrationId)
+      if (rechecked?.state === 'committed') {
+        return await finalizeCommitted(rechecked)
+      }
+      if (rechecked?.state === 'aborted') {
+        return await finalizeAborted(rechecked)
+      }
+    } catch {
+      // Fall through to unknown without revoking credentials.
+    }
+
+    return Object.freeze({
+      migrationId,
+      status: 'unknown' as const,
+      stillPending: true as const,
+      targetCredentialPreserved: true as const,
+      reason: 'authority_state_unresolved',
+    })
+  }
+
+  async reconcileAllPendingCredentials(): Promise<readonly CredentialReconciliationOutcome[]> {
+    const pending = await this.listPendingCredentialReconciliations()
+    const outcomes: CredentialReconciliationOutcome[] = []
+    for (const rec of pending) {
+      const outcome = await this.reconcilePendingCredentialCleanup(rec.migrationId)
+      if (outcome !== null) {
+        outcomes.push(outcome)
+      }
+    }
+    return Object.freeze(outcomes)
   }
 
   reopen(): { readonly draining: false } {

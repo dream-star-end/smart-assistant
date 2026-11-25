@@ -56,6 +56,7 @@ import type { PricingCache } from "../billing/pricing.js";
 import { expireZcodeRelayRoute, mintZcodeRelayRoute } from "../billing/zcodeRouteContext.js";
 import type { CommercialConfig } from "../config.js";
 import { getPool } from "../db/index.js";
+import type { PgTransactionPool } from "../db/threeLayerStateStore.js";
 import { persistGatewayLiveFrame } from "../db/liveTurnFrames.js";
 import type {
   AutomaticRecoveryDecision,
@@ -84,8 +85,33 @@ import {
   type BridgeMetricSink,
   type CodexBindingHandle,
   type ResolveContainerEndpoint,
+  type UserChatBridgeDeps,
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
+
+/**
+ * Selfhost V5 implicit cross-pool routing hooks (N01/B06/B01):
+ * wires ONLY the authoritative PG `pool` (implicit `PgLogicalModelBindingStore`,
+ * `PgSessionAuthorityStateStore`, and PG pending-billing query) plus `modelCatalogCache`.
+ */
+export function buildSelfhostCrossPoolBridgeHooks(input: {
+  readonly isSelfhostV5: boolean;
+  readonly pool: PgTransactionPool;
+  readonly modelCatalogCache: Pick<ModelCatalogCache, "assertFresh"> | undefined;
+}): Pick<UserChatBridgeDeps, "crossPoolFallbackSelector" | "returnToRemoteGrantResolver"> {
+  if (!input.isSelfhostV5 || !input.modelCatalogCache) return {};
+  return {
+    crossPoolFallbackSelector: createSelfhostCrossPoolFallbackSelector({
+      pool: input.pool,
+      catalogCache: input.modelCatalogCache,
+      selfhost: input.isSelfhostV5,
+    }),
+    returnToRemoteGrantResolver: createSelfhostReturnToRemoteGrantResolver({
+      pool: input.pool,
+      selfhost: input.isSelfhostV5,
+    }),
+  };
+}
 
 export function createCodexBindingHandle(deps: {
   env: NodeJS.ProcessEnv;
@@ -288,19 +314,11 @@ export function createCommercialUserChatBridge(deps: {
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     cc5BackendSelector: (input) =>
       selectMasterCc5Backend(deps.cc5Runtime, input, isSelfhostV5, deps.env),
-    ...(isSelfhostV5 && deps.modelCatalogCache
-      ? {
-          crossPoolFallbackSelector: createSelfhostCrossPoolFallbackSelector({
-            pool: getPool(),
-            catalogCache: deps.modelCatalogCache,
-            selfhost: isSelfhostV5,
-          }),
-          returnToRemoteGrantResolver: createSelfhostReturnToRemoteGrantResolver({
-            pool: getPool(),
-            selfhost: isSelfhostV5,
-          }),
-        }
-      : {}),
+    ...buildSelfhostCrossPoolBridgeHooks({
+      isSelfhostV5,
+      pool: getPool(),
+      modelCatalogCache: deps.modelCatalogCache,
+    }),
     containerLinkEnabled: deps.containerLinkOn,
     resolveContainerLinkEndpoint: async (uid, cid) => {
       const ep = await resolveContainerLinkEndpoint(getPool(), deps.runtimeChannel, uid, cid);

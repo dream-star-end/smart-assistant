@@ -171,6 +171,16 @@ export interface ResolvedModelPoolBindings {
   readonly bindings: readonly LogicalModelPoolBinding[]
 }
 
+export interface InspectedModelPoolBindings {
+  readonly status: 'unconfigured' | 'configured'
+  readonly resolved: ResolvedLogicalModelId
+  readonly bindings: readonly LogicalModelPoolBinding[]
+  readonly enabledBindings: readonly LogicalModelPoolBinding[]
+  readonly allConfiguredBindings: readonly LogicalModelPoolBinding[]
+  readonly totalCount: number
+  readonly hasConfiguredBindings: boolean
+}
+
 export interface ArtifactBlobUploadPartMeta {
   readonly sizeBytes: number
   readonly sha256: string
@@ -862,19 +872,35 @@ export class PgSessionAuthorityStateStore {
   async peekRollingCheckpoint(
     userId: number | bigint,
     sessionKey: string,
+    expectedEpoch?: number,
   ): Promise<AuthoritativeRollingCheckpoint | null> {
     const uid = normalizeUserId(userId)
     const key = assertNonEmptyString(sessionKey, 'STATE_STORE_SESSION_KEY_INVALID')
-    const res = await this.pool.query<CheckpointRow>(
-      `SELECT session_key, session_id, checkpoint_generation, placement_epoch, mode,
-              anchor_seq, source_engine, summary, instructions,
-              acked_by_turn_key, acked_at, created_at
-         FROM session_rolling_checkpoints
-        WHERE user_id = $1 AND session_key = $2 AND acked_at IS NULL
-        ORDER BY created_at DESC, checkpoint_generation DESC
-        LIMIT 1`,
-      [uid, key],
-    )
+    if (expectedEpoch !== undefined) {
+      assertPositiveEpoch(expectedEpoch, 'STATE_STORE_PLACEMENT_EPOCH_INVALID')
+    }
+    const res =
+      expectedEpoch !== undefined
+        ? await this.pool.query<CheckpointRow>(
+            `SELECT session_key, session_id, checkpoint_generation, placement_epoch, mode,
+                    anchor_seq, source_engine, summary, instructions,
+                    acked_by_turn_key, acked_at, created_at
+               FROM session_rolling_checkpoints
+              WHERE user_id = $1 AND session_key = $2 AND placement_epoch = $3 AND acked_at IS NULL
+              ORDER BY created_at DESC, checkpoint_generation DESC
+              LIMIT 1`,
+            [uid, key, expectedEpoch],
+          )
+        : await this.pool.query<CheckpointRow>(
+            `SELECT session_key, session_id, checkpoint_generation, placement_epoch, mode,
+                    anchor_seq, source_engine, summary, instructions,
+                    acked_by_turn_key, acked_at, created_at
+               FROM session_rolling_checkpoints
+              WHERE user_id = $1 AND session_key = $2 AND acked_at IS NULL
+              ORDER BY created_at DESC, checkpoint_generation DESC
+              LIMIT 1`,
+            [uid, key],
+          )
     const row = res.rows[0]
     return row ? mapCheckpointRow(row) : null
   }
@@ -1308,16 +1334,12 @@ export class PgLogicalModelBindingStore {
   }
 
   /**
-   * N01: Distinguishes "never configured (0 rows)" from "explicitly configured but all disabled
-   * (totalConfiguredCount > 0, enabledBindings.length === 0)" so callers never treat an
-   * explicitly disabled binding as unconfigured fallback.
+   * N01: Authoritative binding inspection distinguishing:
+   * - `status: 'unconfigured'` (`totalCount === 0`)
+   * - `status: 'configured'` with all bindings disabled (`totalCount > 0 && enabledBindings.length === 0`)
+   * - read failure (propagates thrown error; never swallowed).
    */
-  async resolveBindingsStateForModel(rawModelId: string): Promise<{
-    readonly resolved: ReturnType<typeof resolveLogicalModelId>
-    readonly bindings: readonly LogicalModelPoolBinding[]
-    readonly allConfiguredBindings: readonly LogicalModelPoolBinding[]
-    readonly hasConfiguredBindings: boolean
-  }> {
+  async inspectLogicalModelBindings(rawModelId: string): Promise<InspectedModelPoolBindings> {
     const resolved = resolveLogicalModelId(rawModelId)
     const sql = resolved.isLegacyRemoteAlias
       ? `SELECT logical_model_id, pool_kind, driver_id, canonical_model_id,
@@ -1334,13 +1356,21 @@ export class PgLogicalModelBindingStore {
 
     const res = await this.pool.query<BindingRow>(sql, [resolved.logicalModel])
     const allConfiguredBindings = Object.freeze(res.rows.map(mapBindingRow))
-    const bindings = Object.freeze(allConfiguredBindings.filter((b) => b.enabled))
+    const enabledBindings = Object.freeze(allConfiguredBindings.filter((b) => b.enabled))
+    const totalCount = allConfiguredBindings.length
     return Object.freeze({
+      status: totalCount === 0 ? ('unconfigured' as const) : ('configured' as const),
       resolved,
-      bindings,
+      bindings: enabledBindings,
+      enabledBindings,
       allConfiguredBindings,
-      hasConfiguredBindings: allConfiguredBindings.length > 0,
+      totalCount,
+      hasConfiguredBindings: totalCount > 0,
     })
+  }
+
+  async resolveBindingsStateForModel(rawModelId: string): Promise<InspectedModelPoolBindings> {
+    return this.inspectLogicalModelBindings(rawModelId)
   }
 
   async upsertPoolBinding(binding: LogicalModelPoolBinding): Promise<LogicalModelPoolBinding> {
