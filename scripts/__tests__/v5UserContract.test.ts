@@ -55,6 +55,10 @@ test("continuation code is random letters+digits and only the first prompt carri
   assert.throws(() => continuationPrompts("abc"));
   // OCV5-417: wording that grok-build treats as a prompt-injection canary must not come back.
   for (const text of [p.first, p.second]) assert.doesNotMatch(text, /暗号|口令|密码|记住|只回答|只回复/);
+  // OCV5-891: keep C3 strictly in-session without triggering tool/core-memory write loops.
+  assert.match(p.first, /无需调用工具/);
+  assert.match(p.first, /无需查询或写入记忆与文件/);
+  assert.match(p.second, /无需调用工具/);
 });
 test("continuation answer must contain the exact code as one token", () => {
   for (const ok of ["QWER1234", "编号是 PO-QWER1234。", "`qwer1234`", "**QWER1234**"]) assertContinuationAnswer(ok, "QWER1234");
