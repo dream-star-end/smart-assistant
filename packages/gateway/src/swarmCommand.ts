@@ -65,6 +65,7 @@ export type SwarmCommandErrorCode =
   | "MEMBER_ALREADY_KILLED"
   | "CANNOT_KILL_COORDINATOR"
   | "LOCK_CONTENTION"
+  | "ABORTED"
   | "IO_FAILED";
 
 export interface SwarmCommandFailure {
@@ -89,6 +90,8 @@ export interface InjectSwarmDirectiveOptions {
   now?: number;
   /** 可选测试钩子:覆盖 `.board.lock` 异步等待上限(默认 5000ms)。 */
   lockTimeoutMs?: number;
+  /** 可选取消围栏:在获得文件锁后、真正写入 `board.jsonl` 前做最后一次校验,返回 true 时放弃写入并返回 `ABORTED`。 */
+  shouldAbort?: () => boolean;
 }
 
 export interface InjectSwarmDirectiveSuccess {
@@ -206,8 +209,7 @@ function assertSwarmDirIdentity(dir: VerifiedSwarmDir): SwarmCommandFailure | nu
 
 function sleepAsync(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, Math.max(1, ms));
-    timer.unref();
+    setTimeout(resolve, Math.max(1, ms));
   });
 }
 
@@ -441,11 +443,18 @@ async function appendBoardPostLocked(
   now: number,
   post: { agent: string; channel: string; text: string; time: string; control?: Record<string, unknown> },
   lockTimeoutMs?: number,
+  shouldAbort?: () => boolean,
 ): Promise<{ ok: true; seq: number } | SwarmCommandFailure> {
+  if (shouldAbort?.()) {
+    return { ok: false, code: "ABORTED", error: "directive cancelled before commit" };
+  }
   return withSwarmBoardLock(
     dir,
     now,
     () => {
+      if (shouldAbort?.()) {
+        return { ok: false, code: "ABORTED", error: "directive cancelled before commit" };
+      }
       const boardPath = path.join(dir.swarmDir, "board.jsonl");
       const seqRes = readBoardHeadSeq(boardPath);
       if (!seqRes.ok) return seqRes;
@@ -567,6 +576,7 @@ export async function injectSwarmDirective(
       control: { kind: controlKind, target },
     },
     opts.lockTimeoutMs,
+    opts.shouldAbort,
   );
   if (!appended.ok) return appended;
 
@@ -1212,6 +1222,7 @@ function mapSwarmFailureStatus(code: SwarmCommandErrorCode): number {
       return 404;
     case "MEMBER_ALREADY_KILLED":
     case "LOCK_CONTENTION":
+    case "ABORTED":
       return 409;
     default:
       return 500;

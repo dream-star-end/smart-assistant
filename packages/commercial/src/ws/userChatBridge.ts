@@ -4496,8 +4496,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           !Array.isArray(content.imageEdit)
           ? content.imageEdit as Record<string, unknown>
           : undefined;
-        const explicitSwarmMode =
-          frameObj.swarmMode === true || Boolean(parseSwarmSlashCommand(modelText)?.matched);
+        const slashSwarmMatched = Boolean(parseSwarmSlashCommand(modelText)?.matched);
+        // Preserve tri-state swarmMode across recovery lineage:
+        // - current message `/swarm` always activates swarm (`true`);
+        // - explicit boolean `frameObj.swarmMode` is kept verbatim (`true` / `false`);
+        // - legacy `recoveryJob` without `swarmMode` stays omitted (`undefined`) so
+        //   Gateway can detect live core workers on disk instead of coercing to `false`;
+        // - fresh browser turns omit `swarmMode` when the toggle is OFF, so record `false`.
+        const persistedSwarmMode: boolean | undefined = slashSwarmMatched
+          ? true
+          : typeof frameObj.swarmMode === "boolean"
+            ? frameObj.swarmMode
+            : recoveryJob
+              ? undefined
+              : false;
         const routing = {
           ...(typeof frameObj.model === "string" && frameObj.model !== ""
             ? { model: frameObj.model }
@@ -4507,11 +4519,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ? { modelSwitchId: frameObj.modelSwitchId }
             : {}),
           teamMode: frameObj.teamMode === true,
-          swarmMode: explicitSwarmMode,
+          ...(persistedSwarmMode !== undefined ? { swarmMode: persistedSwarmMode } : {}),
           effortLevel: typeof frameObj.effortLevel === "string" || frameObj.effortLevel === null
             ? frameObj.effortLevel
             : null,
         };
+        const snapshotFrame: Record<string, unknown> = persistedSwarmMode !== undefined
+          ? { ...frameObj, swarmMode: persistedSwarmMode }
+          : (() => {
+              const { swarmMode: _omittedSwarmMode, ...rest } = frameObj;
+              return rest;
+            })();
         const message = {
           id: clientMessageId,
           role: "user" as const,
@@ -4525,7 +4543,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ...(displayText !== modelText ? { _modelText: modelText } : {}),
           ...(replyTo ? { _replyTo: replyTo } : {}),
           _routing: routing,
-          _admissionRestartRequest: snapshotAdmissionRequest({ ...frameObj, swarmMode: explicitSwarmMode }),
+          _admissionRestartRequest: snapshotAdmissionRequest(snapshotFrame),
         };
         if (useDispatchAdmission && deps.admitUserTurn) {
           // ── durable turn dispatch 受理(RFC §2.1)── 替代 persist retry loop。
@@ -4879,36 +4897,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         let enriched: Record<string, unknown> = { ...frameObj, _workspaceMode: sessionWorkspaceMode };
         delete enriched._masterHistoricalMessages;
         if (rawHistory !== null) {
-          // B9: Infer legacy swarm recovery evidence from raw PG history BEFORE sanitize strips _routing/tools.
-          const rawHist = rawHistory as unknown as Array<Record<string, unknown>>;
-          if (typeof frameObj.swarmMode !== "boolean" && recoveryJob) {
-            for (let idx = rawHist.length - 1; idx >= 0 && idx >= rawHist.length - 8; idx -= 1) {
-              const rawMsg = rawHist[idx];
-              if (!rawMsg || typeof rawMsg !== "object") continue;
-              const r = rawMsg._routing as { swarmMode?: unknown } | undefined;
-              if (typeof r?.swarmMode === "boolean") {
-                enriched._inferredLegacySwarmMode = r.swarmMode;
-                break;
-              }
-              if (rawMsg.role === "user") {
-                const uTxt = typeof rawMsg._modelText === "string" ? rawMsg._modelText : typeof rawMsg.text === "string" ? rawMsg.text : "";
-                if (parseSwarmSlashCommand(uTxt)?.matched) {
-                  enriched._inferredLegacySwarmMode = true;
-                  break;
-                }
-              }
-              if (rawMsg.role === "assistant" && Array.isArray(rawMsg.tools)) {
-                const hasSwarmTool = rawMsg.tools.some((t) => {
-                  const n = t && typeof t === "object" && typeof (t as { name?: unknown }).name === "string" ? (t as { name: string }).name : "";
-                  return n === "SwarmBoard" || n === "swarm_board" || n === "SwarmManage" || n === "SwarmPost" || n === "SwarmReadBoard" || n === "SwarmWait";
-                });
-                if (hasSwarmTool) {
-                  enriched._inferredLegacySwarmMode = true;
-                  break;
-                }
-              }
-            }
-          }
           const historical = _sanitizeMasterHistoricalMessagesForFrame(rawHistory, {
             ...(clientMessageId ? { excludeClientMessageId: clientMessageId } : {}),
           });
@@ -6347,7 +6335,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (sealed === null) { failDispatchPreForward(dispatchRecord, 'cursor_authority_seal_rejected'); return; }
               authorityFields = sealed;
             }
-            delete (enriched as Record<string, unknown>)._inferredLegacySwarmMode;
             const forwarded = { ...enriched, requestId, traceId: traceCapture, _creditBudget: cursorSpendable === null ? undefined : cursorSpendable.toString(), ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
             const encoded = JSON.stringify(forwarded); const len = Buffer.byteLength(encoded);
             if (len > maxFrameBytes) { failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG'); rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG'); return; }
@@ -6480,16 +6467,29 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 && typeof (parsedCapture.content as { text?: unknown }).text === "string"
                 ? (parsedCapture.content as { text: string }).text
                 : "";
-            const isLegacyCheckpointSwarmRecovery =
-              typeof parsedCapture.swarmMode !== "boolean" &&
-              Boolean(recoveryJob) &&
-              (enriched as { _inferredLegacySwarmMode?: unknown })._inferredLegacySwarmMode === true;
-            const isLocalSwarmTurn =
-              parsedCapture.swarmMode === true
-              || Boolean(parseSwarmSlashCommand(rawSwarmText)?.matched)
-              || isLegacyCheckpointSwarmRecovery;
+            const explicitSlashSwarm = Boolean(parseSwarmSlashCommand(rawSwarmText)?.matched);
+            const isExplicitSwarmTurn =
+              parsedCapture.swarmMode === true || explicitSlashSwarm;
+            const isLegacyUnknownCheckpointRecovery =
+              typeof parsedCapture.swarmMode !== "boolean"
+              && !explicitSlashSwarm
+              && recoveryJob?.recoveryMode === "checkpoint";
+            // For legacy checkpoint recoveries lacking an explicit swarmMode boolean,
+            // Master cannot inspect the container's local worker roster, so keep
+            // `swarmMode` omitted (`undefined`) on the forwarded frame for Gateway's
+            // live-core-worker fallback, while minting the user's authorized local
+            // member-model allowlist so resumed multi-model workers are not 403'd.
+            const allowSwarmMemberModels =
+              isExplicitSwarmTurn || isLegacyUnknownCheckpointRecovery;
+            const forwardedSwarmMode: boolean | undefined = isExplicitSwarmTurn
+              ? true
+              : parsedCapture.swarmMode === false
+                ? false
+                : recoveryJob
+                  ? undefined
+                  : false;
             const catalogSnapshot = authorityDeps?.catalog.peek() ?? null;
-            const swarmAllowedModelIds = isLocalSwarmTurn
+            const swarmAllowedModelIds = allowSwarmMemberModels
               ? resolveLocalSwarmAllowedAntigravityModels({
                   primaryModelId: antigravityModelId,
                   isAllowedForUser: modelCheckerHandle ? (id) => modelCheckerHandle.isAllowed(id) : null,
@@ -6558,9 +6558,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               authorityFields = sealed;
             }
-            delete (enriched as Record<string, unknown>)._inferredLegacySwarmMode;
+            const { swarmMode: _droppedSwarmMode, ...enrichedForAntigravity } =
+              enriched as Record<string, unknown>;
             const forwarded = {
-              ...enriched,
+              ...enrichedForAntigravity,
               requestId,
               traceId: traceCapture,
               // After the spread so a browser-forged budget or route cannot survive.
@@ -6572,8 +6573,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 accessTokenExpiresAt: minted.accessTokenExpiresAt,
                 ...(minted.idToken ? { idToken: minted.idToken } : {}),
               },
-              swarmMode: isLocalSwarmTurn,
-              ...(isLocalSwarmTurn
+              ...(forwardedSwarmMode !== undefined ? { swarmMode: forwardedSwarmMode } : {}),
+              ...(allowSwarmMemberModels
                 ? { _antigravitySwarmAllowedModels: minted.allowedModelIds ?? [antigravityModelId] }
                 : {}),
               ...authorityFields,
@@ -6738,7 +6739,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               authorityFields = sealed;
             }
-            delete (enriched as Record<string, unknown>)._inferredLegacySwarmMode;
             const forwarded = {
               ...enriched,
               requestId,
@@ -6848,7 +6848,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               authorityFields = sealed;
             }
             if (cleaned) { failDispatchPreForward(dispatchRecordA, "bridge_cleaned"); return; }
-            delete (enrichedParsed as Record<string, unknown>)._inferredLegacySwarmMode;
             const rewrittenObj = {
               ...enrichedParsed,
               requestId,
@@ -7537,7 +7536,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 abandonReason = "bridge_disconnect_before_forward";
                 return;
               }
-              delete (enrichedParsed as Record<string, unknown>)._inferredLegacySwarmMode;
               const rewrittenObj = applyAdmittedServiceTierToFrame({
                 ...enrichedParsed,
                 requestId,
@@ -7637,7 +7635,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     text: extractInboundPromptText(enrichedParsed),
                   })
                 : null;
-              delete (enrichedParsed as Record<string, unknown>)._inferredLegacySwarmMode;
               const rewrittenObj = applyAdmittedServiceTierToFrame({
                 ...enrichedParsed,
                 traceId: turnTraceIdCapture,
@@ -7885,17 +7882,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 turnLogCapture?.warn("user-chat-bridge: ccb spendable lookup failed, fail-open", { err });
               }
             }
-            const inferredRemoteSwarmMode =
-              isAntigravityInboundFrame &&
-              typeof enrichedParsed.swarmMode !== "boolean" &&
-              Boolean(recoveryJob) &&
-              typeof (enrichedParsed as { _inferredLegacySwarmMode?: unknown })._inferredLegacySwarmMode === "boolean"
-                ? (enrichedParsed as { _inferredLegacySwarmMode: boolean })._inferredLegacySwarmMode
-                : undefined;
-            delete (enrichedParsed as Record<string, unknown>)._inferredLegacySwarmMode;
             const rewrittenObj = {
               ...enrichedParsed,
-              ...(inferredRemoteSwarmMode !== undefined ? { swarmMode: inferredRemoteSwarmMode } : {}),
               // OCV5-746: 与 signed billingRequestId 同源同值的 server-owned requestId。
               ...(codexFrameRequestId !== undefined ? { requestId: codexFrameRequestId } : {}),
               traceId: turnTraceIdCapture,

@@ -42,6 +42,10 @@ import {
   settleSwarmSnapshotTerminal,
 } from '../engine/antigravitySwarmWatcher.js'
 import {
+  readBoundedFileWithinRoot,
+  readBoundedFileWithinRootAsync,
+} from '../engine/antigravitySwarmTelemetry.js'
+import {
   antigravityProductToolName,
   antigravityToolOutput,
   sanitizeSwarmToolOutput,
@@ -1728,6 +1732,53 @@ test('OCV5-887: >64KB transcript step, mid-turn GENERIC status, native string wo
     // Only step_index 12 fell inside turn window (>= 02:00:00Z), excluding prior-turn step_index 0 (01:00:00Z)!
     const delta = watcher.turnWorkerUsageDelta()
     assert.deepEqual(delta, { inputTokens: 3000, outputTokens: 700, cacheReadTokens: 200, thinkingTokens: 0 })
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})
+
+test('OCV5-887 P2-05: bounded tail reads landing exactly on a line boundary preserve the first complete line (sync & async)', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-p2-05-tail-'))
+  try {
+    const logDir = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs')
+    await mkdir(logDir, { recursive: true })
+    const rel = [WORKER_CONV, '.system_generated', 'logs', 'transcript.jsonl'] as const
+
+    // 1. Primary tail window: startOffset > 0 lands right after '\n' (exact start of line2)
+    const line1 = `${JSON.stringify({ step_index: 1, tag: 'head', pad: 'A'.repeat(40) })}\n`
+    const line2 = `${JSON.stringify({ step_index: 2, tag: 'boundary-first-line' })}\n`
+    const line3 = `${JSON.stringify({ step_index: 3, tag: 'tail-last-line' })}\n`
+    await writeFile(path.join(logDir, 'transcript.jsonl'), line1 + line2 + line3, 'utf8')
+
+    const exactTailBytes = Buffer.byteLength(line2 + line3, 'utf8')
+    const syncExact = readBoundedFileWithinRoot(brainDir, rel, exactTailBytes)
+    const asyncExact = await readBoundedFileWithinRootAsync(brainDir, rel, exactTailBytes)
+    assert.equal(syncExact, line2 + line3, 'sync tail landing on line start must preserve first complete line')
+    assert.equal(asyncExact, line2 + line3, 'async tail landing on line start must preserve first complete line')
+
+    // 2. Single complete tail line equal to exact maxBytes (previously returned '' by slicing past its trailing '\n')
+    const exactSingleLineBytes = Buffer.byteLength(line3, 'utf8')
+    const syncSingle = readBoundedFileWithinRoot(brainDir, rel, exactSingleLineBytes)
+    const asyncSingle = await readBoundedFileWithinRootAsync(brainDir, rel, exactSingleLineBytes)
+    assert.equal(syncSingle, line3, 'sync single-line exact tail must not drop the only line')
+    assert.equal(asyncSingle, line3, 'async single-line exact tail must not drop the only line')
+
+    // 3. Mid-line startOffset still drops the partial leading fragment cleanly
+    const midLineBytes = exactTailBytes - 5
+    const syncMid = readBoundedFileWithinRoot(brainDir, rel, midLineBytes)
+    const asyncMid = await readBoundedFileWithinRootAsync(brainDir, rel, midLineBytes)
+    assert.equal(syncMid, line3, 'sync mid-line slice must still drop partial leading line')
+    assert.equal(asyncMid, line3, 'async mid-line slice must still drop partial leading line')
+
+    // 4. Adaptive widerStart landing exactly on a line boundary preserves that single large line
+    const hugeLine = `${JSON.stringify({ step_index: 9, tag: 'huge-exact', body: 'B'.repeat(200) })}\n`
+    const prefixLine = `${JSON.stringify({ step_index: 8, tag: 'prefix' })}\n`
+    await writeFile(path.join(logDir, 'transcript.jsonl'), prefixLine + hugeLine, 'utf8')
+    const hugeBytes = Buffer.byteLength(hugeLine, 'utf8')
+    const syncWider = readBoundedFileWithinRoot(brainDir, rel, 64, { maxAdaptiveBytes: hugeBytes })
+    const asyncWider = await readBoundedFileWithinRootAsync(brainDir, rel, 64, { maxAdaptiveBytes: hugeBytes })
+    assert.equal(syncWider, hugeLine, 'sync widerStart landing on line boundary must preserve line')
+    assert.equal(asyncWider, hugeLine, 'async widerStart landing on line boundary must preserve line')
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }

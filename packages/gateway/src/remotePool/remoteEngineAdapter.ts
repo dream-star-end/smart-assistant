@@ -385,7 +385,7 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
         seedBaselineOnStart: existsSync(loc.swarmDir),
         onSnapshot: emitSwarmSnapshot,
         onStallDetected: (alert) => {
-          if (finalized) return
+          if (finalized || userCancelled || interruptReason !== null) return
           const runtime = lookupRemoteSwarmRuntimeForSession(sessionKeyForSwarm)
           if (!runtime) {
             swarmWatcher?.rollbackStallAlert(alert)

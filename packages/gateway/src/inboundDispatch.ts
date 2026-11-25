@@ -1691,7 +1691,7 @@ export async function dispatchInbound(
       const rawRecovery = (frame.content as { recovery?: { automatic?: unknown; mode?: unknown } } | undefined)?.recovery
       const isLegacyAutoCheckpointWithoutSwarmFlag =
         isAntigravityTurn &&
-        (frame as { swarmMode?: unknown }).swarmMode === undefined &&
+        typeof (frame as { swarmMode?: unknown }).swarmMode !== 'boolean' &&
         rawRecovery?.automatic === true &&
         rawRecovery?.mode === 'checkpoint'
       const effectiveSwarmMode =
@@ -2289,7 +2289,12 @@ export async function dispatchInbound(
             ...(e.delegateAgentId ? { delegateAgentId: e.delegateAgentId } : {}),
             engineSessionId: e.engineSessionId,
             status: e.status,
-            ...(e.terminalCode ? { terminalCode: e.terminalCode } : {}),
+            ...(e.terminalCode
+              ? {
+                  terminalCode:
+                    e.terminalCode === 'USER_CANCELLED' ? 'USER_CANCELLED' : 'CODEX_ERROR',
+                }
+              : {}),
             durationMs: e.durationMs,
             ...(e.usage ? { usage: e.usage } : {}),
             // Issue A v1.0.108 — codex rateLimits 快照,master.userChatBridge 落库到

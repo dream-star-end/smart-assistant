@@ -185,18 +185,27 @@ export function resolveAntigravityAuxPricing(
   pricingLookup?: Pick<PricingCache, 'get'> | null,
 ): AntigravityAuxPricing {
   let catalogMatch: ModelPricing | null = null
+  let frozenFallbackMatch: ModelPricing | null = null
   if (pricingLookup) {
-    for (const key of ANTIGRAVITY_AUX_PRICING_KEYS) {
-      const found = pricingLookup.get(key)
-      // Require exact model_id match so wildcard stubs or alias fallbacks
-      // never misidentify the primary model's row as aux pricing.
-      if (found !== null && found.model_id === key) {
-        catalogMatch = found
-        break
+    const frozenFallback = pricingLookup.get(ANTIGRAVITY_AUX_FALLBACK_RATES.model_id)
+    if (
+      frozenFallback !== null &&
+      frozenFallback.model_id === ANTIGRAVITY_AUX_FALLBACK_RATES.model_id
+    ) {
+      frozenFallbackMatch = frozenFallback
+    } else {
+      for (const key of ANTIGRAVITY_AUX_PRICING_KEYS) {
+        const found = pricingLookup.get(key)
+        // Require exact model_id match so wildcard stubs or alias fallbacks
+        // never misidentify the primary model's row as aux pricing.
+        if (found !== null && found.model_id === key) {
+          catalogMatch = found
+          break
+        }
       }
     }
   }
-  const base = catalogMatch ?? ANTIGRAVITY_AUX_FALLBACK_RATES
+  const base = frozenFallbackMatch ?? catalogMatch ?? ANTIGRAVITY_AUX_FALLBACK_RATES
   return {
     model_id: base.model_id,
     display_name: base.display_name,
@@ -233,7 +242,9 @@ export async function sumAntigravityRelayUsage(
   pool: Pick<Pool, 'query'>,
   requestId: string,
   userId: bigint,
+  options?: { excludeRetired?: boolean },
 ): Promise<AntigravityUsageTotals> {
+  const excludeRetiredSql = options?.excludeRetired ? ' AND status_code <> 410' : ''
   const res = await pool.query<{
     bucket?: string | null
     route_model_id?: string | null
@@ -265,7 +276,7 @@ export async function sumAntigravityRelayUsage(
             COUNT(*) FILTER (WHERE status_code = 410)::text AS retired_calls,
             COUNT(*) FILTER (WHERE COALESCE(request_type, '') = $3)::text AS monitoring_calls,
             BOOL_OR(status_code = 410) AS retired
-       FROM antigravity_relay_usage WHERE request_id = $1 AND user_id = $2
+       FROM antigravity_relay_usage WHERE request_id = $1 AND user_id = $2${excludeRetiredSql}
       GROUP BY 1, 2`,
     [
       requestId,
@@ -852,6 +863,38 @@ export async function settleAntigravityTurnRecord(args: {
   if (!row) return null
   if (args.staleBefore) releaseInflight(args.requestId)
 
+  // P1-01: An aborted delegate_antigravity journal is a permanent waiver decision;
+  // never settle or debit it on orphan/reconcile/late passes — close the turn row.
+  try {
+    const delegateJournal = await args.pool.query<{ state: string }>(
+      `SELECT state FROM request_finalize_journal
+        WHERE request_id = $1 AND user_id = $2
+          AND ctx->>'source' = 'delegate_antigravity'
+        LIMIT 1`,
+      [args.requestId, args.userId.toString()],
+    )
+    if (delegateJournal.rows[0]?.state === 'aborted') {
+      await args.pool
+        .query(
+          "UPDATE antigravity_turns SET status = 'abandoned', updated_at = NOW() WHERE request_id = $1 AND user_id = $2",
+          [args.requestId, args.userId.toString()],
+        )
+        .catch(() => {})
+      return null
+    }
+  } catch (err) {
+    const pgCode = (err as { code?: string } | null)?.code
+    if (pgCode !== '42P01') {
+      await args.pool
+        .query("UPDATE antigravity_turns SET status = 'pending', updated_at = NOW() WHERE request_id = $1 AND user_id = $2", [
+          args.requestId,
+          args.userId.toString(),
+        ])
+        .catch(() => {})
+      throw err
+    }
+  }
+
   let resolvedDispatchId = args.dispatchId ?? null
   let resolvedAttemptNo = args.attemptNo ?? null
   let resolvedTurnKey = canonicalTurnKey(args.turnKey)
@@ -862,6 +905,7 @@ export async function settleAntigravityTurnRecord(args: {
       attempt_no: number | null
       dispatch_status: string | null
       dispatch_outcome: string | null
+      authority_turn_key: string | null
       tape_turn_key: string | null
       tape_status: string | null
     }>(
@@ -869,9 +913,12 @@ export async function settleAntigravityTurnRecord(args: {
               d.attempt_no,
               d.status AS dispatch_status,
               d.outcome AS dispatch_outcome,
+              a.turn_key AS authority_turn_key,
               t.turn_key AS tape_turn_key,
               t.status AS tape_status
          FROM turn_dispatches d
+         LEFT JOIN authority_turn_dispatches a
+           ON a.dispatch_id = d.dispatch_id AND a.user_id = d.user_id AND a.attempt_no = d.attempt_no
          LEFT JOIN LATERAL (
            SELECT ct.turn_key, ct.status
              FROM client_session_turn_tapes ct
@@ -886,8 +933,9 @@ export async function settleAntigravityTurnRecord(args: {
     if (lr) {
       resolvedDispatchId ??= lr.dispatch_id
       resolvedAttemptNo ??= lr.attempt_no
-      if (!resolvedTurnKey && lr.tape_turn_key && /^[0-9a-f]{64}$/.test(lr.tape_turn_key)) {
-        resolvedTurnKey = lr.tape_turn_key
+      const serverTurnKey = canonicalTurnKey(lr.authority_turn_key) ?? canonicalTurnKey(lr.tape_turn_key)
+      if (serverTurnKey) {
+        resolvedTurnKey = serverTurnKey
       }
       if (lr.tape_status === 'interrupted' || lr.dispatch_outcome === 'interrupted') {
         inferredOutcome = 'interrupted'
@@ -1055,9 +1103,14 @@ function buildFrozenAntigravityPricingLookup(
     if (auxObj && typeof auxObj === 'object' && !Array.isArray(auxObj)) {
       const auxPricingRaw = (auxObj as Record<string, unknown>).pricing as Record<string, unknown> | undefined
       const auxModelId = typeof auxPricingRaw?.model_id === 'string' ? auxPricingRaw.model_id : ''
-      if (auxModelId && !frozenMap.has(auxModelId)) {
+      if (auxModelId) {
         const p = parseFrozenModelPricingObj(auxModelId, auxPricingRaw)
-        if (p) frozenMap.set(auxModelId, p)
+        if (p) {
+          if (!frozenMap.has(auxModelId)) frozenMap.set(auxModelId, p)
+          for (const key of ANTIGRAVITY_AUX_PRICING_KEYS) {
+            if (!frozenMap.has(key)) frozenMap.set(key, { ...p, model_id: key })
+          }
+        }
       }
     }
   }
@@ -1073,6 +1126,16 @@ function buildFrozenAntigravityPricingLookup(
       get: (modelId: string) => frozenMap.get(modelId) ?? liveFallback.get(modelId),
     },
   }
+}
+
+function countRetiredExtraCalls(raw: unknown): number {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return 0
+  let sum = 0
+  for (const v of Object.values(raw as Record<string, unknown>)) {
+    const n = Number(v)
+    if (Number.isFinite(n) && n > 0) sum += Math.trunc(n)
+  }
+  return sum
 }
 
 /**
@@ -1160,21 +1223,36 @@ export async function settleLateAntigravityRelayUsage(args: {
       )
     if (!primaryPricing) return false
 
-    let accountedCalls = Number(parent.snapshot.antigravity_calls ?? 0)
+    let accountedCalls = Math.max(
+      0,
+      Number(parent.snapshot.antigravity_calls ?? 0) -
+        countRetiredExtraCalls(parent.snapshot.antigravity_retired_models),
+    )
+    // Keep the idempotency key watermark strictly monotonic even across pre-upgrade
+    // child rows whose `antigravity_late_from_calls` included extra-model 410 calls.
+    let keyWatermark = accountedCalls
     let accountedCredits = BigInt(parent.cost_credits)
     let accountedIn = BigInt(parent.input_tokens)
     let accountedOut = BigInt(parent.output_tokens)
     let accountedCache = BigInt(parent.cache_read_tokens)
     for (const child of lateRes.rows) {
-      accountedCalls += Number(child.snapshot.antigravity_late_calls ?? 0)
+      const childFrom = Number(child.snapshot.antigravity_late_from_calls ?? 0)
+      const childDelta = Number(child.snapshot.antigravity_late_calls ?? 0)
+      accountedCalls += childDelta
+      if (Number.isFinite(childFrom) && Number.isFinite(childDelta)) {
+        keyWatermark = Math.max(keyWatermark, childFrom + childDelta)
+      }
       accountedCredits += BigInt(child.cost_credits)
       accountedIn += BigInt(child.input_tokens)
       accountedOut += BigInt(child.output_tokens)
       accountedCache += BigInt(child.cache_read_tokens)
     }
+    keyWatermark = Math.max(keyWatermark, accountedCalls)
 
-    const totals = await sumAntigravityRelayUsage(args.pool, args.requestId, args.userId)
-    if (totals.calls <= accountedCalls || totals.retired) return false
+    const totals = await sumAntigravityRelayUsage(args.pool, args.requestId, args.userId, {
+      excludeRetired: true,
+    })
+    if (totals.calls <= accountedCalls) return false
     if (!hasAllAntigravityExtraPricing(totals, frozenPricingLookup)) return false
 
     const fullPlan = planAntigravitySettle({
@@ -1196,16 +1274,18 @@ export async function settleLateAntigravityRelayUsage(args: {
       cache_write_tokens: 0n,
     }
     const lateRequestId = createHash('sha256')
-      .update(`${args.requestId}:late-from:${accountedCalls}`, 'utf8')
+      .update(`${args.requestId}:late-from:${keyWatermark}`, 'utf8')
       .digest('hex')
       .slice(0, 32)
     const lateSnapshotJson = JSON.stringify({
       ...(JSON.parse(fullPlan.snapshotJson) as Record<string, unknown>),
       antigravity_late_of: args.requestId,
-      antigravity_late_from_calls: accountedCalls,
+      antigravity_late_from_calls: keyWatermark,
       antigravity_late_calls: deltaCalls,
     })
 
+    let effectiveTurnKey = canonicalTurnKey(parent.turn_key)
+    let effectiveParentTurnKey = canonicalTurnKey(parent.parent_turn_key)
     const settled = await settleUsageAndLedger(args.pool, {
       userId: args.userId,
       accountId: null,
@@ -1223,13 +1303,42 @@ export async function settleLateAntigravityRelayUsage(args: {
             delegateAgentId: parent.delegate_agent_id,
           }
         : {}),
-      turnKey: canonicalTurnKey(parent.turn_key),
-      parentTurnKey: canonicalTurnKey(parent.parent_turn_key),
+      turnKey: effectiveTurnKey,
+      parentTurnKey: effectiveParentTurnKey,
       dispatchId: parent.dispatch_id,
       attemptNo: parent.attempt_no,
     })
     if (settled.commitDisposition === 'existing') {
       continue
+    }
+    // P1-06 store-load barrier: if parent turn_key/parent_turn_key was NULL when we read it
+    // before INSERT, re-read parent AFTER late row commit so a concurrent tape attribution repair
+    // that already finished scanning late rows cannot leave this late row keyless.
+    if (!effectiveTurnKey || (parent.mode === 'delegate' && !effectiveParentTurnKey)) {
+      const refreshedParent = await args.pool.query<{
+        turn_key: string | null
+        parent_turn_key: string | null
+      }>(
+        `SELECT turn_key, parent_turn_key FROM usage_records
+          WHERE user_id = $1 AND request_id = $2 LIMIT 1`,
+        [uidStr, args.requestId],
+      )
+      const rp = refreshedParent.rows[0]
+      const freshTurnKey = canonicalTurnKey(rp?.turn_key)
+      const freshParentTurnKey = canonicalTurnKey(rp?.parent_turn_key)
+      if (freshTurnKey !== effectiveTurnKey || freshParentTurnKey !== effectiveParentTurnKey) {
+        effectiveTurnKey = effectiveTurnKey ?? freshTurnKey
+        effectiveParentTurnKey = effectiveParentTurnKey ?? freshParentTurnKey
+        if (effectiveTurnKey || effectiveParentTurnKey) {
+          await args.pool.query(
+            `UPDATE usage_records
+                SET turn_key = COALESCE(turn_key, $3),
+                    parent_turn_key = COALESCE(parent_turn_key, $4)
+              WHERE user_id = $1 AND request_id = $2`,
+            [uidStr, lateRequestId, effectiveTurnKey, effectiveParentTurnKey],
+          )
+        }
+      }
     }
     const persistCredits =
       settled.attributionCredits !== null && settled.attributionCredits !== undefined
@@ -1246,8 +1355,8 @@ export async function settleLateAntigravityRelayUsage(args: {
           parent.session_id,
           parent.parent_session_id,
           parent.delegate_agent_id,
-          canonicalTurnKey(parent.turn_key) ?? null,
-          canonicalTurnKey(parent.parent_turn_key) ?? null,
+          effectiveTurnKey,
+          effectiveParentTurnKey,
         )
         .catch(() => {})
     }

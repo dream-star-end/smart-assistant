@@ -3745,7 +3745,7 @@ describe("Cursor external authority regression tripwire", () => {
       "balance gate must precede account/route admission",
     );
     // Master-owned fields are written after the spread so a browser cannot forge them.
-    assert.match(branch, /\.\.\.enriched,[\s\S]*?_creditBudget: spendable\.toString\(\),[\s\S]*?__oc_antigravity_route:/);
+    assert.match(branch, /\.\.\.enriched(?:ForAntigravity)?,[\s\S]*?_creditBudget: spendable\.toString\(\),[\s\S]*?__oc_antigravity_route:/);
     assert.match(branch, /budgetCredits: spendable/);
     assert.doesNotMatch(branch, /isCursorCredentialMember|insertPendingZcodeAudit/);
     // Client copies of the route field are stripped.

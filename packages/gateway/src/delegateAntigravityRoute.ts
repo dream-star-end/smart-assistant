@@ -314,6 +314,72 @@ export async function acquireDelegateAntigravityRoute(args: {
   }
 }
 
+/** Detailed outcome for Antigravity route lease renewal (OCV5-887 P2-03). */
+export type AntigravityRouteRenewResult = 'ok' | 'revoked' | 'transient_error' | 'unconfigured'
+
+type RouteRenewTransportResult =
+  | { kind: 'unconfigured' }
+  | { kind: 'invalid_token' }
+  | { kind: 'response'; result: FetchResult }
+
+async function requestAntigravityRouteRenew(
+  routeToken: string,
+  opts: { env?: NodeJS.ProcessEnv; fetcher?: typeof undiciRequest } = {},
+): Promise<RouteRenewTransportResult> {
+  const env = opts.env ?? process.env
+  const base = env.OPENCLAUDE_V3_MASTER_BASE_URL?.replace(/\/+$/, '')
+  const bearer = env.OPENCLAUDE_V3_CONTAINER_TOKEN
+  if (!base || !bearer) return { kind: 'unconfigured' }
+  if (!ROUTE_TOKEN_RE.test(routeToken)) return { kind: 'invalid_token' }
+  const result = await postJson(
+    opts.fetcher ?? undiciRequest,
+    `${base}${RENEW_PATH}`,
+    bearer,
+    { routeToken },
+    RENEW_RELEASE_TIMEOUT_MS,
+  )
+  return { kind: 'response', result }
+}
+
+/**
+ * Renew a minted Antigravity relay route lease, explicitly distinguishing
+ * authoritative revocation (`revoked`) from transient master/network failures
+ * (`transient_error`) so queued healthy swarms are not killed by a brief 503.
+ */
+export async function renewAntigravityRouteLeaseDetailed(
+  routeToken: string,
+  opts: { env?: NodeJS.ProcessEnv; fetcher?: typeof undiciRequest } = {},
+): Promise<AntigravityRouteRenewResult> {
+  let outcome: RouteRenewTransportResult
+  try {
+    outcome = await requestAntigravityRouteRenew(routeToken, opts)
+  } catch {
+    return 'transient_error'
+  }
+  if (outcome.kind === 'unconfigured') return 'unconfigured'
+  if (outcome.kind === 'invalid_token') return 'revoked'
+  const { result } = outcome
+  if (result.statusCode === 200) {
+    try {
+      const parsed = JSON.parse(result.text) as { ok?: unknown }
+      if (parsed?.ok === true) return 'ok'
+      if (parsed?.ok === false) return 'revoked'
+      return 'transient_error'
+    } catch {
+      return 'transient_error'
+    }
+  }
+  if (
+    result.statusCode === 401 ||
+    result.statusCode === 403 ||
+    result.statusCode === 404 ||
+    result.statusCode === 410
+  ) {
+    return 'revoked'
+  }
+  return 'transient_error'
+}
+
 /** Main turns use the same identity-scoped renew endpoint, never the mint endpoint.
  *  B8: Works across both Selfhost and Commercial containers; returns `true` when
  *  the master renew endpoint explicitly confirmed liveness (`HTTP 200` + `{ ok: true }`),
@@ -322,13 +388,10 @@ export async function renewAntigravityRouteLease(
   routeToken: string,
   opts: { env?: NodeJS.ProcessEnv; fetcher?: typeof undiciRequest } = {},
 ): Promise<boolean | 'unconfigured'> {
-  const env = opts.env ?? process.env
-  const base = env.OPENCLAUDE_V3_MASTER_BASE_URL?.replace(/\/+$/, '')
-  const bearer = env.OPENCLAUDE_V3_CONTAINER_TOKEN
-  if (!base || !bearer) return 'unconfigured'
-  if (!ROUTE_TOKEN_RE.test(routeToken)) return false
-  const result = await postJson(opts.fetcher ?? undiciRequest, `${base}${RENEW_PATH}`,
-    bearer, { routeToken }, RENEW_RELEASE_TIMEOUT_MS)
+  const outcome = await requestAntigravityRouteRenew(routeToken, opts)
+  if (outcome.kind === 'unconfigured') return 'unconfigured'
+  if (outcome.kind === 'invalid_token') return false
+  const { result } = outcome
   if (result.statusCode !== 200) throw new Error(`Antigravity route renewal HTTP ${result.statusCode}`)
   if (JSON.parse(result.text)?.ok !== true) throw new Error('Antigravity route renewal rejected')
   return true

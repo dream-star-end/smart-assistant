@@ -366,9 +366,16 @@ export function detectSwarmAlerts(snapshot: SwarmSnapshot): SwarmAlertSummary {
   };
 }
 
+const LEGACY_UTC_BOARD_TIME_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+
 export function formatPostClock(time?: string): string {
   if (!time) return "";
-  const ms = Date.parse(time);
+  const trimmed = time.trim();
+  if (!trimmed) return "";
+  const normalized = LEGACY_UTC_BOARD_TIME_RE.test(trimmed)
+    ? `${trimmed.replace(" ", "T")}Z`
+    : trimmed;
+  const ms = Date.parse(normalized);
   if (!Number.isFinite(ms)) return "";
   const d = new Date(ms);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;

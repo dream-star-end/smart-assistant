@@ -10,7 +10,8 @@ import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, 
 import { dirname, join, resolve, sep } from 'node:path'
 import type { EngineBillingEvent, EngineExternalBillingEvent } from './engineEvents.js'
 import { engineSessionId } from './engineSessionId.js'
-import { killProcessGroup } from '../processGroupShutdown.js'
+import { detachChildStdio, killProcessGroup } from '../processGroupShutdown.js'
+import type { AntigravityRouteRenewResult } from '../delegateAntigravityRoute.js'
 
 /**
  * Default max concurrent local native Antigravity CLI swarm processes per user container.
@@ -84,13 +85,35 @@ export interface LocalSwarmSlotAcquisition {
   readonly cancel: () => void
 }
 
+function sleepShort(ms: number): Promise<void> {
+  return new Promise((resolveSleep) => {
+    setTimeout(resolveSleep, ms)
+  })
+}
+
+async function probeRouteLease(
+  onRenewRoute: () => Promise<boolean | AntigravityRouteRenewResult>,
+): Promise<AntigravityRouteRenewResult> {
+  try {
+    const res = await onRenewRoute()
+    if (res === true || res === 'ok') return 'ok'
+    if (res === 'unconfigured') return 'unconfigured'
+    if (res === false || res === 'revoked') return 'revoked'
+    return 'transient_error'
+  } catch {
+    return 'transient_error'
+  }
+}
+
 export async function awaitLocalAntigravitySwarmSlotIfActive(opts: {
   compactionMode: string | undefined
   keepaliveMs: number
   renewRouteIntervalMs?: number
+  transientRetryDelayMs?: number
   onStatus: (detail: string) => void
   onHeartbeat: () => void
-  onRenewRoute?: () => Promise<boolean>
+  onRenewRoute?: () => Promise<boolean | AntigravityRouteRenewResult>
+  onRenewWarn?: (outcome: 'transient_error') => void
   setRelease: (fn: (() => void) | null) => void
   now?: () => number
 }): Promise<{ waited: boolean }> {
@@ -114,7 +137,7 @@ export async function awaitLocalAntigravitySwarmSlotIfActive(opts: {
         if (opts.onRenewRoute && !renewBusy && nowFn() - lastRenewAt >= renewEveryMs) {
           lastRenewAt = nowFn()
           renewBusy = true
-          void opts.onRenewRoute().catch(() => false).finally(() => {
+          void probeRouteLease(opts.onRenewRoute).finally(() => {
             renewBusy = false
           })
         }
@@ -128,11 +151,20 @@ export async function awaitLocalAntigravitySwarmSlotIfActive(opts: {
   } finally {
     if (hb) clearInterval(hb)
   }
-  // B8: If we waited in FIFO queue, verify/renew the minted relay route BEFORE spawning CLI
-  // so a route that expired during a long queue wait fails closed instead of launching a broken CLI.
+  // B8 + P2-03: If we waited in FIFO queue, verify/renew the minted relay route BEFORE spawning CLI.
+  // Fail closed ONLY on explicit revocation (`revoked` / `false`); on transient master/network failures
+  // (e.g. brief 503 during restart), retry once with short backoff, warn, and allow healthy swarm launch.
   if (slot.waited && opts.onRenewRoute) {
-    const alive = await opts.onRenewRoute().catch(() => false)
-    if (!alive) {
+    let outcome = await probeRouteLease(opts.onRenewRoute)
+    if (outcome === 'transient_error') {
+      const retryDelayMs = Math.max(0, opts.transientRetryDelayMs ?? 250)
+      if (retryDelayMs > 0) await sleepShort(retryDelayMs)
+      outcome = await probeRouteLease(opts.onRenewRoute)
+      if (outcome === 'transient_error') {
+        opts.onRenewWarn?.('transient_error')
+      }
+    }
+    if (outcome === 'revoked') {
       release()
       opts.setRelease(null)
       throw new Error('ANTIGRAVITY_ROUTE_EXPIRED_IN_QUEUE: relay route expired while waiting for swarm slot')
@@ -201,44 +233,99 @@ export function acquireLocalAntigravitySwarmSlot(opts?: {
   }
 }
 
+function isProcessGroupAlive(pid: number | undefined): boolean {
+  if (typeof pid !== 'number' || pid <= 0 || process.platform === 'win32') return false
+  try {
+    process.kill(-pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException | null)?.code === 'EPERM'
+  }
+}
+
 /**
  * Reap a lingering CLI process group on active swarm turns where background
- * worker subprocesses keep stdio/sockets open past coordinator result emission.
- * Gives the coordinator `naturalExitGraceMs` to exit cleanly with code 0 first
- * before sending SIGTERM -> SIGKILL.
+ * worker subprocesses keep stdio/sockets open or outlive a leader exit 0.
+ * Gives the coordinator `naturalExitGraceMs` to exit cleanly first, then sends
+ * bounded SIGTERM -> SIGKILL while polling until `close` AND process-group ESRCH.
+ * Always terminates in bounded time (detaching stdio if descendants keep pipes open).
  */
 export async function reapLingeringCliProcessGroup(
   proc: ChildProcess | null,
   isClosed: () => boolean,
-  opts?: { naturalExitGraceMs?: number; termGraceMs?: number; killGraceMs?: number },
+  opts?: {
+    naturalExitGraceMs?: number
+    termGraceMs?: number
+    killGraceMs?: number
+    pollIntervalMs?: number
+    onTimeout?: () => void
+  },
 ): Promise<void> {
-  if (!proc || isClosed()) return
+  if (!proc) return
+  const pid = proc.pid
+  const isReaped = (): boolean => isClosed() && !isProcessGroupAlive(pid)
+  if (isReaped()) return
+
   const naturalExitGraceMs = Math.max(0, opts?.naturalExitGraceMs ?? 150)
   const termGraceMs = Math.max(20, opts?.termGraceMs ?? 800)
   const killGraceMs = Math.max(20, opts?.killGraceMs ?? 400)
+  const pollIntervalMs = Math.max(10, opts?.pollIntervalMs ?? 25)
 
-  const waitClose = (ms: number): Promise<boolean> => {
-    if (isClosed()) return Promise.resolve(true)
+  const waitReaped = (ms: number): Promise<boolean> => {
+    if (isReaped()) return Promise.resolve(true)
     if (ms <= 0) return Promise.resolve(false)
     return new Promise<boolean>((resolveWait) => {
-      const onClose = () => {
+      let settled = false
+      const finish = (ok: boolean) => {
+        if (settled) return
+        settled = true
         clearTimeout(timer)
-        resolveWait(true)
+        clearInterval(poller)
+        proc.removeListener('close', check)
+        resolveWait(ok)
       }
-      const timer = setTimeout(() => {
-        proc.removeListener('close', onClose)
-        resolveWait(isClosed())
-      }, ms)
-      timer.unref()
-      proc.once('close', onClose)
+      const check = () => {
+        if (isReaped()) finish(true)
+      }
+      const timer = setTimeout(() => finish(isReaped()), ms)
+      const poller = setInterval(check, Math.min(pollIntervalMs, ms))
+      poller.unref()
+      if (!isClosed()) proc.once('close', check)
     })
   }
 
-  if (naturalExitGraceMs > 0 && (await waitClose(naturalExitGraceMs))) return
+  if (naturalExitGraceMs > 0 && (await waitReaped(naturalExitGraceMs))) return
   killProcessGroup(proc, 'SIGTERM')
-  if (await waitClose(termGraceMs)) return
+  if (await waitReaped(termGraceMs)) return
   killProcessGroup(proc, 'SIGKILL')
-  await waitClose(killGraceMs)
+  if (await waitReaped(killGraceMs)) return
+  if (!isClosed()) detachChildStdio(proc)
+  opts?.onTimeout?.()
+}
+
+/**
+ * Release a local swarm FIFO slot only after the CLI process group is confirmed
+ * reaped (synchronously when no process exists or already reaped; otherwise via
+ * bounded async `reapLingeringCliProcessGroup` so a slot never deadlocks forever).
+ */
+export function releaseSwarmSlotAfterBoundedReap(
+  proc: ChildProcess | null,
+  isClosed: () => boolean,
+  release: (() => void) | null,
+  opts?: { naturalExitGraceMs?: number; termGraceMs?: number; killGraceMs?: number },
+): void {
+  if (!release) return
+  if (!proc || (isClosed() && !isProcessGroupAlive(proc.pid))) {
+    release()
+    return
+  }
+  void reapLingeringCliProcessGroup(proc, isClosed, {
+    naturalExitGraceMs: opts?.naturalExitGraceMs ?? 0,
+    termGraceMs: opts?.termGraceMs ?? 800,
+    killGraceMs: opts?.killGraceMs ?? 400,
+  }).finally(() => {
+    release()
+  })
 }
 
 export function buildAntigravityDurableBillingEvent(args: {
@@ -249,6 +336,7 @@ export function buildAntigravityDurableBillingEvent(args: {
   parentSessionId?: string
   delegateAgentId?: string
   status: EngineExternalBillingEvent['status']
+  terminalCode?: EngineExternalBillingEvent['terminalCode']
   interrupted: boolean
   budgetStop: boolean
   durationMs: number
@@ -260,6 +348,16 @@ export function buildAntigravityDurableBillingEvent(args: {
   }
 }): EngineBillingEvent {
   const durableStatus: 'success' | 'error' = args.status === 'success' ? 'success' : 'error'
+  const durableTerminalCode: EngineBillingEvent['terminalCode'] =
+    durableStatus === 'error' && !args.budgetStop
+      ? args.terminalCode === 'USER_CANCELLED' || args.interrupted
+        ? 'USER_CANCELLED'
+        : args.terminalCode === 'AUTH_UNAVAILABLE'
+          ? 'AUTH_UNAVAILABLE'
+          : args.terminalCode === 'QUOTA_UNAVAILABLE'
+            ? 'QUOTA_UNAVAILABLE'
+            : 'CODEX_ERROR'
+      : undefined
   return {
     requestId: args.requestId,
     engine: 'antigravity',
@@ -269,9 +367,7 @@ export function buildAntigravityDurableBillingEvent(args: {
     ...(args.delegateAgentId ? { delegateAgentId: args.delegateAgentId } : {}),
     engineSessionId: engineSessionId(args.sessionKey),
     status: durableStatus,
-    ...(durableStatus === 'error' && !args.budgetStop
-      ? { terminalCode: args.interrupted ? ('USER_CANCELLED' as const) : ('CODEX_ERROR' as const) }
-      : {}),
+    ...(durableTerminalCode ? { terminalCode: durableTerminalCode } : {}),
     durationMs: Math.max(0, Math.floor(args.durationMs)),
     usage: {
       input_tokens: Math.max(0, Math.floor(args.usage.inputTokens)),
@@ -426,26 +522,45 @@ export function cleanupKilledNativeSwarmWorktrees(
       }
       if (!registeredNonMain) continue
 
-      // B7: Require current conversation + member ownership (not merely generic `swarm/*`),
-      // so a path reused by another active swarm in the same repo can NEVER be removed!
+      // B7 + P1-11: Require strict current-conversation ownership (NEVER match sibling
+      // conversations under `realBrainDir`, and never remove detached HEAD worktrees
+      // outside this conversation's own brain subdir).
+      const convBrainDir = realBrainDir !== null ? join(realBrainDir, conversationId) : null
+      const underSessionBrain = convBrainDir !== null && realWt.startsWith(`${convBrainDir}${sep}`)
       const memberLower = memberName.trim().toLowerCase()
+      const brainSegments = underSessionBrain
+        ? realWt.slice(convBrainDir!.length + 1).toLowerCase().split(sep).filter(Boolean)
+        : []
+      const brainPathMatchesMember =
+        memberLower.length > 0 && brainSegments.some((seg) => seg === memberLower)
+      const stripConvPrefix = (s: string): string | null => {
+        if (s.startsWith(`${convLower}/`) || s.startsWith(`${convLower}-`)) return s.slice(convLower.length + 1)
+        if (s.startsWith(`${convPrefix}/`) || s.startsWith(`${convPrefix}-`)) return s.slice(convPrefix.length + 1)
+        return null
+      }
       const swarmWorktreeDir = join(repoTop, '.oc-swarm-worktrees')
-      const underSessionBrain = realBrainDir !== null && realWt.startsWith(`${realBrainDir}${sep}`)
+      const relFromSwarmDir = realWt.startsWith(`${swarmWorktreeDir}${sep}`)
+        ? realWt.slice(swarmWorktreeDir.length + 1).toLowerCase()
+        : null
+      const dirTail = relFromSwarmDir ? stripConvPrefix(relFromSwarmDir) : null
       const underConvSwarmDir =
-        realWt.startsWith(`${swarmWorktreeDir}${sep}${convPrefix}-`) ||
-        realWt.startsWith(`${swarmWorktreeDir}${sep}${convLower}-`)
+        dirTail !== null &&
+        memberLower.length > 0 &&
+        (dirTail === memberLower || dirTail.startsWith(`${memberLower}${sep}`))
       const branchLower = checkedOutBranch?.toLowerCase() ?? ''
       const hasSwarmBranchOwnership = isSafeSwarmBranchName(checkedOutBranch)
+      const branchTail = hasSwarmBranchOwnership ? stripConvPrefix(branchLower.slice('swarm/'.length)) : null
       const branchMatchesThisMember =
-        hasSwarmBranchOwnership &&
-        (branchLower.includes(convPrefix) || branchLower.includes(convLower)) &&
-        (!memberLower ||
-          branchLower.endsWith(`/${memberLower}`) ||
-          branchLower.includes(`/${memberLower}-`) ||
-          branchLower.includes(`-${memberLower}`))
-      if (!underSessionBrain && !underConvSwarmDir && !branchMatchesThisMember) continue
-      if (checkedOutBranch !== null && !hasSwarmBranchOwnership) continue
-      if (hasSwarmBranchOwnership && !underSessionBrain && !branchMatchesThisMember) continue
+        branchTail !== null &&
+        memberLower.length > 0 &&
+        (branchTail === memberLower || branchTail.startsWith(`${memberLower}/`))
+      if (checkedOutBranch === null) {
+        if (!underSessionBrain || !brainPathMatchesMember) continue
+      } else {
+        if (!hasSwarmBranchOwnership) continue
+        if ((!underSessionBrain || !brainPathMatchesMember) && !branchMatchesThisMember) continue
+        if (relFromSwarmDir !== null && !underSessionBrain && !underConvSwarmDir) continue
+      }
 
       const dirty = execFileSync('git', ['-C', realWt, 'status', '--porcelain'], {
         encoding: 'utf8',

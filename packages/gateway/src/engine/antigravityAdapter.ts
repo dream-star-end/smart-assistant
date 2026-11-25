@@ -1,4 +1,4 @@
-import { renewAntigravityRouteLease } from '../delegateAntigravityRoute.js'
+import { renewAntigravityRouteLease, renewAntigravityRouteLeaseDetailed } from '../delegateAntigravityRoute.js'
 import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { PassiveStageTiming } from '../passiveStageTiming.js'
 import { identityCompatEnvironment } from '@openclaude/storage'
@@ -91,6 +91,7 @@ import {
   buildAntigravityDurableBillingEvent,
   cleanupKilledNativeSwarmWorktrees,
   reapLingeringCliProcessGroup,
+  releaseSwarmSlotAfterBoundedReap,
 } from './antigravitySwarmConcurrency.js'
 import { injectSwarmDirective } from '../swarmCommand.js'
 import { lookupRemoteSwarmMcpContext } from '../remoteSwarmRuntime.js'
@@ -762,8 +763,16 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       onHeartbeat: () => { this.lastActivityAt = Date.now(); this.emit('activity') },
       onRenewRoute: async () => {
         ctx.routeRenewAt = Date.now()
-        const res = await (timingTestHooks?.renewRoute ?? renewAntigravityRouteLease)(route.routeToken)
-        return res !== false
+        if (timingTestHooks?.renewRoute) {
+          const res = await timingTestHooks.renewRoute(route.routeToken)
+          return res === false ? 'revoked' : 'ok'
+        }
+        return renewAntigravityRouteLeaseDetailed(route.routeToken)
+      },
+      onRenewWarn: (outcome) => {
+        log.warn('antigravity queued route renewal transient failure; proceeding', {
+          sessionKey: this.opts.sessionKey, traceId: ctx.params.traceId, outcome,
+        })
       },
       setRelease: (fn) => { ctx.releaseSwarmSlot = fn },
     })
@@ -812,7 +821,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         },
       },
       onStallDetected: (alert) => {
-        if (ctx.terminal || ctx.abandoned) return
+        if (ctx.terminal || ctx.abandoned || ctx.interrupted) return
         void injectSwarmDirective({
           brainDir,
           conversationId,
@@ -821,9 +830,10 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
           channel: alert.channel,
           sender: GATEWAY_STALL_MONITOR_AGENT,
           controlKind: 'stall',
+          shouldAbort: () => ctx.terminal || ctx.abandoned || ctx.interrupted,
         })
           .then((res) => {
-            if (ctx.terminal || ctx.abandoned) return
+            if (ctx.terminal || ctx.abandoned || ctx.interrupted) return
             if (res.ok) {
               log.info('antigravity_swarm_stall_alert', {
                 sessionKey: this.opts.sessionKey,
@@ -835,7 +845,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
                 seq: res.seq,
               })
               ctx.swarmWatcher?.kick()
-            } else {
+            } else if (res.code !== 'ABORTED') {
               ctx.swarmWatcher?.rollbackStallAlert(alert)
               log.warn('antigravity_swarm_stall_alert_failed', {
                 sessionKey: this.opts.sessionKey, conversationId, target: alert.target,
@@ -844,6 +854,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
             }
           })
           .catch((err) => {
+            if (ctx.terminal || ctx.abandoned || ctx.interrupted) return
             ctx.swarmWatcher?.rollbackStallAlert(alert)
             log.warn('antigravity_swarm_stall_alert_failed', {
               sessionKey: this.opts.sessionKey, conversationId, target: alert.target,
@@ -1595,7 +1606,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         this.nativeId = ctx.conversationId
         this.emit('session_id', ctx.conversationId)
       }
-      if (ctx.swarmWatcher?.hasTurnActivity() && ctx.proc && !ctx.procClosed) {
+      if (ctx.swarmWatcher?.hasTurnActivity() && ctx.proc) {
         await reapLingeringCliProcessGroup(ctx.proc, () => ctx.procClosed)
         if (ctx.terminal || ctx.abandoned) return
       }
@@ -1719,7 +1730,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       parentTurnKey: ctx.params.usageAttribution?.parentTurnKey,
       parentSessionId: ctx.params.usageAttribution?.parentSessionId,
       delegateAgentId: ctx.params.usageAttribution?.delegateAgentId,
-      status, interrupted: ctx.interrupted, budgetStop, durationMs, usage,
+      status, terminalCode, interrupted: ctx.interrupted, budgetStop, durationMs, usage,
     }))
   }
 
@@ -1731,25 +1742,30 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   private forceEnd(ctx: TurnContext): void {
     this.stopKeepalive(ctx)
-    ctx.releaseSwarmSlot?.()
-    ctx.releaseSwarmSlot = null
     // Preserve any already-displayed swarm board in `ctx.tools` BEFORE terminal
     // teardown so `getPartialSnapshot()` persists one settled terminal card.
     this.commitTerminalSwarmBoard(ctx, ctx.interrupted ? 'interrupted' : 'error', {
       emitEvent: false,
       readDisk: false,
     })
-    if (ctx.terminal) return
+    const release = ctx.releaseSwarmSlot
+    ctx.releaseSwarmSlot = null
+    if (ctx.terminal) {
+      releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 150 })
+      return
+    }
     ctx.deliveredSuccess = false
     ctx.terminal = true
     if (ctx.proc && !ctx.procClosed) killProcessGroup(ctx.proc, 'SIGTERM')
+    releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 0 })
     ctx.resolveSummary(null)
   }
 
   private cleanupLaunch(ctx: TurnContext, opts?: { persistSummaryCache?: boolean }): void {
     this.stopSwarmWatcher(ctx)
-    ctx.releaseSwarmSlot?.()
+    const release = ctx.releaseSwarmSlot
     ctx.releaseSwarmSlot = null
+    releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 0 })
     ctx.toolBackfiller?.dispose()
     ctx.toolBackfiller = null
     // Every caller is the end of the turn's process, so its relay requests stop naming this turn too.

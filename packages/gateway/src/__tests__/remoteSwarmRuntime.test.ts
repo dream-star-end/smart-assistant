@@ -32,6 +32,14 @@ import {
   handleRemoteSwarmLocal,
 } from '../remoteSwarmLocal.js'
 import {
+  formatBoardTimestamp,
+  readBoardPostsSinceSeq,
+} from '../remoteSwarmLocks.js'
+import {
+  deleteMergedSwarmBranchIfSafe,
+  removeWorkerGitWorktree,
+} from '../remoteSwarmReconcile.js'
+import {
   DEFAULT_WAIT_TIMEOUT_MS,
   RemoteSwarmRuntime,
   type RemoteSwarmTelemetryEvent,
@@ -2404,6 +2412,371 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
       reconcileRemoteSwarmOnBoot({ rootBase: agyRoot, workspaceRoots: [repo] })
       const survivingBranches = execFileSync('git', ['-C', repo, 'branch', '--list', unmergedBranch], { encoding: 'utf8' }).trim()
       assert.ok(survivingBranches.includes(unmergedBranch), 'unmerged swarm/* branch must survive boot reconcile even when worktree dir is absent')
+    } finally {
+      await rt.shutdownAll()
+    }
+  })
+
+  it('OCV5-887 P1-10: worker drains page 1 AND page 2 directed messages even when both precede the 2 MiB tail', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-p110-root-')
+    const ws = makeTempDir('oc-rswarm-p110-ws-')
+    const sess = 'agent:main:webchat:dm:p110-multipage-worker'
+    const handledTags: string[] = []
+
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn(input) {
+          if (input.workerName === 'paged-worker') {
+            if (input.prompt.includes('PAGE_1_TASK_SEQ_2')) handledTags.push('page1')
+            if (input.prompt.includes('PAGE_2_TASK_SEQ_265')) handledTags.push('page2')
+          }
+          return { text: 'ack' }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+
+    try {
+      rt.registerSession({ sessionKey: sess, model: 'antigravity-gemini-4-neon-remote', workspaceCwd: ws })
+      const loc = rt.locationFor(sess)
+      mkdirSync(loc.swarmDir, { recursive: true })
+      writeFileSync(
+        join(loc.swarmDir, 'members.json'),
+        JSON.stringify({
+          runtime: 'remote',
+          title: 'P1-10 pagination',
+          workspace_cwd: ws,
+          channels: { main: { topic: 'main' } },
+          members: {
+            coordinator: {
+              conversation_id: loc.swarmId,
+              role: 'coordinator',
+              model: 'm',
+              phase: 'RUNNING',
+              wake_mode: 'mentions',
+              wait_since: 0,
+              last_read_seq: 1,
+              killed: false,
+              channels: ['main'],
+            },
+            'paged-worker': {
+              conversation_id: '44444444-4444-4444-8444-444444444444',
+              role: 'worker',
+              model: 'm',
+              phase: 'WAITING',
+              wake_mode: 'mentions',
+              wait_since: 0,
+              last_read_seq: 1,
+              killed: false,
+              channels: ['main'],
+            },
+          },
+        }),
+      )
+
+      const lines: string[] = [
+        `${JSON.stringify({ seq: 1, agent: 'coordinator', channel: 'main', text: 'init', time: '2026-11-24T10:00:00Z' })}\n`,
+        `${JSON.stringify({ seq: 2, agent: 'coordinator', channel: 'main', text: '@paged-worker execute PAGE_1_TASK_SEQ_2', time: '2026-11-24T10:00:01Z' })}\n`,
+      ]
+      for (let s = 3; s <= 264; s += 1) {
+        lines.push(`${JSON.stringify({ seq: s, agent: 'coordinator', channel: 'main', text: `chatter-${s}`, time: '2026-11-24T10:00:02Z' })}\n`)
+      }
+      // Seq 265 is on page 2 (> 256 posts after last_read_seq=1) AND precedes >2.2 MiB of tail posts
+      // authored exclusively by `paged-worker` itself (so the old 2 MiB tail `.some(non-self)` check returns false!).
+      lines.push(
+        `${JSON.stringify({ seq: 265, agent: 'coordinator', channel: 'main', text: '@paged-worker execute PAGE_2_TASK_SEQ_265', time: '2026-11-24T10:00:03Z' })}\n`,
+      )
+      const tailFiller = '尾部自身历史帖子内容'.repeat(350)
+      let seq = 266
+      let tailBytes = 0
+      while (tailBytes < 2.2 * 1024 * 1024) {
+        const line = `${JSON.stringify({ seq, agent: 'paged-worker', channel: 'main', text: tailFiller, time: '2026-11-24T10:00:04Z' })}\n`
+        lines.push(line)
+        tailBytes += Buffer.byteLength(line, 'utf8')
+        seq += 1
+      }
+      writeFileSync(join(loc.swarmDir, 'board.jsonl'), lines.join(''), 'utf8')
+
+      // Wake worker WITHOUT adding a new non-self tail post (simulating resume/wake on backlog).
+      ;(rt as unknown as { scheduleWorkerRun: (s: unknown, n: string) => void }).scheduleWorkerRun(
+        (rt as unknown as { sessions: Map<string, unknown> }).sessions.get(sess),
+        'paged-worker',
+      )
+
+      const deadline = Date.now() + 5_000
+      while (handledTags.length < 2 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25))
+      }
+      assert.deepEqual(handledTags, ['page1', 'page2'], 'worker must sequentially drain page 1 and page 2 directed messages before 2 MiB self-only tail')
+    } finally {
+      await rt.shutdownAll()
+    }
+  })
+
+  it('OCV5-887 P1-11 & P2-10: enforces swarmId/member branch ownership, checked-out branch match, honest missing-dir result, and shutdown stopConfirmed gating', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-p111-root-')
+    const repo = initTempGitRepo()
+
+    const swarmA = 'aaaaaaaa-1111-4222-8333-444444444444'
+    const swarmB = 'bbbbbbbb-1111-4222-8333-444444444444'
+    const branchA = 'swarm/aaaaaaaa-w1-abc123'
+    const branchB = 'swarm/bbbbbbbb-w1-xyz789'
+    execFileSync('git', ['-C', repo, 'branch', branchA, 'HEAD'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', repo, 'branch', branchB, 'HEAD'], { stdio: 'ignore' })
+
+    // 1) Different swarmId or different memberName MUST NOT delete another swarm's merged `swarm/*` branch
+    assert.equal(
+      deleteMergedSwarmBranchIfSafe(repo, branchB, { expectedSwarmId: swarmA, expectedMemberName: 'w1' }),
+      false,
+      'must refuse to delete swarm/* branch owned by a different swarmId',
+    )
+    assert.equal(
+      deleteMergedSwarmBranchIfSafe(repo, branchA, { expectedSwarmId: swarmA, expectedMemberName: 'other' }),
+      false,
+      'must refuse to delete swarm/* branch owned by a different memberName',
+    )
+    assert.ok(execFileSync('git', ['-C', repo, 'branch', '--list', branchB], { encoding: 'utf8' }).includes(branchB))
+    assert.ok(execFileSync('git', ['-C', repo, 'branch', '--list', branchA], { encoding: 'utf8' }).includes(branchA))
+
+    // Matching swarmId + memberName deletes cleanly
+    assert.equal(
+      deleteMergedSwarmBranchIfSafe(repo, branchA, { expectedSwarmId: swarmA, expectedMemberName: 'w1' }),
+      true,
+    )
+    assert.equal(execFileSync('git', ['-C', repo, 'branch', '--list', branchA], { encoding: 'utf8' }).trim(), '')
+
+    // 2) Existing worktree with mismatched passed `branchName` OR mismatched member path MUST NOT remove dir OR branch
+    const mismatchWt = join(repo, '.oc-swarm-worktrees', 'aaaaaaaa-w1')
+    execFileSync('git', ['-C', repo, 'worktree', 'add', '-b', 'swarm/aaaaaaaa-w1-real', mismatchWt, 'HEAD'], { stdio: 'ignore' })
+    const mismatchRes = removeWorkerGitWorktree(repo, mismatchWt, {
+      branchName: branchB,
+      expectedSwarmId: swarmA,
+      expectedMemberName: 'w1',
+    })
+    assert.equal(mismatchRes.removed, false, 'mismatched branchName must refuse to remove worktree directory')
+    assert.equal(existsSync(mismatchWt), true, 'worktree directory must be preserved on branch mismatch')
+    assert.ok(
+      execFileSync('git', ['-C', repo, 'branch', '--list', branchB], { encoding: 'utf8' }).includes(branchB),
+      'mismatched passed branchName must never be deleted',
+    )
+    const wrongMemberRes = removeWorkerGitWorktree(repo, mismatchWt, {
+      branchName: 'swarm/aaaaaaaa-w1-real',
+      expectedSwarmId: swarmA,
+      expectedMemberName: 'w2',
+    })
+    assert.equal(wrongMemberRes.removed, false, 'mismatched memberName must refuse to remove sibling worktree')
+    assert.equal(existsSync(mismatchWt), true)
+    // Matching owner + branch removes cleanly
+    const exactRes = removeWorkerGitWorktree(repo, mismatchWt, {
+      branchName: 'swarm/aaaaaaaa-w1-real',
+      expectedSwarmId: swarmA,
+      expectedMemberName: 'w1',
+    })
+    assert.equal(exactRes.removed, true)
+    assert.equal(exactRes.branchDeleted, true)
+    assert.equal(existsSync(mismatchWt), false)
+
+    // 3) Missing worktree directory + unmerged branch (branch -d fails) MUST NOT falsely report removed/cleaned
+    const unmergedSess = 'agent:main:webchat:dm:p210-missing-unmerged'
+    const unmergedLoc = remoteSwarmLocationForSession(unmergedSess, agyRoot)
+    const unmergedPrefix = unmergedLoc.swarmId.slice(0, 8)
+    const unmergedBranch = `swarm/${unmergedPrefix}-w1-unmerged`
+    const missingWt = join(repo, '.oc-swarm-worktrees', `${unmergedPrefix}-w1`)
+    execFileSync('git', ['-C', repo, 'worktree', 'add', '-b', unmergedBranch, missingWt, 'HEAD'], { stdio: 'ignore' })
+    writeFileSync(join(missingWt, 'keep.txt'), 'unmerged commit\n', 'utf8')
+    execFileSync('git', ['-C', missingWt, 'add', '.'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', missingWt, 'commit', '-m', 'unmerged work'], { stdio: 'ignore' })
+    execFileSync('git', ['-C', repo, 'worktree', 'remove', '--force', missingWt], { stdio: 'ignore' })
+    assert.equal(existsSync(missingWt), false)
+
+    const missingRes = removeWorkerGitWorktree(repo, missingWt, {
+      branchName: unmergedBranch,
+      expectedSwarmId: unmergedLoc.swarmId,
+      expectedMemberName: 'w1',
+    })
+    assert.equal(missingRes.removed, false, 'missing dir with unmerged branch must not report removed=true')
+    assert.equal(missingRes.branchDeleted, false)
+
+    mkdirSync(unmergedLoc.swarmDir, { recursive: true })
+    writeFileSync(
+      join(unmergedLoc.swarmDir, 'members.json'),
+      JSON.stringify({
+        runtime: 'remote',
+        title: 'P2-10 honest boot reconcile',
+        workspace_cwd: repo,
+        channels: { main: { topic: 'main' } },
+        members: {
+          coordinator: {
+            conversation_id: unmergedLoc.swarmId,
+            role: 'coordinator',
+            model: 'm',
+            phase: 'STOPPED',
+            wake_mode: 'mentions',
+            wait_since: 0,
+            last_read_seq: 0,
+            killed: false,
+            channels: ['main'],
+          },
+          w1: {
+            conversation_id: '55555555-5555-4555-8555-555555555555',
+            role: 'worker',
+            model: 'm',
+            phase: 'KILLED',
+            wake_mode: 'mentions',
+            wait_since: 0,
+            last_read_seq: 0,
+            killed: true,
+            channels: ['main'],
+            workspace: { mode: 'branch', path: missingWt, branch: unmergedBranch },
+          },
+        },
+      }),
+    )
+    const bootRec = await reconcileRemoteSwarmOnBoot({ rootBase: agyRoot, workspaceRoots: [repo] })
+    assert.equal(
+      bootRec.cleanedWorktrees.includes(missingWt),
+      false,
+      'boot reconcile must not report missing worktree as cleaned when branch deletion failed',
+    )
+    assert.ok(execFileSync('git', ['-C', repo, 'branch', '--list', unmergedBranch], { encoding: 'utf8' }).includes(unmergedBranch))
+
+    // 4) shutdownSession must preserve clean worktree & branch when worker stop/release is unconfirmed
+    const sdSess = 'agent:main:webchat:dm:p111-unconfirmed-shutdown'
+    let workerStarted!: () => void
+    const workerStartedP = new Promise<void>((r) => {
+      workerStarted = r
+    })
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn() {
+          workerStarted()
+          return { text: 'done' }
+        },
+        async releaseWorkerSession() {
+          return { released: false, state: 'busy' }
+        },
+      },
+    })
+    rt.registerSession({ sessionKey: sdSess, model: 'antigravity-gemini-4-neon-remote', workspaceCwd: repo })
+    const added = (await rt.handleToolCall({
+      sessionKey: sdSess,
+      callerMember: 'coordinator',
+      tool: 'swarm',
+      args: { action: 'add', name: 'busy-brancher', brief: 'work', workspace: 'branch' },
+    })) as { added: Array<{ workspace: string }> }
+    await workerStartedP
+    await new Promise((r) => setTimeout(r, 30))
+    const busyWt = added.added[0]!.workspace
+    const sdLoc = rt.locationFor(sdSess)
+    const sdRoster = JSON.parse(readFileSync(join(sdLoc.swarmDir, 'members.json'), 'utf8')) as {
+      members: Record<string, { workspace?: { branch?: string } }>
+    }
+    const busyBranch = sdRoster.members['busy-brancher']?.workspace?.branch
+    assert.ok(busyBranch)
+
+    const sdRes = await rt.shutdownSession(sdSess)
+    assert.equal(existsSync(busyWt), true, 'worktree must be preserved when shutdown release is unconfirmed')
+    assert.ok(sdRes.preservedDirtyWorktrees.includes(busyWt))
+    assert.ok(
+      execFileSync('git', ['-C', repo, 'branch', '--list', busyBranch!], { encoding: 'utf8' }).includes(busyBranch!),
+      'branch must be preserved when shutdown release is unconfirmed',
+    )
+  })
+
+  it('OCV5-887 P2-07 & P2-08 & P2-11: missing-seq tail disables fast path, forward scan counts UTF-8 bytes, and formatBoardTimestamp preserves UTC Z', async () => {
+    // P2-11: UTC ISO timestamp with Z suffix round-trips identically in any timezone
+    const fixedDate = new Date('2026-11-21T01:01:00.789Z')
+    const formatted = formatBoardTimestamp(fixedDate)
+    assert.equal(formatted, '2026-11-21T01:01:00Z')
+    assert.equal(Date.parse(formatted), Date.UTC(2026, 10, 21, 1, 1, 0))
+
+    // P2-08: >600 KiB board whose tail lines omit explicit `seq` must NOT take tail fast path or skip early posts
+    const dir = makeTempDir('oc-rswarm-p208-')
+    const lines: string[] = [
+      `${JSON.stringify({ seq: 1, agent: 'coordinator', channel: 'main', text: 'EARLY_SEQ_1', time: formatted })}\n`,
+      `${JSON.stringify({ seq: 2, agent: 'coordinator', channel: 'main', text: 'EARLY_SEQ_2_MUST_NOT_SKIP', time: formatted })}\n`,
+    ]
+    const pad = 'x'.repeat(2048)
+    for (let s = 3; s <= 60; s += 1) {
+      lines.push(`${JSON.stringify({ seq: s, agent: 'coordinator', channel: 'main', text: pad, time: formatted })}\n`)
+    }
+    // Append >560 KiB of lines WITHOUT explicit `seq` so the entire 512 KiB tail starts on a seq-less line!
+    for (let i = 0; i < 290; i += 1) {
+      lines.push(`${JSON.stringify({ agent: 'legacy', channel: 'main', text: pad, time: formatted })}\n`)
+    }
+    writeFileSync(join(dir, 'board.jsonl'), lines.join(''), 'utf8')
+
+    const res = readBoardPostsSinceSeq(dir, 1, { maxPosts: 5 })
+    assert.equal(res.posts[0]?.seq, 2)
+    assert.equal(res.posts[0]?.text, 'EARLY_SEQ_2_MUST_NOT_SKIP')
+    assert.equal(res.hasMore, true)
+
+    // P2-07: UTF-8 byte counting in forward scan respects multi-byte CJK size rather than UTF-16 `.length`
+    const utf8Dir = makeTempDir('oc-rswarm-p207-')
+    const cjkPayload = '汉'.repeat(4_000) // 4,000 UTF-16 chars, 12,000 UTF-8 bytes
+    const utf8Lines: string[] = []
+    for (let s = 1; s <= 60; s += 1) {
+      utf8Lines.push(`${JSON.stringify({ seq: s, agent: 'coordinator', channel: 'main', text: cjkPayload, time: formatted })}\n`)
+    }
+    writeFileSync(join(utf8Dir, 'board.jsonl'), utf8Lines.join(''), 'utf8')
+    // 20 KiB budget fits 1 CJK post (~12.1 KiB UTF-8) and must stop before 2nd (~24.2 KiB UTF-8 > 20 KiB,
+    // even though 2 UTF-16 lengths would only be ~8.2K < 20K!).
+    const utf8Res = readBoardPostsSinceSeq(utf8Dir, 0, { maxPosts: 10, maxBytes: 20 * 1024 })
+    assert.equal(utf8Res.posts.length, 1, 'UTF-8 byte budget must cap at 1 CJK post (~12 KiB) instead of counting UTF-16 code units')
+    assert.equal(utf8Res.posts[0]?.seq, 1)
+    assert.equal(utf8Res.hasMore, true)
+
+    // Auditor R1 P1-6: >2.5 MiB legacy seq-less board drained to cursor 700 -> normal post_message
+    // assigns seq=701 (NOT tail-relative 508), and readBoardPostsSinceSeq(dir, 700) reads it once!
+    const agyRoot = makeTempDir('oc-rswarm-r1p16-')
+    const sess = 'agent:main:webchat:dm:r1-p16-legacy-writer'
+    const rt = new RemoteSwarmRuntime({ rootBase: agyRoot })
+    try {
+      rt.registerSession({ sessionKey: sess, model: 'antigravity-gemini-4-neon-remote', workspaceCwd: agyRoot })
+      const loc = remoteSwarmLocationForSession(sess, agyRoot)
+      mkdirSync(loc.swarmDir, { recursive: true })
+      writeFileSync(
+        join(loc.swarmDir, 'members.json'),
+        JSON.stringify({
+          version: 1,
+          swarm_id: loc.swarmId,
+          session_key: sess,
+          title: 'legacy seq-less writer',
+          channels: { main: { name: 'main', created_at: formatted, archived: false } },
+          members: {},
+        }),
+      )
+      const legacyPad = 'a'.repeat(4_000)
+      const legacyLines: string[] = []
+      for (let i = 0; i < 700; i += 1) {
+        legacyLines.push(`${JSON.stringify({ agent: 'legacy', channel: 'main', text: `${i}:${legacyPad}`, time: formatted })}\n`)
+      }
+      writeFileSync(join(loc.swarmDir, 'board.jsonl'), legacyLines.join(''), 'utf8')
+      let cursor = 0
+      let totalRead = 0
+      for (let page = 0; page < 10; page += 1) {
+        const batch = readBoardPostsSinceSeq(loc.swarmDir, cursor, { maxPosts: 256 })
+        totalRead += batch.posts.length
+        cursor = batch.lastScannedSeq
+        if (!batch.hasMore) break
+      }
+      assert.equal(totalRead, 700)
+      assert.equal(cursor, 700)
+      const postedRes = await rt.handleToolCall({
+        sessionKey: sess,
+        callerMember: 'coordinator',
+        tool: 'post_message',
+        args: { text: 'NEW_POST_AFTER_LEGACY_700' },
+      })
+      assert.equal(postedRes.ok, true)
+      const postedSeq = (postedRes as { seq?: number }).seq
+      assert.equal(postedSeq, 701, 'writer must assign absolute headSeq + 1 = 701 on >2 MiB seq-less board')
+      const after = readBoardPostsSinceSeq(loc.swarmDir, cursor, { maxPosts: 10 })
+      assert.equal(after.posts.length, 1)
+      assert.equal(after.posts[0]?.seq, 701)
+      assert.equal(after.posts[0]?.text, 'NEW_POST_AFTER_LEGACY_700')
     } finally {
       await rt.shutdownAll()
     }
