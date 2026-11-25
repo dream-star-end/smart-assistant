@@ -287,7 +287,7 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       emitsCallUsage: true,
       emitsToolInputDeltas: false,
       supportsNativeCompact: false,
-      multimodalInput: supportsVision && !isAntigravityAuthority ? 'native' : 'text-only',
+      multimodalInput: supportsVision ? 'native' : 'text-only',
     }
   }
 
@@ -486,6 +486,11 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     ) {
       const loc = remoteSwarmLocationForSession(this.executionBackend.sessionKey)
       const sessionKeyForSwarm = this.executionBackend.sessionKey
+      lookupRemoteSwarmRuntimeForSession(sessionKeyForSwarm)?.setSessionAllowedModels(
+        sessionKeyForSwarm,
+        params.antigravitySwarmCompaction?.availableRemoteSwarmModels,
+        this._effortLevel,
+      )
       swarmWatcher = new AntigravitySwarmWatcher({
         brainDir: loc.brainDir,
         conversationId: loc.swarmId,

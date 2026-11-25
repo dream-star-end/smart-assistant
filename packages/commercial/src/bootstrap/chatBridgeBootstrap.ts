@@ -56,7 +56,7 @@ import type { PricingCache } from "../billing/pricing.js";
 import { expireZcodeRelayRoute, mintZcodeRelayRoute } from "../billing/zcodeRouteContext.js";
 import type { CommercialConfig } from "../config.js";
 import { getPool } from "../db/index.js";
-import type { PgTransactionPool } from "../db/threeLayerStateStore.js";
+import { PgSessionAuthorityStateStore, type PgTransactionPool } from "../db/threeLayerStateStore.js";
 import { persistGatewayLiveFrame } from "../db/liveTurnFrames.js";
 import type {
   AutomaticRecoveryDecision,
@@ -98,8 +98,12 @@ export function buildSelfhostCrossPoolBridgeHooks(input: {
   readonly isSelfhostV5: boolean;
   readonly pool: PgTransactionPool;
   readonly modelCatalogCache: Pick<ModelCatalogCache, "assertFresh"> | undefined;
-}): Pick<UserChatBridgeDeps, "crossPoolFallbackSelector" | "returnToRemoteGrantResolver"> {
+}): Pick<
+  UserChatBridgeDeps,
+  "crossPoolFallbackSelector" | "returnToRemoteGrantResolver" | "markPlacementMigrationInstalled"
+> {
   if (!input.isSelfhostV5 || !input.modelCatalogCache) return {};
+  const authorityStore = new PgSessionAuthorityStateStore(input.pool);
   return {
     crossPoolFallbackSelector: createSelfhostCrossPoolFallbackSelector({
       pool: input.pool,
@@ -110,6 +114,13 @@ export function buildSelfhostCrossPoolBridgeHooks(input: {
       pool: input.pool,
       selfhost: input.isSelfhostV5,
     }),
+    markPlacementMigrationInstalled: (args) =>
+      authorityStore.markPlacementMigrationInstalled(
+        args.uid,
+        args.sessionKey,
+        args.placementEpoch,
+        args.migrationId,
+      ),
   };
 }
 

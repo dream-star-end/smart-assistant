@@ -360,7 +360,7 @@ if "models" in args:
 home = pathlib.Path(os.environ.get("HOME") or ".")
 agent_md = home / ".gemini" / "antigravity-cli" / "agents" / "ocremote.md"
 agent_text = agent_md.read_text(encoding="utf-8") if agent_md.is_file() else ""
-policy_relaxed = ("--agent" not in args) or ("tools: []" not in agent_text)
+policy_relaxed = ("--agent" not in args) or ('tools: []' not in agent_text and 'tools: ["read_file"]' not in agent_text)
 
 model = args[args.index("--model") + 1] if "--model" in args and args.index("--model") + 1 < len(args) else "gemini-4-carbon-medium"
 conv_id = args[args.index("--conversation") + 1] if "--conversation" in args and args.index("--conversation") + 1 < len(args) else str(uuid.uuid4())

@@ -859,12 +859,8 @@ test('RemoteContainerLane wires brokerTransport, serviceTier, vision-gated conte
         'cx_res = cx.encode(cx_cmd, {"initialized": True, "sessionId": "thr_xlang_1", "expectedModel": "gpt-6-luna", "cliVersion": "0.170.0"})',
         'cc_cmd = {**cmd, "commandId": "cmd_xlang_cc"}',
         'cc_res = cc.encode(cc_cmd, {"sessionId": "11111111-2222-4333-8444-555555555555"})',
-        'agy_err = ""',
-        'try:',
-        '    agy.encode({**cmd, "commandId": "cmd_xlang_agy"}, {"initialized": True, "sessionId": "sess_agy_1"})',
-        'except ValueError as exc:',
-        '    agy_err = str(exc)',
-        'print(json.dumps({"codex": json.loads(cx_res["lines"][0]), "cc": json.loads(cc_res["lines"][0]), "agyError": agy_err}))',
+        'agy_res = agy.encode({**cmd, "commandId": "cmd_xlang_agy"}, {"initialized": True, "sessionId": "sess_agy_1"})',
+        'print(json.dumps({"codex": json.loads(cx_res["lines"][0]), "cc": json.loads(cc_res["lines"][0]), "agy": json.loads(agy_res["lines"][0])}))',
       ].join('\n'),
       join(repoRoot, 'scripts', 'agent-remote'),
       JSON.stringify(commandsSent[0]),
@@ -874,7 +870,7 @@ test('RemoteContainerLane wires brokerTransport, serviceTier, vision-gated conte
   const xlang = JSON.parse(pyProbeOut) as {
     codex: { params: { serviceTierForTurn: string; input: unknown[] } }
     cc: { message: { content: unknown[] } }
-    agyError: string
+    agy: { prompt: string; images: Array<{ mimeType: string; data: string; sha256: string }> }
   }
   assert.equal(xlang.codex.params.serviceTierForTurn, 'priority')
   assert.deepEqual(xlang.codex.params.input, [
@@ -887,7 +883,12 @@ test('RemoteContainerLane wires brokerTransport, serviceTier, vision-gated conte
     { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
     { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: '/9j/4AAQ' } },
   ])
-  assert.equal(xlang.agyError, 'AGY_VISION_CONTENT_UNSUPPORTED')
+  assert.ok(xlang.agy.prompt.includes('Inspect this image'))
+  assert.equal(xlang.agy.images.length, 2)
+  assert.equal(xlang.agy.images[0]!.mimeType, 'image/png')
+  assert.equal(xlang.agy.images[0]!.data, 'iVBORw0KGgo=')
+  assert.equal(xlang.agy.images[1]!.mimeType, 'image/jpeg')
+  assert.equal(xlang.agy.images[1]!.data, '/9j/4AAQ')
 
   // Turn 2: supportsVision=false -> MUST fail closed BEFORE dispatch (never silently strip image!)
   currentSigned = signTurn({ binding, supportsVision: false })
@@ -965,7 +966,8 @@ test('RemoteContainerLane wires brokerTransport, serviceTier, vision-gated conte
 
   await lane.stopLane()
 
-  // Antigravity text-only remote channel rejects image content fail-closed even if supportsVision=true
+  // OCV5-893: Antigravity remote channel supports vision when supportsVision=true,
+  // and still fails closed BEFORE dispatch when supportsVision=false.
   const agyBinding = makeBinding({
     canonicalModel: 'gemini-4-carbon-medium-remote',
     upstreamModel: 'gemini-4-carbon-medium',
@@ -973,8 +975,11 @@ test('RemoteContainerLane wires brokerTransport, serviceTier, vision-gated conte
     engineId: 'antigravity',
     authorityEngine: 'antigravity',
   })
-  const agySigned = signTurn({ binding: agyBinding, supportsVision: true })
-  let agyDispatched = 0
+  let agySigned = signTurn({ binding: agyBinding, supportsVision: true })
+  const agyCommandsSent: Array<Record<string, unknown>> = []
+  const agyFrames: Array<{ seq: number; frame: unknown }> = []
+  let agyNextSeq = 0
+  const agyNativeSessionId = 'sess_agy_vision_1'
   const agyLane = new RemoteContainerLane(
     {
       agentId: 'main',
@@ -989,8 +994,43 @@ test('RemoteContainerLane wires brokerTransport, serviceTier, vision-gated conte
       keyring,
       executionRoot: execRoot,
       platformPrompt: 'p',
-      call: async (path) => {
-        if (path === '/command') agyDispatched += 1
+      hostFactory: () => host,
+      toolContextFactory: async () => ({
+        profile: { cwd: execRoot, mcpConfigPath: null, settingsPath: null, disallowedTools: [] },
+        env: {},
+        platformPrompt: 'test-agy-platform-prompt',
+        cleanup: () => {},
+      }),
+      call: async (path, body) => {
+        if (path === '/admit') {
+          return { ok: true, ready: true, seq: agyNextSeq, nativeSessionId: agyNativeSessionId }
+        }
+        if (path === '/command') {
+          const cmd = body.command as Record<string, unknown>
+          agyCommandsSent.push(cmd)
+          if (cmd.kind === 'newTurn') {
+            const turnId = String(cmd.commandId).slice('turn-'.length)
+            agyFrames.push({
+              seq: ++agyNextSeq,
+              frame: {
+                kind: 'turn_settled',
+                receipt: makeReceipt(agyBinding, {
+                  authorityTurnId: turnId,
+                  turnKey: agySigned.turnKey,
+                  nativeSessionId: agyNativeSessionId,
+                }),
+                outcome: { state: 'proven', requestId: 'req-agy-1' },
+              },
+            })
+          }
+          return { ok: true, dispatched: true }
+        }
+        if (path === '/poll') {
+          const afterSeq = Number(body.afterSeq)
+          return { ok: true, frames: agyFrames.filter((f) => f.seq > afterSeq) }
+        }
+        if (path === '/tool/next') return { ok: true }
+        if (path === '/tool/stopped') return { ok: true }
         if (path === '/stop') return { ok: true, remoteStopped: true }
         return { ok: true }
       },
@@ -1019,8 +1059,46 @@ test('RemoteContainerLane wires brokerTransport, serviceTier, vision-gated conte
     sessionTotals: { totalCostUSD: 0, turns: 0 },
     toolUseIdToName: new Map(),
   })
+  const agyRes = await agyLane.executeTurn(agyValidated, {
+    onNativeSession: () => {},
+    onSubmitted: () => {},
+    onSecurityEvent: () => {},
+    onPresentationItem: () => {},
+  })
+  assert.equal(agyRes.kind, 'settled')
+  assert.equal(agyCommandsSent.length, 1)
+  assert.deepEqual(agyCommandsSent[0]!.content, [
+    { type: 'text', text: 'Look at this' },
+    { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgo=' },
+  ])
+
+  // supportsVision=false must still reject BEFORE dispatch
+  agySigned = signTurn({ binding: agyBinding, supportsVision: false })
+  const agyNoVisionValidated = agyLane.validateTurnSubmission({
+    input: [
+      { type: 'text', text: 'No vision' },
+      { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgo=' },
+    ],
+    turnKey: agySigned.turnKey,
+    modelAuthority: {
+      authorityEnvelope: agySigned.authority,
+      leaseEnvelope: agySigned.lease,
+      executionDescriptor: {
+        canonicalModel: agyBinding.canonicalModel,
+        executionBackend: remotePoolBackendOf(agyBinding),
+        contextWindow: 200_000,
+        capabilityZero: false,
+        supportsThinking: true,
+        supportsVision: false,
+        supportedEfforts: ['low', 'medium', 'high'],
+      },
+    },
+    onEvent: () => {},
+    sessionTotals: { totalCostUSD: 0, turns: 1 },
+    toolUseIdToName: new Map(),
+  })
   await assert.rejects(
-    agyLane.executeTurn(agyValidated, {
+    agyLane.executeTurn(agyNoVisionValidated, {
       onNativeSession: () => {},
       onSubmitted: () => {},
       onSecurityEvent: () => {},
@@ -1028,7 +1106,7 @@ test('RemoteContainerLane wires brokerTransport, serviceTier, vision-gated conte
     }),
     /REMOTE_VISION_CONTENT_UNSUPPORTED/,
   )
-  assert.equal(agyDispatched, 0)
+  assert.equal(agyCommandsSent.length, 1)
   await agyLane.stopLane()
 })
 

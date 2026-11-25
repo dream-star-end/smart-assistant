@@ -120,7 +120,7 @@ const TOOL_IDLE_MS = 20
 const DEFAULT_EXECUTION_ROOT = '/home/agent/.openclaude/.cc5-native-tools'
 const LEASE_RENEW_RETRY_MS = 60_000
 const EXEC_ENV_IDENT_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
-const TEXT_ONLY_REMOTE_DRIVERS = new Set(['antigravity'])
+const TEXT_ONLY_REMOTE_DRIVERS = new Set<string>()
 const inferredMimeBlocks = new WeakSet<RemoteDriverTurnContentBlock>()
 
 function normalizeRemoteServiceTier(

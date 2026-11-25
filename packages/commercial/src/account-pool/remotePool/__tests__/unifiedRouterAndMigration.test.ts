@@ -58,6 +58,13 @@ import {
   poolCandidateKey,
   type PoolCandidateDescriptor,
 } from '../unifiedPlacementRouter.js'
+import {
+  CAPABILITY_SCHEMA_VERSION,
+  ModelCatalogSnapshot,
+  type ModelCatalogEntry,
+  type ModelCatalogPricing,
+} from '../../../billing/modelCatalog.js'
+import { createSelfhostCrossPoolFallbackSelector } from '../selfhostCrossPoolSelector.js'
 
 const tempReconcileDirs: string[] = []
 
@@ -2354,5 +2361,236 @@ describe('OCV5-890 B08-R2: MigrationCoordinator preserves target credential leas
     assert.equal(activeBrainGen, 3)
     assert.equal(activePlacement.poolKind, 'local_container')
     assert.equal((await restartedFinal.listPendingCredentialReconciliations()).length, 0)
+  })
+})
+
+describe('OCV5-893: SelfhostCrossPoolFallbackSelector supports Codex & Antigravity (incl. readOnly) while preserving N01/B06/fail-closed fences', () => {
+  it('selects local_pool for Codex and readOnly Antigravity, rejects unsupported grok, and preserves N01 & B06', async () => {
+    const entries: ModelCatalogEntry[] = [
+      {
+        entryId: 1,
+        modelId: 'gpt-6.2-astra-remote',
+        engine: 'codex',
+        providerId: 'openai',
+        upstreamModelId: 'gpt-6.2-astra',
+        contextWindow: 200_000,
+        capabilityProfile: {
+          supportsVision: true,
+          reasoning: { supported: ['low', 'medium', 'high'], codexModelDefault: 'medium' },
+          ccb: { capabilityZero: false, supportsThinking: false },
+        },
+        capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
+        state: 'active',
+        lockVersion: 1,
+        placement: 'remote_pool',
+      },
+      {
+        entryId: 2,
+        modelId: 'gpt-6.2-astra',
+        engine: 'codex',
+        providerId: 'openai',
+        upstreamModelId: 'gpt-6.2-astra',
+        contextWindow: 200_000,
+        capabilityProfile: {
+          supportsVision: true,
+          reasoning: { supported: ['low', 'medium', 'high'], codexModelDefault: 'medium' },
+          ccb: { capabilityZero: false, supportsThinking: false },
+        },
+        capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
+        state: 'active',
+        lockVersion: 1,
+        placement: 'local',
+      },
+      {
+        entryId: 3,
+        modelId: 'antigravity-gemini-4-neon-remote',
+        engine: 'antigravity',
+        providerId: 'antigravity',
+        upstreamModelId: 'gemini-4-neon',
+        contextWindow: 200_000,
+        capabilityProfile: {
+          supportsVision: true,
+          reasoning: { supported: ['low', 'medium', 'high'], codexModelDefault: null },
+          ccb: { capabilityZero: false, supportsThinking: false },
+        },
+        capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
+        state: 'active',
+        lockVersion: 1,
+        placement: 'remote_pool',
+      },
+      {
+        entryId: 4,
+        modelId: 'antigravity-gemini-4-neon',
+        engine: 'antigravity',
+        providerId: 'antigravity',
+        upstreamModelId: 'gemini-4-neon',
+        contextWindow: 200_000,
+        capabilityProfile: {
+          supportsVision: true,
+          reasoning: { supported: ['low', 'medium', 'high'], codexModelDefault: null },
+          ccb: { capabilityZero: false, supportsThinking: false },
+        },
+        capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
+        state: 'active',
+        lockVersion: 1,
+        placement: 'local',
+      },
+      {
+        entryId: 5,
+        modelId: 'grok-4-build-remote',
+        engine: 'grok',
+        providerId: 'grok',
+        upstreamModelId: 'grok-4-build',
+        contextWindow: 200_000,
+        capabilityProfile: {
+          supportsVision: false,
+          reasoning: { supported: ['medium'], codexModelDefault: null },
+          ccb: { capabilityZero: false, supportsThinking: false },
+        },
+        capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
+        state: 'active',
+        lockVersion: 1,
+        placement: 'remote_pool',
+      },
+      {
+        entryId: 6,
+        modelId: 'grok-4-build',
+        engine: 'grok',
+        providerId: 'grok',
+        upstreamModelId: 'grok-4-build',
+        contextWindow: 200_000,
+        capabilityProfile: {
+          supportsVision: false,
+          reasoning: { supported: ['medium'], codexModelDefault: null },
+          ccb: { capabilityZero: false, supportsThinking: false },
+        },
+        capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
+        state: 'active',
+        lockVersion: 1,
+        placement: 'local',
+      },
+    ]
+    const pricing = new Map<string, ModelCatalogPricing>()
+    for (const e of entries) {
+      pricing.set(e.modelId, {
+        modelId: e.modelId,
+        displayName: e.modelId,
+        inputPerMtok: 100n,
+        outputPerMtok: 200n,
+        cacheReadPerMtok: 10n,
+        cacheWritePerMtok: 25n,
+        multiplier: '1',
+        visibility: 'public',
+        sortOrder: 1,
+        defaultEffort: 'medium',
+      })
+    }
+    const snapshot = new ModelCatalogSnapshot({
+      entries,
+      aliases: new Map(),
+      pricing,
+      securityEpoch: 5n,
+    })
+
+    const codexStore = new InMemoryAuthorityStore(
+      {
+        poolKind: 'remote_pool',
+        engine: 'codex',
+        driverId: 'codex',
+        placementEpoch: 1,
+      },
+      42,
+      'sess-codex-fb',
+    )
+    const agyStore = new InMemoryAuthorityStore(
+      {
+        poolKind: 'remote_pool',
+        engine: 'antigravity',
+        driverId: 'antigravity',
+        placementEpoch: 1,
+      },
+      42,
+      'sess-agy-fb',
+    )
+    const makeStoreAdapter = (store: InMemoryAuthorityStore) =>
+      Object.assign(store, {
+        peekRollingCheckpoint: async () => null,
+      }) as unknown as Parameters<typeof createSelfhostCrossPoolFallbackSelector>[0]['authorityStore']
+
+    let pendingBilling = false
+    const codexSelector = createSelfhostCrossPoolFallbackSelector({
+      selfhost: true,
+      catalogCache: { assertFresh: async () => snapshot },
+      authorityStore: makeStoreAdapter(codexStore),
+      pendingBillingChecker: async () => pendingBilling,
+    })
+
+    // B06 pending billing blocks Codex fallback
+    pendingBilling = true
+    assert.equal(
+      await codexSelector({
+        uid: 42,
+        containerId: 10,
+        sessionKey: 'sess-codex-fb',
+        canonicalModel: 'gpt-6.2-astra-remote',
+        engine: 'codex',
+        cause: new Error('REMOTE_LANE_CAPACITY_EXHAUSTED'),
+      }),
+      null,
+    )
+    assert.equal(codexStore.pointer.placementEpoch, 1)
+
+    // Codex fallback succeeds once billing settles
+    pendingBilling = false
+    const codexRes = await codexSelector({
+      uid: 42,
+      containerId: 10,
+      sessionKey: 'sess-codex-fb',
+      canonicalModel: 'gpt-6.2-astra-remote',
+      engine: 'codex',
+      cause: new Error('REMOTE_LANE_CAPACITY_EXHAUSTED'),
+    })
+    assert.ok(codexRes !== null)
+    assert.equal(codexRes.fallbackPool, 'local_pool')
+    assert.equal(codexRes.resolvedCanonicalModel, 'gpt-6.2-astra')
+    assert.equal(codexRes.migrationGrant?.placementEpoch, 2)
+
+    // Antigravity fallback succeeds INCLUDING readOnly / consultTurn / hermeticNoTools!
+    const agySelector = createSelfhostCrossPoolFallbackSelector({
+      selfhost: true,
+      catalogCache: { assertFresh: async () => snapshot },
+      authorityStore: makeStoreAdapter(agyStore),
+      pendingBillingChecker: async () => false,
+    })
+    const agyRes = await agySelector({
+      uid: 42,
+      containerId: 10,
+      sessionKey: 'sess-agy-fb',
+      canonicalModel: 'antigravity-gemini-4-neon-remote',
+      engine: 'antigravity',
+      cause: new Error('REMOTE_LANE_PROFILE_UNAVAILABLE'),
+      requiredCapabilities: {
+        readOnly: true,
+        consultTurn: true,
+        hermeticNoTools: true,
+      },
+    })
+    assert.ok(agyRes !== null)
+    assert.equal(agyRes.fallbackPool, 'local_pool')
+    assert.equal(agyRes.resolvedCanonicalModel, 'antigravity-gemini-4-neon')
+    assert.equal(agyRes.migrationGrant?.placementEpoch, 2)
+
+    // Unsupported engine (grok) remains fail-closed
+    assert.equal(
+      await codexSelector({
+        uid: 42,
+        containerId: 10,
+        sessionKey: 'sess-grok-fb',
+        canonicalModel: 'grok-4-build-remote',
+        engine: 'grok',
+        cause: new Error('REMOTE_LANE_UNAVAILABLE'),
+      }),
+      null,
+    )
   })
 })

@@ -536,14 +536,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private async spawnTurn(ctx: TurnContext): Promise<void> {
-    // B4 (OCV5-828) / B14 (OCV5-890): Antigravity local CLI runs with `--dangerously-skip-permissions`
-    // and cannot enforce a hard read-only sandbox locally. Fail closed BEFORE projection or spawning;
-    // read-only Antigravity turns must route through the remote pool with ToolBroker hard enforcement.
-    if (ctx.params.readOnly === true) {
-      throw new Error(
-        'ANTIGRAVITY_READ_ONLY_UNSUPPORTED: Antigravity 本地 CLI 暂不支持硬只读沙箱，已拒绝启动该只读回合（主模型未切换）。',
-      )
-    }
+    const readOnly = ctx.params.readOnly === true
     const route = validateAntigravityRoute(this.route)
     const cliModel = antigravityCliModelId(this.currentModel, this.currentEffort)
     if (!cliModel) {
@@ -589,7 +582,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       skillEvalExclude: this.opts.skillEvalExclude,
       skillEvalDraft: this.opts.skillEvalDraft,
       skillTrainRunId: this.opts.skillTrainRunId,
-      hostBin: probeEnvFacts().hostBin,
+      hostBin: readOnly ? null : probeEnvFacts().hostBin,
+      readOnly,
     })
     ctx.projection = projection
     log.info('antigravity CLI credential projected', {
@@ -609,16 +603,18 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     ctx.promptInputsKey = composed.inputsKey
     ctx.promptSlotHashes = composed.slotHashes
     const conversationsDir = join(projection.root, 'home', '.gemini', 'antigravity-cli', 'conversations')
-    const elideDecision = decideAntigravityPromptElision({
-      openClaudeHome: dirname(projection.root),
-      antigravityRootDir: projection.root,
-      conversationsDir,
-      sessionKey: this.opts.sessionKey,
-      requestedConversationId: ctx.requestedConversationId,
-      inputsKey: composed.inputsKey,
-      slotHashes: composed.slotHashes,
-    })
-    ctx.elidedPlatformContext = Boolean(ctx.requestedConversationId) && elideDecision.elide
+    const elideDecision = readOnly
+      ? { elide: false, reason: 'read_only_turn' as const, changedSlots: undefined }
+      : decideAntigravityPromptElision({
+          openClaudeHome: dirname(projection.root),
+          antigravityRootDir: projection.root,
+          conversationsDir,
+          sessionKey: this.opts.sessionKey,
+          requestedConversationId: ctx.requestedConversationId,
+          inputsKey: composed.inputsKey,
+          slotHashes: composed.slotHashes,
+        })
+    ctx.elidedPlatformContext = !readOnly && Boolean(ctx.requestedConversationId) && elideDecision.elide
     const decisionKind = ctx.elidedPlatformContext ? 'elide_resumed' : 'full_inject'
     const changedSlots = elideDecision.changedSlots ?? []
     log.info('antigravity_prompt_context_mode', {
@@ -722,6 +718,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         : {}),
       CLOUD_CODE_URL: route.baseUrl,
       AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+      ...(readOnly ? { OC_READ_ONLY_TURN: '1' } : {}),
       ...(this.traceId ? { OPENCLAUDE_TRACE_ID: this.traceId } : {}),
     }
     const args = [
@@ -755,7 +752,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     ctx.routeRenewAt = Date.now()
     ctx.releaseRelayTrace = bindRouteTrace(route.routeToken, this.traceId)
     await awaitLocalAntigravitySwarmSlotIfActive({
-      compactionMode: ctx.params.antigravitySwarmCompaction?.appliedMode,
+      compactionMode: readOnly ? undefined : ctx.params.antigravitySwarmCompaction?.appliedMode,
       keepaliveMs: timingTestHooks?.keepaliveMs ?? KEEPALIVE_INTERVAL_MS,
       renewRouteIntervalMs: timingTestHooks?.routeRenewMs ?? 60_000,
       onStatus: (detail) => ctx.params.onEvent({ kind: 'turn_status', status: { status: 'working', detail } }),
@@ -790,7 +787,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private ensureSwarmWatcher(ctx: TurnContext, conversationId: string): void {
-    if (ctx.swarmWatcher || ctx.terminal || ctx.abandoned || !ctx.projection) return
+    if (ctx.params.readOnly === true || ctx.swarmWatcher || ctx.terminal || ctx.abandoned || !ctx.projection) return
     if (!CONVERSATION_ID_RE.test(conversationId)) return
     const brainDir = ctx.projection.sessionBrainDir
     const watcher = new AntigravitySwarmWatcher({
@@ -1050,6 +1047,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       if (!ctx.abandoned) this.finishError(ctx, 'ANTIGRAVITY_DELIVERY_FAILED: terminal delivery could not be verified')
     } finally {
       const persistSummaryCache =
+        ctx.params.readOnly !== true &&
         ctx.deliveredSuccess && code === 0 && !ctx.interrupted && !ctx.abandoned && ctx.errorDetail === null
       if (
         persistSummaryCache &&
@@ -1773,11 +1771,13 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const projection = ctx.projection
     if (!projection) return
     ctx.projection = null
-    cleanupKilledNativeSwarmWorktrees(
-      projection.sessionBrainDir,
-      ctx.conversationId ?? ctx.requestedConversationId,
-      ctx.workspaceCwd,
-    )
+    if (ctx.params.readOnly !== true) {
+      cleanupKilledNativeSwarmWorktrees(
+        projection.sessionBrainDir,
+        ctx.conversationId ?? ctx.requestedConversationId,
+        ctx.workspaceCwd,
+      )
+    }
     cleanupAntigravityLaunch(projection, opts)
   }
 

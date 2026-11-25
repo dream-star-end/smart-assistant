@@ -42,6 +42,17 @@ import {
   type SessionEnginePointer,
   type StoragePoolKind,
 } from '@openclaude/protocol'
+import {
+  buildPendingInstallPromptCacheMetaJson,
+  extractPendingInstallMigration,
+  stripPendingInstallPromptCacheMetaJson,
+  type PendingInstallMigration,
+} from './threeLayerPendingInstall.js'
+export {
+  PENDING_INSTALL_MIGRATION_KEY,
+  extractPendingInstallMigration,
+  type PendingInstallMigration,
+} from './threeLayerPendingInstall.js'
 
 export interface PgQueryResult<R extends Record<string, unknown> = Record<string, unknown>> {
   readonly rows: R[]
@@ -1121,8 +1132,34 @@ export class PgSessionAuthorityStateStore {
       const hasCapsuleId = cas.capsuleId !== undefined || cas.capsuleRef !== undefined
       const targetCapsuleId =
         cas.capsuleId !== undefined ? cas.capsuleId : (cas.capsuleRef?.capsuleId ?? null)
-      const hasPromptCacheMeta = cas.promptCacheMeta !== undefined
       const hasUsageBaseline = cas.usageBaseline !== undefined
+
+      // OCV5-893 B3: Preserve existing prompt_cache_meta_json fields and atomically record
+      // `pendingInstallMigration` so retries after a dropped first frame can re-deliver the
+      // exact committed grant in either direction without relying on `nativeSessionId`.
+      const existingPtrRes = await client.query<{ prompt_cache_meta_json: unknown }>(
+        `SELECT prompt_cache_meta_json
+           FROM session_engine_pointers
+          WHERE user_id = $1 AND session_key = $2
+          FOR UPDATE`,
+        [uid, key],
+      )
+      const basePromptCacheMeta =
+        cas.promptCacheMeta !== undefined
+          ? (cas.promptCacheMeta ?? {})
+          : (parseNullableRecord(existingPtrRes.rows[0]?.prompt_cache_meta_json) ?? {})
+      const pendingInstallMigration: PendingInstallMigration = {
+        migrationId: migration.migrationId,
+        targetPoolKind: toPlacement.poolKind,
+        targetEpoch: migration.toEpoch,
+        targetOperationId,
+        continuityTier: cas.continuityTier,
+        committedAtMs: Date.now(),
+      }
+      const nextPromptCacheMetaJson = buildPendingInstallPromptCacheMetaJson(
+        basePromptCacheMeta,
+        pendingInstallMigration,
+      )
 
       const ptrRes = await client.query<PointerRow>(
         `UPDATE session_engine_pointers
@@ -1153,16 +1190,14 @@ export class PgSessionAuthorityStateStore {
           targetOperationId,
           targetProfileId,
           targetCapsuleId,
-          cas.promptCacheMeta === undefined || cas.promptCacheMeta === null
-            ? null
-            : JSON.stringify(cas.promptCacheMeta),
+          nextPromptCacheMetaJson,
           cas.usageBaseline === undefined || cas.usageBaseline === null
             ? null
             : JSON.stringify(cas.usageBaseline),
           cas.migrationId,
           hasNativeSessionId,
           hasCapsuleId,
-          hasPromptCacheMeta,
+          true,
           hasUsageBaseline,
         ],
       )
@@ -1260,6 +1295,61 @@ export class PgSessionAuthorityStateStore {
       [migrationId],
     )
     return res.rows[0] ? mapMigrationRow(res.rows[0]) : null
+  }
+
+  /**
+   * OCV5-893 B3: Idempotently clears `pendingInstallMigration` from
+   * `session_engine_pointers.prompt_cache_meta_json` once the migrated placement
+   * has been confirmed installed on the container for `(expectedEpoch, expectedMigrationId)`.
+   * Preserves all other keys inside `prompt_cache_meta_json`.
+   */
+  async markPlacementMigrationInstalled(
+    userId: number | bigint,
+    sessionKey: string,
+    expectedEpoch: number,
+    expectedMigrationId: string,
+  ): Promise<boolean> {
+    const uid = normalizeUserId(userId)
+    const key = assertNonEmptyString(sessionKey, 'STATE_STORE_SESSION_KEY_INVALID')
+    const epoch = assertPositiveEpoch(expectedEpoch, 'STATE_STORE_PLACEMENT_EPOCH_INVALID')
+    assertCondition(IDENT_8_128_RE.test(expectedMigrationId), 'MIGRATION_ID_INVALID')
+
+    return withTransaction<boolean>(this.pool, async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+        `session-migrate:${uid}:${key}`,
+      ])
+      const ptrRes = await client.query<PointerRow>(
+        `SELECT ${POINTER_SELECT_COLUMNS}
+           FROM session_engine_pointers
+          WHERE user_id = $1 AND session_key = $2
+          FOR UPDATE`,
+        [uid, key],
+      )
+      const row = ptrRes.rows[0]
+      if (!row) return false
+      const pointer = mapPointerRow(row)
+      if (pointer.placementEpoch !== epoch) return false
+      const pending = extractPendingInstallMigration(pointer.promptCacheMeta)
+      if (
+        !pending ||
+        pending.migrationId !== expectedMigrationId ||
+        pending.targetEpoch !== epoch
+      ) {
+        return false
+      }
+      const nextJson = stripPendingInstallPromptCacheMetaJson(pointer.promptCacheMeta)
+      const upd = await client.query<{ placement_epoch: string | number }>(
+        `UPDATE session_engine_pointers
+            SET prompt_cache_meta_json = $3::jsonb,
+                updated_at = NOW()
+          WHERE user_id = $1
+            AND session_key = $2
+            AND placement_epoch = $4
+          RETURNING placement_epoch`,
+        [uid, key, nextJson, epoch],
+      )
+      return upd.rows.length > 0
+    })
   }
 }
 

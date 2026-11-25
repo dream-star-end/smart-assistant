@@ -310,6 +310,17 @@ class InMemoryThreeLayerPgPool implements PgTransactionPool {
       return { rows: [JSON.parse(JSON.stringify(row))], rowCount: 1 }
     }
 
+    if (sql.startsWith('UPDATE session_engine_pointers SET prompt_cache_meta_json = $3')) {
+      const key = `${params[0]}::${params[1]}`
+      const row = db.pointers.get(key)
+      if (!row || Number(row.placement_epoch) !== Number(params[3])) {
+        return { rows: [], rowCount: 0 }
+      }
+      row.prompt_cache_meta_json = params[2] === null ? null : JSON.parse(String(params[2]))
+      row.updated_at = this.nowIso(db)
+      return { rows: [{ placement_epoch: row.placement_epoch }], rowCount: 1 }
+    }
+
     // ── session_rolling_checkpoints ──
     if (sql.startsWith('INSERT INTO session_rolling_checkpoints')) {
       const key = `${params[0]}::${params[1]}::${params[3]}`
@@ -980,7 +991,18 @@ describe('OCV5-890 Wave 1B: PgSessionAuthorityStateStore', () => {
     assert.equal(committed3.pointer.poolKind, 'local_container')
     assert.equal(committed3.pointer.nativeSessionId, 'codex-thread-2')
     assert.equal(committed3.pointer.capsuleId, sha256Hex('cap-2'))
-    assert.deepEqual(committed3.pointer.promptCacheMeta, { affinityKey: 's-0123456789abcdef' })
+    assert.equal(committed3.pointer.promptCacheMeta?.affinityKey, 's-0123456789abcdef')
+    assert.equal(
+      (committed3.pointer.promptCacheMeta?.pendingInstallMigration as { migrationId?: string } | undefined)?.migrationId,
+      began3.migration.migrationId,
+    )
+    assert.equal(
+      await store.markPlacementMigrationInstalled(99, 'sess-mig', 3, began3.migration.migrationId),
+      true,
+    )
+    assert.deepEqual((await store.getEnginePointer(99, 'sess-mig'))?.promptCacheMeta, {
+      affinityKey: 's-0123456789abcdef',
+    })
     assert.deepEqual(committed3.pointer.usageBaseline, { inputTokens: 1200, outputTokens: 300 })
   })
 

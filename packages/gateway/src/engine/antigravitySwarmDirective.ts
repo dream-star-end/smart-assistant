@@ -15,7 +15,13 @@ import {
   parseSwarmSlashCommand,
 } from '@openclaude/protocol'
 import { antigravityRoot, antigravitySessionBrainDir } from './antigravityPlatform.js'
-import { remoteSwarmLocationForSession } from '../remoteSwarmRuntime.js'
+import {
+  extractRouteAllowedRemoteSwarmModels,
+  filterAvailableRemoteSwarmModels,
+  formatAvailableRemoteSwarmModelsHint,
+  lookupRemoteSwarmRuntimeForSession,
+  remoteSwarmLocationForSession,
+} from '../remoteSwarmRuntime.js'
 
 function formatLocalSwarmCliModelGroup(canonicalModelId: string): string | null {
   const entry = ANTIGRAVITY_ENGINE_MODELS.find((m) => m.id === canonicalModelId)
@@ -113,6 +119,12 @@ export const ANTIGRAVITY_SWARM_OFF_DIRECTIVE = [
   '',
 ].join('\n')
 
+export {
+  extractRouteAllowedRemoteSwarmModels,
+  filterAvailableRemoteSwarmModels,
+  formatAvailableRemoteSwarmModelsHint,
+}
+
 export interface AntigravitySwarmCompactionContext {
   readonly isAntigravityTurn: boolean
   readonly isRemoteAntigravity: boolean
@@ -121,6 +133,7 @@ export interface AntigravitySwarmCompactionContext {
   readonly appliedMode?: 'on_full' | 'on_resumed' | 'off_with_history'
   readonly appliedDirectivePrefix?: string
   readonly availableLocalSwarmModels?: readonly string[]
+  readonly availableRemoteSwarmModels?: readonly string[]
   readonly liveMonitorNames?: readonly string[]
 }
 
@@ -313,9 +326,10 @@ function buildAntigravitySwarmOnDirective(opts: {
   hasHistoricalSwarm: boolean
   liveMonitorNames?: readonly string[]
   availableLocalSwarmModels?: readonly string[]
+  availableRemoteSwarmModels?: readonly string[]
 }): string {
   const swarmToolsIntro = opts.isRemoteAntigravity
-    ? '用户已显式开启远端 Antigravity 蜂群（Swarm）模式（由容器侧蜂群运行时驱动，通过 `swarm`、`post_message`、`read_board`、`swarm_wait` 四个 MCP 工具编排并行成员，每个成员同样运行在远端 Gemini 并拥有完整的本地工作区工具与 Git Worktree 隔离）。请按以下规则作为 Coordinator 编排蜂群：'
+    ? '用户已显式开启远端 Antigravity 蜂群（Swarm）模式（由容器侧蜂群运行时驱动，通过 `swarm`、`post_message`、`read_board`、`swarm_wait` 四个 MCP 工具编排并行成员，每个成员同样运行在远端 Antigravity 节点并拥有完整的本地工作区工具与 Git Worktree 隔离）。请按以下规则作为 Coordinator 编排蜂群：'
     : '用户已显式开启 Antigravity 原生蜂群（Swarm）模式。本 OpenClaude 蜂群指令覆盖原生蜂群说明中的模型选择、工作分派、看板链接与推送条款；请按以下规则作为 Coordinator 编排蜂群：'
   const liveMonitors = (opts.liveMonitorNames ?? [])
     .map((n) => n.trim())
@@ -330,15 +344,28 @@ function buildAntigravitySwarmOnDirective(opts: {
   const localModelsHint = opts.isRemoteAntigravity
     ? null
     : formatAvailableLocalSwarmModelsHint(opts.availableLocalSwarmModels)
+  const hasExplicitRemoteAllowlist =
+    opts.isRemoteAntigravity && Array.isArray(opts.availableRemoteSwarmModels)
+  const remoteModelsHint = opts.isRemoteAntigravity
+    ? formatAvailableRemoteSwarmModelsHint(opts.availableRemoteSwarmModels)
+    : null
   const modelRuleLine = opts.isRemoteAntigravity
-    ? '2. 招募成员时**不要指定 `model` 参数**（留空以继承当前会话模型，确保计费与权限一致）。'
+    ? remoteModelsHint
+      ? `2. **按成员模型选择**：默认留空 \`model\` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可在 \`swarm{action:"add", model:"..."}\` 中指定（或对 \`waiting\` 成员用 \`swarm{action:"model", name:"...", model:"..."}\` 切换，亦可用 \`swarm{action:"models"}\` 查询）。仅可使用本次已放行的远端 Antigravity 模型：${remoteModelsHint}（未在白名单内、非远端或跨引擎模型会被运行时拒绝；系统按各成员实际模型独立计费与配额隔离）。`
+      : hasExplicitRemoteAllowlist
+        ? '2. **按成员模型选择**：本轮未放行额外远端蜂群成员模型，招募成员时请留空 `model` 继承当前会话模型（切勿指定未放行、非远端或跨引擎模型）。'
+        : '2. **按成员模型选择**：默认留空 `model` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可先用 `swarm{action:"models"}` 查看本次可用远端 Antigravity 模型，再在 `swarm{action:"add", model:"..."}` 中指定（或对 `waiting` 成员用 `swarm{action:"model", name:"...", model:"..."}` 切换；仅限已放行的远端 Antigravity 模型，不支持非远端或跨引擎模型，系统按各成员实际模型独立计费与配额隔离）。'
     : localModelsHint
       ? `2. **按成员模型选择**：默认留空 \`model\` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可在 \`swarm{action:"add", model:"..."}\` 中指定（或对 \`waiting\` 成员用 \`swarm{action:"model", name:"...", model:"..."}\` 切换）。仅可使用本次已放行的 Antigravity 自带模型：${localModelsHint}（即使 \`swarm{action:"models"}\` 显示其他未授权或旧版模型也请勿选用，中继会按白名单拒放；不支持外部非 Antigravity 模型，系统按各成员实际模型独立计费）。`
       : hasExplicitLocalAllowlist
         ? '2. **按成员模型选择**：本轮绑定账号未放行额外蜂群成员模型，招募成员时请留空 `model` 继承当前会话模型（切勿指定未放行或外部模型）。'
         : '2. **按成员模型选择**：默认留空 `model` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可先用 `swarm{action:"models"}` 查看 Antigravity 自带可用模型，再在 `swarm{action:"add", model:"..."}` 中指定（或对 `waiting` 成员用 `swarm{action:"model", name:"...", model:"..."}` 切换；仅限平台已放行的 Antigravity 自带模型，不支持外部模型，系统按实际模型独立计费）。'
   const resumedModelRule = opts.isRemoteAntigravity
-    ? '招募成员不传 `model`'
+    ? remoteModelsHint
+      ? `招募成员默认留空 \`model\` 继承主模型，也可按需指定已放行的远端 Antigravity 模型（${remoteModelsHint}；勿选列表外模型）`
+      : hasExplicitRemoteAllowlist
+        ? '招募成员留空 `model` 继承主模型'
+        : '招募成员默认留空 `model` 继承主模型，也可按需指定已放行的远端 Antigravity 模型'
     : localModelsHint
       ? `招募成员默认留空 \`model\` 继承主模型，也可按需指定已放行的 Antigravity 自带模型（${localModelsHint}；勿选列表外模型）`
       : hasExplicitLocalAllowlist
@@ -386,6 +413,8 @@ export function applyAntigravitySwarmTurnDirective(opts: {
   liveMonitorNames?: readonly string[]
   /** Server-projected local Antigravity canonical model ids available to this user (OCV5-879). */
   availableLocalSwarmModels?: readonly string[]
+  /** Authoritative remote Antigravity canonical `*-remote` model ids available for this session (OCV5-893). */
+  availableRemoteSwarmModels?: readonly string[]
 }): AntigravitySwarmTurnDirectiveResult {
   const slashSwarm = parseSwarmSlashCommand(opts.rawUserText)
   const viaSlash = Boolean(slashSwarm?.matched)
@@ -410,6 +439,7 @@ export function applyAntigravitySwarmTurnDirective(opts: {
       hasHistoricalSwarm: opts.hasHistoricalSwarm,
       liveMonitorNames: opts.liveMonitorNames,
       availableLocalSwarmModels: opts.availableLocalSwarmModels,
+      availableRemoteSwarmModels: opts.availableRemoteSwarmModels,
     })
     const appliedDirectivePrefix = `${swarmDirective}\n`
     return {
@@ -503,6 +533,7 @@ const EFFICIENCY_GUARD_CLOSE = '\n</oc-efficiency-guard>\n\n'
             ? []
             : ctx.liveMonitorNames,
         availableLocalSwarmModels: ctx.availableLocalSwarmModels,
+        availableRemoteSwarmModels: ctx.availableRemoteSwarmModels,
       })
       return `${fullDirective}\n${body}`
     }
@@ -625,6 +656,7 @@ export async function prepareAntigravitySwarmInboundDirective(opts: {
   compactionCtx?: AntigravitySwarmCompactionContext
 }> {
   let availableLocalSwarmModels: string[] | undefined
+  let availableRemoteSwarmModels: string[] | undefined
   if (opts.isAntigravityTurn && !opts.isRemoteAntigravity && opts.swarmRequested) {
     const routeAllowed = extractRouteAllowedLocalSwarmModels(opts.routeAllowedModelsRaw)
     if (routeAllowed !== undefined) {
@@ -637,6 +669,24 @@ export async function prepareAntigravitySwarmInboundDirective(opts: {
         // Best-effort discovery hint only; relay enforces authoritative allowlist server-side.
       }
     }
+  } else if (opts.isAntigravityTurn && opts.isRemoteAntigravity && opts.swarmRequested) {
+    const routeAllowed = extractRouteAllowedRemoteSwarmModels(opts.routeAllowedModelsRaw)
+    if (routeAllowed !== undefined) {
+      availableRemoteSwarmModels = routeAllowed
+    } else {
+      try {
+        availableRemoteSwarmModels = filterAvailableRemoteSwarmModels(
+          await opts.loadLocalCatalogModels(),
+        )
+      } catch {
+        // Fail closed on missing/unreadable catalog: restrict to signed primary model only (W1).
+        availableRemoteSwarmModels = []
+      }
+    }
+    lookupRemoteSwarmRuntimeForSession(opts.sessionKey)?.setSessionAllowedModels(
+      opts.sessionKey,
+      availableRemoteSwarmModels,
+    )
   }
   const liveMonitorNames =
     opts.isAntigravityTurn && opts.swarmRequested
@@ -665,6 +715,7 @@ export async function prepareAntigravitySwarmInboundDirective(opts: {
       : false,
     liveMonitorNames,
     ...(availableLocalSwarmModels !== undefined ? { availableLocalSwarmModels } : {}),
+    ...(availableRemoteSwarmModels !== undefined ? { availableRemoteSwarmModels } : {}),
   })
   const compactionCtx: AntigravitySwarmCompactionContext | undefined =
     opts.isAntigravityTurn && result.mode !== 'none'
@@ -683,6 +734,7 @@ export async function prepareAntigravitySwarmInboundDirective(opts: {
             ? { appliedDirectivePrefix: result.appliedDirectivePrefix }
             : {}),
           ...(availableLocalSwarmModels !== undefined ? { availableLocalSwarmModels } : {}),
+          ...(availableRemoteSwarmModels !== undefined ? { availableRemoteSwarmModels } : {}),
           ...(liveMonitorNames.length > 0 ? { liveMonitorNames } : {}),
         }
       : undefined

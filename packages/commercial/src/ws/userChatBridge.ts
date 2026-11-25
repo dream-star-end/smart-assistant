@@ -26,7 +26,8 @@ import { SYSTEM_HELP_CAPABILITY, SYSTEM_HELP_BOOTSTRAP_FIELD, takeSystemHelpBoot
 import type { SystemHelpIdentityScope } from '../system-assistant/helpGrant.js'
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
 import { applyTeamLeaderForwarding, resolveBridgeTeamLeaderModel } from "./teamModeForwarding.js";
-import { resolveRemotePoolBackendAndSeal } from "./userChatBridgeRemotePoolSeal.js";
+import { resolveRemotePoolBackendAndSeal, type LocalFallbackCommittedHandle, type PreparedLocalFallbackTransport } from "./userChatBridgeRemotePoolSeal.js";
+import { createLocalFallbackWireTracker, prepareBridgeLocalFallbackTransport, type FallbackWireOutcomeHandler } from "./userChatBridgeLocalFallbackTransport.js";
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
  *
@@ -835,6 +836,7 @@ export interface UserChatBridgeDeps {
     beforeCommit?: (prepared: { migrationGrant: AuthorityPoolMigrationGrant }) => Promise<boolean>;
     onBlocked?: (code: string) => void;
   }) => Promise<AuthorityPoolMigrationGrant | null>;
+  markPlacementMigrationInstalled?: (args: { uid: number; sessionKey: string; placementEpoch: number; migrationId: string }) => Promise<boolean>;
   /** Composition supplies the verified selfhost default; explicit env 0 rolls back. */
   containerLinkEnabled?: boolean;
   containerLinkHeartbeatMs?: number;
@@ -3048,6 +3050,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       turn?: InboundTurnIdentity;
       /** 拒帧时的补偿(abort journal / release preCheck / 还槽);无预扣的路径不传。 */
       compensate?: (reason: string) => Promise<void> | void;
+      prepareLocalFallbackTransport?: (p: { readonly localExec: ResolvedTurnExecution; readonly billingRequestId?: string; readonly authorityTurnId?: string }) => Promise<PreparedLocalFallbackTransport | null>;
+      onLocalFallbackCommitted?: (h: LocalFallbackCommittedHandle) => void;
     }): Promise<Record<string, unknown> | null> => {
       const reject = async (code: string, message: string, reason: string): Promise<null> => {
         args.onReject?.(code);
@@ -3103,6 +3107,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         cc5BackendSelector: deps.cc5BackendSelector,
         crossPoolFallbackSelector: deps.crossPoolFallbackSelector,
         returnToRemoteGrantResolver: deps.returnToRemoteGrantResolver,
+        prepareLocalFallbackTransport: args.prepareLocalFallbackTransport,
+        onLocalFallbackCommitted: args.onLocalFallbackCommitted,
         resolveLocalExec: authorityDeps
           ? (canonicalModel) => resolveTurnExecution(authorityDeps.catalog, canonicalModel)
           : undefined,
@@ -3564,6 +3570,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
        *  heartbeats share the same admitted grace window and unsent gate as ContainerLink. */
       admittedAtMs?: number;
       wireSent?: boolean;
+      pendingMigrationInstall?: { sessionKey: string; placementEpoch: number; migrationId: string };
     }
     const admittedDispatches = new Map<string, AdmittedDispatch>();
     type EnrichmentDispatchPhase = "enriching" | "transferring" | "terminalizing" | "transferred";
@@ -5043,12 +5050,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         frameIsBinary: boolean,
         frameLength: number,
         dispatchRecord?: AdmittedDispatch,
+        onWireOutcome?: FallbackWireOutcomeHandler,
       ): boolean | Promise<boolean> => {
-        // `rejectPromptQueueDispatch` is also the cancellation edge. Every
-        // async preparation lane funnels through this helper, so a timeout or
-        // earlier negative result prevents a late physical execution. Codex
-        // callers observe `false` and run their existing slot/journal/precheck
-        // compensation before returning.
         if (dispatchRequest && promptQueueResolved) return false;
         const completeForward = (accepted: boolean): boolean => {
           if (accepted && dispatchRequest && !promptQueueResolved) {
@@ -5064,7 +5067,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             try { broadcastToUser(uid, ack); } catch { /* sideband only */ }
           }
           return completeForward(
-            forwardInboundFrame(frameData, frameIsBinary, frameLength, dispatchRecord),
+            forwardInboundFrame(frameData, frameIsBinary, frameLength, dispatchRecord, onWireOutcome),
           );
         }
         const record = dispatchRecord ?? [...admittedDispatches.values()].find(
@@ -5088,7 +5091,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               record.pendingRecoveryAck = undefined;
               try { broadcastToUser(uid, ack); } catch { /* sideband only */ }
             }
-            return forwardInboundFrame(frameData, frameIsBinary, frameLength, record);
+            return forwardInboundFrame(frameData, frameIsBinary, frameLength, record, onWireOutcome);
           },
         ).then(
           (accepted) => {
@@ -7748,6 +7751,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const authorityModelCapture = authorityModelForFrame;
         const classifiedCodexCapture = isCodexInboundFrame || isAntigravityInboundFrame;
         const ccbTurnIdentity = inboundTurnIdentityForFrame;
+        const agentIdCapture = inboundAgentIdForFrame;
         trackPreparation(async () => {
           // M6:总括 try/catch —— CCB turn 无预扣/journal/槽(计费在 egress 逐请求结算),一切
           // **意外**异常必须收敛成「dispatch 终态化 + error 帧 + queue grant 取消」,禁 unhandled rejection。
@@ -7795,84 +7799,81 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const authorityTurnId = authorityExec === null
               ? undefined
               : authorityDeps!.signer.mintAuthorityTurnId();
-            if (authorityTurnId !== undefined && dispatchRecordC !== undefined) {
-              try {
-                if (!deps.pgPool) throw new Error("authority turn dispatch binding requires pgPool");
-                await bindAuthorityTurnDispatch(deps.pgPool, {
-                  authorityTurnId,
-                  dispatchId: dispatchRecordC.dispatchId,
-                  userId: uid,
-                  sessionId: dispatchRecordC.sessionId,
-                  dispatchModel: typeof enrichedParsed.model === "string" ? enrichedParsed.model : null,
-                  canonicalModel: authorityExec!.canonicalModel,
-                  attemptNo: dispatchRecordC.attemptNo,
-                  ownerId: dispatchRecordC.leaseOwnerId,
-                  leaseEpoch: dispatchRecordC.leaseEpoch,
-                  ...(containerId !== undefined ? {
-                    agentContainerId: containerId,
-                    runtimeKind: endpoint.desktop ? "desktop" : "docker",
-                  } : {}),
-                });
-              } catch (err) {
-                turnLogCapture?.error("user-chat-bridge: authority turn dispatch binding failed", {
-                  err,
-                  dispatchId: dispatchRecordC.dispatchId,
-                });
-                rejectPromptQueueDispatch("DURABLE_DISPATCH_UNAVAILABLE");
-                failDispatchPreForward(dispatchRecordC, "authority_turn_dispatch_unavailable");
-                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                  sendErrorFrame(
-                    userWs,
-                    "DURABLE_DISPATCH_UNAVAILABLE",
-                    "durable dispatch attribution unavailable, retry this turn shortly",
-                    ccbTurnIdentity,
-                  );
-                }
-                return;
-              }
-            }
-            // 签发边界(MAJOR-2):CCB turn 的计费在 egress 逐请求结算,此处无预扣/无 journal
-            // → 无需补偿;但 epoch 重读一样不能省 —— 拿过时快照签出的票 lease 长达 50min,
-            // 会让「刚被 admin 撤销的模型」在这条 turn 里继续跑到 egress 的下一次 fence 才拦下。
-            // OCV5-746: codex 帧进容器后,gateway 断言 signed envelope 的 billingRequestId 与
-            // frame.requestId 同源同值(engine=codex 的计费身份绑定,见 gateway modelAuthority)。
-            // 远端(-remote / remote_pool)codex 帧不走 6812 的本地 codex 分支,而是落到这条通用
-            // CCB 分支;这里以前只把 dispatch.billingRequestId 签进 envelope、从不写
-            // frame.requestId → 首轮必被容器以 billing_request_mismatch 拒。
-            // 现在只铸**一个** server-owned 值:有 dispatch 复用它的稳定 billingRequestId
-            // (egress 据此写 usage_records.dispatch_id/attempt_no),没有 dispatch 才铸新 id
-            // (legacy 连接)。同值既签进 envelope,也在 spread 之后覆写 frame.requestId ——
-            // 浏览器伪造值不能存活。
             const codexFrameRequestId =
               authorityExec !== null && (authorityExec.engine === "codex" || authorityExec.engine === "antigravity")
                 ? (dispatchRecordC?.billingRequestId ?? ensureRequestIdServerSide())
                 : undefined;
             const authorityBillingRequestId = codexFrameRequestId ?? dispatchRecordC?.billingRequestId;
             let authorityFields: Record<string, unknown> = {};
+            const fallbackBox: { current: LocalFallbackCommittedHandle | null } = { current: null };
+            const wireTracker = createLocalFallbackWireTracker({
+              getHandle: () => fallbackBox.current,
+              log: turnLogCapture,
+              onWireConfirmed: (fh) => {
+                if (dispatchRequest) {
+                  promptQueueDispatchCancellations.set(dispatchRequest.grantId, {
+                    request: dispatchRequest,
+                    cancel: async (c) => { await fh.compensate(`prompt_queue_${c}`); },
+                  });
+                }
+              },
+            });
+            let forwardAttempted = false;
+            let fallbackAbortReason = "local_fallback_not_forwarded";
+            try {
             if (authorityExec !== null) {
               const sealed = await sealAuthorityFieldsOrReject({
                 exec: authorityExec,
-                // B7a:CCB turn 把稳定 billingRequestId 签进 model-authority envelope,
-                // egress gate 据此反查 dispatch 身份写 usage_records.dispatch_id/attempt_no(否则
-                // CCB 计费行丢失 turn↔dispatch 关联)。legacy(无 dispatch 记录)→ undefined 不带。
                 ...(authorityBillingRequestId === undefined ? {} : { billingRequestId: authorityBillingRequestId }),
                 ...(authorityTurnId === undefined ? {} : { authorityTurnId }),
                 log: turnLogCapture,
                 onReject: rejectPromptQueueDispatch,
                 turn: ccbTurnIdentity,
+                ...(authorityExec.placement === "remote_pool" && containerId !== undefined ? {
+                  prepareLocalFallbackTransport: (p) => prepareBridgeLocalFallbackTransport({ ...p, uid, containerId, peerId: ccbTurnIdentity.peerId, clientMessageId: ccbTurnIdentity.clientMessageId, promptQueueGrantId: dispatchRequest?.grantId ?? null, agentId: agentIdCapture, traceId: turnTraceIdCapture, parsedCapture: inboundParsedCapture, enrichedParsed, dispatchRecord: dispatchRecordC, recoveryJob, containerHasCodexSpeedTiers, codexBillingEnabled, sessionMaxMs: readCodexSessionMaxMs(), pgPool: deps.pgPool, preCheckRedis: deps.preCheckRedis, pricing: deps.pricing, codexBinding: deps.codexBinding, createCodexRoute: deps.createCodexRoute, admitAntigravityTurn: deps.admitAntigravityTurn, expireAntigravityRoute: deps.expireAntigravityRoute, activeCodexTurnsByPeer, inflightCodexTurns, pendingAntigravityRelays, codexPeerKey, isCurrentCodexTurnState, releaseCodexTurnState, expireCodexRouteToken, retryPendingGrokLeaseRelease, modelCheckerHandle, catalogSnapshot: authorityDeps?.catalog.peek() ?? null, isCleaned: () => cleaned, log: turnLogCapture }),
+                  onLocalFallbackCommitted: (h) => { fallbackBox.current = h; if (dispatchRecordC) dispatchRecordC.remoteLane = false; },
+                } : {}),
               });
               if (sealed === null) { failDispatchPreForward(dispatchRecordC, "authority_seal_rejected"); return; }
               authorityFields = sealed;
+              const pm = (sealed[MODEL_AUTHORITY_FIELD] as { payload?: { poolMigration?: { migrationId?: string; placementEpoch?: number } } } | undefined)?.payload?.poolMigration;
+              if (dispatchRecordC && pm?.migrationId && typeof pm.placementEpoch === "number" && typeof ccbTurnIdentity.sessionKey === "string" && ccbTurnIdentity.sessionKey) {
+                dispatchRecordC.pendingMigrationInstall = { sessionKey: ccbTurnIdentity.sessionKey, placementEpoch: pm.placementEpoch, migrationId: pm.migrationId };
+              }
             }
-            if (cleaned) { failDispatchPreForward(dispatchRecordC, "bridge_cleaned"); return; }
-            // OCV5-92: CCB egress is settled per request by the anthropic proxy
-            // (balance>0 admits, clamp on finalize), so a single agentic turn
-            // could still overshoot its wallet by up to one request per loop
-            // iteration. Hand the container the spendable balance so the
-            // adapter hard-stops as soon as cumulative cost reaches it.
-            // Lookup failure fails open (per-request 402 remains the floor).
+            if (authorityTurnId !== undefined && dispatchRecordC !== undefined) {
+              try {
+                if (!deps.pgPool) throw new Error("authority turn dispatch binding requires pgPool");
+                const finalCanonicalModel =
+                  typeof authorityFields.model === "string" && authorityFields.model.length > 0
+                    ? authorityFields.model
+                    : authorityExec!.canonicalModel;
+                await bindAuthorityTurnDispatch(deps.pgPool, {
+                  authorityTurnId,
+                  dispatchId: dispatchRecordC.dispatchId,
+                  userId: uid,
+                  sessionId: dispatchRecordC.sessionId,
+                  dispatchModel: typeof enrichedParsed.model === "string" ? enrichedParsed.model : null,
+                  canonicalModel: finalCanonicalModel,
+                  attemptNo: dispatchRecordC.attemptNo,
+                  ownerId: dispatchRecordC.leaseOwnerId,
+                  leaseEpoch: dispatchRecordC.leaseEpoch,
+                  ...(containerId !== undefined ? { agentContainerId: containerId, runtimeKind: endpoint.desktop ? "desktop" : "docker" } : {}),
+                });
+              } catch (err) {
+                fallbackAbortReason = "authority_turn_dispatch_unavailable";
+                turnLogCapture?.error("user-chat-bridge: authority turn dispatch binding failed", { err, dispatchId: dispatchRecordC.dispatchId });
+                rejectPromptQueueDispatch("DURABLE_DISPATCH_UNAVAILABLE");
+                failDispatchPreForward(dispatchRecordC, "authority_turn_dispatch_unavailable");
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(userWs, "DURABLE_DISPATCH_UNAVAILABLE", "durable dispatch attribution unavailable, retry this turn shortly", ccbTurnIdentity);
+                }
+                return;
+              }
+            }
+            if (cleaned) { fallbackAbortReason = "bridge_disconnect_before_forward"; failDispatchPreForward(dispatchRecordC, "bridge_cleaned"); return; }
             let ccbSpendable: bigint | null = null;
-            if (deps.pgPool) {
+            if (deps.pgPool && fallbackBox.current === null) {
               try {
                 ccbSpendable = await readTotalSpendableBalance(uid);
               } catch (err) {
@@ -7881,36 +7882,36 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             const rewrittenObj = {
               ...enrichedParsed,
-              // OCV5-746: 与 signed billingRequestId 同源同值的 server-owned requestId。
               ...(codexFrameRequestId !== undefined ? { requestId: codexFrameRequestId } : {}),
               traceId: turnTraceIdCapture,
-              // After the spread so a browser-forged budget cannot survive.
               ...(ccbSpendable !== null ? { _creditBudget: ccbSpendable.toString() } : {}),
               ...authorityFields,
-              // durable dispatch envelope(容器 durable inbox 准入 + at-most-once)。
               ...dispatchAuthorityField(dispatchRecordC),
             };
             const rewrittenStr = JSON.stringify(rewrittenObj);
             const rewrittenLen = Buffer.byteLength(rewrittenStr);
             if (rewrittenLen > maxFrameBytes) {
-              turnLogCapture?.error("user-chat-bridge: rewritten inbound frame too big", {
-                rewrittenLen, max: maxFrameBytes,
-              });
+              fallbackAbortReason = "rewritten_frame_too_big";
+              turnLogCapture?.error("user-chat-bridge: rewritten inbound frame too big", { rewrittenLen, max: maxFrameBytes });
               failDispatchPreForward(dispatchRecordC, "ERR_FRAME_TOO_BIG");
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                sendErrorFrame(
-                  userWs,
-                  "ERR_FRAME_TOO_BIG",
-                  `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`,
-                  ccbTurnIdentity,
-                );
+                sendErrorFrame(userWs, "ERR_FRAME_TOO_BIG", `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`, ccbTurnIdentity);
                 try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
               }
               return;
             }
-            // forwardPreparedFrame:queue lane 兜住 promptQueueResolved;browser lane 等价
-            // forwardInboundFrame。dispatch 已 accepted 交容器,forward 后不终态化。
-            await forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen, dispatchRecordC);
+            const accepted = await forwardPreparedFrame(
+              Buffer.from(rewrittenStr, "utf8"),
+              false,
+              rewrittenLen,
+              dispatchRecordC,
+              fallbackBox.current ? wireTracker.onWireOutcome : undefined,
+            );
+            if (accepted) forwardAttempted = true;
+            await wireTracker.onSyncForwardResult(accepted, "container_forward_rejected");
+            } finally {
+              if (!forwardAttempted) await wireTracker.onPreForwardAbort(fallbackAbortReason);
+            }
           } catch (err) {
             bridgeLog?.error("user-chat-bridge: ccb inbound IIFE unexpected error", { err });
             rejectPromptQueueDispatch("ERR_INTERNAL");
@@ -8029,6 +8030,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       isBinary: boolean,
       len: number,
       dispatchRecord?: AdmittedDispatch,
+      onWireOutcome?: FallbackWireOutcomeHandler,
     ): boolean {
       if (cleaned) {
         failDispatchPreForward(dispatchRecord, "bridge_cleaned_before_physical_forward");
@@ -8042,20 +8044,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       }
       if (containerWs.readyState === WebSocket.CONNECTING) {
-        // 容器还没 OPEN(早到帧场景);ws.send 在 CONNECTING 状态下抛
-        // → 暂存到 ws lib 的 send buffer 里 = 不可控。这里直接 buffer 起来,
-        // OPEN 后冲刷;若超 buffer 上限 → backpressure
         if (bufferedUC + len > maxBufferedBytes) {
-          // 背压=连接态瞬态信号:只走 close code,不发 turn 级 error 帧(重连+resume 自愈,
-          // 不在会话正文钉卡)。
           try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
-          // backpressure → force final;一般无 inflight,即便有也异常态不 drain
           cleanup("backpressure", true);
           return false;
         }
         bufferedUC += len;
         metrics.onBufferedBytes?.(uid, "user_to_container", bufferedUC);
-        preopenQueue.push({ data, isBinary, len, dispatchRecord });
+        preopenQueue.push({ data, isBinary, len, dispatchRecord, onWireOutcome });
+        onWireOutcome?.({ wireSent: false, handedOff: true, reason: "transport_handoff" });
         return true;
       }
       if (containerWs.readyState !== WebSocket.OPEN) {
@@ -8065,7 +8062,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       const transfer = beginEnrichmentTransfer(dispatchRecord);
       if (dispatchRecord !== undefined && transfer === null) return false;
       if (dispatchRecord) linkHandle?.bindDispatch(dispatchRecord);
-      return sendToContainer(data, isBinary, len, transfer, dispatchRecord);
+      const sent = sendToContainer(data, isBinary, len, transfer, dispatchRecord, onWireOutcome);
+      if (sent) onWireOutcome?.({ wireSent: false, handedOff: true, reason: "transport_handoff" });
+      return sent;
     }
 
     const sendToContainer = (
@@ -8074,12 +8073,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       len: number,
       transfer: EnrichmentDispatchState | null = null,
       dispatchRecord?: AdmittedDispatch,
+      onWireOutcome?: FallbackWireOutcomeHandler,
     ): boolean => {
       try {
         containerWs.send(data, { binary: isBinary }, (err) => {
           const complete = (): void => {
             if (err) {
               bridgeLog?.warn("user-chat-bridge: container send error", { err });
+              onWireOutcome?.({ wireSent: false, reason: "container_send_error" });
               if (transfer) {
                 terminalizeEnrichmentDispatch(transfer, "container_forward_rejected");
                 cleanup("container_error", true);
@@ -8088,9 +8089,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 /hello|beforeReplay/i.test(err.message) &&
                 userWs.readyState === WebSocket.OPEN
               ) {
-                // B4: When hello registration fails/times out on this handle, close ONLY this
-                // browser WS so the tab reconnects and re-registers cleanly without tearing down
-                // the shared container transport or other sessions.
                 try { userWs.close(CLOSE_BRIDGE.INTERNAL, "container hello failed"); } catch { /* */ }
               }
             } else {
@@ -8098,6 +8096,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 dispatchRecord.wireSent = true;
                 linkHandle?.markDispatchSent(dispatchRecord.sessionId, dispatchRecord.clientMessageId);
               }
+              onWireOutcome?.({ wireSent: true, reason: "wire_sent" });
               completeEnrichmentTransfer(transfer);
             }
           };
@@ -8112,7 +8111,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         bridgeLog?.warn("user-chat-bridge: container send threw", { err });
         if (transfer) terminalizeEnrichmentDispatch(transfer, "container_forward_rejected");
         try { userWs.close(CLOSE_BRIDGE.INTERNAL, "agent send failed"); } catch { /* */ }
-        // 容器 send 抛 = 容器 socket 已不可用,billing 帧也来不了 → force final
         cleanup("container_error", true);
         return false;
       }
@@ -8123,6 +8121,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       isBinary: boolean;
       len: number;
       dispatchRecord?: AdmittedDispatch;
+      onWireOutcome?: FallbackWireOutcomeHandler;
     }> = [];
     let loggedRejectedContainerIncident = false;
 
@@ -8402,6 +8401,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           } : {}),
           claimEnrichmentTerminalization, acceptEnrichmentReceipt, dropAdmittedDispatch,
           settleCronOriginClaim, noteDispatchStreamFrame,
+          onDispatchAccepted: (rec) => { if (rec.pendingMigrationInstall && deps.markPlacementMigrationInstalled) void deps.markPlacementMigrationInstalled({ uid: Number(uid), ...rec.pendingMigrationInstall }).catch(() => {}); },
           hasCronOriginClaim: (dispatchId) => cronOriginClaimWaiters.has(dispatchId),
           broadcast: (frame) => { broadcastToUser(uid, frame); },
           warn: (message, meta) => bridgeLog?.warn(message, meta),
@@ -9436,7 +9436,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       void drainDurableControlsForUser(uid);
       // 冲刷 preopen queue
       for (const m of preopenQueue) {
-        forwardInboundFrame(m.data, m.isBinary, m.len, m.dispatchRecord);
+        const flushed = forwardInboundFrame(m.data, m.isBinary, m.len, m.dispatchRecord, m.onWireOutcome);
+        if (!flushed) m.onWireOutcome?.({ wireSent: false, reason: "preopen_flush_rejected" });
       }
       preopenQueue.length = 0;
       bufferedUC = 0;
@@ -10342,6 +10343,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       //     可能被软预扣挡住 —— 但该 turn 确实仍在消耗,语义正确且有界。
       // 已 settle 的 turn 由 Map.delete 纪律先行摘除;这里只清本地帧路由簿记,
       // **不动 journal 权威状态**。
+      for (const m of preopenQueue.splice(0)) {
+        m.onWireOutcome?.({ wireSent: false, reason: "bridge_closed_before_wire_send" });
+      }
       if (inflightCodexTurns.size > 0) {
         bridgeLog?.info("user-chat-bridge: bridge closed with surviving codex turns — journal left inflight (cross-bridge settle / reconciler will adjudicate)", {
           finalCause,

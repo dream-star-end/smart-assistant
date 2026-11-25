@@ -2276,8 +2276,8 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
           workspace_cwd: repo,
           channels: { main: { topic: 'main' } },
           members: {
-            coordinator: { conversation_id: earlyLoc.swarmId, role: 'coordinator', model: 'm', phase: 'RUNNING', wake_mode: 'mentions', wait_since: 0, last_read_seq: 1, killed: false, channels: ['main'] },
-            'early-worker': { conversation_id: '33333333-3333-4333-8333-333333333333', role: 'worker', model: 'm', phase: 'WAITING', wake_mode: 'mentions', wait_since: 0, last_read_seq: 1, killed: false, channels: ['main'] },
+            coordinator: { conversation_id: earlyLoc.swarmId, role: 'coordinator', model: 'antigravity-gemini-4-neon-remote', phase: 'RUNNING', wake_mode: 'mentions', wait_since: 1, last_read_seq: 1, killed: false, channels: ['main'] },
+            'early-worker': { conversation_id: '33333333-3333-4333-8333-333333333333', role: 'worker', model: 'antigravity-gemini-4-neon-remote', phase: 'WAITING', wake_mode: 'mentions', wait_since: 1, last_read_seq: 1, killed: false, channels: ['main'] },
           },
         }),
       )
@@ -2452,7 +2452,7 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
             coordinator: {
               conversation_id: loc.swarmId,
               role: 'coordinator',
-              model: 'm',
+              model: 'antigravity-gemini-4-neon-remote',
               phase: 'RUNNING',
               wake_mode: 'mentions',
               wait_since: 0,
@@ -2463,7 +2463,7 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
             'paged-worker': {
               conversation_id: '44444444-4444-4444-8444-444444444444',
               role: 'worker',
-              model: 'm',
+              model: 'antigravity-gemini-4-neon-remote',
               phase: 'WAITING',
               wake_mode: 'mentions',
               wait_since: 0,
@@ -2778,6 +2778,398 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
       assert.equal(after.posts[0]?.seq, 701)
       assert.equal(after.posts[0]?.text, 'NEW_POST_AFTER_LEGACY_700')
     } finally {
+      await rt.shutdownAll()
+    }
+  })
+
+  it('OCV5-893: enforces per-member model allowlist, CLI slug normalization, billing model/effort passthrough, SWARM_MEMBER_BUSY, fail-closed rollback, and legacy compat', async () => {
+    const agyRoot = makeTempDir('oc-rswarm-models-root-')
+    const repo = initTempGitRepo()
+    const sess = 'agent:main:webchat:dm:ocv5-893-swarm-models'
+
+    let holdBusyWorker!: () => void
+    const busyGate = new Promise<void>((r) => {
+      holdBusyWorker = r
+    })
+    let busyStarted!: () => void
+    const busyStartedP = new Promise<void>((r) => {
+      busyStarted = r
+    })
+    const dispatched: Array<{ workerName: string; model: string; effort?: string }> = []
+
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      maxParallelWorkers: 3,
+      executor: {
+        async runWorkerTurn(input) {
+          dispatched.push({
+            workerName: input.workerName,
+            model: input.model,
+            effort: input.effort,
+          })
+          if (input.workerName === 'busy-worker') {
+            busyStarted()
+            await busyGate
+          }
+          return { text: `ok:${input.model}:${input.effort ?? 'default'}` }
+        },
+        async releaseWorkerSession() {},
+      },
+    })
+
+    try {
+      rt.registerSession({
+        sessionKey: sess,
+        model: 'antigravity-gemini-4-neon-remote',
+        effort: 'xhigh',
+        allowedModels: [
+          'antigravity-gemini-4-neon-remote',
+          'antigravity-gemini-4-carbon-remote',
+          'antigravity-claude-opus-5.5-remote',
+        ],
+        workspaceCwd: repo,
+      })
+
+      // 1. `models` returns authoritative allowlist with canonical ids & CLI aliases
+      const modelsRes = (await rt.handleToolCall({
+        sessionKey: sess,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'models' },
+      })) as {
+        ok: boolean
+        current_model: string
+        current_effort?: string
+        available_models: Array<{ id: string; efforts: string[]; cli_aliases: string[] }>
+      }
+      assert.equal(modelsRes.ok, true)
+      assert.equal(modelsRes.current_model, 'antigravity-gemini-4-neon-remote')
+      assert.equal(modelsRes.current_effort, 'xhigh')
+      assert.deepEqual(
+        modelsRes.available_models.map((m) => m.id),
+        [
+          'antigravity-gemini-4-neon-remote',
+          'antigravity-gemini-4-carbon-remote',
+          'antigravity-claude-opus-5.5-remote',
+        ],
+      )
+
+      // 2. Fail-closed on unauthorized / cross-engine / non-remote models BEFORE writing roster or creating worktree!
+      await assert.rejects(
+        () =>
+          rt.handleToolCall({
+            sessionKey: sess,
+            callerMember: 'coordinator',
+            tool: 'swarm',
+            args: {
+              action: 'add',
+              name: 'bad-cross-engine',
+              brief: 'nope',
+              model: 'gpt-6.2-astra-remote',
+              workspace: 'share',
+            },
+          }),
+        /SWARM_MODEL_NOT_ALLOWED:gpt-6\.2-astra-remote/,
+      )
+      await assert.rejects(
+        () =>
+          rt.handleToolCall({
+            sessionKey: sess,
+            callerMember: 'coordinator',
+            tool: 'swarm',
+            args: {
+              action: 'add',
+              name: 'bad-unlisted',
+              brief: 'nope',
+              model: 'gemini-4-hydrogen-high',
+              workspace: 'share',
+            },
+          }),
+        /SWARM_MODEL_NOT_ALLOWED:gemini-4-hydrogen-high/,
+      )
+      await assert.rejects(
+        () =>
+          rt.handleToolCall({
+            sessionKey: sess,
+            callerMember: 'coordinator',
+            tool: 'swarm',
+            args: {
+              action: 'add',
+              name: 'bad-local',
+              brief: 'nope',
+              model: 'antigravity-gemini-4-carbon',
+              workspace: 'share',
+            },
+          }),
+        /SWARM_MODEL_NOT_ALLOWED:antigravity-gemini-4-carbon/,
+      )
+      assert.equal(
+        existsSync(join(repo, '.oc-swarm-worktrees')),
+        false,
+        'rejected model must not create any git worktree',
+      )
+
+      // 3. `add` accepts both CLI slug (`gemini-4-carbon-high`) and canonical remote id (`antigravity-claude-opus-5.5-remote`)
+      const addSlug = (await rt.handleToolCall({
+        sessionKey: sess,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'carbon-w', brief: 'run carbon', model: 'gemini-4-carbon-high' },
+      })) as { ok: boolean; added: Array<{ name: string; model: string; effort?: string }> }
+      assert.equal(addSlug.ok, true)
+      assert.equal(addSlug.added[0]?.model, 'antigravity-gemini-4-carbon-remote')
+      assert.equal(addSlug.added[0]?.effort, 'high')
+
+      const addCanonical = (await rt.handleToolCall({
+        sessionKey: sess,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: {
+          action: 'add',
+          name: 'opus-w',
+          brief: 'run opus',
+          model: 'antigravity-claude-opus-5.5-remote',
+        },
+      })) as { ok: boolean; added: Array<{ name: string; model: string; effort?: string }> }
+      assert.equal(addCanonical.ok, true)
+      assert.equal(addCanonical.added[0]?.model, 'antigravity-claude-opus-5.5-remote')
+      assert.equal(addCanonical.added[0]?.effort, undefined, 'xhigh default must not leak to opus')
+
+      const deadline = Date.now() + 3_000
+      while (dispatched.length < 2 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      const carbonRun = dispatched.find((d) => d.workerName === 'carbon-w')
+      const opusRun = dispatched.find((d) => d.workerName === 'opus-w')
+      assert.deepEqual(carbonRun, {
+        workerName: 'carbon-w',
+        model: 'antigravity-gemini-4-carbon-remote',
+        effort: 'high',
+      })
+      assert.deepEqual(opusRun, {
+        workerName: 'opus-w',
+        model: 'antigravity-claude-opus-5.5-remote',
+        effort: undefined,
+      })
+
+      // 4. `model` switches an idle worker cleanly and rejects unauthorized switch
+      await new Promise((r) => setTimeout(r, 40))
+      const switched = (await rt.handleToolCall({
+        sessionKey: sess,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'model', name: 'carbon-w', model: 'claude-opus-5-5-medium' },
+      })) as { ok: boolean; name: string; model: string; effort?: string }
+      assert.deepEqual(switched, {
+        ok: true,
+        name: 'carbon-w',
+        model: 'antigravity-claude-opus-5.5-remote',
+        effort: 'medium',
+      })
+      await assert.rejects(
+        () =>
+          rt.handleToolCall({
+            sessionKey: sess,
+            callerMember: 'coordinator',
+            tool: 'swarm',
+            args: { action: 'model', name: 'carbon-w', model: 'gpt-6.2-astra-remote' },
+          }),
+        /SWARM_MODEL_NOT_ALLOWED:gpt-6\.2-astra-remote/,
+      )
+
+      // Next wake of carbon-w uses switched model & effort
+      await rt.handleToolCall({
+        sessionKey: sess,
+        callerMember: 'coordinator',
+        tool: 'post_message',
+        args: { text: '@carbon-w second pass after switch' },
+      })
+      const deadline2 = Date.now() + 3_000
+      while (dispatched.filter((d) => d.workerName === 'carbon-w').length < 2 && Date.now() < deadline2) {
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      const secondCarbonRun = dispatched.filter((d) => d.workerName === 'carbon-w')[1]
+      assert.deepEqual(secondCarbonRun, {
+        workerName: 'carbon-w',
+        model: 'antigravity-claude-opus-5.5-remote',
+        effort: 'medium',
+      })
+
+      // 5. `model` on a running worker rejects with SWARM_MEMBER_BUSY
+      await rt.handleToolCall({
+        sessionKey: sess,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'busy-worker', brief: 'hold' },
+      })
+      await busyStartedP
+      await assert.rejects(
+        () =>
+          rt.handleToolCall({
+            sessionKey: sess,
+            callerMember: 'coordinator',
+            tool: 'swarm',
+            args: { action: 'model', name: 'busy-worker', model: 'gemini-4-carbon-high' },
+          }),
+        /SWARM_MEMBER_BUSY:busy-worker/,
+      )
+      holdBusyWorker()
+
+      // 6. W1: Updating allowlist via setSessionAllowedModels([]) locks session to defaultModel only
+      //    AND revokes pre-existing workers with now-disallowed models BEFORE acquiring a lane!
+      rt.setSessionAllowedModels(sess, [])
+      await assert.rejects(
+        () =>
+          rt.handleToolCall({
+            sessionKey: sess,
+            callerMember: 'coordinator',
+            tool: 'swarm',
+            args: { action: 'add', name: 'locked-out', brief: 'nope', model: 'gemini-4-carbon-high' },
+          }),
+        /SWARM_MODEL_NOT_ALLOWED:gemini-4-carbon-high/,
+      )
+      // Wait for busy-worker to finish before checking opus-w revocation dispatch
+      await new Promise((r) => setTimeout(r, 40))
+      const opusDispatchesBefore = dispatched.filter((d) => d.workerName === 'opus-w').length
+      await rt.handleToolCall({
+        sessionKey: sess,
+        callerMember: 'coordinator',
+        tool: 'post_message',
+        args: { text: '@opus-w try wake after model revoked' },
+      })
+      const revokedDeadline = Date.now() + 2_000
+      let sawRevokedBoardError = false
+      while (Date.now() < revokedDeadline) {
+        const board = (await rt.handleToolCall({
+          sessionKey: sess,
+          callerMember: 'coordinator',
+          tool: 'read_board',
+          args: { since: 0, limit: 50 },
+        })) as { posts: Array<{ agent: string; text: string }> }
+        if (
+          board.posts.some(
+            (p) =>
+              p.agent === 'opus-w' &&
+              p.text.includes('SWARM_MODEL_NOT_ALLOWED:antigravity-claude-opus-5.5-remote'),
+          )
+        ) {
+          sawRevokedBoardError = true
+          break
+        }
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      assert.equal(sawRevokedBoardError, true, 'W1: revoked worker must report SWARM_MODEL_NOT_ALLOWED on board')
+      assert.equal(
+        dispatched.filter((d) => d.workerName === 'opus-w').length,
+        opusDispatchesBefore,
+        'W1: revoked worker must NEVER call executor / acquire lane with disallowed model',
+      )
+
+      // 6b. W2: Concurrent lock contention — worker transitions to running WHILE `action:"model"`
+      //     is queued waiting on `.roster.lock` -> inside-lock check MUST reject with SWARM_MEMBER_BUSY
+      //     and preserve the original persisted model in members.json!
+      rt.setSessionAllowedModels(sess, [
+        'antigravity-gemini-4-neon-remote',
+        'antigravity-gemini-4-carbon-remote',
+        'antigravity-claude-opus-5.5-remote',
+      ])
+      const raceLoc = rt.locationFor(sess)
+      const raceLockPath = join(raceLoc.swarmDir, '.roster.lock')
+      // Hold `.roster.lock` externally so `swarm{action:"model"}` blocks awaiting the write lock
+      writeFileSync(raceLockPath, `99999:${Date.now()}\n`, 'utf8')
+      let releaseRaceWorker!: () => void
+      const raceModelCall = rt.handleToolCall({
+        sessionKey: sess,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'model', name: 'busy-worker', model: 'gemini-4-carbon-high' },
+      })
+      // Yield a tick so `raceModelCall` enters `.roster.lock` wait queue while `busy-worker` is idle,
+      // then transition `busy-worker` to running BEFORE releasing `.roster.lock`!
+      await new Promise((r) => setTimeout(r, 25))
+      const internalState = (rt as unknown as {
+        sessions: Map<string, { workers: Map<string, { running: boolean }> }>
+      }).sessions.get(sess)!
+      const busyRt = internalState.workers.get('busy-worker')!
+      busyRt.running = true
+      releaseRaceWorker = () => {
+        busyRt.running = false
+      }
+      rmSync(raceLockPath, { force: true })
+      try {
+        await assert.rejects(() => raceModelCall, /SWARM_MEMBER_BUSY:busy-worker/)
+      } finally {
+        releaseRaceWorker()
+      }
+      const afterRaceRoster = JSON.parse(readFileSync(join(raceLoc.swarmDir, 'members.json'), 'utf8')) as {
+        members: Record<string, { model: string }>
+      }
+      assert.equal(
+        afterRaceRoster.members['busy-worker']?.model,
+        'antigravity-gemini-4-neon-remote',
+        'W2: rejected concurrent model switch must not overwrite persisted model',
+      )
+
+      // 7. Legacy session (no allowedModels, legacy members.json without effort) stays backward compatible
+      const legacySess = 'agent:main:webchat:dm:ocv5-893-legacy'
+      rt.registerSession({
+        sessionKey: legacySess,
+        model: 'antigravity-gemini-4-neon-remote',
+        effort: 'high',
+        workspaceCwd: repo,
+      })
+      const legacyLoc = rt.locationFor(legacySess)
+      mkdirSync(legacyLoc.swarmDir, { recursive: true })
+      writeFileSync(
+        join(legacyLoc.swarmDir, 'members.json'),
+        JSON.stringify({
+          runtime: 'remote',
+          title: 'legacy roster',
+          workspace_cwd: repo,
+          channels: { main: { topic: 'main' } },
+          members: {
+            coordinator: {
+              conversation_id: legacyLoc.swarmId,
+              role: 'coordinator',
+              model: 'antigravity-gemini-4-neon-remote',
+              phase: 'RUNNING',
+              wake_mode: 'mentions',
+              wait_since: 0,
+              last_read_seq: 0,
+              killed: false,
+              channels: ['main'],
+            },
+            'legacy-w': {
+              conversation_id: '77777777-7777-4777-8777-777777777777',
+              role: 'worker',
+              model: 'antigravity-gemini-4-carbon-remote',
+              phase: 'WAITING',
+              wake_mode: 'mentions',
+              wait_since: 0,
+              last_read_seq: 0,
+              killed: false,
+              channels: ['main'],
+            },
+          },
+        }),
+      )
+      await rt.handleToolCall({
+        sessionKey: legacySess,
+        callerMember: 'coordinator',
+        tool: 'post_message',
+        args: { text: '@legacy-w wake legacy worker' },
+      })
+      const deadline3 = Date.now() + 3_000
+      while (!dispatched.some((d) => d.workerName === 'legacy-w') && Date.now() < deadline3) {
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      assert.deepEqual(dispatched.find((d) => d.workerName === 'legacy-w'), {
+        workerName: 'legacy-w',
+        model: 'antigravity-gemini-4-carbon-remote',
+        effort: 'high',
+      })
+    } finally {
+      holdBusyWorker()
       await rt.shutdownAll()
     }
   })

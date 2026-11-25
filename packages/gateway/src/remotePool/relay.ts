@@ -61,7 +61,7 @@ const MAX_OUTPUT_BYTES = 32 * 1024 * 1024
 const MAX_TOOL_BODY_BYTES = 6 * 1024 * 1024
 const CONTENT_BLOB_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const CONTENT_MIME_RE = /^[a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*$/i
-const TEXT_ONLY_REMOTE_DRIVERS = new Set(['antigravity'])
+const TEXT_ONLY_REMOTE_DRIVERS = new Set<string>()
 
 export function validateRemoteTurnContentBlocks(raw: unknown): RemoteDriverTurnContentBlock[] {
   remotePoolNeed(Array.isArray(raw) && raw.length > 0 && raw.length <= 64, 'REMOTE_CONTENT_BLOCK_INVALID')

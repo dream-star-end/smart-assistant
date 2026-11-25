@@ -41,6 +41,7 @@ import type { ModelCatalogCache, ModelExecutionDescriptor } from '../../billing/
 import {
   PgLogicalModelBindingStore,
   PgSessionAuthorityStateStore,
+  extractPendingInstallMigration,
   type PgTransactionPool,
 } from '../../db/threeLayerStateStore.js'
 import {
@@ -88,11 +89,11 @@ const ENGINE_FAMILY_BY_AUTHORITY: Readonly<Record<AuthorityEngineKind, Inference
     zcode: 'zcode',
   })
 
-/** Local hard read-only support per authority engine (B14: local antigravity is fail-closed). */
+/** Local hard read-only support per authority engine (aligned with local AGY hard read-only sandbox). */
 const LOCAL_READ_ONLY_SUPPORT: Readonly<Record<AuthorityEngineKind, boolean>> = Object.freeze({
   ccb: true,
   codex: true,
-  antigravity: false,
+  antigravity: true,
   grok: false,
   cursor: false,
   zcode: false,
@@ -108,19 +109,21 @@ const LOCAL_SWARM_SUPPORT: Readonly<Record<AuthorityEngineKind, boolean>> = Obje
 })
 
 /**
- * Engines whose local execution uses the signed authority + egress per-request billing path
- * directly (requiring no separate pre-seal local Codex journal or Antigravity relay route).
- * Other engines fail closed at the post-classification seal point so local billing routes
- * can never be bypassed.
+ * Engines supported for selfhost cross-pool pre-dispatch fallback to `local_pool`.
+ * - `ccb`: uses the signed authority + egress per-request billing path directly.
+ * - `codex` / `antigravity`: require `prepareLocalFallbackTransport` in the seal pipeline
+ *   (`resolveRemotePoolBackendAndSeal`) to mint authentic local billing/route credentials
+ *   before PG `placementEpoch` commit, failing closed if preparation is absent or fails.
  */
-const LOCAL_EGRESS_AUTHORITY_BILLED: Readonly<Record<AuthorityEngineKind, boolean>> = Object.freeze({
-  ccb: true,
-  codex: false,
-  antigravity: false,
-  grok: false,
-  cursor: false,
-  zcode: false,
-})
+const LOCAL_CROSS_POOL_FALLBACK_SUPPORTED_ENGINES: Readonly<Record<AuthorityEngineKind, boolean>> =
+  Object.freeze({
+    ccb: true,
+    codex: true,
+    antigravity: true,
+    grok: false,
+    cursor: false,
+    zcode: false,
+  })
 
 export interface CrossPoolFallbackMigrationGrant {
   readonly migrationId: string
@@ -392,7 +395,7 @@ export function createSelfhostCrossPoolFallbackSelector(
     const rawEngine = sourceDesc?.engine ?? input.engine
     if (!AUTHORITY_ENGINE_SET.has(rawEngine)) return null
     const authEngine = rawEngine as AuthorityEngineKind
-    if (LOCAL_EGRESS_AUTHORITY_BILLED[authEngine] !== true) return null
+    if (LOCAL_CROSS_POOL_FALLBACK_SUPPORTED_ENGINES[authEngine] !== true) return null
     const engineFamily = ENGINE_FAMILY_BY_AUTHORITY[authEngine]
 
     // Red Line #1: ONLY accept an active local catalog entry for the EXACT same logical model.
@@ -606,27 +609,28 @@ export function createSelfhostCrossPoolFallbackSelector(
       }
     }
 
-    // B01: If the authoritative pointer is ALREADY active on `local_container` for this engine
-    // (remote remained unavailable across consecutive turns), reuse the existing local placement
-    // directly without starting a redundant same-pool migration or bumping placementEpoch.
-    // If PG committed an earlier remote->local fallback at placementEpoch >= 2 whose first frame
-    // was never installed on the container (`nativeSessionId === null`), re-issue an idempotent
-    // epoch-scoped migrationGrant so a container still holding the remote runner can transition
-    // safely without loosening `CC5_BACKEND_SCOPE_CHANGED`. Once a local turn has completed
-    // (`nativeSessionId !== null`), omit the grant for pure local continuation.
+    // B01 + OCV5-893 B3: If the authoritative pointer is ALREADY active on `local_container`
+    // for this engine (remote remained unavailable across consecutive turns), reuse the existing
+    // local placement directly without starting a redundant same-pool migration or bumping
+    // placementEpoch. Re-issue the exact committed migrationGrant ONLY while PG's durable
+    // `pendingInstallMigration` marker for `(local_container, placementEpoch)` is still present
+    // (never rely on `nativeSessionId === null`, which is preserved across migrations). Once
+    // `markPlacementMigrationInstalled` clears the marker or a newer epoch supersedes it,
+    // omit the grant for pure local continuation.
     if (existingPointer && existingPointer.poolKind === 'local_container') {
       if (existingPointer.migrationState !== 'active' || existingPointer.engine !== authEngine) {
         return null
       }
-      const needsIdempotentGrantRedelivery =
-        existingPointer.placementEpoch >= 2 && existingPointer.nativeSessionId === null
+      const pendingInstall = extractPendingInstallMigration(existingPointer.promptCacheMeta)
       const redeliveredGrant: CrossPoolFallbackMigrationGrant | undefined =
-        needsIdempotentGrantRedelivery
+        pendingInstall !== null &&
+        pendingInstall.targetPoolKind === 'local_container' &&
+        pendingInstall.targetEpoch === existingPointer.placementEpoch
           ? Object.freeze({
-              migrationId: `reissue-local-e${existingPointer.placementEpoch}-${input.uid}`,
-              placementEpoch: existingPointer.placementEpoch,
+              migrationId: pendingInstall.migrationId,
+              placementEpoch: pendingInstall.targetEpoch,
               allowBackendTransition: true as const,
-              continuityTier: 'cold_degraded' as const,
+              continuityTier: pendingInstall.continuityTier,
             })
           : undefined
       return Object.freeze({
@@ -740,7 +744,27 @@ export function createSelfhostCrossPoolFallbackSelector(
       }
     }
 
-    const committed = await authorityStore
+    const readBackCommittedLocal = async () => {
+      const readBack = await authorityStore
+        .getPlacementMigration(begun.migration.migrationId)
+        .catch(() => null)
+      if (readBack && readBack.state === 'committed') {
+        const ptr = await authorityStore
+          .getEnginePointer(input.uid, input.sessionKey)
+          .catch(() => null)
+        if (
+          ptr &&
+          ptr.poolKind === 'local_container' &&
+          ptr.migrationState === 'active' &&
+          ptr.placementEpoch === readBack.toEpoch
+        ) {
+          return { applied: true as const, migration: readBack, pointer: ptr }
+        }
+      }
+      return null
+    }
+
+    let committed = await authorityStore
       .commitPlacementMigration({
         migrationId: begun.migration.migrationId,
         userId: input.uid,
@@ -748,19 +772,10 @@ export function createSelfhostCrossPoolFallbackSelector(
         continuityTier,
       })
       .catch(async () => {
-        // B01: If PG commit landed before the ack was lost, read back the authoritative
-        // migration/pointer state instead of blindly aborting and dropping the grant!
-        const readBack = await authorityStore
-          .getPlacementMigration(begun.migration.migrationId)
-          .catch(() => null)
-        if (readBack && readBack.state === 'committed') {
-          const ptr = await authorityStore
-            .getEnginePointer(input.uid, input.sessionKey)
-            .catch(() => null)
-          if (ptr && ptr.poolKind === 'local_container' && ptr.migrationState === 'active') {
-            return { applied: true as const, migration: readBack, pointer: ptr }
-          }
-        }
+        // B01 + OCV5-893 B3: If PG commit landed before the ack was lost, read back the
+        // authoritative migration/pointer state instead of blindly aborting and dropping the grant!
+        const recovered = await readBackCommittedLocal()
+        if (recovered) return recovered
         await authorityStore
           .abortPlacementMigration({
             migrationId: begun.migration.migrationId,
@@ -773,15 +788,20 @@ export function createSelfhostCrossPoolFallbackSelector(
       })
 
     if (!committed || !committed.applied) {
-      await authorityStore
-        .abortPlacementMigration({
-          migrationId: begun.migration.migrationId,
-          reason: 'commit_not_applied',
-          userId: input.uid,
-          sessionKey: input.sessionKey,
-        })
-        .catch(() => {})
-      return null
+      const recovered = await readBackCommittedLocal()
+      if (recovered) {
+        committed = recovered
+      } else {
+        await authorityStore
+          .abortPlacementMigration({
+            migrationId: begun.migration.migrationId,
+            reason: 'commit_not_applied',
+            userId: input.uid,
+            sessionKey: input.sessionKey,
+          })
+          .catch(() => {})
+        return null
+      }
     }
 
     const migrationGrant: CrossPoolFallbackMigrationGrant = Object.freeze({
@@ -842,7 +862,33 @@ export function createSelfhostReturnToRemoteGrantResolver(
     } catch {
       return null
     }
-    if (!existingPointer || existingPointer.poolKind !== 'local_container') {
+    if (!existingPointer) {
+      return null
+    }
+
+    const backendOperationId =
+      'operationId' in input.executionBackend &&
+      typeof input.executionBackend.operationId === 'string' &&
+      input.executionBackend.operationId.trim().length > 0
+        ? input.executionBackend.operationId.trim()
+        : null
+    const pendingInstall = extractPendingInstallMigration(existingPointer.promptCacheMeta)
+    // OCV5-893 B3: Restrict remote re-delivery strictly to the exact committed targetOperationId
+    // when one was recorded so a brand-new remote operation can never inherit a stale grant.
+    const operationMatchesPendingInstall =
+      pendingInstall !== null &&
+      (pendingInstall.targetOperationId === null ||
+        (backendOperationId !== null && pendingInstall.targetOperationId === backendOperationId))
+    const isPendingRemoteInstallRedelivery =
+      existingPointer.poolKind === 'remote_pool' &&
+      existingPointer.migrationState === 'active' &&
+      existingPointer.engine === authEngine &&
+      pendingInstall !== null &&
+      pendingInstall.targetPoolKind === 'remote_pool' &&
+      pendingInstall.targetEpoch === existingPointer.placementEpoch &&
+      operationMatchesPendingInstall
+
+    if (existingPointer.poolKind !== 'local_container' && !isPendingRemoteInstallRedelivery) {
       return null
     }
 
@@ -900,6 +946,32 @@ export function createSelfhostReturnToRemoteGrantResolver(
     } catch {
       input.onBlocked?.('REMOTE_OPERATION_BILLING_PENDING')
       return null
+    }
+
+    // OCV5-893 B3: PG already committed `local_container -> remote_pool` at this epoch,
+    // but the first frame was lost before container installation (`pendingInstallMigration`
+    // is still present). Re-deliver the exact committed grant after running `beforeCommit`
+    // sign/epoch validation — without starting a redundant migration or bumping epoch!
+    if (isPendingRemoteInstallRedelivery && pendingInstall !== null) {
+      const redeliveredGrant: CrossPoolFallbackMigrationGrant = Object.freeze({
+        migrationId: pendingInstall.migrationId,
+        placementEpoch: pendingInstall.targetEpoch,
+        allowBackendTransition: true as const,
+        continuityTier: pendingInstall.continuityTier,
+      })
+      if (input.beforeCommit) {
+        let approved = false
+        try {
+          approved = await input.beforeCommit({ migrationGrant: redeliveredGrant })
+        } catch {
+          approved = false
+        }
+        if (!approved) {
+          input.onBlocked?.('RETURN_TO_REMOTE_SIGN_REJECTED')
+          return null
+        }
+      }
+      return redeliveredGrant
     }
 
     let rollingCheckpoint: Awaited<ReturnType<PgSessionAuthorityStateStore['peekRollingCheckpoint']>>
@@ -995,7 +1067,27 @@ export function createSelfhostReturnToRemoteGrantResolver(
       }
     }
 
-    const committed = await authorityStore
+    const readBackCommittedRemote = async () => {
+      const readBack = await authorityStore
+        .getPlacementMigration(begun.migration.migrationId)
+        .catch(() => null)
+      if (readBack && readBack.state === 'committed') {
+        const ptr = await authorityStore
+          .getEnginePointer(input.uid, input.sessionKey)
+          .catch(() => null)
+        if (
+          ptr &&
+          ptr.poolKind === 'remote_pool' &&
+          ptr.migrationState === 'active' &&
+          ptr.placementEpoch === readBack.toEpoch
+        ) {
+          return { applied: true as const, migration: readBack, pointer: ptr }
+        }
+      }
+      return null
+    }
+
+    let committed = await authorityStore
       .commitPlacementMigration({
         migrationId: begun.migration.migrationId,
         userId: input.uid,
@@ -1005,6 +1097,10 @@ export function createSelfhostReturnToRemoteGrantResolver(
         ...(backendProfileId ? { profileId: backendProfileId } : {}),
       })
       .catch(async () => {
+        // OCV5-893 B3: If PG commit actually landed before ack was lost, read back
+        // authoritative state and deliver the committed grant instead of mis-aborting!
+        const recovered = await readBackCommittedRemote()
+        if (recovered) return recovered
         await authorityStore
           .abortPlacementMigration({
             migrationId: begun.migration.migrationId,
@@ -1017,23 +1113,28 @@ export function createSelfhostReturnToRemoteGrantResolver(
       })
 
     if (!committed || !committed.applied) {
-      await authorityStore
-        .abortPlacementMigration({
-          migrationId: begun.migration.migrationId,
-          reason: 'return_to_remote_commit_not_applied',
-          userId: input.uid,
-          sessionKey: input.sessionKey,
-        })
-        .catch(() => {})
-      input.onBlocked?.('RETURN_TO_REMOTE_COMMIT_FAILED')
-      return null
+      const recovered = await readBackCommittedRemote()
+      if (recovered) {
+        committed = recovered
+      } else {
+        await authorityStore
+          .abortPlacementMigration({
+            migrationId: begun.migration.migrationId,
+            reason: 'return_to_remote_commit_not_applied',
+            userId: input.uid,
+            sessionKey: input.sessionKey,
+          })
+          .catch(() => {})
+        input.onBlocked?.('RETURN_TO_REMOTE_COMMIT_FAILED')
+        return null
+      }
     }
 
     return Object.freeze({
       migrationId: committed.migration.migrationId,
       placementEpoch: committed.pointer.placementEpoch,
       allowBackendTransition: true as const,
-      continuityTier,
+      continuityTier: committed.migration.continuityTier ?? continuityTier,
     })
   }
 }

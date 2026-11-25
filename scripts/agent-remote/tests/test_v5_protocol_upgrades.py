@@ -665,10 +665,10 @@ for ln in sys.stdin:
         self.assertIn("<openclaude_platform_context>", enc2["lines"][0])
         self.assertIn("SYS_KEEP", enc2["lines"][0])
 
-    def test_new_turn_rejects_image_content_fail_closed(self) -> None:
+    def test_new_turn_supports_multimodal_images_and_rejects_invalid_fail_closed(self) -> None:
         mod, _, _ = load_driver("antigravity")
         st = {"initialized": True, "sessionId": str(uuid.uuid4())}
-        with self.assertRaisesRegex(ValueError, "AGY_VISION_CONTENT_UNSUPPORTED"):
+        enc_mix = validate_encode_batch(
             mod.encode(
                 {
                     "kind": "newTurn",
@@ -680,14 +680,37 @@ for ln in sys.stdin:
                     ],
                 },
                 st,
-            )
-        with self.assertRaisesRegex(ValueError, "AGY_VISION_CONTENT_UNSUPPORTED"):
+            ),
+            {"kind": "newTurn", "commandId": "cmd_agy_img_1"},
+        )
+        wire_mix = json.loads(enc_mix["lines"][0])
+        self.assertEqual(wire_mix["prompt"], "describe")
+        self.assertEqual(len(wire_mix["images"]), 1)
+        self.assertEqual(wire_mix["images"][0]["mimeType"], "image/png")
+
+        enc_img_only = validate_encode_batch(
             mod.encode(
                 {
                     "kind": "newTurn",
                     "commandId": "cmd_agy_img_2",
                     "prompt": "",
                     "content": [{"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo="}],
+                },
+                st,
+            ),
+            {"kind": "newTurn", "commandId": "cmd_agy_img_2"},
+        )
+        wire_img_only = json.loads(enc_img_only["lines"][0])
+        self.assertTrue(len(wire_img_only["prompt"].strip()) > 0)
+        self.assertEqual(len(wire_img_only["images"]), 1)
+
+        with self.assertRaisesRegex(ValueError, "AGY_IMAGE_INVALID"):
+            mod.encode(
+                {
+                    "kind": "newTurn",
+                    "commandId": "cmd_agy_img_bad_path",
+                    "prompt": "describe",
+                    "content": [{"type": "image", "mimeType": "image/png", "path": "/tmp/unmaterialized.png"}],
                 },
                 st,
             )

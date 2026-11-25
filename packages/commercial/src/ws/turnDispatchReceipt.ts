@@ -28,6 +28,7 @@ type ReceiptContext<R extends ReceiptRecord, E extends { record: R }> = {
   settleCronOriginClaim(dispatchId: string, result: ClaimResult): void
   hasCronOriginClaim(dispatchId: string): boolean
   noteDispatchStreamFrame(sessionId: string, clientMessageId: string, final: boolean): void
+  onDispatchAccepted?(record: R): void
   broadcast(frame: unknown): void
   warn(message: string, meta: Record<string, unknown>): void
 }
@@ -122,6 +123,7 @@ export function handleTurnDispatchReceipt<R extends ReceiptRecord, E extends { r
       // The atomic recovery statement verifies this exact attempt/epoch is
       // accepted before it commits forwarded; duplicate receipts cannot win it.
       if (accepted) {
+        context.onDispatchAccepted?.(rec)
         context.broadcast(acceptedFrame())
         context.broadcast(recoveryRunningFrame(rec.recoveryJob!))
       }
@@ -139,12 +141,14 @@ export function handleTurnDispatchReceipt<R extends ReceiptRecord, E extends { r
         })
         if (accepted !== null) {
           claimed = true
+          context.onDispatchAccepted?.(rec)
           context.broadcast(acceptedFrame())
         } else if (mustConfirmCronClaim) {
           const durable = await getDispatchByLogicalKey(pool, {
             userId: context.uid, sessionId: rec.sessionId, clientMessageId: rec.clientMessageId,
           })
           claimed = durable?.dispatchId === rec.dispatchId && durable.attemptNo === rec.attemptNo && durable.status === 'accepted'
+          if (claimed) context.onDispatchAccepted?.(rec)
         }
       } catch (err) {
         context.warn('user-chat-bridge: dispatch receipt CAS failed', { dispatchId: rec.dispatchId, err })

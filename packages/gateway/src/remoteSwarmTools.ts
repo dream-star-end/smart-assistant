@@ -16,6 +16,12 @@ import {
   readBoardPostsSinceSeq,
 } from './remoteSwarmLocks.js'
 import {
+  formatRemoteSwarmModelsResponse,
+  readMemberEffort,
+  resolveRemoteSwarmMemberModel,
+  writeMemberEffort,
+} from './remoteSwarmModelPolicy.js'
+import {
   createWorkerGitWorktree,
   findGitRepoTopLevel,
   isGitWorktreeUnsafeToDelete,
@@ -36,6 +42,8 @@ const MAX_SHARD_ADD = 8
 export interface RemoteSwarmToolHost {
   readonly location: RemoteSwarmLocation
   readonly model: string
+  readonly effort?: string
+  readonly allowedModels?: readonly string[]
   readonly workspaceCwd: string
   isWorkerRunning(name: string): boolean
   getInterruptGeneration(): number
@@ -220,21 +228,25 @@ export async function executeSwarmStatusAction(
   const roster = await host.readRoster()
   const allPosts = readBoardPostsFromDisk(host.location.swarmDir)
   const headSeq = allPosts.reduce((m, p) => Math.max(m, p.seq), 0)
-  const members = Object.entries(roster.members).map(([name, m]) => ({
-    name,
-    role: m.role,
-    model: m.model,
-    status: m.killed
-      ? 'killed'
-      : host.isWorkerRunning(name) || (name === 'coordinator' && m.phase === 'RUNNING')
-        ? 'working'
-        : m.phase === 'STOPPED'
-          ? 'stopped'
-          : 'waiting',
-    channels: m.channels,
-    workspace: m.workspace?.path ?? host.workspaceCwd,
-    workspace_mode: m.workspace?.mode ?? 'inherit',
-  }))
+  const members = Object.entries(roster.members).map(([name, m]) => {
+    const memberEffort = readMemberEffort(m)
+    return {
+      name,
+      role: m.role,
+      model: m.model,
+      ...(memberEffort ? { effort: memberEffort } : {}),
+      status: m.killed
+        ? 'killed'
+        : host.isWorkerRunning(name) || (name === 'coordinator' && m.phase === 'RUNNING')
+          ? 'working'
+          : m.phase === 'STOPPED'
+            ? 'stopped'
+            : 'waiting',
+      channels: m.channels,
+      workspace: m.workspace?.path ?? host.workspaceCwd,
+      workspace_mode: m.workspace?.mode ?? 'inherit',
+    }
+  })
   return {
     ok: true,
     swarm_id: host.location.swarmId,
@@ -354,8 +366,13 @@ export async function executeSwarmAddAction(
         ),
       ]
     : []
-  const workerModel =
-    typeof args.model === 'string' && args.model.trim() ? args.model.trim() : host.model
+  const resolvedModel = resolveRemoteSwarmMemberModel(args.model, {
+    defaultModel: host.model,
+    defaultEffort: host.effort,
+    allowedModels: host.allowedModels,
+  })
+  const workerModel = resolvedModel.canonicalModel
+  const workerEffort = resolvedModel.effort
 
   const specs: Array<{ name: string; fullBrief: string }> =
     count === 1 && !tasksArr
@@ -487,7 +504,7 @@ export async function executeSwarmAddAction(
         roster.channels[ch] = { creator: caller, archived: false }
       }
       for (const spec of specs) {
-        roster.members[spec.name] = {
+        const nextRec: RosterMemberRecord = {
           conversation_id: randomUUID(),
           role: inferMemberRole(spec.name),
           model: workerModel,
@@ -500,6 +517,8 @@ export async function executeSwarmAddAction(
           workspace: wsByMember.get(spec.name) ?? { mode: 'inherit' },
           added_by: caller,
         }
+        writeMemberEffort(nextRec, workerEffort)
+        roster.members[spec.name] = nextRec
         if (roster.pending_adds) {
           delete roster.pending_adds[spec.name]
         }
@@ -537,7 +556,14 @@ export async function executeSwarmAddAction(
     throw err
   }
 
-  const added: Array<{ name: string; workspace_mode: string; workspace: string; seq: number }> = []
+  const added: Array<{
+    name: string
+    model: string
+    effort?: string
+    workspace_mode: string
+    workspace: string
+    seq: number
+  }> = []
   let interrupted = false
   for (const spec of specs) {
     if (host.isSessionStopped(addGeneration)) {
@@ -558,6 +584,8 @@ export async function executeSwarmAddAction(
     }
     added.push({
       name: spec.name,
+      model: workerModel,
+      ...(workerEffort ? { effort: workerEffort } : {}),
       workspace_mode: ws.mode,
       workspace: 'path' in ws ? ws.path : host.workspaceCwd,
       seq: post.seq,
@@ -588,4 +616,45 @@ export async function executeSwarmAddAction(
     }
   }
   return { ok: true, added }
+}
+
+export function executeSwarmModelsAction(
+  host: RemoteSwarmToolHost,
+): Record<string, unknown> {
+  return formatRemoteSwarmModelsResponse({
+    defaultModel: host.model,
+    defaultEffort: host.effort,
+    allowedModels: host.allowedModels,
+  })
+}
+
+export async function executeSwarmModelAction(
+  host: RemoteSwarmToolHost,
+  caller: string,
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const target =
+    typeof args.name === 'string' && args.name.trim() ? args.name.trim().toLowerCase() : caller
+  const rawModel = typeof args.model === 'string' ? args.model.trim() : ''
+  if (!rawModel) throw new Error('SWARM_MODEL_REQUIRED')
+  const resolved = resolveRemoteSwarmMemberModel(rawModel, {
+    defaultModel: host.model,
+    defaultEffort: host.effort,
+    allowedModels: host.allowedModels,
+  })
+  await host.mutateRoster((roster) => {
+    if (host.isWorkerRunning(target)) {
+      throw new Error(`SWARM_MEMBER_BUSY:${target}`)
+    }
+    const rec = roster.members[target]
+    if (!rec) throw new Error(`SWARM_MEMBER_NOT_FOUND:${target}`)
+    rec.model = resolved.canonicalModel
+    writeMemberEffort(rec, resolved.effort)
+  })
+  return {
+    ok: true,
+    name: target,
+    model: resolved.canonicalModel,
+    ...(resolved.effort ? { effort: resolved.effort } : {}),
+  }
 }

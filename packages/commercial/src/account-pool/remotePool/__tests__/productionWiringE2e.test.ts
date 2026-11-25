@@ -292,6 +292,17 @@ class MockThreeLayerPgPool implements PgTransactionPool {
       return { rows: [{ ...row }], rowCount: 1 }
     }
 
+    if (sql.startsWith('UPDATE session_engine_pointers SET prompt_cache_meta_json = $3')) {
+      const k = `${params[0]}:${params[1]}`
+      const row = db.pointers.get(k)
+      if (!row || Number(row.placement_epoch) !== Number(params[3])) {
+        return { rows: [], rowCount: 0 }
+      }
+      row.prompt_cache_meta_json = params[2] === null ? null : JSON.parse(String(params[2]))
+      row.updated_at = this.nowIso(db)
+      return { rows: [{ placement_epoch: row.placement_epoch }], rowCount: 1 }
+    }
+
     // session_placement_migrations
     if (sql.startsWith('INSERT INTO session_placement_migrations')) {
       const now = this.nowIso(db)
@@ -1149,8 +1160,57 @@ describe('OCV5-890 B01/B05/B14 production wiring end-to-end verification', () =>
       (err: unknown) => err instanceof AuthorityRejected && err.code === 'verify_fail',
     )
 
-    // ── Turn 2d (B01 continued remote outage): already on local_container -> direct local reuse, NO migration, NO epoch bump! ──
+    // ── Turn 2d (OCV5-893 B3 + B01 continued remote outage):
+    // Before container confirms installation (`markPlacementMigrationInstalled`), retrying while
+    // already on local_container MUST re-deliver the EXACT committed migrationGrant (even though
+    // `nativeSessionId` is non-null!) without bumping placementEpoch or starting a new migration.
+    // Once `markPlacementMigrationInstalled` clears `pendingInstallMigration`, subsequent local
+    // reuse omits the grant for pure local continuation! ──
     const migrationsCountBeforeReuse = pgPool.state.migrations.size
+    const turn2RedeliverSealed = await resolveRemotePoolBackendAndSeal({
+      uid,
+      containerId,
+      sessionKey,
+      exec: makeSealExec('claude-opus-4-6-remote'),
+      log: null,
+      cc5BackendSelector,
+      crossPoolFallbackSelector: bootstrapHooks.crossPoolFallbackSelector,
+      returnToRemoteGrantResolver: bootstrapHooks.returnToRemoteGrantResolver,
+      resolveLocalExec: async (m) => (snapshot.resolve(m) ? makeSealExec(m) : null),
+      readEpochAtSign: async () => snapshot.securityEpoch,
+      signAuthorityBundle: signExec,
+      reject: async () => null,
+    })
+    assert.ok(turn2RedeliverSealed !== null)
+    const verifiedRedeliver = consumer.consume(turn2RedeliverSealed, { challenge: 'conn-challenge-e2e-1' })
+    assert.equal(
+      verifiedRedeliver.poolMigration?.migrationId,
+      verifiedTurnAuthority.poolMigration.migrationId,
+      'B3: before installation is marked, retry must re-deliver exact committed migrationGrant even when nativeSessionId is non-null',
+    )
+    assert.equal((await authorityStore.getEnginePointer(uid, sessionKey))?.placementEpoch, 2)
+    assert.equal(pgPool.state.migrations.size, migrationsCountBeforeReuse)
+
+    assert.equal(
+      await authorityStore.markPlacementMigrationInstalled(
+        uid,
+        sessionKey,
+        2,
+        verifiedTurnAuthority.poolMigration.migrationId,
+      ),
+      true,
+    )
+    // Idempotent second call returns false
+    assert.equal(
+      await authorityStore.markPlacementMigrationInstalled(
+        uid,
+        sessionKey,
+        2,
+        verifiedTurnAuthority.poolMigration.migrationId,
+      ),
+      false,
+    )
+
     const turn2ReuseSealed = await resolveRemotePoolBackendAndSeal({
       uid,
       containerId,
@@ -1168,7 +1228,7 @@ describe('OCV5-890 B01/B05/B14 production wiring end-to-end verification', () =>
     assert.ok(turn2ReuseSealed !== null, 'continued outage while on local_container must directly reuse local placement')
     assert.equal(turn2ReuseSealed.model, 'claude-opus-4-6')
     const verifiedReuse = consumer.consume(turn2ReuseSealed, { challenge: 'conn-challenge-e2e-1' })
-    assert.equal(verifiedReuse.poolMigration, undefined, 'same-pool local reuse must NOT mint a fake migrationGrant')
+    assert.equal(verifiedReuse.poolMigration, undefined, 'after installation confirmed, same-pool local reuse must NOT re-issue migrationGrant')
     assert.equal(verifiedReuse.executionBackend, undefined)
     assert.equal((await authorityStore.getEnginePointer(uid, sessionKey))?.placementEpoch, 2, 'same-pool local reuse must NOT bump placementEpoch')
     assert.equal(pgPool.state.migrations.size, migrationsCountBeforeReuse, 'same-pool local reuse must NOT begin a new migration')
@@ -1742,6 +1802,18 @@ describe('OCV5-890 B01/B05/B14 production wiring end-to-end verification', () =>
         engine: 'codex',
         placement: 'local',
       }),
+      makeCatalogEntry({
+        entryId: 5,
+        modelId: 'grok-4-build-remote',
+        engine: 'grok',
+        placement: 'remote_pool',
+      }),
+      makeCatalogEntry({
+        entryId: 6,
+        modelId: 'grok-4-build',
+        engine: 'grok',
+        placement: 'local',
+      }),
     ])
     const strictFenceSelector = createSelfhostCrossPoolFallbackSelector({
       pool: pgPool,
@@ -1749,15 +1821,14 @@ describe('OCV5-890 B01/B05/B14 production wiring end-to-end verification', () =>
       selfhost: true,
       authorityStore,
     })
-    // Non-egress-billed engine (codex) must fail closed at post-classification seal point
-    // so local Codex billing route/journal can never be bypassed.
+    // Unsupported engine (grok) must still fail closed directly in selfhostCrossPoolSelector.
     assert.equal(
       await strictFenceSelector({
         uid: 42,
         containerId: 99,
-        sessionKey: 'agent:main:webchat:dm:codex-billing-guard',
-        canonicalModel: 'gpt-6-luna-remote',
-        engine: 'codex',
+        sessionKey: 'agent:main:webchat:dm:grok-unsupported-guard',
+        canonicalModel: 'grok-4-build-remote',
+        engine: 'grok',
         cause: new Error('REMOTE_LANE_CAPACITY_EXHAUSTED'),
       }),
       null,
@@ -1941,15 +2012,343 @@ describe('OCV5-890 B01/B05/B14 production wiring end-to-end verification', () =>
     assert.equal(ready.unsettledLegacyJournalCount, 0)
   })
 
-  it('B14: local AntigravityAdapter unconditionally rejects readOnly turns with ANTIGRAVITY_READ_ONLY_UNSUPPORTED (no boolean bypass)', async () => {
+  it('OCV5-893: Codex & Antigravity cross-pool fallback with prepareLocalFallbackTransport, smooth remote recovery, and strict N01/B06/missing-prep/commit-fail compensation gates', async () => {
+    const pgPool = new MockThreeLayerPgPool()
+    const authorityStore = new PgSessionAuthorityStateStore(pgPool)
+    const bindingStore = new PgLogicalModelBindingStore(pgPool)
+    const uid = 88
+    const containerId = 108
+
+    const snapshot = makeCatalogSnapshot([
+      makeCatalogEntry({
+        entryId: 10,
+        modelId: 'gpt-6-luna-remote',
+        engine: 'codex',
+        placement: 'remote_pool',
+      }),
+      makeCatalogEntry({
+        entryId: 11,
+        modelId: 'gpt-6-luna',
+        engine: 'codex',
+        placement: 'local',
+      }),
+      makeCatalogEntry({
+        entryId: 12,
+        modelId: 'antigravity-gemini-4-neon-remote',
+        engine: 'antigravity',
+        placement: 'remote_pool',
+      }),
+      makeCatalogEntry({
+        entryId: 13,
+        modelId: 'antigravity-gemini-4-neon',
+        engine: 'antigravity',
+        placement: 'local',
+      }),
+    ])
+    const bootstrapHooks = buildSelfhostCrossPoolBridgeHooks({
+      isSelfhostV5: true,
+      pool: pgPool,
+      modelCatalogCache: { assertFresh: async () => snapshot },
+    })
+
+    const signer = AuthoritySigner.createEphemeral()
+    const consumer = new ModelAuthorityConsumer({
+      keyring: parseAuthorityKeyring(signer.publicKeyringEnv()),
+      uid,
+      containerId,
+      required: true,
+    })
+    const makeSealExec = (modelId: string) => {
+      const desc = snapshot.resolve(modelId)!
+      return {
+        canonicalModel: desc.canonicalModel,
+        engine: desc.engine,
+        placement: desc.placement === 'remote_pool' ? ('remote_pool' as const) : ('local' as const),
+        securityEpoch: Number(snapshot.securityEpoch),
+        descriptor: {
+          capabilitySchemaVersion: CAPABILITY_SCHEMA_VERSION,
+          contextWindow: desc.contextWindow,
+          supportsVision: desc.capabilityProfile.supportsVision,
+          supportedEfforts: [...desc.capabilityProfile.reasoning.supported],
+          capabilityProfile: JSON.parse(JSON.stringify(desc.capabilityProfile)),
+        },
+      }
+    }
+    const signExec = (
+      exec: ReturnType<typeof makeSealExec>,
+      billingRequestId?: string,
+      authorityTurnId?: string,
+      executionBackend?: Parameters<AuthoritySigner['signBundle']>[0]['executionBackend'],
+      poolMigration?: Parameters<AuthoritySigner['signBundle']>[0]['poolMigration'],
+    ) =>
+      signer.signBundle({
+        uid,
+        containerId,
+        connectionChallenge: 'conn-ocv5-893-e2e',
+        canonicalModel: exec.canonicalModel,
+        engine: exec.engine,
+        executionDescriptor: exec.descriptor,
+        auxModels: [],
+        ...(executionBackend ? { executionBackend } : {}),
+        ...(poolMigration ? { poolMigration } : {}),
+        ...(authorityTurnId ? { authorityTurnId } : {}),
+        ...(billingRequestId ? { billingRequestId } : {}),
+        executionRevision: 'rev-893-e2e',
+        securityEpoch: exec.securityEpoch,
+      }).bundle
+
+    // 1) Codex & Antigravity full loop: remote -> local fallback (with transport prep) -> remote recovery
+    for (const cfg of [
+      {
+        engine: 'codex' as const,
+        driverId: 'codex',
+        remoteModel: 'gpt-6-luna-remote',
+        localModel: 'gpt-6-luna',
+        routeKey: '__oc_codex_route',
+        routeValue: { baseUrl: 'http://127.0.0.1:18789/codex/t1', modelProvider: 'openai' },
+      },
+      {
+        engine: 'antigravity' as const,
+        driverId: 'antigravity',
+        remoteModel: 'antigravity-gemini-4-neon-remote',
+        localModel: 'antigravity-gemini-4-neon',
+        routeKey: '__oc_antigravity_route',
+        routeValue: { baseUrl: 'http://127.0.0.1:18789/agy/t1', routeToken: 't1', accessToken: 'ya29.x' },
+      },
+    ]) {
+      const sessionKey = `agent:main:webchat:dm:893-e2e-${cfg.engine}`
+      const turn1OpId = `10000000-0000-4000-8000-${cfg.engine === 'codex' ? '000000000001' : '000000000002'}`
+      await authorityStore.upsertEnginePointer({
+        userId: uid,
+        sessionKey,
+        poolKind: 'remote_pool',
+        engine: cfg.engine,
+        nativeSessionId: `native-${cfg.engine}-1`,
+        operationId: turn1OpId,
+        profileId: `prof-${cfg.engine}-1`,
+      })
+
+      // Negative A: Omitting prepareLocalFallbackTransport MUST fail closed without moving PG epoch
+      const deniedNoPrep = await resolveRemotePoolBackendAndSeal({
+        uid,
+        containerId,
+        sessionKey,
+        exec: makeSealExec(cfg.remoteModel),
+        billingRequestId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        log: null,
+        cc5BackendSelector: async () => {
+          throw new Error('REMOTE_LANE_CAPACITY_EXHAUSTED')
+        },
+        crossPoolFallbackSelector: bootstrapHooks.crossPoolFallbackSelector,
+        returnToRemoteGrantResolver: bootstrapHooks.returnToRemoteGrantResolver,
+        resolveLocalExec: async (m) => (snapshot.resolve(m) ? makeSealExec(m) : null),
+        readEpochAtSign: async () => snapshot.securityEpoch,
+        signAuthorityBundle: signExec,
+        reject: async () => null,
+      })
+      assert.equal(deniedNoPrep, null)
+      assert.equal((await authorityStore.getEnginePointer(uid, sessionKey))?.placementEpoch, 1)
+
+      // Negative B: B06 unsettled billing journal rejects BEFORE calling prepareLocalFallbackTransport
+      pgPool.state.pendingJournals.push({
+        userId: String(uid),
+        version: REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION,
+        operationId: turn1OpId,
+        state: 'inflight',
+      })
+      let prepCallsDuringB06 = 0
+      const deniedB06 = await resolveRemotePoolBackendAndSeal({
+        uid,
+        containerId,
+        sessionKey,
+        exec: makeSealExec(cfg.remoteModel),
+        billingRequestId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        log: null,
+        cc5BackendSelector: async () => {
+          throw new Error('REMOTE_LANE_PROFILE_UNAVAILABLE')
+        },
+        crossPoolFallbackSelector: bootstrapHooks.crossPoolFallbackSelector,
+        returnToRemoteGrantResolver: bootstrapHooks.returnToRemoteGrantResolver,
+        prepareLocalFallbackTransport: async () => {
+          prepCallsDuringB06 += 1
+          return null
+        },
+        resolveLocalExec: async (m) => (snapshot.resolve(m) ? makeSealExec(m) : null),
+        readEpochAtSign: async () => snapshot.securityEpoch,
+        signAuthorityBundle: signExec,
+        reject: async () => null,
+      })
+      assert.equal(deniedB06, null)
+      assert.equal(prepCallsDuringB06, 0, 'B06 must reject before invoking prepareLocalFallbackTransport')
+      assert.equal((await authorityStore.getEnginePointer(uid, sessionKey))?.placementEpoch, 1)
+      pgPool.state.pendingJournals.length = 0
+
+      // Negative C: N01 all bindings explicitly disabled rejects BEFORE calling prepareLocalFallbackTransport
+      await bindingStore.upsertPoolBinding({
+        logicalModelId: cfg.localModel,
+        poolKind: 'local_pool',
+        driverId: `local-${cfg.driverId}`,
+        canonicalModelId: cfg.localModel,
+        priority: 1,
+        capabilities: {
+          logicalModel: cfg.localModel,
+          upstreamModelId: cfg.localModel,
+          supportsVision: true,
+          supportedEfforts: ['low', 'medium', 'high'],
+          defaultEffort: 'medium',
+          supportedServiceTiers: ['standard'],
+          supportsReadOnly: true,
+          supportsConsultTurn: true,
+          supportsHermeticNoTools: true,
+          supportsSwarm: false,
+          supportsAdaptiveThinking: false,
+          contextWindow: 200_000,
+        },
+        enabled: false,
+      })
+      let prepCallsDuringN01 = 0
+      const deniedN01 = await resolveRemotePoolBackendAndSeal({
+        uid,
+        containerId,
+        sessionKey,
+        exec: makeSealExec(cfg.remoteModel),
+        billingRequestId: 'cccccccccccccccccccccccccccccccc',
+        log: null,
+        cc5BackendSelector: async () => {
+          throw new Error('REMOTE_LANE_UNAVAILABLE')
+        },
+        crossPoolFallbackSelector: bootstrapHooks.crossPoolFallbackSelector,
+        returnToRemoteGrantResolver: bootstrapHooks.returnToRemoteGrantResolver,
+        prepareLocalFallbackTransport: async () => {
+          prepCallsDuringN01 += 1
+          return null
+        },
+        resolveLocalExec: async (m) => (snapshot.resolve(m) ? makeSealExec(m) : null),
+        readEpochAtSign: async () => snapshot.securityEpoch,
+        signAuthorityBundle: signExec,
+        reject: async () => null,
+      })
+      assert.equal(deniedN01, null)
+      assert.equal(prepCallsDuringN01, 0, 'N01 disabled bindings must reject before invoking prepareLocalFallbackTransport')
+      assert.equal((await authorityStore.getEnginePointer(uid, sessionKey))?.placementEpoch, 1)
+      await bindingStore.setPoolBindingEnabled(cfg.localModel, 'local_pool', `local-${cfg.driverId}`, true)
+
+      // Positive Turn 2: remote unavailable -> local fallback succeeds with minted local route & budget
+      let compensateCount = 0
+      const reqIdFallback = 'dddddddddddddddddddddddddddddddd'
+      const turn2Sealed = await resolveRemotePoolBackendAndSeal({
+        uid,
+        containerId,
+        sessionKey,
+        exec: makeSealExec(cfg.remoteModel),
+        billingRequestId: reqIdFallback,
+        log: null,
+        cc5BackendSelector: async () => {
+          throw new Error('REMOTE_LANE_CAPACITY_EXHAUSTED')
+        },
+        crossPoolFallbackSelector: bootstrapHooks.crossPoolFallbackSelector,
+        returnToRemoteGrantResolver: bootstrapHooks.returnToRemoteGrantResolver,
+        prepareLocalFallbackTransport: async ({ localExec, billingRequestId }) => {
+          assert.equal(localExec.canonicalModel, cfg.localModel)
+          return {
+            billingRequestId,
+            extraFrameFields: {
+              requestId: billingRequestId,
+              _creditBudget: '4200',
+              [cfg.routeKey]: cfg.routeValue,
+            },
+            compensate: () => {
+              compensateCount += 1
+            },
+          }
+        },
+        resolveLocalExec: async (m) => (snapshot.resolve(m) ? makeSealExec(m) : null),
+        readEpochAtSign: async () => snapshot.securityEpoch,
+        signAuthorityBundle: signExec,
+        reject: async () => null,
+      })
+      assert.ok(turn2Sealed !== null)
+      assert.equal(compensateCount, 0)
+      assert.equal(turn2Sealed.model, cfg.localModel)
+      assert.equal(turn2Sealed._creditBudget, '4200')
+      assert.deepEqual(turn2Sealed[cfg.routeKey], cfg.routeValue)
+
+      const verified2 = consumer.consume(turn2Sealed, { challenge: 'conn-ocv5-893-e2e' })
+      assert.equal(verified2.engine, cfg.engine)
+      assert.equal(verified2.poolMigration?.placementEpoch, 2)
+      assert.equal(verified2.poolMigration?.allowBackendTransition, true)
+      assert.equal((await authorityStore.getEnginePointer(uid, sessionKey))?.poolKind, 'local_container')
+
+      // Gateway admission accepts fallback transition with verified grant
+      const storedRemoteResume = remoteV4ResumeId(turn1OpId, `native-${cfg.engine}-1`)
+      assert.equal(
+        cc5SessionBackend({
+          executionAuthority: { source: 'bridge_signed', executionBackend: undefined },
+          engineId: cfg.engine,
+          executionModel: cfg.remoteModel,
+          sessionKey,
+          storedResumeId: storedRemoteResume,
+          poolMigration: verified2.poolMigration,
+        }),
+        undefined,
+      )
+
+      // Positive Turn 3: remote recovers -> return-to-remote grant advances epoch 2 -> 3
+      const recoveredBackend = Object.freeze({
+        kind: REMOTE_DRIVER_BACKEND,
+        version: 4 as const,
+        driverId: cfg.driverId,
+        driverVersion: '5.0.0',
+        engineId: cfg.driverId,
+        authorityEngine: cfg.engine,
+        sessionKey,
+        operationId: `20000000-0000-4000-8000-${cfg.engine === 'codex' ? '000000000001' : '000000000002'}`,
+        generation: '1',
+        profileId: `prof-${cfg.engine}-1`,
+        authEpoch: 'epoch-1',
+      })
+      const turn3Sealed = await resolveRemotePoolBackendAndSeal({
+        uid,
+        containerId,
+        sessionKey,
+        exec: makeSealExec(cfg.remoteModel),
+        billingRequestId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+        log: null,
+        cc5BackendSelector: async () => recoveredBackend,
+        crossPoolFallbackSelector: bootstrapHooks.crossPoolFallbackSelector,
+        returnToRemoteGrantResolver: bootstrapHooks.returnToRemoteGrantResolver,
+        resolveLocalExec: async (m) => (snapshot.resolve(m) ? makeSealExec(m) : null),
+        readEpochAtSign: async () => snapshot.securityEpoch,
+        signAuthorityBundle: signExec,
+        reject: async () => null,
+      })
+      assert.ok(turn3Sealed !== null)
+      const verified3 = consumer.consume(
+        { ...turn3Sealed, requestId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' },
+        { challenge: 'conn-ocv5-893-e2e' },
+      )
+      assert.equal(verified3.poolMigration?.placementEpoch, 3)
+      assert.equal(verified3.poolMigration?.allowBackendTransition, true)
+      assert.equal(verified3.executionBackend?.operationId, recoveredBackend.operationId)
+      assert.equal((await authorityStore.getEnginePointer(uid, sessionKey))?.poolKind, 'remote_pool')
+
+      await assertFreshCc5Session({
+        storedResumeId: undefined,
+        executionBackend: verified3.executionBackend,
+        sessionIds: [sessionKey],
+        hasPersistedTurnActivity: async () => true,
+        poolMigration: verified3.poolMigration,
+      })
+    }
+  })
+
+  it('B14/OCV5-893: local AntigravityAdapter admits readOnly turns into sandbox while still requiring a master-owned relay route', async () => {
     const adapter = new AntigravityAdapter({
       sessionKey: 'agent:main:webchat:dm:b14-agy-readonly',
       agentId: 'main',
       agentBaseDir: '/tmp/oc-b14-test',
       config: { gateway: { port: 18789, accessToken: 'test-token' } } as any,
       model: 'antigravity-gemini-4-carbon',
-      // Attempt to pass the removed fake boolean bypass: MUST still fail closed!
-      ...({ toolBrokerReadOnlyGuard: true } as Record<string, unknown>),
     } as any)
     const run = adapter.submitTurn({
       input: 'inspect files read-only',
@@ -1958,6 +2357,6 @@ describe('OCV5-890 B01/B05/B14 production wiring end-to-end verification', () =>
       sessionTotals: { totalCostUSD: 0, turns: 0 },
       toolUseIdToName: new Map(),
     })
-    await assert.rejects(() => run.submitted, /ANTIGRAVITY_READ_ONLY_UNSUPPORTED/)
+    await assert.rejects(() => run.submitted, /ANTIGRAVITY_ROUTE_REQUIRED/)
   })
 })
