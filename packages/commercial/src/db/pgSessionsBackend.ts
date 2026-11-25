@@ -2429,6 +2429,16 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       }) ? { resetNativeSession: true } : {}),
     },
   };
+  const resolvedSwarmMode: boolean | undefined =
+    typeof route.swarmMode === "boolean"
+      ? route.swarmMode
+      : Boolean(parseSwarmSlashCommand(exactText)?.matched) ||
+          (input.turn.payload.tools ?? []).some((t) => {
+            const n = typeof t?.toolName === "string" ? t.toolName : typeof t?.name === "string" ? t.name : "";
+            return n === SWARM_BOARD_TOOL_NAME || n === "SwarmManage" || n === "SwarmPost" || n === "SwarmReadBoard" || n === "SwarmWait";
+          })
+        ? true
+        : undefined;
   const request: Record<string, unknown> = {
     type: "inbound.message",
     // Presentation metadata stays outside the strict recovery admission envelope.
@@ -2448,20 +2458,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       ? { model: route.model }
       : {}),
     ...(route.teamMode === true ? { teamMode: true } : {}),
-    swarmMode:
-      typeof route.swarmMode === "boolean"
-        ? route.swarmMode
-        : Boolean(parseSwarmSlashCommand(exactText)?.matched) ||
-          (input.turn.payload.tools ?? []).some((t) => {
-            const n = typeof t?.name === "string" ? t.name : "";
-            return (
-              n === SWARM_BOARD_TOOL_NAME ||
-              n === "SwarmManage" ||
-              n === "SwarmPost" ||
-              n === "SwarmReadBoard" ||
-              n === "SwarmWait"
-            );
-          }),
+    ...(resolvedSwarmMode !== undefined ? { swarmMode: resolvedSwarmMode } : {}),
     ts: Date.now(),
     clientMessageId: identity.clientMessageId,
   };

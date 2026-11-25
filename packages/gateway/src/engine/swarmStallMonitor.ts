@@ -79,6 +79,8 @@ export interface SwarmStallAlert {
   /** Formatted board post beginning with `@<target> [stall] ...`. */
   readonly message: string
   readonly attempt: number
+  /** Monotonic stage/budget generation (OCV5-887 P2-09) preventing stale rollbacks across progress resets. */
+  readonly generation: number
   readonly idleMs: number
   /** Highest sequence number of non-monitor posts observed. */
   readonly headSeq: number
@@ -230,6 +232,7 @@ export class SwarmStallMonitor {
    */
   private lastActivityKey: string | null = null
   private lastQuietSince = 0
+  private stageGeneration = 0
   private alertCount = 0
   private lastAlertAt = 0
   private prevAlertAt = 0
@@ -267,6 +270,7 @@ export class SwarmStallMonitor {
   }
 
   private clearAlertState(): void {
+    this.stageGeneration += 1
     this.alertCount = 0
     this.lastAlertAt = 0
     this.prevAlertAt = 0
@@ -276,8 +280,11 @@ export class SwarmStallMonitor {
   /**
    * Roll back the most recently emitted alert when board lock contention or
    * delivery failure prevented it from actually landing on `board.jsonl`.
+   * Rejects stale callbacks from an earlier `stageGeneration` (OCV5-887 P2-09).
    */
-  rollbackAlert(alert: SwarmStallAlert): void {
+  rollbackAlert(alert: SwarmStallAlert, expectedGeneration?: number): void {
+    const gen = expectedGeneration ?? alert.generation
+    if (gen !== this.stageGeneration) return
     if (this.alertCount !== alert.attempt || this.alertCount <= 0) return
     this.alertCount -= 1
     this.lastAlertAt = this.prevAlertAt
@@ -592,16 +599,19 @@ export class SwarmStallMonitor {
     }
 
     const attempt = this.alertCount + 1
-    const alert = this.diagnoseStall({
-      snap,
-      liveCoreMembers,
-      liveWorkers,
-      workingMembers,
-      stagePosts,
-      effectiveHeadSeq,
-      idleMs,
-      attempt,
-    })
+    const alert: SwarmStallAlert = {
+      ...this.diagnoseStall({
+        snap,
+        liveCoreMembers,
+        liveWorkers,
+        workingMembers,
+        stagePosts,
+        effectiveHeadSeq,
+        idleMs,
+        attempt,
+      }),
+      generation: this.stageGeneration,
+    }
 
     this.prevAlertAt = this.lastAlertAt
     this.alertCount = attempt
@@ -634,7 +644,7 @@ export class SwarmStallMonitor {
     effectiveHeadSeq: number
     idleMs: number
     attempt: number
-  }): SwarmStallAlert {
+  }): Omit<SwarmStallAlert, 'generation'> {
     const { snap, liveCoreMembers, liveWorkers, workingMembers, stagePosts, effectiveHeadSeq, idleMs, attempt } = input
     const idleMins = formatIdleMinutes(idleMs)
     const coordinator = liveCoreMembers.find((m) => m.role === 'coordinator')

@@ -73,7 +73,7 @@ export interface DurableCodexBilling {
   status: 'success' | 'error'
   /** Stable, content-free terminal classification. Optional only for rolling
    * compatibility with runtime images predating product-friction telemetry. */
-  terminalCode?: 'USER_CANCELLED' | 'CODEX_ERROR'
+  terminalCode?: 'USER_CANCELLED' | 'CODEX_ERROR' | 'AUTH_UNAVAILABLE' | 'QUOTA_UNAVAILABLE'
   durationMs: number
   usage?: {
     input_tokens?: number

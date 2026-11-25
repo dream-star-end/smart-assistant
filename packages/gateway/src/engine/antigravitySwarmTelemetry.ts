@@ -200,30 +200,52 @@ export interface BoundedTailReadOptions {
   maxAdaptiveBytes?: number
 }
 
-function readSyncSliceUtf8(fd: number, startOffset: number, size: number): string {
-  const buf = Buffer.allocUnsafe(size)
+function readSyncSliceWithBoundary(
+  fd: number,
+  startOffset: number,
+  size: number,
+): { text: string; atLineStart: boolean } {
+  const extra = startOffset > 0 ? 1 : 0
+  const readLen = size + extra
+  const buf = Buffer.allocUnsafe(readLen)
   let offset = 0
-  while (offset < size) {
-    const n = readSync(fd, buf, offset, size - offset, startOffset + offset)
+  while (offset < readLen) {
+    const n = readSync(fd, buf, offset, readLen - offset, startOffset - extra + offset)
     if (n <= 0) break
     offset += n
   }
-  return buf.subarray(0, offset).toString('utf8')
+  const atLineStart = extra === 0 || (offset > 0 && buf[0] === 0x0a)
+  const text = offset > extra ? buf.subarray(extra, offset).toString('utf8') : ''
+  return { text, atLineStart }
 }
 
-async function readAsyncSliceUtf8(
+async function readAsyncSliceWithBoundary(
   fh: Awaited<ReturnType<typeof openAsync>>,
   startOffset: number,
   size: number,
-): Promise<string> {
-  const buf = Buffer.allocUnsafe(size)
+): Promise<{ text: string; atLineStart: boolean }> {
+  const extra = startOffset > 0 ? 1 : 0
+  const readLen = size + extra
+  const buf = Buffer.allocUnsafe(readLen)
   let offset = 0
-  while (offset < size) {
-    const { bytesRead } = await fh.read(buf, offset, size - offset, startOffset + offset)
+  while (offset < readLen) {
+    const { bytesRead } = await fh.read(buf, offset, readLen - offset, startOffset - extra + offset)
     if (bytesRead <= 0) break
     offset += bytesRead
   }
-  return buf.subarray(0, offset).toString('utf8')
+  const atLineStart = extra === 0 || (offset > 0 && buf[0] === 0x0a)
+  const text = offset > extra ? buf.subarray(extra, offset).toString('utf8') : ''
+  return { text, atLineStart }
+}
+
+function trimTailToCompleteLines(slice: { text: string; atLineStart: boolean }): string | null {
+  if (slice.atLineStart) {
+    return slice.text.trim().length > 0 ? slice.text : null
+  }
+  const firstNewline = slice.text.indexOf('\n')
+  if (firstNewline < 0) return null
+  const sliced = slice.text.slice(firstNewline + 1)
+  return sliced.trim().length > 0 ? sliced : null
 }
 
 export function readBoundedFileWithinRoot(
@@ -253,34 +275,28 @@ export function readBoundedFileWithinRoot(
     }
     const size = Math.min(st.size, maxBytes)
     const startOffset = st.size > maxBytes ? st.size - maxBytes : 0
-    const text = readSyncSliceUtf8(fd, startOffset, size)
+    const slice = readSyncSliceWithBoundary(fd, startOffset, size)
     if (startOffset > 0) {
-      const firstNewline = text.indexOf('\n')
-      if (firstNewline >= 0) {
-        const sliced = text.slice(firstNewline + 1)
-        if (sliced.trim().length > 0) return sliced
-      }
+      const complete = trimTailToCompleteLines(slice)
+      if (complete !== null) return complete
       const adaptiveCap = opts?.maxAdaptiveBytes ? Math.max(maxBytes, opts.maxAdaptiveBytes) : maxBytes
       if (adaptiveCap > maxBytes) {
         const widerSize = Math.min(st.size, adaptiveCap)
         const widerStart = st.size > adaptiveCap ? st.size - adaptiveCap : 0
-        const widerText = readSyncSliceUtf8(fd, widerStart, widerSize)
-        if (widerStart === 0) return widerText
-        const widerFirstNl = widerText.indexOf('\n')
-        if (widerFirstNl >= 0) {
-          const widerSliced = widerText.slice(widerFirstNl + 1)
-          if (widerSliced.trim().length > 0) return widerSliced
-        }
+        const wider = readSyncSliceWithBoundary(fd, widerStart, widerSize)
+        if (widerStart === 0) return wider.text
+        const widerComplete = trimTailToCompleteLines(wider)
+        if (widerComplete !== null) return widerComplete
         // Final line alone exceeds `adaptiveCap`: scan up to 256 KB immediately before `widerStart`
         // to recover the preceding complete JSONL lines rather than returning empty string (N1).
         if (widerStart > 0) {
           const lookbackSize = Math.min(widerStart, 256 * 1024)
           const lookbackStart = widerStart - lookbackSize
-          const prevText = readSyncSliceUtf8(fd, lookbackStart, lookbackSize)
-          const lastNl = prevText.lastIndexOf('\n')
+          const prev = readSyncSliceWithBoundary(fd, lookbackStart, lookbackSize)
+          const lastNl = prev.text.lastIndexOf('\n')
           if (lastNl >= 0) {
-            const bounded = prevText.slice(0, lastNl + 1)
-            if (lookbackStart === 0) return bounded
+            const bounded = prev.text.slice(0, lastNl + 1)
+            if (prev.atLineStart) return bounded
             const firstNl = bounded.indexOf('\n')
             return firstNl >= 0 ? bounded.slice(firstNl + 1) : ''
           }
@@ -288,7 +304,7 @@ export function readBoundedFileWithinRoot(
       }
       return ''
     }
-    return text
+    return slice.text
   } catch {
     return null
   } finally {
@@ -326,32 +342,26 @@ export async function readBoundedFileWithinRootAsync(
     }
     const size = Math.min(st.size, maxBytes)
     const startOffset = st.size > maxBytes ? st.size - maxBytes : 0
-    const text = await readAsyncSliceUtf8(fh, startOffset, size)
+    const slice = await readAsyncSliceWithBoundary(fh, startOffset, size)
     if (startOffset > 0) {
-      const firstNewline = text.indexOf('\n')
-      if (firstNewline >= 0) {
-        const sliced = text.slice(firstNewline + 1)
-        if (sliced.trim().length > 0) return sliced
-      }
+      const complete = trimTailToCompleteLines(slice)
+      if (complete !== null) return complete
       const adaptiveCap = opts?.maxAdaptiveBytes ? Math.max(maxBytes, opts.maxAdaptiveBytes) : maxBytes
       if (adaptiveCap > maxBytes) {
         const widerSize = Math.min(st.size, adaptiveCap)
         const widerStart = st.size > adaptiveCap ? st.size - adaptiveCap : 0
-        const widerText = await readAsyncSliceUtf8(fh, widerStart, widerSize)
-        if (widerStart === 0) return widerText
-        const widerFirstNl = widerText.indexOf('\n')
-        if (widerFirstNl >= 0) {
-          const widerSliced = widerText.slice(widerFirstNl + 1)
-          if (widerSliced.trim().length > 0) return widerSliced
-        }
+        const wider = await readAsyncSliceWithBoundary(fh, widerStart, widerSize)
+        if (widerStart === 0) return wider.text
+        const widerComplete = trimTailToCompleteLines(wider)
+        if (widerComplete !== null) return widerComplete
         if (widerStart > 0) {
           const lookbackSize = Math.min(widerStart, 256 * 1024)
           const lookbackStart = widerStart - lookbackSize
-          const prevText = await readAsyncSliceUtf8(fh, lookbackStart, lookbackSize)
-          const lastNl = prevText.lastIndexOf('\n')
+          const prev = await readAsyncSliceWithBoundary(fh, lookbackStart, lookbackSize)
+          const lastNl = prev.text.lastIndexOf('\n')
           if (lastNl >= 0) {
-            const bounded = prevText.slice(0, lastNl + 1)
-            if (lookbackStart === 0) return bounded
+            const bounded = prev.text.slice(0, lastNl + 1)
+            if (prev.atLineStart) return bounded
             const firstNl = bounded.indexOf('\n')
             return firstNl >= 0 ? bounded.slice(firstNl + 1) : ''
           }
@@ -359,7 +369,7 @@ export async function readBoundedFileWithinRootAsync(
       }
       return ''
     }
-    return text
+    return slice.text
   } catch {
     return null
   } finally {

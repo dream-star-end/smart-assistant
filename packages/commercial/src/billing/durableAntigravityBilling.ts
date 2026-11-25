@@ -80,6 +80,21 @@ async function resolveActualDebitedCredits(
   return BigInt(res.rows[0]?.debited ?? '0')
 }
 
+async function forceAbandonAntigravityTurn(
+  pool: Pool,
+  requestId: string,
+  userId: bigint,
+): Promise<void> {
+  await pool
+    .query(
+      `UPDATE antigravity_turns
+          SET status = 'abandoned', updated_at = NOW()
+        WHERE request_id = $1 AND user_id = $2 AND status IN ('pending', 'settling')`,
+      [requestId, userId.toString()],
+    )
+    .catch(() => {})
+}
+
 async function repairAlreadySettledAttribution(args: {
   deps: DurableAntigravityBillingDeps
   userId: bigint
@@ -102,6 +117,19 @@ async function repairAlreadySettledAttribution(args: {
         WHERE user_id = $1 AND request_id = $2`,
       [uidStr, args.requestId, args.turnKey, args.parentTurnKey],
     )
+    // P1-06: Cascade missing turn_key/parent_turn_key to any late delta rows settled before tape finalize.
+    await args.deps.pgPool.query(
+      `UPDATE usage_records
+          SET turn_key = COALESCE(turn_key, $3),
+              parent_turn_key = COALESCE(parent_turn_key, $4)
+        WHERE user_id = $1
+          AND price_snapshot->>'antigravity_late_of' = $2
+          AND (
+            ($3::text IS NOT NULL AND turn_key IS NULL)
+            OR ($4::text IS NOT NULL AND parent_turn_key IS NULL)
+          )`,
+      [uidStr, args.requestId, args.turnKey, args.parentTurnKey],
+    )
   }
   if (args.deps.appendCostCredits && (args.turnKey || args.parentTurnKey)) {
     const actualCredits = await resolveActualDebitedCredits(
@@ -119,6 +147,46 @@ async function repairAlreadySettledAttribution(args: {
       args.turnKey,
       args.parentTurnKey,
     )
+    const lateRows = await args.deps.pgPool.query<{
+      request_id: string
+      session_id: string | null
+      parent_session_id: string | null
+      delegate_agent_id: string | null
+      ledger_id: string | null
+      debited: string
+    }>(
+      `SELECT ur.request_id,
+              ur.session_id,
+              ur.parent_session_id,
+              ur.delegate_agent_id,
+              ur.ledger_id::text AS ledger_id,
+              COALESCE((
+                SELECT SUM(-cl.delta)
+                  FROM credit_ledger cl
+                 WHERE cl.user_id = ur.user_id
+                   AND cl.ref_type = 'usage_record'
+                   AND cl.ref_id = ur.id::text
+                   AND cl.delta < 0
+              ), 0)::text AS debited
+         FROM usage_records ur
+        WHERE ur.user_id = $1
+          AND ur.price_snapshot->>'antigravity_late_of' = $2
+        ORDER BY ur.created_at ASC`,
+      [uidStr, args.requestId],
+    )
+    for (const late of lateRows.rows) {
+      const lateCredits = late.ledger_id === null ? '0' : late.debited
+      await args.deps.appendCostCredits(
+        late.request_id,
+        uidStr,
+        lateCredits,
+        late.session_id ?? args.turnSessionId ?? args.frameSessionId,
+        late.parent_session_id ?? args.parentSessionId,
+        late.delegate_agent_id ?? args.delegateAgentId,
+        args.turnKey,
+        args.parentTurnKey,
+      )
+    }
   }
 }
 
@@ -160,9 +228,45 @@ export async function settleDurableAntigravityBilling(
     log?.warn('durable antigravity billing: foreign requestId rejected without side effects')
     return 'already_committed'
   }
-  if (!journalRow && !turnRow) {
+  const isDelegateJournal = journalRow?.ctx?.source === 'delegate_antigravity'
+  if ((!journalRow && !turnRow) || (!turnRow && !isDelegateJournal)) {
     log?.warn('durable antigravity billing: unknown requestId skipped without side effects')
     return 'already_committed'
+  }
+
+  // P1-03: Verify authoritative root turnKey BEFORE revoking any relay route or mutating DB,
+  // so a mismatched same-UID root frame cannot prematurely revoke another in-flight turn's route
+  // or settle/waive against the wrong turn key.
+  const frameTurnKey = canonicalTurnKey(frame.turnKey)
+  let authoritativeRootTurnKey: string | null = null
+  if (!isDelegateJournal) {
+    try {
+      const authLoc = await deps.pgPool.query<{ auth_turn_key: string | null }>(
+        `SELECT COALESCE(a.turn_key, t.turn_key) AS auth_turn_key
+           FROM turn_dispatches d
+           LEFT JOIN authority_turn_dispatches a
+             ON a.dispatch_id = d.dispatch_id AND a.user_id = d.user_id AND a.attempt_no = d.attempt_no
+           LEFT JOIN LATERAL (
+             SELECT ct.turn_key FROM client_session_turn_tapes ct
+              WHERE ct.dispatch_id = d.dispatch_id AND ct.finalized_at IS NOT NULL
+              ORDER BY ct.finalized_at ASC LIMIT 1
+           ) t ON TRUE
+          WHERE d.billing_request_id = $1 AND d.user_id = $2
+          LIMIT 1`,
+        [requestId, uidStr],
+      )
+      authoritativeRootTurnKey = canonicalTurnKey(authLoc.rows[0]?.auth_turn_key)
+    } catch (err) {
+      const pgCode = (err as { code?: string } | null)?.code
+      if (pgCode !== '42P01') throw err
+    }
+    if (authoritativeRootTurnKey && frameTurnKey && frameTurnKey !== authoritativeRootTurnKey) {
+      log?.warn('durable antigravity billing: root turnKey conflicts with authoritative dispatch, rejected without side effects', {
+        frameTurnKey,
+        authoritativeRootTurnKey,
+      })
+      return 'already_committed'
+    }
   }
 
   const expireByReq = deps.expireRouteForRequest ?? expireAntigravityRelayRouteForRequest
@@ -181,8 +285,10 @@ export async function settleDurableAntigravityBilling(
   const terminalCode =
     frame.status === 'success'
       ? null
-      : frame.terminalCode === 'USER_CANCELLED'
-        ? 'USER_CANCELLED'
+      : frame.terminalCode === 'USER_CANCELLED' ||
+          frame.terminalCode === 'AUTH_UNAVAILABLE' ||
+          frame.terminalCode === 'QUOTA_UNAVAILABLE'
+        ? frame.terminalCode
         : 'ENGINE_ERROR'
 
   const ctxParentSessionId =
@@ -191,15 +297,36 @@ export async function settleDurableAntigravityBilling(
     typeof journalRow?.ctx?.delegateAgentId === 'string' ? journalRow.ctx.delegateAgentId : null
   const ctxParentTurnKey = canonicalTurnKey(journalRow?.ctx?.parentTurnKey)
 
-  const turnKey = canonicalTurnKey(frame.turnKey)
-  const parentTurnKey = canonicalTurnKey(frame.parentTurnKey) ?? ctxParentTurnKey
-  const parentSessionId = frame.parentSessionId ?? ctxParentSessionId
-  const delegateAgentId = frame.delegateAgentId ?? ctxDelegateAgentId
+  const frameParentTurnKey = canonicalTurnKey(frame.parentTurnKey)
+  const frameParentSessionId = frame.parentSessionId ?? null
+  const frameDelegateAgentId = frame.delegateAgentId ?? null
+  if (isDelegateJournal) {
+    const conflicts: Record<string, { journal: string; frame: string }> = {}
+    if (ctxParentTurnKey && frameParentTurnKey && frameParentTurnKey !== ctxParentTurnKey) {
+      conflicts.parentTurnKey = { journal: ctxParentTurnKey, frame: frameParentTurnKey }
+    }
+    if (ctxParentSessionId && frameParentSessionId && frameParentSessionId !== ctxParentSessionId) {
+      conflicts.parentSessionId = { journal: ctxParentSessionId, frame: frameParentSessionId }
+    }
+    if (ctxDelegateAgentId && frameDelegateAgentId && frameDelegateAgentId !== ctxDelegateAgentId) {
+      conflicts.delegateAgentId = { journal: ctxDelegateAgentId, frame: frameDelegateAgentId }
+    }
+    if (Object.keys(conflicts).length > 0) {
+      log?.warn(
+        'durable antigravity billing: delegate frame attribution conflicts with journal, keeping journal authority',
+        { conflicts },
+      )
+    }
+  }
+
+  const turnKey = authoritativeRootTurnKey ?? frameTurnKey
+  const parentTurnKey = ctxParentTurnKey ?? frameParentTurnKey
+  const parentSessionId = ctxParentSessionId ?? frameParentSessionId
+  const delegateAgentId = ctxDelegateAgentId ?? frameDelegateAgentId
   const hasDelegateAttribution = Boolean(delegateAgentId || parentSessionId || parentTurnKey)
 
   // B4: Delegate Antigravity turns freeze pricing (with composed agent multiplier) in request_finalize_journal.
   let settlePricing: Pick<PricingCache, 'get'> = deps.pricing
-  const isDelegateJournal = journalRow?.ctx?.source === 'delegate_antigravity'
   let journalClaimId: string | null = null
 
   if (isDelegateJournal && journalRow) {
@@ -213,6 +340,7 @@ export async function settleDurableAntigravityBilling(
     if (hasFrozenPricing && frozenPricing === null) {
       log?.warn('durable antigravity billing: invalid frozen delegate pricing, waiving journal')
       await abortInflightJournal(deps.pgPool, requestId, 'durable_billing_pricing_invalid', 'INTERNAL_ERROR')
+      await forceAbandonAntigravityTurn(deps.pgPool, requestId, userId)
       releaseInflight(requestId)
       if (deps.preCheckRedis) {
         await releasePreCheck(deps.preCheckRedis, { userId: uidStr, requestId }).catch(() => {})
@@ -226,6 +354,7 @@ export async function settleDurableAntigravityBilling(
       }
     }
     if (journalRow.state === 'aborted') {
+      await forceAbandonAntigravityTurn(deps.pgPool, requestId, userId)
       releaseInflight(requestId)
       if (deps.preCheckRedis) {
         await releasePreCheck(deps.preCheckRedis, { userId: uidStr, requestId }).catch(() => {})
@@ -242,6 +371,7 @@ export async function settleDurableAntigravityBilling(
         )
         const curState = refreshed.rows[0]?.state
         if (curState === 'aborted') {
+          await forceAbandonAntigravityTurn(deps.pgPool, requestId, userId)
           releaseInflight(requestId)
           if (deps.preCheckRedis) {
             await releasePreCheck(deps.preCheckRedis, { userId: uidStr, requestId }).catch(() => {})
@@ -525,15 +655,21 @@ export async function runAntigravityTurnReconcileTick(
           AND t.engine_status IN ('success', 'unknown')
           AND t.updated_at >= NOW() - INTERVAL '12 hours'
           AND ur.status = 'success'
-          AND NOT EXISTS (
-            SELECT 1 FROM antigravity_relay_usage r410
-             WHERE r410.request_id = t.request_id AND r410.user_id = t.user_id AND r410.status_code = 410
-          )
           AND (
             SELECT COUNT(*)::int FROM antigravity_relay_usage r
-             WHERE r.request_id = t.request_id AND r.user_id = t.user_id
+             WHERE r.request_id = t.request_id AND r.user_id = t.user_id AND r.status_code <> 410
           ) > (
-            COALESCE((ur.price_snapshot->>'antigravity_calls')::int, 0) +
+            GREATEST(
+              0,
+              COALESCE((ur.price_snapshot->>'antigravity_calls')::int, 0) -
+              COALESCE((
+                SELECT SUM(v::int)
+                  FROM jsonb_each_text(
+                    COALESCE(ur.price_snapshot->'antigravity_retired_models', '{}'::jsonb)
+                  ) AS kv(k, v)
+                 WHERE v ~ '^[0-9]+$'
+              ), 0)
+            ) +
             COALESCE((
               SELECT SUM(COALESCE((lc.price_snapshot->>'antigravity_late_calls')::int, 0))::int
                 FROM usage_records lc
@@ -542,7 +678,7 @@ export async function runAntigravityTurnReconcileTick(
                  AND lc.price_snapshot->>'antigravity_late_of' = t.request_id
             ), 0)
           )
-        ORDER BY t.updated_at DESC
+        ORDER BY t.updated_at ASC
         LIMIT $1`,
       [batchSize],
     )
@@ -566,6 +702,7 @@ export async function runAntigravityTurnReconcileTick(
       }
     }
   } catch (err) {
+    errors += 1
     opts.logger?.warn('antigravity late-stream reconciler scan failed', {
       err: (err as Error)?.message,
     })

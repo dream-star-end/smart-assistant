@@ -12,7 +12,7 @@ export function antigravityOwnerProtectedSql(turn: string): string {
     EXISTS (SELECT 1 FROM turn_dispatches d
       WHERE d.billing_request_id=${turn}.request_id AND d.user_id=${turn}.user_id
         AND (d.status IN ('admitted','accepted','rejecting')
-          OR (d.status='manual_reconcile' AND d.resolved_at IS NULL AND d.admitted_at >= NOW() - INTERVAL '6 hours')
+          OR (d.status='manual_reconcile' AND d.resolved_at IS NULL)
           OR d.terminal_at >= NOW() - INTERVAL '10 minutes'))
     OR EXISTS (SELECT 1 FROM request_finalize_journal j
       WHERE j.request_id=${turn}.request_id AND j.user_id=${turn}.user_id

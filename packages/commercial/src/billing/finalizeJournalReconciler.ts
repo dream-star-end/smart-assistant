@@ -356,6 +356,34 @@ export async function reconcileStuckFinalizeJournal(
       RETURNING rfj.request_id`,
     [ms],
   )
+  // P1-02: Atomically reset crashed delegate_antigravity finalizing rows (no usage_records)
+  // back to inflight AND unlock their corresponding settling antigravity_turns rows in one CTE
+  // so a mid-recovery crash can never leave `inflight + settling` split state.
+  await query(
+    `WITH reclaimed AS (
+       UPDATE request_finalize_journal rfj
+          SET state = 'inflight',
+              ctx = rfj.ctx - 'settlementClaimId',
+              updated_at = NOW()
+        WHERE rfj.state = 'finalizing'
+          AND COALESCE(rfj.ctx->>'durableBillingRecovery', '') = $2
+          AND COALESCE(rfj.ctx->>'source', '') = 'delegate_antigravity'
+          AND NOT (rfj.ctx ? 'remoteNativeBillingRecovery')
+          AND rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+          AND NOT EXISTS (
+            SELECT 1 FROM usage_records ur
+             WHERE ur.request_id = rfj.request_id AND ur.user_id = rfj.user_id
+          )
+        RETURNING rfj.request_id, rfj.user_id
+     )
+     UPDATE antigravity_turns t
+        SET status = 'pending', updated_at = NOW()
+       FROM reclaimed r
+      WHERE t.request_id = r.request_id
+        AND t.user_id = r.user_id
+        AND t.status = 'settling'`,
+    [ms, DURABLE_CODEX_RECOVERY_VERSION],
+  )
   const abortedRes = await query<{ request_id: string }>(
     `UPDATE request_finalize_journal rfj
         SET state = 'aborted',

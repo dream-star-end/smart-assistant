@@ -226,21 +226,66 @@ export function createWorkerGitWorktree(
 
 const SAFE_SWARM_BRANCH_RE = /^swarm\/[A-Za-z0-9._/-]{1,120}$/
 
+function getCheckedOutBranch(wtPath: string): string | null {
+  try {
+    const out = execFileSync('git', ['-C', wtPath, 'symbolic-ref', '--short', 'HEAD'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3_000,
+    }).trim()
+    return out || null
+  } catch {
+    return null
+  }
+}
+
 /**
- * B6: Delete a `swarm/*` branch ONLY when:
+ * B6 / P1-11: Delete a `swarm/*` branch ONLY when:
  *   1. It carries the trusted `swarm/` namespace (never user branches).
- *   2. Its current commit OID is an ancestor of `repoTop` `HEAD` (`merge-base --is-ancestor`).
- *   3. `git branch -d` (non-force) succeeds.
- * Missing worktree directories NEVER bypass the merge-base proof.
+ *   2. When `expectedSwarmId` / `expectedMemberName` are supplied, the branch name proves
+ *      ownership by that swarm (e.g. `swarm/<swarmId8>-<member>-<ts>`) rather than any
+ *      unrelated `swarm/*` branch in the same repository.
+ *   3. Its current commit OID is an ancestor of `repoTop` `HEAD` (`merge-base --is-ancestor`).
+ *   4. `git branch -d` (non-force) succeeds.
+ * Missing worktree directories NEVER bypass the ownership or merge-base proofs.
  */
-export function deleteMergedSwarmBranchIfSafe(
-  repoTop: string,
-  branchName: string | undefined,
+function branchMatchesSwarmOwner(
+  branchName: string,
+  opts?: { expectedSwarmId?: string; expectedMemberName?: string },
 ): boolean {
-  if (!branchName || !SAFE_SWARM_BRANCH_RE.test(branchName)) return false
+  if (!SAFE_SWARM_BRANCH_RE.test(branchName)) return false
   if (branchName.includes('..') || branchName.includes('//') || branchName.endsWith('.lock')) {
     return false
   }
+  const branchLower = branchName.toLowerCase()
+  const expectedSwarmId = opts?.expectedSwarmId?.trim().toLowerCase()
+  if (expectedSwarmId) {
+    const swarmPrefix = expectedSwarmId.slice(0, 8)
+    const matchesSwarm =
+      branchLower.startsWith(`swarm/${swarmPrefix}-`) ||
+      branchLower.startsWith(`swarm/${swarmPrefix}/`) ||
+      branchLower.startsWith(`swarm/${expectedSwarmId}-`) ||
+      branchLower.startsWith(`swarm/${expectedSwarmId}/`)
+    if (!matchesSwarm) return false
+  }
+  const expectedMember = opts?.expectedMemberName?.trim().toLowerCase()
+  if (expectedMember) {
+    const matchesMember =
+      branchLower.endsWith(`-${expectedMember}`) ||
+      branchLower.includes(`-${expectedMember}-`) ||
+      branchLower.endsWith(`/${expectedMember}`) ||
+      branchLower.includes(`/${expectedMember}-`)
+    if (!matchesMember) return false
+  }
+  return true
+}
+
+export function deleteMergedSwarmBranchIfSafe(
+  repoTop: string,
+  branchName: string | undefined,
+  opts?: { expectedSwarmId?: string; expectedMemberName?: string },
+): boolean {
+  if (!branchName || !branchMatchesSwarmOwner(branchName, opts)) return false
   const fullRef = `refs/heads/${branchName}`
   try {
     execFileSync('git', ['-C', repoTop, 'rev-parse', '--verify', `${fullRef}^{commit}`], {
@@ -268,8 +313,10 @@ export function removeWorkerGitWorktree(
     forceDirty?: boolean
     branchName?: string
     registeredWorktrees?: ReadonlySet<string>
+    expectedSwarmId?: string
+    expectedMemberName?: string
   },
-): { removed: boolean; preservedDirtyPath?: string } {
+): { removed: boolean; branchDeleted?: boolean; preservedDirtyPath?: string } {
   if (!wtPath) return { removed: false }
   const repoTop = findGitRepoTopLevel(baseCwd)
   const wtBase = repoTop ? resolve(repoTop, '.oc-swarm-worktrees') : null
@@ -277,9 +324,18 @@ export function removeWorkerGitWorktree(
   if (!wtBase || !resolvedWt.startsWith(`${wtBase}/`)) {
     return { removed: false }
   }
+  const branchOwnershipOpts =
+    opts?.expectedSwarmId || opts?.expectedMemberName
+      ? {
+          ...(opts.expectedSwarmId ? { expectedSwarmId: opts.expectedSwarmId } : {}),
+          ...(opts.expectedMemberName ? { expectedMemberName: opts.expectedMemberName } : {}),
+        }
+      : undefined
   if (!existsSync(resolvedWt)) {
-    deleteMergedSwarmBranchIfSafe(repoTop!, opts?.branchName)
-    return { removed: true }
+    const branchDeleted = opts?.branchName
+      ? deleteMergedSwarmBranchIfSafe(repoTop!, opts.branchName, branchOwnershipOpts)
+      : false
+    return { removed: branchDeleted, branchDeleted }
   }
   // B1: Never remove symlinks or unregistered plain directories (no fs.rmSync fallback!).
   if (!isRegisteredGitWorktree(repoTop!, resolvedWt, opts?.registeredWorktrees)) {
@@ -288,6 +344,29 @@ export function removeWorkerGitWorktree(
   if (!opts?.forceDirty && isGitWorktreeUnsafeToDelete(repoTop!, resolvedWt, opts?.registeredWorktrees)) {
     return { removed: false, preservedDirtyPath: resolvedWt }
   }
+  // P1-11: Verify worktree path & checked-out branch ownership BEFORE removing either
+  // the worktree directory or branch ref (stale roster must never delete another member's dir).
+  const wtBaseName = resolvedWt.slice(wtBase.length + 1).toLowerCase()
+  if (opts?.expectedSwarmId) {
+    const expectedPrefix = `${opts.expectedSwarmId.slice(0, 8).toLowerCase()}-`
+    if (!wtBaseName.startsWith(expectedPrefix)) {
+      return { removed: false, preservedDirtyPath: resolvedWt }
+    }
+    if (opts.expectedMemberName) {
+      const expectedSlug = `${expectedPrefix}${opts.expectedMemberName.trim().toLowerCase()}`
+      if (wtBaseName !== expectedSlug) {
+        return { removed: false, preservedDirtyPath: resolvedWt }
+      }
+    }
+  }
+  const actualBranch = getCheckedOutBranch(resolvedWt)
+  if (opts?.branchName && actualBranch !== opts.branchName) {
+    return { removed: false, preservedDirtyPath: resolvedWt }
+  }
+  if (actualBranch && branchOwnershipOpts && !branchMatchesSwarmOwner(actualBranch, branchOwnershipOpts)) {
+    return { removed: false, preservedDirtyPath: resolvedWt }
+  }
+  const branchToDelete = actualBranch ?? undefined
   try {
     execFileSync('git', ['-C', repoTop!, 'worktree', 'remove', '--force', resolvedWt], {
       stdio: 'ignore',
@@ -297,8 +376,10 @@ export function removeWorkerGitWorktree(
     // B1: Fail closed when git refuses worktree removal — never fallback to recursive fs.rmSync.
     return { removed: false, preservedDirtyPath: resolvedWt }
   }
-  deleteMergedSwarmBranchIfSafe(repoTop!, opts?.branchName)
-  return { removed: true }
+  const branchDeleted = branchToDelete
+    ? deleteMergedSwarmBranchIfSafe(repoTop!, branchToDelete, branchOwnershipOpts)
+    : false
+  return { removed: true, branchDeleted }
 }
 
 export interface ReconcileRemoteSwarmOptions {
@@ -473,7 +554,7 @@ export async function reconcileRemoteSwarmOnBoot(
           retainedSwarmPrefixes.add(swarmId.slice(0, 8).toLowerCase())
         }
 
-        for (const member of Object.values(rosterSnapshot.members)) {
+        for (const [memberName, member] of Object.entries(rosterSnapshot.members)) {
           const wtPath = member.workspace?.path
           if (!wtPath || member.workspace?.mode === 'inherit') continue
           const repoTop =
@@ -484,12 +565,15 @@ export async function reconcileRemoteSwarmOnBoot(
           if ((archived || member.killed) && repoTop) {
             const resolvedWt = resolve(wtPath)
             seenWorktrees.add(resolvedWt)
-            if (!existsSync(resolvedWt) && !member.workspace?.branch) continue
+            const wtExisted = existsSync(resolvedWt)
+            if (!wtExisted && !member.workspace?.branch) continue
             const wtRes = removeWorkerGitWorktree(repoTop, resolvedWt, {
               forceDirty: false,
               ...(member.workspace?.branch ? { branchName: member.workspace.branch } : {}),
+              expectedSwarmId: swarmId,
+              expectedMemberName: memberName,
             })
-            if (wtRes.removed && existsSync(resolvedWt) === false) {
+            if (wtRes.removed && (wtExisted || wtRes.branchDeleted === true) && !existsSync(resolvedWt)) {
               result.cleanedWorktrees.push(resolvedWt)
             } else if (wtRes.preservedDirtyPath) {
               result.preservedDirtyWorktrees.push(wtRes.preservedDirtyPath)
@@ -517,9 +601,10 @@ export async function reconcileRemoteSwarmOnBoot(
     }
     let prunedAny = false
     for (const entry of entries) {
-      const m = /^([0-9a-f]{8})-[a-z0-9][a-z0-9_-]*$/i.exec(entry)
+      const m = /^([0-9a-f]{8})-([a-z0-9][a-z0-9_-]*)$/i.exec(entry)
       if (!m) continue
       const prefix = m[1]!.toLowerCase()
+      const inferredMember = m[2]!.toLowerCase()
       if (retainedSwarmPrefixes.has(prefix)) continue
       const wtPath = resolve(wtBase, entry)
       if (seenWorktrees.has(wtPath)) continue
@@ -534,6 +619,8 @@ export async function reconcileRemoteSwarmOnBoot(
       const wtRes = removeWorkerGitWorktree(repoTop, wtPath, {
         forceDirty: false,
         registeredWorktrees,
+        expectedSwarmId: prefix,
+        expectedMemberName: inferredMember,
         ...(detectedBranch && /^swarm\//i.test(detectedBranch) ? { branchName: detectedBranch } : {}),
       })
       if (wtRes.removed) {

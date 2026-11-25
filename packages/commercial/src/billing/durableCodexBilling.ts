@@ -335,7 +335,12 @@ export async function settleDurableCodexBilling(
       parentTurnKey: frame.parentTurnKey ?? null,
       parentSessionId: frame.parentSessionId ?? null,
       delegateAgentId: frame.delegateAgentId ?? null,
-      terminalCode: frame.terminalCode,
+      terminalCode:
+        frame.terminalCode === "USER_CANCELLED"
+          ? "USER_CANCELLED"
+          : frame.terminalCode
+            ? "CODEX_ERROR"
+            : undefined,
     });
   } catch (error) {
     if (error instanceof JournalSettlementClaimLostError) {

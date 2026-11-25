@@ -883,3 +883,47 @@ test('OCV5-887: stuck working member alerts coordinator after workingStallThresh
   assert.ok(retriedNextTick, 'rolled-back alert must retry on next tick without waiting 3m cooldown')
   assert.equal(retriedNextTick.attempt, 1)
 })
+
+test('OCV5-887 P2-09: rollbackAlert ignores stale callbacks from an earlier stageGeneration', () => {
+  const mon = new SwarmStallMonitor({
+    stallThresholdMs: 60_000,
+    retryCooldownMs: 180_000,
+    maxAlerts: 3,
+  })
+  const stage1 = makeSnapshot()
+  assert.equal(mon.evaluate(stage1, 0), null)
+  const staleAlert = mon.evaluate(stage1, 60_000)
+  assert.ok(staleAlert)
+  assert.equal(staleAlert.attempt, 1)
+
+  // Genuine business progress advances stageGeneration and resets alert budget
+  const stage2 = makeSnapshot({
+    members: [
+      makeMember({ name: 'coordinator', role: 'coordinator', status: 'waiting', lastPostSeq: 2 }),
+      makeMember({ name: 'worker-a', role: 'worker', status: 'waiting', lastPostSeq: 1 }),
+    ],
+    posts: [
+      ...stage1.posts,
+      { seq: 2, agent: 'coordinator', channel: 'main', text: '@worker-a 第二阶段任务', mentions: ['worker-a'] },
+    ],
+    totalPosts: 2,
+  })
+  assert.equal(mon.evaluate(stage2, 70_000), null)
+  const stage2Alert = mon.evaluate(stage2, 130_000)
+  assert.ok(stage2Alert)
+  assert.equal(stage2Alert.attempt, 1)
+  assert.ok(stage2Alert.generation > staleAlert.generation)
+
+  // Stale async failure callback from stage 1 MUST NOT roll back stage 2's alertCount or cooldown!
+  mon.rollbackAlert(staleAlert)
+  assert.equal(mon.evaluate(stage2, 135_000), null, 'stale rollback must not clear stage 2 cooldown')
+  const stage2Next = mon.evaluate(stage2, 310_000)
+  assert.ok(stage2Next)
+  assert.equal(stage2Next.attempt, 2, 'stage 2 attempt must advance to 2, not revert to 1')
+
+  // Same-generation rollback still works normally
+  mon.rollbackAlert(stage2Next)
+  const stage2Retried = mon.evaluate(stage2, 315_000)
+  assert.ok(stage2Retried)
+  assert.equal(stage2Retried.attempt, 2)
+})

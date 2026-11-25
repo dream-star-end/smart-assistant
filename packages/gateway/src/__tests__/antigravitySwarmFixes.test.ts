@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 
 import { AntigravityAdapter } from '../engine/antigravityAdapter.js'
+import { renewAntigravityRouteLeaseDetailed } from '../delegateAntigravityRoute.js'
 import {
   acquireLocalAntigravitySwarmSlot,
   awaitLocalAntigravitySwarmSlotIfActive,
@@ -23,6 +24,7 @@ import {
   cleanupKilledNativeSwarmWorktrees,
   getLocalSwarmConcurrencyStateForTests,
   reapLingeringCliProcessGroup,
+  releaseSwarmSlotAfterBoundedReap,
   setLocalSwarmConcurrencyLimitForTests,
 } from '../engine/antigravitySwarmConcurrency.js'
 import {
@@ -431,6 +433,248 @@ process.stdin.on('end', () => process.exit(0))
         else process.env[k] = v
       }
       await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('OCV5-887 P1-08/P1-11/P2-03/P2-04: lingering pgrp reap + bounded slot release, strict conv brainDir worktree isolation, transient 503 vs revoked renewal, and AUTH/QUOTA billing codes', async () => {
+    // 1. P1-08: Leader exits 0 (`isClosed() === true`) while a background grandchild remains in `-pid`;
+    //    `reapLingeringCliProcessGroup` MUST still reap the process group, and `releaseSwarmSlotAfterBoundedReap`
+    //    must wait for bounded reap before releasing the FIFO slot (never deadlocking on timeout).
+    {
+      let closed = false
+      const leader = spawn(
+        process.execPath,
+        [
+          '-e',
+          `const { spawn } = require('node:child_process');
+           const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+           g.unref();
+           process.exit(0);`,
+        ],
+        { detached: true, stdio: ['pipe', 'pipe', 'pipe'] },
+      )
+      const pgid = leader.pid!
+      await new Promise<void>((resolve) => {
+        leader.once('close', () => {
+          closed = true
+          resolve()
+        })
+      })
+      assert.equal(closed, true)
+      await reapLingeringCliProcessGroup(leader, () => closed, {
+        naturalExitGraceMs: 20,
+        termGraceMs: 120,
+        killGraceMs: 120,
+        pollIntervalMs: 10,
+      })
+      let pgrpAlive = true
+      try {
+        process.kill(-pgid, 0)
+      } catch {
+        pgrpAlive = false
+      }
+      assert.equal(pgrpAlive, false, 'P1-08: grandchild remaining in exited leader pgrp must be reaped')
+
+      // Bounded release when proc is still running: slot is released only AFTER bounded reap completes
+      setLocalSwarmConcurrencyLimitForTests(1)
+      let relHold: (() => void) | null = null
+      try {
+        const s = acquireLocalAntigravitySwarmSlot()
+        relHold = await s.promise
+        let stubClosed = false
+        const stubborn = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+          detached: true,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        })
+        stubborn.once('close', () => { stubClosed = true })
+        releaseSwarmSlotAfterBoundedReap(stubborn, () => stubClosed, relHold, {
+          naturalExitGraceMs: 0,
+          termGraceMs: 80,
+          killGraceMs: 80,
+        })
+        relHold = null
+        // Slot stays held synchronously until bounded reap finishes, then releases cleanly
+        assert.equal(getLocalSwarmConcurrencyStateForTests().active, 1)
+        const deadline = Date.now() + 1_000
+        while (getLocalSwarmConcurrencyStateForTests().active > 0 && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 15))
+        }
+        assert.equal(getLocalSwarmConcurrencyStateForTests().active, 0)
+      } finally {
+        relHold?.()
+        setLocalSwarmConcurrencyLimitForTests(null)
+      }
+    }
+
+    // 2. P1-11: Strict per-conversation brainDir isolation + detached HEAD guard + exact member boundary
+    {
+      const tmp = await mkdtemp(path.join(tmpdir(), 'oc-p1-11-wt-'))
+      try {
+        const repo = path.join(tmp, 'repo')
+        const brainDir = path.join(tmp, 'brain')
+        const convA = '11111111-2222-4333-8444-555555555555'
+        const convB = '99999999-aaaa-4bbb-8ccc-dddddddddddd'
+        await mkdir(repo, { recursive: true })
+        execFileSync('git', ['-C', repo, 'init', '-b', 'main'])
+        execFileSync('git', ['-C', repo, 'config', 'user.email', 'test@openclaude.local'])
+        execFileSync('git', ['-C', repo, 'config', 'user.name', 'Test'])
+        await writeFile(path.join(repo, 'README.md'), 'init\n')
+        execFileSync('git', ['-C', repo, 'add', '.'])
+        execFileSync('git', ['-C', repo, 'commit', '-m', 'init'])
+
+        const ownBrainWt = path.join(brainDir, convA, 'worktrees', 'own-brain')
+        const sameConvOtherMemberWt = path.join(brainDir, convA, 'worktrees', 'active-sibling')
+        const siblingBrainWt = path.join(brainDir, convB, 'worktrees', 'w-1')
+        const detachedOutsideWt = path.join(repo, '.oc-swarm-worktrees', '11111111-w-detached')
+        const prefixCollideWt = path.join(tmp, 'wt-w10')
+        await mkdir(path.dirname(ownBrainWt), { recursive: true })
+        await mkdir(path.dirname(siblingBrainWt), { recursive: true })
+        await mkdir(path.dirname(detachedOutsideWt), { recursive: true })
+
+        execFileSync('git', ['-C', repo, 'worktree', 'add', '--detach', ownBrainWt, 'HEAD'])
+        execFileSync('git', ['-C', repo, 'worktree', 'add', '--detach', sameConvOtherMemberWt, 'HEAD'])
+        execFileSync('git', ['-C', repo, 'worktree', 'add', '--detach', siblingBrainWt, 'HEAD'])
+        execFileSync('git', ['-C', repo, 'worktree', 'add', '--detach', detachedOutsideWt, 'HEAD'])
+        execFileSync('git', ['-C', repo, 'worktree', 'add', '-b', 'swarm/11111111/w-10', prefixCollideWt, 'HEAD'])
+
+        const swarmDir = path.join(brainDir, convA, '.system_generated', 'swarm')
+        await mkdir(swarmDir, { recursive: true })
+        await writeFile(
+          path.join(swarmDir, 'members.json'),
+          JSON.stringify({
+            members: {
+              coordinator: { role: 'coordinator', killed: false },
+              'own-brain': { role: 'worker', killed: true, workspace: ownBrainWt, workspace_mode: 'share' },
+              'stale-member': { role: 'worker', killed: true, workspace: sameConvOtherMemberWt, workspace_mode: 'share' },
+              'sibling-conv': { role: 'worker', killed: true, workspace: siblingBrainWt, workspace_mode: 'share' },
+              'w-detached': { role: 'worker', killed: true, workspace: detachedOutsideWt, workspace_mode: 'share' },
+              'w-1': { role: 'worker', killed: true, workspace: prefixCollideWt, workspace_mode: 'branch' },
+            },
+          }),
+        )
+
+        const cleaned = cleanupKilledNativeSwarmWorktrees(brainDir, convA, repo)
+        assert.deepEqual(cleaned, [ownBrainWt])
+        assert.equal(existsSync(ownBrainWt), false, 'worktree inside own convBrainDir matching member is cleaned')
+        assert.equal(existsSync(sameConvOtherMemberWt), true, 'P1-11: same-conversation detached worktree owned by another member MUST NOT be removed')
+        assert.equal(existsSync(siblingBrainWt), true, 'P1-11: sibling conversation brainDir worktree MUST NOT be removed')
+        assert.equal(existsSync(detachedOutsideWt), true, 'P1-11: detached HEAD outside own convBrainDir MUST NOT be removed')
+        assert.equal(existsSync(prefixCollideWt), true, 'P1-11: member w-1 must NOT match branch swarm/11111111/w-10')
+      } finally {
+        await rm(tmp, { recursive: true, force: true })
+      }
+    }
+
+    // 3. P2-03: Detailed route lease renewal separates revoked vs transient 503/network error
+    {
+      const token = 'a'.repeat(64)
+      const env = { OPENCLAUDE_V3_MASTER_BASE_URL: 'http://127.0.0.1:9999', OPENCLAUDE_V3_CONTAINER_TOKEN: 'tok' }
+      const mockFetcher = (statusCode: number, body: string) =>
+        (async () => ({
+          statusCode,
+          body: (async function* () {
+            yield Buffer.from(body)
+          })(),
+        })) as never
+
+      assert.equal(await renewAntigravityRouteLeaseDetailed(token, { env: {} }), 'unconfigured')
+      assert.equal(await renewAntigravityRouteLeaseDetailed('bad-token', { env }), 'revoked')
+      assert.equal(await renewAntigravityRouteLeaseDetailed(token, { env, fetcher: mockFetcher(200, '{"ok":true}') }), 'ok')
+      assert.equal(await renewAntigravityRouteLeaseDetailed(token, { env, fetcher: mockFetcher(200, '{"ok":false}') }), 'revoked')
+      assert.equal(await renewAntigravityRouteLeaseDetailed(token, { env, fetcher: mockFetcher(404, '{}') }), 'revoked')
+      assert.equal(await renewAntigravityRouteLeaseDetailed(token, { env, fetcher: mockFetcher(410, '{}') }), 'revoked')
+      assert.equal(await renewAntigravityRouteLeaseDetailed(token, { env, fetcher: mockFetcher(503, 'restarting') }), 'transient_error')
+      assert.equal(
+        await renewAntigravityRouteLeaseDetailed(token, {
+          env,
+          fetcher: (async () => {
+            throw new Error('ECONNREFUSED')
+          }) as never,
+        }),
+        'transient_error',
+      )
+
+      // Queued swarm survives transient 503 (retries once + warns) instead of dying,
+      // while explicit 'revoked' still rejects with ANTIGRAVITY_ROUTE_EXPIRED_IN_QUEUE.
+      setLocalSwarmConcurrencyLimitForTests(1)
+      let rel1: (() => void) | null = null
+      let rel2: (() => void) | null = null
+      try {
+        rel1 = await acquireLocalAntigravitySwarmSlot().promise
+        let transientProbes = 0
+        let warned = 0
+        const pTransient = awaitLocalAntigravitySwarmSlotIfActive({
+          compactionMode: 'on_full',
+          keepaliveMs: 100,
+          transientRetryDelayMs: 5,
+          onStatus: () => {},
+          onHeartbeat: () => {},
+          onRenewRoute: async () => {
+            transientProbes += 1
+            return 'transient_error'
+          },
+          onRenewWarn: () => {
+            warned += 1
+          },
+          setRelease: (fn) => { rel2 = fn },
+        })
+        rel1()
+        rel1 = null
+        await pTransient
+        assert.equal(transientProbes, 2, 'must retry transient_error once before proceeding')
+        assert.equal(warned, 1, 'must warn when transient_error persists on retry')
+        assert.ok(rel2)
+
+        // Revoked route fails closed and releases slot cleanly
+        const pRevoked = awaitLocalAntigravitySwarmSlotIfActive({
+          compactionMode: 'on_full',
+          keepaliveMs: 100,
+          onStatus: () => {},
+          onHeartbeat: () => {},
+          onRenewRoute: async () => 'revoked',
+          setRelease: () => {},
+        })
+        ;(rel2 as (() => void) | null)?.()
+        rel2 = null
+        await assert.rejects(() => pRevoked, /ANTIGRAVITY_ROUTE_EXPIRED_IN_QUEUE/)
+        assert.deepEqual(getLocalSwarmConcurrencyStateForTests(), { active: 0, queued: 0, limit: 1 })
+      } finally {
+        rel1?.()
+        ;(rel2 as (() => void) | null)?.()
+        setLocalSwarmConcurrencyLimitForTests(null)
+      }
+    }
+
+    // 4. P2-04: Durable billing forwards AUTH_UNAVAILABLE and QUOTA_UNAVAILABLE terminal codes
+    {
+      const base = {
+        requestId: 'e'.repeat(32),
+        sessionKey: 'agent:main:webchat:dm:p2-04',
+        budgetStop: false,
+        interrupted: false,
+        durationMs: 42,
+        usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      }
+      assert.equal(
+        buildAntigravityDurableBillingEvent({ ...base, status: 'unavailable', terminalCode: 'AUTH_UNAVAILABLE' }).terminalCode,
+        'AUTH_UNAVAILABLE',
+      )
+      assert.equal(
+        buildAntigravityDurableBillingEvent({ ...base, status: 'unavailable', terminalCode: 'QUOTA_UNAVAILABLE' }).terminalCode,
+        'QUOTA_UNAVAILABLE',
+      )
+      assert.equal(
+        buildAntigravityDurableBillingEvent({ ...base, status: 'error', terminalCode: 'ENGINE_ERROR' }).terminalCode,
+        'CODEX_ERROR',
+      )
+      assert.equal(
+        buildAntigravityDurableBillingEvent({ ...base, status: 'error', terminalCode: 'USER_CANCELLED' }).terminalCode,
+        'USER_CANCELLED',
+      )
+      assert.equal(
+        buildAntigravityDurableBillingEvent({ ...base, status: 'success', budgetStop: true, terminalCode: 'AUTH_UNAVAILABLE' }).terminalCode,
+        undefined,
+      )
     }
   })
 })

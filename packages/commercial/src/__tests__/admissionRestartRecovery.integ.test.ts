@@ -531,9 +531,101 @@ test('OCV5-887 swarmMode survives both _admissionRestartRequest and deferred ove
   assert.equal(job.request.swarmMode, true, 'turn_recovery_jobs must preserve swarmMode: true across restart')
 })
 
-test('OCV5-887 B9: explicit swarmMode:false is preserved (never flipped to true) while legacy undefined swarm tape infers true', async t => {
+test('OCV5-887 P1-07: restart & checkpoint recovery preserve tri-state swarmMode (true / false / undefined)', async t => {
   if (fixture.skipIfUnavailable(t)) return
-  // 1. User sends a new single-agent turn with swarmMode: false -> recovery job preserves false!
+
+  const admitAndFinalizeCrashedCheckpoint = async (args: {
+    sid: string
+    cmid: string
+    text: string
+    swarmMode?: boolean
+    tools?: Array<Record<string, unknown>>
+  }) => {
+    const req: Record<string, unknown> = {
+      ...wire(args.text),
+      peer: { id: args.sid, kind: 'dm' },
+      clientMessageId: args.cmid,
+      idempotencyKey: `web:${args.cmid}:0`,
+      ...(args.swarmMode !== undefined ? { swarmMode: args.swarmMode } : {}),
+    }
+    const content = req.content as Record<string, unknown>
+    const routing: Record<string, unknown> = {
+      model: req.model,
+      ...(args.swarmMode !== undefined ? { swarmMode: args.swarmMode } : {}),
+    }
+    const msg = {
+      id: args.cmid,
+      role: 'user',
+      text: String(content.displayText ?? content.text),
+      _modelText: String(content.text),
+      ts: Date.now(),
+      _routing: routing,
+      _admissionRestartRequest: snapshotAdmissionRequest(req),
+    } as MessageLike & { id: string }
+    const admitted = await backend.admitUserTurn({
+      uid,
+      sessionUserId: `c:${uid}`,
+      sessionId: args.sid,
+      clientMessageId: args.cmid,
+      agentId: 'main',
+      model: 'gpt-6-sol',
+      requestHash: computeDispatchRequestHash(content as DispatchRequestContent),
+      billingRequestId: randomUUID().replaceAll('-', ''),
+      dispatchId: randomUUID(),
+      ownerId: 'old-master',
+      agentContainerId: 511,
+      runtimeKind: 'docker',
+      message: msg,
+    })
+    assert.equal(admitted.kind, 'admitted')
+    if (admitted.kind !== 'admitted') throw new Error('admission failed')
+
+    const turnKey = createHash('sha256').update(admitted.dispatch.dispatchId).digest('hex')
+    const createdAt = Date.now()
+    const bytes = Buffer.from(JSON.stringify({
+      sessionId: args.sid,
+      agentId: 'main',
+      turnIndex: 1,
+      status: 'crashed',
+      errorCode: 'upstream_failed',
+      turnKey,
+      clientMessageId: args.cmid,
+      text: '',
+      thinkingText: 'partial durable progress before crash',
+      ...(args.tools ? { tools: args.tools } : {}),
+      createdAt,
+      usage: { inputTokens: 1, outputTokens: 2 },
+    }))
+    const hash = createHash('sha256').update(bytes).digest('hex')
+    const base = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      sessionId: args.sid,
+      agentId: 'main',
+      turnIndex: 1,
+      status: 'crashed' as const,
+      turnKey,
+      tapeId: turnKey,
+      tapeSha256: hash,
+      totalBytes: bytes.length,
+      partCount: 1,
+      createdAt,
+    }
+    await backend.stageLosslessTurnTapePart(
+      `c:${uid}`,
+      { ...base, action: 'part', partIndex: 0, partSha256: hash, data: bytes.toString('base64') },
+      bytes,
+      { dispatchId: admitted.dispatch.dispatchId, attemptNo: 1 },
+    )
+    const fin = await backend.finalizeLosslessTurnTape(`c:${uid}`, {
+      ...base,
+      action: 'finalize',
+      dispatchId: admitted.dispatch.dispatchId,
+      attemptNo: 1,
+    })
+    assert.equal(fin.applied, 'finalized')
+  }
+
+  // 1. Explicit swarmMode: false via admission restart recovery stays false.
   const offReq: Record<string, unknown> = { ...wire('single agent turn'), swarmMode: false }
   const offContent = offReq.content as Record<string, unknown>
   const offMsg = {
@@ -570,7 +662,113 @@ test('OCV5-887 B9: explicit swarmMode:false is preserved (never flipped to true)
     expectedEpoch: admOff.dispatch.leaseEpoch,
   })
   assert.equal(await backend.recoverInterruptedAdmission(admOff.dispatch.dispatchId), true)
-  const [offJob] = await claimDueRecoveryJobs(getPool(), { userId: uid, ownerId: 'off-master', leaseMs: 60_000 })
-  assert.ok(offJob)
-  assert.equal(offJob.request.swarmMode, false, 'explicit swarmMode: false must never be lost or inverted')
+
+  // 2. Legacy admission restart snapshot omitting swarmMode keeps swarmMode undefined.
+  const legacyRestartSid = 's-legacy-restart-undef'
+  const legacyRestartCmid = 'cm-legacy-restart-undef'
+  const legacyReq: Record<string, unknown> = {
+    ...wire('legacy turn without swarm flag'),
+    peer: { id: legacyRestartSid, kind: 'dm' },
+    clientMessageId: legacyRestartCmid,
+    idempotencyKey: `web:${legacyRestartCmid}:0`,
+  }
+  delete legacyReq.swarmMode
+  const legacyContent = legacyReq.content as Record<string, unknown>
+  const admLegacyRestart = await backend.admitUserTurn({
+    uid,
+    sessionUserId: `c:${uid}`,
+    sessionId: legacyRestartSid,
+    clientMessageId: legacyRestartCmid,
+    agentId: 'main',
+    model: 'gpt-6-sol',
+    requestHash: computeDispatchRequestHash(legacyContent as DispatchRequestContent),
+    billingRequestId: randomUUID().replaceAll('-', ''),
+    dispatchId: randomUUID(),
+    ownerId: 'old-master',
+    agentContainerId: 511,
+    runtimeKind: 'docker',
+    message: {
+      id: legacyRestartCmid,
+      role: 'user',
+      text: String(legacyContent.displayText ?? legacyContent.text),
+      _modelText: String(legacyContent.text),
+      ts: Date.now(),
+      _routing: { model: legacyReq.model },
+      _admissionRestartRequest: snapshotAdmissionRequest(legacyReq),
+    } as MessageLike & { id: string },
+  })
+  assert.equal(admLegacyRestart.kind, 'admitted')
+  if (admLegacyRestart.kind !== 'admitted') return
+  await casToTerminal(getPool(), {
+    dispatchId: admLegacyRestart.dispatch.dispatchId,
+    outcome: 'not_accepted',
+    failureCode: 'DISPATCH_NOT_ACCEPTED',
+    clientNotified: false,
+    expectedEpoch: admLegacyRestart.dispatch.leaseEpoch,
+  })
+  assert.equal(await backend.recoverInterruptedAdmission(admLegacyRestart.dispatch.dispatchId), true)
+
+  // 3. Tape-backed automatic checkpoint recoveries: explicit true, explicit false,
+  //    legacy undefined (no swarm tools -> stays undefined), and legacy undefined with SwarmBoard tool -> true.
+  await admitAndFinalizeCrashedCheckpoint({
+    sid: 's-ckpt-swarm-true',
+    cmid: 'cm-ckpt-swarm-true',
+    text: 'continue active swarm',
+    swarmMode: true,
+  })
+  await admitAndFinalizeCrashedCheckpoint({
+    sid: 's-ckpt-swarm-false',
+    cmid: 'cm-ckpt-swarm-false',
+    text: 'explicitly single-agent turn',
+    swarmMode: false,
+  })
+  await admitAndFinalizeCrashedCheckpoint({
+    sid: 's-ckpt-swarm-legacy-undef',
+    cmid: 'cm-ckpt-swarm-legacy-undef',
+    text: 'legacy turn without swarm flag or swarm tool',
+  })
+  await admitAndFinalizeCrashedCheckpoint({
+    sid: 's-ckpt-swarm-legacy-tool',
+    cmid: 'cm-ckpt-swarm-legacy-tool',
+    text: 'legacy turn that invoked SwarmBoard',
+    tools: [{ blockId: 'blk-swarm-1', toolName: 'SwarmBoard', output: 'ok', completed: true }],
+  })
+
+  const claimed = await claimDueRecoveryJobs(getPool(), {
+    userId: uid,
+    ownerId: 'tri-state-master',
+    leaseMs: 60_000,
+    limit: 10,
+  })
+  const bySession = new Map(claimed.map(job => [job.sessionId, job]))
+
+  const offRestartJob = bySession.get(sessionId)
+  assert.ok(offRestartJob)
+  assert.equal(offRestartJob.request.swarmMode, false, 'explicit swarmMode: false must survive restart recovery')
+
+  const legacyRestartJob = bySession.get(legacyRestartSid)
+  assert.ok(legacyRestartJob)
+  assert.equal(legacyRestartJob.request.swarmMode, undefined, 'legacy restart snapshot without swarmMode must stay undefined')
+  assert.equal(Object.prototype.hasOwnProperty.call(legacyRestartJob.request, 'swarmMode'), false)
+
+  const ckptTrueJob = bySession.get('s-ckpt-swarm-true')
+  assert.ok(ckptTrueJob)
+  assert.equal(ckptTrueJob.recoveryMode, 'checkpoint')
+  assert.equal(ckptTrueJob.request.swarmMode, true, 'explicit swarmMode: true must survive checkpoint recovery')
+
+  const ckptFalseJob = bySession.get('s-ckpt-swarm-false')
+  assert.ok(ckptFalseJob)
+  assert.equal(ckptFalseJob.recoveryMode, 'checkpoint')
+  assert.equal(ckptFalseJob.request.swarmMode, false, 'explicit swarmMode: false must never be flipped or dropped on checkpoint recovery')
+
+  const ckptLegacyUndefJob = bySession.get('s-ckpt-swarm-legacy-undef')
+  assert.ok(ckptLegacyUndefJob)
+  assert.equal(ckptLegacyUndefJob.recoveryMode, 'checkpoint')
+  assert.equal(ckptLegacyUndefJob.request.swarmMode, undefined, 'legacy checkpoint missing swarmMode must stay undefined (never coerced to false) so Gateway live-worker fallback is reachable')
+  assert.equal(Object.prototype.hasOwnProperty.call(ckptLegacyUndefJob.request, 'swarmMode'), false)
+
+  const ckptLegacyToolJob = bySession.get('s-ckpt-swarm-legacy-tool')
+  assert.ok(ckptLegacyToolJob)
+  assert.equal(ckptLegacyToolJob.recoveryMode, 'checkpoint')
+  assert.equal(ckptLegacyToolJob.request.swarmMode, true, 'legacy checkpoint whose own tape ran SwarmBoard infers swarmMode: true')
 })
