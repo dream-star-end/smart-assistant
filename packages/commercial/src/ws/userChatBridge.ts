@@ -1143,7 +1143,7 @@ export interface UserChatBridgeDeps {
   /** Drop a minted Antigravity relay token after the turn settles or aborts. */
   expireAntigravityRoute?: (token: string) => void | Promise<void>;
   /** Expire a turn's relay route by requestId (any bridge; see the terminal-frame branch). */
-  expireAntigravityRouteForRequest?: (requestId: string) => void | Promise<void>;
+  expireAntigravityRouteForRequest?: (requestId: string, expectedUserId: bigint) => void | Promise<void>;
   /**
    * Trusted UUID of the compute host running this bridge. Cursor credentials
    * are mounted only by that host's local supervisor, so Cursor dispatch must
@@ -8233,7 +8233,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               void (async () => {
                 await Promise.allSettled([
                   relay ? Promise.resolve(deps.expireAntigravityRoute?.(relay.token)) : Promise.resolve(),
-                  Promise.resolve(deps.expireAntigravityRouteForRequest?.(requestId)),
+                  Promise.resolve(deps.expireAntigravityRouteForRequest?.(requestId, uid)),
                 ]);
                 if (!pricing) return;
                 try {

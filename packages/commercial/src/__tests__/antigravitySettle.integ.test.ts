@@ -3,6 +3,7 @@ import type { AddressInfo } from 'node:net'
 import { Readable } from 'node:stream'
 import { hashSecret } from '../auth/containerIdentity.js'
 import { makeAntigravityRelayHandler, ANTIGRAVITY_RELAY_PREFIX } from '../http/internalAntigravityRelay.js'
+import { createAntigravityBridgeHooks } from '../http/antigravityRouteRuntime.js'
 import { makeDelegateAntigravityRouteHandler, DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH } from '../http/internalDelegateAntigravityRoute.js'
 import { renewAntigravityRouteLease } from '../../../gateway/src/delegateAntigravityRoute.js'
 import { createHash, randomUUID } from 'node:crypto'
@@ -1890,6 +1891,167 @@ describe('P0-2a real PG aux/monitoring settlement attribution & legacy compatibi
     })
     assert.equal(mixedTick.lateSettled, 1, 'B3 R2: mixed 200+429 turn must still sweep late 200 row')
     assert.equal(await balance(uidA), 937n) // 943 - 6 = 937
+  })
+
+  test('OCV5-888 audit B1/B2/B3: live legacy lease protected, bridge route expiry tenant-fenced, extra-member 410 does not suppress late sweep', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const f = await lifetimeFixture('legacy')
+    try {
+      // B1: Active legacy turn past 15m PG age MUST keep its route alive, stay pending, and incur 0 debit;
+      //     once its bounded 6h route lease expires, reconciler converges it exactly once.
+      await usageRow(f.requestId, f.uid, 100_000, 20_000) // 15 credits if settled
+      const balBefore = await balance(f.uid)
+      await runAntigravityTurnReconcileTick({
+        pgPool: getPool(),
+        pricing,
+        minAgeMs: 15 * 60_000,
+        now: f.started + 31 * 60_000,
+      })
+      assert.equal(await turnStatus(f.requestId), 'pending', 'B1: live legacy turn stays pending')
+      assert.equal(await balance(f.uid), balBefore, 'B1: live legacy turn must not be debited early')
+      assert.ok(await f.resolve(31), 'B1: live legacy route must remain usable after reconciler tick')
+
+      // B1 (admission path): Renew legacy route past 2h (> ANTIGRAVITY_STALE_TURN_MS);
+      //     a new turn admission calling reconcileStaleAntigravityTurns must still protect the live legacy route!
+      for (let min = 62; min <= 124; min += 31) assert.ok(await f.resolve(min))
+      const admissionSettled = await reconcileStaleAntigravityTurns({
+        pool: getPool(),
+        pricing,
+        userId: f.uid,
+        now: f.started + 150 * 60_000,
+      })
+      assert.equal(admissionSettled.length, 0, 'B1 admission: live legacy turn >2h must not be settled')
+      assert.equal(await turnStatus(f.requestId), 'pending', 'B1 admission: live legacy turn stays pending')
+      assert.equal(await balance(f.uid), balBefore, 'B1 admission: balance untouched while route active')
+      assert.ok(await f.resolve(150), 'B1 admission: route still usable after admission reconcile')
+
+      // B2: Production bridge hook enforces server-owned expectedUserId on expireAntigravityRouteForRequest:
+      //     a foreign tenant cannot revoke victim route; the owning tenant can revoke cleanly on reconnect.
+      const hooks = createAntigravityBridgeHooks({ relayPort: 18789, clientSecret: '' })
+      const attackerUid = await user(100n)
+      await hooks.expireAntigravityRouteForRequest(f.requestId, attackerUid)
+      assert.ok(await f.resolve(151), 'B2: foreign tenant must not revoke victim route via bridge hook')
+
+      // Advance past the 6h bounded legacy ceiling -> reconciler settles exactly once.
+      const expiredTick = await runAntigravityTurnReconcileTick({
+        pgPool: getPool(),
+        pricing,
+        minAgeMs: 15 * 60_000,
+        now: f.started + 361 * 60_000,
+      })
+      assert.equal(expiredTick.settled, 1, 'B1: expired legacy turn must settle once')
+      assert.equal(await turnStatus(f.requestId), 'settled')
+      assert.equal(await balance(f.uid), balBefore - 15n)
+      const secondExpiredTick = await runAntigravityTurnReconcileTick({
+        pgPool: getPool(),
+        pricing,
+        minAgeMs: 15 * 60_000,
+        now: f.started + 362 * 60_000,
+      })
+      assert.equal(secondExpiredTick.settled, 0, 'B1: settled legacy turn must not settle twice')
+
+      // B2 positive: owning tenant revokes a separate active route cleanly via the same bridge hook.
+      const ownReq = rid()
+      await recordAntigravityTurn(getPool(), {
+        requestId: ownReq,
+        userId: f.uid,
+        modelId: MODEL,
+        sessionId: 's-b2-own',
+        traceId: null,
+      })
+      const ownMinted = await mintAntigravityRelayRoute({
+        containerId: f.containerId,
+        userId: f.uid,
+        requestId: ownReq,
+        modelId: MODEL,
+        accountId: 1n,
+        budgetCredits: 500n,
+        relayPort: 18789,
+      })
+      assert.ok(
+        await resolveAntigravityRelayRoute({
+          token: ownMinted.token,
+          containerId: f.containerId,
+          userId: f.uid,
+        }),
+      )
+      await hooks.expireAntigravityRouteForRequest(ownReq, f.uid)
+      assert.equal(
+        await resolveAntigravityRelayRoute({
+          token: ownMinted.token,
+          containerId: f.containerId,
+          userId: f.uid,
+        }),
+        null,
+        'B2: owner revoke must expire route',
+      )
+    } finally {
+      await f.close()
+    }
+
+    // B3: Extra swarm member 410 must NOT suppress background late sweep for healthy late calls,
+    //     while the retired extra member itself stays 0 credits and repeat ticks never double-debit.
+    const uidB3 = await user(1_000n)
+    const reqB3 = rid()
+    const EXTRA_MODEL = 'antigravity-gemini-4-carbon'
+    const EXTRA_UPSTREAM = 'gemini-4-carbon-high'
+    const EXTRA_PRICING = {
+      model_id: EXTRA_MODEL,
+      display_name: 'Carbon',
+      input_per_mtok: 200n,
+      output_per_mtok: 400n,
+      cache_read_per_mtok: 20n,
+      cache_write_per_mtok: 0n,
+      multiplier: '1.000',
+      enabled: true,
+    } as unknown as ModelPricing
+    const pricingB3 = {
+      get: (id: string) => (id === MODEL ? PRICING : id === EXTRA_MODEL ? EXTRA_PRICING : null),
+    } as unknown as PricingCache
+    await recordAntigravityTurn(getPool(), {
+      requestId: reqB3,
+      userId: uidB3,
+      modelId: MODEL,
+      sessionId: 's-b3-410',
+      traceId: null,
+    })
+    await usageRow(reqB3, uidB3, 100_000, 20_000) // primary healthy call: 15 credits
+    await query(
+      `INSERT INTO antigravity_relay_usage
+         (call_id, request_id, user_id, route_model_id, upstream_model, request_type, status_code,
+          prompt_tokens, candidates_tokens, thoughts_tokens, cached_tokens)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, 'agent', 410, 500000, 100000, 0, 0)`,
+      [reqB3, uidB3.toString(), MODEL, EXTRA_UPSTREAM],
+    )
+    const parentSettled = await settleAntigravityTurnRecord({
+      pool: getPool(),
+      pricing: pricingB3,
+      requestId: reqB3,
+      userId: uidB3,
+      engineStatus: 'success',
+    })
+    assert.ok(parentSettled)
+    assert.equal(await balance(uidB3), 985n, 'B3: parent settles primary (15) and waives extra-member 410 (0)')
+
+    // Healthy late primary call arrives after parent COMMIT (without invoking instant callback).
+    await usageRow(reqB3, uidB3, 50_000, 0) // +6 credits
+    const lateTick1 = await runAntigravityTurnReconcileTick({
+      pgPool: getPool(),
+      pricing: pricingB3,
+      minAgeMs: 5_000,
+      expireRouteForRequest: async () => {},
+    })
+    assert.equal(lateTick1.lateSettled, 1, 'B3: background sweep must settle healthy late call despite extra-member 410')
+    assert.equal(await balance(uidB3), 979n, 'B3: only healthy late call (+6) debited; retired extra member stays 0')
+
+    const lateTick2 = await runAntigravityTurnReconcileTick({
+      pgPool: getPool(),
+      pricing: pricingB3,
+      minAgeMs: 5_000,
+      expireRouteForRequest: async () => {},
+    })
+    assert.equal(lateTick2.lateSettled, 0, 'B3: repeat sweep must be idempotent (0 extra debits)')
+    assert.equal(await balance(uidB3), 979n)
   })
 
   test('OCV5-887 audit fixes P1-01~06 & P2-01/02/04: aborted delegate guard, finalizing unstuck, journal-first attribution, frozen aux fallback, per-row 410 ignore, late turn_key cascade, manual_reconcile hold, ASC late scan + error count, AUTH/QUOTA terminal codes', async (t) => {

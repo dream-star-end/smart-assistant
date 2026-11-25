@@ -1612,6 +1612,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       }
       this.finish(ctx, typeof result.num_turns === 'number' ? count(result.num_turns) : 1)
     } finally {
+      ctx.settling = false
       resolveSettlingDone()
     }
   }

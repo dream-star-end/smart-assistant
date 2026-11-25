@@ -27,6 +27,7 @@ import {
 import {
   expireAntigravityRelayRoute,
   expireAntigravityRelayRouteForRequest,
+  hasActiveAntigravityRelayRouteForRequest,
 } from './antigravityRouteContext.js'
 import { antigravityOwnerProtectedSql } from './antigravityRouteAuthority.js'
 import {
@@ -583,20 +584,47 @@ export interface AntigravityTurnReconcilerOptions extends DurableAntigravityBill
   batchSize?: number
   intervalMs?: number
   runOnStart?: boolean
+  now?: number
+  hasActiveRouteForRequest?: (
+    requestId: string,
+    expectedUserId: bigint,
+    now?: number,
+  ) => Promise<boolean> | boolean
 }
 
 export async function runAntigravityTurnReconcileTick(
   opts: AntigravityTurnReconcilerOptions,
 ): Promise<{ scanned: number; settled: number; lateSettled: number; errors: number }> {
+  const now = opts.now ?? Date.now()
   const minAgeMs = Math.max(5_000, opts.minAgeMs ?? 15 * 60_000)
   const batchSize = Math.max(1, Math.min(100, opts.batchSize ?? 25))
-  const staleBefore = new Date(Date.now() - minAgeMs)
-  const due = await opts.pgPool.query<{ request_id: string; user_id: string }>(
-    `SELECT request_id, user_id::text AS user_id
+  const staleBefore = new Date(now - minAgeMs)
+  const due = await opts.pgPool.query<{
+    request_id: string
+    user_id: string
+    has_durable_owner: boolean
+  }>(
+    `SELECT request_id,
+            user_id::text AS user_id,
+            (EXISTS (
+               SELECT 1 FROM turn_dispatches d
+                WHERE d.billing_request_id = antigravity_turns.request_id
+                  AND d.user_id = antigravity_turns.user_id
+             ) OR EXISTS (
+               SELECT 1 FROM request_finalize_journal j
+                WHERE j.request_id = antigravity_turns.request_id
+                  AND j.user_id = antigravity_turns.user_id
+             )) AS has_durable_owner
        FROM antigravity_turns
       WHERE status IN ('pending', 'settling')
         AND updated_at < $1
         AND NOT ${antigravityOwnerProtectedSql('antigravity_turns')}
+        AND NOT EXISTS (
+          SELECT 1 FROM turn_dispatches d
+           WHERE d.billing_request_id = antigravity_turns.request_id
+             AND d.user_id = antigravity_turns.user_id
+             AND d.status <> 'terminal'
+        )
       ORDER BY created_at ASC
       LIMIT $2`,
     [staleBefore, batchSize],
@@ -605,9 +633,16 @@ export async function runAntigravityTurnReconcileTick(
   let lateSettled = 0
   let errors = 0
   const expireByReq = opts.expireRouteForRequest ?? expireAntigravityRelayRouteForRequest
+  const hasLiveRoute = opts.hasActiveRouteForRequest ?? hasActiveAntigravityRelayRouteForRequest
   for (const row of due.rows) {
     const uid = BigInt(row.user_id)
     try {
+      // B1: Legacy turns (no durable dispatch or delegate journal) remain protected
+      // while their bounded relay route lease is still live in Redis / memory.
+      if (!row.has_durable_owner) {
+        const routeAlive = await Promise.resolve(hasLiveRoute(row.request_id, uid, now))
+        if (routeAlive) continue
+      }
       await Promise.resolve(expireByReq(row.request_id, uid)).catch(() => {})
       const done = await settleAntigravityTurnRecord({
         pool: opts.pgPool,
@@ -655,6 +690,7 @@ export async function runAntigravityTurnReconcileTick(
           AND t.engine_status IN ('success', 'unknown')
           AND t.updated_at >= NOW() - INTERVAL '12 hours'
           AND ur.status = 'success'
+          AND COALESCE(ur.price_snapshot->>'antigravity_terminal_code', '') <> 'ANTIGRAVITY_MODEL_RETIRED'
           AND (
             SELECT COUNT(*)::int FROM antigravity_relay_usage r
              WHERE r.request_id = t.request_id AND r.user_id = t.user_id AND r.status_code <> 410

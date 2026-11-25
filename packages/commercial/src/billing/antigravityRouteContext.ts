@@ -412,6 +412,38 @@ export async function expireAntigravityRelayRouteForRequest(
   }
 }
 
+/**
+ * Check whether a turn still holds a live (unexpired, non-revoked) relay route.
+ * Used by background reconciliation so legacy turns (no durable dispatch or
+ * delegate journal) remain protected while their bounded route lease is active.
+ */
+export async function hasActiveAntigravityRelayRouteForRequest(
+  requestId: string,
+  expectedUserId?: bigint,
+  now = Date.now(),
+): Promise<boolean> {
+  if (!REQUEST_ID_RE.test(requestId)) return false
+  if (kv) {
+    const key = await kv.get(requestKey(requestId))
+    if (!key || key === EXPIRED_MARK || !key.startsWith(KV_PREFIX) || key.startsWith(`${KV_PREFIX}req:`)) {
+      return false
+    }
+    const raw = await kv.get(key)
+    if (!raw) return false
+    const token = key.slice(KV_PREFIX.length)
+    const parsed = deserialize(token, raw)
+    if (!parsed) return false
+    if (expectedUserId !== undefined && parsed.userId !== expectedUserId) return false
+    return parsed.expiresAt > now
+  }
+  for (const row of routes.values()) {
+    if (row.requestId !== requestId) continue
+    if (expectedUserId !== undefined && row.userId !== expectedUserId) continue
+    if (row.expiresAt > now) return true
+  }
+  return false
+}
+
 export function _resetAntigravityRelayRoutesForTests(): void {
   routes.clear()
   kv = null
