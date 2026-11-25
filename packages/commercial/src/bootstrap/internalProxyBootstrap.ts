@@ -132,7 +132,10 @@ import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "../http/anthropicProxy.js";
-import { createAntigravityRouteRuntime } from "../http/antigravityRouteRuntime.js";
+import {
+  antigravityRelayConcurrencyFromConfig,
+  createAntigravityRouteRuntime,
+} from "../http/antigravityRouteRuntime.js";
 import {
   buildCodexRelayHandler,
   buildCodexTokenRefreshHandler,
@@ -750,6 +753,7 @@ export async function bootstrapInternalProxyAndListeners(
         rootLogger,
         pricing: deps.pricing,
         appendCostCredits: deps.appendCostCreditsForUser,
+        ...antigravityRelayConcurrencyFromConfig(deps.cfg),
       });
       // B8: Mount RENEW_PATH unconditionally so Commercial main Antigravity turns & FIFO queued
       // swarms can renew already-minted route leases, while keeping MINT/RELEASE selfhost-only.

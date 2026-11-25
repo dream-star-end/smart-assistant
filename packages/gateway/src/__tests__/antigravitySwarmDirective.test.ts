@@ -1252,3 +1252,65 @@ test('OCV5-887: hasLiveCoreAntigravitySwarmWorkers detects live core workers for
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('OCV5-894: decentralized swarm directives enforce P2P handoff, #seq citation, fork, #channel, integrator pre-merge, model tiering, and local CLI tools', () => {
+  const localFresh = applyAntigravitySwarmTurnDirective({
+    finalText: '重构五个模块',
+    rawUserText: '重构五个模块',
+    isAntigravityTurn: true,
+    isRemoteAntigravity: false,
+    swarmMode: true,
+    hasHistoricalSwarm: false,
+    availableLocalSwarmModels: ['antigravity-gemini-4-neon', 'antigravity-gemini-4-hydrogen'],
+  })
+  assert.ok(localFresh.text.includes('若任务可拆分为 2 个及以上'))
+  assert.ok(localFresh.text.includes('P2P 交接'))
+  assert.ok(localFresh.text.includes('唤醒门铃而非抄送（CC）'))
+  assert.ok(localFresh.text.includes('#seq'))
+  assert.ok(localFresh.text.includes('fork:"coordinator"'))
+  assert.ok(localFresh.text.includes('#channel'))
+  assert.ok(localFresh.text.includes('integrator'))
+  assert.ok(localFresh.text.includes('oc-memory'))
+  assert.ok(localFresh.text.includes('skill-search'))
+  assert.ok(localFresh.text.includes('NotificationTimeoutSeconds'))
+  assert.ok(localFresh.text.includes('显式分层'))
+
+  const localResumed = applyAntigravitySwarmTurnDirective({
+    finalText: '继续下一阶段',
+    rawUserText: '继续下一阶段',
+    isAntigravityTurn: true,
+    isRemoteAntigravity: false,
+    swarmMode: true,
+    hasHistoricalSwarm: true,
+    availableLocalSwarmModels: ['antigravity-gemini-4-neon', 'antigravity-gemini-4-hydrogen'],
+  })
+  assert.ok(localResumed.text.includes('P2P'))
+  assert.ok(localResumed.text.includes('#seq'))
+  assert.ok(localResumed.text.includes('integrator'))
+  assert.ok(localResumed.text.includes('oc-memory'))
+  assert.ok(
+    localResumed.text.length < localFresh.text.length * 0.6,
+    `resumed directive (${localResumed.text.length}) must stay < 60% of fresh (${localFresh.text.length})`,
+  )
+
+  const remoteFresh = applyAntigravitySwarmTurnDirective({
+    finalText: '远端重构五个模块',
+    rawUserText: '远端重构五个模块',
+    isAntigravityTurn: true,
+    isRemoteAntigravity: true,
+    swarmMode: true,
+    hasHistoricalSwarm: false,
+  })
+  assert.ok(remoteFresh.text.includes('若任务可拆分为 2 个及以上'))
+  assert.ok(remoteFresh.text.includes('P2P 交接'))
+  assert.ok(remoteFresh.text.includes('#seq'))
+  assert.ok(remoteFresh.text.includes('自包含 `brief`'))
+  assert.ok(!remoteFresh.text.includes('fork:"coordinator"'), 'remote swarm must not promise unsupported context fork')
+  assert.ok(remoteFresh.text.includes('integrator'))
+
+  assert.ok(ANTIGRAVITY_PREAMBLE.includes('peer-to-peer'))
+  assert.ok(ANTIGRAVITY_PREAMBLE.includes('#seq'))
+  assert.ok(ANTIGRAVITY_PREAMBLE.includes('integrator'))
+  assert.ok(ANTIGRAVITY_PREAMBLE.includes('oc-memory'))
+  assert.ok(ANTIGRAVITY_PREAMBLE.includes('NotificationTimeoutSeconds'))
+})

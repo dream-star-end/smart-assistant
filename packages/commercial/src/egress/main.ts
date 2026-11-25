@@ -111,6 +111,7 @@ import { GROK_RELAY_PREFIX, makeGrokRelayHandler } from "../http/internalGrokRel
 import { ZCODE_RELAY_PREFIX, makeZcodeRelayHandler } from "../http/internalZcodeRelay.js";
 import { configureZcodeRelayKv, createIoredisZcodeRelayKv } from "../billing/zcodeRouteContext.js";
 import { ANTIGRAVITY_RELAY_PREFIX, makeAntigravityRelayHandler } from "../http/internalAntigravityRelay.js";
+import { antigravityRelayConcurrencyFromConfig } from "../http/antigravityRouteRuntime.js";
 import { configureAntigravityRouteStores } from "../http/antigravityRouteRuntime.js";
 import {
   buildCodexRelayHandler,
@@ -678,6 +679,7 @@ export async function startEgress(): Promise<void> {
     logger: log,
     clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
     pricing,
+    ...antigravityRelayConcurrencyFromConfig(cfg),
     appendCostCredits: (
       requestId,
       rawUserId,

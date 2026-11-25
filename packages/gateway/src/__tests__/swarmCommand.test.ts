@@ -526,8 +526,17 @@ describe("Swarm playbook templates & command parser", () => {
       assert.ok(expanded.prompt.includes(tpl.title));
       assert.ok(expanded.prompt.includes("重构科研引用引擎"));
       assert.ok(expanded.kickoffBoardMessage.startsWith("@all "));
+      assert.ok(expanded.kickoffBoardMessage.includes("#seq"));
+      assert.ok(expanded.prompt.includes("去中心化协作约定"));
+      assert.ok(expanded.prompt.includes("P2P 交接"));
+      assert.ok(expanded.prompt.includes("integrator"));
       assert.ok(expanded.roles.some((r) => r.role === "coordinator"));
     }
+
+    const implVerify = getSwarmPlaybook("parallel-impl-verify");
+    assert.ok(implVerify);
+    assert.ok(implVerify.guardrails.some((g) => g.includes("P2P") && g.includes("#seq")));
+    assert.ok(implVerify.workflow.some((w) => w.includes("@integrator")));
 
     assert.equal(expandSwarmPlaybook("unknown-template", "task"), null);
     assert.equal(expandSwarmPlaybook("parallel-impl-verify", "   "), null);

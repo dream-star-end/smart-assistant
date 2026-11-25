@@ -6,7 +6,7 @@ import { buildAgentSkillStore, buildRunSkillStore, type SkillStore } from '@open
  * below reuses wire shape validation; no readiness decision is made by MCP.
  */
 export function buildMcpSkillStore(env: NodeJS.ProcessEnv = process.env): SkillStore {
-  const agentId = env.OPENCLAUDE_AGENT_ID ?? 'main'
+  const agentId = env.OPENCLAUDE_AGENT_ID?.trim() || env.OC_AGENT_ID?.trim() || 'main'
   const raw = env.OC_IDENTITY_COMPAT_PROFILE
   let compat: Parameters<typeof buildAgentSkillStore>[1]
   if (raw !== undefined && raw !== '') {

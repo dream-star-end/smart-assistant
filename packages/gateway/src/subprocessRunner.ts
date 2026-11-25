@@ -859,9 +859,9 @@ export class SubprocessRunner extends EventEmitter {
           ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway?.port),
           OC_AGENT_ID: this.opts.agentId,
           ...identityCompatEnvironment(this.opts.identityCompat),
-          ...(this.delegateContextFile
-            ? { OPENCLAUDE_DELEGATE_CONTEXT_FILE: this.delegateContextFile }
-            : {}),
+          ...(this.delegateContextFile ? { OPENCLAUDE_DELEGATE_CONTEXT_FILE: this.delegateContextFile } : {}),
+          ...(this.opts.skillEvalExclude ? { OPENCLAUDE_SKILL_EVAL_EXCLUDE: this.opts.skillEvalExclude } : {}),
+          ...(this.opts.skillEvalDraft ? { OPENCLAUDE_SKILL_EVAL_DRAFT_NAME: this.opts.skillEvalDraft.name, OPENCLAUDE_SKILL_EVAL_DRAFT_DIR: this.opts.skillEvalDraft.dir } : {}),
           // Per-session effort level (xhigh / max from chat-mode pills, or
           // undefined to let CCB use its model-default — Opus 4.7 → high).
           // Empty string deletes any inherited CLAUDE_CODE_EFFORT_LEVEL so a

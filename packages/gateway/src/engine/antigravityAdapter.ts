@@ -708,8 +708,14 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       OPENCLAUDE_AGENT_ID: this.opts.agentId,
       ...identityCompatEnvironment(this.opts.identityCompat),
       OC_SESSION_KEY: this.opts.sessionKey,
+      OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
       OPENCLAUDE_ENGINE: 'antigravity',
-      ...(process.env.OPENCLAUDE_HOME?.trim() ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME.trim() } : {}),
+      OPENCLAUDE_DELEGATION_DEPTH: String(this.opts.delegationDepth ?? 0),
+      ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),
+      OPENCLAUDE_HOME: projection.openClaudeHome,
+      ...(projection.baselineSkillsDir ? { OPENCLAUDE_BASELINE_SKILLS_DIR: projection.baselineSkillsDir } : {}),
+      ...(this.opts.skillEvalExclude ? { OPENCLAUDE_SKILL_EVAL_EXCLUDE: this.opts.skillEvalExclude } : {}),
+      ...(this.opts.skillEvalDraft ? { OPENCLAUDE_SKILL_EVAL_DRAFT_NAME: this.opts.skillEvalDraft.name, OPENCLAUDE_SKILL_EVAL_DRAFT_DIR: this.opts.skillEvalDraft.dir } : {}),
       ...(projection.delegateContextFile
         ? {
             OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port),
@@ -755,6 +761,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       compactionMode: readOnly ? undefined : ctx.params.antigravitySwarmCompaction?.appliedMode,
       keepaliveMs: timingTestHooks?.keepaliveMs ?? KEEPALIVE_INTERVAL_MS,
       renewRouteIntervalMs: timingTestHooks?.routeRenewMs ?? 60_000,
+      ...(projection.localSwarmMaxConcurrent !== undefined ? { maxConcurrent: projection.localSwarmMaxConcurrent } : {}),
       onStatus: (detail) => ctx.params.onEvent({ kind: 'turn_status', status: { status: 'working', detail } }),
       onHeartbeat: () => { this.lastActivityAt = Date.now(); this.emit('activity') },
       onRenewRoute: async () => {

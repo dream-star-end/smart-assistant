@@ -723,30 +723,30 @@ export const SWARM_PLAYBOOK_TEMPLATES: readonly SwarmPlaybookTemplate[] = Object
     title: "并行实现+验收",
     aliases: ["并行实现", "impl-verify", "parallel-impl", "并行开发验收"],
     category: "engineering",
-    summary: "将功能拆分为零冲突文件所有权的并行开发切片，并配置独立只读验收员执行类型与单测闭环。",
+    summary: "将功能拆分为零冲突文件所有权的并行开发切片，去中心化 P2P 交接，并配独立验收/预整合角色完成类型与单测闭环。",
     channels: [
-      { name: "main", topic: "任务切分、交付汇总与最终结论" },
-      { name: "impl", topic: "各切片接口契约与并行实现进度" },
-      { name: "verify", topic: "独立回归测试、边界审查与缺陷追踪" },
+      { name: "main", topic: "任务切分、接口契约、交付汇总与最终结论（禁过程刷屏）" },
+      { name: "impl", topic: "各切片接口契约与并行实现进度（P2P 交接）" },
+      { name: "verify", topic: "分支预合并、独立回归测试、边界审查与缺陷追踪" },
     ],
     roles: [
       {
         name: "coordinator",
         role: "coordinator",
         workspace: "inherit",
-        responsibility: "切分零冲突文件所有权、定义共享类型契约、协调合并与最终交付。",
+        responsibility: "仅做最小边界切分与接口契约约定即发车，不亲手编码/串行消化过程讨论；收尾终审预整合结果并统一 commit/push。",
       },
       {
         name: "worker-a",
         role: "worker",
         workspace: "share",
-        responsibility: "负责核心模块切片 A 实现及对应单元测试，严禁越界修改他人文件。",
+        responsibility: "负责核心模块切片 A 实现及对应单元测试，严禁越界修改他人文件；完工后在 #verify 直接 @verifier 交接并附贴号 #seq（勿 CC @coordinator）。",
       },
       {
         name: "worker-b",
         role: "worker",
         workspace: "share",
-        responsibility: "负责外围/集成切片 B 实现及对应单元测试，严禁越界修改他人文件。",
+        responsibility: "负责外围/集成切片 B 实现及对应单元测试，严禁越界修改他人文件；完工后在 #verify 直接 @verifier 交接并附贴号 #seq（勿 CC @coordinator）。",
       },
       {
         name: "verifier",
@@ -754,17 +754,18 @@ export const SWARM_PLAYBOOK_TEMPLATES: readonly SwarmPlaybookTemplate[] = Object
         workspace: "inherit",
         readOnly: true,
         responsibility:
-          "独立只读复核代码差异、运行触碰范围目标单测与类型检查（仅做功能自测核验，不替代 T2 跨家族独立审计），发现阻断问题点名 @worker 返修（限 1 轮复核收口）。",
+          "独立只读复核代码差异、运行触碰范围目标单测与类型检查（多分支收口时可由 coordinator 另派 integrator 预合并后验收；仅做功能自测核验，不替代 T2 跨家族独立审计），发现阻断问题直接 @原作者 返修（限 1 轮复核收口），全绿后一次 @coordinator [done]。",
       },
     ],
     workflow: [
-      "1. @coordinator 先明确接口契约与严格文件所有权清单，广播至 @all。",
-      "2. @worker-a 与 @worker-b 在各自独立工作区并行实现并自测，完成后直接 @verifier 交接。",
-      "3. @verifier 独立跑触碰范围目标单测、类型检查与边界复核，输出 PASS/FAIL 结论；发现阻断问题点名对应 @worker 返修（限 1 轮复核收口）。",
-      "4. 验收全绿后 @coordinator 汇总交付清单并结束蜂群。",
+      "1. @coordinator 发布最小接口契约、零交集文件所有权清单与下游交接链至 @all（本地原生蜂群需复用已读上下文可传 fork:\"coordinator\"，远端蜂群用自包含 brief + 贴号 #seq）。",
+      "2. @worker-a 与 @worker-b 在 #impl 独立 worktree 并行实现并自测（重探索可自带快档 helper），完成后直接 @verifier 交接（不抄送 @coordinator）。",
+      "3. @verifier 独立跑触碰范围目标单测、类型检查与边界复核，发现阻断问题直接点名对应 @worker P2P 返修（限 1 轮复核收口）；多分支收口可派专职 @integrator 先预合并解冲突再验收。",
+      "4. 验收全绿后由 @verifier（或 @integrator）一次性 @coordinator [done]（附贴号 #seq），@coordinator 终审合入、kill 成员、统一 push 并收口。",
     ],
     guardrails: [
       "严格文件所有权隔离，禁止两名写手编辑同一文件。",
+      "去中心化 P2P 交接：@name 仅唤醒下一环节负责人，严禁将 @coordinator 当抄送（CC）；引用前文一律写贴号 #seq。",
       "验收员保持只读，不代改业务代码；发现缺陷必须由原作者修复并复测。",
     ],
   },
@@ -1092,6 +1093,12 @@ export function expandSwarmPlaybook(
     .map((g) => `- ${g}`)
     .join("\n");
 
+  const coordinationLines = [
+    "- **P2P 交接防瓶颈**：`@name` 是唤醒门铃而非抄送（CC），上下游直接 `@下一环节负责人` 闭环交接与返修，仅在最终 `[done]` 交付、需要拍板或遇阻塞时唤醒 `@coordinator`。",
+    "- **频道与引用降噪**：过程讨论留在对应 `#channel`，`#main` 只发跨区契约与终态；引用前文汇报一律写贴号 `#seq`，禁整段复制转述；本地原生蜂群需复用已读上下文可传 `fork:\"coordinator\"`（远端蜂群靠自包含 `brief` + 贴号 `#seq` 传递上下文）。",
+    "- **收口与分层选模**：多 `share` 写手收口可派专职 `integrator` 预合并并跑完单测再交 `@coordinator` 终审 push；本地原生蜂群可按分工显式指定已放行模型档位（轻探索用快档、重攻坚用高档）。",
+  ].join("\n");
+
   const prompt = [
     `【Swarm 剧本：${template.title} (${template.id})】`,
     `目标任务：${cleanTask}`,
@@ -1099,12 +1106,13 @@ export function expandSwarmPlaybook(
     `角色编排：\n${roleLines}`,
     `频道规划：\n${channelLines}`,
     `执行流程：\n${workflowLines}`,
+    `去中心化协作约定：\n${coordinationLines}`,
     `硬约束与红线：\n${guardrailLines}`,
   ]
     .filter(Boolean)
     .join("\n\n");
 
-  const kickoffBoardMessage = `@all 启动剧本「${template.title}」：${cleanTask}。请按各自角色与红线推进，阶段交接直接 @下一环节负责人。`;
+  const kickoffBoardMessage = `@all 启动剧本「${template.title}」：${cleanTask}。请按各自角色与频道推进，阶段交接直接 @下一环节负责人（勿 CC @coordinator，引用前文写 #seq）。`;
 
   return {
     template,

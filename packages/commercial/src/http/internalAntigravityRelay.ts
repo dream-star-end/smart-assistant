@@ -88,14 +88,15 @@ const METADATA_METHODS = new Set([
 ])
 const MAX_GENERATE_BODY = 32 * 1024 * 1024
 /** Title + agent call run together; Antigravity native swarm workers can run
- * multiple parallel turns on the same route (each still strictly reserved
- * against route.budgetCredits atomically below). */
-export const ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE = 12
+ * many parallel turns on the same route (each still strictly reserved against
+ * route.budgetCredits atomically below). Override via `OC_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE`
+ * (`0` disables the count cap while keeping atomic budget reservation). */
+export const ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE = 64
 /** Independent per-route concurrency cap for auxiliary light-model calls
  * (e.g. gemini-3.5-flash-lite agent_monitoring / checkpoint / web_search) so
- * monitoring bursts never contend for the primary model's 12 slots while still
- * bounding aux fan-out on a single route. */
-export const ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE = 24
+ * monitoring bursts never contend for primary slots. Override via
+ * `OC_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE` (`0` disables cap). */
+export const ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE = 128
 /** Output tokens assumed for an in-flight reservation (input comes from the body size). */
 const RESERVED_OUTPUT_TOKENS = 2048
 const MAX_METADATA_BODY = 1024 * 1024
@@ -182,6 +183,17 @@ export interface AntigravityRelayDeps {
     parentTurnKey?: string | null,
   ) => Promise<unknown>
   now?: () => number
+  /** Per-route concurrent primary-lane ceiling (`0` or `Infinity` disables count cap; budget reservation still applies). */
+  maxInflightPerRoute?: number
+  /** Per-route concurrent aux-lane ceiling (`0` or `Infinity` disables count cap; budget reservation still applies). */
+  maxAuxInflightPerRoute?: number
+}
+
+function resolveRelayInflightCap(explicit: number | undefined, fallback: number): number {
+  if (explicit !== undefined) {
+    return Number.isFinite(explicit) && explicit >= 1 ? Math.floor(explicit) : Number.POSITIVE_INFINITY
+  }
+  return fallback >= 1 ? fallback : Number.POSITIVE_INFINITY
 }
 
 function error(res: ServerResponse, status: number, code: string, requestId: string): void {
@@ -803,14 +815,22 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         },
         touchedAt: ts,
       }
+      const primaryCap = resolveRelayInflightCap(
+        deps.maxInflightPerRoute,
+        ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE,
+      )
+      const auxCap = resolveRelayInflightCap(
+        deps.maxAuxInflightPerRoute,
+        ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE,
+      )
       let auxSlot: AuxInflightSlot | null = null
       if (isAuxLane) {
         auxSlot = auxInflight.get(token) ?? { count: 0, touchedAt: ts }
-        if (auxSlot.count >= ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE) {
+        if (auxSlot.count >= auxCap) {
           error(res, 429, 'ANTIGRAVITY_AUX_ROUTE_BUSY', requestId)
           return
         }
-      } else if (slot.count >= ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE) {
+      } else if (slot.count >= primaryCap) {
         error(res, 429, 'ANTIGRAVITY_ROUTE_BUSY', requestId)
         return
       }

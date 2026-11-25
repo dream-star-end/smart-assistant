@@ -3173,4 +3173,118 @@ describe('RemoteSwarmRuntime & Admission (OCV5-835)', () => {
       await rt.shutdownAll()
     }
   })
+
+  it('OCV5-894: default remote swarm workers run uncapped in parallel without 3/4 hard clamp, and honors OC_REMOTE_SWARM_MAX_WORKERS > 4', async () => {
+    const prevEnv = process.env.OC_REMOTE_SWARM_MAX_WORKERS
+    Reflect.deleteProperty(process.env, 'OC_REMOTE_SWARM_MAX_WORKERS')
+    const agyRoot = makeTempDir('oc-remote-swarm-uncap-')
+    const repo = initTempGitRepo()
+    const sess = 'agent:main:webchat:dm:test-swarm-uncapped'
+    let activeNow = 0
+    let peakActive = 0
+    let allSixEntered!: () => void
+    const sixReady = new Promise<void>((resolve) => {
+      allSixEntered = resolve
+    })
+    let releaseWorkers!: () => void
+    const holdGate = new Promise<void>((resolve) => {
+      releaseWorkers = resolve
+    })
+
+    const rt = new RemoteSwarmRuntime({
+      rootBase: agyRoot,
+      executor: {
+        async runWorkerTurn() {
+          activeNow += 1
+          peakActive = Math.max(peakActive, activeNow)
+          if (activeNow >= 6) allSixEntered()
+          await holdGate
+          activeNow -= 1
+          return { text: 'done' }
+        },
+        async releaseWorkerSession() {
+          return { released: true, state: 'stopped' }
+        },
+      },
+    })
+    try {
+      rt.registerSession({
+        sessionKey: sess,
+        model: 'antigravity-gemini-4-neon-remote',
+        workspaceCwd: repo,
+        parentAgentId: 'main',
+      })
+      for (let i = 1; i <= 6; i += 1) {
+        await rt.handleToolCall({
+          sessionKey: sess,
+          callerMember: 'coordinator',
+          tool: 'swarm',
+          args: { action: 'add', name: `w-${i}`, brief: `Parallel job ${i}` },
+        })
+      }
+      await Promise.race([
+        sixReady,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`only ${peakActive}/6 workers ran concurrently`)), 3000)),
+      ])
+      assert.equal(peakActive, 6, 'all 6 workers must execute simultaneously without default 3/4 cap')
+      releaseWorkers()
+
+      // Non-blocking 2: Explicit OC_REMOTE_SWARM_MAX_WORKERS=5 runs 5 concurrently (>4, no hard clamp) and queues the 6th
+      process.env.OC_REMOTE_SWARM_MAX_WORKERS = '5'
+      let capActive = 0
+      let capPeak = 0
+      let fiveIn!: () => void
+      const fiveReady = new Promise<void>((resolve) => { fiveIn = resolve })
+      let releaseFirstFive!: () => void
+      const gateFive = new Promise<void>((resolve) => { releaseFirstFive = resolve })
+      const rt5 = new RemoteSwarmRuntime({
+        rootBase: makeTempDir('oc-remote-swarm-cap5-'),
+        executor: {
+          async runWorkerTurn() {
+            capActive += 1
+            capPeak = Math.max(capPeak, capActive)
+            if (capActive === 5) fiveIn()
+            await gateFive
+            capActive -= 1
+            return { text: 'ok' }
+          },
+          async releaseWorkerSession() {
+            return { released: true, state: 'stopped' }
+          },
+        },
+      })
+      try {
+        const sess5 = 'agent:main:webchat:dm:test-swarm-cap5'
+        rt5.registerSession({
+          sessionKey: sess5,
+          model: 'antigravity-gemini-4-neon-remote',
+          workspaceCwd: repo,
+          parentAgentId: 'main',
+        })
+        for (let i = 1; i <= 6; i += 1) {
+          await rt5.handleToolCall({
+            sessionKey: sess5,
+            callerMember: 'coordinator',
+            tool: 'swarm',
+            args: { action: 'add', name: `c-${i}`, brief: `Capped job ${i}` },
+          })
+        }
+        await Promise.race([
+          fiveReady,
+          new Promise((_, reject) => setTimeout(() => reject(new Error(`only ${capPeak}/5 workers ran`)), 3000)),
+        ])
+        await new Promise((r) => setTimeout(r, 80))
+        assert.equal(capPeak, 5, 'OC_REMOTE_SWARM_MAX_WORKERS=5 must allow 5 (>4) and hold the 6th queued')
+        releaseFirstFive()
+      } finally {
+        releaseFirstFive()
+        await rt5.shutdownAll()
+      }
+    } finally {
+      releaseWorkers()
+      await rt.shutdownAll()
+      if (prevEnv === undefined) Reflect.deleteProperty(process.env, 'OC_REMOTE_SWARM_MAX_WORKERS')
+      else process.env.OC_REMOTE_SWARM_MAX_WORKERS = prevEnv
+    }
+  })
 })

@@ -42,6 +42,25 @@ export function configureAntigravityRouteStores(deps: {
   configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(deps.redis))
 }
 
+export interface AntigravityRelayConcurrencyConfig {
+  OC_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE?: number
+  OC_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE?: number
+}
+
+/** Shared config → relay concurrency cap mapper for BOTH master bootstrap and split egress. */
+export function antigravityRelayConcurrencyFromConfig(
+  cfg: AntigravityRelayConcurrencyConfig,
+): Pick<AntigravityRelayDeps, 'maxInflightPerRoute' | 'maxAuxInflightPerRoute'> {
+  return {
+    ...(cfg.OC_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE !== undefined
+      ? { maxInflightPerRoute: cfg.OC_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE }
+      : {}),
+    ...(cfg.OC_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE !== undefined
+      ? { maxAuxInflightPerRoute: cfg.OC_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE }
+      : {}),
+  }
+}
+
 export interface AntigravityRouteRuntimeDeps {
   identityRepo: ContainerIdentityRepo
   pool: Pick<Pool, 'query'>
@@ -51,6 +70,8 @@ export interface AntigravityRouteRuntimeDeps {
   rootLogger: Logger
   pricing: PricingCache
   appendCostCredits?: AntigravityRelayDeps['appendCostCredits']
+  maxInflightPerRoute?: number
+  maxAuxInflightPerRoute?: number
 }
 
 export interface AntigravityRouteRuntime {
@@ -68,6 +89,8 @@ export function createAntigravityRouteRuntime(
     clientSecret: deps.clientSecret,
     pricing: deps.pricing,
     appendCostCredits: deps.appendCostCredits,
+    ...(deps.maxInflightPerRoute !== undefined ? { maxInflightPerRoute: deps.maxInflightPerRoute } : {}),
+    ...(deps.maxAuxInflightPerRoute !== undefined ? { maxAuxInflightPerRoute: deps.maxAuxInflightPerRoute } : {}),
   })
   return {
     relayHandler,

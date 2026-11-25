@@ -13,7 +13,7 @@
  *          `AntigravitySwarmWatcher` & `swarmCommand.ts` (live SwarmBoard UI, delta frames,
  *          telemetry, human steer, honest `[control:kill]`, playbooks) work seamlessly
  *        - Full Master-side billing & audit via `remoteDriverTurnBilling`
- *        - Bounded concurrency semaphore (default 3 parallel workers) protecting remote node lane caps
+ *        - Uncapped parallel worker execution by default (optional cap via `OC_REMOTE_SWARM_MAX_WORKERS` or constructor option)
  */
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { appendFileSync, existsSync } from 'node:fs'
@@ -85,7 +85,7 @@ export {
   resolveRemoteSwarmMemberModel,
 }
 
-const DEFAULT_MAX_PARALLEL_WORKERS = 3
+export const DEFAULT_MAX_PARALLEL_WORKERS = 0
 /** Staggered away from SwarmStallMonitor's 180s quiet threshold (P1-4). */
 export const DEFAULT_WAIT_TIMEOUT_MS = 240_000
 const MAX_WAIT_TIMEOUT_MS = 300_000
@@ -303,10 +303,10 @@ export class RemoteSwarmRuntime {
     hmacSecret?: Buffer
   }) {
     this.rootBase = opts?.rootBase ?? antigravityRoot()
-    const envCap = Number.parseInt(process.env.OC_REMOTE_SWARM_MAX_WORKERS ?? '', 10)
-    const configured =
-      opts?.maxParallelWorkers ?? (Number.isFinite(envCap) ? envCap : DEFAULT_MAX_PARALLEL_WORKERS)
-    this.maxParallelWorkers = Math.max(1, Math.min(4, configured))
+    const envRaw = (process.env.OC_REMOTE_SWARM_MAX_WORKERS ?? '').trim().toLowerCase()
+    const envCap = !envRaw || envRaw === '0' || envRaw === 'unlimited' || envRaw === 'inf' || envRaw === 'infinity' ? 0 : Number.parseInt(envRaw, 10)
+    const configured = opts?.maxParallelWorkers !== undefined ? opts.maxParallelWorkers : Number.isFinite(envCap) ? envCap : DEFAULT_MAX_PARALLEL_WORKERS
+    this.maxParallelWorkers = Number.isFinite(configured) && configured >= 1 ? Math.floor(configured) : Number.POSITIVE_INFINITY
     this.executor = opts?.executor
     this.hmacSecret = opts?.hmacSecret ?? randomBytes(32)
   }
