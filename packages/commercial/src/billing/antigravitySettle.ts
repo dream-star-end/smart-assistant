@@ -4,6 +4,7 @@ import {
   antigravityCanonicalModelForUpstream,
 } from '@openclaude/protocol'
 import { antigravityOwnerProtectedSql } from './antigravityRouteAuthority.js'
+import { hasActiveAntigravityRelayRouteForRequest } from './antigravityRouteContext.js'
 /**
  * Antigravity turn settlement (OCV5-415 P2).
  *
@@ -1263,16 +1264,30 @@ export async function reconcileStaleAntigravityTurns(args: {
   now?: number
   limit?: number
 }): Promise<SettledTurn[]> {
-  const staleBefore = new Date((args.now ?? Date.now()) - ANTIGRAVITY_STALE_TURN_MS)
-  const due = await args.pool.query<{ request_id: string }>(
-    `SELECT request_id FROM antigravity_turns
+  const now = args.now ?? Date.now()
+  const staleBefore = new Date(now - ANTIGRAVITY_STALE_TURN_MS)
+  const due = await args.pool.query<{ request_id: string; has_durable_owner: boolean }>(
+    `SELECT request_id,
+            (EXISTS (
+               SELECT 1 FROM turn_dispatches d
+                WHERE d.billing_request_id = antigravity_turns.request_id
+                  AND d.user_id = antigravity_turns.user_id
+             ) OR EXISTS (
+               SELECT 1 FROM request_finalize_journal j
+                WHERE j.request_id = antigravity_turns.request_id
+                  AND j.user_id = antigravity_turns.user_id
+             )) AS has_durable_owner
+       FROM antigravity_turns
       WHERE user_id = $1 AND status IN ('pending','settling') AND updated_at < $2
         AND NOT ${antigravityOwnerProtectedSql('antigravity_turns')}
       ORDER BY created_at LIMIT $3`,
     [args.userId.toString(), staleBefore, args.limit ?? 5],
   )
   const out: SettledTurn[] = []
-  for (const { request_id } of due.rows) {
+  for (const { request_id, has_durable_owner } of due.rows) {
+    if (!has_durable_owner && (await hasActiveAntigravityRelayRouteForRequest(request_id, args.userId, now))) {
+      continue
+    }
     const done = await settleAntigravityTurnRecord({
       pool: args.pool,
       pricing: args.pricing,

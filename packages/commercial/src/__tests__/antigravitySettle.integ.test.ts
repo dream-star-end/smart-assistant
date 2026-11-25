@@ -1908,12 +1908,26 @@ describe('P0-2a real PG aux/monitoring settlement attribution & legacy compatibi
       assert.equal(await balance(f.uid), balBefore, 'B1: live legacy turn must not be debited early')
       assert.ok(await f.resolve(31), 'B1: live legacy route must remain usable after reconciler tick')
 
+      // B1 (admission path): Renew legacy route past 2h (> ANTIGRAVITY_STALE_TURN_MS);
+      //     a new turn admission calling reconcileStaleAntigravityTurns must still protect the live legacy route!
+      for (let min = 62; min <= 124; min += 31) assert.ok(await f.resolve(min))
+      const admissionSettled = await reconcileStaleAntigravityTurns({
+        pool: getPool(),
+        pricing,
+        userId: f.uid,
+        now: f.started + 150 * 60_000,
+      })
+      assert.equal(admissionSettled.length, 0, 'B1 admission: live legacy turn >2h must not be settled')
+      assert.equal(await turnStatus(f.requestId), 'pending', 'B1 admission: live legacy turn stays pending')
+      assert.equal(await balance(f.uid), balBefore, 'B1 admission: balance untouched while route active')
+      assert.ok(await f.resolve(150), 'B1 admission: route still usable after admission reconcile')
+
       // B2: Production bridge hook enforces server-owned expectedUserId on expireAntigravityRouteForRequest:
       //     a foreign tenant cannot revoke victim route; the owning tenant can revoke cleanly on reconnect.
       const hooks = createAntigravityBridgeHooks({ relayPort: 18789, clientSecret: '' })
       const attackerUid = await user(100n)
       await hooks.expireAntigravityRouteForRequest(f.requestId, attackerUid)
-      assert.ok(await f.resolve(32), 'B2: foreign tenant must not revoke victim route via bridge hook')
+      assert.ok(await f.resolve(151), 'B2: foreign tenant must not revoke victim route via bridge hook')
 
       // Advance past the 6h bounded legacy ceiling -> reconciler settles exactly once.
       const expiredTick = await runAntigravityTurnReconcileTick({
