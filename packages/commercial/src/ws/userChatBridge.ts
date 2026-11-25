@@ -1143,7 +1143,7 @@ export interface UserChatBridgeDeps {
   /** Drop a minted Antigravity relay token after the turn settles or aborts. */
   expireAntigravityRoute?: (token: string) => void | Promise<void>;
   /** Expire a turn's relay route by requestId (any bridge; see the terminal-frame branch). */
-  expireAntigravityRouteForRequest?: (requestId: string) => void | Promise<void>;
+  expireAntigravityRouteForRequest?: (requestId: string, expectedUserId: bigint) => void | Promise<void>;
   /**
    * Trusted UUID of the compute host running this bridge. Cursor credentials
    * are mounted only by that host's local supervisor, so Cursor dispatch must
@@ -5230,7 +5230,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const p = parsed as Record<string, unknown>;
             const sH = Object.prototype.hasOwnProperty.call(p, SYSTEM_HELP_BOOTSTRAP_FIELD);
             const sM = Object.prototype.hasOwnProperty.call(p, '_masterHistoricalMessages');
-            if (sH || sM) { if (sH) takeSystemHelpBootstrap(p); if (sM) Reflect.deleteProperty(p, '_masterHistoricalMessages'); passthroughData = Buffer.from(JSON.stringify(p), 'utf8'); passthroughLen = passthroughData.byteLength; }
+            if (sH || sM) { if (sH) takeSystemHelpBootstrap(p); if (sM) delete p._masterHistoricalMessages; passthroughData = Buffer.from(JSON.stringify(p), 'utf8'); passthroughLen = passthroughData.byteLength; }
           }
         } catch { /* ordinary binary payloads retain their original transport */ }
       }
@@ -8245,7 +8245,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               void (async () => {
                 await Promise.allSettled([
                   relay ? Promise.resolve(deps.expireAntigravityRoute?.(relay.token)) : Promise.resolve(),
-                  Promise.resolve(deps.expireAntigravityRouteForRequest?.(requestId)),
+                  Promise.resolve(deps.expireAntigravityRouteForRequest?.(requestId, uid)),
                 ]);
                 if (!pricing) return;
                 try {

@@ -1944,6 +1944,7 @@ describe("userChatBridge — model authorization", () => {
       assert.deepEqual(message._routing, {
         model: DEFAULT_CODEX_ENGINE_MODEL,
         teamMode: true,
+        swarmMode: false,
         effortLevel: "high",
       });
       await waitFor(() => historyCalls.length === 1);
@@ -3763,7 +3764,7 @@ describe("Cursor external authority regression tripwire", () => {
     const settle = source.slice(settleStart, source.indexOf("external.engine === 'cursor'", settleStart));
     assert.match(settle, /settleAntigravityTurnRecord\(/);
     assert.doesNotMatch(settle, /usage,/);
-    assert.match(settle, /if \(pricing\) \{/);
+    assert.match(settle, /if \(!pricing\) return;/);
     assert.doesNotMatch(settle, /if \(relay && pricing\)/);
   });
 
@@ -3775,7 +3776,7 @@ describe("Cursor external authority regression tripwire", () => {
     assert.doesNotMatch(close, /expireAntigravityRoute/);
     const settleStart = source.indexOf("external.engine === 'antigravity'");
     const settle = source.slice(settleStart, source.indexOf("settleAntigravityTurnRecord(", settleStart));
-    assert.match(settle, /deps\.expireAntigravityRouteForRequest\?\.\(requestId\)/);
+    assert.match(settle, /deps\.expireAntigravityRouteForRequest\?\.\(requestId,\s*uid\)/);
   });
 
   test("OCV5-92: every base engine inbound carries a master-owned _creditBudget and ZCode gates on balance", async () => {

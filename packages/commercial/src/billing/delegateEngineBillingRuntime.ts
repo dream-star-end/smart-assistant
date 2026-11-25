@@ -108,7 +108,7 @@ export interface DelegateEngineBillingRuntimeDeps {
   settleAntigravityTurnFn?: typeof settleAntigravityTurnRecord
   abandonAntigravityTurnFn?: typeof abandonAntigravityTurn
   expireAntigravityRoute?: (token: string) => Promise<void> | void
-  expireAntigravityRouteForRequest?: (requestId: string) => Promise<void> | void
+  expireAntigravityRouteForRequest?: (requestId: string, expectedUserId: bigint) => Promise<void> | void
   releaseAntigravityInflightFn?: typeof releaseInflight
   attributeOpenTurnFn?: typeof attributeOpenTurn
   broadcastToUser?: (userId: bigint, payload: Record<string, unknown>) => void
@@ -444,7 +444,7 @@ export function createDelegateEngineBillingRuntime(
         if (routeToken) {
           await Promise.resolve(runExpireAntigravityRoute(routeToken)).catch(() => {})
         }
-        await Promise.resolve(runExpireAntigravityRouteForRequest(requestId)).catch(() => {})
+        await Promise.resolve(runExpireAntigravityRouteForRequest(requestId, userId)).catch(() => {})
         const pool = deps.getPool()
         const reservation = { userId: String(identity.userId), requestId }
         const claimId = await runClaimJournal(pool, requestId)
@@ -636,7 +636,7 @@ export function createDelegateEngineBillingRuntime(
         if (routeToken) {
           await Promise.resolve(runExpireAntigravityRoute(routeToken)).catch(() => {})
         }
-        await Promise.resolve(runExpireAntigravityRouteForRequest(requestId)).catch(() => {})
+        await Promise.resolve(runExpireAntigravityRouteForRequest(requestId, userId)).catch(() => {})
         await runAbandonAntigravity(deps.getPool(), requestId, userId).catch(() => {})
         runReleaseAntigravityInflight(requestId)
         await runAbort(
