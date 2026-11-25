@@ -19,6 +19,8 @@ import {
   mergeSwarmSnapshots,
   parseRemoteDriverExecutionBackend,
   sameRemoteExecutionBackend,
+  type CallTokenUsageSnapshot,
+  type ContextCompaction,
   type GoalStateSnapshot,
   type OutboundContentBlock,
   type PromptPrivacyPolicy,
@@ -60,9 +62,14 @@ import type {
 import { engineSessionId } from '../engine/engineSessionId.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 import type { ExecutionTarget } from '../remoteTarget.js'
+import { CREDIT_EXHAUSTED_DETAIL, CreditBudgetGuard } from '../creditExhaustion.js'
 import { classifyRunError } from '../errorClassify.js'
 import { RemoteContainerLane, type RemoteContainerLaneOptions } from './containerLane.js'
-import { parseRemoteV4ResumeId, remoteV4ResumeId } from './resumeId.js'
+import {
+  extractPortableNativeSessionId,
+  parseRemoteV4ResumeId,
+  remoteV4ResumeId,
+} from './resumeId.js'
 import { remotePoolNeed } from './types.js'
 
 const DEFAULT_PHANTOM_SIGNALS: PhantomSignals = {
@@ -100,12 +107,95 @@ function formatInputPreview(input: unknown): string {
   return raw.length > 400 ? `${raw.slice(0, 400)}…` : raw
 }
 
+function pickUsageCounter(raw: Readonly<Record<string, number>>, keys: readonly string[]): number {
+  for (const key of keys) {
+    const val = raw[key]
+    if (typeof val === 'number' && Number.isFinite(val) && val >= 0) {
+      return Math.trunc(val)
+    }
+  }
+  return 0
+}
+
+interface RawUsageCounters {
+  readonly rawInput: number
+  readonly output: number
+  readonly cacheRead: number
+  readonly cacheCreation: number
+}
+
+interface NormalizedUsageSnapshot {
+  readonly inputTokens: number
+  readonly outputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheCreationTokens: number
+  readonly totalTokens: number
+}
+
+const ZERO_RAW_USAGE: RawUsageCounters = {
+  rawInput: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheCreation: 0,
+}
+
+const ZERO_NORMALIZED_USAGE: NormalizedUsageSnapshot = {
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheCreationTokens: 0,
+  totalTokens: 0,
+}
+
+function rawUsageFromCounters(raw: Readonly<Record<string, number>>): RawUsageCounters {
+  return {
+    rawInput: pickUsageCounter(raw, ['input_tokens', 'inputTokens']),
+    output: pickUsageCounter(raw, ['output_tokens', 'outputTokens']),
+    cacheRead: pickUsageCounter(raw, [
+      'cache_read_input_tokens',
+      'cachedInputTokens',
+      'cache_read_tokens',
+      'cacheReadTokens',
+    ]),
+    cacheCreation: pickUsageCounter(raw, [
+      'cache_creation_input_tokens',
+      'cacheWriteInputTokens',
+      'cache_write_tokens',
+      'cacheCreationTokens',
+    ]),
+  }
+}
+
+function normalizeUsageSnapshot(
+  raw: RawUsageCounters,
+  baseline: RawUsageCounters | null,
+  inputIncludesCacheRead: boolean,
+): NormalizedUsageSnapshot {
+  const deltaRawInput = baseline ? Math.max(0, raw.rawInput - baseline.rawInput) : raw.rawInput
+  const deltaOutput = baseline ? Math.max(0, raw.output - baseline.output) : raw.output
+  const deltaCacheRead = baseline ? Math.max(0, raw.cacheRead - baseline.cacheRead) : raw.cacheRead
+  const deltaCacheCreation = baseline
+    ? Math.max(0, raw.cacheCreation - baseline.cacheCreation)
+    : raw.cacheCreation
+  const inputTokens = inputIncludesCacheRead
+    ? Math.max(0, deltaRawInput - deltaCacheRead)
+    : deltaRawInput
+  return {
+    inputTokens,
+    outputTokens: deltaOutput,
+    cacheReadTokens: deltaCacheRead,
+    cacheCreationTokens: deltaCacheCreation,
+    totalTokens: inputTokens + deltaOutput + deltaCacheRead + deltaCacheCreation,
+  }
+}
+
 export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
   readonly executionBackend: RemoteDriverExecutionBackend
   readonly engineId: string
   readonly capabilities: EngineCapabilities
 
   private readonly lane: RemoteContainerLane
+  private readonly _agentId: string
   private readonly _engineSessionId: string
   private readonly _initialResumeNativeId?: string
   private _nativeId: string | null
@@ -115,6 +205,7 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
   private _toolsets: string[] | undefined
   private _executionTarget: ExecutionTarget = { kind: 'local' }
   private _shuttingDown = false
+  private _threadCumulativeBaseline: RawUsageCounters = { ...ZERO_RAW_USAGE }
   private _activeRun?: {
     readonly getPartialSnapshot: () => PartialSnapshot
     readonly getPendingTools: () => number
@@ -142,12 +233,36 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
 
     this.executionBackend = backend
     this.engineId = backend.authorityEngine
+    this._agentId = opts.agentId
     this._engineSessionId = engineSessionId(opts.sessionKey)
     this._initialResumeNativeId = parsedResume?.nativeId
     this._nativeId = parsedResume?.nativeId ?? null
     this._model = opts.model
     this._effortLevel = opts.effortLevel
     this._toolsets = opts.agentToolsets
+
+    this.lane = new RemoteContainerLane(
+      {
+        ...opts,
+        resumeSessionId: parsedResume?.nativeId,
+      },
+      laneOptions,
+    )
+    remotePoolNeed(this.lane.binding.canonicalModel === opts.model, 'REMOTE_MODEL_BINDING_MISMATCH')
+
+    const optsWithAuthority = opts as EngineCreateOpts & {
+      readonly executionAuthority?: {
+        readonly supportsVision?: boolean
+        readonly executionDescriptor?: { readonly supportsVision?: boolean }
+      }
+    }
+    const bindingVision = (
+      this.lane.binding as unknown as { readonly supportsVision?: boolean }
+    ).supportsVision
+    const supportsVision =
+      optsWithAuthority.executionAuthority?.executionDescriptor?.supportsVision === true ||
+      optsWithAuthority.executionAuthority?.supportsVision === true ||
+      bindingVision === true
 
     const isCodexAuthority = backend.authorityEngine === 'codex'
     const isAntigravityAuthority = backend.authorityEngine === 'antigravity'
@@ -168,20 +283,11 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       needsServerRequestId: needsServerReqId,
       historyMode: 'native-resume',
       permissionModel: 'native',
-      emitsCallUsage: false,
+      emitsCallUsage: true,
       emitsToolInputDeltas: false,
       supportsNativeCompact: false,
-      multimodalInput: 'text-only',
+      multimodalInput: supportsVision && !isAntigravityAuthority ? 'native' : 'text-only',
     }
-
-    this.lane = new RemoteContainerLane(
-      {
-        ...opts,
-        resumeSessionId: parsedResume?.nativeId,
-      },
-      laneOptions,
-    )
-    remotePoolNeed(this.lane.binding.canonicalModel === opts.model, 'REMOTE_MODEL_BINDING_MISMATCH')
   }
 
   get fenceReason(): string | undefined {
@@ -510,6 +616,24 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
     let presentationErrorText: string | undefined
     let presentationErrorCode: string | undefined
     let terminalErrorCode: string | undefined
+    const latestUsageByScope = new Map<string, NormalizedUsageSnapshot>()
+    let turnStartBaseline: RawUsageCounters = { ...this._threadCumulativeBaseline }
+    let latestCumulativeRaw: RawUsageCounters | null = null
+    let prevTurnNet: NormalizedUsageSnapshot = { ...ZERO_NORMALIZED_USAGE }
+    const creditGuard = new CreditBudgetGuard({
+      budgetFen: params.creditBudgetFen,
+      modelId: () => this._model ?? this.lane.binding.canonicalModel,
+      agentId: this._agentId,
+      composeAgentMultiplier: false,
+      codexServiceTier:
+        params.readOnly || params.serviceTier === null || params.serviceTier === undefined
+          ? null
+          : params.serviceTier,
+      isLive: () => this._activeRun === activeHandle && !finalized,
+      onExhausted: () => {
+        this.interrupt('system')
+      },
+    })
 
     const handleSecurityEvent = (ev: RemoteSecurityEvent): void => {
       this.lastActivityAt = Date.now()
@@ -519,6 +643,89 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       const payload = ev.payload
       if (payload.kind === 'turnTerminal' && typeof payload.errorCode === 'string' && payload.errorCode.length > 0) {
         terminalErrorCode = payload.errorCode
+      }
+      if (payload.kind === 'usage') {
+        const isCumulative =
+          this.capabilities.billingMode === 'engine-reported' ||
+          payload.semanticsId.startsWith('codex-') ||
+          payload.semanticsId.includes('cumulative')
+        const inputIncludesCacheRead =
+          isCumulative ||
+          Object.prototype.hasOwnProperty.call(payload.rawCounters, 'cachedInputTokens')
+        const rawCounters = rawUsageFromCounters(payload.rawCounters)
+        if (isCumulative) {
+          latestCumulativeRaw = rawCounters
+        }
+        const scopeSnapshot = normalizeUsageSnapshot(
+          rawCounters,
+          isCumulative ? turnStartBaseline : null,
+          inputIncludesCacheRead,
+        )
+        const scopeKey = isCumulative ? '__thread_cumulative__' : payload.scopeId || payload.sampleId
+        const prevScope = latestUsageByScope.get(scopeKey)
+        const deltaInput = Math.max(0, scopeSnapshot.inputTokens - (prevScope?.inputTokens ?? 0))
+        const deltaOutput = Math.max(0, scopeSnapshot.outputTokens - (prevScope?.outputTokens ?? 0))
+        const deltaCacheRead = Math.max(
+          0,
+          scopeSnapshot.cacheReadTokens - (prevScope?.cacheReadTokens ?? 0),
+        )
+        const deltaCacheCreation = Math.max(
+          0,
+          scopeSnapshot.cacheCreationTokens - (prevScope?.cacheCreationTokens ?? 0),
+        )
+        const deltaTotal = deltaInput + deltaOutput + deltaCacheRead + deltaCacheCreation
+        latestUsageByScope.set(scopeKey, scopeSnapshot)
+
+        if (prevScope === undefined || deltaTotal > 0) {
+          const primaryTarget = params.assistantMessageId
+            ? `${params.assistantMessageId}-s${currentTextSegmentIndex}`
+            : payload.scopeId || payload.sampleId
+          const callUsage: CallTokenUsageSnapshot = {
+            callId: payload.sampleId,
+            targetIds: [primaryTarget],
+            usage: {
+              inputTokens: deltaInput,
+              outputTokens: deltaOutput,
+              cacheReadTokens: deltaCacheRead,
+              cacheCreationTokens: deltaCacheCreation,
+              totalTokens: deltaTotal,
+            },
+          }
+          params.onEvent({ kind: 'call_usage', call: callUsage })
+        }
+
+        let runningInput = 0
+        let runningOutput = 0
+        let runningCacheRead = 0
+        let runningCacheCreation = 0
+        for (const latest of latestUsageByScope.values()) {
+          runningInput += latest.inputTokens
+          runningOutput += latest.outputTokens
+          runningCacheRead += latest.cacheReadTokens
+          runningCacheCreation += latest.cacheCreationTokens
+        }
+        const nextTurnNet: NormalizedUsageSnapshot = {
+          inputTokens: runningInput,
+          outputTokens: runningOutput,
+          cacheReadTokens: runningCacheRead,
+          cacheCreationTokens: runningCacheCreation,
+          totalTokens: runningInput + runningOutput + runningCacheRead + runningCacheCreation,
+        }
+        const hasPositiveNetDelta =
+          nextTurnNet.inputTokens > prevTurnNet.inputTokens ||
+          nextTurnNet.outputTokens > prevTurnNet.outputTokens ||
+          nextTurnNet.cacheReadTokens > prevTurnNet.cacheReadTokens ||
+          nextTurnNet.cacheCreationTokens > prevTurnNet.cacheCreationTokens
+        prevTurnNet = nextTurnNet
+        if (creditGuard.active && hasPositiveNetDelta) {
+          creditGuard.observe({
+            inputTokens: nextTurnNet.inputTokens,
+            outputTokens: nextTurnNet.outputTokens,
+            cacheReadTokens: nextTurnNet.cacheReadTokens,
+            cacheCreationTokens: nextTurnNet.cacheCreationTokens,
+          })
+        }
+        return
       }
       if (payload.kind === 'toolCallObserved' && payload.phase === 'started') {
         const callId = payload.callId
@@ -632,6 +839,31 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
 
     const settleWithReceipt = (receipt: RemoteReceiptV4, durationMs: number): void => {
       if (finalized) return
+      if (receipt.usageMode === 'cumulative' || this.capabilities.billingMode === 'engine-reported') {
+        const finalRaw = rawUsageFromCounters(receipt.countersFinal)
+        this._threadCumulativeBaseline = {
+          rawInput: Math.max(
+            this._threadCumulativeBaseline.rawInput,
+            finalRaw.rawInput,
+            latestCumulativeRaw?.rawInput ?? 0,
+          ),
+          output: Math.max(
+            this._threadCumulativeBaseline.output,
+            finalRaw.output,
+            latestCumulativeRaw?.output ?? 0,
+          ),
+          cacheRead: Math.max(
+            this._threadCumulativeBaseline.cacheRead,
+            finalRaw.cacheRead,
+            latestCumulativeRaw?.cacheRead ?? 0,
+          ),
+          cacheCreation: Math.max(
+            this._threadCumulativeBaseline.cacheCreation,
+            finalRaw.cacheCreation,
+            latestCumulativeRaw?.cacheCreation ?? 0,
+          ),
+        }
+      }
       const totalTokens =
         receipt.usage.inputTokens +
         receipt.usage.outputTokens +
@@ -697,7 +929,13 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
           effectiveErrorCode === 'CC_AUTH_ERROR' ||
           effectiveErrorCode === 'CC_ACCOUNT_VERIFICATION_REQUIRED')
 
-      if (isInterrupted) {
+      if (creditGuard.isExhausted) {
+        params.onEvent({
+          kind: 'error',
+          error: CREDIT_EXHAUSTED_DETAIL,
+          errorCode: 'engine_error',
+        })
+      } else if (isInterrupted) {
         params.onEvent({
           kind: 'error',
           error: 'Turn cancelled by user',
@@ -788,10 +1026,16 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
 
     const drainPromise = (async () => {
       try {
+        const effectiveServiceTier =
+          validated.serviceTier ??
+          (params.serviceTier === 'fast' || params.serviceTier === 'ultrafast'
+            ? params.serviceTier
+            : undefined)
         const outcome = await this.lane.executeTurn(
           {
             ...validated,
             ...(this._effortLevel ? { effort: this._effortLevel } : {}),
+            ...(effectiveServiceTier ? { serviceTier: effectiveServiceTier } : {}),
           },
           {
             onNativeSession: (nativeId) => {
@@ -805,6 +1049,27 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
                 this._nativeId = nativeId
               }
               this.emit('session_id', remoteV4ResumeId(this.executionBackend.operationId, nativeId))
+            },
+            onAdmittedBaseline: (countersBaseline) => {
+              // B04: Hydrate authoritative thread cumulative baseline from relay admission
+              // (finance.bindNativeThread) so a freshly-instantiated adapter resuming an existing
+              // Codex thread never counts historical thread tokens toward this turn's budget guard.
+              const admittedRaw = rawUsageFromCounters(countersBaseline)
+              turnStartBaseline = {
+                rawInput: Math.max(turnStartBaseline.rawInput, admittedRaw.rawInput),
+                output: Math.max(turnStartBaseline.output, admittedRaw.output),
+                cacheRead: Math.max(turnStartBaseline.cacheRead, admittedRaw.cacheRead),
+                cacheCreation: Math.max(turnStartBaseline.cacheCreation, admittedRaw.cacheCreation),
+              }
+              this._threadCumulativeBaseline = {
+                rawInput: Math.max(this._threadCumulativeBaseline.rawInput, admittedRaw.rawInput),
+                output: Math.max(this._threadCumulativeBaseline.output, admittedRaw.output),
+                cacheRead: Math.max(this._threadCumulativeBaseline.cacheRead, admittedRaw.cacheRead),
+                cacheCreation: Math.max(
+                  this._threadCumulativeBaseline.cacheCreation,
+                  admittedRaw.cacheCreation,
+                ),
+              }
             },
             onSubmitted: () => {
               resolveSubmitted()
@@ -827,6 +1092,18 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
               if (finalized) return
               if (item.kind === 'status' && item.code === 'compacting') {
                 params.onEvent({ kind: 'turn_status', status: 'compacting' })
+              } else if (item.kind === 'compaction') {
+                const compaction: ContextCompaction = {
+                  engine: this.engineId,
+                  scope: 'native_context',
+                  strategy: item.code === 'checkpoint_reset' ? 'checkpoint_reset' : 'native_summary',
+                  ...(typeof item.text === 'string' && item.text.trim().length > 0
+                    ? { summaryPreview: item.text.trim().slice(0, 500) }
+                    : {}),
+                  ...(this._nativeId ? { sessionId: this._nativeId } : {}),
+                  ...(params.requestId ? { requestId: params.requestId } : {}),
+                }
+                params.onEvent({ kind: 'context_compacted', compaction })
               } else if (item.kind === 'error') {
                 if (!presentationErrorCode && typeof item.code === 'string' && item.code.length > 0) {
                   presentationErrorCode = item.code
@@ -948,6 +1225,7 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
 
   clearSessionId(): void {
     this._nativeId = null
+    this._threadCumulativeBaseline = { ...ZERO_RAW_USAGE }
   }
 
   setResumeSessionId(sessionId: string): void {
@@ -959,6 +1237,19 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
       'REMOTE_RESUME_ID_INCOMPATIBLE',
     )
     this._nativeId ??= parsed.nativeId
+  }
+
+  /**
+   * Controlled migration helper: rebinds this adapter to `nextNativeId` (either a bare
+   * native session id or a `remotev4:<oldOperationId>:<nativeId>` token from a prior lane)
+   * without weakening the default strict `isResumeIdCompatible` / `setResumeSessionId` checks.
+   */
+  allowMigratedResume(nextNativeId: string): string {
+    const portable = extractPortableNativeSessionId(nextNativeId)
+    remotePoolNeed(portable !== null, 'REMOTE_MIGRATED_RESUME_ID_INVALID')
+    this._nativeId = portable
+    this._threadCumulativeBaseline = { ...ZERO_RAW_USAGE }
+    return remoteV4ResumeId(this.executionBackend.operationId, portable)
   }
 
   requiresReopenForModel(model: string | undefined): boolean {

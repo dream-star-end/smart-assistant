@@ -115,6 +115,16 @@ export interface RemoteDriverDecodeBatch {
   readonly nextNativeState: Record<string, unknown>
 }
 
+export type RemoteDriverTurnContentBlock =
+  | { readonly type: 'text'; readonly text: string }
+  | {
+      readonly type: 'image'
+      readonly mimeType: string
+      readonly data?: string
+      readonly blobId?: string
+      readonly path?: string
+    }
+
 export type RemoteDriverCommand =
   | { readonly kind: 'initialize'; readonly commandId: string; readonly model: string; readonly instructions?: string }
   | {
@@ -124,6 +134,8 @@ export type RemoteDriverCommand =
       readonly prompt: string
       readonly nativeSessionId?: string
       readonly effort?: string
+      readonly serviceTier?: 'standard' | 'fast' | 'ultrafast'
+      readonly content?: readonly RemoteDriverTurnContentBlock[]
       readonly instructions?: string
     }
   | {

@@ -817,11 +817,11 @@ export async function dispatchInbound(
       ...(turnAuthority !== undefined
         ? {
             executionAuthority: {
-              canonicalModel: turnAuthority.canonicalModel,
-              engine: turnAuthority.engine,
+              canonicalModel: turnAuthority.canonicalModel, engine: turnAuthority.engine,
               source: 'bridge_signed' as const,
               ...(turnAuthority.executionBackend ? { executionBackend: turnAuthority.executionBackend } : {}),
             },
+            ...(turnAuthority.poolMigration ? { poolMigration: turnAuthority.poolMigration } : {}),
           }
         : {}),
       ...(promptQueueExecutionFence ? { promptQueueExecutionFence } : {}),

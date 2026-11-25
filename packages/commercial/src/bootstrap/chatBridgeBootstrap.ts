@@ -26,6 +26,10 @@ import {
   type AccountScheduler,
 } from "../account-pool/scheduler.js";
 import {
+  createSelfhostCrossPoolFallbackSelector,
+  createSelfhostReturnToRemoteGrantResolver,
+} from "../account-pool/remotePool/index.js";
+import {
   observeWsBridgeBuffered,
   observeWsBridgeSessionDuration,
   observeWsBridgeTtft,
@@ -276,16 +280,27 @@ export function createCommercialUserChatBridge(deps: {
     : undefined;
   const recycleUnattestedContainer = createUnattestedContainerRecycler(() => deps.v3Deps);
 
+  const isSelfhostV5 =
+    getRuntimeChannel() === "v5" &&
+    deps.flavorIdentity.status === "ok" &&
+    deps.flavorIdentity.flavor === "selfhost";
+
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     cc5BackendSelector: (input) =>
-      selectMasterCc5Backend(
-        deps.cc5Runtime,
-        input,
-        getRuntimeChannel() === "v5" &&
-          deps.flavorIdentity.status === "ok" &&
-          deps.flavorIdentity.flavor === "selfhost",
-        deps.env,
-      ),
+      selectMasterCc5Backend(deps.cc5Runtime, input, isSelfhostV5, deps.env),
+    ...(isSelfhostV5 && deps.modelCatalogCache
+      ? {
+          crossPoolFallbackSelector: createSelfhostCrossPoolFallbackSelector({
+            pool: getPool(),
+            catalogCache: deps.modelCatalogCache,
+            selfhost: isSelfhostV5,
+          }),
+          returnToRemoteGrantResolver: createSelfhostReturnToRemoteGrantResolver({
+            pool: getPool(),
+            selfhost: isSelfhostV5,
+          }),
+        }
+      : {}),
     containerLinkEnabled: deps.containerLinkOn,
     resolveContainerLinkEndpoint: async (uid, cid) => {
       const ep = await resolveContainerLinkEndpoint(getPool(), deps.runtimeChannel, uid, cid);

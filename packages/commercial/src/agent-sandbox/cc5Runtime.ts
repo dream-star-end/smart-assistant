@@ -171,6 +171,7 @@ export function createMasterCc5Runtime(
       dockerId: string
       sessionKey: string
       canonicalModel: string
+      allowStickyFailover?: boolean
     }) => {
       if (isReservedVerificationSessionKey(request.sessionKey)) {
         throw new Error('REMOTE_SESSION_KEY_RESERVED')
@@ -192,6 +193,7 @@ export function createMasterCc5Runtime(
             pool,
             drainGate,
             ...(fixture.v4PlacementOptions ?? {}),
+            ...(request.allowStickyFailover === true ? { allowStickyFailover: true } : {}),
           },
         )
         return {
@@ -282,6 +284,7 @@ export async function selectMasterCc5Backend(
     canonicalModel: string
     engine: string
     placement: 'local' | 'remote_pool'
+    allowStickyFailover?: boolean
   },
   selfhost: boolean,
   env: Cc5PolicyEnvironment,
@@ -298,15 +301,17 @@ export async function selectMasterCc5Backend(
   ) {
     throw new Error('REMOTE_LANE_UNAVAILABLE')
   }
-  const backend = await runtime.ensureLane({
+  const laneEngine: 'codex' | 'antigravity' | undefined =
+    input.engine === 'codex' || input.engine === 'antigravity' ? input.engine : undefined
+  const laneRequest = {
     uid: input.uid,
     containerDbId: String(input.containerId),
     sessionKey: input.sessionKey,
     canonicalModel: input.canonicalModel,
-    ...(input.engine === 'codex' || input.engine === 'antigravity'
-      ? { engine: input.engine }
-      : {}),
-  })
+    ...(laneEngine ? { engine: laneEngine } : {}),
+    ...(input.allowStickyFailover === true ? { allowStickyFailover: true } : {}),
+  }
+  const backend = await runtime.ensureLane(laneRequest)
   if (
     !isRemoteBackendAuthority({
       engine: input.engine,

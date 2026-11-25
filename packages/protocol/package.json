@@ -85,6 +85,21 @@
       "types": "./src/agentRemoteState.ts",
       "openclaude-precompiled": "./dist/agentRemoteState.js",
       "default": "./src/agentRemoteState.ts"
+    },
+    "./storage-seam": {
+      "types": "./src/storage-seam/index.ts",
+      "openclaude-precompiled": "./dist/storage-seam/index.js",
+      "default": "./src/storage-seam/index.ts"
+    },
+    "./inference-pool": {
+      "types": "./src/inference-pool/index.ts",
+      "openclaude-precompiled": "./dist/inference-pool/index.js",
+      "default": "./src/inference-pool/index.ts"
+    },
+    "./exec-env": {
+      "types": "./src/exec-env/index.ts",
+      "openclaude-precompiled": "./dist/exec-env/index.js",
+      "default": "./src/exec-env/index.ts"
     }
   },
   "dependencies": {

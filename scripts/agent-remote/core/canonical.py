@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 SAFE_INTEGER = 2**53 - 1
 GENESIS_RAW_EVIDENCE_DIGEST = "0" * 64
@@ -149,6 +149,33 @@ def remote_canonical_bytes(value: Any) -> bytes:
 
 def remote_canonical_sha256(value: Any) -> str:
     return hashlib.sha256(remote_canonical_bytes(value)).hexdigest()
+
+
+def filter_args_by_schema(
+    args: Dict[str, Any],
+    input_schema: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Filter tool arguments to keys declared in `input_schema["properties"]`.
+
+    Strips CLI-private UI fields (e.g. `toolSummary`) while preserving exact
+    values of all schema-declared parameters. When `input_schema` has no
+    non-empty `properties` dict, returns a shallow copy of `args` unchanged.
+    """
+    if type(args) is not dict:
+        raise ValueError("REMOTE_CANONICAL_JSON_INVALID")
+    if isinstance(input_schema, dict):
+        props = input_schema.get("properties")
+        if isinstance(props, dict) and len(props) > 0:
+            return {k: v for k, v in args.items() if k in props}
+    return dict(args)
+
+
+def remote_schema_filtered_sha256(
+    args: Dict[str, Any],
+    input_schema: Optional[Dict[str, Any]],
+) -> str:
+    """Compute canonical SHA-256 over schema-filtered tool arguments."""
+    return remote_canonical_sha256(filter_args_by_schema(args, input_schema))
 
 
 def advance_raw_evidence_digest(

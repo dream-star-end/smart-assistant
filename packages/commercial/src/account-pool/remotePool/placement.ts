@@ -26,6 +26,7 @@ import {
   REMOTE_DRIVER_BACKEND,
   REMOTE_DRIVER_PROTOCOL_VERSION,
   type RemoteProbeSnapshot,
+  computeStickyHomeKey,
   remoteCanonicalSha256,
   validateRemoteProbeSnapshot,
 } from '@openclaude/protocol'
@@ -63,6 +64,7 @@ import {
 
 const DEFAULT_BINDING_TTL_MS = 24 * 60 * 60_000
 const SHA256_RE = /^[a-f0-9]{64}$/
+const STICKY_HOME_DRIVERS = new Set(['antigravity'])
 
 function need(condition: unknown, code = 'REMOTE_DRIVER_PLACEMENT_INVALID'): asserts condition {
   if (!condition) throw new Error(code)
@@ -114,6 +116,8 @@ export interface PlaceRemoteDriverLaneOptions {
   readonly allowTestFaultsInSandbox?: boolean
   readonly testFaultSandboxMode?: 'account_mutex' | 'shared_node_cap_5'
   readonly onAccountMutexBlocked?: (attempt: number) => void
+  /** OCV5-890: permit cross-node failover within the same pool when the sticky profile is unavailable. */
+  readonly allowStickyFailover?: boolean
 }
 
 export interface RemoteDriverPlacementResult {
@@ -124,20 +128,32 @@ export interface RemoteDriverPlacementResult {
   readonly profileUuid: string
   readonly profileName: string
   readonly generation: string
+  readonly migratedFromProfileId?: string
+}
+
+interface BillingJournalQueryable {
+  query(sql: string, params?: unknown[]): Promise<{ readonly rows: readonly unknown[] }>
 }
 
 async function assertNoPendingBillingJournal(
-  client: PoolClient,
+  client: BillingJournalQueryable,
   uidStr: string,
-  operationId: string,
+  operationId: string | null,
+  sessionKey?: string | null,
 ): Promise<void> {
   const pendingJournal = await client.query(
     `SELECT 1 FROM request_finalize_journal
       WHERE user_id = $1
         AND ctx->>'remoteNativeBillingRecovery' = ANY($2::text[])
         AND (
-          ctx#>>'{remoteNative,scope,operationId}' = $3
-          OR ctx#>>'{remoteDriverV4,scope,operationId}' = $3
+          ($3::text IS NOT NULL AND (
+            ctx#>>'{remoteNative,scope,operationId}' = $3
+            OR ctx#>>'{remoteDriverV4,scope,operationId}' = $3
+          ))
+          OR ($4::text IS NOT NULL AND (
+            ctx#>>'{remoteNative,scope,sessionKey}' = $4
+            OR ctx#>>'{remoteDriverV4,scope,sessionKey}' = $4
+          ))
         )
         AND state IN ('inflight', 'finalizing')
       LIMIT 1`,
@@ -149,11 +165,21 @@ async function assertNoPendingBillingJournal(
         REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION,
       ],
       operationId,
+      sessionKey ?? null,
     ],
   )
   if (pendingJournal.rows.length > 0) {
     throw new Error('REMOTE_OPERATION_BILLING_PENDING')
   }
+}
+
+export async function assertNoPendingRemoteBillingForSession(
+  client: BillingJournalQueryable,
+  uid: number | string | bigint,
+  sessionKey: string,
+  operationId?: string | null,
+): Promise<void> {
+  await assertNoPendingBillingJournal(client, String(uid), operationId ?? null, sessionKey)
 }
 
 export async function placeRemoteDriverLane(
@@ -243,6 +269,7 @@ export async function placeRemoteDriverLane(
       }
 
       let selectedRow: Record<string, any> | undefined
+      let migratedFromProfileId: string | undefined
       let verifiedProbe: RemoteProbeSnapshot | undefined
       let activeFingerprint: string | undefined
 
@@ -457,9 +484,24 @@ export async function placeRemoteDriverLane(
         const exhausted = (profiles: string[]) =>
           Object.assign(new Error('REMOTE_LANE_CAPACITY_EXHAUSTED'), { profiles })
 
+        const priorStickyOperationId = sticky?.operation_id
+        let effectiveSticky: typeof sticky | undefined = sticky
         if (sticky) {
           selectedRow = eligible.find((r) => String(r.profile_id) === sticky.profile_id)
-          if (!selectedRow) {
+          if (!selectedRow && options.allowStickyFailover === true && eligible.length > 0) {
+            migratedFromProfileId = sticky.profile_id
+            effectiveSticky = undefined
+          } else if (!selectedRow) {
+            // B06: Check unsettled billing BEFORE reporting profile/capacity unavailability so
+            // cross-pool fallback never treats a billing-pending session as eligible for local takeover.
+            if (priorStickyOperationId) {
+              await assertNoPendingBillingJournal(
+                client,
+                uidStr,
+                priorStickyOperationId,
+                effectiveSessionKey,
+              )
+            }
             if (reverifyProfiles.has(sticky.profile_id)) {
               throw new Error('REMOTE_DRIVER_REVERIFY_REQUIRED')
             }
@@ -471,7 +513,8 @@ export async function placeRemoteDriverLane(
             }
             throw new Error('REMOTE_LANE_PROFILE_UNAVAILABLE')
           }
-        } else {
+        }
+        if (!effectiveSticky) {
           const ranked = rankRemotePoolCandidates(
             eligible.map((r) => ({
               profileId: String(r.profile_id),
@@ -493,6 +536,14 @@ export async function placeRemoteDriverLane(
           )
           selectedRow = eligible.find((r) => String(r.profile_id) === ranked[0]?.profileId)
           if (!selectedRow) {
+            if (priorStickyOperationId) {
+              await assertNoPendingBillingJournal(
+                client,
+                uidStr,
+                priorStickyOperationId,
+                effectiveSessionKey,
+              )
+            }
             if (fullProfiles.size > 0) throw exhausted([...fullProfiles])
             if (reverifyProfiles.size > 0) throw new Error('REMOTE_DRIVER_REVERIFY_REQUIRED')
             if (staleProfiles.size > 0) throw new Error('REMOTE_DRIVER_PROBE_STALE')
@@ -500,13 +551,24 @@ export async function placeRemoteDriverLane(
           }
         }
 
+        need(selectedRow !== undefined, 'NO_ELIGIBLE_REMOTE_PROFILE')
         const info = readyMap.get(String(selectedRow.profile_id))!
         verifiedProbe = info.snapshot
         activeFingerprint = info.fingerprint
 
-        if (sticky) {
-          await assertNoPendingBillingJournal(client, uidStr, sticky.operation_id)
-          selectedRow._sticky = sticky
+        // B06: Unconditionally guard the prior sticky operation's billing settlement
+        // before admitting or creating any new operation, even when allowStickyFailover
+        // cleared effectiveSticky to migrate onto another profile.
+        if (priorStickyOperationId) {
+          await assertNoPendingBillingJournal(
+            client,
+            uidStr,
+            priorStickyOperationId,
+            effectiveSessionKey,
+          )
+        }
+        if (effectiveSticky) {
+          selectedRow._sticky = effectiveSticky
         }
       }
 
@@ -662,6 +724,9 @@ export async function placeRemoteDriverLane(
           mergedDriverContext.bridgeFiles = defaultNodeCtx.bridgeFiles
         }
       }
+      if (STICKY_HOME_DRIVERS.has(reg.driverId) && mergedDriverContext.stickyHomeKey === undefined) {
+        mergedDriverContext.stickyHomeKey = computeStickyHomeKey(effectiveSessionKey)
+      }
 
       const spec: RemotePoolLaneSpec = Object.freeze({
         controllerPath,
@@ -761,6 +826,7 @@ export async function placeRemoteDriverLane(
         profileUuid: String(selectedRow.profile_id),
         profileName,
         generation,
+        ...(migratedFromProfileId ? { migratedFromProfileId } : {}),
       }
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {})

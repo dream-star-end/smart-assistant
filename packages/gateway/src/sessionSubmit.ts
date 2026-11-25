@@ -11,7 +11,7 @@ import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 import { isRemoteV4ResumeId, parseRemoteV4ResumeId } from './remotePool/resumeId.js'
 import { restartRunnerForConfigChange } from './runnerConfigRestart.js'
 import { BOX_IDLE_PRE_EXPIRY_MIN_TOKENS, boxIdlePreExpiryMs, cancelIdlePreExpiry } from './boxContextBudget.js'
-import { cc5SessionBackend, assertFreshCc5Session } from './cc5SessionBackend.js'
+import { cc5SessionBackend, assertFreshCc5Session, type CrossPoolMigrationGrant } from './cc5SessionBackend.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
 import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
@@ -1577,7 +1577,7 @@ export async function submit(
 
 export async function _getOrCreateExclusive(
   this: SessionSubmitHost,
-  opts: Parameters<SessionManager['getOrCreate']>[0],
+  opts: Parameters<SessionManager['getOrCreate']>[0] & { poolMigration?: CrossPoolMigrationGrant },
 ): Promise<AgentSession> {
   const ownsDispatchFence = this._ownsPromptQueueExecutionFence(
     opts.sessionKey,
@@ -1591,12 +1591,7 @@ export async function _getOrCreateExclusive(
   }
   // Identity construction outlives an individual dispatch/switch. Never retain
   // their one-use admission credentials in the reusable session template.
-  const {
-    promptQueueExecutionFence: _fence,
-    modelSwitchId: _switchId,
-    preheatOnly: _preheatOnly,
-    ...identityCreationOpts
-  } = opts
+  const { promptQueueExecutionFence: _fence, modelSwitchId: _switchId, preheatOnly: _preheatOnly, poolMigration: _poolMigration, ...identityCreationOpts } = opts
   // Hermetic advisor/Auto-Dream sessions have no persona or identity overlay.
   // Fetching marketplace identity here would fail-closed the no-tools path
   // whenever master sync is briefly unavailable.
@@ -1640,14 +1635,19 @@ export async function _getOrCreateExclusive(
   // This runs under the creation gate. A late speculative lookup must not
   // overwrite a real first turn that created its runner while projection awaited.
   if (opts.preheatOnly && existing) return existing
+  const poolMigration = opts.poolMigration
+  const hasAuthorizedMigration = Boolean(
+    poolMigration?.allowBackendTransition && poolMigration.migrationId.trim().length >= 8 &&
+      Number.isSafeInteger(poolMigration.placementEpoch) && poolMigration.placementEpoch >= 1,
+  )
   const executionBackend = cc5SessionBackend({ ...opts, engineId, executionModel,
-    storedResumeId: this._resumeMap.get(opts.sessionKey) })
+    storedResumeId: this._resumeMap.get(opts.sessionKey), poolMigration })
   const backendChanged = !sameRemoteExecutionBackend(existing?.runner.executionBackend, executionBackend)
-  if (existing?.runner.executionBackend && backendChanged) throw new Error('CC5_BACKEND_SCOPE_CHANGED')
+  if (existing?.runner.executionBackend && backendChanged && !hasAuthorizedMigration) throw new Error('CC5_BACKEND_SCOPE_CHANGED')
   const assertFreshBackendTarget = (current: AgentSession | undefined) => assertFreshCc5Session({
     current, storedResumeId: this._resumeMap.get(opts.sessionKey),
     storedResumeProvider: normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)),
-    executionBackend,
+    executionBackend, poolMigration,
     sessionIds: [opts.sessionKey, ...(opts.peerId ? [opts.peerId] : [])], hasPersistedTurnActivity,
   })
   if (executionBackend && (!existing || backendChanged)) await assertFreshBackendTarget(existing)
@@ -1752,9 +1752,7 @@ export async function _getOrCreateExclusive(
           const canonical = this.sessions.get(opts.sessionKey)
           if (canonical && canonical !== existing) {
             await canonical.lock
-            if (canonical.runner.executionBackend && !sameRemoteExecutionBackend(canonical.runner.executionBackend, executionBackend)) {
-              throw new Error('CC5_BACKEND_SCOPE_CHANGED')
-            }
+            if (canonical.runner.executionBackend && !sameRemoteExecutionBackend(canonical.runner.executionBackend, executionBackend) && !hasAuthorizedMigration) throw new Error('CC5_BACKEND_SCOPE_CHANGED')
             const desiredEngineNow =
               opts.model !== undefined ||
               opts.executionAuthority !== undefined ||
@@ -2378,6 +2376,7 @@ export async function getOrCreate(
      *  usage_records.mode/parent_session_id/delegate_agent_id。
      *  Spawn-time attribute(delegate sessionKey 带时间戳一次性,不存在复用)。 */
     usageAttribution?: UsageAttributionTag
+    poolMigration?: CrossPoolMigrationGrant
   },
 ): Promise<AgentSession> {
   return this._enterSessionCreateGate(opts.sessionKey, () => this._getOrCreateExclusive(opts))

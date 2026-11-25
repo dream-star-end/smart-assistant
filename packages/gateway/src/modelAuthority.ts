@@ -1,4 +1,5 @@
 import {
+  type AuthorityPoolMigrationGrant,
   type RemoteExecutionBackend,
   isBoxApiModel,
   isCc5ExecutionBackend,
@@ -135,6 +136,7 @@ export function isEngineLocalTurnExempt(env: NodeJS.ProcessEnv = process.env): b
  */
 export interface TurnExecutionDescriptor {
   readonly executionBackend?: RemoteExecutionBackend
+  readonly poolMigration?: AuthorityPoolMigrationGrant
   readonly canonicalModel: string
   readonly engine: ModelAuthorityEngine
   readonly contextWindow: number | null
@@ -566,6 +568,7 @@ export class ModelAuthorityConsumer {
       canonicalModel: payload.canonicalModel,
       engine: payload.engine,
       ...(payload.executionBackend ? { executionBackend: payload.executionBackend } : {}),
+      ...(payload.poolMigration ? { poolMigration: payload.poolMigration } : {}),
       contextWindow: descriptorRaw.contextWindow,
       supportsVision: descriptorRaw.supportsVision,
       supportedEfforts: descriptorRaw.supportedEfforts,

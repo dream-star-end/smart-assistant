@@ -16,7 +16,7 @@ from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional
 
-from core.canonical import remote_canonical_sha256, strict_json
+from core.canonical import filter_args_by_schema, remote_canonical_sha256, strict_json
 from core.contract import IDENT_RE, TOOL_ALIAS_RE, need
 
 DRIVER_ID = "antigravity"
@@ -25,6 +25,7 @@ AUTHORITY_ENGINE = "antigravity"
 DRIVER_VERSION = "1.0.0"
 SEMANTICS_ID = "antigravity-stream-json-v1"
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+STICKY_HOME_KEY_RE = re.compile(r"^s-[a-f0-9]{16}\Z")
 
 MODEL_SPECS: Dict[str, Dict[str, Any]] = {
     "gemini-4-carbon": {"display": "Gemini 4 Carbon", "efforts": ["low", "medium", "high"], "default": "medium"},
@@ -136,8 +137,61 @@ sys.stdout.flush()
 _AGY_HOST_PY = r"""#!/usr/bin/env python3
 import collections, json, os, pathlib, queue, re, shutil, signal, sqlite3, subprocess, sys, threading, time
 
-cfg = json.loads((pathlib.Path(__file__).resolve().parent / "host_config.json").read_text(encoding="utf-8"))
-home_dir = pathlib.Path(os.environ["HOME"])
+script_dir = pathlib.Path(__file__).resolve().parent
+cfg = json.loads((script_dir / "host_config.json").read_text(encoding="utf-8"))
+
+def _atomic_write_bytes(dst_path, data, mode=0o600):
+    dst_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp_path = dst_path.with_name(f".{dst_path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    fd = os.open(tmp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, mode)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short write")
+            view = view[written:]
+        os.fsync(fd)
+    except Exception:
+        os.close(fd)
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    os.close(fd)
+    os.replace(tmp_path, dst_path)
+
+sticky_home_raw = str(cfg.get("stickyHomeDir") or "").strip()
+if sticky_home_raw:
+    home_dir = pathlib.Path(sticky_home_raw)
+    home_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    home_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(home_dir, 0o700)
+    os.environ["HOME"] = str(home_dir)
+else:
+    home_dir = pathlib.Path(os.environ["HOME"])
+
+def sync_sticky_isolation_files():
+    if not sticky_home_raw:
+        return
+    src_home = script_dir / "home"
+    for rel_path, mode in (
+        (".gemini/config/mcp_config.json", 0o400),
+        (".gemini/config/hooks.json", 0o400),
+        (".gemini/antigravity-cli/agents/ocremote.md", 0o400),
+    ):
+        src_file = src_home / rel_path
+        if src_file.is_file():
+            _atomic_write_bytes(home_dir / rel_path, src_file.read_bytes(), mode=mode)
+    settings_dst = home_dir / ".gemini" / "antigravity-cli" / "settings.json"
+    if not settings_dst.exists():
+        settings_src = src_home / ".gemini" / "antigravity-cli" / "settings.json"
+        payload = settings_src.read_bytes() if settings_src.is_file() else b"{}\n"
+        _atomic_write_bytes(settings_dst, payload, mode=0o600)
+
+sync_sticky_isolation_files()
+
 cli_home_dir = home_dir / ".gemini" / "antigravity-cli"
 cli_home_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 acct_home_raw = str(cfg.get("accountHome") or "").strip()
@@ -152,8 +206,7 @@ if acct_home_raw:
         ):
             if cand.is_file():
                 dst = cli_home_dir / "antigravity-oauth-token"
-                shutil.copy2(cand, dst)
-                os.chmod(dst, 0o600)
+                _atomic_write_bytes(dst, cand.read_bytes(), mode=0o600)
                 break
         acct_cli_dir = acct_home / ".gemini" / "antigravity-cli"
         if acct_cli_dir.is_dir():
@@ -164,6 +217,8 @@ if acct_home_raw:
                 if not target.exists():
                     continue
                 local_sub = cli_home_dir / sub
+                if local_sub.is_symlink() and os.readlink(local_sub) == str(target):
+                    continue
                 if local_sub.is_symlink():
                     local_sub.unlink()
                 elif local_sub.is_dir():
@@ -274,6 +329,7 @@ def stop_child_gracefully():
 
 def spawn_cli(resume_id, effort_val=""):
     global child, current_child_model
+    sync_sticky_isolation_files()
     launch_baseline = max(seen_max_step_idx, compute_db_baseline(resume_id)) if resume_id else -1
     is_resumed = bool(resume_id)
     target_model = resolve_cli_model(cfg["model"], effort_val)
@@ -311,7 +367,12 @@ def spawn_cli(resume_id, effort_val=""):
             pass
 
     pretool_dir = pathlib.Path(__file__).resolve().parent / "run" / "pretool"
+    tool_schema_keys_map = cfg.get("toolSchemaKeys") if isinstance(cfg.get("toolSchemaKeys"), dict) else {}
     hydrated_by_step = {}
+
+    def _project_by_schema(full_args, allowed_keys):
+        allowed_set = set(allowed_keys)
+        return {k: v for k, v in full_args.items() if k in allowed_set}
 
     def _has_truncated_string(val):
         if isinstance(val, str):
@@ -334,9 +395,7 @@ def spawn_cli(resume_id, effort_val=""):
         return cur == full
 
     def _restore_truncated(cur, full):
-        # Project the hook's full args onto the stream-visible shape. Only `512 chars + …` strings are
-        # replaced; keys that the CLI injects for itself (e.g. `toolSummary`) and never forwards to the
-        # MCP `tools/call` are dropped, so the observation hashes exactly what ocbridge will receive.
+        # Fallback when tool schema keys are unavailable: project hook's full args onto stream-visible shape.
         if isinstance(cur, str) and cur.endswith("\u2026"):
             return full
         if isinstance(cur, dict):
@@ -354,7 +413,18 @@ def spawn_cli(resume_id, effort_val=""):
             return None
         return doc
 
-    def _try_hydrate_from_pretool_dir(scid, sidx, tname, cur_params):
+    def _apply_hook_doc(cur_params, doc_args, schema_keys):
+        if schema_keys:
+            cur_proj = _project_by_schema(cur_params, schema_keys)
+            full_proj = _project_by_schema(doc_args, schema_keys)
+            if _value_matches_truncated(cur_proj, full_proj):
+                return full_proj
+            return None
+        if _value_matches_truncated(cur_params, doc_args):
+            return _restore_truncated(cur_params, doc_args)
+        return None
+
+    def _try_hydrate_from_pretool_dir(scid, sidx, tname, cur_params, schema_keys):
         if not pretool_dir.is_dir():
             return None
         if type(sidx) is int:
@@ -363,10 +433,11 @@ def spawn_cli(resume_id, effort_val=""):
                 doc = _read_pretool_doc(step_path)
                 if doc and doc.get("name") == tname:
                     dcid = str(doc.get("conversationId") or "")
-                    if (not dcid or not scid or dcid == scid) and _value_matches_truncated(cur_params, doc["args"]):
-                        restored = _restore_truncated(cur_params, doc["args"])
-                        hydrated_by_step[(scid, sidx)] = restored
-                        return restored
+                    if not dcid or not scid or dcid == scid:
+                        restored = _apply_hook_doc(cur_params, doc["args"], schema_keys)
+                        if restored is not None:
+                            hydrated_by_step[(scid, sidx)] = restored
+                            return restored
         for cand in sorted(pretool_dir.glob("seq_*.json")):
             doc = _read_pretool_doc(cand)
             if not doc or doc.get("name") != tname:
@@ -377,33 +448,37 @@ def spawn_cli(resume_id, effort_val=""):
             dsidx = doc.get("stepIdx")
             if type(dsidx) is int and type(sidx) is int and dsidx != sidx:
                 continue
-            if _value_matches_truncated(cur_params, doc["args"]):
+            restored = _apply_hook_doc(cur_params, doc["args"], schema_keys)
+            if restored is not None:
                 try:
                     cand.unlink()
                 except OSError:
                     pass
-                restored = _restore_truncated(cur_params, doc["args"])
                 if type(sidx) is int:
                     hydrated_by_step[(scid, sidx)] = restored
                 return restored
         return None
 
     def hydrate_mcp_tool_params(scid, sidx, tname, cur_params):
-        # Untruncated params already equal the MCP `tools/call` arguments; never swap in hook args.
-        if not _has_truncated_string(cur_params):
-            return cur_params
+        bare_name = tname[len("mcp_ocbridge_"):] if tname.startswith("mcp_ocbridge_") else tname
+        raw_skeys = tool_schema_keys_map.get(bare_name)
+        schema_keys = [str(k) for k in raw_skeys] if isinstance(raw_skeys, list) and len(raw_skeys) > 0 else None
         if type(sidx) is int and (scid, sidx) in hydrated_by_step:
             return hydrated_by_step[(scid, sidx)]
-        found = _try_hydrate_from_pretool_dir(scid, sidx, tname, cur_params)
+        has_trunc = _has_truncated_string(cur_params)
+        if schema_keys is None and not has_trunc:
+            return cur_params
+        found = _try_hydrate_from_pretool_dir(scid, sidx, tname, cur_params, schema_keys)
         if found is not None:
             return found
-        deadline = time.monotonic() + 1.5
-        while time.monotonic() < deadline:
-            time.sleep(0.01)
-            found = _try_hydrate_from_pretool_dir(scid, sidx, tname, cur_params)
-            if found is not None:
-                return found
-        return cur_params
+        if has_trunc:
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                time.sleep(0.01)
+                found = _try_hydrate_from_pretool_dir(scid, sidx, tname, cur_params, schema_keys)
+                if found is not None:
+                    return found
+        return _project_by_schema(cur_params, schema_keys) if schema_keys else cur_params
 
     def read_out():
         global conv_id, child, turn_in_flight, interrupted_flag, pending_interrupt_cmd, seen_max_step_idx
@@ -532,6 +607,7 @@ while True:
         elif child is None:
             spawn_cli("", res_eff)
     elif op == "turn":
+        sync_sticky_isolation_files()
         prompt = str(cmd.get("prompt") or "")
         if not cmd.get("hasInstructions") and cfg.get("systemPrompt") and not applied_launch_system_prompt:
             prompt = "<openclaude_platform_context>\n" + str(cfg["systemPrompt"]) + "\n</openclaude_platform_context>\n\n" + prompt
@@ -749,12 +825,29 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
         and 1 <= len(tools_obj["tools"]) <= 128,
         "AGY_TOOLS_CATALOG_INVALID",
     )
-    tool_names = [
-        str(t["name"])
-        for t in tools_obj["tools"]
-        if isinstance(t, dict) and isinstance(t.get("name"), str) and TOOL_ALIAS_RE.fullmatch(str(t["name"]))
-    ]
+    tool_names: List[str] = []
+    tool_schema_keys: Dict[str, List[str]] = {}
+    for t in tools_obj["tools"]:
+        if isinstance(t, dict) and isinstance(t.get("name"), str) and TOOL_ALIAS_RE.fullmatch(str(t["name"])):
+            tname_s = str(t["name"])
+            tool_names.append(tname_s)
+            schema = t.get("inputSchema")
+            if isinstance(schema, dict) and isinstance(schema.get("properties"), dict) and len(schema["properties"]) > 0:
+                tool_schema_keys[tname_s] = sorted(str(k) for k in schema["properties"].keys())
     need(len(tool_names) >= 1, "AGY_TOOLS_CATALOG_INVALID")
+
+    raw_sticky_key = context.get("stickyHomeKey")
+    if raw_sticky_key is None and isinstance(context.get("manifest"), dict):
+        raw_sticky_key = context["manifest"].get("stickyHomeKey")
+    sticky_home_dir = ""
+    if (
+        isinstance(raw_sticky_key, str)
+        and STICKY_HOME_KEY_RE.fullmatch(raw_sticky_key)
+        and not str(root).startswith("/tmp/oc-drvtest-")
+        and account_home
+        and account_home.startswith("/")
+    ):
+        sticky_home_dir = str(Path(account_home).resolve() / "oc-sticky" / raw_sticky_key)
 
     fault_tokens: List[str] = []
     if str(root).startswith("/tmp/oc-drvtest-"):
@@ -818,7 +911,7 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
             ]
         }
 
-    host_cfg = {
+    host_cfg: Dict[str, Any] = {
         "cliPath": cli_path,
         "qemuPath": qemu_path,
         "accountHome": account_home,
@@ -828,7 +921,10 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
         "systemPrompt": system_prompt,
         "initialSessionId": initial_session_id,
         "nativeToolsFlag": native_tools_flag,
+        "toolSchemaKeys": tool_schema_keys,
     }
+    if sticky_home_dir:
+        host_cfg["stickyHomeDir"] = sticky_home_dir
 
     files: Dict[str, Dict[str, Any]] = {
         "home/.gemini/config/mcp_config.json": {"content": json.dumps(mcp_config, separators=(",", ":")), "mode": 0o400},
@@ -843,7 +939,7 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
     return {
         "argv": ["/usr/bin/python3", "-I", "-B", str(root / "agy_host.py")],
         "environment": {
-            "HOME": str(root / "home"),
+            "HOME": sticky_home_dir if sticky_home_dir else str(root / "home"),
             "XDG_CACHE_HOME": str(root / "cache"),
             "TMPDIR": str(root / "tmp"),
             "PATH": "/usr/local/bin:/usr/bin:/bin",
@@ -944,6 +1040,14 @@ def encode(command: Dict[str, Any], native_state: Dict[str, Any]) -> Dict[str, A
             lines.append(json.dumps(payload, separators=(",", ":")))
 
     elif kind == "newTurn":
+        raw_content = command.get("content")
+        if raw_content is not None:
+            need(isinstance(raw_content, list) and len(raw_content) > 0, "AGY_CONTENT_INVALID")
+            for blk in raw_content:
+                need(isinstance(blk, dict) and isinstance(blk.get("type"), str), "AGY_CONTENT_INVALID")
+                if blk["type"] != "text":
+                    raise ValueError("AGY_VISION_CONTENT_UNSUPPORTED")
+                need(isinstance(blk.get("text"), str), "AGY_CONTENT_INVALID")
         prompt = command.get("prompt")
         need(isinstance(prompt, str) and len(prompt.strip()) > 0, "AGY_EMPTY_PROMPT")
         need(not state.get("activeTurn"), "AGY_TURN_ALREADY_ACTIVE")
@@ -1215,6 +1319,28 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
                 state["turnSawUsage"] = True
                 seen_steps.append(sidx)
                 state["seenUsageSteps"] = seen_steps
+                tseq_cur = int(frame.get("turnSeq") or state.get("activeTurnSeq") or 1)
+                sess_cur = str(state.get("sessionId") or scid or "unknown")
+                term_scope = _turn_terminal_id(state, sess_cur, tseq_cur)
+                step_tag = str(sidx) if type(sidx) is int and sidx >= 0 else str(len(seen_steps))
+                sample_id = f"{term_scope}-s{step_tag}"[:128]
+                security_events.append(
+                    {
+                        "kind": "usage",
+                        "sampleId": sample_id,
+                        "scopeId": term_scope,
+                        "semanticsId": SEMANTICS_ID,
+                        "rawCounters": {
+                            "input_tokens": int(state["turnInput"]),
+                            "output_tokens": int(state["turnOutput"]),
+                            "cache_read_tokens": int(state["turnCacheRead"]),
+                        },
+                    }
+                )
+
+        elif stype == 23 or stype == "23" or (isinstance(stype, str) and stype.lower() in ("compaction", "context_compaction", "context_compacted")):
+            presentation.append({"kind": "compaction", "code": "step_type_23"})
+            state.pop("loadedInstructionsHash", None)
 
         elif stype == "tool":
             state["trailingError"] = None
@@ -1229,6 +1355,9 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
             else:
                 alias = tname[len("mcp_ocbridge_") :]
                 params = tinfo.get("parameters") if isinstance(tinfo.get("parameters"), dict) else {}
+                tool_schemas = state.get("toolSchemas")
+                if isinstance(tool_schemas, dict) and isinstance(tool_schemas.get(alias), dict):
+                    params = filter_args_by_schema(params, tool_schemas[alias])
                 need(TOOL_ALIAS_RE.fullmatch(alias) and type(sidx) is int and sidx >= 0, "AGY_TOOL_STEP_INVALID")
                 sess_id = state.get("sessionId")
                 need(isinstance(sess_id, str) and IDENT_RE.fullmatch(sess_id), "AGY_TOOL_MISSING_SESSION")
@@ -1256,6 +1385,10 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
                 state["preludeError"] = err_text
             else:
                 state["trailingError"] = err_text
+
+    elif raw_ev in ("compaction", "context_compacted"):
+        presentation.append({"kind": "compaction", "code": "step_type_23"})
+        state.pop("loadedInstructionsHash", None)
 
     elif raw_ev == "result":
         res = raw.get("result")

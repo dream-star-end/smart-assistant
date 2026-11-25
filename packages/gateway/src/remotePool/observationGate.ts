@@ -9,6 +9,7 @@
  */
 import { EventEmitter } from 'node:events'
 import {
+  computeSchemaFilteredArgsSha256,
   remoteCanonicalSha256,
   validatePendingToolRequest,
   validateSecurityEvent,
@@ -62,6 +63,7 @@ export class RemoteObservationGate {
       testFaultAllowDuplicateClaim?: boolean
       allowTestBypassInTmp?: boolean
       authorizeTimeoutMs?: number
+      toolInputSchemas?: ReadonlyMap<string, Record<string, unknown>>
     } = {},
   ) {
     if (
@@ -71,6 +73,15 @@ export class RemoteObservationGate {
       throw new Error('REMOTE_OBSERVATION_BYPASS_FORBIDDEN')
     }
     this.events.setMaxListeners(128)
+  }
+
+  private computeAlignedArgsHash(
+    toolAlias: string,
+    args: Readonly<Record<string, unknown>>,
+    fullHash: string,
+  ): string {
+    const schema = this.options.toolInputSchemas?.get(toolAlias)
+    return schema ? computeSchemaFilteredArgsSha256(args, schema) : fullHash
   }
 
   get isFenced(): boolean {
@@ -146,6 +157,7 @@ export class RemoteObservationGate {
         validateCc5NativeToolInput(`mcp__ocbridge__${payload.name}`, payload.arguments, REMOTE_V4_TOOL_INPUT_MAX_BYTES)
         const recomputedHash = remoteCanonicalSha256(payload.arguments)
         remotePoolNeed(recomputedHash === payload.argsHash, 'REMOTE_TOOL_ARGS_HASH_MISMATCH')
+        const alignedHash = this.computeAlignedArgsHash(payload.name, payload.arguments, recomputedHash)
 
         if (payload.phase === 'started') {
           remotePoolNeed(
@@ -162,7 +174,7 @@ export class RemoteObservationGate {
             ...(ev.nativeTurnId ? { nativeTurnId: ev.nativeTurnId } : {}),
             callId: payload.callId,
             name: payload.name,
-            argsHash: recomputedHash,
+            argsHash: alignedHash,
             arguments: structuredClone(payload.arguments),
             completed: false,
           })
@@ -172,7 +184,7 @@ export class RemoteObservationGate {
             prior !== undefined &&
               prior.nativeSessionId === ev.nativeSessionId &&
               prior.name === payload.name &&
-              prior.argsHash === recomputedHash &&
+              prior.argsHash === alignedHash &&
               prior.nativeTurnId === ev.nativeTurnId,
             'REMOTE_TOOL_COMPLETION_MISMATCH',
           )
@@ -239,6 +251,7 @@ export class RemoteObservationGate {
       validateCc5NativeToolInput(`mcp__ocbridge__${req.name}`, req.arguments, REMOTE_V4_TOOL_INPUT_MAX_BYTES)
       const actualHash = remoteCanonicalSha256(req.arguments)
       remotePoolNeed(actualHash === req.argsHash, 'REMOTE_TOOL_ARGS_HASH_MISMATCH')
+      const alignedHash = this.computeAlignedArgsHash(req.name, req.arguments, actualHash)
 
       if (this.options.testFaultBypassObservation && this.options.allowTestBypassInTmp) {
         return {
@@ -247,7 +260,7 @@ export class RemoteObservationGate {
           ...(req.nativeTurnId ? { nativeTurnId: req.nativeTurnId } : {}),
           callId: req.callId,
           name: req.name,
-          argsHash: actualHash,
+          argsHash: alignedHash,
           arguments: structuredClone(req.arguments),
           completed: false,
         }
@@ -274,7 +287,7 @@ export class RemoteObservationGate {
           const matches =
             obs.nativeSessionId === req.nativeSessionId &&
             obs.name === req.name &&
-            obs.argsHash === actualHash &&
+            obs.argsHash === alignedHash &&
             turnMatches
           if (!matches) {
             finish(new Error('REMOTE_TOOL_SCOPE_MISMATCH'))

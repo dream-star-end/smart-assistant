@@ -168,6 +168,7 @@ import {
   MODEL_AUTHORITY_CAPABILITY,
   resolveEffectiveTurnServiceTier,
   MODEL_AUTHORITY_FIELD,
+  type AuthorityPoolMigrationGrant,
   DURABLE_TURN_DISPATCH_CAPABILITY,
   DISPATCH_AUTHORITY_FIELD,
   stripDispatchAuthorityField,
@@ -823,6 +824,9 @@ export interface UserChatBridgeDeps {
   cc5BackendSelector?: (input: { uid: number; containerId: number; sessionKey: string;
     canonicalModel: string; engine: string; placement: "local" | "remote_pool" }) =>
     Promise<RemoteExecutionBackend | undefined>;
+  crossPoolFallbackSelector?: (args: { uid: number; containerId: number; sessionKey: string; canonicalModel: string; engine: string; cause: unknown; expectedSecurityEpoch?: number }) =>
+    Promise<{ executionBackend?: RemoteExecutionBackend; fallbackPool: "local_pool" | "remote_pool"; resolvedCanonicalModel?: string; migrationGrant?: AuthorityPoolMigrationGrant } | null>;
+  returnToRemoteGrantResolver?: (args: { uid: number; containerId: number; sessionKey: string; canonicalModel: string; engine: string; executionBackend: RemoteExecutionBackend }) => Promise<AuthorityPoolMigrationGrant | null>;
   /** Composition supplies the verified selfhost default; explicit env 0 rolls back. */
   containerLinkEnabled?: boolean;
   containerLinkHeartbeatMs?: number;
@@ -2977,6 +2981,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       billingRequestId?: string,
       authorityTurnId?: string,
       executionBackend?: RemoteExecutionBackend,
+      poolMigration?: AuthorityPoolMigrationGrant,
     ): ModelAuthorityBundle => {
       if (authorityDeps === undefined || containerChallenge === null || containerId === undefined) {
         throw new Error(
@@ -2992,6 +2997,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         executionDescriptor: exec.descriptor,
         auxModels: executionBackend ? [] : exec.auxModels,
         ...(executionBackend ? { executionBackend } : {}),
+        ...(poolMigration ? { poolMigration } : {}),
         executionRevision: exec.executionRevision,
         securityEpoch: exec.securityEpoch,
         ...(authorityTurnId === undefined ? {} : { authorityTurnId }),
@@ -3076,45 +3082,46 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         );
       }
       let executionBackend: RemoteExecutionBackend | undefined;
+      let execToSign = args.exec, poolMigration: AuthorityPoolMigrationGrant | undefined;
       try {
         if (args.exec.placement === "remote_pool") {
-          // A remote model never falls back to a local or Box run: no lane, no turn.
-          if (!args.turn?.sessionKey || !deps.cc5BackendSelector || containerId === undefined) {
-            throw new Error("REMOTE_LANE_UNAVAILABLE");
-          }
+          if (!args.turn?.sessionKey || !deps.cc5BackendSelector || containerId === undefined) throw new Error("REMOTE_LANE_UNAVAILABLE");
           executionBackend = await deps.cc5BackendSelector({ uid: Number(uid), containerId,
             sessionKey: args.turn.sessionKey, canonicalModel: args.exec.canonicalModel,
             engine: args.exec.engine, placement: args.exec.placement });
           if (!executionBackend) throw new Error("REMOTE_LANE_UNAVAILABLE");
+          if (deps.returnToRemoteGrantResolver) poolMigration = (await deps.returnToRemoteGrantResolver({ uid: Number(uid), containerId, sessionKey: args.turn.sessionKey, canonicalModel: args.exec.canonicalModel, engine: args.exec.engine, executionBackend }).catch(() => null)) ?? undefined;
         }
       } catch (err) {
-        args.log?.warn("user-chat-bridge: remote lane unavailable", {
-          model: args.exec.canonicalModel,
-          cause: err instanceof Error ? (err.cause instanceof Error ? err.cause.message : err.message) : String(err),
-        });
-        // OCV5-746 §4: the node refused the session for its real reason. Never present a full node
-        // as an outage, and never bill a turn whose session was never admitted.
-        if (err instanceof Error && ["REMOTE_NODE_MEMORY_EXHAUSTED", "REMOTE_NODE_TASKS_EXHAUSTED"].includes((err as Error & { code?: string }).code ?? "")) {
-          const active = Number((err as Error & { activeSessions?: unknown }).activeSessions);
-          return await reject(
-            (err as Error & { code: string }).code,
-            `远端节点${(err as Error & { code?: string }).code === "REMOTE_NODE_TASKS_EXHAUSTED" ? "进程/线程额度不足" : "内存不足"}，当前底座已有 ${Number.isSafeInteger(active) && active >= 0 ? active : 0} 个会话在跑`,
-            (err as Error & { code: string }).code.toLowerCase(),
-          );
+        const fb = args.turn?.sessionKey && containerId !== undefined && deps.crossPoolFallbackSelector
+          ? await deps.crossPoolFallbackSelector({ uid: Number(uid), containerId, sessionKey: args.turn.sessionKey, canonicalModel: args.exec.canonicalModel, engine: args.exec.engine, cause: err, expectedSecurityEpoch: args.exec.securityEpoch }).catch(() => null)
+          : null;
+        let fallbackAccepted = false;
+        if (fb && fb.fallbackPool === "local_pool") {
+          if (fb.resolvedCanonicalModel && authorityDeps) {
+            const localExec = await resolveTurnExecution(authorityDeps.catalog, fb.resolvedCanonicalModel).catch(() => null);
+            if (localExec && localExec.placement === "local" && localExec.engine === args.exec.engine && localExec.securityEpoch === args.exec.securityEpoch) {
+              execToSign = localExec; executionBackend = undefined; poolMigration = fb.migrationGrant; fallbackAccepted = true;
+            }
+          } else if (!fb.resolvedCanonicalModel) { executionBackend = undefined; poolMigration = fb.migrationGrant; fallbackAccepted = true; }
+        } else if (fb?.executionBackend) { executionBackend = fb.executionBackend; poolMigration = fb.migrationGrant; fallbackAccepted = true; }
+        if (!fallbackAccepted) {
+          args.log?.warn("user-chat-bridge: remote lane unavailable", { model: args.exec.canonicalModel, cause: err instanceof Error ? (err.cause instanceof Error ? err.cause.message : err.message) : String(err) });
+          if (err instanceof Error && ["REMOTE_NODE_MEMORY_EXHAUSTED", "REMOTE_NODE_TASKS_EXHAUSTED"].includes((err as Error & { code?: string }).code ?? "")) {
+            const active = Number((err as Error & { activeSessions?: unknown }).activeSessions);
+            return await reject((err as Error & { code: string }).code,
+              `远端节点${(err as Error & { code?: string }).code === "REMOTE_NODE_TASKS_EXHAUSTED" ? "进程/线程额度不足" : "内存不足"}，当前底座已有 ${Number.isSafeInteger(active) && active >= 0 ? active : 0} 个会话在跑`,
+              (err as Error & { code: string }).code.toLowerCase());
+          }
+          return await reject("REMOTE_NATIVE_UNAVAILABLE", "remote node unavailable for this chat, retry shortly", "remote_native_binding_rejected");
         }
-        return await reject("REMOTE_NATIVE_UNAVAILABLE", "remote node unavailable for this chat, retry shortly", "remote_native_binding_rejected");
       }
       // 注意:**不**在这里查 `cleaned`。调用方在 seal 之后紧接着就有自己的 cleaned 分支
       // (带各自完整的补偿),在这里提前 return null 会让"已拒(补偿过)"与"桥关了
       // (还没补偿)"两种 null 语义混在一起 —— 正是漏账最爱的那种歧义。
       return {
-        model: args.exec.canonicalModel,
-        [MODEL_AUTHORITY_FIELD]: signAuthorityBundle(
-          args.exec,
-          args.billingRequestId,
-          args.authorityTurnId,
-          executionBackend,
-        ),
+        model: execToSign.canonicalModel,
+        [MODEL_AUTHORITY_FIELD]: signAuthorityBundle(execToSign, args.billingRequestId, args.authorityTurnId, executionBackend, poolMigration),
       };
     };
 

@@ -216,7 +216,8 @@
     "0350_perf_timeline_and_live_snapshot",
     "0351_perf_timeline_and_live_snapshot_indexes",
     "0352_pending_browser_handoffs",
-    "0353_context_eval_observability"
+    "0353_context_eval_observability",
+    "0354_three_layer_pool_unification"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
