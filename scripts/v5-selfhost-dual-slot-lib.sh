@@ -781,7 +781,8 @@ selfhost_cutover_wait_for_safe_window() { # [--strict] [--slot=<A|B>] [--candida
 # ── Blue-green Master orchestration (B03, B04, B11) ──────────────────────
 
 selfhost_wait_slot_standby_ready() { # <slot> [timeout_s]
-  local slot="$1" timeout_s="${2:-90}" port priv i
+  local slot="$1" timeout_s="${2:-${OC_SELFHOST_STANDBY_TIMEOUT_SEC:-180}}" port priv i
+  [[ "$timeout_s" =~ ^[1-9][0-9]*$ ]] || timeout_s=180
   port="$(selfhost_master_slot_port "$slot")" || return 1
   priv="$(selfhost_master_slot_priv_port "$slot")" || return 1
   for (( i = 1; i <= timeout_s; i++ )); do
@@ -909,7 +910,7 @@ selfhost_master_dual_slot_flip() { # <rel>
     selfhost_ds_log "  ✗ 启动候选槽 ${new_unit} 失败;旧槽 ${old_slot} 保持不受影响"
     return 1
   fi
-  if ! selfhost_wait_slot_standby_ready "$new_slot" 90; then
+  if ! selfhost_wait_slot_standby_ready "$new_slot"; then
     systemctl stop "$new_unit" 2>/dev/null || true
     return 1
   fi
@@ -1062,7 +1063,7 @@ selfhost_master_migrate_legacy_to_dual_slot() { # <rel> [prev_live]
     systemctl reset-failed "$(selfhost_master_slot_unit B)" 2>/dev/null || true
     selfhost_ds_log "  ✗ 预热 @B 失败;legacy 零触碰"; rm -f -- "$V5_MIGRATION_STATE_FILE"; return 1
   fi
-  if ! selfhost_wait_slot_standby_ready B 90; then
+  if ! selfhost_wait_slot_standby_ready B; then
     systemctl stop "$(selfhost_master_slot_unit B)" 2>/dev/null || true
     rm -f -- "$V5_MIGRATION_STATE_FILE"; return 1
   fi
