@@ -137,6 +137,7 @@ import {
   reconcileStaleAntigravityTurns,
   recordAntigravityTurn,
   settleAntigravityTurnRecord,
+  settleLateAntigravityRelayUsage,
 } from "../billing/antigravitySettle.js";
 import { resolveLocalSwarmAllowedAntigravityModels } from "../billing/antigravityRouteContext.js";
 import {
@@ -1046,7 +1047,7 @@ export interface UserChatBridgeDeps {
       _imageEdit?: Record<string, unknown>;
       _modelText?: string;
       _replyTo?: MessageReplyQuote;
-      _routing?: { model?: string; teamMode: boolean; effortLevel: string | null };
+      _routing?: { model?: string; teamMode: boolean; swarmMode?: boolean; effortLevel: string | null };
     },
   ) => Promise<{
     applied: boolean;
@@ -1142,7 +1143,7 @@ export interface UserChatBridgeDeps {
   /** Drop a minted Antigravity relay token after the turn settles or aborts. */
   expireAntigravityRoute?: (token: string) => void | Promise<void>;
   /** Expire a turn's relay route by requestId (any bridge; see the terminal-frame branch). */
-  expireAntigravityRouteForRequest?: (requestId: string) => void | Promise<void>;
+  expireAntigravityRouteForRequest?: (requestId: string, expectedUserId: bigint) => void | Promise<void>;
   /**
    * Trusted UUID of the compute host running this bridge. Cursor credentials
    * are mounted only by that host's local supervisor, so Cursor dispatch must
@@ -4495,6 +4496,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           !Array.isArray(content.imageEdit)
           ? content.imageEdit as Record<string, unknown>
           : undefined;
+        const slashSwarmMatched = Boolean(parseSwarmSlashCommand(modelText)?.matched);
+        // Preserve tri-state swarmMode across recovery lineage:
+        // - current message `/swarm` always activates swarm (`true`);
+        // - explicit boolean `frameObj.swarmMode` is kept verbatim (`true` / `false`);
+        // - legacy `recoveryJob` without `swarmMode` stays omitted (`undefined`) so
+        //   Gateway can detect live core workers on disk instead of coercing to `false`;
+        // - fresh browser turns omit `swarmMode` when the toggle is OFF, so record `false`.
+        const persistedSwarmMode: boolean | undefined = slashSwarmMatched
+          ? true
+          : typeof frameObj.swarmMode === "boolean"
+            ? frameObj.swarmMode
+            : recoveryJob
+              ? undefined
+              : false;
         const routing = {
           ...(typeof frameObj.model === "string" && frameObj.model !== ""
             ? { model: frameObj.model }
@@ -4504,10 +4519,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ? { modelSwitchId: frameObj.modelSwitchId }
             : {}),
           teamMode: frameObj.teamMode === true,
+          ...(persistedSwarmMode !== undefined ? { swarmMode: persistedSwarmMode } : {}),
           effortLevel: typeof frameObj.effortLevel === "string" || frameObj.effortLevel === null
             ? frameObj.effortLevel
             : null,
         };
+        const snapshotFrame: Record<string, unknown> = persistedSwarmMode !== undefined
+          ? { ...frameObj, swarmMode: persistedSwarmMode }
+          : (() => {
+              const { swarmMode: _omittedSwarmMode, ...rest } = frameObj;
+              return rest;
+            })();
         const message = {
           id: clientMessageId,
           role: "user" as const,
@@ -4521,7 +4543,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ...(displayText !== modelText ? { _modelText: modelText } : {}),
           ...(replyTo ? { _replyTo: replyTo } : {}),
           _routing: routing,
-          _admissionRestartRequest: snapshotAdmissionRequest(frameObj),
+          _admissionRestartRequest: snapshotAdmissionRequest(snapshotFrame),
         };
         if (useDispatchAdmission && deps.admitUserTurn) {
           // ── durable turn dispatch 受理(RFC §2.1)── 替代 persist retry loop。
@@ -5194,7 +5216,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           const parsed: unknown = JSON.parse(bytes.toString('utf8'));
           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
             const p = parsed as Record<string, unknown>;
-            const sH = Object.prototype.hasOwnProperty.call(p, SYSTEM_HELP_BOOTSTRAP_FIELD), sM = Object.prototype.hasOwnProperty.call(p, '_masterHistoricalMessages');
+            const sH = Object.prototype.hasOwnProperty.call(p, SYSTEM_HELP_BOOTSTRAP_FIELD);
+            const sM = Object.prototype.hasOwnProperty.call(p, '_masterHistoricalMessages');
             if (sH || sM) { if (sH) takeSystemHelpBootstrap(p); if (sM) delete p._masterHistoricalMessages; passthroughData = Buffer.from(JSON.stringify(p), 'utf8'); passthroughLen = passthroughData.byteLength; }
           }
         } catch { /* ordinary binary payloads retain their original transport */ }
@@ -6392,6 +6415,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       modelId: turn.modelId,
                       sessionId: turn.sessionId,
                       traceId: turn.traceId,
+                      turnKey: turn.turnKey ?? null,
+                      parentTurnKey: turn.parentTurnKey ?? null,
                       persist: deps.appendCostCredits,
                       publish: (event) => { broadcastToUser(uid, event); },
                     });
@@ -6442,10 +6467,29 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 && typeof (parsedCapture.content as { text?: unknown }).text === "string"
                 ? (parsedCapture.content as { text: string }).text
                 : "";
-            const isLocalSwarmTurn =
-              parsedCapture.swarmMode === true || Boolean(parseSwarmSlashCommand(rawSwarmText)?.matched);
+            const explicitSlashSwarm = Boolean(parseSwarmSlashCommand(rawSwarmText)?.matched);
+            const isExplicitSwarmTurn =
+              parsedCapture.swarmMode === true || explicitSlashSwarm;
+            const isLegacyUnknownCheckpointRecovery =
+              typeof parsedCapture.swarmMode !== "boolean"
+              && !explicitSlashSwarm
+              && recoveryJob?.recoveryMode === "checkpoint";
+            // For legacy checkpoint recoveries lacking an explicit swarmMode boolean,
+            // Master cannot inspect the container's local worker roster, so keep
+            // `swarmMode` omitted (`undefined`) on the forwarded frame for Gateway's
+            // live-core-worker fallback, while minting the user's authorized local
+            // member-model allowlist so resumed multi-model workers are not 403'd.
+            const allowSwarmMemberModels =
+              isExplicitSwarmTurn || isLegacyUnknownCheckpointRecovery;
+            const forwardedSwarmMode: boolean | undefined = isExplicitSwarmTurn
+              ? true
+              : parsedCapture.swarmMode === false
+                ? false
+                : recoveryJob
+                  ? undefined
+                  : false;
             const catalogSnapshot = authorityDeps?.catalog.peek() ?? null;
-            const swarmAllowedModelIds = isLocalSwarmTurn
+            const swarmAllowedModelIds = allowSwarmMemberModels
               ? resolveLocalSwarmAllowedAntigravityModels({
                   primaryModelId: antigravityModelId,
                   isAllowedForUser: modelCheckerHandle ? (id) => modelCheckerHandle.isAllowed(id) : null,
@@ -6514,8 +6558,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               authorityFields = sealed;
             }
+            const { swarmMode: _droppedSwarmMode, ...enrichedForAntigravity } =
+              enriched as Record<string, unknown>;
             const forwarded = {
-              ...enriched,
+              ...enrichedForAntigravity,
               requestId,
               traceId: traceCapture,
               // After the spread so a browser-forged budget or route cannot survive.
@@ -6527,7 +6573,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 accessTokenExpiresAt: minted.accessTokenExpiresAt,
                 ...(minted.idToken ? { idToken: minted.idToken } : {}),
               },
-              ...(isLocalSwarmTurn
+              ...(forwardedSwarmMode !== undefined ? { swarmMode: forwardedSwarmMode } : {}),
+              ...(allowSwarmMemberModels
                 ? { _antigravitySwarmAllowedModels: minted.allowedModelIds ?? [antigravityModelId] }
                 : {}),
               ...authorityFields,
@@ -8182,49 +8229,55 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const pool = deps.pgPool;
               const pricing = deps.pricing;
               const relay = pendingAntigravityRelays.get(requestId);
-              if (relay) {
-                void Promise.resolve(deps.expireAntigravityRoute?.(relay.token)).catch(() => {});
-                pendingAntigravityRelays.delete(requestId);
-              }
-              // A reconnected bridge never saw the token: expire by requestId too.
-              void Promise.resolve(deps.expireAntigravityRouteForRequest?.(requestId)).catch(() => {});
-              // Claimed from the durable turn row, so a reconnected bridge
-              // settles too; usage comes from the relay's rows (a replayed
-              // frame cannot inflate it) and usage_records(user_id, request_id)
-              // keeps the charge idempotent.
-              if (pricing) {
-                void (async () => {
-                  try {
-                    const done = await settleAntigravityTurnRecord({
+              if (relay) pendingAntigravityRelays.delete(requestId);
+              void (async () => {
+                await Promise.allSettled([
+                  relay ? Promise.resolve(deps.expireAntigravityRoute?.(relay.token)) : Promise.resolve(),
+                  Promise.resolve(deps.expireAntigravityRouteForRequest?.(requestId, uid)),
+                ]);
+                if (!pricing) return;
+                try {
+                  const done = await settleAntigravityTurnRecord({
+                    pool,
+                    pricing,
+                    requestId,
+                    userId: uid,
+                    engineStatus: status,
+                    terminalCode,
+                  });
+                  if (done === null) {
+                    bridgeLog?.warn("user-chat-bridge: Antigravity settle skipped (claimed elsewhere, unknown turn or pricing missing)", { requestId });
+                    return;
+                  }
+                  await publishZcodeCatalogSettle({
+                    settled: done.settled,
+                    requestId,
+                    userId: uid.toString(),
+                    modelId: done.turn.modelId,
+                    sessionId: done.turn.sessionId,
+                    traceId: done.turn.traceId,
+                    turnKey: done.turn.turnKey ?? null,
+                    parentTurnKey: done.turn.parentTurnKey ?? null,
+                    persist: deps.appendCostCredits,
+                    publish: (event) => { broadcastToUser(uid, event); },
+                    onPersistError: (err) => {
+                      bridgeLog?.warn("user-chat-bridge: Antigravity persist costCredits threw", { requestId, err });
+                    },
+                  });
+                  // B3: Sweep any late relay call committed between parent SUM and parent COMMIT.
+                  if (status === 'success') {
+                    await settleLateAntigravityRelayUsage({
                       pool,
                       pricing,
                       requestId,
                       userId: uid,
-                      engineStatus: status,
-                      terminalCode,
-                    });
-                    if (done === null) {
-                      bridgeLog?.warn("user-chat-bridge: Antigravity settle skipped (claimed elsewhere, unknown turn or pricing missing)", { requestId });
-                      return;
-                    }
-                    await publishZcodeCatalogSettle({
-                      settled: done.settled,
-                      requestId,
-                      userId: uid.toString(),
-                      modelId: done.turn.modelId,
-                      sessionId: done.turn.sessionId,
-                      traceId: done.turn.traceId,
-                      persist: deps.appendCostCredits,
-                      publish: (event) => { broadcastToUser(uid, event); },
-                      onPersistError: (err) => {
-                        bridgeLog?.warn("user-chat-bridge: Antigravity persist costCredits threw", { requestId, err });
-                      },
-                    });
-                  } catch (err) {
-                    bridgeLog?.warn("user-chat-bridge: Antigravity settle failed", { requestId, err });
+                      appendCostCredits: deps.appendCostCredits,
+                    }).catch(() => {});
                   }
-                })();
-              }
+                } catch (err) {
+                  bridgeLog?.warn("user-chat-bridge: Antigravity settle failed", { requestId, err });
+                }
+              })();
             } else if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'cursor') {
               const pool = deps.pgPool;
               const pricing = deps.pricing;

@@ -1,5 +1,5 @@
 import { scanUploadReferenceRows, hydrateUploadReferenceMessages, UPLOAD_REFERENCE_MAX_BYTES, UPLOAD_REFERENCE_MAX_MS, UPLOAD_REFERENCE_MAX_ROWS, type UploadReferenceRow } from '@openclaude/storage';
-import { automaticRetryStatus, getUserError, type AutomaticRetryStatus } from '@openclaude/protocol';
+import { automaticRetryStatus, getUserError, parseSwarmSlashCommand, SWARM_BOARD_TOOL_NAME, type AutomaticRetryStatus } from '@openclaude/protocol';
 import { buildSessionSnapshot, type SessionSnapshotOptions } from './sessionSnapshot.js';
 import { patchSessionMetadataInTx } from './sessionMetadataApproval.js'
 import { readCcbNativeRestoreArchiveFromDb } from "./pgCcbTranscriptRestore.js";
@@ -1103,12 +1103,13 @@ export function escapeNulInSessionMessagesJson(json: string): string {
 function deferredUserReplayMetadata(message: MessageLike): MessageLike {
   const rawRouting = message._routing && typeof message._routing === "object" &&
     !Array.isArray(message._routing)
-    ? message._routing as { model?: unknown; teamMode?: unknown; effortLevel?: unknown }
+    ? message._routing as { model?: unknown; teamMode?: unknown; swarmMode?: unknown; effortLevel?: unknown }
     : undefined;
   const routing = rawRouting
     ? {
         ...(typeof rawRouting.model === "string" ? { model: rawRouting.model } : {}),
         ...(typeof rawRouting.teamMode === "boolean" ? { teamMode: rawRouting.teamMode } : {}),
+        ...(typeof rawRouting.swarmMode === "boolean" ? { swarmMode: rawRouting.swarmMode } : {}),
         ...(typeof rawRouting.effortLevel === "string" || rawRouting.effortLevel === null
           ? { effortLevel: rawRouting.effortLevel }
           : {}),
@@ -2175,6 +2176,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
         | "waiveReason"
         | "agentId"
         | "turnKey"
+        | "tools"
       >;
       records: Array<{ payload: MessageLike }>;
     };
@@ -2427,6 +2429,16 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       }) ? { resetNativeSession: true } : {}),
     },
   };
+  const resolvedSwarmMode: boolean | undefined =
+    typeof route.swarmMode === "boolean"
+      ? route.swarmMode
+      : Boolean(parseSwarmSlashCommand(exactText)?.matched) ||
+          (input.turn.payload.tools ?? []).some((t) => {
+            const n = typeof t?.toolName === "string" ? t.toolName : typeof t?.name === "string" ? t.name : "";
+            return n === SWARM_BOARD_TOOL_NAME || n === "SwarmManage" || n === "SwarmPost" || n === "SwarmReadBoard" || n === "SwarmWait";
+          })
+        ? true
+        : undefined;
   const request: Record<string, unknown> = {
     type: "inbound.message",
     // Presentation metadata stays outside the strict recovery admission envelope.
@@ -2446,6 +2458,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       ? { model: route.model }
       : {}),
     ...(route.teamMode === true ? { teamMode: true } : {}),
+    ...(resolvedSwarmMode !== undefined ? { swarmMode: resolvedSwarmMode } : {}),
     ts: Date.now(),
     clientMessageId: identity.clientMessageId,
   };
@@ -11139,11 +11152,11 @@ export function createPgSessionsBackend(
               ).rows[0];
               if (
                 pendingExact &&
-                ((sessionId != null && pendingExact.session_id !== sessionId) ||
-                  (parentSessionId != null && pendingExact.parent_session_id !== parentSessionId) ||
-                  (delegateAgentId != null && pendingExact.delegate_agent_id !== delegateAgentId) ||
-                  (turnKey != null && pendingExact.turn_key !== turnKey) ||
-                  (parentTurnKey != null && pendingExact.parent_turn_key !== parentTurnKey) ||
+                ((sessionId != null && pendingExact.session_id !== null && pendingExact.session_id !== sessionId) ||
+                  (parentSessionId != null && pendingExact.parent_session_id !== null && pendingExact.parent_session_id !== parentSessionId) ||
+                  (delegateAgentId != null && pendingExact.delegate_agent_id !== null && pendingExact.delegate_agent_id !== delegateAgentId) ||
+                  (turnKey != null && pendingExact.turn_key !== null && pendingExact.turn_key !== turnKey) ||
+                  (parentTurnKey != null && pendingExact.parent_turn_key !== null && pendingExact.parent_turn_key !== parentTurnKey) ||
                   BigInt(pendingExact.cost_credits) !== BigInt(normalizedCostCredits))
               ) {
                 throw new Error("lossless pending cost component refuses remapping");
@@ -11393,14 +11406,40 @@ export function createPgSessionsBackend(
           };
           if (pending) {
             if (
-              (locator.sessionId !== null && pending.session_id !== locator.sessionId) ||
-              (locator.parentSessionId !== null && pending.parent_session_id !== locator.parentSessionId) ||
-              (locator.delegateAgentId !== null && pending.delegate_agent_id !== locator.delegateAgentId) ||
-              (locator.turnKey !== null && pending.turn_key !== locator.turnKey) ||
-              (locator.parentTurnKey !== null && pending.parent_turn_key !== locator.parentTurnKey) ||
+              (locator.sessionId !== null && pending.session_id !== null && pending.session_id !== locator.sessionId) ||
+              (locator.parentSessionId !== null && pending.parent_session_id !== null && pending.parent_session_id !== locator.parentSessionId) ||
+              (locator.delegateAgentId !== null && pending.delegate_agent_id !== null && pending.delegate_agent_id !== locator.delegateAgentId) ||
+              (locator.turnKey !== null && pending.turn_key !== null && pending.turn_key !== locator.turnKey) ||
+              (locator.parentTurnKey !== null && pending.parent_turn_key !== null && pending.parent_turn_key !== locator.parentTurnKey) ||
               BigInt(pending.cost_credits) !== BigInt(normalizedCostCredits)
             ) {
               throw new Error("lossless pending cost component refuses remapping");
+            }
+            if (
+              (locator.sessionId !== null && pending.session_id === null) ||
+              (locator.parentSessionId !== null && pending.parent_session_id === null) ||
+              (locator.delegateAgentId !== null && pending.delegate_agent_id === null) ||
+              (locator.turnKey !== null && pending.turn_key === null) ||
+              (locator.parentTurnKey !== null && pending.parent_turn_key === null)
+            ) {
+              await client.query(
+                `UPDATE pending_usage_patches
+                    SET session_id = COALESCE(session_id, $3),
+                        parent_session_id = COALESCE(parent_session_id, $4),
+                        delegate_agent_id = COALESCE(delegate_agent_id, $5),
+                        turn_key = COALESCE(turn_key, $6),
+                        parent_turn_key = COALESCE(parent_turn_key, $7)
+                  WHERE request_id = $1 AND user_id = $2`,
+                [
+                  requestId,
+                  userId,
+                  locator.sessionId,
+                  locator.parentSessionId,
+                  locator.delegateAgentId,
+                  locator.turnKey,
+                  locator.parentTurnKey,
+                ],
+              );
             }
             return { applied: "pending" };
           }

@@ -32,7 +32,9 @@ import {
   atomicWriteJson,
   ensurePrivateDir,
   formatBoardTimestamp,
+  readBoardHeadSeqFromDisk,
   readBoardPostsFromDisk,
+  readBoardPostsSinceSeq,
   readOrInitRosterStrict,
   readRosterStrict,
   withAsyncSwarmFileLock,
@@ -613,7 +615,7 @@ export class RemoteSwarmRuntime {
         // queued on `.board.lock` prevents the stale brief post and worker wake.
         if (isStaleGeneration()) return null
         const existing = readBoardPostsFromDisk(state.location.swarmDir)
-        const headSeq = existing.reduce((max, p) => Math.max(max, p.seq), 0)
+        const headSeq = readBoardHeadSeqFromDisk(state.location.swarmDir)
         const next: BoardPostRecord = {
           seq: headSeq + 1,
           agent: input.agent,
@@ -837,7 +839,7 @@ export class RemoteSwarmRuntime {
       '.board.lock',
       () => {
         const existing = readBoardPostsFromDisk(state.location.swarmDir)
-        const headSeq = existing.reduce((max, p) => Math.max(max, p.seq), 0)
+        const headSeq = readBoardHeadSeqFromDisk(state.location.swarmDir)
         const next: BoardPostRecord = {
           seq: headSeq + 1,
           agent: GATEWAY_STALL_MONITOR_AGENT,
@@ -1121,8 +1123,10 @@ export class RemoteSwarmRuntime {
         if (!member || member.killed) return
         rt.lastKnownConvId = member.conversation_id
 
-        const allPosts = readBoardPostsFromDisk(state.location.swarmDir)
-        const unread = allPosts.filter((p) => p.seq > (member.last_read_seq ?? 0))
+        const batch = readBoardPostsSinceSeq(state.location.swarmDir, member.last_read_seq ?? 0, {
+          maxPosts: 256,
+        })
+        const unread = batch.posts
         if (unread.length === 0 && !rt.pendingWake) return
         rt.pendingWake = false
 
@@ -1141,8 +1145,8 @@ export class RemoteSwarmRuntime {
               (p.channel === 'main' || (member.channels ?? ['main']).includes(p.channel)))
           )
         })
-        // Cursor of posts actually inspected/consumed in this turn (NEVER advance past
-        // newer messages that arrive while `runWorkerTurn` is executing — IMPORTANT 3).
+        // Cursor of posts actually inspected/consumed in this batch (NEVER skip uninspected
+        // gaps on >2 MiB boards — B10, and NEVER advance past newer messages arriving mid-turn — IMPORTANT 3).
         const consumedSeq = unread.reduce((m, p) => Math.max(m, p.seq), member.last_read_seq ?? 0)
         if (relevant.length === 0) {
           if (isCancelled()) return
@@ -1152,6 +1156,7 @@ export class RemoteSwarmRuntime {
               m.last_read_seq = Math.max(m.last_read_seq ?? 0, consumedSeq)
             }
           })
+          if (batch.hasMore) continue
           return
         }
 
@@ -1354,17 +1359,17 @@ export class RemoteSwarmRuntime {
 
         if (isCancelled()) break
 
-        // Re-check unread messages in case a new directed post arrived during the turn.
+        // Re-check unread messages in case more pages remain or a new directed post arrived during the turn (P1-10).
         const postTurnRoster = await this.readRoster(state)
         if (isCancelled()) break
         const postTurnMember = postTurnRoster.members[rt.name]
+        if (!postTurnMember || postTurnMember.killed) break
         const hasMoreUnread =
-          Boolean(postTurnMember && !postTurnMember.killed) &&
-          readBoardPostsFromDisk(state.location.swarmDir).some(
-            (p) =>
-              p.seq > (postTurnMember!.last_read_seq ?? 0) &&
-              p.agent.toLowerCase() !== rt.name.toLowerCase(),
-          )
+          batch.hasMore ||
+          readBoardPostsSinceSeq(state.location.swarmDir, postTurnMember.last_read_seq ?? 0, {
+            maxPosts: 1,
+            filter: (p) => p.agent.toLowerCase() !== rt.name.toLowerCase(),
+          }).posts.length > 0
         if (!rt.pendingWake && !hasMoreUnread) break
       }
     } catch (err) {
@@ -1543,6 +1548,9 @@ export class RemoteSwarmRuntime {
       if (workspace?.path && workspace.mode !== 'inherit') {
         const wtRes = removeWorkerGitWorktree(state.workspaceCwd, workspace.path, {
           forceDirty: opts?.forceDirtyWorktree,
+          ...(workspace.branch ? { branchName: workspace.branch } : {}),
+          expectedSwarmId: state.location.swarmId,
+          expectedMemberName: name,
         })
         if (wtRes.preservedDirtyPath) {
           preservedDirtyWorktrees.push(wtRes.preservedDirtyPath)
@@ -1912,17 +1920,20 @@ export class RemoteSwarmRuntime {
       })
     }
 
+    const unconfirmedStopMembers = new Set<string>()
     const activeWaits: Promise<void>[] = []
     for (const rt of state.workers.values()) {
       rt.pendingWake = false
       rt.abortController?.abort(new Error('SWARM_SESSION_SHUTDOWN'))
       if (rt.runPromise) {
-        activeWaits.push(
-          Promise.race([
-            rt.runPromise.catch(() => {}),
+        activeWaits.push((async () => {
+          let settled = false
+          await Promise.race([
+            rt.runPromise!.catch(() => {}).then(() => { settled = true }),
             new Promise<void>((r) => setTimeout(r, 5_000).unref?.()),
-          ]),
-        )
+          ])
+          if (!settled || rt.running) unconfirmedStopMembers.add(rt.name)
+        })())
       }
     }
     await Promise.allSettled(activeWaits)
@@ -1931,7 +1942,11 @@ export class RemoteSwarmRuntime {
     for (const rt of state.workers.values()) {
       activeMcpContexts.delete(rt.workerSessionKey)
       if (this.executor) {
-        releases.push(this.executor.releaseWorkerSession(rt.workerSessionKey).catch(() => {}))
+        releases.push(
+          this.executor.releaseWorkerSession(rt.workerSessionKey)
+            .then((rel) => { if (rel && rel.released === false && rel.state !== 'not_found') unconfirmedStopMembers.add(rt.name) })
+            .catch(() => { unconfirmedStopMembers.add(rt.name) }),
+        )
       }
     }
     await Promise.allSettled(releases)
@@ -1939,19 +1954,20 @@ export class RemoteSwarmRuntime {
     const preservedDirtyWorktrees: string[] = []
     try {
       const roster = readRosterStrict(state.location)
-      if (roster) {
-        for (const rec of Object.values(roster.members)) {
-          if (rec.workspace?.path && rec.workspace.mode !== 'inherit') {
-            const wtRes = removeWorkerGitWorktree(state.workspaceCwd, rec.workspace.path)
-            if (wtRes.preservedDirtyPath) {
-              preservedDirtyWorktrees.push(wtRes.preservedDirtyPath)
-            }
-          }
+      for (const [memberName, rec] of Object.entries(roster?.members ?? {})) {
+        if (!rec.workspace?.path || rec.workspace.mode === 'inherit') continue
+        if (unconfirmedStopMembers.has(memberName) || state.workers.get(memberName)?.running) {
+          if (existsSync(rec.workspace.path)) preservedDirtyWorktrees.push(rec.workspace.path)
+          continue
         }
+        const wtRes = removeWorkerGitWorktree(state.workspaceCwd, rec.workspace.path, {
+          ...(rec.workspace.branch ? { branchName: rec.workspace.branch } : {}),
+          expectedSwarmId: state.location.swarmId,
+          expectedMemberName: memberName,
+        })
+        if (wtRes.preservedDirtyPath) preservedDirtyWorktrees.push(wtRes.preservedDirtyPath)
       }
-    } catch {
-      /* ignore unreadable roster during teardown */
-    }
+    } catch { /* ignore unreadable roster during teardown */ }
 
     this.sessions.delete(cleanKey)
     return { preservedDirtyWorktrees }

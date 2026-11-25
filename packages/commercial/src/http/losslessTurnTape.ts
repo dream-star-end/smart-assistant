@@ -4,6 +4,7 @@ import { gzipSync } from "node:zlib";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   isClientMessageId,
+  isNonJournalDurableBillingEngine,
   LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
   losslessBillingAnchorId,
   type CallTokenUsageSnapshot,
@@ -264,11 +265,15 @@ function parseEngineBillingValue(value: unknown, path: string): DurableCodexBill
   if (value.status !== "success" && value.status !== "error") {
     throw new Error(`${prefix}.status is invalid`);
   }
-  if (value.engine !== undefined && value.engine !== "cursor") {
+  const rawDisc: unknown = value.engine;
+  if (rawDisc !== undefined && !isNonJournalDurableBillingEngine(rawDisc)) {
     throw new Error(`${prefix}.engine is invalid`);
   }
   if (value.terminalCode !== undefined &&
-      value.terminalCode !== "USER_CANCELLED" && value.terminalCode !== "CODEX_ERROR") {
+      value.terminalCode !== "USER_CANCELLED" &&
+      value.terminalCode !== "CODEX_ERROR" &&
+      value.terminalCode !== "AUTH_UNAVAILABLE" &&
+      value.terminalCode !== "QUOTA_UNAVAILABLE") {
     throw new Error(`${prefix}.terminalCode is invalid`);
   }
   for (const key of ["turnKey", "parentTurnKey"] as const) {
@@ -319,7 +324,9 @@ function parseEngineBillingValue(value: unknown, path: string): DurableCodexBill
   if (
     exact.status === "error" &&
     exact.terminalCode !== "USER_CANCELLED" &&
-    exact.terminalCode !== "CODEX_ERROR"
+    exact.terminalCode !== "CODEX_ERROR" &&
+    exact.terminalCode !== "AUTH_UNAVAILABLE" &&
+    exact.terminalCode !== "QUOTA_UNAVAILABLE"
   ) {
     exact.terminalCode = legacyReason === "codex turn interrupted"
       ? "USER_CANCELLED"

@@ -42,6 +42,10 @@ import {
   settleSwarmSnapshotTerminal,
 } from '../engine/antigravitySwarmWatcher.js'
 import {
+  readBoundedFileWithinRoot,
+  readBoundedFileWithinRootAsync,
+} from '../engine/antigravitySwarmTelemetry.js'
+import {
   antigravityProductToolName,
   antigravityToolOutput,
   sanitizeSwarmToolOutput,
@@ -1633,6 +1637,148 @@ test('W3 auditor R1 regressions: telemetry sync/async fence (no double count), d
     for (let i = 1; i < revs.length; i += 1) {
       assert.ok(revs[i]! > revs[i - 1]!, `revisions must be strictly monotonic: ${JSON.stringify(revs)}`)
     }
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})
+
+test('OCV5-887: >64KB transcript step, mid-turn GENERIC status, native string workspace, >2MB board totalPosts, and turnWorkerUsageDelta', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-887-watcher-'))
+  try {
+    const { swarmDir } = await writeSwarmFixture(brainDir)
+    // Native CLI writes `workspace` as a path string + `workspace_mode`
+    await writeFile(
+      path.join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'OCV5-887 验证',
+        members: {
+          coordinator: { conversation_id: COORD_CONV, role: 'coordinator', killed: false },
+          parser: {
+            conversation_id: WORKER_CONV,
+            role: 'worker',
+            killed: false,
+            workspace: '/repo/.worktrees/parser',
+            workspace_mode: 'branch',
+          },
+        },
+      }),
+    )
+
+    // 1. Mid-turn truncated GENERIC step (without planner DONE in tail) stays working instead of false waiting
+    const midTurnTail = parseMemberTranscriptTail(
+      `${JSON.stringify({ step_index: 7, type: 'GENERIC', status: 'DONE', created_at: '2026-11-24T01:00:00Z' })}\n`,
+    )
+    assert.equal(midTurnTail.status, 'working')
+    assert.equal(midTurnTail.stepCount, 8)
+
+    // 2. >64KB (~120KB) single-line JSONL step in transcript.jsonl is read intact via adaptive 2MB tail
+    const workerTranscript = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs', 'transcript.jsonl')
+    const hugeOutput = 'X'.repeat(120 * 1024)
+    await writeFile(
+      workerTranscript,
+      `${[
+        JSON.stringify({
+          step_index: 0,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-24T01:00:00.000Z',
+          usage: { input_tokens: 500, output_tokens: 100 },
+        }),
+        JSON.stringify({
+          step_index: 12,
+          type: 'ERROR_MESSAGE',
+          status: 'ERROR',
+          content: `fatal crash after big tool output: ${hugeOutput}`,
+          created_at: '2026-11-24T02:00:10.000Z',
+          usage: { input_tokens: 3000, output_tokens: 700, cache_read_input_tokens: 200 },
+        }),
+      ].join('\n')}\n`,
+    )
+
+    // 3. >2MB board.jsonl preserves monotonic totalPosts from headSeq
+    const filler = '讨论板正文填充'.repeat(300)
+    const boardLines: string[] = []
+    let bytes = 0
+    let seq = 1
+    while (bytes < 2.2 * 1024 * 1024) {
+      const line = `${JSON.stringify({ seq, agent: 'parser', channel: 'main', text: filler })}\n`
+      boardLines.push(line)
+      bytes += Buffer.byteLength(line, 'utf8')
+      seq += 1
+    }
+    const expectedTotalPosts = seq - 1
+    await writeFile(path.join(swarmDir, 'board.jsonl'), boardLines.join(''))
+
+    const watcher = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: COORD_CONV,
+      pollMs: 60_000,
+      seedBaselineOnStart: true,
+      now: () => Date.parse('2026-11-24T02:00:01.000Z'),
+      onSnapshot: () => {},
+    })
+    watcher.start()
+    watcher.activateTurnSwarm()
+    const finalSnap = watcher.stopAndReadFinal('completed')
+    assert.ok(finalSnap)
+    assert.equal(finalSnap.totalPosts, expectedTotalPosts)
+    const parserMember = finalSnap.members.find((m) => m.name === 'parser')
+    assert.ok(parserMember)
+    assert.equal(parserMember.stepCount, 13, '120KB line must not reset stepCount to 0')
+    assert.equal(parserMember.failed, true)
+    assert.equal(parserMember.workspace, 'branch')
+    assert.ok(parserMember.workspacePath?.endsWith('parser'))
+
+    // Only step_index 12 fell inside turn window (>= 02:00:00Z), excluding prior-turn step_index 0 (01:00:00Z)!
+    const delta = watcher.turnWorkerUsageDelta()
+    assert.deepEqual(delta, { inputTokens: 3000, outputTokens: 700, cacheReadTokens: 200, thinkingTokens: 0 })
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})
+
+test('OCV5-887 P2-05: bounded tail reads landing exactly on a line boundary preserve the first complete line (sync & async)', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-p2-05-tail-'))
+  try {
+    const logDir = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs')
+    await mkdir(logDir, { recursive: true })
+    const rel = [WORKER_CONV, '.system_generated', 'logs', 'transcript.jsonl'] as const
+
+    // 1. Primary tail window: startOffset > 0 lands right after '\n' (exact start of line2)
+    const line1 = `${JSON.stringify({ step_index: 1, tag: 'head', pad: 'A'.repeat(40) })}\n`
+    const line2 = `${JSON.stringify({ step_index: 2, tag: 'boundary-first-line' })}\n`
+    const line3 = `${JSON.stringify({ step_index: 3, tag: 'tail-last-line' })}\n`
+    await writeFile(path.join(logDir, 'transcript.jsonl'), line1 + line2 + line3, 'utf8')
+
+    const exactTailBytes = Buffer.byteLength(line2 + line3, 'utf8')
+    const syncExact = readBoundedFileWithinRoot(brainDir, rel, exactTailBytes)
+    const asyncExact = await readBoundedFileWithinRootAsync(brainDir, rel, exactTailBytes)
+    assert.equal(syncExact, line2 + line3, 'sync tail landing on line start must preserve first complete line')
+    assert.equal(asyncExact, line2 + line3, 'async tail landing on line start must preserve first complete line')
+
+    // 2. Single complete tail line equal to exact maxBytes (previously returned '' by slicing past its trailing '\n')
+    const exactSingleLineBytes = Buffer.byteLength(line3, 'utf8')
+    const syncSingle = readBoundedFileWithinRoot(brainDir, rel, exactSingleLineBytes)
+    const asyncSingle = await readBoundedFileWithinRootAsync(brainDir, rel, exactSingleLineBytes)
+    assert.equal(syncSingle, line3, 'sync single-line exact tail must not drop the only line')
+    assert.equal(asyncSingle, line3, 'async single-line exact tail must not drop the only line')
+
+    // 3. Mid-line startOffset still drops the partial leading fragment cleanly
+    const midLineBytes = exactTailBytes - 5
+    const syncMid = readBoundedFileWithinRoot(brainDir, rel, midLineBytes)
+    const asyncMid = await readBoundedFileWithinRootAsync(brainDir, rel, midLineBytes)
+    assert.equal(syncMid, line3, 'sync mid-line slice must still drop partial leading line')
+    assert.equal(asyncMid, line3, 'async mid-line slice must still drop partial leading line')
+
+    // 4. Adaptive widerStart landing exactly on a line boundary preserves that single large line
+    const hugeLine = `${JSON.stringify({ step_index: 9, tag: 'huge-exact', body: 'B'.repeat(200) })}\n`
+    const prefixLine = `${JSON.stringify({ step_index: 8, tag: 'prefix' })}\n`
+    await writeFile(path.join(logDir, 'transcript.jsonl'), prefixLine + hugeLine, 'utf8')
+    const hugeBytes = Buffer.byteLength(hugeLine, 'utf8')
+    const syncWider = readBoundedFileWithinRoot(brainDir, rel, 64, { maxAdaptiveBytes: hugeBytes })
+    const asyncWider = await readBoundedFileWithinRootAsync(brainDir, rel, 64, { maxAdaptiveBytes: hugeBytes })
+    assert.equal(syncWider, hugeLine, 'sync widerStart landing on line boundary must preserve line')
+    assert.equal(asyncWider, hugeLine, 'async widerStart landing on line boundary must preserve line')
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }

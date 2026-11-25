@@ -121,6 +121,51 @@ describe("injectSwarmDirective", () => {
       assert.equal(snap?.totalPosts, 3);
       assert.equal(snap?.posts[1]?.agent, "human");
       assert.equal(snap?.posts[2]?.seq, 3);
+      assert.match(snap?.posts[1]?.time ?? "", /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+      assert.equal(Date.parse(snap?.posts[1]?.time ?? ""), Date.parse("2026-11-21T01:00:00.000Z"));
+      assert.equal(snap?.posts[2]?.time, "2026-11-21T01:01:00Z");
+    } finally {
+      rmSync(brainDir, { recursive: true, force: true });
+    }
+  });
+
+  it("P2-09: shouldAbort fence skips board append when cancelled before or while waiting for .board.lock", async () => {
+    const brainDir = mkdtempSync(path.join(tmpdir(), "oc-swarm-abort-"));
+    try {
+      const swarmDir = setupSwarmFixture(brainDir);
+
+      // 1. Pre-cancelled directive returns ABORTED without touching board.jsonl
+      const preAborted = await injectSwarmDirective({
+        brainDir,
+        conversationId: COORD_CONV,
+        target: "coordinator",
+        message: "stale stall alert",
+        shouldAbort: () => true,
+      });
+      assert.equal(preAborted.ok, false);
+      if (!preAborted.ok) assert.equal(preAborted.code, "ABORTED");
+
+      // 2. Cancelled while waiting on .board.lock aborts inside lock before committing
+      const lockPath = path.join(swarmDir, ".board.lock");
+      writeFileSync(lockPath, "999999:0\n");
+      let cancelled = false;
+      setTimeout(() => {
+        cancelled = true;
+        rmSync(lockPath, { force: true });
+      }, 45);
+      const midAborted = await injectSwarmDirective({
+        brainDir,
+        conversationId: COORD_CONV,
+        target: "coordinator",
+        message: "late stall alert after turn end",
+        lockTimeoutMs: 1_000,
+        shouldAbort: () => cancelled,
+      });
+      assert.equal(midAborted.ok, false);
+      if (!midAborted.ok) assert.equal(midAborted.code, "ABORTED");
+
+      const lines = readFileSync(path.join(swarmDir, "board.jsonl"), "utf8").trim().split("\n");
+      assert.equal(lines.length, 1, "aborted directives must never append to board.jsonl");
     } finally {
       rmSync(brainDir, { recursive: true, force: true });
     }

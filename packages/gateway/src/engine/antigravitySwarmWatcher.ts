@@ -58,7 +58,8 @@ export {
 
 const MAX_MEMBERS_JSON_BYTES = 512 * 1024
 const MAX_BOARD_JSONL_BYTES = 2 * 1024 * 1024
-const TRANSCRIPT_TAIL_BYTES = 64 * 1024
+const TRANSCRIPT_TAIL_BYTES = 256 * 1024
+const TRANSCRIPT_TAIL_ADAPTIVE_MAX_BYTES = 2 * 1024 * 1024
 const DEFAULT_POLL_MS = 750
 /** Minimum interval between activity-only (`stepCount`/`activity`/`unreadCount`) emissions.
  * Structural changes (new posts, member status/role/error changes, channels, terminal phase)
@@ -428,6 +429,17 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
     }
   }
   const isTurnStartStep = lastType === 'USER_INPUT' || lastType === 'SYSTEM_MESSAGE'
+  const firstTailType = asStr(steps[0]?.type).toUpperCase()
+  const tailTruncatedMidTurn =
+    turnStart === 0 && firstTailType !== 'USER_INPUT' && firstTailType !== 'SYSTEM_MESSAGE'
+  if (tailTruncatedMidTurn && lastPlanner === null && lastType === 'GENERIC') {
+    return {
+      ...telBase,
+      stepCount: maxStepIndex,
+      status: 'working',
+      activity: '处理工具结果…',
+    }
+  }
   return {
     ...telBase,
     stepCount: maxStepIndex,
@@ -501,8 +513,16 @@ function parseMemberWorkspace(m: RawRosterMember): {
       ...(wsPath ? { workspacePath: wsPath } : {}),
     }
   }
-  const wsStr = asStr(m.workspace) || asStr(m.workspace_mode) || undefined
-  return wsStr ? { workspace: wsStr } : {}
+  const rawMode = asStr(m.workspace_mode)
+  const rawWs = asStr(m.workspace)
+  if (rawMode) {
+    const wsPath = rawWs && rawWs !== rawMode ? sanitizeWorkspacePath(rawWs) : undefined
+    return {
+      workspace: rawMode,
+      ...(wsPath ? { workspacePath: wsPath } : {}),
+    }
+  }
+  return rawWs ? { workspace: rawWs } : {}
 }
 
 /**
@@ -596,8 +616,8 @@ function parseBoardPosts(text: string | null): {
       // Torn final JSONL line will be parsed on next poll tick.
     }
   }
-  const totalPosts = all.length
-  const posts = totalPosts > SWARM_MAX_POSTS ? all.slice(totalPosts - SWARM_MAX_POSTS) : all
+  const totalPosts = Math.max(all.length, headSeq)
+  const posts = all.length > SWARM_MAX_POSTS ? all.slice(all.length - SWARM_MAX_POSTS) : all
   return { posts, totalPosts, headSeq, lastPostByAgent, postCountByChannel }
 }
 
@@ -835,6 +855,7 @@ export function readAntigravitySwarmSnapshot(opts: {
           opts.brainDir,
           [memberConvId, '.system_generated', 'logs', 'transcript.jsonl'],
           TRANSCRIPT_TAIL_BYTES,
+          { maxAdaptiveBytes: TRANSCRIPT_TAIL_ADAPTIVE_MAX_BYTES },
         )
       : null
     const incTelemetry =
@@ -895,6 +916,7 @@ async function readAntigravitySwarmSnapshotAsync(opts: {
                 opts.brainDir,
                 [memberConvId, '.system_generated', 'logs', 'transcript.jsonl'],
                 TRANSCRIPT_TAIL_BYTES,
+                { maxAdaptiveBytes: TRANSCRIPT_TAIL_ADAPTIVE_MAX_BYTES },
               ),
               opts.telemetryCache
                 ? opts.telemetryCache.scanAsync(opts.brainDir, memberConvId, { drainAll: opts.drainTelemetry })
@@ -1088,7 +1110,8 @@ export class AntigravitySwarmWatcher {
   private baselineActivationHash: string | null = null
   private lastStatSignature: string | null = null
   private trackedMemberConvIds: string[] = []
-  private readonly telemetryCache = new IncrementalTranscriptTelemetryCache()
+  private nonCoordinatorConvIds = new Set<string>()
+  private readonly telemetryCache: IncrementalTranscriptTelemetryCache
   private lastSnapshot: SwarmSnapshot | null = null
   private emittedInTurn = false
   private turnActive = false
@@ -1111,6 +1134,15 @@ export class AntigravitySwarmWatcher {
     this.onSnapshot = opts.onSnapshot
     this.onStallDetected = opts.onStallDetected
     this.stallMonitor = opts.onStallDetected ? new SwarmStallMonitor(opts.stallMonitor) : null
+    // When resuming an existing swarm (`seedBaselineOnStart`), anchor window token
+    // deltas at turn start (minus 1s clock skew margin) so historical worker steps
+    // are not re-counted in `turnWorkerUsageDelta()`.
+    const windowStart = this.seedBaselineOnStart ? Math.max(0, this.now() - 1_000) : undefined
+    this.telemetryCache = new IncrementalTranscriptTelemetryCache(
+      undefined,
+      undefined,
+      windowStart,
+    )
   }
 
   start(): void {
@@ -1171,6 +1203,36 @@ export class AntigravitySwarmWatcher {
     return this.lastSnapshot ? structuredClone(this.lastSnapshot) : null
   }
 
+  /** Roll back a stall alert's quota consumption when lock contention prevented board delivery. */
+  rollbackStallAlert(alert: SwarmStallAlert): void {
+    this.stallMonitor?.rollbackAlert(alert)
+  }
+
+  /** Non-coordinator worker token delta observed during this turn (for tape display accuracy). */
+  turnWorkerUsageDelta(): {
+    inputTokens: number
+    outputTokens: number
+    cacheReadTokens: number
+    thinkingTokens: number
+  } {
+    if (!this.turnActive) {
+      return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, thinkingTokens: 0 }
+    }
+    let inputTokens = 0
+    let outputTokens = 0
+    let cacheReadTokens = 0
+    let thinkingTokens = 0
+    for (const convId of this.nonCoordinatorConvIds) {
+      const snap = this.telemetryCache.peek(convId)
+      if (!snap) continue
+      inputTokens += snap.windowInputTokens ?? snap.inputTokens
+      outputTokens += snap.windowOutputTokens ?? snap.outputTokens
+      cacheReadTokens += snap.windowCacheReadTokens ?? snap.cacheReadTokens
+      thinkingTokens += snap.windowThinkingTokens ?? snap.thinkingTokens
+    }
+    return { inputTokens, outputTokens, cacheReadTokens, thinkingTokens }
+  }
+
   private computeStatSignature(): string {
     const parts: string[] = [
       statSignatureWithinRoot(this.brainDir, [this.conversationId, '.system_generated', 'swarm', 'members.json']),
@@ -1201,6 +1263,9 @@ export class AntigravitySwarmWatcher {
   private setTrackedMembers(ids: string[]): void {
     const uniq = Array.from(new Set(ids.filter((id) => CONVERSATION_ID_RE.test(id)))).sort()
     this.trackedMemberConvIds = uniq
+    this.nonCoordinatorConvIds = new Set(
+      uniq.filter((id) => id.toLowerCase() !== this.conversationId.toLowerCase()),
+    )
     this.telemetryCache.prune(new Set(uniq))
   }
 
@@ -1636,6 +1701,7 @@ export class AntigravitySwarmWatcher {
       this.turnActive = true
     }
     const nextRev = this.revision + 1
+    const finalMemberConvIds: string[] = []
     const snap = readAntigravitySwarmSnapshot({
       brainDir: this.brainDir,
       conversationId: this.conversationId,
@@ -1643,9 +1709,11 @@ export class AntigravitySwarmWatcher {
       revision: nextRev,
       startedAt: this.startedAt,
       now: this.now(),
+      outMemberConvIds: finalMemberConvIds,
       telemetryCache: this.telemetryCache,
       drainTelemetry: true,
     })
+    if (finalMemberConvIds.length > 0) this.setTrackedMembers(finalMemberConvIds)
     if (!snap) {
       if (!this.lastSnapshot) return null
       const fallback = settleSwarmSnapshotTerminal(this.lastSnapshot, phase)

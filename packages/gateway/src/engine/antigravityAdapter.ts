@@ -1,4 +1,4 @@
-import { renewAntigravityRouteLease } from '../delegateAntigravityRoute.js'
+import { renewAntigravityRouteLease, renewAntigravityRouteLeaseDetailed } from '../delegateAntigravityRoute.js'
 import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { PassiveStageTiming } from '../passiveStageTiming.js'
 import { identityCompatEnvironment } from '@openclaude/storage'
@@ -86,6 +86,13 @@ import {
   settleSwarmSnapshotTerminal,
 } from './antigravitySwarmWatcher.js'
 import { GATEWAY_STALL_MONITOR_AGENT } from './swarmStallMonitor.js'
+import {
+  awaitLocalAntigravitySwarmSlotIfActive,
+  buildAntigravityDurableBillingEvent,
+  cleanupKilledNativeSwarmWorktrees,
+  reapLingeringCliProcessGroup,
+  releaseSwarmSlotAfterBoundedReap,
+} from './antigravitySwarmConcurrency.js'
 import { injectSwarmDirective } from '../swarmCommand.js'
 import { lookupRemoteSwarmMcpContext } from '../remoteSwarmRuntime.js'
 import {
@@ -216,6 +223,7 @@ interface TurnContext {
   resultConversationId: string | null
   requestedConversationId: string | null
   settling: boolean
+  settlingDone: Promise<void> | null
   nativeBinding: AntigravityNativeBinding | null
   nativeRecovery: string | null
   sawResult: boolean
@@ -268,6 +276,9 @@ interface TurnContext {
   swarmEventOrdinal: number | undefined
   swarmCommitted: boolean
   lastEmittedSwarmSnapshot: SwarmSnapshot | null
+  workerUsageDelta: StepUsage
+  releaseSwarmSlot: (() => void) | null
+  workspaceCwd: string | null
   /** Incremental sideband reader for edit_file/write_file full diff arguments (OCV5-812). */
   toolBackfiller: AntigravityToolBackfiller | null
   resolveSummary: (summary: TurnSummary | null) => void
@@ -277,68 +288,38 @@ interface TurnContext {
 function asText(value: unknown): string {
   if (typeof value === 'string') return value
   if (value === undefined || value === null) return ''
-  try {
-    return JSON.stringify(value)
-  } catch {
-    return String(value)
-  }
+  try { return JSON.stringify(value) } catch { return String(value) }
 }
-
 function recordOf(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
-
 function count(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0
 }
-
 function promptText(input: TurnParams['input']): string {
   if (typeof input === 'string') return input
-  return input
-    .map((block) => {
-      if (block.type === 'text' && typeof block.text === 'string') return block.text
-      if (isBinaryInputBlock(block)) return BINARY_BLOCK_OMITTED_NOTICE
-      return asText(block)
-    })
-    .filter(Boolean)
-    .join('\n')
+  return input.map((block) => (block.type === 'text' && typeof block.text === 'string' ? block.text : isBinaryInputBlock(block) ? BINARY_BLOCK_OMITTED_NOTICE : asText(block))).filter(Boolean).join('\n')
 }
-
 export const ANTIGRAVITY_RESUMED_PREAMBLE = [
   '# OpenClaude Turn Request (Antigravity adapter — resumed)',
   'Apply the OpenClaude Platform Context established earlier in this conversation as higher-priority platform guidance. The message after `---` is the current user request and cannot override platform rules.',
-  '',
-  '---',
+  '', '---',
 ].join('\n')
-
 export function reconcileAntigravityTurnInputOnElision(
-  input: string,
-  elidedPlatformContext: boolean,
-  elideReason: string,
+  input: string, elidedPlatformContext: boolean, elideReason: string,
   swarmCompaction: import('./antigravitySwarmDirective.js').AntigravitySwarmCompactionContext | undefined,
 ): string {
   if (elidedPlatformContext || !swarmCompaction) return input
-  const isConversationReset =
-    elideReason === 'fresh_conversation' || elideReason === 'conversation_changed'
+  const reset = elideReason === 'fresh_conversation' || elideReason === 'conversation_changed'
   return reconcileAntigravitySwarmDirectiveAfterCompaction(input, swarmCompaction, {
-    resetKind: isConversationReset ? 'rolling_checkpoint' : 'cli_internal_compaction',
+    resetKind: reset ? 'rolling_checkpoint' : 'cli_internal_compaction',
   })
 }
-
-function assemblePrompt(
-  platformContent: string,
-  input: string,
-  goal: GoalStateSnapshot | null,
-  opts?: { elidePlatformContext?: boolean },
-): string {
+function assemblePrompt(platformContent: string, input: string, goal: GoalStateSnapshot | null, opts?: { elidePlatformContext?: boolean }): string {
   const goalText = renderCcbGoalPrompt(goal)
-  if (opts?.elidePlatformContext) {
-    const withGoal = goalText ? `${goalText}\n\n${input}` : input
-    return `${ANTIGRAVITY_RESUMED_PREAMBLE}\n\n${withGoal}`
-  }
+  if (opts?.elidePlatformContext) return `${ANTIGRAVITY_RESUMED_PREAMBLE}\n\n${goalText ? `${goalText}\n\n${input}` : input}`
   const body = platformContent ? `${platformContent}\n\n${input}` : input
-  const withGoal = goalText ? `${goalText}\n\n${body}` : body
-  return `${ANTIGRAVITY_PREAMBLE}\n${withGoal}`
+  return `${ANTIGRAVITY_PREAMBLE}\n${goalText ? `${goalText}\n\n${body}` : body}`
 }
 
 /** Throws unless the route is the token-bound loopback relay. */
@@ -475,6 +456,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       resultConversationId: null,
       requestedConversationId: null,
       settling: false,
+      settlingDone: null,
       nativeBinding: null,
       nativeRecovery: null,
       sawResult: false,
@@ -514,6 +496,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       swarmEventOrdinal: undefined,
       swarmCommitted: false,
       lastEmittedSwarmSnapshot: null,
+      workerUsageDelta: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, thinkingTokens: 0 },
+      releaseSwarmSlot: null,
+      workspaceCwd: null,
       toolBackfiller: null,
       resolveSummary,
       resolveDrain: null,
@@ -766,12 +751,39 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       throw new Error('ANTIGRAVITY_RESUME_BASELINE_UNKNOWN: native launch boundary unavailable')
     }
     if (ctx.requestedConversationId) args.push('--conversation', ctx.requestedConversationId)
+    ctx.workspaceCwd = cwdDecision.cwd
     ctx.routeToken = route.routeToken
     ctx.routeRenewAt = Date.now()
     ctx.releaseRelayTrace = bindRouteTrace(route.routeToken, this.traceId)
+    await awaitLocalAntigravitySwarmSlotIfActive({
+      compactionMode: ctx.params.antigravitySwarmCompaction?.appliedMode,
+      keepaliveMs: timingTestHooks?.keepaliveMs ?? KEEPALIVE_INTERVAL_MS,
+      renewRouteIntervalMs: timingTestHooks?.routeRenewMs ?? 60_000,
+      onStatus: (detail) => ctx.params.onEvent({ kind: 'turn_status', status: { status: 'working', detail } }),
+      onHeartbeat: () => { this.lastActivityAt = Date.now(); this.emit('activity') },
+      onRenewRoute: async () => {
+        ctx.routeRenewAt = Date.now()
+        if (timingTestHooks?.renewRoute) {
+          const res = await timingTestHooks.renewRoute(route.routeToken)
+          return res === false ? 'revoked' : 'ok'
+        }
+        return renewAntigravityRouteLeaseDetailed(route.routeToken)
+      },
+      onRenewWarn: (outcome) => {
+        log.warn('antigravity queued route renewal transient failure; proceeding', {
+          sessionKey: this.opts.sessionKey, traceId: ctx.params.traceId, outcome,
+        })
+      },
+      setRelease: (fn) => { ctx.releaseSwarmSlot = fn },
+    })
+    if (ctx.terminal || ctx.abandoned) {
+      this.cleanupLaunch(ctx)
+      ctx.resolveDrain?.()
+      ctx.resolveDrain = null
+      return
+    }
     if (ctx.requestedConversationId) {
       this.ensureSwarmWatcher(ctx, ctx.requestedConversationId)
-      // Snapshot pre-spawn transcript_full.jsonl EOF before launching the resumed CLI (B2).
       const backfiller = this.ensureToolBackfiller(ctx)
       backfiller?.captureStartOffset()
     }
@@ -809,7 +821,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         },
       },
       onStallDetected: (alert) => {
-        if (ctx.terminal || ctx.abandoned) return
+        if (ctx.terminal || ctx.abandoned || ctx.interrupted) return
         void injectSwarmDirective({
           brainDir,
           conversationId,
@@ -818,9 +830,10 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
           channel: alert.channel,
           sender: GATEWAY_STALL_MONITOR_AGENT,
           controlKind: 'stall',
+          shouldAbort: () => ctx.terminal || ctx.abandoned || ctx.interrupted,
         })
           .then((res) => {
-            if (ctx.terminal || ctx.abandoned) return
+            if (ctx.terminal || ctx.abandoned || ctx.interrupted) return
             if (res.ok) {
               log.info('antigravity_swarm_stall_alert', {
                 sessionKey: this.opts.sessionKey,
@@ -832,24 +845,20 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
                 seq: res.seq,
               })
               ctx.swarmWatcher?.kick()
-            } else {
+            } else if (res.code !== 'ABORTED') {
+              ctx.swarmWatcher?.rollbackStallAlert(alert)
               log.warn('antigravity_swarm_stall_alert_failed', {
-                sessionKey: this.opts.sessionKey,
-                conversationId,
-                target: alert.target,
-                reason: alert.reason,
-                code: res.code,
-                error: res.error,
+                sessionKey: this.opts.sessionKey, conversationId, target: alert.target,
+                reason: alert.reason, code: res.code, error: res.error,
               })
             }
           })
           .catch((err) => {
+            if (ctx.terminal || ctx.abandoned || ctx.interrupted) return
+            ctx.swarmWatcher?.rollbackStallAlert(alert)
             log.warn('antigravity_swarm_stall_alert_failed', {
-              sessionKey: this.opts.sessionKey,
-              conversationId,
-              target: alert.target,
-              reason: alert.reason,
-              error: String((err as Error)?.message ?? err),
+              sessionKey: this.opts.sessionKey, conversationId, target: alert.target,
+              reason: alert.reason, error: String((err as Error)?.message ?? err),
             })
           })
       },
@@ -922,7 +931,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     let finalSwarm: SwarmSnapshot | null = null
     if (opts.readDisk && watcher) {
       finalSwarm = watcher.stopAndReadFinal(phase)
+      ctx.workerUsageDelta = watcher.turnWorkerUsageDelta()
     } else {
+      if (watcher) ctx.workerUsageDelta = watcher.turnWorkerUsageDelta()
       watcher?.stop()
       const hadActivity = (watcher?.hasTurnActivity() ?? false) || ctx.lastEmittedSwarmSnapshot !== null
       const base = ctx.lastEmittedSwarmSnapshot ?? (hadActivity ? watcher?.latestSnapshot() ?? null : null)
@@ -1029,7 +1040,10 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       if (ctx.abandoned) return
       if (tail.trim()) this.handleLine(ctx, tail.trim())
       if (ctx.pendingResult) await this.settleResult(ctx)
-      if (!ctx.terminal) {
+      // B1: Wait for an in-flight settleResult (e.g. swarm process-group grace/reap) to finish
+      // reading final SwarmBoard + worker token deltas and setting `deliveredSuccess` BEFORE cleanupLaunch!
+      if (ctx.settling && ctx.settlingDone) await ctx.settlingDone
+      if (!ctx.terminal && !ctx.settling) {
         const detail = ctx.errorDetail || ctx.stderr.trim() || `antigravity exited with code ${String(code)}`
         this.finishError(ctx, detail)
       }
@@ -1495,101 +1509,112 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       if (emptySuccess) ctx.errorDetail ??= 'ANTIGRAVITY_EXIT_TIMEOUT: CLI did not close after its empty result'
     }
     ctx.settling = true
-    ctx.pendingResult = null
-    ctx.resultResponseBytes = Buffer.byteLength(asText(result.response), 'utf8')
-    let status = asText(result.status)
-    // OCV5-556: once a launch of a conversation failed (e.g. relay
-    // ROUTE_EXPIRED), 1.4.0 ends every later `--conversation` launch with
-    // status ERROR and that old error, even when the launch answered normally
-    // (exit 0, empty stderr). The recovery and the next messages then "failed"
-    // until the retry circuit opened. Such a launch resumed a conversation,
-    // started, answered, streamed no error step of its own, exited 0 and wrote
-    // no error to stderr; a launch that really failed (even after a partial
-    // reply) exits non-zero and prints the error (Codex r1 P1).
-    if (ctx.procClosed && ctx.exitCode === 0 && this.mayBeRepeatedOldError(ctx, result)) {
-      log.warn('antigravity CLI repeated an earlier launch error on a run that answered', {
-        sessionKey: this.opts.sessionKey,
-        error: asText(result.error).slice(0, 300),
-      })
-      status = 'SUCCESS'
-    }
-    if ((ctx.resultConversationId && ctx.initConversationId && ctx.resultConversationId !== ctx.initConversationId) ||
-        (ctx.requestedConversationId && ctx.resultConversationId !== ctx.requestedConversationId)) {
-      ctx.errorDetail ??= 'ANTIGRAVITY_CONVERSATION_MISMATCH: result does not match this launch'
-    }
-    if (status === 'CANCELED' || status === 'INTERRUPTED') ctx.interrupted = true
-    if (ctx.trailingErrorStep && ctx.trailingErrorDetail && ctx.errorDetail === null) {
-      ctx.errorDetail = ctx.trailingErrorDetail
-    }
-    if (status !== 'SUCCESS' && ctx.errorDetail === null) {
-      ctx.errorDetail = asText(result.error) || ctx.preludeErrorDetail || ctx.stderr.trim() ||
-        (ctx.procClosed && ctx.exitCode !== 0
-          ? `antigravity exited with code ${String(ctx.exitCode)}`
-          : `Antigravity turn ended with status ${status || 'unknown'}`)
-    }
-    if (ctx.procClosed && ctx.exitCode !== 0 && !ctx.interrupted) {
-      ctx.errorDetail ??= ctx.stderr.trim() || `antigravity exited with code ${String(ctx.exitCode)}`
-    }
-    if (status === 'SUCCESS' && ctx.errorDetail === null) {
-      // 1.3.4 reports SUCCESS for runs that produced nothing (oversized input)
-      // and for headless soft-denied tools. Both are failures for the user.
-      const denied = Array.isArray(result.denied_actions) ? result.denied_actions : []
-      if (ctx.trailingErrorStep) {
-        const why = asText(result.error) || ctx.stderr.trim().slice(-500) || 'CLI reported success after an error step'
-        ctx.errorDetail = `${ANTIGRAVITY_ERROR_STEP}: ${why}`
-      } else if (denied.length > 0 || SOFT_DENY_RE.test(ctx.stderr)) {
-        const actions = denied.map((d) => asText(recordOf(d)?.action) || asText(d)).filter(Boolean)
-        ctx.errorDetail = `ANTIGRAVITY_TOOL_DENIED: ${actions.length > 0 ? actions.join(',') : ctx.stderr.trim().slice(0, 500)}`
+    let resolveSettlingDone!: () => void
+    ctx.settlingDone = new Promise<void>((r) => { resolveSettlingDone = r })
+    try {
+      ctx.pendingResult = null
+      ctx.resultResponseBytes = Buffer.byteLength(asText(result.response), 'utf8')
+      let status = asText(result.status)
+      // OCV5-556: once a launch of a conversation failed (e.g. relay
+      // ROUTE_EXPIRED), 1.4.0 ends every later `--conversation` launch with
+      // status ERROR and that old error, even when the launch answered normally
+      // (exit 0, empty stderr). The recovery and the next messages then "failed"
+      // until the retry circuit opened. Such a launch resumed a conversation,
+      // started, answered, streamed no error step of its own, exited 0 and wrote
+      // no error to stderr; a launch that really failed (even after a partial
+      // reply) exits non-zero and prints the error (Codex r1 P1).
+      if (ctx.procClosed && ctx.exitCode === 0 && this.mayBeRepeatedOldError(ctx, result)) {
+        log.warn('antigravity CLI repeated an earlier launch error on a run that answered', {
+          sessionKey: this.opts.sessionKey,
+          error: asText(result.error).slice(0, 300),
+        })
+        status = 'SUCCESS'
       }
-    }
-    const unanchoredResumeResponse = ctx.resumedLaunch && ctx.firstOwnStepIndex === null &&
-      asText(result.response).trim() !== ''
-    if (status === 'SUCCESS' && ctx.errorDetail === null && !ctx.interrupted &&
-        ctx.procClosed && ctx.exitCode === 0 && !ctx.answerText.trim() &&
-        (!asText(result.response).trim() || unanchoredResumeResponse) &&
-        !CLI_STDERR_ERROR_RE.test(ctx.stderr) && ctx.nativeBinding) {
-      const recovered = await (this.deliveryDeps.nativeTrajectory?.recover ?? recoverAntigravityNativeTrajectory)(
-        ctx.nativeBinding, ctx.initConversationId ?? undefined, ctx.resultConversationId ?? undefined,
-      )
-      // Cancellation/end/shutdown may have retired the turn while IO yielded.
-      if (ctx.terminal || ctx.abandoned) return
-      if (!ctx.interrupted && ctx.errorDetail === null) {
-        ctx.nativeRecovery = recovered.ok ? 'recovered' : recovered.reason
-        if (recovered.ok && (!unanchoredResumeResponse || recovered.text === asText(result.response))) {
-          this.appendText(ctx, recovered.text)
-        } else if (unanchoredResumeResponse) {
-          ctx.errorDetail = 'ANTIGRAVITY_UNVERIFIED_RESULT: no current launch answer boundary'
+      if ((ctx.resultConversationId && ctx.initConversationId && ctx.resultConversationId !== ctx.initConversationId) ||
+          (ctx.requestedConversationId && ctx.resultConversationId !== ctx.requestedConversationId)) {
+        ctx.errorDetail ??= 'ANTIGRAVITY_CONVERSATION_MISMATCH: result does not match this launch'
+      }
+      if (status === 'CANCELED' || status === 'INTERRUPTED') ctx.interrupted = true
+      if (ctx.trailingErrorStep && ctx.trailingErrorDetail && ctx.errorDetail === null) {
+        ctx.errorDetail = ctx.trailingErrorDetail
+      }
+      if (status !== 'SUCCESS' && ctx.errorDetail === null) {
+        ctx.errorDetail = asText(result.error) || ctx.preludeErrorDetail || ctx.stderr.trim() ||
+          (ctx.procClosed && ctx.exitCode !== 0
+            ? `antigravity exited with code ${String(ctx.exitCode)}`
+            : `Antigravity turn ended with status ${status || 'unknown'}`)
+      }
+      if (ctx.procClosed && ctx.exitCode !== 0 && !ctx.interrupted) {
+        ctx.errorDetail ??= ctx.stderr.trim() || `antigravity exited with code ${String(ctx.exitCode)}`
+      }
+      if (status === 'SUCCESS' && ctx.errorDetail === null) {
+        // 1.3.4 reports SUCCESS for runs that produced nothing (oversized input)
+        // and for headless soft-denied tools. Both are failures for the user.
+        const denied = Array.isArray(result.denied_actions) ? result.denied_actions : []
+        if (ctx.trailingErrorStep) {
+          const why = asText(result.error) || ctx.stderr.trim().slice(-500) || 'CLI reported success after an error step'
+          ctx.errorDetail = `${ANTIGRAVITY_ERROR_STEP}: ${why}`
+        } else if (denied.length > 0 || SOFT_DENY_RE.test(ctx.stderr)) {
+          const actions = denied.map((d) => asText(recordOf(d)?.action) || asText(d)).filter(Boolean)
+          ctx.errorDetail = `ANTIGRAVITY_TOOL_DENIED: ${actions.length > 0 ? actions.join(',') : ctx.stderr.trim().slice(0, 500)}`
         }
       }
-    }
-    if (ctx.terminal || ctx.abandoned) return
-    if (unanchoredResumeResponse && !ctx.answerText.trim()) {
-      ctx.errorDetail ??= 'ANTIGRAVITY_UNVERIFIED_RESULT: no current launch answer boundary'
-    }
-    if (status === 'SUCCESS' && !ctx.interrupted && ctx.errorDetail === null &&
-        !ctx.sawOutput && !asText(result.response).trim()) {
-      ctx.errorDetail = EMPTY_RUN_RE.test(ctx.stderr)
-        ? `ANTIGRAVITY_EMPTY_RUN: ${ctx.stderr.trim().slice(0, 500)}`
-        : 'ANTIGRAVITY_EMPTY_RUN: CLI reported success with no output'
-    }
-    // A terminal response is an alternate delivery channel, not evidence that
-    // erases a current error. Reconcile only after error/cancellation/denial
-    // adjudication, through the same durable text path used by streaming.
-    if (!ctx.interrupted && ctx.errorDetail === null) {
-      const response = asText(result.response)
-      if (response.trim() && response.startsWith(ctx.answerText)) {
-        const missing = response.slice(ctx.answerText.length)
-        if (missing) this.appendText(ctx, missing)
+      const unanchoredResumeResponse = ctx.resumedLaunch && ctx.firstOwnStepIndex === null &&
+        asText(result.response).trim() !== ''
+      if (status === 'SUCCESS' && ctx.errorDetail === null && !ctx.interrupted &&
+          ctx.procClosed && ctx.exitCode === 0 && !ctx.answerText.trim() &&
+          (!asText(result.response).trim() || unanchoredResumeResponse) &&
+          !CLI_STDERR_ERROR_RE.test(ctx.stderr) && ctx.nativeBinding) {
+        const recovered = await (this.deliveryDeps.nativeTrajectory?.recover ?? recoverAntigravityNativeTrajectory)(
+          ctx.nativeBinding, ctx.initConversationId ?? undefined, ctx.resultConversationId ?? undefined,
+        )
+        // Cancellation/end/shutdown may have retired the turn while IO yielded.
+        if (ctx.terminal || ctx.abandoned) return
+        if (!ctx.interrupted && ctx.errorDetail === null) {
+          ctx.nativeRecovery = recovered.ok ? 'recovered' : recovered.reason
+          if (recovered.ok && (!unanchoredResumeResponse || recovered.text === asText(result.response))) {
+            this.appendText(ctx, recovered.text)
+          } else if (unanchoredResumeResponse) {
+            ctx.errorDetail = 'ANTIGRAVITY_UNVERIFIED_RESULT: no current launch answer boundary'
+          }
+        }
       }
+      if (ctx.terminal || ctx.abandoned) return
+      if (unanchoredResumeResponse && !ctx.answerText.trim()) {
+        ctx.errorDetail ??= 'ANTIGRAVITY_UNVERIFIED_RESULT: no current launch answer boundary'
+      }
+      if (status === 'SUCCESS' && !ctx.interrupted && ctx.errorDetail === null &&
+          !ctx.sawOutput && !asText(result.response).trim()) {
+        ctx.errorDetail = EMPTY_RUN_RE.test(ctx.stderr)
+          ? `ANTIGRAVITY_EMPTY_RUN: ${ctx.stderr.trim().slice(0, 500)}`
+          : 'ANTIGRAVITY_EMPTY_RUN: CLI reported success with no output'
+      }
+      // A terminal response is an alternate delivery channel, not evidence that
+      // erases a current error. Reconcile only after error/cancellation/denial
+      // adjudication, through the same durable text path used by streaming.
+      if (!ctx.interrupted && ctx.errorDetail === null) {
+        const response = asText(result.response)
+        if (response.trim() && response.startsWith(ctx.answerText)) {
+          const missing = response.slice(ctx.answerText.length)
+          if (missing) this.appendText(ctx, missing)
+        }
+      }
+      // Commit only a conversation whose turn landed. On failure or cancel the
+      // last committed id stays: SessionManager's resume map still holds it and
+      // decides history replay from it, so the adapter must not diverge.
+      if (!ctx.interrupted && ctx.errorDetail === null && ctx.conversationId !== null) {
+        this.nativeId = ctx.conversationId
+        this.emit('session_id', ctx.conversationId)
+      }
+      if (ctx.swarmWatcher?.hasTurnActivity() && ctx.proc) {
+        await reapLingeringCliProcessGroup(ctx.proc, () => ctx.procClosed)
+        if (ctx.terminal || ctx.abandoned) return
+      }
+      this.finish(ctx, typeof result.num_turns === 'number' ? count(result.num_turns) : 1)
+    } finally {
+      ctx.settling = false
+      resolveSettlingDone()
     }
-    // Commit only a conversation whose turn landed. On failure or cancel the
-    // last committed id stays: SessionManager's resume map still holds it and
-    // decides history replay from it, so the adapter must not diverge.
-    if (!ctx.interrupted && ctx.errorDetail === null && ctx.conversationId !== null) {
-      this.nativeId = ctx.conversationId
-      this.emit('session_id', ctx.conversationId)
-    }
-    this.finish(ctx, typeof result.num_turns === 'number' ? count(result.num_turns) : 1)
   }
 
   /** Everything but the exit code that marks an ERROR as the repeated old one. */
@@ -1605,11 +1630,15 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   private usageSnapshot(ctx: TurnContext) {
     const u = ctx.usage
+    const w = ctx.workerUsageDelta
+    const inputTokens = u.inputTokens + w.inputTokens
+    const outputTokens = u.outputTokens + w.outputTokens + w.thinkingTokens
+    const cacheReadTokens = u.cacheReadTokens + w.cacheReadTokens
     return {
-      totalTokens: u.inputTokens + u.outputTokens + u.cacheReadTokens,
-      inputTokens: u.inputTokens,
-      outputTokens: u.outputTokens,
-      cacheReadTokens: u.cacheReadTokens,
+      totalTokens: inputTokens + outputTokens + cacheReadTokens,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
       cacheCreationTokens: 0,
     }
   }
@@ -1649,7 +1678,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     // 1.3.4 never streams thought text (only thinking_tokens), so the
     // thinking channel stays empty.
     const usage = this.usageSnapshot(ctx)
-    this.emitExternalBilling(ctx, isError)
+    this.emitExternalBilling(ctx, isError, usage)
     ctx.params.onEvent({ kind: 'final', meta: { ...usage, stopReason, cost: 0 } })
     ctx.resolveSummary({
       usage: { cost: 0, ...usage },
@@ -1670,13 +1699,15 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     })
   }
 
-  /** Status-only sideband: master settles from the relay's usage rows. */
-  private emitExternalBilling(ctx: TurnContext, isError: boolean): void {
+  /** Status-only live sideband + durable turn-tape billing locator (OCV5-887). */
+  private emitExternalBilling(
+    ctx: TurnContext,
+    isError: boolean,
+    usage: ReturnType<AntigravityAdapter['usageSnapshot']>,
+  ): void {
     const requestId = ctx.params.requestId
     if (!requestId || !REQUEST_ID_RE.test(requestId)) return
     const detail = ctx.errorDetail ?? ''
-    // The relay refuses new calls past the admission budget; the tokens used
-    // up to there were consumed, so settle them (master clamps to balance).
     const budgetStop = isError && !ctx.interrupted && BUDGET_EXHAUSTED_RE.test(detail)
     const cls = !isError || ctx.interrupted || budgetStop ? null
       : authError(detail) ? 'auth' as const
@@ -1689,13 +1720,18 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       : cls === 'auth' ? 'AUTH_UNAVAILABLE'
       : cls === 'quota' ? 'QUOTA_UNAVAILABLE'
       : 'ENGINE_ERROR'
+    const durationMs = Date.now() - ctx.startedAt
     this.emit('external_billing', {
-      requestId,
-      engine: 'antigravity',
-      status,
-      durationMs: Date.now() - ctx.startedAt,
+      requestId, engine: 'antigravity', status, durationMs,
       ...(terminalCode ? { terminalCode } : {}),
     } satisfies EngineExternalBillingEvent)
+    this.emit('billing', buildAntigravityDurableBillingEvent({
+      requestId, sessionKey: this.opts.sessionKey, turnKey: ctx.params.turnKey,
+      parentTurnKey: ctx.params.usageAttribution?.parentTurnKey,
+      parentSessionId: ctx.params.usageAttribution?.parentSessionId,
+      delegateAgentId: ctx.params.usageAttribution?.delegateAgentId,
+      status, terminalCode, interrupted: ctx.interrupted, budgetStop, durationMs, usage,
+    }))
   }
 
   private finishError(ctx: TurnContext, detail: string): void {
@@ -1712,14 +1748,24 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       emitEvent: false,
       readDisk: false,
     })
-    if (ctx.terminal) return
+    const release = ctx.releaseSwarmSlot
+    ctx.releaseSwarmSlot = null
+    if (ctx.terminal) {
+      releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 150 })
+      return
+    }
     ctx.deliveredSuccess = false
     ctx.terminal = true
+    if (ctx.proc && !ctx.procClosed) killProcessGroup(ctx.proc, 'SIGTERM')
+    releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 0 })
     ctx.resolveSummary(null)
   }
 
   private cleanupLaunch(ctx: TurnContext, opts?: { persistSummaryCache?: boolean }): void {
     this.stopSwarmWatcher(ctx)
+    const release = ctx.releaseSwarmSlot
+    ctx.releaseSwarmSlot = null
+    releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 0 })
     ctx.toolBackfiller?.dispose()
     ctx.toolBackfiller = null
     // Every caller is the end of the turn's process, so its relay requests stop naming this turn too.
@@ -1728,6 +1774,11 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const projection = ctx.projection
     if (!projection) return
     ctx.projection = null
+    cleanupKilledNativeSwarmWorktrees(
+      projection.sessionBrainDir,
+      ctx.conversationId ?? ctx.requestedConversationId,
+      ctx.workspaceCwd,
+    )
     cleanupAntigravityLaunch(projection, opts)
   }
 
@@ -1898,17 +1949,9 @@ export const _internals = {
 registerEngine('antigravity', (opts) => new AntigravityAdapter(opts))
 
 registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, promptPolicy, promptOnly }) => {
-  const runner = new SubprocessRunner({
-    ...opts,
-    harness: 'official-cc',
-    boxResidentCc: true,
-  })
-  if (promptPolicy !== undefined) {
-    runner.setPromptPrivacy(promptPolicy)
-  }
-  const { learning, profile, env, cleanup } = await runner.prepareRemoteToolContext({
-    supportsVision,
-  })
+  const runner = new SubprocessRunner({ ...opts, harness: 'official-cc', boxResidentCc: true })
+  if (promptPolicy !== undefined) runner.setPromptPrivacy(promptPolicy)
+  const { learning, profile, env, cleanup } = await runner.prepareRemoteToolContext({ supportsVision })
   const swarmCtx = lookupRemoteSwarmMcpContext(opts.sessionKey)
   const swarmEnv: Record<string, string> = swarmCtx
     ? {
@@ -1925,31 +1968,13 @@ registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, prompt
         mcpServers?: Record<string, { env?: Record<string, string> }>
       }
       if (rawCfg?.mcpServers?.['openclaude-memory']) {
-        rawCfg.mcpServers['openclaude-memory'].env = {
-          ...(rawCfg.mcpServers['openclaude-memory'].env ?? {}),
-          ...swarmEnv,
-        }
+        rawCfg.mcpServers['openclaude-memory'].env = { ...(rawCfg.mcpServers['openclaude-memory'].env ?? {}), ...swarmEnv }
         writeFileSync(profile.mcpConfigPath, JSON.stringify(rawCfg, null, 2), { mode: 0o600 })
       }
-    } catch {
-      // keep original mcp config if unreadable
-    }
+    } catch { /* keep original mcp config if unreadable */ }
   }
-  const platformPrompt = learning.extraPromptFile
-    ? readFileSync(learning.extraPromptFile, 'utf8')
-    : ''
-  if (promptOnly) {
-    cleanup()
-    return {
-      profile,
-      env: mergedEnv,
-      platformPrompt,
-      promptCwd: profile.cwd,
-      promptPolicyFingerprint: runner.promptPolicyFingerprint,
-      promptIntelligentUi: runner.promptIntelligentUi,
-      cleanup: () => {},
-    }
-  }
+  const platformPrompt = learning.extraPromptFile ? readFileSync(learning.extraPromptFile, 'utf8') : ''
+  if (promptOnly) cleanup()
   return {
     profile,
     env: mergedEnv,
@@ -1957,6 +1982,6 @@ registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, prompt
     promptCwd: profile.cwd,
     promptPolicyFingerprint: runner.promptPolicyFingerprint,
     promptIntelligentUi: runner.promptIntelligentUi,
-    cleanup,
+    cleanup: promptOnly ? () => {} : cleanup,
   }
 })

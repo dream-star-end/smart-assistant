@@ -43,6 +43,7 @@ import {
   isCodexEngineModel,
   isCursorEngineModel,
   isAntigravityEngineModel,
+  isNonJournalDurableBillingEngine,
   isRemoteDriverExecutionBackend,
   parseSwarmSlashCommand,
   isClientMessageId,
@@ -83,7 +84,10 @@ import { capMarketplaceToolsets, mergeOnDemandToolsets } from './toolsetIntent.j
 import { projectCcbExecutionDescriptor } from './subprocessRunner.js'
 import { readV3CodexRelayConfig, V3_CODEX_RELAY_PREFIX } from './v3CodexRelay.js'
 import { resolveEngine } from './engine/registry.js'
-import { prepareAntigravitySwarmInboundDirective } from './engine/antigravitySwarmDirective.js'
+import {
+  hasLiveCoreAntigravitySwarmWorkers,
+  prepareAntigravitySwarmInboundDirective,
+} from './engine/antigravitySwarmDirective.js'
 import {
   prepareRemoteSwarmInboundTurn,
   recordRemoteSwarmLeaderStreamEvent,
@@ -1677,11 +1681,28 @@ export async function dispatchInbound(
 
         finalText = lines.join('\n')
       }
-      // Antigravity swarm mode (OCV5-809/835/842/882 mutex): hoisted above advisor/teamMode.
+      // Antigravity swarm mode (OCV5-809/835/842/882/887 mutex): hoisted above advisor/teamMode.
       const effectiveModelForSwarm = safeModelForRouting ?? agent.model ?? this.deps.config.defaults.model
       const isAntigravityTurn = turnAuthority?.engine === 'antigravity' || (typeof effectiveModelForSwarm === 'string' && isAntigravityEngineModel(effectiveModelForSwarm))
       const isRemoteAntigravity = isAntigravityTurn && (isRemoteDriverExecutionBackend(turnAuthority?.executionBackend) || (typeof effectiveModelForSwarm === 'string' && effectiveModelForSwarm.endsWith('-remote')))
-      const swarmRequested = swarmMode || Boolean(parseSwarmSlashCommand(rawUserText)?.matched)
+      const boundSwarmConversationId = isAntigravityTurn && !isRemoteAntigravity
+        ? (session.ccbSessionId ?? session.runner?.nativeSessionId ?? this.sessions.resolveAntigravitySwarmTarget?.(frame.peer.id)?.conversationId ?? undefined)
+        : undefined
+      const rawRecovery = (frame.content as { recovery?: { automatic?: unknown; mode?: unknown } } | undefined)?.recovery
+      const isLegacyAutoCheckpointWithoutSwarmFlag =
+        isAntigravityTurn &&
+        typeof (frame as { swarmMode?: unknown }).swarmMode !== 'boolean' &&
+        rawRecovery?.automatic === true &&
+        rawRecovery?.mode === 'checkpoint'
+      const effectiveSwarmMode =
+        swarmMode ||
+        (isLegacyAutoCheckpointWithoutSwarmFlag &&
+          hasLiveCoreAntigravitySwarmWorkers({
+            sessionKey,
+            isRemote: isRemoteAntigravity,
+            conversationId: boundSwarmConversationId,
+          }))
+      const swarmRequested = effectiveSwarmMode || Boolean(parseSwarmSlashCommand(rawUserText)?.matched)
       const isAntigravitySwarmActive = isAntigravityTurn && swarmRequested
       const teamMode = inboundCollabMode === 'team' && !isAntigravitySwarmActive
       const requestedAdvisorModel =
@@ -1805,11 +1826,8 @@ export async function dispatchInbound(
         effort: safeEffortLevel ?? undefined, workspaceCwd: session.workspaceCwd || agent.cwd || process.cwd(),
         parentAgentId: agent.id, allowedToolsets: agent.toolsets, ensureRuntime: () => this._ensureRemoteSwarmRuntime(),
       })
-      const boundSwarmConversationId = isAntigravityTurn && !isRemoteAntigravity
-        ? (session.ccbSessionId ?? session.runner?.nativeSessionId ?? this.sessions.resolveAntigravitySwarmTarget?.(frame.peer.id)?.conversationId ?? undefined)
-        : undefined
       const { result: swarmDirectiveResult, compactionCtx: antigravitySwarmCompactionCtx } = await prepareAntigravitySwarmInboundDirective({
-        finalText, rawUserText, sessionKey, isAntigravityTurn, isRemoteAntigravity, swarmMode, swarmRequested, boundSwarmConversationId,
+        finalText, rawUserText, sessionKey, isAntigravityTurn, isRemoteAntigravity, swarmMode: effectiveSwarmMode, swarmRequested, boundSwarmConversationId,
         routeAllowedModelsRaw: (frame as any)._antigravitySwarmAllowedModels,
         loadLocalCatalogModels: async () => (await getLocalCatalogView()).models,
       })
@@ -2237,11 +2255,10 @@ export async function dispatchInbound(
           // ts / frameSeq 由 deliver() 在 ring 落地时一并 stamp,这里不预填
           // (与 outbound.codex_billing / outbound.error 同 wire stamp 模式)。
           this.deliver(turnStatusFrame, adapter)
-        } else if (e.kind === 'codex_billing' && e.engine === 'cursor') {
-          // Cursor durable billing rides the tape (engine_billings) only. Master
-          // has no request_finalize_journal row for cursor turns, so the live
-          // codex_billing frame would just be dropped with a warning; the live
-          // low-latency path for cursor is the separate external_billing frame.
+        } else if (e.kind === 'codex_billing' && isNonJournalDurableBillingEngine(e.engine)) {
+          // Cursor & Antigravity durable billing ride the tape (engine_billings) only.
+          // Master has no request_finalize_journal row for them, so the live
+          // codex_billing frame would be dropped; low-latency live settlement uses external_billing.
         } else if (e.kind === 'codex_billing') {
           // M1a 复活(原 PR2 v1.0.66)— codex turn 终态侧信道。CodexAdapter 在内核
           // result 帧上经 'billing' 通道 emit,sessionManager 包装成 'codex_billing'
@@ -2272,7 +2289,12 @@ export async function dispatchInbound(
             ...(e.delegateAgentId ? { delegateAgentId: e.delegateAgentId } : {}),
             engineSessionId: e.engineSessionId,
             status: e.status,
-            ...(e.terminalCode ? { terminalCode: e.terminalCode } : {}),
+            ...(e.terminalCode
+              ? {
+                  terminalCode:
+                    e.terminalCode === 'USER_CANCELLED' ? 'USER_CANCELLED' : 'CODEX_ERROR',
+                }
+              : {}),
             durationMs: e.durationMs,
             ...(e.usage ? { usage: e.usage } : {}),
             // Issue A v1.0.108 — codex rateLimits 快照,master.userChatBridge 落库到

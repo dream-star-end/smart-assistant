@@ -33,6 +33,27 @@ export type TurnWaiveReason =
   | 'platform_authority_expired'
   | 'turn_limit'
 
+/** Non-journal engines whose durable billing frames ride `engine_billings[]`. */
+export type NonJournalDurableBillingEngine = 'cursor' | 'antigravity'
+
+export const NON_JOURNAL_DURABLE_BILLING_ENGINES: ReadonlySet<string> = new Set<NonJournalDurableBillingEngine>([
+  'cursor',
+  'antigravity',
+])
+
+export function isNonJournalDurableBillingEngine(
+  candidate: unknown,
+): candidate is NonJournalDurableBillingEngine {
+  return typeof candidate === 'string' && NON_JOURNAL_DURABLE_BILLING_ENGINES.has(candidate)
+}
+
+export function isAntigravityDurableBillingFrame(
+  frame: Pick<DurableCodexBilling, 'engine'>,
+): boolean {
+  const discriminator: unknown = frame.engine
+  return discriminator === 'antigravity'
+}
+
 /** Engine-reported Codex billing evidence stored inside the same immutable
  * tape as the paid reply. Master-owned journal context supplies pricing and
  * identity; this payload supplies the final usage and exact turn locators. */
@@ -40,9 +61,10 @@ export interface DurableCodexBilling {
   requestId: string
   /** Engine discriminator for non-journal engines. Absent = codex/grok
    * (master settles via request_finalize_journal). 'cursor' = subscription
-   * engine whose durable evidence is settled against cursor_external_usage_audit
-   * (no journal row exists). Survives master parse / DB canonicalization. */
-  engine?: 'cursor'
+   * engine whose durable evidence is settled against cursor_external_usage_audit;
+   * 'antigravity' = relay-metered engine settled against antigravity_turns +
+   * antigravity_relay_usage (no journal row exists). Survives master parse / DB canonicalization. */
+  engine?: NonJournalDurableBillingEngine
   turnKey?: string
   parentTurnKey?: string
   parentSessionId?: string
@@ -51,7 +73,7 @@ export interface DurableCodexBilling {
   status: 'success' | 'error'
   /** Stable, content-free terminal classification. Optional only for rolling
    * compatibility with runtime images predating product-friction telemetry. */
-  terminalCode?: 'USER_CANCELLED' | 'CODEX_ERROR'
+  terminalCode?: 'USER_CANCELLED' | 'CODEX_ERROR' | 'AUTH_UNAVAILABLE' | 'QUOTA_UNAVAILABLE'
   durationMs: number
   usage?: {
     input_tokens?: number
