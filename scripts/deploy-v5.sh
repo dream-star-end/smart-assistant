@@ -6894,8 +6894,11 @@ smoke() {
   #     trackScheduler 同批更新)
   #   remoteDriverDrift(OCV5-749:index.ts leaderBundle.add({name:"remoteDriverDrift",domain:"v5-owned"})
   #     + trackScheduler("remoteDriverDrift","v5-owned"),selfhost 条件启用;与 smoke allowlist 对齐)
+  #   antigravityTurnReconciler(2026-11-25 selfhost OCV5-887/OCV5-888 正向同步 PR #1417 引入:
+  #     兜底 Antigravity 持久结算与迟到补账,与 cursorAuditReconciler 同级,index.ts 门在
+  #     runtimeChannel=v5 且挂 LeaderBundle 单 leader。关停:COMMERCIAL_ANTIGRAVITY_RECONCILER_DISABLED=1)
   allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview tutorialModeration providerHealth sessionsGcSweep incidentSnapshot cursorAuthSync"
-  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler cursorUsageSweep grokUsageSweep desktopEnrollSweep cursorExternalApiOutbox logLevelSync remoteDriverDrift"
+  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler antigravityTurnReconciler cursorUsageSweep grokUsageSweep desktopEnrollSweep cursorExternalApiOutbox logLevelSync remoteDriverDrift"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do
