@@ -1610,6 +1610,32 @@ describe('Host .hmac-key single-source resolution & arch-steward-review.sh parit
     assert.equal(rDirectHost.status, 1, '--receipt inside host governor root MUST enforce host .hmac-key')
     assert.match(`${rDirectHost.stdout}\n${rDirectHost.stderr}`, /STEWARD-RECEIPT-DIGEST-MISMATCH/)
 
+    // Parent-directory symlink alias pointing into host governor root MUST ALSO resolve via realpath & enforce host .hmac-key!
+    const aliasDir = path.join(tmpdir(), `steward-gov-alias-${process.pid}-${Date.now()}`)
+    symlinkSync(hostReceiptDir, aliasDir)
+    t.after(() => rmSync(aliasDir, { force: true }))
+    const rAliasHost = spawnSync(
+      'npx',
+      [
+        '--no-install',
+        'tsx',
+        AUDIT_SCRIPT,
+        '--enforce-commit',
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--receipt-dir',
+        aliasDir,
+        '--unsafe-test-skip-owner',
+      ],
+      { cwd: ROOT, env: { ...cleanB2Env, OC_GOVERNOR_ROOT: tmp }, encoding: 'utf8' },
+    )
+    assert.equal(rAliasHost.status, 1, 'parent-directory symlink alias into host governor root MUST enforce host .hmac-key')
+    assert.match(`${rAliasHost.stdout}\n${rAliasHost.stderr}`, /STEWARD-RECEIPT-DIGEST-MISMATCH/)
+
     // With empty --receipt-dir override AND Steward-Receipt trailer pointing to host file:
     // MUST stop local lookup immediately (no fallback to host dir OR commit trailer!)
     const rEmptyDir = spawnSync(

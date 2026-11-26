@@ -1,16 +1,10 @@
 /**
  * Architecture Steward Receipt Signing, Verification, Discovery & Formatters (OCV5-905 / OCV5-903 B2 & B3).
- *
- * Production hardening:
- *   - Hard-rejects `dryRun === true`, non-production schema (`oc.v5.arch-steward-dry-run/1`),
- *     placeholder/mock/example/dry-run `jobId`, `sessionKey`, `provider`, `command`, or `[dry-run]` notes.
- *   - Enforces file trust boundaries on receipt files: regular file, non-symlink, non-group/world-writable,
- *     root-owned (`uid === 0`) by default, and NEVER accepts unsigned in-repo `.github/steward-receipts/` files.
- *   - Supports out-of-commit GitHub Commit Status `oc-v5/arch-steward` verification shared across
- *     hosted CI runners and host release trains.
+ * Rejects dry-run receipts, symlinks, writable/non-root host receipts, and unsigned in-repo files;
+ * supports out-of-commit GitHub Commit Status `oc-v5/arch-steward` and host `.hmac-key` verification.
  */
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
-import { lstatSync, readFileSync } from 'node:fs'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import path from 'node:path'
 
 import { type HmacKeyLoadResult, readValidatedHmacKeyFile } from './a0ApprovalReceipt.js'
@@ -676,6 +670,15 @@ export interface StewardHmacKeyState {
   source?: 'env' | 'file' | 'host-default'
 }
 
+function canonicalizePath(p: string): string {
+  try {
+    return realpathSync(p)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return path.resolve(p)
+    throw err
+  }
+}
+
 function targetsHostGovRoot(opts: {
   root?: string
   explicitReceiptPath?: string
@@ -685,18 +688,17 @@ function targetsHostGovRoot(opts: {
 }): boolean {
   if (usesDefaultHostStewardDir(opts)) return true
   const baseRoot = opts.root ?? process.cwd()
+  const realGovRoot = canonicalizePath(opts.govRoot)
   const paths: string[] = []
-  if (opts.explicitReceiptPath) paths.push(path.resolve(baseRoot, opts.explicitReceiptPath))
-  for (const d of opts.receiptDirs ?? []) paths.push(path.resolve(baseRoot, d))
-  if (opts.env.OC_STEWARD_RECEIPT_DIR?.trim()) paths.push(path.resolve(opts.env.OC_STEWARD_RECEIPT_DIR.trim()))
-  return paths.some((p) => isPathInsideDir(p, opts.govRoot))
+  if (opts.explicitReceiptPath) paths.push(canonicalizePath(path.resolve(baseRoot, opts.explicitReceiptPath)))
+  for (const d of opts.receiptDirs ?? []) paths.push(canonicalizePath(path.resolve(baseRoot, d)))
+  if (opts.env.OC_STEWARD_RECEIPT_DIR?.trim()) {
+    paths.push(canonicalizePath(path.resolve(opts.env.OC_STEWARD_RECEIPT_DIR.trim())))
+  }
+  return paths.some((p) => isPathInsideDir(p, realGovRoot))
 }
 
-/**
- * Single source of truth for Steward HMAC key resolution across CLI, wrapper, and train gates.
- * Rejects symlinks/loose modes/wrong owner fail-closed; on non-root EACCES for a valid 0600
- * host key returns `{ hmacKey: undefined, requireHmac: true }` (zero plain-sha256 downgrade).
- */
+/** Single source of truth for Steward HMAC key resolution across CLI, wrapper, and train gates. */
 export function resolveStewardHmacKeyState(opts: {
   hmacKeyEnv: string
   hmacKeyFile?: string
