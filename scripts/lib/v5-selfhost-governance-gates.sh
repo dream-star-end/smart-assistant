@@ -609,6 +609,20 @@ _master_referee_build_context_eval_view() { # <ref-root> <staging> <view-dir> <r
     fi
   fi
   master_referee_build_exec_view "$ref_root" "$view_dir" "$nm_eff" || return 1
+  # If parent checkout dir (e.g. /home/runner 0750 in CI Docker) still blocks nobody(65534),
+  # stage a minimal world-readable tsx runtime inside view_dir/node_modules so uid=65534 drop stays intact.
+  if [[ "$(id -u)" == 0 ]] && command -v setpriv >/dev/null 2>&1; then
+    if ! setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs test -r "$nm_eff/tsx/dist/cli.mjs" 2>/dev/null; then
+      rm -f "$view_dir/node_modules"
+      mkdir -p "$view_dir/node_modules"
+      for dep in tsx esbuild @esbuild get-tsconfig resolve-pkg-maps typescript; do
+        if [[ -e "$nm_eff/$dep" ]]; then
+          cp -rL "$nm_eff/$dep" "$view_dir/node_modules/$dep" 2>/dev/null || true
+        fi
+      done
+      chmod -R a+rX "$view_dir/node_modules" 2>/dev/null || true
+    fi
+  fi
   chmod 0755 "$view_dir" 2>/dev/null || true
   python3 - "$staging" "$view_dir" <<'PY'
 import os

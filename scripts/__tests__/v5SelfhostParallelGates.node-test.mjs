@@ -63,6 +63,7 @@ MASTER_GATE_IDLE_TIMEOUT_S=20
 OC_V5_TRAIN_SUMMARY_DIR=${q(join(f.dir, 'logs'))}
 LEASE_TRAIN_ID=tr-parallel-test
 mlog() { echo "$*" >&2; }
+master_referee_prepare_exec_root() { printf "%s\n" "$1"; }
 ${['master_gate_load1', 'master_gate_attempt_log', 'master_gate_first_failure', 'master_seed_frontend_buildinfo'].map(fn).join('\n')}
 tsum_init
 trap 'rc=$?; reap_master_build_jobs; tsum_finish "$rc"' EXIT

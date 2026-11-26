@@ -606,7 +606,7 @@ export function collectMetaGuardrailIntegrity(opts: CockpitCliOptions): MetaGuar
     const approvalsDir = path.join(opts.governorRoot, 'control/a0-approvals')
     if (existsSync(approvalsDir)) {
       let tampered = 0
-      for (const f of readdirSync(approvalsDir).filter((x) => x.endsWith('.json'))) {
+      for (const f of readdirSync(approvalsDir).filter((x) => x.endsWith('.json') && !x.endsWith('.gh.json'))) {
         const doc = safeReadJson<Record<string, unknown>>(path.join(approvalsDir, f))
         if (!doc || !verifyApprovalChecksum(doc)) tampered += 1
       }

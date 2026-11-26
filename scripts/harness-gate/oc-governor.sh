@@ -772,6 +772,7 @@ if hmac_path.exists() and not hmac_path.is_symlink() and (os.lstat(hmac_path).st
 active_a0, expired_a0, tampered_a0 = [], 0, 0
 if (ctrl / "a0-approvals").is_dir():
     for f in sorted((ctrl / "a0-approvals").glob("*.json")):
+        if f.name.endswith(".gh.json"): continue
         doc = load_json(f)
         if not isinstance(doc, dict): tampered_a0 += 1; continue
         sha = str(doc.get("sha") or "")

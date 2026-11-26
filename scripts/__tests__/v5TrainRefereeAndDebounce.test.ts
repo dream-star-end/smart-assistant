@@ -165,8 +165,10 @@ function writeRefereeManifest(
     }
   }
   walk(refDir)
+  const manifestPath = join(refDir, 'MANIFEST.json')
+  if (existsSync(manifestPath)) chmodSync(manifestPath, 0o644)
   writeFileSync(
-    join(refDir, 'MANIFEST.json'),
+    manifestPath,
     `${JSON.stringify(
       {
         schemaVersion: 1,
@@ -226,6 +228,7 @@ function stageAuditedTransitionReferee(opts: {
   approvalSha256: string
 }) {
   const transitionPath = join(opts.refDir, 'TRANSITION_APPROVAL.json')
+  if (existsSync(transitionPath)) chmodSync(transitionPath, 0o644)
   writeFileSync(
     transitionPath,
     `${JSON.stringify(
@@ -639,28 +642,34 @@ process.exit(0)
     exportArchive(f.repo, cleanSha, staging, f.env, false)
     poisonStagingNodeModules(staging)
 
-    const res = runBash(
-      [
-        'mlog() { echo "$*" >&2; }',
-        'tsum_note() { :; }',
-        `source ${q(GOV_LIB)}`,
-        `REPO_ROOT=${q(f.repo)}`,
-        `MASTER_LIVE_LINK=${q(noLive)}`,
-        `OC_V5_REFEREE_ROOT=${q(refDir)}`,
-        `MASTER_GATE_TMPDIR=${q(gateTmp)}`,
-        `OC_V5_GOVERNANCE_BASE_REF=${q(baseSha)}`,
-        `master_run_governance_fast_gates ${q(staging)} ${q(cleanSha)}`,
-      ].join('\n'),
-      {
-        ...f.env,
-        NODE_OPTIONS: '--require=/nonexistent/poison-preload.cjs',
-        NODE_PATH: '/nonexistent/poison-node-path',
-        TSX_TSCONFIG_PATH: '/nonexistent/poison-tsconfig.json',
-        GH_TOKEN: 'ghp_must_be_stripped_in_context_eval',
-        GITHUB_TOKEN: 'ghs_must_be_stripped_in_context_eval',
-        OC_SECRET_PROBE: 'host_secret_must_never_leak',
-      },
-    )
+    chmodSync(refDir, 0o555)
+    let res: ReturnType<typeof runBash>
+    try {
+      res = runBash(
+        [
+          'mlog() { echo "$*" >&2; }',
+          'tsum_note() { :; }',
+          `source ${q(GOV_LIB)}`,
+          `REPO_ROOT=${q(f.repo)}`,
+          `MASTER_LIVE_LINK=${q(noLive)}`,
+          `OC_V5_REFEREE_ROOT=${q(refDir)}`,
+          `MASTER_GATE_TMPDIR=${q(gateTmp)}`,
+          `OC_V5_GOVERNANCE_BASE_REF=${q(baseSha)}`,
+          `master_run_governance_fast_gates ${q(staging)} ${q(cleanSha)}`,
+        ].join('\n'),
+        {
+          ...f.env,
+          NODE_OPTIONS: '--require=/nonexistent/poison-preload.cjs',
+          NODE_PATH: '/nonexistent/poison-node-path',
+          TSX_TSCONFIG_PATH: '/nonexistent/poison-tsconfig.json',
+          GH_TOKEN: 'ghp_must_be_stripped_in_context_eval',
+          GITHUB_TOKEN: 'ghs_must_be_stripped_in_context_eval',
+          OC_SECRET_PROBE: 'host_secret_must_never_leak',
+        },
+      )
+    } finally {
+      chmodSync(refDir, 0o755)
+    }
     assert.equal(res.status, 0, res.stderr + res.stdout)
     assert.equal(existsSync(poisonMarker), false, 'MUST NEVER execute poisoned staging tsx, script, or protocol!')
 
