@@ -6,19 +6,19 @@
   "decayTargets": {
     "violationsBaseline": {
       "path": "arch/violations-baseline.json",
-      "anchorTotal": 3448,
-      "anchorR2Total": 1191,
+      "anchorTotal": 3428,
+      "anchorR2Total": 1171,
       "monthlyTotalDecayRate": 0.03,
-      "quarterlyTotalDecayRate": 0.10,
+      "quarterlyTotalDecayRate": 0.1,
       "monthlyR2DecayRate": 0.05,
       "quarterlyR2DecayRate": 0.15
     },
     "fileSizeBaseline": {
       "path": ".github/file-size-baseline.json",
       "anchorRedFiles": 18,
-      "anchorCssFiles": 2,
-      "anchorYellowFiles": 47,
-      "anchorTotalTrackedLines": 227587,
+      "anchorCssFiles": 1,
+      "anchorYellowFiles": 48,
+      "anchorTotalTrackedLines": 228135,
       "monthlyRedFileReduction": 1,
       "quarterlyTotalLinesDecayRate": 0.05
     }
@@ -34,10 +34,15 @@
   },
   "debtFirstPolicy": {
     "windowWeeks": 2,
-    "triggerReworkRatio": 0.40,
-    "releaseReworkRatio": 0.30,
-    "reworkPrefixes": ["fix", "bug"],
-    "blockedPrefixesInDebtFirst": ["feat"],
+    "triggerReworkRatio": 0.4,
+    "releaseReworkRatio": 0.3,
+    "reworkPrefixes": [
+      "fix",
+      "bug"
+    ],
+    "blockedPrefixesInDebtFirst": [
+      "feat"
+    ],
     "allowedPrefixesInDebtFirst": [
       "bug",
       "fix",

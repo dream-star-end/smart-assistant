@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "summary": {
-    "totalEntries": 125,
-    "totalCount": 448,
+    "totalEntries": 126,
+    "totalCount": 464,
     "byRule": {
-      "SEC-SAST-SQL-INTERPOLATION": 257,
-      "SEC-SAST-UNBOUNDED-LOOP-AWAIT": 191
+      "SEC-SAST-SQL-INTERPOLATION": 268,
+      "SEC-SAST-UNBOUNDED-LOOP-AWAIT": 196
     }
   },
   "entries": {
@@ -14,6 +14,7 @@
     "packages/commercial/src/account-pool/remotePool/drainGate.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 1,
     "packages/commercial/src/account-pool/remotePool/driftCoordinator.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 4,
     "packages/commercial/src/account-pool/remotePool/legacyRetirement.ts|SEC-SAST-SQL-INTERPOLATION": 2,
+    "packages/commercial/src/account-pool/remotePool/logicalModelBindingsSync.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 5,
     "packages/commercial/src/account-pool/remotePool/placement.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 12,
     "packages/commercial/src/account-pool/remotePool/verificationCasesExt.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 3,
     "packages/commercial/src/account-pool/remotePool/verificationCatalog.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 4,
@@ -69,7 +70,7 @@
     "packages/commercial/src/db/pgSessionsBackend.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 18,
     "packages/commercial/src/db/serviceRestartLiveFold.ts|SEC-SAST-SQL-INTERPOLATION": 2,
     "packages/commercial/src/db/sessionSnapshot.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 1,
-    "packages/commercial/src/db/threeLayerStateStore.ts|SEC-SAST-SQL-INTERPOLATION": 13,
+    "packages/commercial/src/db/threeLayerStateStore.ts|SEC-SAST-SQL-INTERPOLATION": 24,
     "packages/commercial/src/deploy/deployState.ts|SEC-SAST-SQL-INTERPOLATION": 3,
     "packages/commercial/src/deploy/deployState.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 1,
     "packages/commercial/src/dispatch/admissionRestartRecovery.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 1,

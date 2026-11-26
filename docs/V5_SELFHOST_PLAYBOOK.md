@@ -197,11 +197,12 @@ npm run check:debt-ttl
 npm run check:pg-migration-safety -- --base origin/feat/v5-selfhost
 scripts/arch-steward-review.sh --author-model <dev-model>
 
-# 园艺健康、Cron 存活、周度变异抽检与 4 信号高管驾驶舱
+# 园艺健康、Cron 存活、周度变异抽检、4 信号高管驾驶舱与本地 pre-push 钩子
 npm run check:cron-liveness
 npm run check:dead-code
 npm run check:mutation:weekly
 npm run check:cockpit-digest
+git config core.hooksPath .githooks
 
 # 发布门与 CI 双向守恒
 npx tsx scripts/check-release-gate-parity.ts

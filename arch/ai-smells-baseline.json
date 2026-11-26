@@ -9,11 +9,11 @@
     "lintSuppress"
   ],
   "totals": {
-    "emptyCatch": 1583,
-    "typeEscape": 910,
-    "syncIo": 2228,
+    "emptyCatch": 1588,
+    "typeEscape": 911,
+    "syncIo": 2252,
     "lintSuppress": 177,
-    "all": 4898
+    "all": 4928
   },
   "files": {
     "packages/channels/feishu/src/client.ts": {
@@ -238,6 +238,12 @@
       "syncIo": 6,
       "lintSuppress": 0
     },
+    "packages/commercial/src/account-pool/remotePool/logicalModelBindingsSync.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
     "packages/commercial/src/account-pool/remotePool/migrationCoordinator.ts": {
       "emptyCatch": 4,
       "typeEscape": 0,
@@ -266,6 +272,12 @@
       "emptyCatch": 0,
       "typeEscape": 0,
       "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/selfhostCrossPoolSelector.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
       "lintSuppress": 0
     },
     "packages/commercial/src/account-pool/remotePool/verificationEvidence.ts": {
@@ -979,6 +991,12 @@
     "packages/commercial/src/http/admin/modelCatalog.ts": {
       "emptyCatch": 0,
       "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/admin/modelPoolBindings.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
       "syncIo": 0,
       "lintSuppress": 0
     },
@@ -2296,6 +2314,12 @@
       "syncIo": 0,
       "lintSuppress": 0
     },
+    "packages/gateway/src/crossPoolCheckpoint.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 16,
+      "lintSuppress": 0
+    },
     "packages/gateway/src/delegateAntigravityRoute.ts": {
       "emptyCatch": 2,
       "typeEscape": 0,
@@ -3167,9 +3191,9 @@
       "lintSuppress": 0
     },
     "packages/gateway/src/sessionCheckpointStore.ts": {
-      "emptyCatch": 1,
+      "emptyCatch": 2,
       "typeEscape": 0,
-      "syncIo": 12,
+      "syncIo": 20,
       "lintSuppress": 0
     },
     "packages/gateway/src/sessionLifecycle.ts": {

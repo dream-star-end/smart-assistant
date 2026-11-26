@@ -42,11 +42,10 @@ import { cn } from "../lib/utils";
 import { ComposerPlusMenu } from "./ComposerPlusMenu";
 import { preloadSwarmViews, SwarmPlaybookPopoverLazy } from "./chat/lazyTimelineCards";
 import { RepoPill } from "./github/RepoPill";
-import {
-  IconButton,
-  iconButtonVariants,
-  useToast,
-} from "./ui";
+import { IconButton, iconButtonVariants, useToast } from "./ui";
+
+const composerActionsBarClass = (hasModelSlot: boolean) =>
+  cn("ml-auto flex items-center gap-1 sm:gap-1.5", hasModelSlot ? "min-w-0" : "shrink-0");
 
 // Captured by one upload, not keyed by the reusable "new" draft name. Promotion
 // moves this exact attachment's owner without redirecting future new drafts.
@@ -1372,7 +1371,7 @@ export function Composer({
                 />
               )}
             </span>
-            <div className={cn("ml-auto flex items-center gap-1 sm:gap-1.5", modelSlot ? "min-w-0" : "shrink-0")}>
+            <div className={composerActionsBarClass(Boolean(modelSlot))}>
               {modelSlot && (
                 <div
                   data-testid="composer-model-slot"

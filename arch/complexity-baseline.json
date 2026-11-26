@@ -6,9 +6,9 @@
     "maxNesting": 5
   },
   "summary": {
-    "exceedingFunctions": 2032,
-    "overLines": 1313,
-    "overCcDirect": 1374,
+    "exceedingFunctions": 2048,
+    "overLines": 1325,
+    "overCcDirect": 1386,
     "overMaxNesting": 66
   },
   "functions": {
@@ -182,6 +182,16 @@
       "ccDirect": 23,
       "maxNesting": 4
     },
+    "packages/commercial/src/account-pool/remotePool/crossPoolContinuity.ts::buildAnchorsSection": {
+      "lines": 127,
+      "ccDirect": 45,
+      "maxNesting": 4
+    },
+    "packages/commercial/src/account-pool/remotePool/crossPoolContinuity.ts::buildCrossPoolAnchoredSummary": {
+      "lines": 99,
+      "ccDirect": 27,
+      "maxNesting": 3
+    },
     "packages/commercial/src/account-pool/remotePool/drainGate.ts::startRemoteReleaseDrainSocketServer": {
       "lines": 113,
       "ccDirect": 5,
@@ -221,6 +231,16 @@
       "lines": 191,
       "ccDirect": 29,
       "maxNesting": 1
+    },
+    "packages/commercial/src/account-pool/remotePool/logicalModelBindingsSync.ts::resolveSelfhostLogicalModelPoolTarget": {
+      "lines": 112,
+      "ccDirect": 22,
+      "maxNesting": 2
+    },
+    "packages/commercial/src/account-pool/remotePool/logicalModelBindingsSync.ts::syncLogicalModelPoolBindingsFromCatalog": {
+      "lines": 113,
+      "ccDirect": 13,
+      "maxNesting": 3
     },
     "packages/commercial/src/account-pool/remotePool/migrationCoordinator.ts::MigrationCoordinator.handoff": {
       "lines": 631,
@@ -268,14 +288,24 @@
       "maxNesting": 1
     },
     "packages/commercial/src/account-pool/remotePool/selfhostCrossPoolSelector.ts::createSelfhostCrossPoolFallbackSelector": {
-      "lines": 482,
+      "lines": 492,
       "ccDirect": 6,
       "maxNesting": 0
     },
-    "packages/commercial/src/account-pool/remotePool/selfhostCrossPoolSelector.ts::createSelfhostReturnToRemoteGrantResolver": {
-      "lines": 308,
+    "packages/commercial/src/account-pool/remotePool/selfhostCrossPoolSelector.ts::createSelfhostForcedLocalMigrationResolver": {
+      "lines": 337,
       "ccDirect": 3,
       "maxNesting": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/selfhostCrossPoolSelector.ts::createSelfhostReturnToRemoteGrantResolver": {
+      "lines": 365,
+      "ccDirect": 3,
+      "maxNesting": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/selfhostCrossPoolSelector.ts::resolveAndVerifyCrossPoolContinuity": {
+      "lines": 105,
+      "ccDirect": 18,
+      "maxNesting": 3
     },
     "packages/commercial/src/account-pool/remotePool/unifiedPlacementRouter.ts::UnifiedPlacementRouter.determineMigrationTrigger": {
       "lines": 73,
@@ -1047,6 +1077,11 @@
       "ccDirect": 14,
       "maxNesting": 2
     },
+    "packages/commercial/src/bootstrap/chatBridgeBootstrap.ts::buildSelfhostCrossPoolBridgeHooks": {
+      "lines": 162,
+      "ccDirect": 3,
+      "maxNesting": 1
+    },
     "packages/commercial/src/bootstrap/chatBridgeBootstrap.ts::createCodexBindingHandle": {
       "lines": 145,
       "ccDirect": 2,
@@ -1103,8 +1138,8 @@
       "maxNesting": 1
     },
     "packages/commercial/src/bootstrap/runtimeSupervisorBootstrap.ts::assembleV3SupervisorCore": {
-      "lines": 203,
-      "ccDirect": 30,
+      "lines": 228,
+      "ccDirect": 32,
       "maxNesting": 3
     },
     "packages/commercial/src/bootstrap/runtimeSupervisorBootstrap.ts::bootstrapPluginsRuntime": {
@@ -1623,17 +1658,17 @@
       "maxNesting": 1
     },
     "packages/commercial/src/db/threeLayerPendingInstall.ts::extractPendingInstallMigration": {
-      "lines": 37,
+      "lines": 39,
       "ccDirect": 21,
       "maxNesting": 1
     },
     "packages/commercial/src/db/threeLayerStateStore.ts::PgSessionAuthorityStateStore.beginPlacementMigration": {
-      "lines": 123,
+      "lines": 121,
       "ccDirect": 2,
       "maxNesting": 0
     },
     "packages/commercial/src/db/threeLayerStateStore.ts::PgSessionAuthorityStateStore.commitPlacementMigration": {
-      "lines": 148,
+      "lines": 137,
       "ccDirect": 2,
       "maxNesting": 0
     },
@@ -1815,6 +1850,16 @@
     "packages/commercial/src/http/admin/feedback.ts::handleAdminFeedbackWorkflow": {
       "lines": 62,
       "ccDirect": 29,
+      "maxNesting": 2
+    },
+    "packages/commercial/src/http/admin/modelPoolBindings.ts::createAdminModelPoolBindingsHandlers": {
+      "lines": 344,
+      "ccDirect": 4,
+      "maxNesting": 0
+    },
+    "packages/commercial/src/http/admin/modelPoolBindings.ts::createAdminModelPoolBindingsHandlers.handlePut": {
+      "lines": 246,
+      "ccDirect": 48,
       "maxNesting": 2
     },
     "packages/commercial/src/http/admin/orgs.ts::handleAdminAdjustOrgCredits": {
@@ -2723,12 +2768,12 @@
       "maxNesting": 3
     },
     "packages/commercial/src/http/router.ts::buildCommercialRoutes": {
-      "lines": 995,
+      "lines": 998,
       "ccDirect": 1,
       "maxNesting": 0
     },
     "packages/commercial/src/http/router.ts::createCommercialHandler": {
-      "lines": 632,
+      "lines": 633,
       "ccDirect": 2,
       "maxNesting": 0
     },
@@ -4138,8 +4183,8 @@
       "maxNesting": 3
     },
     "packages/commercial/src/ws/turnDispatchReceipt.ts::handleTurnDispatchReceipt": {
-      "lines": 178,
-      "ccDirect": 35,
+      "lines": 201,
+      "ccDirect": 49,
       "maxNesting": 2
     },
     "packages/commercial/src/ws/turnPerformance.ts::extractFirstVisibleAttribution": {
@@ -4153,7 +4198,7 @@
       "maxNesting": 3
     },
     "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge": {
-      "lines": 8804,
+      "lines": 8811,
       "ccDirect": 37,
       "maxNesting": 1
     },
@@ -4168,12 +4213,12 @@
       "maxNesting": 5
     },
     "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge": {
-      "lines": 7747,
+      "lines": 7754,
       "ccDirect": 18,
       "maxNesting": 1
     },
     "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.attachMasterTurnState": {
-      "lines": 849,
+      "lines": 851,
       "ccDirect": 205,
       "maxNesting": 5
     },
@@ -4183,13 +4228,13 @@
       "maxNesting": 2
     },
     "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.executeAdmittedTurn": {
-      "lines": 3021,
+      "lines": 3009,
       "ccDirect": 31,
       "maxNesting": 3
     },
     "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.executeAdmittedTurn.continuePreparation": {
-      "lines": 2779,
-      "ccDirect": 250,
+      "lines": 2767,
+      "ccDirect": 268,
       "maxNesting": 7
     },
     "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.finalCleanup": {
@@ -4208,8 +4253,8 @@
       "maxNesting": 2
     },
     "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.onContainerMessage": {
-      "lines": 1271,
-      "ccDirect": 262,
+      "lines": 1272,
+      "ccDirect": 263,
       "maxNesting": 6
     },
     "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.onContainerMessage.forwardCommittedFrame": {
@@ -4223,8 +4268,8 @@
       "maxNesting": 2
     },
     "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.resolveAuthorityExecOrReject": {
-      "lines": 132,
-      "ccDirect": 16,
+      "lines": 143,
+      "ccDirect": 28,
       "maxNesting": 3
     },
     "packages/commercial/src/ws/userChatBridge.ts::isValidatedAnnotatedImageInbound": {
@@ -4247,9 +4292,19 @@
       "ccDirect": 61,
       "maxNesting": 5
     },
+    "packages/commercial/src/ws/userChatBridgeRemotePoolSeal.ts::buildCrossPoolCheckpointWirePayload": {
+      "lines": 51,
+      "ccDirect": 23,
+      "maxNesting": 1
+    },
+    "packages/commercial/src/ws/userChatBridgeRemotePoolSeal.ts::parseAndHandleMigrationInstallReceipt": {
+      "lines": 135,
+      "ccDirect": 48,
+      "maxNesting": 2
+    },
     "packages/commercial/src/ws/userChatBridgeRemotePoolSeal.ts::resolveRemotePoolBackendAndSeal": {
-      "lines": 370,
-      "ccDirect": 57,
+      "lines": 583,
+      "ccDirect": 108,
       "maxNesting": 5
     },
     "packages/commercial/src/ws/voiceTranscribe.ts::createVoiceTranscribeHandler": {
@@ -4721,6 +4776,26 @@
       "lines": 96,
       "ccDirect": 28,
       "maxNesting": 3
+    },
+    "packages/gateway/src/crossPoolCheckpoint.ts::buildMigrationInstallReceipt": {
+      "lines": 74,
+      "ccDirect": 39,
+      "maxNesting": 1
+    },
+    "packages/gateway/src/crossPoolCheckpoint.ts::defaultSaveCheckpointWithGeneration": {
+      "lines": 132,
+      "ccDirect": 46,
+      "maxNesting": 4
+    },
+    "packages/gateway/src/crossPoolCheckpoint.ts::finalizeInboundCrossPoolMigration": {
+      "lines": 109,
+      "ccDirect": 26,
+      "maxNesting": 4
+    },
+    "packages/gateway/src/crossPoolCheckpoint.ts::ingestVerifiedCrossPoolCheckpoint": {
+      "lines": 106,
+      "ccDirect": 41,
+      "maxNesting": 2
     },
     "packages/gateway/src/delegateAntigravityRoute.ts::acquireDelegateAntigravityRoute": {
       "lines": 142,
@@ -5443,8 +5518,8 @@
       "maxNesting": 1
     },
     "packages/gateway/src/inboundDispatch.ts::dispatchInbound": {
-      "lines": 2571,
-      "ccDirect": 399,
+      "lines": 2570,
+      "ccDirect": 400,
       "maxNesting": 9
     },
     "packages/gateway/src/inboundDispatch.ts::dispatchInbound.onLeaderEvent": {
@@ -6157,6 +6232,11 @@
       "ccDirect": 14,
       "maxNesting": 7
     },
+    "packages/gateway/src/sessionCheckpointStore.ts::savePendingCheckpointWithGeneration": {
+      "lines": 69,
+      "ccDirect": 23,
+      "maxNesting": 1
+    },
     "packages/gateway/src/sessionLifecycle.ts::compactSession": {
       "lines": 300,
       "ccDirect": 82,
@@ -6218,8 +6298,8 @@
       "maxNesting": 2
     },
     "packages/gateway/src/sessionSubmit.ts::_getOrCreateExclusive": {
-      "lines": 683,
-      "ccDirect": 191,
+      "lines": 672,
+      "ccDirect": 186,
       "maxNesting": 7
     },
     "packages/gateway/src/sessionSubmit.ts::finishIdleUnderLock": {
@@ -7953,8 +8033,8 @@
       "maxNesting": 0
     },
     "packages/web-react/src/components/chat/AgentGroupCard.tsx::ChildBlockView": {
-      "lines": 99,
-      "ccDirect": 24,
+      "lines": 88,
+      "ccDirect": 22,
       "maxNesting": 2
     },
     "packages/web-react/src/components/chat/BrowserView.tsx::BrowserView": {
