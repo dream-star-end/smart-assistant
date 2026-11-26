@@ -290,7 +290,7 @@ RUN printf '%s\n' 'deb http://deb.debian.org/debian bookworm-backports main' \
 # P1d / v5 ccb 单底座:OC_INCLUDE_CODEX=0 → 不装 codex CLI(镜像更小、冷启更快;v5 runner
 # seam 永不走 codex、模型面无 gpt-*,故 codex 二进制对 v5 是纯死重)。v3 默认 1,行为不变。
 ARG OC_INCLUDE_CODEX=1
-ARG OC_CODEX_VERSION=0.171.0
+ARG OC_CODEX_VERSION=0.172.0
 RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
       npm install -g "@openai/codex@${OC_CODEX_VERSION}" --no-audit --no-fund \
       && test "$(codex --version)" = "codex-cli ${OC_CODEX_VERSION}" \
@@ -303,7 +303,7 @@ RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
 # pinned and verified at build time; gateway additionally gates every spawn to
 # a credential-bound loopback Cursor relay.
 ARG OC_INCLUDE_OFFICIAL_CLAUDE=0
-ARG OC_OFFICIAL_CLAUDE_VERSION=2.1.325
+ARG OC_OFFICIAL_CLAUDE_VERSION=2.1.332
 RUN if [ "$OC_INCLUDE_OFFICIAL_CLAUDE" = "1" ]; then set -eux; \
       npm install -g "@anthropic-ai/claude-code@${OC_OFFICIAL_CLAUDE_VERSION}" --no-audit --no-fund; \
       test "$(claude --version | awk '{print $1}')" = "$OC_OFFICIAL_CLAUDE_VERSION"; \
@@ -317,8 +317,8 @@ RUN if [ "$OC_INCLUDE_OFFICIAL_CLAUDE" = "1" ]; then set -eux; \
 # account-scoped wrapper always resolves this exact, checksum-pinned build.
 # Opt-in keeps ordinary V3/runtime rebuilds unchanged. A Cursor-enabled V5
 # candidate must build with OC_INCLUDE_CURSOR=1 and retain the matching label.
-ARG OC_CURSOR_AGENT_VERSION=2026.10.16-e3cb207
-ARG OC_CURSOR_AGENT_SHA256=3aa3f48cd7a3909a98c9b3f2a4085f0c021088bf826690b22c61f424c843e552
+ARG OC_CURSOR_AGENT_VERSION=2026.11.22-e9042b2
+ARG OC_CURSOR_AGENT_SHA256=7663b1c5d1b56e095ef8e23bef38d66df6cfd665c4873470214e0e411f0f97b3
 ARG OC_INCLUDE_CURSOR=0
 COPY --chown=root:root ./scripts/patch-cursor-agent-sand.mjs /usr/local/lib/openclaude/patch-cursor-agent-sand.mjs
 RUN if [ "$OC_INCLUDE_CURSOR" = "1" ]; then set -eux; \
@@ -358,7 +358,7 @@ COPY --chown=root:root ./platform-runtime/etc-codex/managed_config.toml /etc/cod
 # native binary under $GROK_HOME; copy that verified binary to /usr/local/bin so
 # per-user persistent homes do not each receive a ~100 MB duplicate.
 ARG OC_INCLUDE_GROK=0
-ARG OC_GROK_VERSION=1.0.77
+ARG OC_GROK_VERSION=1.0.92
 RUN if [ "$OC_INCLUDE_GROK" = "1" ]; then set -eux; \
       npm install -g "@xai-official/grok@${OC_GROK_VERSION}" --no-audit --no-fund; \
       grok --version | grep -q "^grok ${OC_GROK_VERSION} "; \
@@ -876,9 +876,9 @@ RUN set -eux; \
 # 1.5.0 (docs/antigravity-large-history-resume.md). No Node dependency. Auto-update
 # is disabled at runtime by the adapter (AGY_CLI_DISABLE_AUTO_UPDATE=true).
 ARG OC_INCLUDE_ANTIGRAVITY=0
-ARG OC_ANTIGRAVITY_CLI_VERSION=1.5.15
-ARG OC_ANTIGRAVITY_CLI_BUILD=1.5.15-5944945928962048
-ARG OC_ANTIGRAVITY_CLI_SHA512=e659293510ca6192b2aed009d00fe2b800a81548bb0bc0e83c9c1aa9c84b572e08242e13f41a651a74e79d7b6459280b0608109f0c655c50a7d726d98610d63b
+ARG OC_ANTIGRAVITY_CLI_VERSION=1.5.18
+ARG OC_ANTIGRAVITY_CLI_BUILD=1.5.18-6386224290725888
+ARG OC_ANTIGRAVITY_CLI_SHA512=ef379ec869719112f696e8c7cfddf776618712e58fc38e53df80801d6528abb4677782c7c8778f9c09c9123fa44c2c32675d228c06f2a8f7a8f4214e75f5bb26
 RUN if [ "$OC_INCLUDE_ANTIGRAVITY" = "1" ]; then set -eux; \
       test "$(dpkg --print-architecture)" = amd64; \
       archive=/tmp/antigravity-cli-${OC_ANTIGRAVITY_CLI_VERSION}.tar.gz; \

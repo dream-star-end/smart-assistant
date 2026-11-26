@@ -86,9 +86,9 @@ CATALOG_ADMIN_ROLE="${PG_ROLE}_catalog_admin"
 # NOLOGIN deploy role. The catalog admin role is read-only on deploy_state.
 MODEL_AUTHORITY_DEPLOY_ROLE="${PG_ROLE}_model_deploy"
 REDIS_URL="redis://127.0.0.1:6379/3"
-# Runtime image pin (OCV5-880: OCV5-860 CLI + Chrome 158 + GNU Octave 7.3; rebuild via
-# OC_FLAVOR=selfhost packages/commercial/agent-sandbox/build-image.sh; previous tag kept for rollback).
-RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2325-codex01710-grok1077-zcode3153-agy1515-chrome-octave-slim"
+# Runtime image pin (OCV5-899: CC 2.1.332 + Codex 0.172.0 + Grok 1.0.92 + Cursor 2026.11.22 +
+# AGY 1.5.18 + ZCode 3.15.3 + Chrome 158 + GNU Octave 7.3; previous tag kept for rollback).
+RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2332-codex01720-grok1092-cur1122-zcode3153-agy1518-chrome-octave-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
 PERSONAL_PORT="18789"

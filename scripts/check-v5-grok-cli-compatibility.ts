@@ -35,9 +35,9 @@ const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 const DEPLOY = join(CANDIDATE, "scripts/deploy-v5.sh");
 /** The oldest Grok CLI xAI still serves. */
 const MINIMUM = "1.0.13";
-/** The Grok CLI the runtime image pins and deploy-v5.sh demands (OCV5-771: 1.0.62 -> 1.0.77). The PASS
+/** The Grok CLI the runtime image pins and deploy-v5.sh demands (OCV5-899: 1.0.77 -> 1.0.92). The PASS
  * lines below spell it out literally because incidents.json anchors them verbatim. */
-const PINNED = "1.0.77";
+const PINNED = "1.0.92";
 const IMAGE = "openclaude/openclaude-runtime:v5-proof-slim";
 const OLD_IMAGE = "openclaude/openclaude-runtime:v5-proof-previous";
 const IMAGE_ID = `sha256:${"8".repeat(64)}`;
@@ -190,8 +190,8 @@ ${call}
     timeout: seconds * 1000 + 1500, killSignal: "SIGKILL",
     env: { PATH: "/usr/bin:/bin", HOME: box.root, CAPSULE: box.root, STANDIN_GROK: grok, STANDIN_UNIT: unit,
       STANDIN_COMMIT: box.commit, ALLOW_ANY_BRANCH: "1",
-      STANDIN_CODEX_LABEL: codex?.label ?? "0.171.0",
-      STANDIN_CODEX_BIN: codex?.bin ?? "codex-cli 0.171.0",
+      STANDIN_CODEX_LABEL: codex?.label ?? "0.172.0",
+      STANDIN_CODEX_BIN: codex?.bin ?? "codex-cli 0.172.0",
       STANDIN_CODEX_RC: String(codex?.rc ?? 0) } });
   if (ran.status === 137 || ran.signal === "SIGKILL" || ran.error) fail("DEADLINE_EXCEEDED");
   return { status: ran.status, out: `${ran.stdout}`, err: `${ran.stderr}`, calls: box.calls() };
@@ -210,15 +210,15 @@ function proveOfflinePrepare(box: Capsule): string {
   if (old.calls.some((line) => line.startsWith("psql ")) || box.exists(`remote/cutovers/${NONCE}`)) {
     fail("OFFLINE_PREPARE_OLD_CLI_WENT_ON");
   }
-  const badCodexLabel = consumer(box, current, "active", call, { label: "0.170.0" });
-  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected 0.171.0")) {
+  const badCodexLabel = consumer(box, current, "active", call, { label: "0.171.0" });
+  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected 0.172.0")) {
     fail(`OFFLINE_PREPARE_ACCEPTED_OLD_CODEX_LABEL_${badCodexLabel.status}: ${badCodexLabel.err.slice(-300)}`);
   }
-  const badCodexBin = consumer(box, current, "active", call, { label: "0.171.0", bin: "codex-cli 0.170.0" });
-  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected codex-cli 0.171.0")) {
+  const badCodexBin = consumer(box, current, "active", call, { label: "0.172.0", bin: "codex-cli 0.171.0" });
+  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected codex-cli 0.172.0")) {
     fail(`OFFLINE_PREPARE_ACCEPTED_OLD_CODEX_BIN_${badCodexBin.status}: ${badCodexBin.err.slice(-300)}`);
   }
-  const missingCodex = consumer(box, current, "active", call, { label: "0.171.0", rc: 127 });
+  const missingCodex = consumer(box, current, "active", call, { label: "0.172.0", rc: 127 });
   if (missingCodex.status === 0 || !missingCodex.err.includes("codex --version failed")) {
     fail(`OFFLINE_PREPARE_ACCEPTED_MISSING_CODEX_${missingCodex.status}: ${missingCodex.err.slice(-300)}`);
   }
@@ -229,7 +229,7 @@ function proveOfflinePrepare(box: Capsule): string {
     || manifest.target_commit !== box.commit) fail("OFFLINE_PREPARE_MANIFEST");
   if (!ok.calls.includes(`docker run --rm --entrypoint codex ${IMAGE_ID} --version`)) fail("OFFLINE_PREPARE_CODEX_NOT_RUN");
   if (!ok.calls.includes(`docker run --rm --entrypoint grok-native ${IMAGE_ID} --version`)) fail("OFFLINE_PREPARE_CLI_NOT_RUN");
-  return "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.77";
+  return "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.92";
 }
 
 // The online slim image switch.
@@ -241,23 +241,23 @@ assert_target_runtime_image_ready`;
   if (old.status === 0 || !old.err.includes(`expected='grok ${PINNED}`)) {
     fail(`ONLINE_IMAGE_ACCEPTED_OLD_CLI_${old.status}: ${old.err.slice(-300)}`);
   }
-  const badCodexLabel = consumer(box, current, "active", call, { label: "0.170.0" });
-  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected=0.171.0")) {
+  const badCodexLabel = consumer(box, current, "active", call, { label: "0.171.0" });
+  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected=0.172.0")) {
     fail(`ONLINE_IMAGE_ACCEPTED_OLD_CODEX_LABEL_${badCodexLabel.status}: ${badCodexLabel.err.slice(-300)}`);
   }
-  const badCodexBin = consumer(box, current, "active", call, { label: "0.171.0", bin: "codex-cli 0.170.0" });
-  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected='codex-cli 0.171.0'")) {
+  const badCodexBin = consumer(box, current, "active", call, { label: "0.172.0", bin: "codex-cli 0.171.0" });
+  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected='codex-cli 0.172.0'")) {
     fail(`ONLINE_IMAGE_ACCEPTED_OLD_CODEX_BIN_${badCodexBin.status}: ${badCodexBin.err.slice(-300)}`);
   }
-  const missingCodex = consumer(box, current, "active", call, { label: "0.171.0", rc: 127 });
+  const missingCodex = consumer(box, current, "active", call, { label: "0.172.0", rc: 127 });
   if (missingCodex.status === 0 || !missingCodex.err.includes("codex --version failed")) {
     fail(`ONLINE_IMAGE_ACCEPTED_MISSING_CODEX_${missingCodex.status}: ${missingCodex.err.slice(-300)}`);
   }
   const ok = consumer(box, current, "active", call);
-  if (ok.status !== 0 || !ok.out.includes(`grok=${current}`) || !ok.out.includes("codex=codex-cli 0.171.0")) {
+  if (ok.status !== 0 || !ok.out.includes(`grok=${current}`) || !ok.out.includes("codex=codex-cli 0.172.0")) {
     fail(`ONLINE_IMAGE_REFUSED_${ok.status}: ${ok.err.slice(-400)}`);
   }
-  return "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.77";
+  return "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.92";
 }
 
 // The staged activation: the stopped unit may be started only on a checked image.
@@ -274,25 +274,25 @@ function proveStagedActivation(box: Capsule): string {
     fail(`STAGED_ACTIVATION_ACCEPTED_OLD_CLI_${old.status}: ${old.err.slice(-300)}`);
   }
   if (old.calls.some((line) => line.startsWith("systemctl start"))) fail("STAGED_ACTIVATION_OLD_CLI_STARTED");
-  const badCodexLabel = staged(current, { label: "0.170.0" });
-  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected=0.171.0")) {
+  const badCodexLabel = staged(current, { label: "0.171.0" });
+  if (badCodexLabel.status === 0 || !badCodexLabel.err.includes("expected=0.172.0")) {
     fail(`STAGED_ACTIVATION_ACCEPTED_OLD_CODEX_LABEL_${badCodexLabel.status}: ${badCodexLabel.err.slice(-300)}`);
   }
-  const badCodexBin = staged(current, { label: "0.171.0", bin: "codex-cli 0.170.0" });
-  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected='codex-cli 0.171.0'")) {
+  const badCodexBin = staged(current, { label: "0.172.0", bin: "codex-cli 0.171.0" });
+  if (badCodexBin.status === 0 || !badCodexBin.err.includes("expected='codex-cli 0.172.0'")) {
     fail(`STAGED_ACTIVATION_ACCEPTED_OLD_CODEX_BIN_${badCodexBin.status}: ${badCodexBin.err.slice(-300)}`);
   }
-  const missingCodex = staged(current, { label: "0.171.0", rc: 127 });
+  const missingCodex = staged(current, { label: "0.172.0", rc: 127 });
   if (missingCodex.status === 0 || !missingCodex.err.includes("codex --version failed")) {
     fail(`STAGED_ACTIVATION_ACCEPTED_MISSING_CODEX_${missingCodex.status}: ${missingCodex.err.slice(-300)}`);
   }
   const ok = staged(current);
-  if (!ok.out.includes(`✓ runtime image source=${box.commit},codex=codex-cli 0.171.0,grok=${current}`)) {
+  if (!ok.out.includes(`✓ runtime image source=${box.commit},codex=codex-cli 0.172.0,grok=${current}`)) {
     fail(`STAGED_ACTIVATION_REFUSED_${ok.status}: ${ok.err.slice(-400)}`);
   }
   // the manifest's image was installed into the env file before the check, by the product's own step
   if (!box.read("remote/commercial-v5.env").includes(`OC_RUNTIME_IMAGE=${IMAGE}\n`)) fail("STAGED_ACTIVATION_ENV");
-  return "[grok-426-staged-activation] PASS — the staged unit is checked against Grok CLI 1.0.77 before it may start";
+  return "[grok-426-staged-activation] PASS — the staged unit is checked against Grok CLI 1.0.92 before it may start";
 }
 
 /** xAI's CLI chat proxy as the incident recorded it: older clients get 426. */
