@@ -601,77 +601,154 @@ selfhost_docker_container_running() { # <container_id_or_name>
 #   - ac.host_id IS NULL AND (ac.host_uuid IS NULL OR compute_hosts.name = 'self')
 #   - strict COALESCE(..., FALSE) IS TRUE so NULL runtime_kind never vanishes.
 selfhost_query_tiered_idle_pg() {
-  local has_rab="false" has_rab_v4="false" has_rab_proto="false" has_ac="false" has_ch="false"
-  local rem_bind_strict_sql="0" rem_bind_v4_cand_sql="0" rem_bind_v4_refs_sql="''"
-  local survivable_expr="FALSE" refs_sql="''" host_cond="ac.host_uuid IS NULL"
-  local j_v4_surv_expr="FALSE" rem_j_v4_refs_sql="''"
-  has_rab="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
-SELECT (to_regclass('public.remote_agent_bindings') IS NOT NULL)::text;" 2>/dev/null || printf 'err')"
-  [[ "$has_rab" == "true" || "$has_rab" == "false" ]] || return 1
-  has_ac="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
-SELECT (to_regclass('public.agent_containers') IS NOT NULL)::text;" 2>/dev/null || printf 'err')"
-  [[ "$has_ac" == "true" || "$has_ac" == "false" ]] || return 1
-  has_ch="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
-SELECT (to_regclass('public.compute_hosts') IS NOT NULL)::text;" 2>/dev/null || printf 'err')"
-  [[ "$has_ch" == "true" || "$has_ch" == "false" ]] || return 1
-  if [[ "$has_rab" == "true" ]]; then
-    has_rab_v4="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
-SELECT (
-  EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'driver_id')
-  AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'container_db_id')
-  AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'uid')
-  AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'docker_id')
-  AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'operation_id')
-  AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'generation')
-)::text;" 2>/dev/null || printf 'err')"
-    [[ "$has_rab_v4" == "true" || "$has_rab_v4" == "false" ]] || return 1
-    has_rab_proto="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
-SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'remote_protocol_version')::text;" 2>/dev/null || printf 'err')"
-    [[ "$has_rab_proto" == "true" || "$has_rab_proto" == "false" ]] || return 1
-  fi
+  local meta_row has_rab="false" has_ac="false" has_ch="false" has_rab_v4="false" has_rab_proto="false" has_rfj_4state="false"
+  local host_cond="ac.host_uuid IS NULL" local_ac_cte="" open_rab_cte="" rfj_open_cond="" rfj_v4_cond="FALSE"
+  meta_row="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
+BEGIN READ ONLY;
+SET LOCAL statement_timeout = '5s';
+SET LOCAL jit = off;
+SELECT
+  (to_regclass('public.remote_agent_bindings') IS NOT NULL)::text,
+  (to_regclass('public.agent_containers') IS NOT NULL)::text,
+  (to_regclass('public.compute_hosts') IS NOT NULL)::text,
+  (
+    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'driver_id')
+    AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'container_db_id')
+    AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'uid')
+    AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'docker_id')
+    AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'operation_id')
+    AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'generation')
+  )::text,
+  EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'remote_protocol_version')::text,
+  EXISTS (
+    SELECT 1 FROM pg_constraint c
+     WHERE c.conrelid = to_regclass('public.request_finalize_journal')
+       AND c.contype = 'c'
+       AND c.convalidated IS TRUE
+       AND pg_get_constraintdef(c.oid) = 'CHECK ((state = ANY (ARRAY[''inflight''::text, ''finalizing''::text, ''committed''::text, ''aborted''::text])))'
+  )::text;
+COMMIT;" 2>/dev/null || printf 'err')"
+  IFS='|' read -r has_rab has_ac has_ch has_rab_v4 has_rab_proto has_rfj_4state <<<"$meta_row"
+  for _b in "$has_rab" "$has_ac" "$has_ch" "$has_rab_v4" "$has_rab_proto" "$has_rfj_4state"; do
+    [[ "$_b" == "true" || "$_b" == "false" ]] || return 1
+  done
+
   if [[ "$has_ch" == "true" ]]; then
     host_cond="(ac.host_uuid IS NULL OR EXISTS (SELECT 1 FROM public.compute_hosts ch WHERE ch.id = ac.host_uuid AND ch.name = 'self'))"
   fi
   if [[ "$has_ac" == "true" ]]; then
-    local local_ac_cond="ac.state = 'active' AND ac.runtime_channel = 'v5' AND ac.runtime_kind = 'docker' AND ac.host_id IS NULL AND ${host_cond} AND ac.bound_ip IS NOT NULL AND host(ac.bound_ip) <> '' AND ac.port IS NOT NULL AND ac.port > 0 AND COALESCE(NULLIF(ac.container_internal_id, ''), NULLIF(ac.docker_id, '')) IS NOT NULL"
-    survivable_expr="COALESCE(d.runtime_kind = 'docker' AND d.agent_container_id IS NOT NULL AND EXISTS (SELECT 1 FROM public.agent_containers ac WHERE ac.id = d.agent_container_id AND ac.user_id = d.user_id AND ${local_ac_cond}), FALSE)"
-    refs_sql="COALESCE((SELECT string_agg(COALESCE(NULLIF(ac.container_internal_id, ''), NULLIF(ac.docker_id, '')), ',') FROM turn_dispatches d JOIN public.agent_containers ac ON ac.id = d.agent_container_id WHERE d.status = 'accepted' AND (${survivable_expr}) IS TRUE), '')"
-    if [[ "$has_rab" == "true" && "$has_rab_v4" == "true" ]]; then
-      local proto_cond="FALSE"
-      [[ "$has_rab_proto" == "true" ]] && proto_cond="b.remote_protocol_version = 4"
-      local b_v4_surv_expr="COALESCE(b.driver_id IS NOT NULL AND ${proto_cond} AND b.container_db_id IS NOT NULL AND EXISTS (SELECT 1 FROM public.agent_containers ac WHERE ac.id = b.container_db_id AND ac.user_id = b.uid AND ${local_ac_cond} AND b.docker_id = COALESCE(NULLIF(ac.docker_id, ''), NULLIF(ac.container_internal_id, ''))), FALSE)"
-      rem_bind_v4_cand_sql="(SELECT count(*) FROM public.remote_agent_bindings b WHERE b.state <> 'released' AND (${b_v4_surv_expr}) IS TRUE)"
-      rem_bind_strict_sql="(SELECT count(*) FROM public.remote_agent_bindings b WHERE b.state <> 'released' AND NOT ((${b_v4_surv_expr}) IS TRUE))"
-      rem_bind_v4_refs_sql="COALESCE((SELECT string_agg(COALESCE(NULLIF(ac.container_internal_id, ''), NULLIF(ac.docker_id, '')), ',') FROM public.remote_agent_bindings b JOIN public.agent_containers ac ON ac.id = b.container_db_id AND ac.user_id = b.uid WHERE b.state <> 'released' AND (${b_v4_surv_expr}) IS TRUE), '')"
-      j_v4_surv_expr="COALESCE(j.ctx->>'remoteNativeBillingRecovery' = 'remote-native-v4' AND j.state = 'inflight' AND NULLIF(j.ctx#>>'{remoteDriverV4,scope,operationId}', '') IS NOT NULL AND NULLIF(j.ctx#>>'{remoteDriverV4,scope,generation}', '') IS NOT NULL AND EXISTS (SELECT 1 FROM public.remote_agent_bindings b WHERE b.state <> 'released' AND b.operation_id::text = j.ctx#>>'{remoteDriverV4,scope,operationId}' AND b.generation::text = j.ctx#>>'{remoteDriverV4,scope,generation}' AND (${b_v4_surv_expr}) IS TRUE) AND EXISTS (SELECT 1 FROM turn_dispatches d WHERE d.dispatch_id = j.dispatch_id AND d.status = 'accepted' AND (${survivable_expr}) IS TRUE), FALSE)"
-      rem_j_v4_refs_sql="COALESCE((SELECT string_agg(COALESCE(NULLIF(ac.container_internal_id, ''), NULLIF(ac.docker_id, '')), ',') FROM request_finalize_journal j JOIN turn_dispatches d ON d.dispatch_id = j.dispatch_id JOIN public.agent_containers ac ON ac.id = d.agent_container_id WHERE (${j_v4_surv_expr}) IS TRUE), '')"
-    elif [[ "$has_rab" == "true" ]]; then
-      rem_bind_strict_sql="(SELECT count(*) FROM public.remote_agent_bindings WHERE state <> 'released')"
-    fi
-  elif [[ "$has_rab" == "true" ]]; then
-    rem_bind_strict_sql="(SELECT count(*) FROM public.remote_agent_bindings WHERE state <> 'released')"
+    local_ac_cte="
+  SELECT ac.id, ac.user_id,
+         COALESCE(NULLIF(ac.container_internal_id, ''), NULLIF(ac.docker_id, '')) AS ref,
+         COALESCE(NULLIF(ac.docker_id, ''), NULLIF(ac.container_internal_id, '')) AS match_docker_id
+    FROM public.agent_containers ac
+   WHERE ac.state = 'active'
+     AND ac.runtime_channel = 'v5'
+     AND ac.runtime_kind = 'docker'
+     AND ac.host_id IS NULL
+     AND ${host_cond}
+     AND ac.bound_ip IS NOT NULL
+     AND host(ac.bound_ip) <> ''
+     AND ac.port IS NOT NULL
+     AND ac.port > 0
+     AND COALESCE(NULLIF(ac.container_internal_id, ''), NULLIF(ac.docker_id, '')) IS NOT NULL"
+  else
+    local_ac_cte="SELECT NULL::bigint AS id, NULL::bigint AS user_id, NULL::text AS ref, NULL::text AS match_docker_id WHERE FALSE"
   fi
+
+  if [[ "$has_rab" == "true" && "$has_ac" == "true" && "$has_rab_v4" == "true" ]]; then
+    local proto_cond="FALSE"
+    [[ "$has_rab_proto" == "true" ]] && proto_cond="b.remote_protocol_version = 4"
+    open_rab_cte="
+  SELECT b.operation_id::text AS operation_id_text,
+         b.generation::text AS generation_text,
+         COALESCE(b.driver_id IS NOT NULL AND ${proto_cond} AND b.container_db_id IS NOT NULL AND lac.id IS NOT NULL AND b.docker_id = lac.match_docker_id, FALSE) AS is_v4_surv,
+         lac.ref AS container_ref
+    FROM public.remote_agent_bindings b
+    LEFT JOIN local_ac lac ON lac.id = b.container_db_id AND lac.user_id = b.uid
+   WHERE b.state <> 'released'"
+    rfj_v4_cond="COALESCE(
+      j.state = 'inflight'
+      AND j.ctx->>'remoteNativeBillingRecovery' = 'remote-native-v4'
+      AND NULLIF(j.ctx#>>'{remoteDriverV4,scope,operationId}', '') IS NOT NULL
+      AND NULLIF(j.ctx#>>'{remoteDriverV4,scope,generation}', '') IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM open_rab b
+         WHERE b.is_v4_surv IS TRUE
+           AND b.operation_id_text = j.ctx#>>'{remoteDriverV4,scope,operationId}'
+           AND b.generation_text = j.ctx#>>'{remoteDriverV4,scope,generation}'
+      )
+      AND EXISTS (
+        SELECT 1 FROM open_dispatches d
+         WHERE d.dispatch_id = j.dispatch_id
+           AND d.is_survivable IS TRUE
+      ),
+      FALSE
+    )"
+  elif [[ "$has_rab" == "true" ]]; then
+    open_rab_cte="
+  SELECT NULL::text AS operation_id_text,
+         NULL::text AS generation_text,
+         FALSE AS is_v4_surv,
+         NULL::text AS container_ref
+    FROM public.remote_agent_bindings b
+   WHERE b.state <> 'released'"
+  else
+    open_rab_cte="SELECT NULL::text AS operation_id_text, NULL::text AS generation_text, FALSE AS is_v4_surv, NULL::text AS container_ref WHERE FALSE"
+  fi
+
+  # When the validated 4-state CHECK constraint guarantees state IN (inflight,finalizing,committed,aborted),
+  # predicate j.state IN ('inflight','finalizing') hits partial index idx_rfj_stuck directly (~1ms vs 3x Seq Scan + JIT).
+  # If a future migration adds a 5th state (changing the CHECK constraint) or a test DB lacks it, fail closed to NOT IN.
+  if [[ "$has_rfj_4state" == "true" ]]; then
+    rfj_open_cond="j.state IN ('inflight', 'finalizing')"
+  else
+    rfj_open_cond="j.state NOT IN ('aborted', 'committed')"
+  fi
+
   psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
 BEGIN READ ONLY;
 SET LOCAL statement_timeout = '5s';
+SET LOCAL jit = off;
+WITH local_ac AS MATERIALIZED (
+  ${local_ac_cte}
+),
+open_dispatches AS MATERIALIZED (
+  SELECT d.dispatch_id, d.user_id, d.status,
+         COALESCE(d.status = 'accepted' AND d.runtime_kind = 'docker' AND d.agent_container_id IS NOT NULL AND lac.id IS NOT NULL, FALSE) AS is_survivable,
+         lac.ref AS container_ref
+    FROM turn_dispatches d
+    LEFT JOIN local_ac lac ON lac.id = d.agent_container_id AND lac.user_id = d.user_id
+   WHERE d.status IN ('admitted', 'rejecting', 'accepted')
+),
+open_rab AS MATERIALIZED (
+  ${open_rab_cte}
+),
+open_rfj AS MATERIALIZED (
+  SELECT j.request_id, j.state, j.dispatch_id,
+         (j.ctx ? 'remoteNativeBillingRecovery') AS has_rem_recovery,
+         (${rfj_v4_cond}) AS is_v4_surv
+    FROM request_finalize_journal j
+   WHERE ${rfj_open_cond}
+)
 SELECT
-  (SELECT count(*) FROM turn_dispatches WHERE status IN ('admitted','rejecting')),
-  (SELECT count(*) FROM turn_dispatches WHERE status = 'accepted'),
-  (SELECT count(*) FROM turn_dispatches d WHERE d.status = 'accepted' AND (${survivable_expr}) IS TRUE),
-  ${rem_bind_strict_sql},
-  (SELECT count(*) FROM request_finalize_journal j
-    WHERE NOT ((${j_v4_surv_expr}) IS TRUE)
-      AND ((j.ctx ? 'remoteNativeBillingRecovery' AND j.state IN ('inflight','finalizing'))
+  (SELECT count(*) FROM open_dispatches WHERE status IN ('admitted','rejecting')),
+  (SELECT count(*) FROM open_dispatches WHERE status = 'accepted'),
+  (SELECT count(*) FROM open_dispatches WHERE is_survivable IS TRUE),
+  (SELECT count(*) FROM open_rab WHERE is_v4_surv IS NOT TRUE),
+  (SELECT count(*) FROM open_rfj j
+    WHERE j.is_v4_surv IS NOT TRUE
+      AND ((j.has_rem_recovery AND j.state IN ('inflight','finalizing'))
         OR j.state = 'finalizing'
-        OR (j.state NOT IN ('aborted','committed') AND NOT EXISTS (
-             SELECT 1 FROM turn_dispatches d
-              WHERE d.dispatch_id = j.dispatch_id
-                AND ((d.status = 'terminal' AND d.terminal_at IS NOT NULL)
-                  OR (d.status = 'accepted' AND (${survivable_expr}) IS TRUE)))))),
-  ${refs_sql},
-  ${rem_bind_v4_cand_sql},
-  (SELECT count(*) FROM request_finalize_journal j WHERE (${j_v4_surv_expr}) IS TRUE),
-  concat_ws(',', NULLIF(${rem_bind_v4_refs_sql}, ''), NULLIF(${rem_j_v4_refs_sql}, ''));
+        OR (j.state NOT IN ('aborted','committed')
+            AND NOT EXISTS (SELECT 1 FROM open_dispatches d WHERE d.dispatch_id = j.dispatch_id AND d.is_survivable IS TRUE)
+            AND NOT EXISTS (SELECT 1 FROM turn_dispatches d WHERE d.dispatch_id = j.dispatch_id AND d.status = 'terminal' AND d.terminal_at IS NOT NULL)))),
+  COALESCE((SELECT string_agg(container_ref, ',') FROM open_dispatches WHERE is_survivable IS TRUE), ''),
+  (SELECT count(*) FROM open_rab WHERE is_v4_surv IS TRUE),
+  (SELECT count(*) FROM open_rfj WHERE is_v4_surv IS TRUE),
+  concat_ws(',',
+    NULLIF(COALESCE((SELECT string_agg(container_ref, ',') FROM open_rab WHERE is_v4_surv IS TRUE), ''), ''),
+    NULLIF(COALESCE((SELECT string_agg(d.container_ref, ',') FROM open_rfj j JOIN open_dispatches d ON d.dispatch_id = j.dispatch_id WHERE j.is_v4_surv IS TRUE AND d.is_survivable IS TRUE), ''), ''));
 COMMIT;"
 }
 
@@ -1046,11 +1123,12 @@ selfhost_wait_old_slot_drained() { # <old_slot> [new_slot] [timeout_s]
 }
 
 # B11: Verified rollback — ONLY stop candidate @NEW after proving frontdoor==OLD,
-# deploy_state==OLD/stable, OLD leader&VIP, OLD fencing==false, and 18790/healthz green.
+# deploy_state==OLD/stable, pre-reopen hook (e.g. first-migration external relay teardown),
+# verified remote-v4 reopen, OLD fencing==false, OLD leader&VIP, and 18790/healthz green.
 # If ANY check fails, keep BOTH slots running, persist recovery lock, return 79.
-selfhost_dual_slot_verified_rollback() { # <old_slot> <new_slot> <old_rel>
-  local old_slot="$1" new_slot="$2" old_rel="$3"
-  local new_unit cur_lv fd_ok=0 ds_ok=0 lv_ok=0 hz_ok=0 unfence_ok=0
+selfhost_dual_slot_verified_rollback() { # <old_slot> <new_slot> <old_rel> [remote_relay_indep]
+  local old_slot="$1" new_slot="$2" old_rel="$3" remote_relay_indep="${4:-0}"
+  local new_unit cur_lv fd_ok=0 ds_ok=0 hook_ok=1 reopen_ok=0 lv_ok=0 hz_ok=0 unfence_ok=0
   new_unit="$(selfhost_master_slot_unit "$new_slot")"
   selfhost_ds_log "  master-dual-slot: 启动已校验回滚 (${new_slot} -> ${old_slot})"
 
@@ -1061,20 +1139,38 @@ selfhost_dual_slot_verified_rollback() { # <old_slot> <new_slot> <old_rel>
   fi
   selfhost_priv_control_call "$new_slot" POST /internal/v5/deploy/refresh-desired >/dev/null 2>&1 || true
   selfhost_priv_control_call "$old_slot" POST /internal/v5/deploy/refresh-desired >/dev/null 2>&1 || true
-  if selfhost_slot_unfence_and_verify "$old_slot"; then unfence_ok=1; fi
-  if declare -F remote_v4_cutover_reopen >/dev/null 2>&1; then
-    OC_REMOTE_V4_DRAIN_SOCKET="$(selfhost_master_slot_drain_sock "$old_slot")" remote_v4_cutover_reopen || true
+
+  # Only tear down external relay / reopen / unfence @OLD once frontdoor & deploy_state are
+  # confirmed reverted to @OLD (otherwise @NEW may still serve traffic).
+  if (( fd_ok == 1 && ds_ok == 1 )); then
+    if [[ -n "${SELFHOST_PRE_REOPEN_OLD_HOOK:-}" ]] && declare -F "$SELFHOST_PRE_REOPEN_OLD_HOOK" >/dev/null 2>&1; then
+      if ! "$SELFHOST_PRE_REOPEN_OLD_HOOK" "$old_slot"; then
+        hook_ok=0
+      fi
+    fi
+    if (( hook_ok == 1 )); then
+      if (( remote_relay_indep == 0 )) && declare -F remote_v4_cutover_reopen >/dev/null 2>&1; then
+        if OC_REMOTE_V4_DRAIN_SOCKET="$(selfhost_master_slot_drain_sock "$old_slot")" remote_v4_cutover_reopen; then
+          reopen_ok=1
+        fi
+      else
+        reopen_ok=1
+      fi
+      if (( reopen_ok == 1 )); then
+        if selfhost_slot_unfence_and_verify "$old_slot"; then unfence_ok=1; fi
+      fi
+    fi
   fi
   if selfhost_wait_slot_leader_vip "$old_slot" 15000; then lv_ok=1; fi
   if selfhost_healthz_18790_ok; then hz_ok=1; fi
 
-  if (( fd_ok == 1 && ds_ok == 1 && unfence_ok == 1 && lv_ok == 1 && hz_ok == 1 )); then
-    selfhost_ds_log "  ✓ 已核实旧槽 ${old_slot} 恢复接管 (frontdoor+deploy_state+unfence+leader/VIP+18790 全绿), 安全停候选槽 ${new_unit}"
+  if (( fd_ok == 1 && ds_ok == 1 && hook_ok == 1 && reopen_ok == 1 && unfence_ok == 1 && lv_ok == 1 && hz_ok == 1 )); then
+    selfhost_ds_log "  ✓ 已核实旧槽 ${old_slot} 恢复接管 (frontdoor+deploy_state+reopen+unfence+leader/VIP+18790 全绿), 安全停候选槽 ${new_unit}"
     systemctl stop "$new_unit" 2>/dev/null || true
     return 1
   fi
   selfhost_mark_dual_slot_recovery_required "rollback_verification_failed" \
-    "fd=${fd_ok} ds=${ds_ok} unfence=${unfence_ok} leader_vip=${lv_ok} healthz=${hz_ok} old=${old_slot} new=${new_slot}"
+    "fd=${fd_ok} ds=${ds_ok} hook=${hook_ok} reopen=${reopen_ok} unfence=${unfence_ok} leader_vip=${lv_ok} healthz=${hz_ok} old=${old_slot} new=${new_slot}"
   return 79
 }
 
@@ -1103,12 +1199,21 @@ selfhost_master_dual_slot_flip() { # <rel>
     return 1
   fi
 
-  # B11: Safe abort before switch — MUST verify old slot fencing==false before stopping @NEW!
+  # B11: Safe abort before switch — tear down any pre-reopen hook (e.g. first-migration external relay),
+  # verify old slot remote-v4 reopened, and verify old slot fencing==false BEFORE stopping @NEW!
   local remote_relay_indep=0
   _abort_before_switch() {
     local reason="${1:-pre_switch_abort}"
+    if [[ -n "${SELFHOST_PRE_REOPEN_OLD_HOOK:-}" ]] && declare -F "$SELFHOST_PRE_REOPEN_OLD_HOOK" >/dev/null 2>&1; then
+      if ! "$SELFHOST_PRE_REOPEN_OLD_HOOK" "$old_slot"; then
+        return 79
+      fi
+    fi
     if (( remote_relay_indep == 0 )) && declare -F remote_v4_cutover_reopen >/dev/null 2>&1; then
-      OC_REMOTE_V4_DRAIN_SOCKET="$(selfhost_master_slot_drain_sock "$old_slot")" remote_v4_cutover_reopen || true
+      if ! OC_REMOTE_V4_DRAIN_SOCKET="$(selfhost_master_slot_drain_sock "$old_slot")" remote_v4_cutover_reopen; then
+        selfhost_mark_dual_slot_recovery_required "remote_v4_reopen_failed" "reason=${reason} old=${old_slot} new=${new_slot}"
+        return 79
+      fi
     fi
     if ! selfhost_slot_unfence_and_verify "$old_slot"; then
       selfhost_mark_dual_slot_recovery_required "unfence_verify_failed" "reason=${reason} old=${old_slot} new=${new_slot}"
@@ -1164,7 +1269,7 @@ selfhost_master_dual_slot_flip() { # <rel>
         _abort_before_switch "ds_cas_unapplied"
         return $?
       elif [[ "$rb_slot" == "$new_slot" || "$rb_op" == "$op_id" ]]; then
-        selfhost_dual_slot_verified_rollback "$old_slot" "$new_slot" "$old_rel"
+        selfhost_dual_slot_verified_rollback "$old_slot" "$new_slot" "$old_rel" "$remote_relay_indep"
         return $?
       fi
     fi
@@ -1176,7 +1281,7 @@ selfhost_master_dual_slot_flip() { # <rel>
     if [[ "$SELFHOST_LAST_FRONTDOOR_SLOT" == "$new_slot" ]]; then
       selfhost_ds_log "  · frontdoor 读回已为 ${new_slot},继续核对"
     else
-      selfhost_dual_slot_verified_rollback "$old_slot" "$new_slot" "$old_rel"
+      selfhost_dual_slot_verified_rollback "$old_slot" "$new_slot" "$old_rel" "$remote_relay_indep"
       return $?
     fi
   fi
@@ -1185,7 +1290,7 @@ selfhost_master_dual_slot_flip() { # <rel>
   selfhost_priv_control_call "$new_slot" POST /internal/v5/deploy/refresh-desired >/dev/null 2>&1 || true
 
   if ! selfhost_wait_slot_leader_vip "$new_slot" 30000; then
-    selfhost_dual_slot_verified_rollback "$old_slot" "$new_slot" "$old_rel"
+    selfhost_dual_slot_verified_rollback "$old_slot" "$new_slot" "$old_rel" "$remote_relay_indep"
     return $?
   fi
 

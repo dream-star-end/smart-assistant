@@ -356,27 +356,56 @@ remote_relay_wait_slot_ready() { # <A|B> [timeout_s]
   done
 }
 
-# B2: Rollback to older release without remote-relay@.service template.
-# NEVER swallows systemctl stop failures (marks recovery_required and returns 79).
+# Stop a remote-relay unit and prove it reached inactive|failed; otherwise persist
+# recovery_required lock and return 79 (never swallow candidate/rollback stop errors).
+remote_relay_stop_unit_verified() { # <unit> [reason_code]
+  local unit="$1" reason_code="${2:-remote_relay_stop_failed}" post_st=""
+  if ! systemctl stop "$unit"; then
+    remote_relay_log "  ✗ 停用 ${unit} 失败 (${reason_code})"
+    remote_relay_mark_recovery "$reason_code" "unit=${unit}"
+    return 79
+  fi
+  post_st="$(systemctl is-active "$unit" 2>/dev/null || true)"
+  if [[ "$post_st" != "inactive" && "$post_st" != "failed" ]]; then
+    remote_relay_log "  ✗ 停用 ${unit} 后状态未证实停止 (state=${post_st:-<empty>})"
+    remote_relay_mark_recovery "${reason_code}_unverified" "unit=${unit} state=${post_st:-empty}"
+    return 79
+  fi
+  return 0
+}
+
+# B2: Rollback to older release without remote-relay@.service template (or first-migrate abort).
+# Fail closed (recovery_required + rc=79) if ANY slot cannot be proven inactive|failed,
+# fails to disable while enabled, or if active.sock / state.json still exists after cleanup.
 remote_relay_stop_all_for_legacy_rollback() {
-  local s unit st
-  remote_relay_log "  remote-relay: live release 无独立中继模板 → 停止 A/B 槽并清理 active symlink 与 state 文件"
+  local reason="${1:-live release 无独立中继模板}" s unit st en
+  remote_relay_log "  remote-relay: ${reason} → 停止 A/B 槽并清理 active symlink 与 state 文件"
   for s in A B; do
     unit="$(remote_relay_slot_unit "$s")"
     st="$(systemctl is-active "$unit" 2>/dev/null || true)"
-    if [[ "$st" == "active" || "$st" == "activating" || "$st" == "deactivating" ]]; then
+    if [[ "$st" != "inactive" && "$st" != "failed" ]]; then
       if [[ "$st" == "active" ]]; then
         remote_relay_drain_begin "$s" >/dev/null 2>&1 || true
       fi
-      if ! systemctl stop "$unit"; then
-        remote_relay_log "  ✗ 回滚停用 remote-relay 槽 ${s} (${unit}) 失败"
-        remote_relay_mark_recovery "remote_relay_rollback_stop_failed" "unit=${unit}"
+      remote_relay_stop_unit_verified "$unit" "remote_relay_rollback_stop_failed" || return 79
+    fi
+    en="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    if [[ "$en" == "enabled" ]]; then
+      if ! systemctl disable "$unit" >/dev/null 2>&1; then
+        remote_relay_log "  ✗ 回滚取消自启 remote-relay 槽 ${s} (${unit}) 失败"
+        remote_relay_mark_recovery "remote_relay_rollback_disable_failed" "unit=${unit}"
         return 79
       fi
+    else
+      systemctl disable "$unit" >/dev/null 2>&1 || true
     fi
-    systemctl disable "$unit" >/dev/null 2>&1 || true
   done
-  rm -f -- "$V5_REMOTE_RELAY_ACTIVE_SOCK" "$V5_REMOTE_RELAY_STATE_FILE"
+  rm -f -- "$V5_REMOTE_RELAY_ACTIVE_SOCK" "$V5_REMOTE_RELAY_STATE_FILE" 2>/dev/null || true
+  if [[ -e "$V5_REMOTE_RELAY_ACTIVE_SOCK" || -L "$V5_REMOTE_RELAY_ACTIVE_SOCK" || -e "$V5_REMOTE_RELAY_STATE_FILE" || -L "$V5_REMOTE_RELAY_STATE_FILE" ]]; then
+    remote_relay_log "  ✗ 清理 remote-relay active symlink 或 state 文件失败，保留恢复锁"
+    remote_relay_mark_recovery "remote_relay_rollback_cleanup_failed" "sock=${V5_REMOTE_RELAY_ACTIVE_SOCK} state=${V5_REMOTE_RELAY_STATE_FILE}"
+    return 79
+  fi
   return 0
 }
 
@@ -459,7 +488,7 @@ remote_relay_slot_flip() {
   remote_relay_log "  remote-relay: 启动新槽 ${target} (${new_svc})${cur:+, 当前槽 ${cur}}"
   if ! systemctl start "$new_svc"; then
     [[ -r "$V5_REMOTE_RELAY_LOG" ]] && tail -n 40 "$V5_REMOTE_RELAY_LOG" >&2 || true
-    systemctl stop "$new_svc" 2>/dev/null || true
+    remote_relay_stop_unit_verified "$new_svc" "remote_relay_candidate_stop_failed" || return 79
     return 1
   fi
 
@@ -467,7 +496,7 @@ remote_relay_slot_flip() {
   new_inst="$(remote_relay_wait_slot_ready "$target")" || wait_rc=$?
   # B6: Handle intentionally-disabled (rc=76) distinctly from broken/error (rc=1)
   if (( wait_rc == 76 )); then
-    systemctl stop "$new_svc" 2>/dev/null || true
+    remote_relay_stop_unit_verified "$new_svc" "remote_relay_candidate_stop_failed" || return 79
     if [[ -z "$cur" && ! -e "$V5_REMOTE_RELAY_STATE_FILE" ]]; then
       remote_relay_log "  · remote-relay 功能未启用（disabled），跳过中继切槽"
       return 0
@@ -479,10 +508,7 @@ remote_relay_slot_flip() {
         return 1
       fi
       old_svc="$(remote_relay_slot_unit "$cur")"
-      if ! systemctl stop "$old_svc"; then
-        remote_relay_mark_recovery "remote_relay_disable_stop_old_failed" "unit=${old_svc}"
-        return 79
-      fi
+      remote_relay_stop_unit_verified "$old_svc" "remote_relay_disable_stop_old_failed" || return 79
       systemctl disable "$old_svc" >/dev/null 2>&1 || true
     fi
     rm -f -- "$V5_REMOTE_RELAY_ACTIVE_SOCK" "$V5_REMOTE_RELAY_STATE_FILE"
@@ -491,7 +517,7 @@ remote_relay_slot_flip() {
   fi
   if (( wait_rc != 0 )); then
     [[ -r "$V5_REMOTE_RELAY_LOG" ]] && tail -n 40 "$V5_REMOTE_RELAY_LOG" >&2 || true
-    systemctl stop "$new_svc" 2>/dev/null || true
+    remote_relay_stop_unit_verified "$new_svc" "remote_relay_candidate_stop_failed" || return 79
     return 1
   fi
 
@@ -500,14 +526,14 @@ remote_relay_slot_flip() {
   local new_enabled=""
   if ! systemctl enable "$new_svc" >/dev/null 2>&1; then
     remote_relay_log "  ✗ systemctl enable ${new_svc} 失败，中止切槽（旧槽 ${cur:-none} 保持不变）"
-    systemctl stop "$new_svc" 2>/dev/null || true
+    remote_relay_stop_unit_verified "$new_svc" "remote_relay_candidate_stop_failed" || return 79
     return 1
   fi
   new_enabled="$(systemctl is-enabled "$new_svc" 2>/dev/null || true)"
   if [[ "$new_enabled" != "enabled" ]]; then
     remote_relay_log "  ✗ systemctl is-enabled ${new_svc} 返回 '${new_enabled:-<empty>}'（期望 enabled），中止切槽"
     systemctl disable "$new_svc" >/dev/null 2>&1 || true
-    systemctl stop "$new_svc" 2>/dev/null || true
+    remote_relay_stop_unit_verified "$new_svc" "remote_relay_candidate_stop_failed" || return 79
     return 1
   fi
 
@@ -519,7 +545,7 @@ remote_relay_slot_flip() {
 
   if ! remote_relay_atomic_switch_symlink "$target"; then
     systemctl disable "$new_svc" >/dev/null 2>&1 || true
-    systemctl stop "$new_svc" 2>/dev/null || true
+    remote_relay_stop_unit_verified "$new_svc" "remote_relay_candidate_stop_failed" || return 79
     return 1
   fi
   if ! active_inst="$(remote_relay_probe_health "$V5_REMOTE_RELAY_ACTIVE_SOCK" "$target" 2>/dev/null)" || [[ "$active_inst" != "$new_inst" ]]; then
@@ -527,7 +553,7 @@ remote_relay_slot_flip() {
     remote_relay_restore_symlink "$cur" "$prev_link"
     remote_relay_restore_state_atomic "$prev_state_existed" "$prev_state_content" || true
     systemctl disable "$new_svc" >/dev/null 2>&1 || true
-    systemctl stop "$new_svc" 2>/dev/null || true
+    remote_relay_stop_unit_verified "$new_svc" "remote_relay_candidate_stop_failed" || return 79
     return 1
   fi
   # B10: Persist authoritative migrated/activeSlot state atomically (fsync file + dir) after verified probe.
@@ -536,7 +562,7 @@ remote_relay_slot_flip() {
     remote_relay_restore_symlink "$cur" "$prev_link"
     remote_relay_restore_state_atomic "$prev_state_existed" "$prev_state_content" || true
     systemctl disable "$new_svc" >/dev/null 2>&1 || true
-    systemctl stop "$new_svc" 2>/dev/null || true
+    remote_relay_stop_unit_verified "$new_svc" "remote_relay_candidate_stop_failed" || return 79
     return 1
   fi
 
@@ -556,16 +582,39 @@ remote_relay_slot_flip() {
   return 0
 }
 
-remote_relay_old_master_reports_external() {
-  declare -F selfhost_master_dual_slot_active >/dev/null 2>&1 || return 1
-  selfhost_master_dual_slot_active || return 1
+# 3-state probe of live dual-slot Master's remote-relay ownership:
+#   external   -> HTTP 200 valid JSON with ok==true and remoteRelayExternal==true
+#   in-process -> HTTP 404 (pre-readiness legacy) OR HTTP 200 valid JSON with ok==true
+#                 and remoteRelayExternal explicitly false or null/absent
+#   unknown    -> timeout/unreachable/non-200/invalid JSON/ok!=true/non-dual-slot
+remote_relay_probe_old_master_mode() {
+  declare -F selfhost_master_dual_slot_active >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  selfhost_master_dual_slot_active || { printf 'unknown'; return 0; }
   local slot raw code body
-  slot="$(selfhost_master_current_slot)" || return 1
+  slot="$(selfhost_master_current_slot)" || { printf 'unknown'; return 0; }
   raw="$(selfhost_priv_control_call "$slot" GET /internal/v5/cutover-readiness 2>/dev/null || printf '000\n')"
   code="${raw%%$'\n'*}"
   if [[ "$raw" == *$'\n'* ]]; then body="${raw#*$'\n'}"; else body=""; fi
-  [[ "$code" == "200" && -n "$body" ]] \
-    && printf '%s\n' "$body" | jq -e '.ok == true and .remoteRelayExternal == true' >/dev/null 2>&1
+  if [[ "$code" == "404" ]]; then
+    printf 'in-process'
+    return 0
+  fi
+  if [[ "$code" == "200" && -n "$body" ]]; then
+    if printf '%s\n' "$body" | jq -e '.ok == true and .remoteRelayExternal == true' >/dev/null 2>&1; then
+      printf 'external'
+      return 0
+    fi
+    if printf '%s\n' "$body" | jq -e '.ok == true and (.remoteRelayExternal == false or .remoteRelayExternal == null)' >/dev/null 2>&1; then
+      printf 'in-process'
+      return 0
+    fi
+  fi
+  printf 'unknown'
+  return 0
+}
+
+remote_relay_old_master_reports_external() {
+  [[ "$(remote_relay_probe_old_master_mode)" == "external" ]]
 }
 
 # B2: Unified egress -> remote-relay -> Master orchestration covering:
@@ -616,9 +665,27 @@ selfhost_flip_egress_relay_and_master() {
     return 0
   fi
 
-  # Case 2: First-time migration from in-process Master to external remote-relay
-  if ! remote_relay_any_slot_active && ! remote_relay_old_master_reports_external; then
-    local is_dual=0 old_slot="" drain_sock="" fenced=0 fence_rc=0 flip_rc=0 m_rc=0
+  # Case 2: First-time migration from in-process Master to external remote-relay.
+  # In dual-slot mode, distinguish external / in-process / unknown via 3-state probe:
+  #   - in-process -> enter Case 2 (even if an orphaned relay survived a prior aborted deploy)
+  #   - external   -> proceed to Case 3 (steady-state blue-green)
+  #   - unknown    -> fail closed (return 1 without touching active relay or old Master)
+  local need_first_migrate=0 old_mode=""
+  if declare -F selfhost_master_dual_slot_active >/dev/null 2>&1 && selfhost_master_dual_slot_active; then
+    old_mode="$(remote_relay_probe_old_master_mode)"
+    case "$old_mode" in
+      in-process) need_first_migrate=1 ;;
+      external) need_first_migrate=0 ;;
+      *)
+        remote_relay_log "  ✗ 无法判定现役 Master 的 remote-relay 模式 (mode=${old_mode})，fail-closed 中止切流（不触碰现役中继与旧 Master）"
+        return 1
+        ;;
+    esac
+  elif ! remote_relay_any_slot_active; then
+    need_first_migrate=1
+  fi
+  if (( need_first_migrate == 1 )); then
+    local is_dual=0 old_slot="" drain_sock="" fenced=0 drained_old=0 fence_rc=0 flip_rc=0 m_rc=0
     if declare -F selfhost_master_dual_slot_active >/dev/null 2>&1 && selfhost_master_dual_slot_active; then
       is_dual=1
       old_slot="$(selfhost_master_current_slot)"
@@ -629,8 +696,11 @@ selfhost_flip_egress_relay_and_master() {
 
     _first_migrate_abort() {
       local reopen_sock="$drain_sock"
-      if declare -F remote_v4_cutover_reopen >/dev/null 2>&1; then
-        OC_REMOTE_V4_DRAIN_SOCKET="$reopen_sock" remote_v4_cutover_reopen || true
+      if (( drained_old == 1 )) && declare -F remote_v4_cutover_reopen >/dev/null 2>&1; then
+        if ! OC_REMOTE_V4_DRAIN_SOCKET="$reopen_sock" remote_v4_cutover_reopen; then
+          remote_relay_mark_recovery "first_migrate_reopen_failed" "old=${old_slot} sock=${reopen_sock}"
+          return 79
+        fi
       fi
       if (( is_dual == 1 && fenced == 1 )); then
         if ! selfhost_slot_unfence_and_verify "$old_slot"; then
@@ -639,6 +709,47 @@ selfhost_flip_egress_relay_and_master() {
         fi
       fi
       return 1
+    }
+
+    _RR_FM_TORN_DOWN=0
+    _RR_FM_IS_DUAL="$is_dual"
+    _RR_FM_OLD_SLOT="$old_slot"
+    _remote_relay_first_migrate_teardown_external() {
+      if (( _RR_FM_TORN_DOWN == 1 )); then
+        return 0
+      fi
+      if (( _RR_FM_IS_DUAL == 1 )); then
+        local post_mode
+        post_mode="$(remote_relay_probe_old_master_mode)"
+        if [[ "$post_mode" != "in-process" ]]; then
+          remote_relay_log "  ✗ [首次迁移中止] 现役 Master 模式非明确 in-process (mode=${post_mode})，禁止停用外部中继"
+          remote_relay_mark_recovery "first_migrate_abort_master_mode_${post_mode}" "old=${_RR_FM_OLD_SLOT}"
+          return 79
+        fi
+      fi
+      local s st
+      for s in A B; do
+        st="$(systemctl is-active "$(remote_relay_slot_unit "$s")" 2>/dev/null || true)"
+        case "$st" in
+          inactive|failed) ;;
+          active)
+            remote_relay_log "  remote-relay: [首次迁移中止] 排空并回收未接管的外部中继槽 ${s}"
+            if ! remote_relay_drain_blocking "$(remote_relay_slot_sock "$s")" 1; then
+              remote_relay_log "  ✗ [首次迁移中止] 外部中继槽 ${s} 阻塞排空失败，禁止在外部中继有活跃任务时重开旧 Master"
+              remote_relay_mark_recovery "first_migrate_abort_relay_drain_failed" "slot=${s}"
+              return 79
+            fi
+            ;;
+          *)
+            remote_relay_log "  ✗ [首次迁移中止] 外部中继槽 ${s} 状态未知或未稳态 (state=${st:-<empty>})，禁止重开旧 Master"
+            remote_relay_mark_recovery "first_migrate_abort_relay_state_unknown" "slot=${s} state=${st:-empty}"
+            return 79
+            ;;
+        esac
+      done
+      remote_relay_stop_all_for_legacy_rollback "首次迁移中止" || return $?
+      _RR_FM_TORN_DOWN=1
+      return 0
     }
 
     remote_relay_log "  remote-relay: [首次迁移] 启动独立中继前，先对旧进程内 Master 开启 fence 并排空 remote-v4"
@@ -655,6 +766,7 @@ selfhost_flip_egress_relay_and_master() {
       fi
     fi
     if declare -F remote_v4_cutover_drain >/dev/null 2>&1; then
+      drained_old=1
       if ! OC_REMOTE_V4_DRAIN_SOCKET="$drain_sock" remote_v4_cutover_drain; then
         _first_migrate_abort
         return $?
@@ -669,10 +781,22 @@ selfhost_flip_egress_relay_and_master() {
       return "$flip_rc"
     fi
 
+    local prev_pre_reopen_hook="${SELFHOST_PRE_REOPEN_OLD_HOOK:-}"
+    SELFHOST_PRE_REOPEN_OLD_HOOK="_remote_relay_first_migrate_teardown_external"
     selfhost_master_restart_or_flip || m_rc=$?
+    SELFHOST_PRE_REOPEN_OLD_HOOK="$prev_pre_reopen_hook"
     if (( m_rc != 0 )); then
-      if (( is_dual == 0 && m_rc != 79 )) && declare -F remote_v4_cutover_reopen >/dev/null 2>&1; then
-        OC_REMOTE_V4_DRAIN_SOCKET="$drain_sock" remote_v4_cutover_reopen || true
+      if (( m_rc == 79 )); then
+        return 79
+      fi
+      # If inner selfhost_master_dual_slot_flip already invoked _remote_relay_first_migrate_teardown_external
+      # (e.g. [2/5..3/5] abort or [4/5] verified rollback), it ALREADY drained+stopped the external relay
+      # BEFORE verified reopen + unfence of old_slot. Only when Master failed BEFORE that hook (e.g. [1/5]
+      # standby warm-up failure or non-dual-slot restart failure) do we tear down & reopen+unfence here.
+      if (( _RR_FM_TORN_DOWN == 0 )); then
+        _remote_relay_first_migrate_teardown_external || return $?
+        local ab_rc=0; _first_migrate_abort || ab_rc=$?
+        if (( ab_rc == 79 )); then return 79; fi
       fi
       return "$m_rc"
     fi

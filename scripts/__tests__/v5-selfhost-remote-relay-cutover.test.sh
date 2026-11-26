@@ -473,6 +473,353 @@ else
   fail "B2: first migration failed"
 fi
 
+# B2a-abort: First migration Master failure (e.g. standby boot fail at [1/5] or idle gate fail)
+# MUST drain (releaseIdleLanes=true) + stop newly-started relay, remove active.sock/state.json,
+# reopen old Master remote-v4-drain, AND unfence old Master!
+ln -sfn "$TMP/rel-rr" "$MASTER_LIVE_LINK"
+printf 'inactive\n' >"$RR_STATE_DIR/A"; printf 'inactive\n' >"$RR_STATE_DIR/B"
+rm -f -- "$V5_REMOTE_RELAY_ACTIVE_SOCK" "$V5_REMOTE_RELAY_STATE_FILE"
+: >"$TMP/rr.trace"
+selfhost_master_restart_or_flip() { printf 'MASTER_FLIP_FAIL\n' >>"$TMP/rr.trace"; return 1; }
+rc=0; selfhost_flip_egress_relay_and_master || rc=$?
+selfhost_master_restart_or_flip() { printf 'MASTER_FLIP\n' >>"$TMP/rr.trace"; return 0; }
+assert_eq "B2a-abort: first migration Master failure returns 1" "1" "$rc"
+l_dr_ab="$(grep -n '^DRAIN_BLOCK:A:{"releaseIdleLanes":true,"keepClosedForRestart":true}$' "$TMP/rr.trace" | head -n1 | cut -d: -f1)"
+l_st_ab="$(grep -n '^SYS:stop openclaude-v5-selfhost-remote-relay@A\.service$' "$TMP/rr.trace" | head -n1 | cut -d: -f1)"
+l_re_ab="$(grep -n '^OLD_MASTER_REOPEN$' "$TMP/rr.trace" | head -n1 | cut -d: -f1)"
+l_uf_ab="$(grep -n '^PRIV:A:POST:/internal/v5/cutover-fence$' "$TMP/rr.trace" | tail -n1 | cut -d: -f1)"
+fc_ab="$(grep -c '^PRIV:A:POST:/internal/v5/cutover-fence$' "$TMP/rr.trace" || echo 0)"
+(( fc_ab >= 2 && l_dr_ab > 0 && l_dr_ab < l_st_ab && l_st_ab < l_re_ab && l_re_ab < l_uf_ab )) \
+  && [[ ! -e "$V5_REMOTE_RELAY_ACTIVE_SOCK" && ! -e "$V5_REMOTE_RELAY_STATE_FILE" ]] \
+  && pass "B2a-abort: drains+stops orphan relay BEFORE reopening & unfencing legacy Master" \
+  || fail "B2a-abort: cleanup ordering or artifact removal failed (fc=$fc_ab dr=$l_dr_ab st=$l_st_ab re=$l_re_ab uf=$l_uf_ab)"
+
+# B2a-orphan: Even if a stale relay@B was left running while live Master still reports remoteRelayExternal=false,
+# MUST still enter Case 2 (fence+drain old Master BEFORE flipping relay)!
+ln -sfn "$TMP/rel-rr" "$MASTER_LIVE_LINK"
+printf 'inactive\n' >"$RR_STATE_DIR/A"; printf 'active\n' >"$RR_STATE_DIR/B"
+remote_relay_atomic_switch_symlink B
+remote_relay_write_state_atomic B "rr-B-inst"
+: >"$TMP/rr.trace"
+if selfhost_flip_egress_relay_and_master; then
+  l_fn2="$(grep -n '^PRIV:A:POST:/internal/v5/cutover-fence$' "$TMP/rr.trace" | head -n1 | cut -d: -f1)"
+  l_dr2="$(grep -n '^OLD_MASTER_DRAIN:' "$TMP/rr.trace" | head -n1 | cut -d: -f1)"
+  l_rr2="$(grep -n '^SYS:start openclaude-v5-selfhost-remote-relay@A\.service$' "$TMP/rr.trace" | head -n1 | cut -d: -f1)"
+  (( l_fn2 > 0 && l_fn2 < l_dr2 && l_dr2 < l_rr2 )) \
+    && pass "B2a-orphan: stale active relay with in-process Master still fences+drains old Master first" \
+    || fail "B2a-orphan: skipped old Master fence+drain (fn=$l_fn2 dr=$l_dr2 rr=$l_rr2)"
+else
+  fail "B2a-orphan: failed unexpectedly"
+fi
+
+# B2-auditor-2: Readiness timeout/503/invalid JSON -> mode=unknown -> MUST fail closed (rc=1)
+# WITHOUT stopping active external relay or removing active.sock / state.json!
+ln -sfn "$TMP/rel-rr" "$MASTER_LIVE_LINK"
+printf 'active\n' >"$RR_STATE_DIR/A"; printf 'inactive\n' >"$RR_STATE_DIR/B"
+remote_relay_atomic_switch_symlink A
+remote_relay_write_state_atomic A "rr-A-inst"
+: >"$TMP/rr.trace"
+mock_priv_unknown() { printf 'PRIV:%s:%s:%s\n' "$1" "$2" "$3" >>"$TMP/rr.trace"; printf '000\n'; }
+export OC_SELFHOST_PRIV_CONTROL_CMD=mock_priv_unknown
+rc=0; selfhost_flip_egress_relay_and_master || rc=$?
+export OC_SELFHOST_PRIV_CONTROL_CMD=mock_priv_b2
+assert_eq "B2-auditor-2: unknown readiness mode returns 1 fail-closed" "1" "$rc"
+! grep -q '^SYS:stop ' "$TMP/rr.trace" \
+  && ! grep -q '^PRIV:A:POST:/internal/v5/cutover-fence$' "$TMP/rr.trace" \
+  && [[ -L "$V5_REMOTE_RELAY_ACTIVE_SOCK" && -f "$V5_REMOTE_RELAY_STATE_FILE" ]] \
+  && pass "B2-auditor-2: unknown readiness preserves active external relay, symlink, and state" \
+  || fail "B2-auditor-2: unknown readiness mutated active relay or fenced old Master"
+
+# B2-auditor-3a: First migration preheat failure + /reopen returns error -> MUST return 79,
+# persist recovery lock, and NEVER clear cutover-fence!
+rm -f -- "$V5_DUAL_SLOT_RECOVERY_LOCK"
+ln -sfn "$TMP/rel-rr" "$MASTER_LIVE_LINK"
+printf 'inactive\n' >"$RR_STATE_DIR/A"; printf 'inactive\n' >"$RR_STATE_DIR/B"
+rm -f -- "$V5_REMOTE_RELAY_ACTIVE_SOCK" "$V5_REMOTE_RELAY_STATE_FILE"
+: >"$TMP/rr.trace"
+selfhost_master_restart_or_flip() { printf 'MASTER_PREHEAT_FAIL\n' >>"$TMP/rr.trace"; return 1; }
+remote_v4_cutover_reopen() { printf 'OLD_MASTER_REOPEN_FAIL\n' >>"$TMP/rr.trace"; return 1; }
+rc=0; selfhost_flip_egress_relay_and_master || rc=$?
+selfhost_master_restart_or_flip() { printf 'MASTER_FLIP\n' >>"$TMP/rr.trace"; return 0; }
+remote_v4_cutover_reopen() { printf 'OLD_MASTER_REOPEN\n' >>"$TMP/rr.trace"; return 0; }
+assert_eq "B2-auditor-3a: failed /reopen after preheat abort returns 79" "79" "$rc"
+fc_reopen_fail="$(grep -c '^PRIV:A:POST:/internal/v5/cutover-fence$' "$TMP/rr.trace" || echo 0)"
+[[ "$fc_reopen_fail" == "1" && -f "$V5_DUAL_SLOT_RECOVERY_LOCK" ]] \
+  && pass "B2-auditor-3a: failed /reopen keeps old Master fenced and persists recovery lock" \
+  || fail "B2-auditor-3a: unfenced old Master despite failed /reopen (fence_calls=$fc_reopen_fail)"
+rm -f -- "$V5_DUAL_SLOT_RECOVERY_LOCK"
+
+# B2-auditor-3b: Real remote_v4_cutover_reopen in v5-selfhost-master-release-lib.sh MUST propagate
+# non-zero exit from drain-remote-v4.sh and preserve REMOTE_V4_CUTOVER_DRAINED=1 on failure.
+if bash -c '
+  set -Eeuo pipefail
+  TMPD="$1"; ROOTD="$2"
+  mkdir -p "$TMPD/fake-scripts/agent-remote"
+  cat >"$TMPD/fake-scripts/agent-remote/drain-remote-v4.sh" <<EOF
+#!/usr/bin/env bash
+exit 1
+EOF
+  chmod +x "$TMPD/fake-scripts/agent-remote/drain-remote-v4.sh"
+  python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" "$TMPD/drain.sock"
+  SCRIPT_DIR="$TMPD/fake-scripts"
+  DRY=0
+  OC_REMOTE_V4_DRAIN_SOCKET="$TMPD/drain.sock"
+  cutover_clog() { :; }
+  source "$ROOTD/scripts/v5-selfhost-master-release-lib.sh"
+  REMOTE_V4_CUTOVER_DRAINED=1
+  rc=0; remote_v4_cutover_reopen || rc=$?
+  [[ "$rc" -ne 0 && "$REMOTE_V4_CUTOVER_DRAINED" == "1" ]]
+' _ "$TMP" "$ROOT"; then
+  pass "B2-auditor-3b: real remote_v4_cutover_reopen propagates error and keeps REMOTE_V4_CUTOVER_DRAINED=1"
+else
+  fail "B2-auditor-3b: real remote_v4_cutover_reopen swallowed failure or cleared drained flag"
+fi
+
+# B2-auditor-1a/1b/1c: REAL inner selfhost_master_dual_slot_flip + REAL outer selfhost_flip_egress_relay_and_master!
+# Verifies external relay drain+stop ALWAYS precedes old Master reopen+unfence across BOTH [3/5] idle gate
+# failure AND [4/5] post-CAS verified rollback, and relay drain failure aborts rc=79 WITHOUT reopening old Master!
+if bash -c '
+  set -Eeuo pipefail
+  TMPD="$1"; ROOTD="$2"
+  source "$ROOTD/scripts/v5-selfhost-dual-slot-lib.sh"
+  source "$ROOTD/scripts/v5-selfhost-remote-relay-lib.sh"
+  export OC_SELFHOST_DUAL_SLOT_ACTIVE=1
+  export OC_SELFHOST_STANDBY_TIMEOUT_SEC=1 OC_SELFHOST_STANDBY_POLL_SEC=0
+  export OC_SELFHOST_IDLE_WAIT_TIMEOUT_SEC=1 OC_SELFHOST_IDLE_WAIT_POLL_SEC=0
+  export MASTER_LIVE_LINK="$TMPD/e2e-live"
+  export V5_SLOT_LINK_PREFIX="$TMPD/e2e-slot"
+  export V5_REMOTE_RELAY_RUN_DIR="$TMPD/e2e-run"
+  export V5_REMOTE_RELAY_ACTIVE_SOCK="$TMPD/e2e-run/remote-relay-active.sock"
+  export V5_REMOTE_RELAY_STATE_FILE="$TMPD/e2e-rr-state.json"
+  export V5_DUAL_SLOT_RECOVERY_LOCK="$TMPD/e2e-recovery.lock"
+  mkdir -p "$TMPD/e2e-rel-old" "$TMPD/e2e-rel-new/deploy/v5-selfhost" "$TMPD/e2e-rel-new/scripts" "$TMPD/e2e-run" "$TMPD/e2e-sys"
+  : >"$TMPD/e2e-rel-new/deploy/v5-selfhost/openclaude-v5-selfhost-remote-relay@.service"
+  : >"$TMPD/e2e-rel-new/scripts/v5-selfhost-frontdoor.mjs"
+  ln -sfn "$TMPD/e2e-rel-old" "$V5_SLOT_LINK_PREFIX-A"
+  ln -sfn "$TMPD/e2e-rel-new" "$MASTER_LIVE_LINK"
+  TRACE="$TMPD/e2e.trace"
+  FAIL_RELAY_DRAIN=0
+  FAIL_IDLE_GATE=1
+  FAIL_LEADER_B=0
+
+  egress_slot_flip() { echo "EGRESS_FLIP" >>"$TRACE"; return 0; }
+  systemctl() {
+    local sub="$1" unit="${2:-}"
+    echo "SYS:$sub $unit" >>"$TRACE"
+    case "$unit" in
+      openclaude-v5-selfhost-remote-relay@A.service)
+        case "$sub" in
+          start) echo active >"$TMPD/e2e-sys/rrA"; : >"$V5_REMOTE_RELAY_RUN_DIR/remote-relay-A.sock" ;;
+          stop) echo inactive >"$TMPD/e2e-sys/rrA" ;;
+          enable) echo enabled >"$TMPD/e2e-sys/enA" ;;
+          disable) echo disabled >"$TMPD/e2e-sys/enA" ;;
+          is-enabled) [[ -f "$TMPD/e2e-sys/enA" ]] && cat "$TMPD/e2e-sys/enA" || echo disabled ;;
+          is-active) [[ -f "$TMPD/e2e-sys/rrA" ]] && cat "$TMPD/e2e-sys/rrA" || echo inactive; [[ "$(cat "$TMPD/e2e-sys/rrA" 2>/dev/null || echo inactive)" == active ]] ;;
+          *) return 0 ;;
+        esac ;;
+      openclaude-v5-selfhost-remote-relay@B.service)
+        case "$sub" in
+          is-active) echo inactive; return 3 ;;
+          *) return 0 ;;
+        esac ;;
+      *) return 0 ;;
+    esac
+  }
+  mock_rr_http() {
+    local sock="$1" method="$2" path="$3" body="${4:-}"
+    if [[ "$path" == "/healthz" ]]; then
+      printf "200\n{\"ok\":true,\"role\":\"remote-relay\",\"slot\":\"A\",\"instanceId\":\"rr-e2e-A\",\"runtimeState\":\"ready\",\"remoteRuntimeReady\":true,\"accepting\":true}\n"
+      return 0
+    fi
+    if [[ "$path" == "/drain" ]]; then
+      echo "RELAY_DRAIN:$body" >>"$TRACE"
+      if (( FAIL_RELAY_DRAIN == 1 )); then
+        printf "500\n{\"ok\":false,\"error\":\"ACTIVE_TURN\"}\n"
+        return 0
+      fi
+      printf "200\n{\"ok\":true,\"drained\":true}\n"
+      return 0
+    fi
+    printf "200\n{\"ok\":true}\n"
+  }
+  export OC_SELFHOST_REMOTE_RELAY_HTTP_CMD=mock_rr_http
+  selfhost_frontdoor_current_slot() { cat "$TMPD/e2e-fd"; }
+  selfhost_frontdoor_switch_verified() { echo "$1" >"$TMPD/e2e-fd"; echo "FD_SWITCH:$1" >>"$TRACE"; SELFHOST_LAST_FRONTDOOR_SLOT="$1"; return 0; }
+  selfhost_deploy_state_read_lock_version() { echo 10; }
+  selfhost_deploy_state_cas_switch() { echo "DS_SWITCH:$2" >>"$TRACE"; echo 11; }
+  selfhost_deploy_state_cas_revert() { echo "DS_REVERT:$2" >>"$TRACE"; echo 12; }
+  selfhost_wait_slot_standby_ready() { echo "STANDBY_OK:$1" >>"$TRACE"; return 0; }
+  selfhost_wait_slot_leader_vip() {
+    if [[ "$1" == "B" && "$FAIL_LEADER_B" == "1" ]]; then echo "LEADER_FAIL:B" >>"$TRACE"; return 1; fi
+    echo "LEADER_OK:$1" >>"$TRACE"; return 0
+  }
+  selfhost_healthz_18790_ok() { return 0; }
+  selfhost_query_tiered_idle_pg() {
+    if (( FAIL_IDLE_GATE == 1 )); then echo "IDLE_GATE_FAIL" >>"$TRACE"; return 1; fi
+    printf "0|0|0|0|0||0|0|\n"
+  }
+  remote_v4_cutover_drain() { echo "OLD_MASTER_DRAIN" >>"$TRACE"; return 0; }
+  remote_v4_cutover_reopen() { echo "OLD_MASTER_REOPEN" >>"$TRACE"; return 0; }
+  mock_e2e_priv() {
+    local slot="$1" method="$2" path="$3" body="${4:-}"
+    if [[ "$path" == "/internal/v5/cutover-fence" ]]; then
+      local en; en="$(printf "%s" "$body" | jq -r ".enabled")"
+      echo "FENCE:$slot:$en" >>"$TRACE"
+      echo "$en" >"$TMPD/e2e-fence-$slot"
+      printf "200\n{\"ok\":true,\"slot\":\"%s\",\"fencing\":%s}\n" "$slot" "$en"; return 0
+    fi
+    local fn; fn="$(cat "$TMPD/e2e-fence-$slot" 2>/dev/null || echo false)"
+    if [[ "$slot" == "A" ]]; then
+      printf "200\n{\"ok\":true,\"slot\":\"A\",\"role\":\"leader\",\"vipOwner\":true,\"fencing\":%s,\"containerLinkEnabled\":true,\"nonSurvivableInFlight\":0}\n" "$fn"
+    else
+      printf "200\n{\"ok\":true,\"slot\":\"B\",\"role\":\"standby\",\"vipOwner\":false,\"fencing\":%s,\"containerLinkEnabled\":true,\"nonSurvivableInFlight\":0,\"remoteRelayExternal\":true,\"remoteRelayHealthy\":true,\"remoteRelayInstanceId\":\"rr-e2e-A\"}\n" "$fn"
+    fi
+  }
+  export OC_SELFHOST_PRIV_CONTROL_CMD=mock_e2e_priv
+
+  # 1a: [3/5] idle gate fails -> relay drained & stopped STRICTLY BEFORE old Master reopen & unfence!
+  echo A >"$TMPD/e2e-fd"; echo false >"$TMPD/e2e-fence-A"; echo inactive >"$TMPD/e2e-sys/rrA"
+  rm -f -- "$V5_REMOTE_RELAY_ACTIVE_SOCK" "$V5_REMOTE_RELAY_STATE_FILE" "$V5_DUAL_SLOT_RECOVERY_LOCK"
+  : >"$TRACE"; FAIL_IDLE_GATE=1; FAIL_RELAY_DRAIN=0; FAIL_LEADER_B=0
+  rc=0; selfhost_flip_egress_relay_and_master || rc=$?
+  [[ "$rc" == "1" ]]
+  l_ig="$(grep -n "^IDLE_GATE_FAIL$" "$TRACE" | head -n1 | cut -d: -f1)"
+  l_rd="$(grep -n "^RELAY_DRAIN:{\"releaseIdleLanes\":true,\"keepClosedForRestart\":true}$" "$TRACE" | head -n1 | cut -d: -f1)"
+  l_rs="$(grep -n "^SYS:stop openclaude-v5-selfhost-remote-relay@A\.service$" "$TRACE" | head -n1 | cut -d: -f1)"
+  l_ro="$(grep -n "^OLD_MASTER_REOPEN$" "$TRACE" | head -n1 | cut -d: -f1)"
+  l_uf="$(grep -n "^FENCE:A:false$" "$TRACE" | head -n1 | cut -d: -f1)"
+  l_ms="$(grep -n "^SYS:stop openclaude-v5-selfhost@B\.service$" "$TRACE" | head -n1 | cut -d: -f1)"
+  (( l_ig > 0 && l_ig < l_rd && l_rd < l_rs && l_rs < l_ro && l_ro < l_uf && l_uf < l_ms ))
+  [[ ! -e "$V5_REMOTE_RELAY_ACTIVE_SOCK" && ! -e "$V5_REMOTE_RELAY_STATE_FILE" ]]
+
+  # 1b: [3/5] idle gate fails + relay drain fails -> rc=79, recovery lock, OLD MASTER NEVER REOPENED/UNFENCED!
+  echo A >"$TMPD/e2e-fd"; echo false >"$TMPD/e2e-fence-A"; echo inactive >"$TMPD/e2e-sys/rrA"
+  rm -f -- "$V5_REMOTE_RELAY_ACTIVE_SOCK" "$V5_REMOTE_RELAY_STATE_FILE" "$V5_DUAL_SLOT_RECOVERY_LOCK"
+  : >"$TRACE"; FAIL_IDLE_GATE=1; FAIL_RELAY_DRAIN=1; FAIL_LEADER_B=0
+  rc=0; selfhost_flip_egress_relay_and_master || rc=$?
+  [[ "$rc" == "79" && -f "$V5_DUAL_SLOT_RECOVERY_LOCK" ]]
+  ! grep -q "^OLD_MASTER_REOPEN$" "$TRACE"
+  ! grep -q "^FENCE:A:false$" "$TRACE"
+
+  # 1c: [4/5] post-CAS verified rollback -> reverts fd+ds, THEN drains+stops relay BEFORE reopen+unfence!
+  echo A >"$TMPD/e2e-fd"; echo false >"$TMPD/e2e-fence-A"; echo inactive >"$TMPD/e2e-sys/rrA"
+  rm -f -- "$V5_REMOTE_RELAY_ACTIVE_SOCK" "$V5_REMOTE_RELAY_STATE_FILE" "$V5_DUAL_SLOT_RECOVERY_LOCK"
+  : >"$TRACE"; FAIL_IDLE_GATE=0; FAIL_RELAY_DRAIN=0; FAIL_LEADER_B=1
+  rc=0; selfhost_flip_egress_relay_and_master || rc=$?
+  [[ "$rc" == "1" ]]
+  l_rv="$(grep -n "^DS_REVERT:A$" "$TRACE" | head -n1 | cut -d: -f1)"
+  l_rd3="$(grep -n "^RELAY_DRAIN:{\"releaseIdleLanes\":true,\"keepClosedForRestart\":true}$" "$TRACE" | head -n1 | cut -d: -f1)"
+  l_rs3="$(grep -n "^SYS:stop openclaude-v5-selfhost-remote-relay@A\.service$" "$TRACE" | head -n1 | cut -d: -f1)"
+  l_ro3="$(grep -n "^OLD_MASTER_REOPEN$" "$TRACE" | head -n1 | cut -d: -f1)"
+  l_uf3="$(grep -n "^FENCE:A:false$" "$TRACE" | head -n1 | cut -d: -f1)"
+  (( l_rv > 0 && l_rv < l_rd3 && l_rd3 < l_rs3 && l_rs3 < l_ro3 && l_ro3 < l_uf3 ))
+' _ "$TMP" "$ROOT"; then
+  pass "B2-auditor-1a/1b/1c: real inner+outer flow enforces relay drain+stop BEFORE old Master reopen+unfence (both [3/5] abort & [4/5] rollback, fail-closed rc=79 on relay drain error)"
+else
+  fail "B2-auditor-1a/1b/1c: real inner+outer first-migration abort/rollback ordering violated"
+fi
+
+# B2-R2-1/2/3: Verify all 3 R2 audit findings closed:
+#   R2-1: unknown/empty systemctl is-active or undeletable state.json returns 79 (never false 0)
+#   R2-2: candidate ready timeout + stop failure returns 79 and keeps old Master fenced
+#   R2-3: drain lost-ACK/timeout sets REMOTE_V4_CUTOVER_DRAINED=1 so reopen on missing/75 socket fails closed
+if bash -c '
+  set -Eeuo pipefail
+  TMPD="$1"; ROOTD="$2"
+  source "$ROOTD/scripts/v5-selfhost-dual-slot-lib.sh"
+  source "$ROOTD/scripts/v5-selfhost-remote-relay-lib.sh"
+  export V5_REMOTE_RELAY_RUN_DIR="$TMPD/r2-run"
+  export V5_REMOTE_RELAY_ACTIVE_SOCK="$TMPD/r2-run/remote-relay-active.sock"
+  export V5_REMOTE_RELAY_STATE_FILE="$TMPD/r2-ro/state.json"
+  export V5_DUAL_SLOT_RECOVERY_LOCK="$TMPD/r2-recovery.lock"
+  export OC_REMOTE_RELAY_READY_TIMEOUT_SEC=1 OC_REMOTE_RELAY_READY_POLL_SEC=0.05
+  export MASTER_LIVE_LINK="$TMPD/r2-live"
+  mkdir -p "$TMPD/r2-run" "$TMPD/r2-ro" "$TMPD/r2-rel/deploy/v5-selfhost"
+  : >"$TMPD/r2-rel/deploy/v5-selfhost/openclaude-v5-selfhost-remote-relay@.service"
+  ln -sfn "$TMPD/r2-rel" "$MASTER_LIVE_LINK"
+
+  # R2-1a: empty systemctl is-active (D-Bus failure) + stop cannot verify inactive -> rc=79!
+  systemctl() {
+    case "$1" in
+      is-active) return 1 ;; # prints empty stdout
+      stop) return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  rm -f -- "$V5_DUAL_SLOT_RECOVERY_LOCK"
+  rc=0; remote_relay_stop_all_for_legacy_rollback "test-dbus-fail" || rc=$?
+  [[ "$rc" == "79" && -f "$V5_DUAL_SLOT_RECOVERY_LOCK" ]]
+
+  # R2-1b: slots inactive but state path cannot be removed by rm -f (e.g. non-empty dir, even as root) -> rc=79!
+  systemctl() {
+    case "$1" in
+      is-active) echo inactive; return 3 ;;
+      is-enabled) echo disabled; return 1 ;;
+      *) return 0 ;;
+    esac
+  }
+  mkdir -p "$V5_REMOTE_RELAY_STATE_FILE"
+  rm -f -- "$V5_DUAL_SLOT_RECOVERY_LOCK"
+  rc=0; remote_relay_stop_all_for_legacy_rollback "test-rm-fail" || rc=$?
+  rmdir "$V5_REMOTE_RELAY_STATE_FILE"
+  [[ "$rc" == "79" && -f "$V5_DUAL_SLOT_RECOVERY_LOCK" ]]
+
+  # R2-2: first migration candidate relay ready timeout + stop failure -> rc=79 & old Master NOT unfenced!
+  rm -f -- "$V5_REMOTE_RELAY_STATE_FILE" "$V5_REMOTE_RELAY_ACTIVE_SOCK" "$V5_DUAL_SLOT_RECOVERY_LOCK"
+  export OC_SELFHOST_DUAL_SLOT_ACTIVE=1
+  egress_slot_flip() { return 0; }
+  selfhost_master_current_slot() { printf "A"; }
+  remote_v4_cutover_drain() { return 0; }
+  remote_v4_cutover_reopen() { echo "UNEXPECTED_REOPEN" >>"$TMPD/r2.trace"; return 0; }
+  mock_r2_priv() {
+    if [[ "$3" == "/internal/v5/cutover-fence" ]]; then
+      echo "FENCE:$4" >>"$TMPD/r2.trace"
+      printf "200\n{\"ok\":true,\"slot\":\"A\",\"fencing\":true}\n"; return 0
+    fi
+    printf "200\n{\"ok\":true,\"slot\":\"A\",\"remoteRelayExternal\":false}\n"
+  }
+  export OC_SELFHOST_PRIV_CONTROL_CMD=mock_r2_priv
+  mock_r2_http() { printf "503\n{\"ok\":false,\"error\":\"BOOT_FAIL\"}\n"; }
+  export OC_SELFHOST_REMOTE_RELAY_HTTP_CMD=mock_r2_http
+  R2_STATE="$TMPD/r2-a-st"; echo inactive >"$R2_STATE"
+  systemctl() {
+    case "$1" in
+      is-active) [[ "$2" == *"@A.service" ]] && cat "$R2_STATE" || echo inactive; [[ "$2" == *"@A.service" && "$(cat "$R2_STATE")" == active ]] ;;
+      start) echo active >"$R2_STATE"; : >"$V5_REMOTE_RELAY_RUN_DIR/remote-relay-A.sock"; return 0 ;;
+      stop) return 1 ;; # simulate stop failure!
+      *) return 0 ;;
+    esac
+  }
+  : >"$TMPD/r2.trace"
+  rc=0; selfhost_flip_egress_relay_and_master || rc=$?
+  [[ "$rc" == "79" && -f "$V5_DUAL_SLOT_RECOVERY_LOCK" ]]
+  ! grep -q "UNEXPECTED_REOPEN" "$TMPD/r2.trace"
+  ! grep -q "false" "$TMPD/r2.trace"
+
+  # R2-3: real remote_v4_cutover_drain lost-ACK/timeout (rc=1) sets REMOTE_V4_CUTOVER_DRAINED=1,
+  # so subsequent remote_v4_cutover_reopen encountering rc=75 / missing socket FAILS (never false 0)!
+  mkdir -p "$TMPD/r2-scripts/agent-remote"
+  cat >"$TMPD/r2-scripts/agent-remote/drain-remote-v4.sh" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "--drain" ]]; then exit 1; fi
+exit 75
+EOF
+  chmod +x "$TMPD/r2-scripts/agent-remote/drain-remote-v4.sh"
+  python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" "$TMPD/r2-drain.sock"
+  SCRIPT_DIR="$TMPD/r2-scripts"; DRY=0; ALLOW_INFLIGHT=0; OC_REMOTE_V4_DRAIN_SOCKET="$TMPD/r2-drain.sock"
+  cutover_clog() { :; }
+  source "$ROOTD/scripts/v5-selfhost-master-release-lib.sh"
+  REMOTE_V4_CUTOVER_DRAINED=0
+  d_rc=0; remote_v4_cutover_drain || d_rc=$?
+  [[ "$d_rc" -ne 0 && "$REMOTE_V4_CUTOVER_DRAINED" == "1" ]]
+  r_rc=0; remote_v4_cutover_reopen || r_rc=$?
+  [[ "$r_rc" -ne 0 && "$REMOTE_V4_CUTOVER_DRAINED" == "1" ]]
+' _ "$TMP" "$ROOT"; then
+  pass "B2-R2-1/2/3: empty is-active/cleanup fail -> rc=79, candidate stop fail -> rc=79 keeps fence, drain lost-ACK requires verified reopen"
+else
+  fail "B2-R2-1/2/3: R2 fail-closed regression check failed"
+fi
+
 # B2b: Reverse rollback -> MUST drain active external relay (with releaseIdleLanes=true) BEFORE flipping Master, THEN stop relay & remove state/symlink!
 ln -sfn "$TMP/rel-old-no-rr" "$MASTER_LIVE_LINK"
 printf 'active\n' >"$RR_STATE_DIR/A"; printf 'inactive\n' >"$RR_STATE_DIR/B"
@@ -752,6 +1099,30 @@ if PGHOST=127.0.0.1 PGPORT=55432 PGUSER=test PGPASSWORD=test PGDATABASE=openclau
   # Missing operationId link in journal ctx -> MUST BLOCK
   rr_sql "UPDATE request_finalize_journal SET ctx='{\"remoteNativeBillingRecovery\":\"remote-native-v4\"}' WHERE request_id='req-1';"
   ! run_pg_gate && pass "REAL PG: inflight journal missing remoteDriverV4.scope.operationId strictly blocks" || fail "REAL PG: unlinked journal falsely passed"
+  # Fail-closed fallback without 4-state CHECK constraint: custom non-terminal state MUST BLOCK
+  rr_sql "UPDATE request_finalize_journal SET ctx='{\"remoteNativeBillingRecovery\":\"remote-native-v4\",\"remoteDriverV4\":{\"v\":4,\"scope\":{\"operationId\":\"22222222-2222-2222-2222-222222222222\",\"generation\":\"1\"}}}' WHERE request_id='req-1';"
+  rr_sql "INSERT INTO request_finalize_journal VALUES ('req-custom','pending','{}',NULL);"
+  ! run_pg_gate && pass "REAL PG: without 4-state CHECK, unknown non-terminal state ('pending') fails closed" || fail "REAL PG: unknown non-terminal state falsely passed"
+  rr_sql "DELETE FROM request_finalize_journal WHERE request_id='req-custom';"
+  # Production-shape performance regression: 10,000 committed/aborted TOASTed rows + 4-state CHECK + idx_rfj_stuck
+  # MUST finish well under 1s (previously blew 5s statement_timeout via 138 InitPlans JIT + 3x Seq Scan)
+  rr_sql "ALTER TABLE request_finalize_journal ADD CONSTRAINT request_finalize_journal_state_check CHECK (state = ANY (ARRAY['inflight'::text, 'finalizing'::text, 'committed'::text, 'aborted'::text]));"
+  rr_sql "CREATE INDEX idx_rfj_stuck ON request_finalize_journal (state) WHERE state = ANY (ARRAY['inflight'::text, 'finalizing'::text]);"
+  rr_sql "INSERT INTO request_finalize_journal (request_id, state, ctx, dispatch_id)
+    SELECT 'hist-' || g, CASE WHEN g % 10 = 0 THEN 'aborted' ELSE 'committed' END,
+           jsonb_build_object('model', 'gpt-6.2-astra', 'pad', repeat('x', 4096)), NULL
+      FROM generate_series(1, 10000) g;"
+  rr_sql "ANALYZE request_finalize_journal;"
+  t0_ms="$(date +%s%3N)"
+  if run_pg_gate; then
+    t1_ms="$(date +%s%3N)"
+    elapsed_ms=$(( t1_ms - t0_ms ))
+    (( elapsed_ms < 2000 )) \
+      && pass "REAL PG: 10k TOASTed history rows + idx_rfj_stuck passed in ${elapsed_ms}ms (<2000ms)" \
+      || fail "REAL PG: 10k history rows took ${elapsed_ms}ms (>=2000ms)"
+  else
+    fail "REAL PG: 10k history rows gate failed or timed out"
+  fi
 
   PGHOST=127.0.0.1 PGPORT=55432 PGUSER=test PGPASSWORD=test PGDATABASE=openclaude_test \
     psql -X -v ON_ERROR_STOP=1 -q -c "DROP DATABASE \"$RR_DB\";"

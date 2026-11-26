@@ -2471,12 +2471,30 @@ COMMIT;")"; then
 REMOTE_V4_CUTOVER_DRAINED=0
 
 remote_v4_cutover_reopen() {
-  local sock
+  local sock rc=0
   if declare -F selfhost_master_active_drain_sock >/dev/null 2>&1; then sock="$(selfhost_master_active_drain_sock)"; else sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"; fi
-  REMOTE_V4_CUTOVER_DRAINED=0
-  [[ "${DRY:-0}" != 1 ]] || return 0
-  [[ -S "$sock" ]] || return 0
-  bash "$SCRIPT_DIR/agent-remote/drain-remote-v4.sh" --reopen --socket "$sock" >/dev/null 2>&1 || true
+  if [[ "${DRY:-0}" == 1 ]]; then
+    REMOTE_V4_CUTOVER_DRAINED=0
+    return 0
+  fi
+  if [[ ! -S "$sock" ]]; then
+    if [[ "${REMOTE_V4_CUTOVER_DRAINED:-0}" == 1 ]]; then
+      cutover_clog "  ✗ remote-v4 reopen 失败: drain socket 缺失 ($sock)"
+      return 1
+    fi
+    REMOTE_V4_CUTOVER_DRAINED=0
+    return 0
+  fi
+  bash "$SCRIPT_DIR/agent-remote/drain-remote-v4.sh" --reopen --socket "$sock" >/dev/null 2>&1 || rc=$?
+  if (( rc == 0 )); then
+    REMOTE_V4_CUTOVER_DRAINED=0
+    return 0
+  fi
+  if (( rc == 75 && ${REMOTE_V4_CUTOVER_DRAINED:-0} == 0 )); then
+    return 0
+  fi
+  cutover_clog "  ✗ remote-v4 reopen 失败 (sock=$sock rc=$rc)"
+  return 1
 }
 
 # OCV5-749 AC-5 / OCV5-854: R1 generation cutover drain fence (slot-aware socket).
@@ -2529,6 +2547,9 @@ SELECT count(*)::text FROM public.remote_agent_bindings
     cutover_clog "  ✗ remote-v4 drain socket 缺失但存在活跃 v4 绑定 ($v4_active);拒绝切流"
     return 1
   fi
+  # Drain request was attempted against an existing socket and timed out or lost ACK:
+  # admissions may already be closed on old Master, so require explicit reopen success.
+  REMOTE_V4_CUTOVER_DRAINED=1
   cutover_clog "  ✗ remote-v4 排空超时或失败 (rc=$rc): $out;中止切流,不强杀在途回合"
   return 1
 }
