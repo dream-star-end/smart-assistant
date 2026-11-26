@@ -149,7 +149,9 @@ def worker_case(c, allow, systemd):
     task = bin_dir/'fake-task'
     task.write_text('#!/bin/sh\nexit 0\n')
     task.chmod(0o755)
-    c.env.update(OC_V5_AUTORECOVER='off', OC_V5_LEASE_WORKER_LOCK=str(c.root/'worker.lock'),
+    c.env.update(OC_V5_AUTORECOVER='off', OC_V5_TRAIN_DEBOUNCE_SEC='0',
+        OC_V5_GOVERNOR_MODE_FILE=str(c.root/'no-governor-mode.json'),
+        OC_V5_LEASE_WORKER_LOCK=str(c.root/'worker.lock'),
         OC_V5_LEASE_LOG_DIR=str(c.root/'logs'), OC_V5_LEASE_DEPLOY_BIN=str(fake),
         OC_V5_LEASE_TASK_CLI=str(task), OC_V5_LEASE_SURVIVOR_COMMITTED=str(c.root/'committed'),
         OC_V5_LEASE_CUTOVER_GRACE_FILE=str(c.root/'grace'))

@@ -86,9 +86,7 @@ CATALOG_ADMIN_ROLE="${PG_ROLE}_catalog_admin"
 # NOLOGIN deploy role. The catalog admin role is read-only on deploy_state.
 MODEL_AUTHORITY_DEPLOY_ROLE="${PG_ROLE}_model_deploy"
 REDIS_URL="redis://127.0.0.1:6379/3"
-# Runtime image pin (OCV5-899 + OCV5-900: CC 2.1.332 + Codex 0.172.0 + Grok 1.0.92 + Cursor 2026.11.22 +
-# AGY 1.5.18 + ZCode 3.15.3 + Chrome 158 + GNU Octave 7.3 + sci-verify pint/uncertainties/hypothesis/z3-solver/pytest;
-# previous chrome-octave-slim tag kept for rollback).
+# Runtime image pin (OCV5-904: loaded from deploy/v5/runtime-image-pin.json via v5-selfhost-train-guards.sh; fallback default).
 RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2332-codex01720-grok1092-cur1122-zcode3153-agy1518-chrome-octave-z3-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
@@ -137,7 +135,7 @@ LEASE_TARGET_SHA=""
 RELEASE_POLICY_RESUME=0
 RELEASE_POLICY_SAMPLER_RESTORE=0
 LEASE_LIB="$SCRIPT_DIR/v5-lease-lib.sh"
-# Incident trailer 发布前快检(fail-closed;止血豁免 OC_V5_SKIP_TRAILER_GATE=1)。
+# Incident trailer 发布前快检(fail-closed;禁止环境变量跳过,紧急豁免仅限宿主 root break-glass 文件)。
 FIX_TRAILER_GATE="$SCRIPT_DIR/check-v5-fix-trailers.sh"
 # OCV5-418 门禁失败策略(个人版):rollback(默认)|stay,优先级 env > 策略文件。
 SELFHOST_POLICY_FILE="${OC_V5_SELFHOST_POLICY_FILE:-/etc/openclaude/selfhost-deploy-policy.env}"
@@ -179,6 +177,8 @@ source "$SCRIPT_DIR/lib/v5-selfhost-train-summary.sh"   # OCV5-539: <trainId>.su
 source "$SCRIPT_DIR/lib/v5-selfhost-workspace-links.sh"  # OCV5-549: ws_links_ensure
 source "$SCRIPT_DIR/lib/v5-selfhost-prepare.sh"       # P4: lock-free prepare, locked flip
 source "$SCRIPT_DIR/lib/v5-selfhost-backup-lock.sh"     # OCV5-600: selfhost_backup_lock_holder
+source "$SCRIPT_DIR/lib/v5-selfhost-train-guards.sh"    # OCV5-904: pin/governor/ci-green/retention-rollback
+v5_selfhost_load_runtime_image_pin
 # P0-Web 前端热切换(OCV5-489):overlay 指针根 + 纯函数库 + --p0-web* 编排。
 WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-overlay}"
 # shellcheck source=scripts/v5-web-overlay-lib.sh
@@ -564,9 +564,7 @@ usage() {
   --lease-train=ID --target-sha=SHA
                         仅配合 --deploy:由 v5-lease-worker 发车时传入;HEAD 必须精确等于 SHA,否则拒绝。
                         人工直跑 --deploy 会自动登记 manual train(有 open train 时拒绝并行发布)。见 scripts/oc-lease.sh
-  env OC_V5_SKIP_TRAILER_GATE=1
-                        仅配合 --deploy:跳过构建前的 Incident trailer 门(scripts/check-v5-fix-trailers.sh)。
-                        仅限止血;会打 ⚠ 留痕,CI check:v5:incidents 仍会红,事后必须补 waiver / 冻结 tip。
+  break-glass (仅宿主机 root): /opt/openclaude/harness-gate/control/{ci,trailer}-breakglass-<40hex> (禁止环境变量绕过)
   --force-env           仅配合 --bootstrap:覆盖已存在的 env 文件
   --force-npm-ci        配合 --build-master-only 或 --deploy:跳过硬链,在 staging 内冷装
   --p0-web --target-sha=SHA
@@ -2004,11 +2002,12 @@ cmd_bootstrap() {
 # 只查 HEAD 已提交历史(git show <sha>:path),工作区脏文件与 --allow-dirty 无关。
 assert_fix_trailers() {
   local head="$1"
-  if [[ "${OC_V5_SKIP_TRAILER_GATE:-0}" == 1 ]]; then
-    log "  ⚠ OC_V5_SKIP_TRAILER_GATE=1:跳过 Incident trailer 门(仅限止血;CI check:v5:incidents 仍会红,事后必须补 waiver/冻结)"
-    return 0
+  if declare -F v5_selfhost_trailer_breakglass_check >/dev/null 2>&1; then
+    v5_selfhost_trailer_breakglass_check "$head" && return 0
+  elif [[ "${OC_V5_SKIP_TRAILER_GATE:-0}" == 1 ]]; then
+    die "OC_V5_SKIP_TRAILER_GATE=1 环境变量逃生口已移除，禁止绕过 Incident trailer 门！"
   fi
-  [[ -x "$FIX_TRAILER_GATE" ]] || die "缺 $FIX_TRAILER_GATE(或不可执行)。补救: git checkout -- scripts/check-v5-fix-trailers.sh;止血可 OC_V5_SKIP_TRAILER_GATE=1。"
+  [[ -x "$FIX_TRAILER_GATE" ]] || die "缺 $FIX_TRAILER_GATE(或不可执行)。补救: git checkout -- scripts/check-v5-fix-trailers.sh。"
   log "── Incident trailer 门(HEAD=${head:0:12},构建前 fail-closed) ──"
   local rc=0 out
   out="$("$FIX_TRAILER_GATE" --repo "$REPO_ROOT" --head "$head" 2>&1)" || rc=$?
@@ -2017,11 +2016,7 @@ assert_fix_trailers() {
     2) log "  ⚠ trailer 门不可判(rc=2),放行但请人工核对:"; log "$out" ;;
     *) die "Incident trailer 门拒绝发布(rc=$rc):
 $out
-补救:
-  在源提交 trailer 写 Incident: INC-YYYYMMDD-SLUG 并登记 e2e/session-display/incidents.json
-  或 Incident: none (<理由>) + e2e/session-display/incident-waivers.json
-  已上线不可改写的提交才走 check-v5-incident-regressions.ts 的 IMPORTED_TRAILER_HISTORY_TIPS
-  真·止血: OC_V5_SKIP_TRAILER_GATE=1 scripts/deploy-v5-selfhost.sh --deploy …(会留痕)" ;;
+补救: 在源提交写 Incident: INC-... 并登记 incidents.json 或 Incident: none (<理由>) + incident-waivers.json；紧急豁免仅限宿主 root break-glass 文件。" ;;
   esac
 }
 
@@ -2114,6 +2109,7 @@ $dirty
   sha="$(source_commit)"
   if [[ "$PLATFORM_FROM_HEAD" == 1 && "$DRY" != 1 ]]; then
     lease_train_begin "$sha"
+    if declare -F v5_selfhost_check_governor_mode >/dev/null 2>&1; then v5_selfhost_check_governor_mode "$sha"; v5_selfhost_verify_ci_green "$sha"; fi
     assert_fix_trailers "$sha"
     selfhost_prepare_candidate "$sha"
     selfhost_prepared_enter_flip "$sha"
@@ -2147,6 +2143,7 @@ $dirty
   if [[ "$SELFHOST_SPLIT_PREPARED" != 1 ]]; then
     selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"
   fi
+  if declare -F v5_selfhost_check_governor_mode >/dev/null 2>&1; then v5_selfhost_check_governor_mode "$sha"; v5_selfhost_verify_ci_green "$sha"; fi
   assert_fix_trailers "$sha"
   assert_p0_web_overlay_contained "$sha"
   log "── source=$sha 构建三面制品(失败则 live 不动) ──"
@@ -2170,6 +2167,7 @@ $dirty
   CUTOVER_JOINT=1
   log "── 进入 --cutover 翻转窗口(同一套状态机,不是第二份逻辑) release=$DEPLOY_BUILT_RELEASE ──"
   cmd_cutover
+  if declare -F v5_selfhost_post_cutover_retention_gate >/dev/null 2>&1; then v5_selfhost_post_cutover_retention_gate "$DEPLOY_BUILT_RELEASE" "$sha"; fi
   lease_train_finish committed "cutover committed live=$DEPLOY_BUILT_RELEASE"
   log "✓ --deploy 完成 live → $DEPLOY_BUILT_RELEASE"
 }
