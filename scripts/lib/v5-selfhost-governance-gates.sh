@@ -893,10 +893,10 @@ _master_governance_run_gate() {
 master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   local staging="$1" full_sha="$2" base_ref="" base_sha="" git_dir="" head_sha=""
   local ref_root="" ref_nm="" ref_view="" ctx_view="" pinned_gitdir="" s changed_mig changed_cl
-  local ref_biome="" fs_script="" debt_script=""
+  local ref_biome="" fs_script="" debt_script="" steward_script="" steward_gov_root="" steward_hmac_key=""
   local -a g=(env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory 'GIT_CONFIG_VALUE_0=*' git -C "$REPO_ROOT")
   local -a MASTER_GOV_TSX_CMD=()
-  local -a pg_file_args=() fs_args=() debt_args=() biome_args=()
+  local -a pg_file_args=() fs_args=() debt_args=() steward_args=() biome_args=()
 
   mlog "── Wave 1/2 治理快门(只读/隔离外置裁判, pinned staging @ ${full_sha:0:12}) ──"
   ref_root="$(master_resolve_referee_root "$staging" "$full_sha")" || {
@@ -1049,7 +1049,16 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-complexity-ratchet.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --enforce --base "$base_ref" || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-clones-ratchet.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --enforce --base "$base_ref" || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-security-sast.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --enforce --base "$base_ref" || return 1
-  _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-cross-family-audit.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "--enforce-commit" 1 -- --enforce-commit --root "$staging" --base "$base_ref" --head "$full_sha" || return 1
+  steward_script="${ref_root:+$ref_view/scripts/check-cross-family-audit.ts}"
+  [[ -n "$steward_script" ]] || steward_script="$staging/scripts/check-cross-family-audit.ts"
+  steward_args=(--enforce-commit --root "$staging" --base "$base_ref" --head "$full_sha")
+  steward_gov_root="${OC_GOVERNOR_ROOT:-/opt/openclaude/harness-gate}"
+  steward_hmac_key="$steward_gov_root/control/.hmac-key"
+  if [[ -z "${OC_STEWARD_HMAC_KEY:-}" && "$(id -u)" == 0 && ( -e "$steward_hmac_key" || -L "$steward_hmac_key" ) && -f "$steward_script" ]] \
+    && grep -qF -- '--hmac-key-file' "$steward_script" 2>/dev/null; then
+    steward_args+=(--hmac-key-file "$steward_hmac_key")
+  fi
+  _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-cross-family-audit.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "--enforce-commit" 1 -- "${steward_args[@]}" || return 1
 
   debt_script="${ref_root:+$ref_view/scripts/check-debt-ttl.ts}"
   [[ -n "$debt_script" ]] || debt_script="$staging/scripts/check-debt-ttl.ts"

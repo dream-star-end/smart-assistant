@@ -32,7 +32,8 @@ die() { echo "✗ [arch-steward-review] $*" >&2; exit 2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DEFAULT_HOST_RECEIPT_DIR="/opt/openclaude/harness-gate/steward-receipts"
+GOV_ROOT="${OC_GOVERNOR_ROOT:-/opt/openclaude/harness-gate}"
+DEFAULT_HOST_RECEIPT_DIR="${GOV_ROOT}/steward-receipts"
 
 root=""
 base_ref=""
@@ -40,6 +41,7 @@ head_ref="HEAD"
 author_model="${OC_AUTHOR_MODEL:-}"
 steward_model="${OC_STEWARD_MODEL:-}"
 out_path=""
+hmac_key_file=""
 channel="auto"
 dry_run=0
 print_prompt=0
@@ -55,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --author-model) author_model="${2:-}"; shift 2 ;;
     --steward-model) steward_model="${2:-}"; shift 2 ;;
     --out) out_path="${2:-}"; shift 2 ;;
+    --hmac-key-file) hmac_key_file="${2:-}"; shift 2 ;;
     --channel) channel="${2:-}"; shift 2 ;;
     --publish-github-status) publish_gh=1; shift ;;
     --github-repo) gh_repo="${2:-}"; shift 2 ;;
@@ -355,17 +358,32 @@ node -e '
 ' "$tmp_raw" "$head_sha" "$base_sha" "$author_model" "$author_family" "$steward_model" "$steward_family" "$triggers_json" "$job_id" "$session_key" "$now_iso" "$effective_channel" "$invoked_cmd" > "$tmp_unsigned"
 
 mkdir -p "$(dirname "$out_path")"
-run_tsx "$AUDIT_SCRIPT" --sign-receipt "$tmp_unsigned" --out "$out_path"
+effective_hmac_key_file="$hmac_key_file"
+if [[ -z "$effective_hmac_key_file" && -z "${OC_STEWARD_HMAC_KEY:-}" ]]; then
+  out_abs="$(node -e 'const path=require("node:path"); console.log(path.resolve(process.argv[1]))' "$out_path")"
+  gov_abs="$(node -e 'const path=require("node:path"); console.log(path.resolve(process.argv[1]))' "$GOV_ROOT")"
+  host_hmac_key="${gov_abs}/control/.hmac-key"
+  if [[ "$out_abs" == "${gov_abs}/"* && ( -e "$host_hmac_key" || -L "$host_hmac_key" ) ]]; then
+    effective_hmac_key_file="$host_hmac_key"
+  fi
+fi
+
+hmac_args=()
+if [[ -n "$effective_hmac_key_file" ]]; then
+  hmac_args+=(--hmac-key-file "$effective_hmac_key_file")
+fi
+if [[ "$unsafe_test_skip_owner" == 1 || "${OC_STEWARD_UNSAFE_TEST_SKIP_OWNER:-0}" == 1 ]]; then
+  hmac_args+=(--unsafe-test-skip-owner)
+fi
+
+run_tsx "$AUDIT_SCRIPT" --sign-receipt "$tmp_unsigned" --out "$out_path" "${hmac_args[@]}"
 chmod 0644 "$out_path" 2>/dev/null || true
 echo "[arch-steward-review] Production receipt written: $out_path"
 
 # 7. Mechanically enforce the produced receipt and (if --publish-github-status) publish atomic approve/veto status!
 # B3: On VETO or enforcement failure, publish `state=failure` (`verdict=veto`) to `oc-v5/arch-steward` BEFORE exiting 1
 # so any earlier approve status on the same SHA is immediately superseded across CI and host channels.
-enforce_args=(--enforce-commit --root "$root" --base "$base_sha" --head "$head_sha" --receipt "$out_path")
-if [[ "$unsafe_test_skip_owner" == 1 || "${OC_STEWARD_UNSAFE_TEST_SKIP_OWNER:-0}" == 1 ]]; then
-  enforce_args+=(--unsafe-test-skip-owner)
-fi
+enforce_args=(--enforce-commit --root "$root" --base "$base_sha" --head "$head_sha" --receipt "$out_path" "${hmac_args[@]}")
 enforce_rc=0
 run_tsx "$AUDIT_SCRIPT" "${enforce_args[@]}" || enforce_rc=$?
 

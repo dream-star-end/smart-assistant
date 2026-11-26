@@ -16,7 +16,11 @@ import path from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { runStewardGate, runStewardGateAsync } from '../check-cross-family-audit.js'
+import {
+  resolveStewardHmacKeyState,
+  runStewardGate,
+  runStewardGateAsync,
+} from '../check-cross-family-audit.js'
 import {
   ARCH_STEWARD_DRY_RUN_SCHEMA_VERSION,
   ARCH_STEWARD_RECEIPT_SCHEMA_VERSION,
@@ -1409,5 +1413,341 @@ export function branchy(a: boolean, b: boolean, c: string | null) {
     // 1 base + 1 (??) + 1 (if) + 1 (&&) + 1 (||) + 2 (case clauses) = 7
     assert.equal(metrics[0]!.ccDirect, 7)
     assert.equal(typeof computeDirectCyclomaticComplexity, 'function')
+  })
+})
+
+describe('Host .hmac-key single-source resolution & arch-steward-review.sh parity (B1 & B2)', () => {
+  test('B2: distinguishes absent vs present-unreadable vs broken-symlink/loose-mode and blocks plain sha256 downgrade', (t) => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'steward-hmac-default-'))
+    t.after(() => rmSync(tmp, { recursive: true, force: true }))
+    const ctrlDir = path.join(tmp, 'control')
+    mkdirSync(ctrlDir, { recursive: true })
+    const keyPath = path.join(ctrlDir, '.hmac-key')
+    const env = { OC_GOVERNOR_ROOT: tmp }
+
+    // 1. Truly absent -> requireHmac: false
+    assert.deepEqual(
+      resolveStewardHmacKeyState({
+        hmacKeyEnv: 'OC_STEWARD_HMAC_KEY',
+        requireRootOwner: false,
+        allowHostDefault: true,
+        env,
+        isRoot: true,
+      }),
+      { requireHmac: false },
+    )
+
+    // 2. Broken symlink -> MUST throw fail-closed even for non-root!
+    symlinkSync(path.join(tmp, 'does-not-exist'), keyPath)
+    assert.throws(
+      () =>
+        resolveStewardHmacKeyState({
+          hmacKeyEnv: 'OC_STEWARD_HMAC_KEY',
+          requireRootOwner: false,
+          allowHostDefault: true,
+          env,
+          isRoot: false,
+        }),
+      /no symlinks/,
+    )
+    rmSync(keyPath, { force: true })
+
+    // 3. Valid 0600 key -> loaded & requireHmac: true; inert when allowHostDefault=false or dir overridden
+    writeFileSync(keyPath, 'host-steward-secret-key-0123456789\n')
+    chmodSync(keyPath, 0o600)
+    assert.deepEqual(
+      resolveStewardHmacKeyState({
+        hmacKeyEnv: 'OC_STEWARD_HMAC_KEY',
+        requireRootOwner: false,
+        allowHostDefault: true,
+        env,
+        isRoot: true,
+      }),
+      { hmacKey: 'host-steward-secret-key-0123456789', requireHmac: true, source: 'host-default' },
+    )
+    assert.deepEqual(
+      resolveStewardHmacKeyState({
+        hmacKeyEnv: 'OC_STEWARD_HMAC_KEY',
+        requireRootOwner: false,
+        allowHostDefault: false,
+        env,
+        isRoot: true,
+      }),
+      { requireHmac: false },
+    )
+    assert.deepEqual(
+      resolveStewardHmacKeyState({
+        hmacKeyEnv: 'OC_STEWARD_HMAC_KEY',
+        requireRootOwner: false,
+        allowHostDefault: true,
+        receiptDirs: ['/tmp/dir'],
+        env,
+        isRoot: true,
+      }),
+      { requireHmac: false },
+    )
+
+    // 4. Non-root EACCES on valid 0600 key -> requireHmac: true (NO plain sha256 downgrade!)
+    const nonRootEaccesState = resolveStewardHmacKeyState({
+      hmacKeyEnv: 'OC_STEWARD_HMAC_KEY',
+      requireRootOwner: true,
+      allowHostDefault: true,
+      env,
+      isRoot: false,
+      loadKeyFile: () => ({
+        present: true,
+        ok: false,
+        reason: `failed to read HMAC key file ${keyPath}: EACCES: permission denied`,
+      }),
+    })
+    assert.deepEqual(nonRootEaccesState, {
+      hmacKey: undefined,
+      requireHmac: true,
+      source: 'host-default',
+    })
+    const plainReceipt = signArchStewardReceipt(
+      makeUnsignedReceipt({
+        headSha: 'a'.repeat(40),
+        baseSha: 'b'.repeat(40),
+        triggers: ['CLONE_OR_T2_CORE_PATH'],
+      }),
+    )
+    const verDown = verifyArchStewardReceipt(plainReceipt, {
+      headSha: 'a'.repeat(40),
+      baseSha: 'b'.repeat(40),
+      requiredTriggers: ['CLONE_OR_T2_CORE_PATH'],
+      hmacKey: nonRootEaccesState.hmacKey,
+      requireHmac: nonRootEaccesState.requireHmac,
+      rootFileIntegrity: true,
+    })
+    assert.equal(verDown.ok, false, 'non-root EACCES on host .hmac-key MUST reject local plain sha256 receipt')
+    assert.ok(verDown.violations.some((v) => v.code === 'STEWARD-RECEIPT-DIGEST-MISMATCH'))
+
+    // 5. Loose permissions (0644) -> throws fail-closed
+    chmodSync(keyPath, 0o644)
+    assert.throws(
+      () =>
+        resolveStewardHmacKeyState({
+          hmacKeyEnv: 'OC_STEWARD_HMAC_KEY',
+          requireRootOwner: false,
+          allowHostDefault: true,
+          env,
+          isRoot: true,
+        }),
+      /mode 0600\/0400/,
+    )
+
+    // 6. B2 exclusive override: an empty --receipt-dir / OC_STEWARD_RECEIPT_DIR MUST NOT fall back to host default dir!
+    chmodSync(keyPath, 0o600)
+    const hostReceiptDir = path.join(tmp, 'steward-receipts')
+    const emptyOverrideDir = path.join(tmp, 'empty-override-receipts')
+    mkdirSync(hostReceiptDir, { recursive: true })
+    mkdirSync(emptyOverrideDir, { recursive: true })
+    const repo = initTempGitRepo()
+    t.after(() => rmSync(repo.dir, { recursive: true, force: true }))
+    const baseSha = repo.git(['rev-parse', 'HEAD'])
+    repo.write('packages/gateway/src/b2FallbackGuard.ts', 'export const b2 = 1\n')
+    const headSha = repo.commit('feat(v5): touch gateway core for B2 exclusive override guard')
+    const plainHostReceipt = signArchStewardReceipt(
+      makeUnsignedReceipt({
+        headSha,
+        baseSha,
+        triggers: ['CLONE_OR_T2_CORE_PATH'],
+      }),
+    )
+    writeFileSync(path.join(hostReceiptDir, `${headSha}.json`), JSON.stringify(plainHostReceipt, null, 2))
+
+    // Without override: host .hmac-key rejects plain sha256 receipt
+    const cleanB2Env = Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([k]) => k !== 'OC_STEWARD_HMAC_KEY' && k !== 'OC_STEWARD_RECEIPT_DIR',
+      ),
+    )
+    const rHostPlain = spawnSync(
+      'npx',
+      [
+        '--no-install',
+        'tsx',
+        AUDIT_SCRIPT,
+        '--enforce-commit',
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--unsafe-test-skip-owner',
+      ],
+      { cwd: ROOT, env: { ...cleanB2Env, OC_GOVERNOR_ROOT: tmp }, encoding: 'utf8' },
+    )
+    assert.equal(rHostPlain.status, 1, 'host default dir with .hmac-key MUST reject plain sha256 receipt')
+
+    // With empty --receipt-dir override: MUST NOT fall back to host default dir and accept plain sha256!
+    const rEmptyDir = spawnSync(
+      'npx',
+      [
+        '--no-install',
+        'tsx',
+        AUDIT_SCRIPT,
+        '--enforce-commit',
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--receipt-dir',
+        emptyOverrideDir,
+        '--unsafe-test-skip-owner',
+      ],
+      { cwd: ROOT, env: { ...cleanB2Env, OC_GOVERNOR_ROOT: tmp }, encoding: 'utf8' },
+    )
+    assert.equal(rEmptyDir.status, 1, 'empty --receipt-dir override MUST NOT fall back to host default plain-sha256 receipt')
+    assert.match(`${rEmptyDir.stdout}\n${rEmptyDir.stderr}`, /STEWARD-RECEIPT-MISSING/)
+
+    // With empty OC_STEWARD_RECEIPT_DIR override: also MUST NOT fall back to host default dir!
+    const rEmptyEnvDir = spawnSync(
+      'npx',
+      [
+        '--no-install',
+        'tsx',
+        AUDIT_SCRIPT,
+        '--enforce-commit',
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--unsafe-test-skip-owner',
+      ],
+      {
+        cwd: ROOT,
+        env: { ...cleanB2Env, OC_GOVERNOR_ROOT: tmp, OC_STEWARD_RECEIPT_DIR: emptyOverrideDir },
+        encoding: 'utf8',
+      },
+    )
+    assert.equal(rEmptyEnvDir.status, 1, 'empty OC_STEWARD_RECEIPT_DIR MUST NOT fall back to host default plain-sha256 receipt')
+    assert.match(`${rEmptyEnvDir.stdout}\n${rEmptyEnvDir.stderr}`, /STEWARD-RECEIPT-MISSING/)
+  })
+
+  test('B1: arch-steward-review.sh with file-only .hmac-key (no OC_STEWARD_HMAC_KEY env) produces hmac-sha256 receipt accepted by release train', (t) => {
+    const repo = initTempGitRepo()
+    const govRoot = mkdtempSync(path.join(tmpdir(), 'steward-b1-gov-'))
+    t.after(() => {
+      rmSync(repo.dir, { recursive: true, force: true })
+      rmSync(govRoot, { recursive: true, force: true })
+    })
+    const ctrlDir = path.join(govRoot, 'control')
+    mkdirSync(ctrlDir, { recursive: true })
+    const keyPath = path.join(ctrlDir, '.hmac-key')
+    writeFileSync(keyPath, 'b1-file-only-host-hmac-secret-9876543210\n')
+    chmodSync(keyPath, 0o600)
+
+    const baseSha = repo.git(['rev-parse', 'HEAD'])
+    repo.write('packages/gateway/src/b1HmacParity.ts', 'export const b1 = 1\n')
+    const headSha = repo.commit('feat(v5): touch gateway core for B1 file-only HMAC parity test')
+
+    const approvePayload = JSON.stringify({
+      verdict: 'approve',
+      dimensions: {
+        godClassAppend: { status: 'pass', notes: 'No append magnet touched.' },
+        wheelReinvention: { status: 'pass', notes: 'No clones.' },
+        boundaryIntegrity: { status: 'pass', notes: 'Clean boundary.' },
+        complexityDrift: { status: 'pass', notes: 'Trivial module.' },
+      },
+      blockers: [],
+    })
+    const fakeCmd = `node -e 'process.stdout.write(process.argv[1])' '${approvePayload}'`
+    const baseEnv = Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([k]) => k !== 'OC_STEWARD_HMAC_KEY' && k !== 'OC_STEWARD_RECEIPT_DIR',
+      ),
+    )
+    const cleanEnv: NodeJS.ProcessEnv = {
+      ...baseEnv,
+      OC_GOVERNOR_ROOT: govRoot,
+      OC_STEWARD_REVIEW_CMD: fakeCmd,
+    }
+
+    const rWrap = spawnSync(
+      'bash',
+      [
+        REVIEW_SH,
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--author-model',
+        'gemini-4-neon',
+        '--steward-model',
+        'gpt-6.2-astra',
+        '--channel',
+        'command',
+        '--unsafe-test-skip-owner',
+      ],
+      { env: cleanEnv, encoding: 'utf8' },
+    )
+    assert.equal(rWrap.status, 0, `wrapper failed: stdout=${rWrap.stdout}\nstderr=${rWrap.stderr}`)
+
+    const producedPath = path.join(govRoot, 'steward-receipts', `${headSha}.json`)
+    assert.ok(existsSync(producedPath), `expected receipt at ${producedPath}`)
+    const producedDoc = JSON.parse(readFileSync(producedPath, 'utf8'))
+    assert.match(
+      String(producedDoc.receiptDigest ?? ''),
+      /^hmac-sha256:[0-9a-f]{64}$/,
+      'wrapper targeting host governor root with .hmac-key MUST sign with hmac-sha256',
+    )
+
+    // Verify exact release-train invocation (--hmac-key-file) AND default host auto-discovery both ACCEPT it
+    const rTrainExplicit = spawnSync(
+      'npx',
+      [
+        '--no-install',
+        'tsx',
+        AUDIT_SCRIPT,
+        '--enforce-commit',
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--hmac-key-file',
+        keyPath,
+        '--unsafe-test-skip-owner',
+      ],
+      { cwd: ROOT, env: cleanEnv, encoding: 'utf8' },
+    )
+    assert.equal(
+      rTrainExplicit.status,
+      0,
+      `train explicit --hmac-key-file rejected wrapper receipt: ${rTrainExplicit.stdout}\n${rTrainExplicit.stderr}`,
+    )
+
+    const rTrainAuto = spawnSync(
+      'npx',
+      [
+        '--no-install',
+        'tsx',
+        AUDIT_SCRIPT,
+        '--enforce-commit',
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--unsafe-test-skip-owner',
+      ],
+      { cwd: ROOT, env: cleanEnv, encoding: 'utf8' },
+    )
+    assert.equal(
+      rTrainAuto.status,
+      0,
+      `default host auto-discovery rejected wrapper receipt: ${rTrainAuto.stdout}\n${rTrainAuto.stderr}`,
+    )
   })
 })
