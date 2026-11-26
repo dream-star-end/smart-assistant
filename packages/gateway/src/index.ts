@@ -172,8 +172,13 @@ export {
   SESSION_BG_COMMAND_ID_RE,
   cancelSessionBgCommand,
   listSessionBgCommands,
+  reapSessionBgCommandsByClass,
+  sweepExpiredSessionBgCommands,
   type CancelSessionBgCommandResult,
+  type ReapSessionBgCommandsResult,
   type SessionBgCommandItem,
+  type SessionBgCommandOwnerFilter,
+  type SweepExpiredSessionBgCommandsResult,
 } from './sessionBgCommands.js'
 export {
   cancelSingleDelegateJob,

@@ -34,6 +34,14 @@ import {
   executeDriverVerificationRun,
 } from './verificationExecutor.js'
 import { proveVerificationRunLocalStopped } from './verificationRuntimeProof.js'
+import {
+  type LegacyHistoricalTurnRecord,
+  createLegacyBillingReadOnlyShell,
+} from './legacyRetirement.js'
+import {
+  type LegacyRetirementGateStatus,
+  LegacyTrackRetirementGate,
+} from './legacyRetirementRuntime.js'
 
 const UUID_RE = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i
 const DEFAULT_CUTOVER_DEADLINE_MS = 12 * 60_000
@@ -68,6 +76,7 @@ export interface RemoteDriverV4CommissioningServiceDeps {
   ) => { probe(context: Record<string, unknown>): Promise<RemotePoolProbeOutput> }
   readonly recoveryFixtures?: Parameters<typeof reconcileRemoteLane>[3]
   readonly onJobSettled?: (job: CutoverJobRecord) => void
+  readonly legacyRetirementGate?: LegacyTrackRetirementGate
 }
 
 async function releaseVerificationBindingsForProfile(
@@ -210,6 +219,7 @@ export class RemoteDriverV4CommissioningService {
 
   async revertToLegacy(profileId: string): Promise<Record<string, unknown>> {
     need(UUID_RE.test(profileId), 'REMOTE_PROFILE_ID_INVALID')
+    await this.deps.legacyRetirementGate?.assertLegacyPlacementAllowedAsync()
     const pool = this.deps.executorDeps.pool
     const liveContainer = await this.deps.executorDeps.containerSource().catch(() => null)
     await releaseVerificationBindingsForProfile(
@@ -237,6 +247,39 @@ export class RemoteDriverV4CommissioningService {
       readyGeneration: reverted.readyGeneration,
       syncedOffers,
     }
+  }
+
+  async getLegacyRetirementStatus(): Promise<LegacyRetirementGateStatus> {
+    if (this.deps.legacyRetirementGate) {
+      return await this.deps.legacyRetirementGate.getStatus()
+    }
+    const fallback = new LegacyTrackRetirementGate({
+      queryable: this.deps.executorDeps.pool,
+      mode: 'force_off',
+    })
+    return await fallback.getStatus()
+  }
+
+  async lookupLegacyHistoricalTurn(input: {
+    readonly requestId: string
+    readonly userId?: number | bigint
+  }): Promise<LegacyHistoricalTurnRecord | null> {
+    if (this.deps.legacyRetirementGate) {
+      return await this.deps.legacyRetirementGate.lookupHistoricalTurn(input)
+    }
+    return await createLegacyBillingReadOnlyShell(this.deps.executorDeps.pool).lookupHistoricalTurn(
+      input,
+    )
+  }
+
+  async sealLegacyRetirement(adminUid = 3): Promise<LegacyRetirementGateStatus> {
+    need(this.deps.legacyRetirementGate !== undefined, 'LEGACY_RETIREMENT_GATE_UNAVAILABLE')
+    return await this.deps.legacyRetirementGate.seal(adminUid)
+  }
+
+  async unsealLegacyRetirement(adminUid = 3): Promise<LegacyRetirementGateStatus> {
+    need(this.deps.legacyRetirementGate !== undefined, 'LEGACY_RETIREMENT_GATE_UNAVAILABLE')
+    return await this.deps.legacyRetirementGate.unseal(adminUid)
   }
 
   private async launchJob(

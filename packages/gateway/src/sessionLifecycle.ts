@@ -32,6 +32,7 @@ import {
   unmarkSessionCompacting,
 } from './sessionCheckpointStore.js'
 import { clearSessionAutoCompactState } from './sessionAutoCompact.js'
+import { runPeriodicBgCommandSweep } from './sessionBgCommands.js'
 import {
   abandonAllIdle,
   consumeIdleReset,
@@ -580,15 +581,14 @@ export async function runEvictionPass(this: SessionLifecycleHost): Promise<Evict
 
 // 周期性 LRU 驱逐 — webchat sessions survive much longer than cron/task sessions
 export function startEvictionLoop(this: SessionLifecycleHost, intervalMs = 60_000): () => void {
-  // 2026-04-22 Codex R1 N11:await 每个 runner.shutdown() 完成后才 delete + onSessionDestroyed。
-  // 用 async IIFE 不阻塞 interval 队列(每轮 eviction 独立跑,上一轮若卡住不影响下一轮)。
   let _inFlight = false
   const t = setInterval(() => {
-    if (_inFlight) return // 防并行:shutdown 链慢 → 跳过本轮,下一轮再扫
+    if (_inFlight) return
     _inFlight = true
     ;(async () => {
       try {
         await runEvictionPass.call(this)
+        await runPeriodicBgCommandSweep(log)
       } finally {
         _inFlight = false
       }

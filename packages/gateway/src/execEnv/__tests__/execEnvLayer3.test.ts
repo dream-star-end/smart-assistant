@@ -164,7 +164,7 @@ describe('Layer 3 JobRegistry (ExecEnvJobRegistry & BoundedDeltaStreamBuffer)', 
       leaseId: lease1.leaseId,
       sessionKey: lease1.sessionKey,
       lifecycleClass: 'managed_job',
-      command: ['/bin/sh', '-c', 'echo phase1; sleep 0.25; echo phase2'],
+      command: ['/bin/sh', '-c', 'echo phase1; sleep 1.5; echo phase2'],
       yieldAfterMs: 80,
       label: 'long-build',
     })
@@ -222,7 +222,7 @@ describe('Layer 3 JobRegistry (ExecEnvJobRegistry & BoundedDeltaStreamBuffer)', 
     const finished = await reg.waitJob(managed.jobId, {
       leaseId: rebound.lease.leaseId,
       action: 'wait',
-      timeoutMs: 3_000,
+      timeoutMs: 5_000,
       fromCursor: managed.nextStdoutCursor,
     })
     assert.equal(finished.status, 'exited')

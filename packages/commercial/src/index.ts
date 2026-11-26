@@ -1215,8 +1215,7 @@ export async function registerCommercial(
   // V3 Phase 3 supervisor 装配 —— 必须在 createCommercialHandler 之前构造,
   // 因为 admin/containers HIGH#6 路径要在 deps.v3Supervisor 上 dispatch v3 行。
   // 见下方 idleSweep / volumeGc / orphanReconcile / makeV3EnsureRunning 都复用 v3Deps。
-  let v3Deps: V3SupervisorDeps | undefined;
-  let cc5Runtime: ReturnType<typeof createMasterCc5Runtime>;
+  let v3Deps: V3SupervisorDeps | undefined; let cc5Runtime: ReturnType<typeof createMasterCc5Runtime>; let legacyRetirementGate: ReturnType<typeof assembleV3SupervisorCore>["legacyRetirementGate"] | undefined;
   if (cfg.OC_RUNTIME_IMAGE) {
     const assembled = assembleV3SupervisorCore({
       env: process.env,
@@ -1231,9 +1230,7 @@ export async function registerCommercial(
       selfHostUuid,
       sessionsDeletedRef,
     });
-    const v3Docker = assembled.v3Docker;
-    v3Deps = assembled.v3Deps;
-    cc5Runtime = assembled.cc5Runtime;
+    const v3Docker = assembled.v3Docker; v3Deps = assembled.v3Deps; cc5Runtime = assembled.cc5Runtime; legacyRetirementGate = assembled.legacyRetirementGate;
     cc5RuntimeRef.current = cc5Runtime;
 
     if (dualMasterEnabled && controlPlaneEnabled) {
@@ -1455,7 +1452,7 @@ export async function registerCommercial(
     && modelAuthoritySigner && modelAuthorityProvisionRequired && modelCatalogCache && v3Deps
     ? new CodexCommissioning({pool:getPool(),preCheckRedis,catalog:modelCatalogCache,keyring:()=>modelAuthoritySigner!.publicKeyring(),
       signer:modelAuthoritySigner,loadUserModelAuthz,log:rootLogger.child({subsys:"codexCommissioning"}),
-      containerSource:makeAdminCommissionContainerSource(v3Deps)}) : undefined;
+      containerSource:makeAdminCommissionContainerSource(v3Deps),legacyRetirementGate}) : undefined;
   const v4ExecutorDeps = runtimeChannel === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost"
     && modelAuthoritySigner && modelAuthorityProvisionRequired && modelCatalogCache && v3Deps
     ? { pool: getPool(), preCheckRedis, catalog: modelCatalogCache, keyring: () => modelAuthoritySigner!.publicKeyring(),
@@ -1463,7 +1460,7 @@ export async function registerCommercial(
         containerSource: makeAdminCommissionContainerSource(v3Deps) }
     : undefined;
   const remoteDriverV4 = v4ExecutorDeps
-    ? new RemoteDriverV4CommissioningService({ executorDeps: v4ExecutorDeps })
+    ? new RemoteDriverV4CommissioningService({ executorDeps: v4ExecutorDeps, legacyRetirementGate })
     : undefined;
   const qqBotServiceRef: { current: QqBotService | undefined } = { current: undefined };
   const pendingDecisionsRuntime = createCommercialPendingDecisionsRuntime({

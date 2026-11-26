@@ -995,7 +995,7 @@
   "R3-env|packages/mcp-memory/src/index.ts|-": 20,
   "R3-env|packages/mcp-memory/src/localCliTools.ts|-": 2,
   "R3-env|packages/mcp-memory/src/memoryTools.ts|-": 3,
-  "R3-env|packages/mcp-memory/src/ocBashJobManager.ts|-": 4,
+  "R3-env|packages/mcp-memory/src/ocBashJobManager.ts|-": 3,
   "R3-env|packages/mcp-memory/src/ocMemoryCli.ts|-": 4,
   "R3-env|packages/mcp-memory/src/presentTaskApproval.ts|-": 1,
   "R3-env|packages/mcp-memory/src/projectFileSearch.ts|-": 2,

@@ -32,6 +32,7 @@ import {
   claimInflightJournalForSettlement, finalizeInflightJournal, settleUsageAndLedger,
   startInflightJournal, type BillingAuthorityStamp,
 } from './proxyBilling.js'
+import { assertLegacyBillingGateAllowed, assertLegacyTrackNotRetiredTx, type LegacyBillingGatePort } from '../account-pool/remotePool/legacyRetirementRuntime.js'
 
 export { REMOTE_NATIVE_BILLING_RECOVERY_VERSION } from './remoteNativeBillingIdentity.js'
 const BACKEND = 'cc5-interactive-v1'
@@ -86,6 +87,8 @@ export interface RemoteNativeTurnFinanceDeps {
   /** The lane node's CLI model (target upstream). */
   upstreamModel: string
   now?: () => number
+  /** OCV5-908 P2-2: when sealed, fails closed before writing any legacy billing journal. */
+  legacyRetirementGate?: LegacyBillingGatePort
 }
 /** Primitive substitutes are for isolated tests only. Production passes no second argument. */
 export interface RemoteNativeFinanceFixtures {
@@ -401,6 +404,7 @@ export function createRemoteNativeTurnFinance(
       return v4Port.admit(input)
     },
     async admit(input) {
+    await assertLegacyBillingGateAllowed(deps.legacyRetirementGate)
     const scope = scopeOf(input.binding, deps.upstreamModel)
     need(scope.expiresAt > now() && input.sessionKey === scope.sessionKey && HASH.test(input.turnKey))
     const keys = typeof deps.keyring === 'function' ? deps.keyring() : deps.keyring
@@ -443,8 +447,10 @@ export function createRemoteNativeTurnFinance(
     need(pricing)
     const client = await deps.pool.connect()
     let dispatch: { dispatch_id: string; attempt_no: number; session_id: string; turn_key: string | null; authority_turn_key: string | null }
+    let c!: Context
     try {
       await client.query('BEGIN')
+      await assertLegacyTrackNotRetiredTx(client, 'billing')
       if (engine === 'codex') {
         await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`remote-finance:${scope.uid}:${scope.operationId}`])
         const pending = await client.query(`SELECT 1 FROM request_finalize_journal
@@ -468,9 +474,7 @@ export function createRemoteNativeTurnFinance(
         && typeof selected.session_id === 'string'
         && (selected.turn_key === null || selected.turn_key === input.turnKey)
         && (selected.authority_turn_key === null || selected.authority_turn_key === input.turnKey))
-      // The gateway derives turnKey after master admission. Bind it exactly
-      // once under the already-signed dispatch identity, never by request key
-      // alone. Lock both records so renewal cannot race a different binding.
+      // Bind derived turnKey once under signed dispatch identity; lock both rows.
       const bound = await client.query(`/* remote-native:bind-turn */
         WITH authority_bound AS (
           UPDATE authority_turn_dispatches SET turn_key=$6
@@ -483,24 +487,18 @@ export function createRemoteNativeTurnFinance(
              AND EXISTS(SELECT 1 FROM authority_bound WHERE dispatch_id=$3)`,
       [a.authorityTurnId, scope.uid, selected.dispatch_id, selected.attempt_no, selected.session_id, input.turnKey])
       need(bound.rowCount === 1)
-      await client.query('COMMIT')
       dispatch = selected
+      c = { v: scope.backendKind === BACKEND ? 1 : 2, scope, requestId: a.billingRequestId, turnKey: input.turnKey,
+        authorityTurnId: a.authorityTurnId, dispatchId: dispatch.dispatch_id, attemptNo: dispatch.attempt_no,
+        sessionId: dispatch.session_id, pricing: serializeBillingPricing(pricing), billingRevision: gate.snapshot.billingRevision,
+        authority: { kind: 'bridge_signed', executionRevision: gate.executionRevision, projectionRevision: null, securityEpoch: gate.securityEpoch.toString() },
+        hostStartAttempted: false, input: null, receipt: null, reserved: false, reservedCredits: '0' }
+      need(await startInflightJournal(client, { requestId: c.requestId, userId: BigInt(scope.uid), containerId: BigInt(scope.containerDbId), model: scope.canonicalModel, precheckCredits: REMOTE_NATIVE_RESERVATION_CREDITS, dispatchId: c.dispatchId, attemptNo: c.attemptNo, ctxJson: { remoteNativeBillingRecovery: marker(c), remoteNative: c } }))
+      await client.query('COMMIT')
     } catch (err) {
       try { await client.query('ROLLBACK') } catch { /* unknown binding cannot launch a worker */ }
       throw err
     } finally { client.release() }
-    const c: Context = { v: scope.backendKind === BACKEND ? 1 : 2, scope, requestId: a.billingRequestId, turnKey: input.turnKey,
-      authorityTurnId: a.authorityTurnId, dispatchId: dispatch.dispatch_id, attemptNo: dispatch.attempt_no,
-      sessionId: dispatch.session_id, pricing: serializeBillingPricing(pricing),
-      billingRevision: gate.snapshot.billingRevision,
-      authority: { kind: 'bridge_signed', executionRevision: gate.executionRevision,
-        projectionRevision: null, securityEpoch: gate.securityEpoch.toString() },
-      hostStartAttempted: false, input: null, receipt: null, reserved: false, reservedCredits: '0' }
-    const started = await startInflightJournal(deps.pool, { requestId: c.requestId,
-      userId: BigInt(scope.uid), containerId: BigInt(scope.containerDbId), model: scope.canonicalModel,
-      precheckCredits: REMOTE_NATIVE_RESERVATION_CREDITS, dispatchId: c.dispatchId, attemptNo: c.attemptNo,
-      ctxJson: { remoteNativeBillingRecovery: marker(c), remoteNative: c } })
-    need(started) // do not overwrite/release another invocation's reservation
     const prehostAbort = async (reason: 'USER_CANCELLED' | 'INTERNAL_ERROR', provenNoHostEffect = false, diagnostic = 'remote_native_prehost_stopped'): Promise<boolean> => {
       const row = await deps.pool.query(`/* remote-native:prehost-abort */
         UPDATE request_finalize_journal SET state='aborted',final_credits=0,
