@@ -7,11 +7,17 @@ import { validateRuntimeImagePin } from './runtimeImagePin.js'
 export {
   type A0ApprovalReceipt,
   type ApprovalVerification,
+  buildA0CanonicalPayload,
+  canonicalizeA0AllowedPaths,
   computeA0ReceiptDigest,
+  computeA0ReceiptHmac,
   globToRegExp,
   isPlainObject,
   matchesAnyGlob,
+  readValidatedHmacKeyFile,
+  verifyA0ApprovalFile,
   verifyA0ApprovalReceipt,
+  verifyA0ApprovalUnified,
 } from './a0ApprovalReceipt.js'
 
 export interface A0Finding {
@@ -571,4 +577,135 @@ export function evaluateShrinkOnlyJsonChange(
   return violations.length > 0
     ? violations
     : [{ path: filePath, tier: 'A1', rule: 'A1-BASELINE-SHRUNK', detail: `${filePath} monotonically tightened` }]
+}
+
+export const POLICY_PATH = 'arch/a0-protected-paths.json'
+
+export interface A0Category {
+  id: string
+  description: string
+  paths?: string[]
+  gateGlobs?: string[]
+}
+
+export interface A0Policy {
+  schemaVersion: 1
+  approvalDefaults?: {
+    hostApprovalDir?: string
+    envApprovalDir?: string
+    receiptSchemaVersion?: number
+  }
+  a0Categories: A0Category[]
+  a1MonotonicSurfaces: {
+    declarativePins: string[]
+    newGateGlobs: string[]
+    moduleMap: string
+    fileSizeBaseline: string
+    fileSizeExceptions: string
+    designTokensExempt: string
+    aiSmellsBaseline: string
+    violationsBaseline: string
+    budgets: string
+    contextEvalBaseline: string
+    featureFlagsRegistry: string
+    countRatchetBaselines: string[]
+    shrinkOnlyBaselines: string[]
+  }
+}
+
+export type DiffStatus = 'A' | 'M' | 'D' | 'R' | 'C' | 'T'
+
+export interface DiffEntry {
+  status: DiffStatus
+  path: string
+  oldPath?: string
+}
+
+const REQUIRED_BOOTSTRAP_CATEGORIES = [
+  'a0-meta-referee',
+  'monotonic-baseline-checkers',
+  'ci-workflows-and-gate-manifests',
+  'host-control-plane-and-deploy',
+  'billing-accounting-core',
+  'permission-and-contract-core',
+] as const
+
+const DISALLOWED_BOOTSTRAP_RULES = new Set([
+  'A0-PROTECTED-DELETED',
+  'A0-PROTECTED-RENAMED',
+  'A0-GATE-DELETED',
+  'A0-GATE-RENAMED',
+  'A0-FILESIZE-SLACK-NONZERO',
+  'A0-PIN-DELETED',
+  'A0-PIN-INVALID-JSON',
+  'A0-PIN-SCHEMA-INVALID',
+  'A0-MODULES-DELETED',
+  'A0-BASELINE-DELETED',
+  'A0-BUDGET-RAISED',
+  'A0-BUDGET-REMOVED',
+  'A0-FLAG-TTL-EXTENDED',
+  'A0-FLAG-MADE-PERMANENT',
+  'A0-EXCEPTION-ADDED',
+  'A0-EXCEPTION-RENEWED',
+  'A0-EXCEPTION-RAISED',
+])
+
+export function validateBootstrapNonWeakening(
+  policy: A0Policy,
+  a0Blocks: readonly A0Finding[],
+): string[] {
+  const errors: string[] = []
+  const byId = new Map(policy.a0Categories.map((c) => [c.id, c]))
+  for (const catId of REQUIRED_BOOTSTRAP_CATEGORIES) {
+    const cat = byId.get(catId)
+    if (!cat || (!cat.paths?.length && !cat.gateGlobs?.length)) {
+      errors.push(`bootstrap policy missing required A0 category "${catId}"`)
+    }
+  }
+  const metaPaths = new Set(byId.get('a0-meta-referee')?.paths ?? [])
+  for (const reqPath of [POLICY_PATH, 'scripts/check-a0-monotonic.ts', '.github/CODEOWNERS']) {
+    if (!metaPaths.has(reqPath)) {
+      errors.push(`bootstrap policy a0-meta-referee must protect "${reqPath}"`)
+    }
+  }
+  for (const blk of a0Blocks) {
+    if (DISALLOWED_BOOTSTRAP_RULES.has(blk.rule)) {
+      errors.push(`bootstrap disallowed weakening rule ${blk.rule} at ${blk.path}: ${blk.detail}`)
+    }
+  }
+  return errors
+}
+
+export function parsePolicy(raw: unknown): A0Policy {
+  if (
+    !isPlainObject(raw) ||
+    raw.schemaVersion !== 1 ||
+    !Array.isArray(raw.a0Categories) ||
+    !isPlainObject(raw.a1MonotonicSurfaces)
+  ) {
+    throw new Error(`${POLICY_PATH} must have schemaVersion=1, a0Categories[], and a1MonotonicSurfaces`)
+  }
+  return raw as unknown as A0Policy
+}
+
+export function parseNameStatusZ(raw: string): DiffEntry[] {
+  const parts = raw.split('\0')
+  const out: DiffEntry[] = []
+  let i = 0
+  while (i < parts.length) {
+    const code = parts[i++]
+    if (!code) break
+    const status = code[0] as DiffStatus
+    if (status === 'R' || status === 'C') {
+      const oldPath = parts[i++]
+      const newPath = parts[i++]
+      if (oldPath && newPath) {
+        out.push({ status, oldPath, path: newPath })
+      }
+    } else {
+      const filePath = parts[i++]
+      if (filePath) out.push({ status, path: filePath })
+    }
+  }
+  return out
 }

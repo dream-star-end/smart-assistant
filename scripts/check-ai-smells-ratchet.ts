@@ -24,10 +24,11 @@
  * Exit: 0 ok, 1 violations (in --enforce mode), 2 usage/missing-baseline error.
  */
 import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import ts from 'typescript'
+import { checkGatewayCoverage, discoverPackagesProdFiles } from './lib/prodFileDiscovery.js'
 
 export const BASELINE_PATH = 'arch/ai-smells-baseline.json'
 export const SMELL_CATEGORIES = ['emptyCatch', 'typeEscape', 'syncIo', 'lintSuppress'] as const
@@ -217,46 +218,27 @@ export function scanSourceForAiSmells(filePath: string, sourceText: string): {
   return { counts, hits }
 }
 
+const AI_SMELLS_SKIP_DIRS = new Set([
+  'node_modules',
+  'dist',
+  'dist-types',
+  'build',
+  'generated',
+  '__tests__',
+  '__smoke__',
+])
+
 export function collectProductionFiles(root: string): string[] {
-  const pkgRoot = path.join(root, 'packages')
-  if (!existsSync(pkgRoot)) return []
-  const out: string[] = []
+  return discoverPackagesProdFiles({
+    root,
+    skipDirs: AI_SMELLS_SKIP_DIRS,
+    includeFile: isAiSmellsProductionFile,
+    fallbackRootSrc: false,
+  })
+}
 
-  const walk = (relDir: string) => {
-    const absDir = path.join(root, relDir)
-    if (!existsSync(absDir)) return
-    for (const ent of readdirSync(absDir, { withFileTypes: true })) {
-      if (
-        ent.name === 'node_modules' ||
-        ent.name === 'dist' ||
-        ent.name === 'dist-types' ||
-        ent.name === 'build' ||
-        ent.name === 'generated' ||
-        ent.name === '__tests__' ||
-        ent.name === '__smoke__'
-      ) {
-        continue
-      }
-      const nextRel = `${relDir}/${ent.name}`
-      if (ent.isDirectory()) {
-        walk(nextRel)
-      } else if (ent.isFile() && isAiSmellsProductionFile(nextRel)) {
-        out.push(nextRel)
-      }
-    }
-  }
-
-  for (const pkg of readdirSync(pkgRoot).sort()) {
-    if (pkg === 'channels') {
-      const chRoot = path.join(pkgRoot, 'channels')
-      if (existsSync(chRoot)) {
-        for (const ch of readdirSync(chRoot).sort()) walk(`packages/channels/${ch}/src`)
-      }
-    } else {
-      walk(`packages/${pkg}/src`)
-    }
-  }
-  return out.sort()
+export function checkDiscoveryCoverage(root: string, discoveredFiles: readonly string[]): string | null {
+  return checkGatewayCoverage(root, discoveredFiles)
 }
 
 export function sumCounts(filesMap: Record<string, SmellCounts>): SmellCounts & { all: number } {
@@ -452,6 +434,15 @@ function main(argv: string[]): number {
   } catch (err) {
     console.error(`[check-ai-smells-ratchet] git root error: ${(err as Error).message}`)
     return 2
+  }
+
+  if (enforce && !explicitFiles) {
+    const discovered = collectProductionFiles(repoRoot)
+    const coverageErr = checkDiscoveryCoverage(repoRoot, discovered)
+    if (coverageErr) {
+      console.error(`[GATE-ERROR] AI-SMELLS-RATCHET (coverage-zero): ${coverageErr}`)
+      return 1
+    }
   }
 
   const scan = scanRepository(repoRoot, explicitFiles)

@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# oc-governor.sh — Host Physical 4-Gate Governance Control Plane (OCV5-906).
+# oc-governor.sh — Host Physical 4-Gate Governance Control Plane (OCV5-906 / OCV5-903 B2 & B3).
 #
 # Physical Gates:
 #   1. Global Operating Mode   : mode [show | autonomous | debt_first | emergency_stop] --reason "..."
 #   2. A0 Relaxation Seal      : approve-a0 / revoke-a0 / verify-a0 (--sha <40hex>)
+#                                Byte-level parity with scripts/lib/a0ApprovalReceipt.ts:
+#                                trimmed reason (>=8), canonical allowedPaths binding,
+#                                optional root-only 0600 ${ROOT}/control/.hmac-key (no downgrade),
+#                                strict root-owner/non-symlink/non-writable checks, and
+#                                optional --publish-github-status (oc-v5/a0-approval).
 #   3. Blast-Radius Hard-Lock  : check-blast-radius --branch <br> --files <...> [--voucher <path>]
 #                                issue-blast-voucher --scope <ddl|billing> --files <...> --reason "..."
 #   4. Dual Circuit Breaker    : record-rollback / trip-breaker / check-cost-breaker / unlock-breaker
@@ -14,6 +19,7 @@ GOV_ROOT="${OC_GOVERNOR_ROOT:-/opt/openclaude/harness-gate}"
 CTRL_DIR="$GOV_ROOT/control"
 APPROVALS_DIR="$CTRL_DIR/a0-approvals"
 VOUCHERS_DIR="$CTRL_DIR/blast-vouchers"
+HMAC_KEY_FILE="$CTRL_DIR/.hmac-key"
 MODE_FILE="$CTRL_DIR/mode.json"
 AUDIT_FILE="$CTRL_DIR/audit.jsonl"
 ROLLBACKS_FILE="$CTRL_DIR/rollbacks.jsonl"
@@ -65,6 +71,33 @@ EOF
   atomic_write_file "$BREAKER_CARD_FILE" "$card" 0644
 }
 
+resolve_github_repo_slug() {
+  local explicit="${1:-}"
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
+    printf '%s\n' "$GITHUB_REPOSITORY"
+    return 0
+  fi
+  if [[ -n "${GH_REPO:-}" ]]; then
+    printf '%s\n' "$GH_REPO"
+    return 0
+  fi
+  local origin_url=""
+  origin_url="$(git remote get-url origin 2>/dev/null || true)"
+  if [[ -n "$origin_url" ]]; then
+    python3 - "$origin_url" <<'PY'
+import re, sys
+url = sys.argv[1].strip()
+m = re.search(r"github\.com[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?$", url)
+if m:
+    print(m.group(1))
+PY
+  fi
+}
+
 # ── Gate 1: Global Operating Mode ──────────────────────────────────────────
 
 cmd_mode() {
@@ -105,7 +138,9 @@ cmd_mode() {
 # ── Gate 2: A0 Relaxation Approval Seal ────────────────────────────────────
 
 cmd_approve_a0() {
-  local sha="" reason="" ttl_hours="24"
+  local sha="" reason="" ttl_hours="24" publish_gh=0 gh_repo="" hmac_key_file="$HMAC_KEY_FILE"
+  local require_root_owner=1
+  [[ "${OC_GOVERNOR_UNSAFE_TEST_SKIP_OWNER:-0}" == "1" ]] && require_root_owner=0
   local -a allowed_paths=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -113,40 +148,123 @@ cmd_approve_a0() {
       --reason) reason="${2:-}"; shift 2 ;;
       --ttl-hours) ttl_hours="${2:-}"; shift 2 ;;
       --allowed-path) allowed_paths+=("${2:-}"); shift 2 ;;
+      --hmac-key-file) hmac_key_file="${2:-}"; shift 2 ;;
+      --publish-github-status) publish_gh=1; shift ;;
+      --github-repo) gh_repo="${2:-}"; shift 2 ;;
+      --unsafe-test-skip-owner) require_root_owner=0; shift ;;
       *) die_usage "unknown approve-a0 argument: $1" ;;
     esac
   done
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die_usage "--sha must be a 40-char lowercase hex commit SHA"
-  [[ ${#reason} -ge 8 ]] || die_usage "--reason must be at least 8 characters"
   [[ "$ttl_hours" =~ ^[0-9]+([.][0-9]+)?$ ]] || die_usage "--ttl-hours must be a positive number"
   ensure_dirs
-  local ts actor paths_joined="" out_payload doc_json risk_card
+  local ts actor paths_joined="" out_payload doc_json risk_card gh_desc
   ts="$(now_iso)"; actor="$(actor_name)"
   (( ${#allowed_paths[@]} > 0 )) && paths_joined="$(printf '%s\n' "${allowed_paths[@]}")"
 
-  out_payload="$(python3 - "$sha" "$reason" "$ttl_hours" "$ts" "$actor" "$paths_joined" <<'PY'
-import datetime as dt, hashlib, json, sys
-sha, reason, ttl_s, issued_iso, actor, paths_raw = sys.argv[1:]
+  out_payload="$(python3 - "$sha" "$reason" "$ttl_hours" "$ts" "$actor" "$paths_joined" "$hmac_key_file" "$require_root_owner" <<'PY'
+import datetime as dt, hashlib, hmac, json, os, stat, sys
+sha, raw_reason, ttl_s, issued_iso, actor, paths_raw, hmac_key_file, req_root_s = sys.argv[1:]
+req_root = req_root_s == "1"
+
+if "\n" in raw_reason or "\r" in raw_reason:
+    raise SystemExit("--reason must be a single-line string")
+reason = raw_reason.strip()
+if len(reason) < 8:
+    raise SystemExit("--reason must be at least 8 characters after trimming")
+
 ttl = float(ttl_s)
-if ttl <= 0 or ttl > 168: raise SystemExit("--ttl-hours must be in (0, 168]")
+if ttl <= 0 or ttl > 168:
+    raise SystemExit("--ttl-hours must be in (0, 168]")
+
 issued_dt = dt.datetime.fromisoformat(issued_iso.replace("Z", "+00:00"))
 expires_iso = (issued_dt + dt.timedelta(hours=ttl)).strftime("%Y-%m-%dT%H:%M:%SZ")
 issued_norm = issued_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-canonical = f"a0-approval-v1\nsha={sha}\nissuedAt={issued_norm}\nexpiresAt={expires_iso}\nreason={reason}\n"
+
+raw_lines = [p for p in paths_raw.splitlines()] if paths_raw else []
+paths = []
+if raw_lines:
+    for p in raw_lines:
+        if "\r" in p or "\n" in p or not p.strip():
+            raise SystemExit("--allowed-path entries must be non-empty single-line strings")
+        paths.append(p.strip())
+    paths = sorted(set(paths))
+
+paths_canonical = "*" if not paths else json.dumps(paths, separators=(",", ":"), ensure_ascii=False)
+canonical = (
+    f"a0-approval-v1\n"
+    f"sha={sha}\n"
+    f"issuedAt={issued_norm}\n"
+    f"expiresAt={expires_iso}\n"
+    f"reason={reason}\n"
+    f"allowedPaths={paths_canonical}\n"
+)
 digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+hmac_hex = None
+if hmac_key_file and (os.path.lexists(hmac_key_file)):
+    st = os.lstat(hmac_key_file)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise SystemExit(f"HMAC key file must be a regular file (no symlinks): {hmac_key_file}")
+    if (st.st_mode & 0o077) != 0:
+        raise SystemExit(f"HMAC key file must be mode 0600/0400 (no group/world access): {hmac_key_file}")
+    if req_root and st.st_uid != 0:
+        raise SystemExit(f"HMAC key file must be owned by root (uid=0, got uid={st.st_uid}): {hmac_key_file}")
+    key_str = open(hmac_key_file, encoding="utf-8").read().strip()
+    if not key_str:
+        raise SystemExit(f"HMAC key file is empty: {hmac_key_file}")
+    hmac_hex = hmac.new(key_str.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
 risk_card = f"[A0-RISK-CARD] SHA {sha[:12]} approved by {actor} until {expires_iso} (TTL {ttl:g}h) — Reason: {' '.join(reason.split())}"
-doc = {"schemaVersion": 1, "sha": sha, "reason": reason, "approvedBy": actor, "issuedAt": issued_norm, "expiresAt": expires_iso, "sha256": digest, "riskCard": risk_card}
-paths = [p.strip() for p in paths_raw.splitlines() if p.strip()]
-if paths: doc["allowedPaths"] = paths
-print(json.dumps({"doc": doc, "riskCard": risk_card}, ensure_ascii=False))
+doc = {
+    "schemaVersion": 1,
+    "sha": sha,
+    "reason": reason,
+    "approvedBy": actor,
+    "issuedAt": issued_norm,
+    "expiresAt": expires_iso,
+    "sha256": digest,
+    "riskCard": risk_card,
+}
+if hmac_hex is not None:
+    doc["hmacSha256"] = hmac_hex
+if paths:
+    doc["allowedPaths"] = paths
+
+# Build GitHub commit status description (<= 140 chars) binding sha, expiry, digest, paths & reason
+paths_tag = "*" if not paths else ",".join(paths)
+meta_prefix = f"sha={sha[:12]} exp={expires_iso} digest={digest[:16]}"
+if len(meta_prefix) + len(paths_tag) + 12 < 110:
+    meta_prefix = f"{meta_prefix} paths={paths_tag}"
+avail = max(8, 140 - len(meta_prefix) - 3)
+reason_clean = " ".join(reason.split())
+if len(reason_clean) > avail:
+    reason_clean = reason_clean[: max(8, avail - 3)] + "..."
+gh_desc = f"{meta_prefix} | {reason_clean}"[:140]
+
+print(json.dumps({"doc": doc, "riskCard": risk_card, "ghDesc": gh_desc, "reason": reason}, ensure_ascii=False))
 PY
 )" || die_usage "failed to build A0 approval seal"
 
   doc_json="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["doc"], ensure_ascii=False, indent=2))' "$out_payload")"
   risk_card="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["riskCard"])' "$out_payload")"
+  gh_desc="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ghDesc"])' "$out_payload")"
+  reason="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["reason"])' "$out_payload")"
   atomic_write_file "$APPROVALS_DIR/${sha}.json" "$doc_json" 0644
   atomic_write_file "$APPROVALS_DIR/${sha}.card.txt" "$risk_card" 0644
-  append_audit_safe "$(python3 -c 'import json,sys; t,a,s,r,ttl=sys.argv[1:]; print(json.dumps({"ts":t,"action":"approve_a0","actor":a,"sha":s,"ttlHours":float(ttl),"reason":r,"outcome":"ok"}, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$sha" "$reason" "$ttl_hours")"
+
+  if [[ "$publish_gh" == "1" ]]; then
+    local resolved_repo=""
+    resolved_repo="$(resolve_github_repo_slug "$gh_repo")"
+    [[ -n "$resolved_repo" ]] || die_usage "--publish-github-status requires --github-repo <owner/repo> (or GITHUB_REPOSITORY / GH_REPO)"
+    command -v gh >/dev/null 2>&1 || die_usage "--publish-github-status requires gh CLI in PATH"
+    gh api -X POST "repos/${resolved_repo}/statuses/${sha}" \
+      -f state=success \
+      -f context="oc-v5/a0-approval" \
+      -f description="$gh_desc" >/dev/null || die_gate "failed to publish GitHub status oc-v5/a0-approval on ${resolved_repo}@${sha}"
+  fi
+
+  append_audit_safe "$(python3 -c 'import json,sys; t,a,s,r,ttl,pgh=sys.argv[1:]; print(json.dumps({"ts":t,"action":"approve_a0","actor":a,"sha":s,"ttlHours":float(ttl),"reason":r,"publishedGithubStatus":pgh=="1","outcome":"ok"}, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$sha" "$reason" "$ttl_hours" "$publish_gh")"
   printf '%s\n' "$doc_json"
 }
 
@@ -167,39 +285,197 @@ cmd_revoke_a0() {
 }
 
 cmd_verify_a0() {
-  local sha=""
+  local sha="" file="" hmac_key_file="" require_root_owner=1
+  [[ "${OC_GOVERNOR_UNSAFE_TEST_SKIP_OWNER:-0}" == "1" ]] && require_root_owner=0
+  local -a check_paths=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --sha) sha="${2:-}"; shift 2 ;;
+      --file) file="${2:-}"; shift 2 ;;
+      --path) check_paths+=("${2:-}"); shift 2 ;;
+      --hmac-key-file) hmac_key_file="${2:-}"; shift 2 ;;
+      --require-root-owner) require_root_owner=1; shift ;;
+      --unsafe-test-skip-owner) require_root_owner=0; shift ;;
       *) die_usage "unknown verify-a0 argument: $1" ;;
     esac
   done
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die_usage "--sha must be a 40-char lowercase hex commit SHA"
-  local file="$APPROVALS_DIR/${sha}.json" ts actor
-  ts="$(now_iso)"; actor="$(actor_name)"
-  if [[ -L "$file" || ! -f "$file" ]]; then
-    append_audit_safe "$(python3 -c 'import json,sys; print(json.dumps({"ts":sys.argv[1],"action":"check_a0","actor":sys.argv[2],"sha":sys.argv[3],"reason":"missing_or_symlink","outcome":"blocked"}))' "$ts" "$actor" "$sha")"
-    die_gate "A0 approval missing or symlink for SHA $sha"
+  [[ -n "$file" ]] || file="$APPROVALS_DIR/${sha}.json"
+  if [[ -z "$hmac_key_file" ]]; then
+    hmac_key_file="$(dirname "$(dirname "$file")")/.hmac-key"
   fi
+  local ts actor paths_nl=""
+  ts="$(now_iso)"; actor="$(actor_name)"
+  (( ${#check_paths[@]} > 0 )) && paths_nl="$(printf '%s\n' "${check_paths[@]}")"
+
   local check_out rc=0
   set +e
-  check_out="$(python3 - "$file" "$sha" "$ts" <<'PY'
-import datetime as dt, hashlib, json, sys
-path, want_sha, now_iso = sys.argv[1:]
-doc = json.load(open(path, encoding="utf-8"))
-if doc.get("sha") != want_sha: print("sha_mismatch"); sys.exit(11)
-issued, expires, reason, sig = str(doc.get("issuedAt") or ""), str(doc.get("expiresAt") or ""), str(doc.get("reason") or ""), str(doc.get("sha256") or "")
-canonical = f"a0-approval-v1\nsha={want_sha}\nissuedAt={issued}\nexpiresAt={expires}\nreason={reason}\n"
-if sig != hashlib.sha256(canonical.encode("utf-8")).hexdigest(): print("signature_tampered"); sys.exit(12)
-if dt.datetime.fromisoformat(now_iso.replace("Z", "+00:00")) >= dt.datetime.fromisoformat(expires.replace("Z", "+00:00")): print("approval_expired"); sys.exit(13)
-print(json.dumps({"ok": True, "sha": want_sha, "expiresAt": expires, "riskCard": doc.get("riskCard")}))
+  check_out="$(python3 - "$file" "$sha" "$ts" "$require_root_owner" "$hmac_key_file" "$paths_nl" <<'PY'
+import datetime as dt, hashlib, hmac, json, os, re, stat, sys
+
+path, want_sha, now_iso, req_root_s, hmac_key_file, paths_nl = sys.argv[1:]
+req_root = req_root_s == "1"
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA64_RE = re.compile(r"^[0-9a-f]{64}$")
+ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$")
+
+def fail(code: str, exit_code: int = 10):
+    print(code)
+    sys.exit(exit_code)
+
+def glob_to_regex(glob: str) -> re.Pattern:
+    out = []
+    i = 0
+    n = len(glob)
+    while i < n:
+        ch = glob[i]
+        if ch == "*":
+            if i + 1 < n and glob[i + 1] == "*":
+                if i + 2 < n and glob[i + 2] == "/":
+                    out.append("(?:.+/)?")
+                    i += 3
+                    continue
+                out.append(".*")
+                i += 2
+                continue
+            out.append("[^/]*")
+        elif ch in "+?^${}()|[]\\.":
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+        i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+if not SHA40_RE.fullmatch(want_sha):
+    fail("invalid_sha", 10)
+
+try:
+    st = os.lstat(path)
+except OSError:
+    fail("missing_file", 10)
+
+if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+    fail("not_regular_file_or_symlink", 10)
+if (st.st_mode & 0o022) != 0:
+    fail("group_or_world_writable", 10)
+if req_root and st.st_uid != 0:
+    fail(f"owner_not_root:uid={st.st_uid}", 10)
+
+try:
+    doc = json.loads(open(path, encoding="utf-8").read())
+except Exception:
+    fail("invalid_json", 11)
+
+if not isinstance(doc, dict):
+    fail("not_json_object", 11)
+if type(doc.get("schemaVersion")) is not int or doc.get("schemaVersion") != 1:
+    fail("unsupported_schema_version", 11)
+if doc.get("sha") != want_sha:
+    fail("sha_mismatch", 11)
+
+raw_reason = doc.get("reason")
+if not isinstance(raw_reason, str) or "\r" in raw_reason or "\n" in raw_reason:
+    fail("invalid_reason", 11)
+trimmed_reason = raw_reason.strip()
+if len(trimmed_reason) < 8:
+    fail("reason_too_short", 11)
+
+issued = doc.get("issuedAt")
+expires = doc.get("expiresAt")
+if not isinstance(issued, str) or not isinstance(expires, str):
+    fail("invalid_timestamps", 11)
+if not ISO_RE.fullmatch(issued) or not ISO_RE.fullmatch(expires):
+    fail("invalid_timestamps", 11)
+try:
+    issued_dt = dt.datetime.fromisoformat(issued.replace("Z", "+00:00"))
+    expires_dt = dt.datetime.fromisoformat(expires.replace("Z", "+00:00"))
+    now_dt = dt.datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+except Exception:
+    fail("invalid_timestamps", 11)
+
+if expires_dt <= issued_dt:
+    fail("expires_before_issued", 11)
+if now_dt >= expires_dt:
+    fail("approval_expired", 13)
+
+allowed_paths = None
+if "allowedPaths" in doc and doc["allowedPaths"] is not None:
+    raw_paths = doc["allowedPaths"]
+    if not isinstance(raw_paths, list) or len(raw_paths) == 0:
+        fail("invalid_allowed_paths", 11)
+    cleaned = []
+    for item in raw_paths:
+        if not isinstance(item, str) or "\r" in item or "\n" in item or not item.strip():
+            fail("invalid_allowed_paths", 11)
+        cleaned.append(item.strip())
+    allowed_paths = sorted(set(cleaned))
+
+paths_canonical = "*" if allowed_paths is None else json.dumps(allowed_paths, separators=(",", ":"), ensure_ascii=False)
+canonical = (
+    f"a0-approval-v1\n"
+    f"sha={want_sha}\n"
+    f"issuedAt={issued}\n"
+    f"expiresAt={expires}\n"
+    f"reason={trimmed_reason}\n"
+    f"allowedPaths={paths_canonical}\n"
+)
+
+sig = doc.get("sha256")
+if not isinstance(sig, str) or not SHA64_RE.fullmatch(sig):
+    fail("missing_sha256", 12)
+expected_sha = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+if not hmac.compare_digest(sig, expected_sha):
+    fail("signature_tampered", 12)
+
+# Optional root-only 0600 HMAC key check (rejects plain sha256 downgrade when key file exists!)
+hmac_key = None
+if hmac_key_file and os.path.lexists(hmac_key_file):
+    kst = os.lstat(hmac_key_file)
+    if stat.S_ISLNK(kst.st_mode) or not stat.S_ISREG(kst.st_mode):
+        fail("invalid_hmac_key_file", 12)
+    if (kst.st_mode & 0o077) != 0:
+        fail("hmac_key_insecure_permissions", 12)
+    if req_root and kst.st_uid != 0:
+        fail("hmac_key_owner_not_root", 12)
+    try:
+        hmac_key = open(hmac_key_file, encoding="utf-8").read().strip()
+    except OSError:
+        fail("hmac_key_unreadable", 12)
+    if not hmac_key:
+        fail("hmac_key_empty", 12)
+
+hmac_field = doc.get("hmacSha256")
+if hmac_key is not None:
+    if not isinstance(hmac_field, str) or not SHA64_RE.fullmatch(hmac_field):
+        fail("hmac_required_downgrade_rejected", 12)
+    expected_hmac = hmac.new(hmac_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(hmac_field, expected_hmac):
+        fail("hmac_tampered", 12)
+elif hmac_field is not None:
+    fail("unexpected_hmac_without_key", 12)
+
+target_paths = [p.strip() for p in paths_nl.splitlines() if p.strip()]
+if allowed_paths is not None and target_paths:
+    matchers = [glob_to_regex(g) for g in allowed_paths]
+    uncovered = [p for p in target_paths if not any(m.match(p) for m in matchers)]
+    if uncovered:
+        fail(f"allowed_paths_uncovered:{','.join(uncovered)}", 14)
+
+print(json.dumps({
+    "ok": True,
+    "sha": want_sha,
+    "expiresAt": expires,
+    "hmacVerified": hmac_key is not None,
+    "allowedPaths": allowed_paths,
+    "riskCard": doc.get("riskCard"),
+}))
 PY
 )"
   rc=$?
   set -e
   if [[ "$rc" -ne 0 ]]; then
     local action_tag="check_a0"
-    [[ "$check_out" == "signature_tampered" ]] && action_tag="a0_tamper"
+    [[ "$check_out" == "signature_tampered" || "$check_out" == "hmac_tampered" || "$check_out" == "hmac_required_downgrade_rejected" ]] && action_tag="a0_tamper"
     append_audit_safe "$(python3 -c 'import json,sys; print(json.dumps({"ts":sys.argv[1],"action":sys.argv[2],"actor":sys.argv[3],"sha":sys.argv[4],"reason":sys.argv[5],"outcome":"blocked"}))' "$ts" "$actor" "$action_tag" "$sha" "$check_out")"
     die_gate "A0 approval invalid for $sha: $check_out"
   fi
@@ -434,7 +710,7 @@ cmd_unlock_breaker() {
 
 cmd_status() {
   python3 - "$GOV_ROOT" "$(now_iso)" <<'PY'
-import datetime as dt, hashlib, json, pathlib, sys
+import datetime as dt, hashlib, hmac, json, os, pathlib, stat, sys
 root, now_iso = pathlib.Path(sys.argv[1]), sys.argv[2]
 now_dt = dt.datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
 since_7d = now_dt - dt.timedelta(days=7)
@@ -443,14 +719,29 @@ def load_json(p):
     try: return json.loads(p.read_text(encoding="utf-8")) if p.is_file() else None
     except Exception: return None
 mode_doc = load_json(ctrl / "mode.json") or {"schemaVersion": 1, "mode": "autonomous", "autoMergeFrozen": False, "reason": "default uninitialized"}
+hmac_key = None
+hmac_path = ctrl / ".hmac-key"
+if hmac_path.exists() and not hmac_path.is_symlink() and (os.lstat(hmac_path).st_mode & 0o077) == 0:
+    try: hmac_key = hmac_path.read_text(encoding="utf-8").strip() or None
+    except Exception: hmac_key = None
 active_a0, expired_a0, tampered_a0 = [], 0, 0
 if (ctrl / "a0-approvals").is_dir():
     for f in sorted((ctrl / "a0-approvals").glob("*.json")):
         doc = load_json(f)
-        if not doc: tampered_a0 += 1; continue
-        sha, issued, expires, reason = str(doc.get("sha") or ""), str(doc.get("issuedAt") or ""), str(doc.get("expiresAt") or ""), str(doc.get("reason") or "")
-        canonical = f"a0-approval-v1\nsha={sha}\nissuedAt={issued}\nexpiresAt={expires}\nreason={reason}\n"
+        if not isinstance(doc, dict): tampered_a0 += 1; continue
+        sha = str(doc.get("sha") or "")
+        issued = str(doc.get("issuedAt") or "")
+        expires = str(doc.get("expiresAt") or "")
+        reason = str(doc.get("reason") or "").strip()
+        raw_paths = doc.get("allowedPaths")
+        paths_canonical = "*" if raw_paths is None else json.dumps(sorted(set(str(p).strip() for p in raw_paths)), separators=(",", ":"), ensure_ascii=False) if isinstance(raw_paths, list) else None
+        if paths_canonical is None: tampered_a0 += 1; continue
+        canonical = f"a0-approval-v1\nsha={sha}\nissuedAt={issued}\nexpiresAt={expires}\nreason={reason}\nallowedPaths={paths_canonical}\n"
         if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != doc.get("sha256"): tampered_a0 += 1; continue
+        if hmac_key is not None:
+            expected_hmac = hmac.new(hmac_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+            if not isinstance(doc.get("hmacSha256"), str) or not hmac.compare_digest(doc["hmacSha256"], expected_hmac):
+                tampered_a0 += 1; continue
         try: exp_dt = dt.datetime.fromisoformat(expires.replace("Z", "+00:00"))
         except Exception: tampered_a0 += 1; continue
         if now_dt >= exp_dt: expired_a0 += 1
@@ -485,7 +776,7 @@ card_path = ctrl / "breaker-card.md"
 print(json.dumps({
     "schemaVersion": 1, "root": str(root), "checkedAt": now_iso,
     "gate1_mode": mode_doc,
-    "gate2_a0_approvals": {"activeCount": len(active_a0), "activeShas": active_a0, "expiredCount": expired_a0, "tamperedCount": tampered_a0},
+    "gate2_a0_approvals": {"activeCount": len(active_a0), "activeShas": active_a0, "expiredCount": expired_a0, "tamperedCount": tampered_a0, "hmacActive": hmac_key is not None},
     "gate3_blast_radius": {"hardLockedBranches": ["feat/v5-aurora-rewrite"], "activeVouchers": active_vouchers, "blockedAttempts7d": blocked_blast_7d},
     "gate4_circuit_breaker": {"tripped": bool(breaker_doc.get("tripped") or cost_doc.get("tripped")), "kind": breaker_doc.get("kind"), "rollbackCount7d": rollbacks_7d, "costBreakerTripped": bool(cost_doc.get("tripped")), "dailyUsd": cost_doc.get("dailyUsd"), "limitUsd": cost_doc.get("limitUsd"), "breakerCardPresent": card_path.is_file(), "breakerCardPath": str(card_path) if card_path.is_file() else None},
 }, ensure_ascii=False, indent=2))
@@ -496,9 +787,9 @@ usage() {
   cat <<'EOF'
 Usage: oc-governor <command> [options]
   mode [show | autonomous | debt_first | emergency_stop] [--reason "..."]
-  approve-a0 --sha <40hex> --reason "..." [--ttl-hours 24] [--allowed-path <p>]
+  approve-a0 --sha <40hex> --reason "..." [--ttl-hours 24] [--allowed-path <p>] [--publish-github-status] [--github-repo <owner/repo>]
   revoke-a0 --sha <40hex> [--reason "..."]
-  verify-a0 --sha <40hex>
+  verify-a0 --sha <40hex> [--file <path>] [--path <rel>] [--hmac-key-file <path>] [--unsafe-test-skip-owner]
   check-blast-radius --branch <br> --files <f1> [f2...] [--voucher <id|path>]
   issue-blast-voucher --scope <ddl|billing|ddl+billing> --files <...> --reason "..." [--ttl-hours 4]
   record-rollback --train <id> --reason "..."

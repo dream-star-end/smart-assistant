@@ -1,4 +1,5 @@
 import * as assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -396,6 +397,173 @@ describe('check-debt-ttl: decay ratchet & auto Debt-First freeze', () => {
       )
       assert.equal(stats.week2.total, 1)
       assert.equal(stats.week2.rework, 1)
+    } finally {
+      fx.cleanup()
+    }
+  })
+
+  it('B9 bidirectional regression: on 2026-12-03 with external debt_first + budgets met, bug/refactor pass --enforce (exit 0) while feat fails (exit 1); emergency_stop always exits 1', () => {
+    const fx = makeFixtureRepo({ modeJson: JSON.stringify({ mode: 'debt_first' }) })
+    try {
+      const modePath = path.join(fx.dir, 'mode.json')
+
+      // Exact B9 scenario: effectiveFrom = 2026-12-03, external debt_first, 0 expired TTLs, budgets onTrack=true
+      assert.equal(
+        main([
+          '--root',
+          fx.dir,
+          '--enforce',
+          '--today',
+          '2026-12-03',
+          '--mode-file',
+          modePath,
+          '--check-commit-prefix',
+          'bug(v5): fix lease worker timeout',
+        ]),
+        0,
+        'bug(v5) fix commit MUST return exit 0 in debt_first mode when budgets & TTLs are met',
+      )
+
+      assert.equal(
+        main([
+          '--root',
+          fx.dir,
+          '--enforce',
+          '--today',
+          '2026-12-03',
+          '--mode-file',
+          modePath,
+          '--check-commit-prefix',
+          'refactor(v5): split large supervisor module',
+        ]),
+        0,
+        'refactor(v5) commit MUST return exit 0 in debt_first mode when budgets & TTLs are met',
+      )
+
+      // Same conditions with feat(v5): MUST return exit 1!
+      assert.equal(
+        main([
+          '--root',
+          fx.dir,
+          '--enforce',
+          '--today',
+          '2026-12-03',
+          '--mode-file',
+          modePath,
+          '--check-commit-prefix',
+          'feat(v5): add new experimental feature',
+        ]),
+        1,
+        'feat(v5) commit MUST return exit 1 in debt_first mode',
+      )
+
+      // emergency_stop MUST ALWAYS exit 1, even for bug(v5): and even before effectiveFrom!
+      const stopPath = path.join(fx.dir, 'stop-mode.json')
+      writeFileSync(stopPath, JSON.stringify({ mode: 'emergency_stop' }))
+      assert.equal(
+        main([
+          '--root',
+          fx.dir,
+          '--enforce',
+          '--today',
+          '2026-12-03',
+          '--mode-file',
+          stopPath,
+          '--check-commit-prefix',
+          'bug(v5): fix under emergency_stop',
+        ]),
+        1,
+      )
+      assert.equal(
+        main([
+          '--root',
+          fx.dir,
+          '--enforce',
+          '--today',
+          '2026-11-26',
+          '--mode-file',
+          stopPath,
+        ]),
+        1,
+      )
+
+      // Real git commit auto-detection (--enforce without --check-commit-prefix, and --base/--head range)
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-C', fx.dir, ...args], { encoding: 'utf8' }).trim()
+      git('init', '-q', '-b', 'feat/v5-selfhost')
+      git('config', 'user.email', 't@t')
+      git('config', 'user.name', 't')
+      git('add', '-A')
+      git('commit', '-qm', 'chore(v5): seed baseline')
+      git('tag', 'base-debt')
+
+      writeFileSync(path.join(fx.dir, 'note.txt'), 'fix 1\n')
+      git('add', '-A')
+      git('commit', '-qm', 'bug(v5): fix debt item')
+
+      // --enforce alone auto-reads HEAD subject (`bug(v5): ...`) -> exit 0!
+      assert.equal(
+        main(['--root', fx.dir, '--enforce', '--today', '2026-12-03', '--mode-file', modePath]),
+        0,
+      )
+      // --enforce --base base-debt --head HEAD -> exit 0!
+      assert.equal(
+        main([
+          '--root',
+          fx.dir,
+          '--enforce',
+          '--base',
+          'base-debt',
+          '--head',
+          'HEAD',
+          '--today',
+          '2026-12-03',
+          '--mode-file',
+          modePath,
+        ]),
+        0,
+      )
+
+      // Adding a feat(v5) commit in the range -> exit 1!
+      writeFileSync(path.join(fx.dir, 'note.txt'), 'feat 2\n')
+      git('add', '-A')
+      git('commit', '-qm', 'feat(v5): sneak feature during debt_first')
+      assert.equal(
+        main([
+          '--root',
+          fx.dir,
+          '--enforce',
+          '--base',
+          'base-debt',
+          '--head',
+          'HEAD',
+          '--today',
+          '2026-12-03',
+          '--mode-file',
+          modePath,
+        ]),
+        1,
+      )
+      // Even if a subsequent bug commit is on top of feat in the same range, --base..--head catches the feat!
+      writeFileSync(path.join(fx.dir, 'note.txt'), 'fix 3\n')
+      git('add', '-A')
+      git('commit', '-qm', 'bug(v5): follow-up fix')
+      assert.equal(
+        main([
+          '--root',
+          fx.dir,
+          '--enforce',
+          '--base',
+          'base-debt',
+          '--head',
+          'HEAD',
+          '--today',
+          '2026-12-03',
+          '--mode-file',
+          modePath,
+        ]),
+        1,
+      )
     } finally {
       fx.cleanup()
     }
