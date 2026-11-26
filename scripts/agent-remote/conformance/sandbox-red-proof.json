@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "suiteDigest": "562d0d84909c5fd1a6c4f17a48403652122cf687039caf852ee43a8eba36137f",
+  "suiteDigest": "d416ac00260988f96cd141a91d9611eb3f2aa42193aab87099e9da7293f1f809",
   "drivers": {
     "codex": {
       "driverId": "codex",
@@ -121,10 +121,10 @@
     "antigravity": {
       "driverId": "antigravity",
       "engineId": "antigravity",
-      "driverDigest": "d6e4d5dfc3d50e6fc09ff2c2f63b4ab9cd3662458fa603367e61053ccd6091bc",
+      "driverDigest": "89b8428de5c0db196a2f924d0645d6940a79ce0600230e6adcd55dd824cbfea1",
       "coreDigest": "f12e13c09154a29046c8fbc72e361a7e36e56bcb7b0f9f276d4f1da58396070f",
       "controllerSha256": "5ae2af6b638ba246a2328c809250eeda09a1ba1789a62b238d0a76002be709ec",
-      "policySha256": "385c9ecee366d3419d14b6dd37bb9a349de33f829d6a85ccaae750296fca4c4a",
+      "policySha256": "88c28961ff9089ca8eac92cb8d263b59bdf3001ef43d5c096b5b080b372475ea",
       "requirements": [
         {
           "requirementId": "R1",
@@ -177,5 +177,5 @@
       ]
     }
   },
-  "proofSha256": "6a89330b65e3e16a258a73a49e74491bd37eac0996f5066696af08c301635e69"
+  "proofSha256": "aa12aa5b47fd6140d3bb4299034f0b44449143abba624a1e157f76f8cfcbc39a"
 }
