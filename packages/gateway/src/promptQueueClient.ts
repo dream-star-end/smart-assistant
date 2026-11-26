@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { isRecord } from '@openclaude/kernel'
 import {
   PROMPT_QUEUE_CLAIM_PATH,
   PROMPT_QUEUE_DETAIL_PATH,
@@ -634,10 +635,6 @@ function assertOnlyKeys(
 function record(value: unknown, name: string): Record<string, unknown> {
   if (!isRecord(value)) invalidResponse(`${name} must be an object`)
   return value
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
 function invalidResponse(message: string): never {

@@ -16,7 +16,7 @@
  * `inputsKey`, compaction/rebuild invalidation, cold-start retry, or
  * `OC_RESUMED_ENVELOPE_DEDUP=off` immediately falls back to full injection.
  */
-import { createHash, randomBytes } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import {
   chmodSync,
   mkdirSync,
@@ -28,6 +28,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import path from 'node:path'
+import { sha256Hex } from '@openclaude/kernel'
 import type { PromptSlotApplied } from '../promptSlots.js'
 
 export type ResumedDedupEngine = 'cursor' | 'grok' | 'zcode'
@@ -106,10 +107,6 @@ export interface ResumedEnvelopeElideDecision {
   reason: ResumedEnvelopeElideReason
   /** Exact slots/inputs that changed when `reason === 'inputs_changed'`; `['legacy_untracked']` for older cache files. */
   changedSlots?: string[]
-}
-
-function sha256Hex(text: string): string {
-  return createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
 export function resumedEnvelopeStatePath(
