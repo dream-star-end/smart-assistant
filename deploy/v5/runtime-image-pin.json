@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "channel": "v5-selfhost",
+  "runtimeImage": "openclaude/openclaude-runtime:v5-cli-cc2332-codex01720-grok1092-cur1122-zcode3153-agy1518-chrome-octave-z3-slim",
+  "previousRuntimeImage": "openclaude/openclaude-runtime:v5-cli-cc2332-codex01720-grok1092-cur1122-zcode3153-agy1518-chrome-octave-slim",
+  "ticket": "OCV5-900",
+  "updatedAt": "2026-11-26",
+  "cliVersions": {
+    "claudeCode": "2.1.332",
+    "codex": "0.172.0",
+    "grok": "1.0.92",
+    "cursor": "2026.11.22",
+    "antigravity": "1.5.18",
+    "antigravityBuild": "1.5.18-6386224290725888",
+    "zcodeCli": "0.16.9",
+    "zcodeAppImage": "3.15.3"
+  },
+  "capabilities": {
+    "chrome": "158",
+    "gnuOctave": "7.3",
+    "sciVerify": [
+      "pint",
+      "uncertainties",
+      "hypothesis",
+      "z3-solver",
+      "pytest"
+    ]
+  },
+  "note": "Declarative runtime image and Agent CLI version pin for v5-selfhost (A1 auto-pass surface; scripts/deploy-v5-selfhost.sh reads .runtimeImage via jq with fallback)."
+}

@@ -1,0 +1,149 @@
+{
+  "schemaVersion": 1,
+  "note": "Authoritative A0 / A1 monotonic guardrail separation policy (OCV5-904). A0 paths/rules represent the true meta-layer requiring human CODEOWNERS review or a host root-signed A0 approval receipt. A1 surfaces are mechanically verified as monotonic tighten-only or validated declarative pins and auto-pass without human bottleneck.",
+  "approvalDefaults": {
+    "hostApprovalDir": "/opt/openclaude/harness-gate/control/a0-approvals",
+    "envApprovalDir": "OC_A0_APPROVAL_DIR",
+    "receiptSchemaVersion": 1
+  },
+  "a0Categories": [
+    {
+      "id": "a0-meta-referee",
+      "description": "A0/A1 referee itself, its semantic rule library, protected-path manifest, and CODEOWNERS",
+      "paths": [
+        "scripts/check-a0-monotonic.ts",
+        "scripts/lib/a0MonotonicRules.ts",
+        "scripts/lib/a0ApprovalReceipt.ts",
+        "arch/a0-protected-paths.json",
+        ".github/CODEOWNERS"
+      ]
+    },
+    {
+      "id": "monotonic-baseline-checkers",
+      "description": "Core monotonic ratchet, architecture, parity, steward, and debt-TTL gate checkers",
+      "paths": [
+        "scripts/check-monotonic-baselines.ts",
+        "scripts/check-file-size-ratchet.ts",
+        "scripts/check-ai-smells-ratchet.ts",
+        "scripts/check-architecture.ts",
+        "scripts/check-release-gate-parity.ts",
+        "scripts/check-cross-family-audit.ts",
+        "scripts/check-debt-ttl.ts",
+        "scripts/check-complexity-ratchet.ts",
+        "scripts/check-clones-ratchet.ts",
+        "scripts/check-security-sast.ts"
+      ]
+    },
+    {
+      "id": "incident-ledger-freeze-anchors",
+      "description": "Incident ledger append-only freeze anchors, tombstones, approvers, and superset gate",
+      "paths": [
+        "e2e/session-display/incident-ledger-baseline.json",
+        "e2e/session-display/incident-ledger-baseline.sha256",
+        "e2e/session-display/incident-tombstones.json",
+        "e2e/session-display/incident-tombstone-approvers.json",
+        "scripts/check-incident-ledger-superset.ts"
+      ]
+    },
+    {
+      "id": "ci-workflows-and-gate-manifests",
+      "description": "CI workflow definitions, gate runner scripts, release-gate parity manifest, and linter config",
+      "paths": [
+        ".github/workflows/**",
+        ".github/scripts/**",
+        "deploy/v5/selfhost-release-gates.json",
+        "biome.json"
+      ]
+    },
+    {
+      "id": "host-control-plane-and-deploy",
+      "description": "Host physical governor/referee scripts, selfhost deploy orchestrator, and migration gates",
+      "paths": [
+        "scripts/harness-gate/**",
+        "scripts/deploy-v5-selfhost.sh",
+        "scripts/v5-selfhost-master-release-lib.sh",
+        "scripts/v5-selfhost-migration-*.sh",
+        "scripts/lib/v5-selfhost-*.sh"
+      ]
+    },
+    {
+      "id": "billing-accounting-core",
+      "description": "Core credit ledger, pricing authority, spend/refund/preCheck billing invariants",
+      "paths": [
+        "packages/commercial/src/billing/ledger.ts",
+        "packages/commercial/src/billing/pricing.ts",
+        "packages/commercial/src/billing/persistedBillingPricing.ts",
+        "packages/commercial/src/billing/calculator.ts",
+        "packages/commercial/src/billing/spend.ts",
+        "packages/commercial/src/billing/refund.ts",
+        "packages/commercial/src/billing/preCheck.ts"
+      ]
+    },
+    {
+      "id": "permission-and-contract-core",
+      "description": "Runtime action permission policy, advisor read-only lock, REST contracts, and flavor rules",
+      "paths": [
+        "packages/gateway/src/actionPolicyEngine.ts",
+        "packages/protocol/src/advisorNoWrite.ts",
+        "packages/protocol/src/httpContracts.ts",
+        "packages/protocol/rest-contract-snapshot.json",
+        "packages/commercial/src/flavor/flavor-rules.json"
+      ]
+    },
+    {
+      "id": "exemptions-and-known-failures",
+      "description": "Known-failure allowlists, integration tier manifests, and exemption additions/renewals",
+      "paths": [
+        ".github/known-failures/**",
+        ".github/integ-tiers/**"
+      ]
+    },
+    {
+      "id": "release-announcements",
+      "description": "Human-authored user-facing release announcements",
+      "paths": [
+        "changelog.json"
+      ]
+    },
+    {
+      "id": "existing-gate-deletion-or-modification",
+      "description": "Deleting or modifying any pre-existing gate script (adding brand-new check-*.ts is A1)",
+      "gateGlobs": [
+        "scripts/check-*.ts",
+        "scripts/check-*.sh",
+        "packages/commercial/scripts/lint-*.ts"
+      ]
+    }
+  ],
+  "a1MonotonicSurfaces": {
+    "declarativePins": [
+      "deploy/v5/runtime-image-pin.json"
+    ],
+    "newGateGlobs": [
+      "scripts/check-*.ts",
+      "scripts/check-*.sh",
+      "packages/commercial/scripts/lint-*.ts"
+    ],
+    "moduleMap": "arch/modules.json",
+    "fileSizeBaseline": ".github/file-size-baseline.json",
+    "fileSizeExceptions": ".github/file-size-ratchet-exceptions.json",
+    "designTokensExempt": "packages/web-react/design-tokens-exempt.json",
+    "aiSmellsBaseline": "arch/ai-smells-baseline.json",
+    "violationsBaseline": "arch/violations-baseline.json",
+    "budgets": "packages/web-react/budgets.json",
+    "contextEvalBaseline": ".github/context-eval-baseline.json",
+    "featureFlagsRegistry": "deploy/v5/feature-flags-registry.json",
+    "countRatchetBaselines": [
+      "packages/web-react/design-tokens-counts.json",
+      "packages/web-react/ui-static-baseline.json",
+      "packages/web-react/layout-invariants-baseline.json"
+    ],
+    "shrinkOnlyBaselines": [
+      "arch/file-cycles-baseline.json",
+      "arch/subdomain-violations-baseline.json",
+      "arch/complexity-baseline.json",
+      "arch/clones-baseline.json",
+      "arch/security-sast-baseline.json"
+    ]
+  }
+}

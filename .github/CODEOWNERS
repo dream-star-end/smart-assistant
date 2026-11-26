@@ -1,53 +1,91 @@
-# OpenClaude V5 Selfhost A/B Governance CODEOWNERS (OCV5-847, Blueprint §4.2.5)
+# OpenClaude V5 Selfhost A0 / A1 / Class B Governance CODEOWNERS (OCV5-904)
 #
-# Class A (locked here): static gates, rules, exemptions, budgets, CI workflows,
-# release train scripts/manifest, freeze anchors, runtime permission core, and
-# changelog.json. Any change requires @dream-star-end human review.
+# === Layering Model ===
+# - Class A0 (LOCKED HERE -> requires @dream-star-end human review or host root-signed
+#   A0 approval receipt): true meta-layer guardrails (~10 categories) including the A0
+#   referee itself, core monotonic baseline checkers, CI workflows & release gate manifests,
+#   host control-plane & deploy orchestrators, incident ledger freeze anchors, exemption/
+#   waiver renewal surfaces, billing accounting core, permission/contract core, and changelog.
 #
-# Class B (intentionally NOT listed here): dynamic debt-ratchet / append-only
-# baselines guarded monotonically via `--base` checks by the Class A checkers
-# above, so routine debt cleanup, fix(v5) ledger appends, and flag retirements
-# never deadlock auto-merge.
+# - Class A1 (NOT listed here -> mechanically enforced monotonic tighten-only by
+#   `scripts/check-a0-monotonic.ts` + `scripts/check-monotonic-baselines.ts`):
+#     * `deploy/v5/runtime-image-pin.json` (declarative runtime image & CLI version pin)
+#     * Brand-new gate scripts (`scripts/check-*.ts`, `scripts/check-*.sh` with status A)
+#     * `arch/modules.json` module splits without adding `allow` edges or `authorities`
+#     * Tightening `packages/web-react/budgets.json` and `.github/context-eval-baseline.json`
+#
+# - Class B (NOT listed here -> monotonic shrink-only debt-ratchet baselines):
+#     * `.github/file-size-baseline.json`, `arch/ai-smells-baseline.json`,
+#       `arch/violations-baseline.json`, `arch/file-cycles-baseline.json`,
+#       `arch/subdomain-violations-baseline.json`, `arch/complexity-baseline.json`,
+#       `arch/clones-baseline.json`, `arch/security-sast-baseline.json`,
+#       `deploy/v5/feature-flags-registry.json`, `packages/web-react/*-baseline.json`.
 
-# === 1. CI workflows, rules & gate infrastructure ===
+# === A0-1. A0 Meta-Referee & CODEOWNERS ===
 .github/CODEOWNERS                                      @dream-star-end
+arch/a0-protected-paths.json                            @dream-star-end
+scripts/check-a0-monotonic.ts                           @dream-star-end
+scripts/lib/a0MonotonicRules.ts                         @dream-star-end
+scripts/lib/a0ApprovalReceipt.ts                        @dream-star-end
+
+# === A0-2. Core Monotonic, Ratchet, Architecture & Parity Checkers ===
+scripts/check-monotonic-baselines.ts                    @dream-star-end
+scripts/check-file-size-ratchet.ts                      @dream-star-end
+scripts/check-ai-smells-ratchet.ts                      @dream-star-end
+scripts/check-architecture.ts                           @dream-star-end
+scripts/check-release-gate-parity.ts                    @dream-star-end
+scripts/check-cross-family-audit.ts                     @dream-star-end
+scripts/check-debt-ttl.ts                               @dream-star-end
+scripts/check-complexity-ratchet.ts                     @dream-star-end
+scripts/check-clones-ratchet.ts                         @dream-star-end
+scripts/check-security-sast.ts                          @dream-star-end
+
+# === A0-3. CI Workflows, Gate Scripts, Release Manifest & Linter Config ===
 .github/workflows/                                      @dream-star-end
 .github/scripts/                                        @dream-star-end
+deploy/v5/selfhost-release-gates.json                   @dream-star-end
+biome.json                                              @dream-star-end
+
+# === A0-4. Exemptions, Waivers & Known Failures (Renewal Lock) ===
+.github/file-size-ratchet-exceptions.json               @dream-star-end
 .github/known-failures/                                 @dream-star-end
 .github/integ-tiers/                                    @dream-star-end
-.github/file-size-ratchet-exceptions.json               @dream-star-end
-biome.json                                              @dream-star-end
-arch/modules.json                                       @dream-star-end
-
-# === 2. Frontend budgets, exemptions, gate tests & tutorial history anchor ===
-packages/web-react/vite.config.ts                       @dream-star-end
-packages/web-react/budgets.json                         @dream-star-end
 packages/web-react/design-tokens-exempt.json            @dream-star-end
-packages/web-react/src/test/designTokens.test.ts        @dream-star-end
-packages/web-react/browser-tests/layout-invariants.mjs  @dream-star-end
-packages/web-react/browser-tests/vlm-rubric/            @dream-star-end
-packages/web-react/tutorial-sync-history-head.json      @dream-star-end
 
-# === 3. Core gate scripts, migration gates & release train scripts/manifest ===
-scripts/check-*.ts                                      @dream-star-end
-scripts/check-*.sh                                      @dream-star-end
-scripts/v5-selfhost-migration-*.sh                      @dream-star-end
-scripts/v5-selfhost-master-release-lib.sh               @dream-star-end
+# === A0-5. Host Control Plane, Deploy Orchestrator & Migration Gates ===
+scripts/harness-gate/                                   @dream-star-end
 scripts/deploy-v5-selfhost.sh                           @dream-star-end
+scripts/v5-selfhost-master-release-lib.sh               @dream-star-end
+scripts/v5-selfhost-migration-*.sh                      @dream-star-end
 scripts/lib/v5-selfhost-*.sh                            @dream-star-end
-packages/commercial/scripts/lint-*.ts                   @dream-star-end
-deploy/v5/selfhost-release-gates.json                   @dream-star-end
 
-# === 4. P0 flavor / incident ledger freeze anchors, permission core & changelog ===
-# (Preserves all 6 original freeze/flavor/checker entries verbatim.)
+# === A0-6. Incident Ledger Freeze Anchors & Flavor Rules ===
 e2e/session-display/incident-ledger-baseline.json       @dream-star-end
 e2e/session-display/incident-ledger-baseline.sha256     @dream-star-end
 e2e/session-display/incident-tombstones.json            @dream-star-end
 e2e/session-display/incident-tombstone-approvers.json   @dream-star-end
 scripts/check-incident-ledger-superset.ts               @dream-star-end
 packages/commercial/src/flavor/flavor-rules.json        @dream-star-end
+
+# === A0-7. Billing Accounting & Pricing Core ===
+packages/commercial/src/billing/ledger.ts               @dream-star-end
+packages/commercial/src/billing/pricing.ts              @dream-star-end
+packages/commercial/src/billing/persistedBillingPricing.ts @dream-star-end
+packages/commercial/src/billing/calculator.ts           @dream-star-end
+packages/commercial/src/billing/spend.ts                @dream-star-end
+packages/commercial/src/billing/refund.ts               @dream-star-end
+packages/commercial/src/billing/preCheck.ts             @dream-star-end
+
+# === A0-8. Permission & Contract Security Core ===
+packages/gateway/src/actionPolicyEngine.ts              @dream-star-end
 packages/protocol/src/advisorNoWrite.ts                 @dream-star-end
 packages/protocol/src/httpContracts.ts                  @dream-star-end
 packages/protocol/rest-contract-snapshot.json           @dream-star-end
-packages/gateway/src/actionPolicyEngine.ts              @dream-star-end
+
+# === A0-9. Frontend Gate Anchors & Human-Authored Release Announcements ===
+packages/web-react/vite.config.ts                       @dream-star-end
+packages/web-react/src/test/designTokens.test.ts        @dream-star-end
+packages/web-react/browser-tests/layout-invariants.mjs  @dream-star-end
+packages/web-react/browser-tests/vlm-rubric/            @dream-star-end
+packages/web-react/tutorial-sync-history-head.json      @dream-star-end
 changelog.json                                          @dream-star-end
