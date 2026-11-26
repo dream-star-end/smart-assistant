@@ -668,11 +668,11 @@ RUN set -eux; \
     rm -f /tmp/octave-smoke.png; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Scientific verification libraries for cleanroom dimensional/uncertainty/property-based physics checks (OCV5-895).
+# Scientific verification libraries for cleanroom dimensional/uncertainty/property-based/SMT checks (OCV5-895 / OCV5-900).
 # Python 3.11 compatible pinned versions; trailing base-stage layer keeps heavy upstream layers cached.
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
-      pint==0.25.3 uncertainties==3.2.3 hypothesis==6.170.17 \
-    && python3 -c "import pint, uncertainties, hypothesis; print('sci-verify-ok', pint.__version__, uncertainties.__version__, hypothesis.__version__)"
+      pint==0.25.3 uncertainties==3.2.3 hypothesis==6.170.17 z3-solver==5.4.1.0 pytest==9.2.0 \
+    && python3 -c "import pint, uncertainties, hypothesis, z3, pytest; s = z3.Solver(); x = z3.Real('x'); s.add(x*x < 0); assert s.check() == z3.unsat; print('sci-verify-ok', pint.__version__, uncertainties.__version__, hypothesis.__version__, getattr(z3, '__version__', None) or z3.get_version_string(), pytest.__version__)"
 
 # ── oc-* 工具: trailing base-stage layers (after CLI/Playwright/Chromium) ──
 # 镜像内 /usr/local/bin 副本仅当 bundle 未挂载时兜底;source 已迁 platform-runtime/bin/(改动真热)。

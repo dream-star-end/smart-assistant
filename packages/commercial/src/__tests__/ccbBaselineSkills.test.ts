@@ -305,6 +305,8 @@ describe('ccb-baseline skills ↔ manifest', () => {
     assert.match(sciAuditSkill, /grok-build/)
     assert.match(sciAuditSkill, /deepseek-v4-flash/)
     assert.match(sciAuditSkill, /excludedReviewers/)
+    assert.match(sciAuditSkill, /check_smt_inequality/)
+    assert.match(sciAuditSkill, /\bz3\b/)
     assert.doesNotMatch(sciAuditSkill, /box-api-claude-/)
     assert.doesNotMatch(sciAuditSkill, /gpt-5\.6-sol/)
     assert.doesNotMatch(sciAuditSkill, /k3\.1-pro/)
@@ -326,13 +328,16 @@ describe('ccb-baseline skills ↔ manifest', () => {
       'check_dimensions',
       'check_ssot_numbers',
       'check_callsite_impact',
+      'check_smt_inequality',
       'emit_witness_verdict',
     ]) {
       assert.match(verifyTemplate, new RegExp(`def ${fn}\\(`))
     }
+    assert.match(verifyTemplate, /def check_smt_inequality\(/)
     assert.match(verifyTemplate, /OC_WITNESS_VERDICT_FILE/)
     assert.match(verifyTemplate, /missing_keys/)
     assert.match(verifyTemplate, /NO_COVERAGE/)
+    assert.match(verifyTemplate, /vacuous_assumptions/)
 
     const reviewSkill = readFileSync(join(skillsDir, 'multi-model-review', 'SKILL.md'), 'utf8')
     assert.match(reviewSkill, /scientific-deep-audit/)
@@ -366,5 +371,7 @@ describe('ccb-baseline skills ↔ manifest', () => {
     assert.match(dockerfile, /pint==0\.25\.3/)
     assert.match(dockerfile, /uncertainties==3\.2\.3/)
     assert.match(dockerfile, /hypothesis==6\.170\.17/)
+    assert.match(dockerfile, /z3-solver==5\.4\.1\.0/)
+    assert.match(dockerfile, /pytest==9\.2\.0/)
   })
 })

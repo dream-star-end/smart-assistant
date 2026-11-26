@@ -30,6 +30,7 @@ import {
   selectApiKey,
   startApiKeyPoolCache,
 } from "../account-pool/apiKeyPool.js";
+import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
 import {
   expireCodexRouteContext,
   expireGrokRouteContextByLease,
@@ -339,6 +340,7 @@ import {
 import { makeCursorExternalRoute, type CursorExternalRoute } from "../http/proxy/cursorExternal.js";
 import { makeExternalModelsHandler, type ExternalModelsHandler } from "../http/proxy/externalModels.js";
 import { makeExternalUsageHandler, type ExternalUsageHandler } from "../http/proxy/externalUsage.js";
+import { fetchPlatformFlash } from "../http/proxy/shared.js";
 import {
   assertPlatformDefaultModelConfigured,
   staticProviderKeysFromConfig,
@@ -615,6 +617,9 @@ export async function bootstrapInternalProxyAndListeners(
       const researchProxyHandler: ResearchProxyHandler = makeResearchProxyHandler({
         identityRepo,
         redis: deps.redis,
+        platformFlashApiKey: deps.cfg.OPENCODE_GO_API_KEY,
+        platformFlashFetch: fetchPlatformFlash,
+        minicheckDispatcher: directEgressDispatcher,
       });
       const ocrProxyHandler: OcrProxyHandler = makeOcrProxyHandler({
         identityRepo,

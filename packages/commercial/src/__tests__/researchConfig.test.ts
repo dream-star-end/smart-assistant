@@ -68,6 +68,76 @@ describe("researchConfig.validateResearchConfig", () => {
     assert.throws(() => validateResearchConfig(bad), ResearchConfigValidationError);
   });
 
+  it("接受 minicheck backend=llm（缺省 model 及显式 model 覆写）", () => {
+    const bare = validateResearchConfig({
+      ...DEFAULT_RESEARCH_CONFIG,
+      minicheck: { backend: "llm" },
+    });
+    assert.equal(bare.minicheck.backend, "llm");
+    assert.equal(bare.minicheck.model, undefined);
+
+    const custom = validateResearchConfig({
+      ...DEFAULT_RESEARCH_CONFIG,
+      minicheck: {
+        backend: "llm",
+        model: "deepseek-v4-flash",
+        threshold: 0.7,
+        strict: true,
+      },
+    });
+    assert.equal(custom.minicheck.backend, "llm");
+    assert.equal(custom.minicheck.model, "deepseek-v4-flash");
+    assert.equal(custom.minicheck.threshold, 0.7);
+    assert.equal(custom.minicheck.strict, true);
+  });
+
+  it("拒 minicheck 非法 backend / model / threshold / 未知字段", () => {
+    assert.throws(
+      () =>
+        validateResearchConfig({
+          ...DEFAULT_RESEARCH_CONFIG,
+          minicheck: { backend: "openai" },
+        }),
+      ResearchConfigValidationError,
+    );
+    assert.throws(
+      () =>
+        validateResearchConfig({
+          ...DEFAULT_RESEARCH_CONFIG,
+          minicheck: { backend: "llm", model: "" },
+        }),
+      ResearchConfigValidationError,
+    );
+    assert.throws(
+      () =>
+        validateResearchConfig({
+          ...DEFAULT_RESEARCH_CONFIG,
+          minicheck: { backend: "llm", model: "m".repeat(65) },
+        }),
+      ResearchConfigValidationError,
+    );
+    assert.throws(
+      () =>
+        validateResearchConfig({
+          ...DEFAULT_RESEARCH_CONFIG,
+          minicheck: { backend: "llm", threshold: 1.5 },
+        }),
+      ResearchConfigValidationError,
+    );
+    assert.throws(
+      () =>
+        validateResearchConfig({
+          ...DEFAULT_RESEARCH_CONFIG,
+          minicheck: { backend: "llm", apiKey: "leaked" },
+        }),
+      ResearchConfigValidationError,
+    );
+  });
+
+  it("DEFAULT_RESEARCH_CONFIG.minicheck 保持 off 兼容旧行", () => {
+    assert.deepEqual(DEFAULT_RESEARCH_CONFIG.minicheck, { backend: "off" });
+  });
+
   it("secret 名白名单稳定", () => {
     assert.deepEqual(
       [...RESEARCH_SECRET_NAMES].sort(),

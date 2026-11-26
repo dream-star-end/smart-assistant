@@ -1,6 +1,6 @@
 ---
 name: scientific-deep-audit
-description: 零硬伤科研深审（物理硬伤、数学推导、公式代码等价性、四层正交深审、反例仲裁与零回归封版）：在论文、技术报告与数值仿真代码交付前，运行机器确定性净室底座（SymPy/Octave/pint/hypothesis/SSOT/调用链影响面扫描）+ 正交物理域切片蜂群 + 真跨家族盲审红队 + `oc-review verify` 反例法庭与 Chao1 残余风险停机闸门，根治"修1破2"与纯多模型投票集体误判。用户要求"科研深审/查物理硬伤/公式代码对齐/零回归封版/scientific-deep-audit"时使用。
+description: 零硬伤科研深审（物理硬伤、数学推导、公式代码等价性、四层正交深审、反例仲裁与零回归封版）：在论文、技术报告与数值仿真代码交付前，运行机器确定性净室底座（SymPy/Octave/pint/hypothesis+pytest/z3 SMT/SSOT/调用链影响面扫描）+ 正交物理域切片蜂群 + 真跨家族盲审红队 + `oc-review verify` 反例法庭与 Chao1 残余风险停机闸门，根治"修1破2"与纯多模型投票集体误判。用户要求"科研深审/查物理硬伤/公式代码对齐/零回归封版/scientific-deep-audit"时使用。
 tags: [research, scientific-audit, physics, verification, multi-model, swarm]
 ---
 
@@ -35,9 +35,10 @@ tags: [research, scientific-audit, physics, verification, multi-model, swarm]
 1. **符号推导与 $SO(3)$ 不变量检查**（`check_so3_invariants`）：用 SymPy/NumPy 校验旋转矩阵正交性 $R^T R = I$ 与手性 $\det(R) = +1$，阻断多级旋转链双重扣除或左手系反射错误。
 2. **解析雅可比 vs 中心/复步差分**（`check_jacobian_parity`）：逐行核验解析雅可比与数值中心差分（公差 $< 10^{-8}$），捕获漏改偏导数分支。
 3. **量纲与误差传播核验**（`check_dimensions`）：利用 `pint` 检查方程左右量纲一致性（缺包时自动 `SKIP` 不崩溃），可配合 `uncertainties` 核验协方差/标准差传播。
-4. **非零非对称大参数差分 Fuzzing**（`check_nonzero_roundtrip`）：结合 `hypothesis` / 随机非零大参数（拒绝 `0` 或 `[1,1,1]` 退化输入）检验正反演闭环 $f^{-1}(f(x)) \approx x$，确保不会在缺省参数下静默退回旧模型。
+4. **非零非对称大参数差分 Fuzzing（L0 属性与回归测试：`hypothesis` + `pytest`）**（`check_nonzero_roundtrip`）：结合 `hypothesis` 属性收缩与 `pytest` 参数化回归套件，用随机非零大参数（拒绝 `0` 或 `[1,1,1]` 退化输入）检验正反演闭环 $f^{-1}(f(x)) \approx x$，确保不会在缺省参数下静默退回旧模型。
 5. **SSOT 表格/JSON 数值对账**（`check_ssot_numbers`）：将 Markdown/正文报告数值与 `metrics.json` 或 CSV 单源真值自动对账，捕获常数漂移（如 `0.8881` vs `0.6745`）与 **RMS / 方差混淆**。
 6. **补丁影响面调用链与门控穿透扫描**（`check_callsite_impact`）：给定被修改函数或门控字段（如 `opt`、`el_sd`），扫描全仓生产调用点，高亮漏传新参数的调用位置。
+7. **L2 SMT 不等式与反例求解**（`check_smt_inequality` / `z3`）：基于 `z3`（`z3-solver`）与 Python `ast` 安全白名单（`--mode smt`），对引理不等式、界估计与参数可行域做机器可满足性判定；强制先执行**非空前提检验**（Non-vacuity check：若前提合取本身 `unsat` 则立刻判 `FAIL: vacuous_assumptions`，严防矛盾假设导致空真假通过），再求解 `And(*assumptions, Not(conclusion))`——`unsat` 证全称成立、`sat` 导出具象反例赋值、`unknown`/超时或缺 `z3` 时诚实返回 `SKIP` 绝不假绿。
 
 ### Step 2：第二层——正交物理域切片蜂群
 按物理边界与代码模块划分为**零交集**切片并行只读审查（可调用内置剧本 `/swarm-playbook scientific-deep-audit`）：

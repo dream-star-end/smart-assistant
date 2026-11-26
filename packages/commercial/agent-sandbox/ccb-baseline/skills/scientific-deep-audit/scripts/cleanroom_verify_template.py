@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Reusable cleanroom deterministic physics & code verification template (OCV5-895).
+Reusable cleanroom deterministic physics & code verification template (OCV5-895 / OCV5-900).
 
 Core checks work out of the box on Python 3.11+ with numpy / scipy / sympy.
-Optional scientific packages (`pint`, `uncertainties`, `hypothesis`) are probed
-gracefully: missing packages produce a structured SKIP rather than crashing,
-and when installed they automatically unlock dimensional, uncertainty, and
-property-based differential fuzzing checks.
+Optional scientific packages (`pint`, `uncertainties`, `hypothesis`, `z3`, `pytest`)
+are probed gracefully: missing packages produce a structured SKIP rather than crashing,
+and when installed they automatically unlock dimensional, uncertainty, property-based
+differential fuzzing, and Z3 SMT inequality / counterexample checks.
 
 Sub-checks:
   1. check_jacobian_parity   - Central / complex-step finite diff vs analytic Jacobian (<1e-8)
@@ -15,6 +15,7 @@ Sub-checks:
   4. check_dimensions        - Physical equation dimensional consistency (via optional `pint`)
   5. check_ssot_numbers      - Markdown / report number reconciliation vs metrics.json / CSV + RMS-vs-var check
   6. check_callsite_impact   - Production callsite scan highlighting calls missing new gating/option args
+  7. check_smt_inequality    - Safe AST-whitelisted Z3 SMT inequality proof, non-vacuity check & counterexample search
 
 Usage:
   python3 cleanroom_verify_template.py --self-test
@@ -22,21 +23,24 @@ Usage:
   python3 cleanroom_verify_template.py --mode callsite --root ./src --symbol polar_to_local --required-arg opt
   python3 cleanroom_verify_template.py --mode so3 --matrix '[[1,0,0],[0,1,0],[0,0,1]]'
   python3 cleanroom_verify_template.py --mode dimensions --lhs 'm / s^2' --rhs 'N / kg'
+  python3 cleanroom_verify_template.py --mode smt --vars '{"x":"real"}' --assume 'x > 0' --conclude 'x + 1/x >= 2'
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import importlib
 import json
+import keyword
 import math
 import os
 import re
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -48,12 +52,15 @@ import numpy as np
 def probe_optional_packages() -> dict[str, dict[str, Any]]:
     """Probe optional verification libraries without failing if absent."""
     probes: dict[str, dict[str, Any]] = {}
-    for pkg in ("numpy", "scipy", "sympy", "pint", "uncertainties", "hypothesis"):
+    for pkg in ("numpy", "scipy", "sympy", "pint", "uncertainties", "hypothesis", "z3", "pytest"):
         try:
             mod = importlib.import_module(pkg)
+            version = getattr(mod, "__version__", None)
+            if not version and hasattr(mod, "get_version_string"):
+                version = mod.get_version_string()
             probes[pkg] = {
                 "available": True,
-                "version": getattr(mod, "__version__", "unknown"),
+                "version": version or "unknown",
             }
         except ImportError as exc:
             probes[pkg] = {
@@ -808,7 +815,478 @@ def check_callsite_impact(
 
 
 # ---------------------------------------------------------------------------
-# Self-Test Suite (tests positive PASS and negative FAIL detection for all 6)
+# 7. SMT Inequality & Counterexample Check (via optional `z3` + AST whitelist)
+# ---------------------------------------------------------------------------
+
+_SMT_ALLOWED_SORTS = frozenset({"real", "int", "bool"})
+_SMT_RESERVED_NAMES = frozenset({"True", "False", "None", "abs", "min", "max"})
+_SMT_MAX_AST_NODES = 1024
+
+
+class _SmtAstError(ValueError):
+    """Raised when an SMT expression violates the strict Python AST whitelist."""
+
+
+def _normalize_smt_variables(variables: Mapping[str, str] | None) -> dict[str, str]:
+    if variables is None:
+        return {}
+    if not isinstance(variables, Mapping):
+        raise _SmtAstError("variables must be a mapping of {name: 'real'|'int'|'bool'}")
+    normalized: dict[str, str] = {}
+    for raw_name, raw_sort in variables.items():
+        if (
+            not isinstance(raw_name, str)
+            or not raw_name.isidentifier()
+            or keyword.iskeyword(raw_name)
+            or raw_name in _SMT_RESERVED_NAMES
+        ):
+            raise _SmtAstError(f"Invalid or reserved SMT variable identifier: {raw_name!r}")
+        if not isinstance(raw_sort, str):
+            raise _SmtAstError(f"Sort for variable {raw_name!r} must be a string")
+        sort_norm = raw_sort.strip().lower()
+        if sort_norm not in _SMT_ALLOWED_SORTS:
+            raise _SmtAstError(
+                f"Unsupported SMT sort {raw_sort!r} for {raw_name!r}; allowed: 'real', 'int', 'bool'"
+            )
+        normalized[raw_name] = sort_norm
+    return normalized
+
+
+def _infer_and_validate_smt_sort(node: ast.AST, var_sorts: Mapping[str, str]) -> str:
+    if isinstance(node, ast.Expression):
+        return _infer_and_validate_smt_sort(node.body, var_sorts)
+
+    if isinstance(node, ast.Constant):
+        val = node.value
+        if isinstance(val, bool):
+            return "bool"
+        if isinstance(val, int):
+            return "int"
+        if isinstance(val, float):
+            if not math.isfinite(val):
+                raise _SmtAstError("Non-finite float constant is not allowed in SMT expressions")
+            return "real"
+        raise _SmtAstError(f"Disallowed constant literal {val!r}; only numeric/bool constants allowed")
+
+    if isinstance(node, ast.Name):
+        if not isinstance(node.ctx, ast.Load):
+            raise _SmtAstError("Only Load variable context is allowed")
+        if node.id not in var_sorts:
+            raise _SmtAstError(f"Undeclared SMT variable or symbol: {node.id!r}")
+        return var_sorts[node.id]
+
+    if isinstance(node, ast.UnaryOp):
+        op_sort = _infer_and_validate_smt_sort(node.operand, var_sorts)
+        if isinstance(node.op, (ast.UAdd, ast.USub)):
+            if op_sort not in ("int", "real"):
+                raise _SmtAstError("Unary +/- requires a numeric ('int' or 'real') operand")
+            return op_sort
+        if isinstance(node.op, ast.Not):
+            if op_sort != "bool":
+                raise _SmtAstError("Boolean 'not' requires a boolean operand")
+            return "bool"
+        raise _SmtAstError(f"Disallowed unary operator: {type(node.op).__name__}")
+
+    if isinstance(node, ast.BinOp):
+        if not isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)):
+            raise _SmtAstError(f"Disallowed binary operator: {type(node.op).__name__}")
+        l_sort = _infer_and_validate_smt_sort(node.left, var_sorts)
+        r_sort = _infer_and_validate_smt_sort(node.right, var_sorts)
+        if l_sort not in ("int", "real") or r_sort not in ("int", "real"):
+            raise _SmtAstError("Arithmetic operators (+ - * / **) require numeric operands")
+        if isinstance(node.op, ast.Div):
+            return "real"
+        if isinstance(node.op, ast.Pow) and isinstance(node.right, ast.UnaryOp):
+            return "real"
+        return "real" if ("real" in (l_sort, r_sort)) else "int"
+
+    if isinstance(node, ast.BoolOp):
+        if not isinstance(node.op, (ast.And, ast.Or)):
+            raise _SmtAstError(f"Disallowed boolean operator: {type(node.op).__name__}")
+        for val_node in node.values:
+            if _infer_and_validate_smt_sort(val_node, var_sorts) != "bool":
+                raise _SmtAstError("Boolean 'and'/'or' requires boolean operands")
+        return "bool"
+
+    if isinstance(node, ast.Compare):
+        cur_sort = _infer_and_validate_smt_sort(node.left, var_sorts)
+        for op, comp in zip(node.ops, node.comparators):
+            nxt_sort = _infer_and_validate_smt_sort(comp, var_sorts)
+            if isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)):
+                if cur_sort not in ("int", "real") or nxt_sort not in ("int", "real"):
+                    raise _SmtAstError("Ordering comparisons (< <= > >=) require numeric operands")
+            elif isinstance(op, (ast.Eq, ast.NotEq)):
+                if (cur_sort == "bool") != (nxt_sort == "bool"):
+                    raise _SmtAstError("Equality comparisons (== !=) cannot mix boolean and numeric sorts")
+            else:
+                raise _SmtAstError(f"Disallowed comparison operator: {type(op).__name__}")
+            cur_sort = nxt_sort
+        return "bool"
+
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in ("abs", "min", "max"):
+            target = node.func.id if isinstance(node.func, ast.Name) else type(node.func).__name__
+            raise _SmtAstError(f"Disallowed function/callable {target!r}; only abs, min, max are allowed")
+        if node.keywords:
+            raise _SmtAstError("Keyword arguments are not allowed in SMT expressions")
+        for arg in node.args:
+            if isinstance(arg, ast.Starred):
+                raise _SmtAstError("Starred arguments are not allowed in SMT expressions")
+        fn_name = node.func.id
+        if fn_name == "abs" and len(node.args) != 1:
+            raise _SmtAstError("abs() requires exactly 1 numeric argument")
+        if fn_name in ("min", "max") and len(node.args) < 2:
+            raise _SmtAstError(f"{fn_name}() requires at least 2 numeric arguments")
+        arg_sorts = [_infer_and_validate_smt_sort(arg, var_sorts) for arg in node.args]
+        if any(s not in ("int", "real") for s in arg_sorts):
+            raise _SmtAstError(f"{fn_name}() requires numeric arguments")
+        return "real" if "real" in arg_sorts else "int"
+
+    raise _SmtAstError(f"Disallowed AST construct: {type(node).__name__}")
+
+
+def _parse_smt_formula_ast(expr_text: str, var_sorts: Mapping[str, str]) -> ast.Expression:
+    if not isinstance(expr_text, str) or not expr_text.strip():
+        raise _SmtAstError("SMT formula string must be non-empty")
+    try:
+        tree = ast.parse(expr_text, mode="eval")
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError) as exc:
+        raise _SmtAstError(f"Syntax error in SMT formula {expr_text!r}: {exc}") from exc
+    node_count = sum(1 for _ in ast.walk(tree))
+    if node_count > _SMT_MAX_AST_NODES:
+        raise _SmtAstError(f"SMT formula exceeds max AST node limit ({node_count} > {_SMT_MAX_AST_NODES})")
+    top_sort = _infer_and_validate_smt_sort(tree, var_sorts)
+    if top_sort != "bool":
+        raise _SmtAstError(f"Top-level SMT formula {expr_text!r} must evaluate to a boolean condition, got {top_sort!r}")
+    return tree
+
+
+def _align_z3_arith(lhs: Any, rhs: Any, z3_mod: Any) -> tuple[Any, Any]:
+    if z3_mod.is_real(lhs) and z3_mod.is_int(rhs):
+        return lhs, z3_mod.ToReal(rhs)
+    if z3_mod.is_int(lhs) and z3_mod.is_real(rhs):
+        return z3_mod.ToReal(lhs), rhs
+    return lhs, rhs
+
+
+def _compile_smt_ast(node: ast.AST, z3_vars: Mapping[str, Any], z3_mod: Any) -> Any:
+    if isinstance(node, ast.Expression):
+        return _compile_smt_ast(node.body, z3_vars, z3_mod)
+
+    if isinstance(node, ast.Constant):
+        val = node.value
+        if isinstance(val, bool):
+            return z3_mod.BoolVal(val)
+        if isinstance(val, int):
+            return z3_mod.IntVal(val)
+        if isinstance(val, float):
+            return z3_mod.RealVal(str(val))
+        raise _SmtAstError(f"Unsupported constant: {val!r}")
+
+    if isinstance(node, ast.Name):
+        return z3_vars[node.id]
+
+    if isinstance(node, ast.UnaryOp):
+        operand = _compile_smt_ast(node.operand, z3_vars, z3_mod)
+        if isinstance(node.op, ast.UAdd):
+            return operand
+        if isinstance(node.op, ast.USub):
+            return -operand
+        if isinstance(node.op, ast.Not):
+            return z3_mod.Not(operand)
+        raise _SmtAstError(f"Unsupported unary op: {type(node.op).__name__}")
+
+    if isinstance(node, ast.BinOp):
+        left = _compile_smt_ast(node.left, z3_vars, z3_mod)
+        right = _compile_smt_ast(node.right, z3_vars, z3_mod)
+        if isinstance(node.op, ast.Div):
+            l_real = z3_mod.ToReal(left) if z3_mod.is_int(left) else left
+            r_real = z3_mod.ToReal(right) if z3_mod.is_int(right) else right
+            return l_real / r_real
+        left, right = _align_z3_arith(left, right, z3_mod)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Pow):
+            if isinstance(node.right, ast.UnaryOp) and z3_mod.is_int(left):
+                left = z3_mod.ToReal(left)
+                right = z3_mod.ToReal(right) if z3_mod.is_int(right) else right
+            return left ** right
+        raise _SmtAstError(f"Unsupported bin op: {type(node.op).__name__}")
+
+    if isinstance(node, ast.BoolOp):
+        compiled_vals = [_compile_smt_ast(v, z3_vars, z3_mod) for v in node.values]
+        if isinstance(node.op, ast.And):
+            return z3_mod.And(*compiled_vals)
+        if isinstance(node.op, ast.Or):
+            return z3_mod.Or(*compiled_vals)
+        raise _SmtAstError(f"Unsupported bool op: {type(node.op).__name__}")
+
+    if isinstance(node, ast.Compare):
+        clauses: list[Any] = []
+        left = _compile_smt_ast(node.left, z3_vars, z3_mod)
+        for op, comp in zip(node.ops, node.comparators):
+            right = _compile_smt_ast(comp, z3_vars, z3_mod)
+            lhs, rhs = (
+                _align_z3_arith(left, right, z3_mod)
+                if (z3_mod.is_arith(left) and z3_mod.is_arith(right))
+                else (left, right)
+            )
+            if isinstance(op, ast.Lt):
+                clauses.append(lhs < rhs)
+            elif isinstance(op, ast.LtE):
+                clauses.append(lhs <= rhs)
+            elif isinstance(op, ast.Gt):
+                clauses.append(lhs > rhs)
+            elif isinstance(op, ast.GtE):
+                clauses.append(lhs >= rhs)
+            elif isinstance(op, ast.Eq):
+                clauses.append(lhs == rhs)
+            elif isinstance(op, ast.NotEq):
+                clauses.append(lhs != rhs)
+            else:
+                raise _SmtAstError(f"Unsupported compare op: {type(op).__name__}")
+            left = right
+        return clauses[0] if len(clauses) == 1 else z3_mod.And(*clauses)
+
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        args = [_compile_smt_ast(a, z3_vars, z3_mod) for a in node.args]
+        fn_name = node.func.id
+        if fn_name == "abs":
+            x = args[0]
+            zero = z3_mod.RealVal(0) if z3_mod.is_real(x) else z3_mod.IntVal(0)
+            return z3_mod.If(x >= zero, x, -x)
+        if fn_name in ("min", "max"):
+            acc = args[0]
+            for nxt in args[1:]:
+                acc, nxt = _align_z3_arith(acc, nxt, z3_mod)
+                cond = (acc <= nxt) if fn_name == "min" else (acc >= nxt)
+                acc = z3_mod.If(cond, acc, nxt)
+            return acc
+
+    raise _SmtAstError(f"Unsupported AST node during compilation: {type(node).__name__}")
+
+
+def _z3_val_to_python(val: Any, z3_mod: Any) -> Any:
+    if z3_mod.is_true(val):
+        return True
+    if z3_mod.is_false(val):
+        return False
+    if z3_mod.is_int_value(val):
+        return int(val.as_long())
+    if z3_mod.is_rational_value(val):
+        num = int(val.numerator_as_long())
+        den = int(val.denominator_as_long())
+        if den == 1:
+            return float(num)
+        try:
+            approx = num / den
+            if math.isfinite(approx):
+                return approx
+        except OverflowError:
+            pass
+        return f"{num}/{den}"
+    if hasattr(z3_mod, "is_algebraic_value") and z3_mod.is_algebraic_value(val):
+        dec = val.as_decimal(12).rstrip("?")
+        try:
+            return float(dec)
+        except ValueError:
+            return str(val)
+    return str(val)
+
+
+def _extract_z3_counterexample(
+    model: Any,
+    z3_vars: Mapping[str, Any],
+    z3_mod: Any,
+) -> dict[str, Any]:
+    ce: dict[str, Any] = {}
+    for name, ref in z3_vars.items():
+        evaluated = model.eval(ref, model_completion=True)
+        ce[name] = _z3_val_to_python(evaluated, z3_mod)
+    for decl in model.decls():
+        dname = decl.name()
+        if dname not in ce and decl.arity() == 0:
+            ce[dname] = _z3_val_to_python(model[decl], z3_mod)
+    return ce
+
+
+def check_smt_inequality(
+    variables: Mapping[str, str] | None = None,
+    assumptions: Sequence[str] = (),
+    conclusion: str | None = None,
+    *,
+    build_problem_fn: Callable[[Any], Any] | None = None,
+    timeout_ms: int = 5000,
+) -> CheckResult:
+    """
+    Verify mathematical inequalities / implications using Z3 SMT with:
+      1. Strict Python `ast` whitelist parsing (blocks eval/exec/attribute/call injection),
+      2. Non-vacuity check (`And(*assumptions)` must not be `unsat`, preventing vacuous truth),
+      3. Negated-conclusion counterexample search (`And(*assumptions, Not(conclusion))`),
+      4. Graceful structured `SKIP` when `z3-solver` is absent or solver returns `unknown`.
+    """
+    if timeout_ms <= 0:
+        return CheckResult("check_smt_inequality", "FAIL", f"timeout_ms must be > 0, got {timeout_ms}")
+
+    parsed_assumptions: list[ast.Expression] = []
+    parsed_conclusion: ast.Expression | None = None
+    var_sorts: dict[str, str] = {}
+
+    if build_problem_fn is None:
+        if conclusion is None:
+            return CheckResult(
+                "check_smt_inequality",
+                "FAIL",
+                "Either `conclusion` (declarative AST mode) or `build_problem_fn` must be provided",
+                {"reason": "missing_conclusion"},
+            )
+        try:
+            var_sorts = _normalize_smt_variables(variables)
+            if isinstance(assumptions, (str, bytes)):
+                raise _SmtAstError("assumptions must be a sequence of formula strings, not a bare string")
+            parsed_assumptions = [_parse_smt_formula_ast(expr, var_sorts) for expr in assumptions]
+            parsed_conclusion = _parse_smt_formula_ast(conclusion, var_sorts)
+        except _SmtAstError as exc:
+            return CheckResult(
+                "check_smt_inequality",
+                "FAIL",
+                f"SMT AST whitelist check rejected input: {exc}",
+                {"reason": "ast_whitelist_violation", "error": str(exc)},
+            )
+
+    try:
+        import z3  # type: ignore
+    except ImportError:
+        return CheckResult(
+            "check_smt_inequality",
+            "SKIP",
+            "z3-solver not installed; skipping SMT inequality verification (install z3-solver==5.4.1.0 to enable)",
+            {"missing_package": "z3-solver"},
+        )
+
+    z3_vars: dict[str, Any] = {}
+    if build_problem_fn is not None:
+        try:
+            built = build_problem_fn(z3)
+            if isinstance(built, Mapping):
+                raw_vars_map = built.get("variables")
+                if isinstance(raw_vars_map, Mapping):
+                    z3_vars = {str(k): v for k, v in raw_vars_map.items()}
+                z3_assumptions = list(built.get("assumptions", ()))
+                z3_conclusion = built["conclusion"]
+            elif isinstance(built, tuple) and len(built) == 2:
+                z3_assumptions = list(built[0])
+                z3_conclusion = built[1]
+            elif isinstance(built, tuple) and len(built) == 3 and isinstance(built[0], Mapping):
+                z3_vars = {str(k): v for k, v in built[0].items()}
+                z3_assumptions = list(built[1])
+                z3_conclusion = built[2]
+            else:
+                return CheckResult(
+                    "check_smt_inequality",
+                    "FAIL",
+                    "build_problem_fn must return (assumptions, conclusion) or {'assumptions': [...], 'conclusion': ...}",
+                    {"reason": "invalid_callback_return"},
+                )
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult(
+                "check_smt_inequality",
+                "FAIL",
+                f"build_problem_fn failed: {exc}",
+                {"reason": "callback_error", "error": str(exc)},
+            )
+    else:
+        for name, sort_name in var_sorts.items():
+            if sort_name == "real":
+                z3_vars[name] = z3.Real(name)
+            elif sort_name == "int":
+                z3_vars[name] = z3.Int(name)
+            else:
+                z3_vars[name] = z3.Bool(name)
+        assert parsed_conclusion is not None
+        z3_assumptions = [_compile_smt_ast(tree, z3_vars, z3) for tree in parsed_assumptions]
+        z3_conclusion = _compile_smt_ast(parsed_conclusion, z3_vars, z3)
+
+    # Step 1: Non-vacuity / inhabitation check on assumptions
+    if len(z3_assumptions) > 0:
+        vac_solver = z3.Solver()
+        vac_solver.set("timeout", int(timeout_ms))
+        vac_solver.add(z3.And(*z3_assumptions))
+        vac_res = vac_solver.check()
+        if vac_res == z3.unsat:
+            return CheckResult(
+                "check_smt_inequality",
+                "FAIL",
+                "Assumptions are mutually contradictory (unsat); rejecting vacuous truth",
+                {
+                    "reason": "vacuous_assumptions",
+                    "assumptions_count": len(z3_assumptions),
+                    "timeout_ms": timeout_ms,
+                },
+            )
+        if vac_res != z3.sat:
+            return CheckResult(
+                "check_smt_inequality",
+                "SKIP",
+                f"Z3 returned unknown while checking assumption non-vacuity ({vac_solver.reason_unknown()})",
+                {
+                    "reason": "z3_unknown_or_timeout",
+                    "phase": "non_vacuity",
+                    "z3_reason": vac_solver.reason_unknown(),
+                    "timeout_ms": timeout_ms,
+                },
+            )
+
+    # Step 2: Refutation search on And(*assumptions, Not(conclusion))
+    solver = z3.Solver()
+    solver.set("timeout", int(timeout_ms))
+    if z3_assumptions:
+        solver.add(z3.And(*z3_assumptions, z3.Not(z3_conclusion)))
+    else:
+        solver.add(z3.Not(z3_conclusion))
+
+    res = solver.check()
+    if res == z3.unsat:
+        return CheckResult(
+            "check_smt_inequality",
+            "PASS",
+            f"SMT inequality proved universally valid ({len(z3_assumptions)} non-vacuous assumption(s))",
+            {
+                "assumptions_count": len(z3_assumptions),
+                "non_vacuous": True,
+                "timeout_ms": timeout_ms,
+            },
+        )
+    if res == z3.sat:
+        counterexample = _extract_z3_counterexample(solver.model(), z3_vars, z3)
+        return CheckResult(
+            "check_smt_inequality",
+            "FAIL",
+            f"SMT counterexample found: {counterexample}",
+            {
+                "counterexample": counterexample,
+                "assumptions_count": len(z3_assumptions),
+                "timeout_ms": timeout_ms,
+            },
+        )
+    return CheckResult(
+        "check_smt_inequality",
+        "SKIP",
+        f"Z3 solver returned unknown or timed out ({solver.reason_unknown()})",
+        {
+            "reason": "z3_unknown_or_timeout",
+            "z3_reason": solver.reason_unknown(),
+            "timeout_ms": timeout_ms,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Self-Test Suite (tests positive PASS and negative FAIL detection for all 7)
 # ---------------------------------------------------------------------------
 
 def run_self_test() -> dict[str, Any]:
@@ -970,7 +1448,96 @@ def run_self_test() -> dict[str, Any]:
             cs_zero.to_dict(),
         )
 
-        # 7. Witness verdict emission protocol (OC_WITNESS_VERDICT_FILE + stdout sentinel)
+        # 7. SMT inequality verification: AST whitelist (always) + Z3 PASS/FAIL/vacuous or graceful SKIP
+        smt_bad_import = check_smt_inequality(
+            {"x": "real"},
+            ["x > 0"],
+            "__import__('os').system('id') == 0",
+        )
+        smt_bad_attr = check_smt_inequality(
+            {"x": "real"},
+            ["x.__class__ == 1"],
+            "x > 0",
+        )
+        smt_bad_eval = check_smt_inequality(
+            {"x": "real"},
+            ["eval('1 + 1') == 2"],
+            "x > 0",
+        )
+        smt_bad_undeclared = check_smt_inequality(
+            {"x": "real"},
+            ["x > 0"],
+            "undeclared_var > 0",
+        )
+        smt_bad_nonbool = check_smt_inequality(
+            {"x": "real"},
+            ["x > 0"],
+            "x + 1",
+        )
+        _record(
+            "smt_ast_whitelist_blocks_injection",
+            all(
+                r.status == "FAIL" and r.details.get("reason") == "ast_whitelist_violation"
+                for r in (smt_bad_import, smt_bad_attr, smt_bad_eval, smt_bad_undeclared, smt_bad_nonbool)
+            ),
+            {
+                "import_call": smt_bad_import.to_dict(),
+                "attr_access": smt_bad_attr.to_dict(),
+                "eval_call": smt_bad_eval.to_dict(),
+                "undeclared_var": smt_bad_undeclared.to_dict(),
+                "non_bool_top": smt_bad_nonbool.to_dict(),
+            },
+        )
+
+        smt_valid = check_smt_inequality(
+            {"a": "real", "b": "real"},
+            ["a >= 0", "b >= 0"],
+            "a * a + b * b >= 2 * a * b and abs(a - b) >= max(a, b) - min(a, b)",
+        )
+        if probes["z3"]["available"]:
+            smt_cb = check_smt_inequality(
+                build_problem_fn=lambda z3_mod: (
+                    [z3_mod.Real("u") > 1],
+                    z3_mod.Real("u") * z3_mod.Real("u") > z3_mod.Real("u"),
+                )
+            )
+            smt_ce = check_smt_inequality(
+                {"x": "real", "y": "real"},
+                ["x > 0", "y > 0"],
+                "x + y > x * y",
+            )
+            smt_vac = check_smt_inequality(
+                {"x": "real"},
+                ["x > 10", "x < 2"],
+                "x == 999",
+            )
+            _record(
+                "smt_inequality_pass",
+                smt_valid.status == "PASS" and smt_cb.status == "PASS",
+                {"declarative": smt_valid.to_dict(), "callback": smt_cb.to_dict()},
+            )
+            _record(
+                "smt_counterexample_caught",
+                (
+                    smt_ce.status == "FAIL"
+                    and isinstance(smt_ce.details.get("counterexample"), dict)
+                    and set(smt_ce.details["counterexample"].keys()) == {"x", "y"}
+                ),
+                smt_ce.to_dict(),
+            )
+            _record(
+                "smt_vacuous_assumptions_caught",
+                smt_vac.status == "FAIL" and smt_vac.details.get("reason") == "vacuous_assumptions",
+                smt_vac.to_dict(),
+            )
+        else:
+            _record(
+                "smt_graceful_skip",
+                smt_valid.status == "SKIP" and smt_valid.details.get("missing_package") == "z3-solver",
+                smt_valid.to_dict(),
+            )
+
+        # 8. Witness verdict emission protocol (OC_WITNESS_VERDICT_FILE + stdout sentinel)
         import contextlib
         import io
 
@@ -1024,7 +1591,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--self-test", action="store_true", help="Run built-in verification self-test suite")
     p.add_argument(
         "--mode",
-        choices=["so3", "dimensions", "ssot", "callsite", "probe"],
+        choices=["so3", "dimensions", "ssot", "callsite", "smt", "probe"],
         help="Run a single reusable verification check from CLI",
     )
     p.add_argument("--matrix", help="JSON 3x3 matrix string for --mode so3")
@@ -1038,6 +1605,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--root", help="Source root directory for --mode callsite")
     p.add_argument("--symbol", help="Function/symbol name for --mode callsite")
     p.add_argument("--required-arg", action="append", default=[], help="Required arg name for --mode callsite")
+    p.add_argument("--vars", help="JSON dict of {var: 'real'|'int'|'bool'} for --mode smt")
+    p.add_argument("--assume", action="append", default=[], help="Assumption formula for --mode smt (repeatable)")
+    p.add_argument("--conclude", help="Target conclusion formula for --mode smt")
+    p.add_argument("--timeout-ms", type=int, default=5000, help="Z3 solver timeout in ms for --mode smt")
     return p
 
 
@@ -1074,6 +1645,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.root or not args.symbol:
             parser.error("--root and --symbol are required for --mode callsite")
         res = check_callsite_impact(args.root, args.symbol, required_args=args.required_arg)
+    elif args.mode == "smt":
+        if not args.conclude:
+            parser.error("--conclude is required for --mode smt")
+        try:
+            smt_vars = json.loads(args.vars) if args.vars else {}
+        except json.JSONDecodeError as exc:
+            parser.error(f"--vars must be valid JSON: {exc}")
+        if not isinstance(smt_vars, dict):
+            parser.error("--vars must decode to a JSON object mapping variable names to 'real'|'int'|'bool'")
+        res = check_smt_inequality(
+            smt_vars,
+            args.assume,
+            args.conclude,
+            timeout_ms=args.timeout_ms,
+        )
     else:
         parser.print_help()
         return 2
