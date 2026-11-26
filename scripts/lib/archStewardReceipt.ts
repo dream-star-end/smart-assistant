@@ -590,17 +590,20 @@ export function findStewardReceiptForCommit(opts: {
     if (res) return res
   }
 
-  // Authoritative host root-only steward receipt directory: EXCLUSIVE — never fall back here
-  // when explicit --receipt-dir or OC_STEWARD_RECEIPT_DIR override is configured, keeping
-  // receipt lookup and host .hmac-key enforcement 1:1 consistent (zero plain-sha256 fallback).
-  if (usesDefaultHostStewardDir({ explicitReceiptPath: opts.explicitReceiptPath, receiptDirs: opts.receiptDirs, env })) {
-    const hostReceiptDir = env.OC_GOVERNOR_ROOT?.trim()
-      ? path.join(path.resolve(env.OC_GOVERNOR_ROOT.trim()), 'steward-receipts')
-      : DEFAULT_HOST_STEWARD_RECEIPT_DIR
-    const hostCandidate = path.join(hostReceiptDir, `${sha}.json`)
-    const hostRes = tryReadTrustedJsonFile(hostCandidate, hostCandidate, 'host-file')
-    if (hostRes) return hostRes
+  // Exclusive override boundary: when --receipt-dir or OC_STEWARD_RECEIPT_DIR was explicitly
+  // configured and missed, stop local lookup immediately (never fall through to default host dir
+  // or commit trailer; upper-layer GitHub oc-v5/arch-steward status remains independent).
+  if (!usesDefaultHostStewardDir({ explicitReceiptPath: opts.explicitReceiptPath, receiptDirs: opts.receiptDirs, env })) {
+    return { found: false, searchedLocations }
   }
+
+  // Authoritative host root-only steward receipt directory (in-repo .github/steward-receipts/ is intentionally excluded!)
+  const hostReceiptDir = env.OC_GOVERNOR_ROOT?.trim()
+    ? path.join(path.resolve(env.OC_GOVERNOR_ROOT.trim()), 'steward-receipts')
+    : DEFAULT_HOST_STEWARD_RECEIPT_DIR
+  const hostCandidate = path.join(hostReceiptDir, `${sha}.json`)
+  const hostRes = tryReadTrustedJsonFile(hostCandidate, hostCandidate, 'host-file')
+  if (hostRes) return hostRes
 
   // Commit trailer only allowed when pointing to an external trusted file (never unsigned in-repo/base64 bypass)
   if (opts.commitMessage) {
@@ -673,25 +676,33 @@ export interface StewardHmacKeyState {
   source?: 'env' | 'file' | 'host-default'
 }
 
+function targetsHostGovRoot(opts: {
+  root?: string
+  explicitReceiptPath?: string
+  receiptDirs?: readonly string[]
+  env: NodeJS.ProcessEnv
+  govRoot: string
+}): boolean {
+  if (usesDefaultHostStewardDir(opts)) return true
+  const baseRoot = opts.root ?? process.cwd()
+  const paths: string[] = []
+  if (opts.explicitReceiptPath) paths.push(path.resolve(baseRoot, opts.explicitReceiptPath))
+  for (const d of opts.receiptDirs ?? []) paths.push(path.resolve(baseRoot, d))
+  if (opts.env.OC_STEWARD_RECEIPT_DIR?.trim()) paths.push(path.resolve(opts.env.OC_STEWARD_RECEIPT_DIR.trim()))
+  return paths.some((p) => isPathInsideDir(p, opts.govRoot))
+}
+
 /**
- * Single source of truth for Architecture Steward HMAC key resolution across host CLI,
- * `arch-steward-review.sh`, and `v5-selfhost-governance-gates.sh`:
- *   1. Explicit env var (`OC_STEWARD_HMAC_KEY`) -> `{ hmacKey, requireHmac: true }`
- *   2. Explicit `--hmac-key-file` -> validated via `readValidatedHmacKeyFile` (fail-closed)
- *   3. Default host control-plane `${OC_GOVERNOR_ROOT:-/opt/openclaude/harness-gate}/control/.hmac-key`
- *      (only when `allowHostDefault` is true and no explicit receipt/dir override is active):
- *        - Absent (`ENOENT`) -> `{ requireHmac: false }`
- *        - Valid & readable -> `{ hmacKey, requireHmac: true }`
- *        - Symlink / broken symlink / loose mode / wrong owner / empty -> throws fail-closed
- *        - Valid 0600 root-owned key unreadable by non-root (`EACCES`/`EPERM`) ->
- *          `{ hmacKey: undefined, requireHmac: true }` so local plain-sha256 receipts are
- *          HARD-REJECTED (zero downgrade) while GitHub-status channel can still verify.
+ * Single source of truth for Steward HMAC key resolution across CLI, wrapper, and train gates.
+ * Rejects symlinks/loose modes/wrong owner fail-closed; on non-root EACCES for a valid 0600
+ * host key returns `{ hmacKey: undefined, requireHmac: true }` (zero plain-sha256 downgrade).
  */
 export function resolveStewardHmacKeyState(opts: {
   hmacKeyEnv: string
   hmacKeyFile?: string
   requireRootOwner: boolean
   allowHostDefault: boolean
+  root?: string
   explicitReceiptPath?: string
   receiptDirs?: readonly string[]
   env?: NodeJS.ProcessEnv
@@ -710,18 +721,20 @@ export function resolveStewardHmacKeyState(opts: {
     return { hmacKey: keyRes.key, requireHmac: true, source: 'file' }
   }
 
+  const govRoot = path.resolve(env.OC_GOVERNOR_ROOT?.trim() || '/opt/openclaude/harness-gate')
   if (
     !opts.allowHostDefault ||
-    !usesDefaultHostStewardDir({
+    !targetsHostGovRoot({
+      root: opts.root,
       explicitReceiptPath: opts.explicitReceiptPath,
       receiptDirs: opts.receiptDirs,
       env,
+      govRoot,
     })
   ) {
     return { requireHmac: false }
   }
 
-  const govRoot = env.OC_GOVERNOR_ROOT?.trim() || '/opt/openclaude/harness-gate'
   const candidate = path.join(govRoot, 'control', '.hmac-key')
   const keyRes = loadKeyFile(candidate, opts.requireRootOwner)
   if (!keyRes.present) return { requireHmac: false }

@@ -1547,7 +1547,10 @@ describe('Host .hmac-key single-source resolution & arch-steward-review.sh parit
     t.after(() => rmSync(repo.dir, { recursive: true, force: true }))
     const baseSha = repo.git(['rev-parse', 'HEAD'])
     repo.write('packages/gateway/src/b2FallbackGuard.ts', 'export const b2 = 1\n')
-    const headSha = repo.commit('feat(v5): touch gateway core for B2 exclusive override guard')
+    const hostReceiptFile = path.join(hostReceiptDir, 'placeholder.json')
+    const headSha = repo.commit(
+      `feat(v5): touch gateway core for B2 exclusive override guard\n\nSteward-Receipt: ${hostReceiptFile}`,
+    )
     const plainHostReceipt = signArchStewardReceipt(
       makeUnsignedReceipt({
         headSha,
@@ -1556,8 +1559,9 @@ describe('Host .hmac-key single-source resolution & arch-steward-review.sh parit
       }),
     )
     writeFileSync(path.join(hostReceiptDir, `${headSha}.json`), JSON.stringify(plainHostReceipt, null, 2))
+    writeFileSync(hostReceiptFile, JSON.stringify(plainHostReceipt, null, 2))
 
-    // Without override: host .hmac-key rejects plain sha256 receipt
+    // Without override: host .hmac-key rejects plain sha256 receipt with exact STEWARD-RECEIPT-DIGEST-MISMATCH
     const cleanB2Env = Object.fromEntries(
       Object.entries(process.env).filter(
         ([k]) => k !== 'OC_STEWARD_HMAC_KEY' && k !== 'OC_STEWARD_RECEIPT_DIR',
@@ -1581,8 +1585,33 @@ describe('Host .hmac-key single-source resolution & arch-steward-review.sh parit
       { cwd: ROOT, env: { ...cleanB2Env, OC_GOVERNOR_ROOT: tmp }, encoding: 'utf8' },
     )
     assert.equal(rHostPlain.status, 1, 'host default dir with .hmac-key MUST reject plain sha256 receipt')
+    assert.match(`${rHostPlain.stdout}\n${rHostPlain.stderr}`, /STEWARD-RECEIPT-DIGEST-MISMATCH/)
 
-    // With empty --receipt-dir override: MUST NOT fall back to host default dir and accept plain sha256!
+    // Direct --receipt pointing into host governor root MUST ALSO enforce host .hmac-key (zero plain-sha256 downgrade!)
+    const rDirectHost = spawnSync(
+      'npx',
+      [
+        '--no-install',
+        'tsx',
+        AUDIT_SCRIPT,
+        '--enforce-commit',
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--receipt',
+        hostReceiptFile,
+        '--unsafe-test-skip-owner',
+      ],
+      { cwd: ROOT, env: { ...cleanB2Env, OC_GOVERNOR_ROOT: tmp }, encoding: 'utf8' },
+    )
+    assert.equal(rDirectHost.status, 1, '--receipt inside host governor root MUST enforce host .hmac-key')
+    assert.match(`${rDirectHost.stdout}\n${rDirectHost.stderr}`, /STEWARD-RECEIPT-DIGEST-MISMATCH/)
+
+    // With empty --receipt-dir override AND Steward-Receipt trailer pointing to host file:
+    // MUST stop local lookup immediately (no fallback to host dir OR commit trailer!)
     const rEmptyDir = spawnSync(
       'npx',
       [
@@ -1602,10 +1631,10 @@ describe('Host .hmac-key single-source resolution & arch-steward-review.sh parit
       ],
       { cwd: ROOT, env: { ...cleanB2Env, OC_GOVERNOR_ROOT: tmp }, encoding: 'utf8' },
     )
-    assert.equal(rEmptyDir.status, 1, 'empty --receipt-dir override MUST NOT fall back to host default plain-sha256 receipt')
+    assert.equal(rEmptyDir.status, 1, 'empty --receipt-dir override MUST NOT fall back to host dir or commit trailer')
     assert.match(`${rEmptyDir.stdout}\n${rEmptyDir.stderr}`, /STEWARD-RECEIPT-MISSING/)
 
-    // With empty OC_STEWARD_RECEIPT_DIR override: also MUST NOT fall back to host default dir!
+    // With empty OC_STEWARD_RECEIPT_DIR override AND commit trailer: also MUST NOT fall back!
     const rEmptyEnvDir = spawnSync(
       'npx',
       [
@@ -1627,7 +1656,7 @@ describe('Host .hmac-key single-source resolution & arch-steward-review.sh parit
         encoding: 'utf8',
       },
     )
-    assert.equal(rEmptyEnvDir.status, 1, 'empty OC_STEWARD_RECEIPT_DIR MUST NOT fall back to host default plain-sha256 receipt')
+    assert.equal(rEmptyEnvDir.status, 1, 'empty OC_STEWARD_RECEIPT_DIR MUST NOT fall back to host dir or commit trailer')
     assert.match(`${rEmptyEnvDir.stdout}\n${rEmptyEnvDir.stderr}`, /STEWARD-RECEIPT-MISSING/)
   })
 

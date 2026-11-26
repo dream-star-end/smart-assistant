@@ -510,6 +510,7 @@ async function main(argv: string[]): Promise<number> {
       hmacKeyFile,
       requireRootOwner,
       allowHostDefault,
+      root,
       explicitReceiptPath: receiptPath,
       receiptDirs,
     })
