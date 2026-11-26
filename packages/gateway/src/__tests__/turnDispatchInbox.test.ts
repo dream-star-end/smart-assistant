@@ -1536,3 +1536,97 @@ test('OCV5-121 running CAS misses other than exact rejected still fail closed', 
     } finally { t.mock.restoreAll() }
   }
 })
+
+test('OCV5-898: running receipt carries valid 64-hex turnKey before engine execution and keeps _currentDispatch pure data', async () => {
+  const { SessionManager } = await import('../sessionManager.js')
+  const {
+    attachDispatchReceiptSender,
+    buildTurnDispatchReceiptFrame,
+    forwardDispatchReceiptSender,
+  } = await import('../turnDispatchInbox.js')
+
+  const validKey = 'a'.repeat(64)
+  const ctxMeta = { dispatchId: 'd-898-frame', attemptNo: 1, sessionId: 'sess-898', clientMessageId: 'cm-898' }
+  const queuedFrame = buildTurnDispatchReceiptFrame(ctxMeta, { state: 'queued', outcome: null, turnKey: null }, 1000)
+  assert.equal('turnKey' in queuedFrame, false, 'queued receipt omits null turnKey')
+  const badKeyFrame = buildTurnDispatchReceiptFrame(ctxMeta, { state: 'running', outcome: null, turnKey: 'bad-key' }, 1001)
+  assert.equal('turnKey' in badKeyFrame, false, 'malformed turnKey must not leak onto wire')
+  const runningFrame = buildTurnDispatchReceiptFrame(ctxMeta, { state: 'running', outcome: null, turnKey: validKey }, 1002)
+  assert.equal(runningFrame.turnKey, validKey)
+
+  const ctx = {
+    userId: 'u3',
+    sessionId: 'sess-898-live',
+    clientMessageId: 'cm-898-live',
+    dispatchId: '11111111-1111-4111-8111-111111111898',
+    attemptNo: 1,
+  }
+  await insertQueuedTurnDispatch({ ...ctx, payloadHash: 'h898' })
+  const sourceToken = {}
+  const receivedFrames: ReturnType<typeof buildTurnDispatchReceiptFrame>[] = []
+  attachDispatchReceiptSender(sourceToken, (row) => {
+    receivedFrames.push(buildTurnDispatchReceiptFrame(ctx, row, 2000))
+  })
+  const dispatchContext = { ...ctx }
+  forwardDispatchReceiptSender(sourceToken, dispatchContext)
+
+  const sm = new SessionManager({ version: 1, gateway: {}, auth: {}, defaults: {}, sessions: {} } as never)
+  const session = {
+    sessionKey: 'agent:main:webchat:dm:' + ctx.sessionId,
+    peerId: ctx.sessionId,
+    agentId: 'main',
+    turns: 0,
+    runner: { executionBackend: undefined },
+  } as never
+  let turnKeyAtModelStart: string | undefined
+  let receiptsAtModelStart = -1
+  ;(sm as unknown as { _runOneTurn: (...args: unknown[]) => Promise<void> })._runOneTurn = async (
+    _s, _u, _e, _r, _t, _c, _am, _tm, _tool, tk,
+  ) => {
+    turnKeyAtModelStart = tk as string
+    receiptsAtModelStart = receivedFrames.length
+  }
+
+  await (sm as unknown as { runOneTurnWithRetry: (...args: unknown[]) => Promise<void> }).runOneTurnWithRetry(
+    session, 'hello', () => {}, undefined, undefined, undefined, undefined, ctx.clientMessageId, dispatchContext,
+  )
+  assert.equal(receiptsAtModelStart, 1, 'running receipt must be emitted before engine starts')
+  assert.equal(receivedFrames.length, 1)
+  assert.equal(receivedFrames[0]?.state, 'running')
+  assert.match(receivedFrames[0]?.turnKey ?? '', /^[0-9a-f]{64}$/)
+  assert.equal(receivedFrames[0]?.turnKey, turnKeyAtModelStart)
+  assert.deepEqual(Object.keys((session as { _currentDispatch?: Record<string, unknown> })._currentDispatch ?? {}).sort(), [
+    'attemptNo', 'clientMessageId', 'dispatchId', 'sessionId', 'userId',
+  ])
+})
+
+test('OCV5-898 R2: selectBridgeReceiptSocket routes strictly to original socket or same-peer same-owner open bridge socket', async () => {
+  const { selectBridgeReceiptSocket } = await import('../turnDispatchInbox.js')
+  type FakeSock = { id: string; readyState: number; bridge: boolean; uid: string }
+  const openPrimary: FakeSock = { id: 'primary', readyState: 1, bridge: true, uid: 'u3' }
+  const closedPrimary: FakeSock = { id: 'primary-closed', readyState: 3, bridge: true, uid: 'u3' }
+  const browserSock: FakeSock = { id: 'browser', readyState: 1, bridge: false, uid: 'u3' }
+  const otherUserBridge: FakeSock = { id: 'other-user-bridge', readyState: 1, bridge: true, uid: 'u9' }
+  const samePeerBridge: FakeSock = { id: 'reconnected-bridge', readyState: 1, bridge: true, uid: 'u3' }
+
+  assert.equal(
+    selectBridgeReceiptSocket(openPrimary, [samePeerBridge], (s) => s.bridge, 'u3', (s) => s.uid, 1),
+    openPrimary,
+    'open originating socket always wins',
+  )
+  assert.equal(
+    selectBridgeReceiptSocket(closedPrimary, [browserSock, otherUserBridge, samePeerBridge], (s) => s.bridge, 'u3', (s) => s.uid, 1),
+    samePeerBridge,
+    'closed primary falls back strictly to same-peer same-owner open bridge socket',
+  )
+  assert.equal(
+    selectBridgeReceiptSocket(closedPrimary, [browserSock, otherUserBridge], (s) => s.bridge, 'u3', (s) => s.uid, 1),
+    null,
+    'skips cleanly when only browser or foreign-owner sockets exist on peer',
+  )
+  assert.equal(
+    selectBridgeReceiptSocket(closedPrimary, undefined, (s) => s.bridge, 'u3', (s) => s.uid, 1),
+    null,
+    'skips cleanly when peer has no active sockets',
+  )
+})

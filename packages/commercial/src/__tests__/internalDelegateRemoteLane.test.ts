@@ -87,6 +87,17 @@ function makeHarness(overrides: {
   failBind?: boolean
   laneReleaseState?: 'released' | 'not_found' | 'mismatch' | 'unknown'
   currentOperationId?: string
+  activeParentDispatches?: Array<{
+    dispatch_id: string
+    attempt_no?: number
+    user_id: string
+    agent_container_id: string
+    session_id: string
+    turn_key: string | null
+    /** Positive Master-side evidence key (authority_turn_dispatches / inflight journal). */
+    evidence_turn_key?: string | null
+  }>
+  rejectBindTurnKeys?: string[]
 } = {}) {
   const prevChannel = process.env.OC_RUNTIME_CHANNEL
   process.env.OC_RUNTIME_CHANNEL = 'v5'
@@ -103,6 +114,8 @@ function makeHarness(overrides: {
   let storedDispatch: Record<string, unknown> | null = null
   let storedBinding: Record<string, unknown> | null = null
   let currentOp = overrides.currentOperationId ?? OP_ID_GEN1
+  const activeParentDispatches = (overrides.activeParentDispatches ?? []).map((row) => ({ ...row }))
+  const rejectBindTurnKeys = new Set(overrides.rejectBindTurnKeys ?? [])
 
   const runQuery = async (sql: string, params: unknown[] = []) => {
     sqlCalls.push({ sql, params })
@@ -113,7 +126,53 @@ function makeHarness(overrides: {
       if (uid === '3' && containerId === String(TEST_CONTAINER_ID) && key === OWNED_PARENT_TURN_KEY) {
         return { rows: [{ session_id: 'parent-sess-1' }], rowCount: 1 }
       }
+      const matched = activeParentDispatches.find(
+        (row) => row.user_id === uid && row.agent_container_id === containerId && row.turn_key === key,
+      )
+      if (matched) {
+        return { rows: [{ session_id: matched.session_id }], rowCount: 1 }
+      }
       return { rows: [], rowCount: 0 }
+    }
+    if (sql.includes('open-turn:verify-parent-turn-evidence')) {
+      const uid = String(params[0])
+      const containerId = String(params[1])
+      const turnKey = String(params[2])
+      const matched = activeParentDispatches.find(
+        (row) =>
+          row.user_id === uid &&
+          row.agent_container_id === containerId &&
+          (row.turn_key === null || row.turn_key === turnKey) &&
+          row.evidence_turn_key === turnKey,
+      )
+      if (!matched) return { rows: [], rowCount: 0 }
+      return {
+        rows: [
+          {
+            dispatch_id: matched.dispatch_id,
+            attempt_no: matched.attempt_no ?? 1,
+            session_id: matched.session_id,
+          },
+        ],
+        rowCount: 1,
+      }
+    }
+    if (sql.includes('open-turn:bind-active-dispatch-turn-key')) {
+      const dispatchId = String(params[0])
+      const uid = String(params[1])
+      const turnKey = String(params[2])
+      const containerId = String(params[3])
+      if (rejectBindTurnKeys.has(turnKey)) return { rows: [], rowCount: 0 }
+      const target = activeParentDispatches.find(
+        (row) =>
+          row.dispatch_id === dispatchId &&
+          row.user_id === uid &&
+          row.agent_container_id === containerId &&
+          (row.turn_key === null || row.turn_key === turnKey),
+      )
+      if (!target) return { rows: [], rowCount: 0 }
+      target.turn_key = turnKey
+      return { rows: [], rowCount: 1 }
     }
     if (sql.includes('delegate-remote-lane:check-owned')) {
       const dispatchId = String(params[0])
@@ -156,7 +215,12 @@ function makeHarness(overrides: {
       }
       return { rows: [storedDispatch], rowCount: 1 }
     }
-    if (sql.includes('FROM turn_dispatches') && sql.includes('FOR UPDATE') && storedDispatch) {
+    if (
+      sql.includes('FROM turn_dispatches') &&
+      sql.includes('FOR UPDATE') &&
+      storedDispatch &&
+      (!sql.includes('client_message_id') || storedDispatch.client_message_id === params[2])
+    ) {
       return { rows: [storedDispatch], rowCount: 1 }
     }
     if (sql.includes('INSERT INTO authority_turn_dispatches')) {
@@ -613,6 +677,139 @@ describe('internalDelegateRemoteLane (OCV5-835)', () => {
       } finally {
         h.restore()
       }
+    }
+  })
+
+  it('OCV5-898 R2: rejects unverified parentTurnKey even with matching parentSessionId (403), accepts positive Master evidence and backfills fast path', async () => {
+    const ctx = { hostUuid: 'host-1', boundIp: '172.18.0.5' }
+    const UNVERIFIED_KEY = '9'.repeat(64)
+    const EVIDENCED_KEY = '8'.repeat(64)
+    const WAIVED_EVIDENCED_KEY = '7'.repeat(64)
+    const PARENT_SESS = 'webmwvihnbb151ji6'
+    const OTHER_SESS = 'webmwwg72yp1adrv5'
+
+    const h = makeHarness({
+      activeParentDispatches: [
+        {
+          dispatch_id: '33333333-3333-4333-8333-333333333333',
+          attempt_no: 1,
+          user_id: '3',
+          agent_container_id: String(TEST_CONTAINER_ID),
+          session_id: PARENT_SESS,
+          turn_key: null,
+          evidence_turn_key: EVIDENCED_KEY,
+        },
+        {
+          dispatch_id: '44444444-4444-4444-8444-444444444444',
+          attempt_no: 1,
+          user_id: '3',
+          agent_container_id: String(TEST_CONTAINER_ID),
+          session_id: OTHER_SESS,
+          turn_key: null,
+          evidence_turn_key: WAIVED_EVIDENCED_KEY,
+        },
+      ],
+      rejectBindTurnKeys: [WAIVED_EVIDENCED_KEY],
+    })
+    try {
+      // 1. BLOCKER 1: Caller-supplied key with matching active parentSessionId but NO positive Master evidence MUST return 403
+      const rUnverified = makeRes()
+      await h.handler(
+        makeReq('POST', {
+          sessionKey: VALID_DELEGATE_KEY,
+          model: 'antigravity-gemini-4-neon-remote',
+          delegateAgentId: 'coding-assistant',
+          parentSessionId: PARENT_SESS,
+          parentTurnKey: UNVERIFIED_KEY,
+        }),
+        rUnverified.res,
+        ctx,
+        DELEGATE_REMOTE_LANE_ENSURE_PATH,
+      )
+      assert.equal(rUnverified.status, 403)
+      assert.equal(
+        (rUnverified.json().error as { code?: string } | undefined)?.code,
+        'DELEGATE_REMOTE_LANE_PARENT_TURN_INVALID',
+      )
+      assert.equal(h.ensuredCalls.length, 0, 'unverified parentTurnKey must reject before lane ensure')
+
+      // 2. Positive Master evidence with wrong parentSessionId MUST return 403
+      const rWrongSess = makeRes()
+      await h.handler(
+        makeReq('POST', {
+          sessionKey: VALID_DELEGATE_KEY,
+          model: 'antigravity-gemini-4-neon-remote',
+          parentSessionId: OTHER_SESS,
+          parentTurnKey: EVIDENCED_KEY,
+        }),
+        rWrongSess.res,
+        ctx,
+        DELEGATE_REMOTE_LANE_ENSURE_PATH,
+      )
+      assert.equal(rWrongSess.status, 403)
+      assert.equal(h.ensuredCalls.length, 0)
+
+      // 3. Positive Master evidence (authority_turn_dispatches / inflight journal) + matching session -> backfills & signs 200
+      const rOk = makeRes()
+      await h.handler(
+        makeReq('POST', {
+          sessionKey: VALID_DELEGATE_KEY,
+          model: 'antigravity-gemini-4-neon-remote',
+          delegateAgentId: 'coding-assistant',
+          parentSessionId: PARENT_SESS,
+          parentTurnKey: EVIDENCED_KEY,
+        }),
+        rOk.res,
+        ctx,
+        DELEGATE_REMOTE_LANE_ENSURE_PATH,
+      )
+      assert.equal(rOk.status, 200, JSON.stringify(rOk.json()))
+      assert.deepEqual(h.signedInputs[0]?.payload.billingAttribution, {
+        mode: 'delegate',
+        parentTurnKey: EVIDENCED_KEY,
+        parentSessionId: PARENT_SESS,
+        delegateAgentId: 'coding-assistant',
+      })
+
+      // 4. Subsequent delegate call on the same parent turn hits fast path directly (no second bind UPDATE)
+      const bindCallsBefore = h.sqlCalls.filter((c) => c.sql.includes('open-turn:bind-active-dispatch-turn-key')).length
+      const rFast = makeRes()
+      await h.handler(
+        makeReq('POST', {
+          sessionKey: VALID_SWARM_KEY,
+          model: 'antigravity-gemini-4-neon-remote',
+          delegateAgentId: 'swarm:w1',
+          parentSessionId: PARENT_SESS,
+          parentTurnKey: EVIDENCED_KEY,
+        }),
+        rFast.res,
+        ctx,
+        DELEGATE_REMOTE_LANE_ENSURE_PATH,
+      )
+      assert.equal(rFast.status, 200, JSON.stringify(rFast.json()))
+      const bindCallsAfter = h.sqlCalls.filter((c) => c.sql.includes('open-turn:bind-active-dispatch-turn-key')).length
+      assert.equal(bindCallsAfter, bindCallsBefore, 'backfilled parent turn must hit fast verify path')
+
+      // 5. Evidence whose guarded bind fails (e.g. waived/conflict) MUST return 403
+      const rWaived = makeRes()
+      await h.handler(
+        makeReq('POST', {
+          sessionKey: VALID_DELEGATE_KEY,
+          model: 'antigravity-gemini-4-neon-remote',
+          parentSessionId: OTHER_SESS,
+          parentTurnKey: WAIVED_EVIDENCED_KEY,
+        }),
+        rWaived.res,
+        ctx,
+        DELEGATE_REMOTE_LANE_ENSURE_PATH,
+      )
+      assert.equal(rWaived.status, 403)
+      assert.equal(
+        (rWaived.json().error as { code?: string } | undefined)?.code,
+        'DELEGATE_REMOTE_LANE_PARENT_TURN_INVALID',
+      )
+    } finally {
+      h.restore()
     }
   })
 })

@@ -8,6 +8,8 @@ import { PricingCache } from "../billing/pricing.js";
 import {
   __resetOpenTurnKeyMemory,
   attributeOpenTurn,
+  BIND_ACTIVE_DISPATCH_TURN_KEY_SQL,
+  bindActiveDispatchTurnKey,
   costBroadcastParentSessionId,
   decideOpenTurnAttribution,
   delegateOpenTurnCtx,
@@ -16,6 +18,8 @@ import {
   LOOKUP_SINGLE_OPEN_TURN_SQL,
   rememberOpenTurnKey,
   REMEMBER_OPEN_TURN_KEY_SQL,
+  VERIFY_ACTIVE_PARENT_TURN_EVIDENCE_SQL,
+  verifyAndBindParentTurnFromEvidence,
   visionOpenTurnCtx,
   type OpenDispatchRow,
 } from "../billing/openTurnAttribution.js";
@@ -448,5 +452,214 @@ describe("delegate admit wiring", () => {
     assert.equal(ctx.ctxJson.parentSessionId, "web-parent");
     assert.equal(ctx.ctxJson.openTurnAttribution, undefined);
     assert.equal(ctx.dispatchId, undefined);
+  });
+});
+
+describe("OCV5-898 guarded active-dispatch turn_key binding", () => {
+  beforeEach(() => __resetOpenTurnKeyMemory());
+
+  it("bindActiveDispatchTurnKey serializes with lockTurnBillingKeys, enforces strict containerId, maps 23505 to false, and only caches confirmed writes", async () => {
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    let nextBehavior: { kind: "ok"; rowCount: number } | { kind: "unique_violation" } = {
+      kind: "ok",
+      rowCount: 0,
+    };
+    const pool = {
+      async connect() {
+        return {
+          async query(sql: string, params: unknown[] = []) {
+            calls.push({ sql: String(sql), params });
+            if (String(sql) === BIND_ACTIVE_DISPATCH_TURN_KEY_SQL) {
+              if (nextBehavior.kind === "unique_violation") {
+                throw Object.assign(new Error("duplicate key"), { code: "23505" });
+              }
+              return { rows: [], rowCount: nextBehavior.rowCount } as never;
+            }
+            return { rows: [], rowCount: 0 } as never;
+          },
+          release() {},
+        };
+      },
+    } as unknown as Pick<Pool, "connect">;
+
+    // Malformed / missing-container inputs fail closed without touching PG
+    assert.equal(await bindActiveDispatchTurnKey(pool, { dispatchId: "not-a-uuid", userId: 3n, containerId: 7392, turnKey: TAPE }), false);
+    assert.equal(await bindActiveDispatchTurnKey(pool, { dispatchId: DISPATCH, userId: 3n, containerId: 7392, turnKey: "short" }), false);
+    assert.equal(await bindActiveDispatchTurnKey(pool, { dispatchId: DISPATCH, userId: 3n, containerId: 0, turnKey: TAPE }), false);
+    assert.equal(await bindActiveDispatchTurnKey(pool, { dispatchId: DISPATCH, userId: 3n, containerId: -5n, turnKey: TAPE }), false);
+    assert.equal(await bindActiveDispatchTurnKey(pool, { dispatchId: DISPATCH, userId: 3n, containerId: 7392, turnKey: TAPE, attemptNo: 0 }), false);
+    assert.equal(calls.length, 0);
+
+    // 0-row rejection (e.g. waived/fenced/terminal/null-container) must NOT be cached
+    nextBehavior = { kind: "ok", rowCount: 0 };
+    assert.equal(
+      await bindActiveDispatchTurnKey(pool, {
+        dispatchId: DISPATCH,
+        userId: 3n,
+        containerId: 7392,
+        attemptNo: 1,
+        sessionId: SESSION,
+        clientMessageId: "cm-1",
+        turnKey: TAPE,
+      }),
+      false,
+    );
+    assert.deepEqual(
+      calls.map((c) => c.sql.split("\n")[0]),
+      [
+        "BEGIN",
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        "/* open-turn:bind-active-dispatch-turn-key */",
+        "COMMIT",
+      ],
+    );
+    const updateCall = calls[2]!;
+    assert.equal(updateCall.sql, BIND_ACTIVE_DISPATCH_TURN_KEY_SQL);
+    assert.match(updateCall.sql, /agent_container_id IS NOT NULL/);
+    assert.match(updateCall.sql, /agent_container_id = \$4::bigint/);
+    assert.match(updateCall.sql, /turn_waivers/);
+    assert.match(updateCall.sql, /server_authored_turn_anchor_map/);
+    assert.match(updateCall.sql, /usage_records/);
+    assert.match(updateCall.sql, /producer_fenced_at IS NULL/);
+    assert.match(updateCall.sql, /terminal_at IS NULL/);
+    assert.deepEqual(updateCall.params, [DISPATCH, "3", TAPE, "7392", 1, SESSION, "cm-1"]);
+
+    // DB unique_violation (23505) on active (user_id, turn_key) rolls back and returns false cleanly
+    calls.length = 0;
+    nextBehavior = { kind: "unique_violation" };
+    assert.equal(
+      await bindActiveDispatchTurnKey(pool, {
+        dispatchId: DISPATCH,
+        userId: 3n,
+        containerId: 7392,
+        attemptNo: 1,
+        sessionId: SESSION,
+        turnKey: TAPE,
+      }),
+      false,
+    );
+    assert.equal(calls.at(-1)?.sql, "ROLLBACK");
+
+    // Confirmed 1-row bind populates bounded dedup cache; skipCache still hits PG live
+    calls.length = 0;
+    nextBehavior = { kind: "ok", rowCount: 1 };
+    assert.equal(
+      await bindActiveDispatchTurnKey(pool, {
+        dispatchId: DISPATCH,
+        userId: 3n,
+        containerId: 7392,
+        attemptNo: 1,
+        sessionId: SESSION,
+        turnKey: TAPE,
+      }),
+      true,
+    );
+    assert.equal(calls.length, 4);
+    assert.equal(
+      await bindActiveDispatchTurnKey(pool, {
+        dispatchId: DISPATCH,
+        userId: 3n,
+        containerId: 7392,
+        attemptNo: 1,
+        sessionId: SESSION,
+        turnKey: TAPE,
+      }),
+      true,
+    );
+    assert.equal(calls.length, 4, "confirmed bind is deduplicated on repeat receipt");
+    assert.equal(
+      await bindActiveDispatchTurnKey(pool, {
+        dispatchId: DISPATCH,
+        userId: 3n,
+        containerId: 7392,
+        attemptNo: 1,
+        sessionId: SESSION,
+        turnKey: TAPE,
+        skipCache: true,
+      }),
+      true,
+    );
+    assert.equal(calls.length, 8, "skipCache bypasses in-memory dedup for live verification");
+  });
+
+  it("verifyAndBindParentTurnFromEvidence requires positive Master evidence and fails closed on missing evidence, session mismatch, or bind conflict", async () => {
+    const mkPool = (
+      evidenceRows: Array<{ dispatch_id: string; attempt_no: number; session_id: string }>,
+      updateResult: { kind: "ok"; rowCount: number } | { kind: "unique_violation" },
+    ) => {
+      const seenSql: string[] = [];
+      const exec = async (sql: string) => {
+        seenSql.push(String(sql));
+        if (String(sql) === VERIFY_ACTIVE_PARENT_TURN_EVIDENCE_SQL) {
+          return { rows: evidenceRows, rowCount: evidenceRows.length } as never;
+        }
+        if (String(sql) === BIND_ACTIVE_DISPATCH_TURN_KEY_SQL) {
+          if (updateResult.kind === "unique_violation") {
+            throw Object.assign(new Error("duplicate key"), { code: "23505" });
+          }
+          return { rows: [], rowCount: updateResult.rowCount } as never;
+        }
+        return { rows: [], rowCount: 0 } as never;
+      };
+      const pool = {
+        query: exec,
+        async connect() {
+          return { query: exec, release() {} };
+        },
+      } as unknown as Pick<Pool, "query" | "connect">;
+      return { pool, seenSql };
+    };
+
+    // 1. No positive authority/journal evidence -> fail closed (null) without any UPDATE
+    const none = mkPool([], { kind: "ok", rowCount: 1 });
+    assert.equal(
+      await verifyAndBindParentTurnFromEvidence(none.pool, {
+        userId: 3n,
+        containerId: 7392n,
+        turnKey: TAPE,
+        requestedParentSessionId: SESSION,
+      }),
+      null,
+    );
+    assert.equal(none.seenSql.length, 1);
+
+    // 2. Positive evidence exists, session matches -> locks billing key and backfills turn_dispatches.turn_key
+    const ok = mkPool([{ dispatch_id: DISPATCH, attempt_no: 2, session_id: SESSION }], { kind: "ok", rowCount: 1 });
+    assert.deepEqual(
+      await verifyAndBindParentTurnFromEvidence(ok.pool, {
+        userId: 3n,
+        containerId: 7392n,
+        turnKey: TAPE,
+        requestedParentSessionId: SESSION,
+      }),
+      { dispatchId: DISPATCH, sessionId: SESSION },
+    );
+    assert.equal(ok.seenSql.some((s) => s.includes("pg_advisory_xact_lock")), true);
+    assert.equal(ok.seenSql.includes(BIND_ACTIVE_DISPATCH_TURN_KEY_SQL), true);
+
+    // 3. Session mismatch -> fail closed without calling UPDATE
+    const mismatch = mkPool([{ dispatch_id: DISPATCH, attempt_no: 2, session_id: "other-session" }], { kind: "ok", rowCount: 1 });
+    assert.equal(
+      await verifyAndBindParentTurnFromEvidence(mismatch.pool, {
+        userId: 3n,
+        containerId: 7392n,
+        turnKey: TAPE,
+        requestedParentSessionId: SESSION,
+      }),
+      null,
+    );
+    assert.equal(mismatch.seenSql.length, 1);
+
+    // 4. Positive evidence raced with waiver or unique_violation -> fail closed (null)
+    const raced = mkPool([{ dispatch_id: DISPATCH, attempt_no: 2, session_id: SESSION }], { kind: "unique_violation" });
+    assert.equal(
+      await verifyAndBindParentTurnFromEvidence(raced.pool, {
+        userId: 3n,
+        containerId: 7392n,
+        turnKey: TAPE,
+        requestedParentSessionId: SESSION,
+      }),
+      null,
+    );
   });
 });

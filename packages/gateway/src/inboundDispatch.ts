@@ -99,7 +99,7 @@ import {
   stripModelAuthorityField,
   type TurnExecutionDescriptor,
 } from './modelAuthority.js'
-import { getDispatchContext } from './turnDispatchInbox.js'
+import { forwardDispatchReceiptSender, getDispatchContext } from './turnDispatchInbox.js'
 import {
   getLocalCatalogView,
   triggerLocalCatalogRefreshOnConfigChanged,
@@ -2449,13 +2449,17 @@ export async function dispatchInbound(
         // DispatchTurnContext(uid/…)→ sessionManager 逻辑键形状(userId/…)。
         ...(turnDispatchContext
           ? {
-              dispatchContext: {
-                userId: turnDispatchContext.uid,
-                sessionId: turnDispatchContext.sessionId,
-                clientMessageId: turnDispatchContext.clientMessageId,
-                dispatchId: turnDispatchContext.dispatchId,
-                attemptNo: turnDispatchContext.attemptNo,
-              },
+              dispatchContext: (() => {
+                const ctx = {
+                  userId: turnDispatchContext.uid,
+                  sessionId: turnDispatchContext.sessionId,
+                  clientMessageId: turnDispatchContext.clientMessageId,
+                  dispatchId: turnDispatchContext.dispatchId,
+                  attemptNo: turnDispatchContext.attemptNo,
+                }
+                forwardDispatchReceiptSender(turnDispatchContext, ctx)
+                return ctx
+              })(),
             }
           : {}),
         ...(Object.prototype.hasOwnProperty.call(frame, '_goalState')

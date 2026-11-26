@@ -50,7 +50,10 @@ import {
 } from '../auth/containerIdentity.js'
 import type { makeLoadUserModelAuthz } from '../auth/userModelAuthz.js'
 import type { ModelCatalogCache } from '../billing/modelCatalog.js'
-import { lookupSingleOpenTurn } from '../billing/openTurnAttribution.js'
+import {
+  lookupSingleOpenTurn,
+  verifyAndBindParentTurnFromEvidence,
+} from '../billing/openTurnAttribution.js'
 import { bindAuthorityTurnDispatch } from '../billing/verificationSponsorship.js'
 import { admitDispatch } from '../dispatch/turnDispatchStore.js'
 import type { assertFlavorIdentity } from '../flavor/assertFlavor.js'
@@ -243,7 +246,7 @@ async function terminateOwnedDispatch(
  * owned by `(userId, containerId)` — never an arbitrary historical or already-waived turn (B3).
  */
 async function resolveMasterChildAttribution(
-  pool: Pick<Pool, 'query'>,
+  pool: Pick<Pool, 'query' | 'connect'>,
   args: {
     userId: number
     containerId: number
@@ -270,10 +273,26 @@ async function resolveMasterChildAttribution(
         LIMIT 1`,
       [String(args.userId), String(args.containerId), args.requestedParentTurnKey],
     )
+    let rowSession = (hit.rowCount ?? 0) > 0 ? hit.rows[0]?.session_id : undefined
     if ((hit.rowCount ?? 0) === 0) {
-      throw new Error('DELEGATE_REMOTE_LANE_PARENT_TURN_INVALID')
+      // Positive Master-side evidence fallback ONLY (OCV5-898 R2): accept and backfill
+      // `turn_dispatches.turn_key` only when `authority_turn_dispatches` or an inflight
+      // `request_finalize_journal` already proves `turnKey` belongs to an active dispatch
+      // owned by `(userId, containerId)`. Unverified keys (including old containers with
+      // no receipt and no Master evidence) fail closed with 403.
+      const bound = await verifyAndBindParentTurnFromEvidence(pool, {
+        userId: BigInt(args.userId),
+        containerId: BigInt(args.containerId),
+        turnKey: args.requestedParentTurnKey,
+        ...(args.requestedParentSessionId
+          ? { requestedParentSessionId: args.requestedParentSessionId }
+          : {}),
+      })
+      if (!bound) {
+        throw new Error('DELEGATE_REMOTE_LANE_PARENT_TURN_INVALID')
+      }
+      rowSession = bound.sessionId
     }
-    const rowSession = hit.rows[0]?.session_id
     if (
       args.requestedParentSessionId &&
       typeof rowSession === 'string' &&

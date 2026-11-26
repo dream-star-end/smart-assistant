@@ -62,7 +62,7 @@ import {
   getV3MasterSinkOrNull,
   type V3MasterSinkPayload,
 } from './v3MasterSink.js'
-import { failClosedOnRunningCasMiss } from './turnDispatchInbox.js'
+import { failClosedOnRunningCasMiss, notifyDispatchRunningReceipt } from './turnDispatchInbox.js'
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   assessTurnRecoveryTape,
@@ -2762,7 +2762,7 @@ export async function runOneTurnWithRetry(
         cause: recordErr,
       })
     }
-    session._currentDispatch = dispatchContext
+    session._currentDispatch = dispatchContext; if (runningRow) notifyDispatchRunningReceipt(dispatchContext, runningRow)
   }
   if (queueLifecycle) {
     await queueLifecycle.onTurnReserved({

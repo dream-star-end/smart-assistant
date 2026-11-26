@@ -1,14 +1,23 @@
 import { isClientMessageId, type OutboundAck } from '@openclaude/protocol'
+import { bindActiveDispatchTurnKey, TURN_KEY_RE } from '../billing/openTurnAttribution.js'
 import { rejectedDispatchFailureCode } from '../dispatch/attachmentTotalFailure.js'
 import type { Pool } from 'pg'
 import { casAdmittedToAccepted, casToTerminal, getDispatchByLogicalKey } from '../dispatch/turnDispatchStore.js'
 import { markRecoveryContainerReceipt, type ClaimedRecoveryJob } from '../dispatch/turnRecoveryStore.js'
 import { recoveryRunningFrame } from './recoveryPresentation.js'
 
+const ACTIVE_RECEIPT_STATES = new Set([
+  'queued',
+  'running',
+  'recovery_pending',
+  'sink_staged',
+  'sink_stage_failed',
+])
+
 type Receipt = {
   clientMessageId?: unknown; dispatchId?: unknown; attemptNo?: unknown
   sessionId?: unknown; state?: unknown; outcome?: unknown
-  userFailureCode?: unknown
+  userFailureCode?: unknown; turnKey?: unknown
 }
 type ReceiptRecord = {
   clientMessageId: string; sessionId: string; dispatchId: string; attemptNo: number
@@ -61,8 +70,72 @@ export function handleTurnDispatchReceipt<R extends ReceiptRecord, E extends { r
   if (!parsed || typeof parsed !== 'object' ||
     (parsed as { type?: unknown }).type !== 'outbound.control.turn_dispatch_receipt') return false
   const receipt = parsed as Receipt
+  const receiptTurnKey =
+    typeof receipt.turnKey === 'string' && TURN_KEY_RE.test(receipt.turnKey)
+      ? receipt.turnKey
+      : undefined
+  const verifiedContainerId =
+    typeof context.agentContainerId === 'number' &&
+    Number.isSafeInteger(context.agentContainerId) &&
+    context.agentContainerId > 0
+      ? context.agentContainerId
+      : undefined
+  const bindReceiptTurnKey = (
+    targetPool: Pool,
+    target: { dispatchId: string; attemptNo: number; sessionId: string; clientMessageId: string },
+    turnKey: string,
+  ): Promise<void> => {
+    // BLOCKER 3 (OCV5-898 R2): never bind turn_key without verified container ownership.
+    if (verifiedContainerId === undefined) return Promise.resolve()
+    return bindActiveDispatchTurnKey(targetPool, {
+      dispatchId: target.dispatchId,
+      userId: context.uid,
+      containerId: verifiedContainerId,
+      attemptNo: target.attemptNo,
+      sessionId: target.sessionId,
+      clientMessageId: target.clientMessageId,
+      turnKey,
+    }).then(() => undefined).catch((err) => {
+      context.warn('user-chat-bridge: dispatch receipt turnKey bind failed', {
+        dispatchId: target.dispatchId,
+        err,
+      })
+    })
+  }
   const rec = isClientMessageId(receipt.clientMessageId) ? context.admittedDispatches.get(receipt.clientMessageId) : undefined
-  if (!rec) return true
+  if (!rec) {
+    // Follow-up `running` receipt carrying `turnKey` normally arrives after the
+    // initial `queued` receipt has already moved the dispatch to `accepted` and
+    // dropped `admittedDispatches`. Require verified containerId + exact
+    // dispatch/attempt/session/clientMessageId identity before writing PG.
+    if (
+      context.pool &&
+      verifiedContainerId !== undefined &&
+      receiptTurnKey &&
+      isClientMessageId(receipt.clientMessageId) &&
+      typeof receipt.dispatchId === 'string' &&
+      typeof receipt.sessionId === 'string' &&
+      receipt.sessionId.length > 0 &&
+      typeof receipt.attemptNo === 'number' &&
+      Number.isInteger(receipt.attemptNo) &&
+      receipt.attemptNo > 0 &&
+      receipt.outcome === null &&
+      typeof receipt.state === 'string' &&
+      ACTIVE_RECEIPT_STATES.has(receipt.state)
+    ) {
+      void bindReceiptTurnKey(
+        context.pool,
+        {
+          dispatchId: receipt.dispatchId,
+          attemptNo: receipt.attemptNo,
+          sessionId: receipt.sessionId,
+          clientMessageId: receipt.clientMessageId,
+        },
+        receiptTurnKey,
+      )
+    }
+    return true
+  }
   const disposition = classifyTurnDispatchReceipt(receipt, rec)
   if (disposition === 'invalid') {
     context.warn('user-chat-bridge: invalid dispatch receipt ignored', {
@@ -127,6 +200,9 @@ export function handleTurnDispatchReceipt<R extends ReceiptRecord, E extends { r
         context.broadcast(acceptedFrame())
         context.broadcast(recoveryRunningFrame(rec.recoveryJob!))
       }
+      if (receiptTurnKey) {
+        void bindReceiptTurnKey(pool, rec, receiptTurnKey)
+      }
     }).catch(() => {})
     context.dropAdmittedDispatch(rec.clientMessageId)
   } else {
@@ -149,6 +225,9 @@ export function handleTurnDispatchReceipt<R extends ReceiptRecord, E extends { r
           })
           claimed = durable?.dispatchId === rec.dispatchId && durable.attemptNo === rec.attemptNo && durable.status === 'accepted'
           if (claimed) context.onDispatchAccepted?.(rec)
+        }
+        if (receiptTurnKey) {
+          await bindReceiptTurnKey(pool, rec, receiptTurnKey)
         }
       } catch (err) {
         context.warn('user-chat-bridge: dispatch receipt CAS failed', { dispatchId: rec.dispatchId, err })
