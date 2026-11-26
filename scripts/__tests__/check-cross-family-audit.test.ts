@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
@@ -157,20 +157,24 @@ describe('check-cross-family-audit: policy enforcement (red & green)', () => {
 
   test('CLI supports --dev-model/--audit-model, --receipt JSON, and strictly rejects combining --receipt with CLI model flags', (t) => {
     const tsxBin = path.join(ROOT, 'node_modules/.bin/tsx')
+    const tsxCli = path.join(ROOT, 'node_modules/tsx/dist/cli.mjs')
+    const runAuditCli = (args: string[]) =>
+      existsSync(tsxBin)
+        ? spawnSync(tsxBin, [SCRIPT, ...args], { encoding: 'utf8' })
+        : existsSync(tsxCli)
+          ? spawnSync(process.execPath, [tsxCli, SCRIPT, ...args], { encoding: 'utf8' })
+          : spawnSync(process.execPath, ['--import', 'tsx', SCRIPT, ...args], { encoding: 'utf8' })
 
-    const rOk = spawnSync(
-      tsxBin,
-      [SCRIPT, '--dev-model', 'antigravity-orchestrator-carbon', '--audit-model', 'gpt-6.2-astra'],
-      { encoding: 'utf8' },
-    )
+    const rOk = runAuditCli([
+      '--dev-model',
+      'antigravity-orchestrator-carbon',
+      '--audit-model',
+      'gpt-6.2-astra',
+    ])
     assert.equal(rOk.status, 0)
     assert.match(rOk.stdout, /\[cross-family-audit\] ok:/)
 
-    const rSame = spawnSync(
-      tsxBin,
-      [SCRIPT, '--dev-model', 'gpt-6.2-sol', '--audit-model', 'gpt-6.2-astra'],
-      { encoding: 'utf8' },
-    )
+    const rSame = runAuditCli(['--dev-model', 'gpt-6.2-sol', '--audit-model', 'gpt-6.2-astra'])
     assert.equal(rSame.status, 1)
     assert.match(rSame.stderr, /\[GATE-ERROR\] CROSS-FAMILY-SAME-FAMILY-AUDIT/)
 
@@ -187,19 +191,15 @@ describe('check-cross-family-audit: policy enforcement (red & green)', () => {
       JSON.stringify({ devModel: 'antigravity-gemini-4-neon', auditModel: 'deepseek-v4-flash' }),
     )
 
-    const rRecOk = spawnSync(tsxBin, [SCRIPT, '--receipt', okReceipt], { encoding: 'utf8' })
+    const rRecOk = runAuditCli(['--receipt', okReceipt])
     assert.equal(rRecOk.status, 0)
 
-    const rRecBad = spawnSync(tsxBin, [SCRIPT, '--receipt', badReceipt], { encoding: 'utf8' })
+    const rRecBad = runAuditCli(['--receipt', badReceipt])
     assert.equal(rRecBad.status, 1)
     assert.match(rRecBad.stderr, /\[GATE-ERROR\] CROSS-FAMILY-WEAK-AUDIT-MODEL/)
 
     // Blocker 6: combining --receipt with --audit-model or --dev-model MUST fail closed with exit 2
-    const rConflict = spawnSync(
-      tsxBin,
-      [SCRIPT, '--receipt', badReceipt, '--audit-model', 'gpt-6.2-astra'],
-      { encoding: 'utf8' },
-    )
+    const rConflict = runAuditCli(['--receipt', badReceipt, '--audit-model', 'gpt-6.2-astra'])
     assert.equal(rConflict.status, 2)
     assert.match(rConflict.stderr, /mutually exclusive/)
   })
