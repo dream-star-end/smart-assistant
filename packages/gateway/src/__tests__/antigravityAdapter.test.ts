@@ -57,7 +57,7 @@ const ROUTE = {
   idToken: 'eyJhbGciOi.id-token-payload.sig',
 }
 
-const FAKE_CLI = `#!/usr/bin/env node
+const FAKE_CLI = `#!${process.execPath}
 const fs = require('node:fs')
 let input = ''
 let replayed = false
@@ -744,7 +744,7 @@ describe('AntigravityAdapter', () => {
       const summaryWriterCli = path.join(h.dir, 'summary-writer-cli.cjs')
       const seededCheckFile = path.join(h.dir, 'seeded-check.json')
       const sqliteModulePath = fileURLToPath(import.meta.resolve('better-sqlite3'))
-      await writeFile(summaryWriterCli, `#!/usr/bin/env node
+      await writeFile(summaryWriterCli, `#!${process.execPath}
 const fs = require('node:fs')
 const path = require('node:path')
 const Database = require(${JSON.stringify(sqliteModulePath)})
@@ -838,7 +838,7 @@ process.stdin.on('end', () => {
       // Turn 4 (forceEnd via run.end() before exit 0): must NOT overwrite stable summary cache even when child exits 0.
       const forceEndCli = path.join(h.dir, 'force-end-cli.cjs')
       const readyMarker = path.join(h.dir, 'force-end-ready')
-      await writeFile(forceEndCli, `#!/usr/bin/env node
+      await writeFile(forceEndCli, `#!${process.execPath}
 const fs = require('node:fs')
 const path = require('node:path')
 const Database = require(${JSON.stringify(sqliteModulePath)})
@@ -1850,7 +1850,7 @@ describe('Antigravity resumed platform context deduplication (OCV5-781)', () => 
 
   async function installStatefulCli(h: Harness): Promise<string> {
     const cli = path.join(h.dir, 'stateful-agy.cjs')
-    await writeFile(cli, `#!/usr/bin/env node
+    await writeFile(cli, `#!${process.execPath}
 const fs = require('node:fs')
 const path = require('node:path')
 const Database = require(${JSON.stringify(sqliteModulePath)})
