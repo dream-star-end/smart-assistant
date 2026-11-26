@@ -180,16 +180,18 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # OCV5-906: 高强度状态机属性测试 (PBT_RUNS=2000) + 周度 T2 核心增量变异抽检
+  # OCV5-906 / OCV5-903 (Non-blocker 4): 高强度状态机属性测试 (PBT_RUNS=2000) + 周度 T2 核心增量变异抽检
+  # 显式锁定 feat/v5-selfhost；workflow_dispatch 选商业分支(如 feat/v5-aurora-rewrite)时自动跳过。
   selfhost-pbt-and-mutation:
     name: selfhost PBT (2000 runs) & weekly mutation
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.ref == '' || github.event.inputs.ref == 'feat/v5-selfhost' }}
     steps:
       - name: Checkout feat/v5-selfhost
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref || 'feat/v5-selfhost' }}
+          ref: feat/v5-selfhost
           fetch-depth: 0
 
       - name: Setup Node

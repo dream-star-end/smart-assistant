@@ -248,8 +248,17 @@ export function readJsonl(filePath: string): Array<Record<string, unknown>> {
 export function verifyApprovalChecksum(doc: Record<string, unknown>): boolean {
   const expected = doc.sha256 ?? doc.payloadSha256
   if (typeof expected !== 'string' || !/^[0-9a-f]{64}$/.test(expected)) return false
-  const canonicalV1 = `a0-approval-v1\nsha=${doc.sha ?? ''}\nissuedAt=${doc.issuedAt ?? ''}\nexpiresAt=${doc.expiresAt ?? ''}\nreason=${doc.reason ?? ''}\n`
-  if (createHash('sha256').update(canonicalV1, 'utf8').digest('hex') === expected) return true
-  const legacy = `${doc.sha ?? ''}|${doc.issuedAt ?? ''}|${doc.expiresAt ?? ''}|${doc.reason ?? ''}`
+  const sha = typeof doc.sha === 'string' ? doc.sha : ''
+  const issuedAt = typeof doc.issuedAt === 'string' ? doc.issuedAt : ''
+  const expiresAt = typeof doc.expiresAt === 'string' ? doc.expiresAt : ''
+  const reason = typeof doc.reason === 'string' ? doc.reason.trim() : ''
+  const allowedPathsLine = Array.isArray(doc.allowedPaths)
+    ? JSON.stringify([...new Set(doc.allowedPaths.map((p) => String(p).trim()))].sort())
+    : '*'
+  const canonicalV1WithPaths = `a0-approval-v1\nsha=${sha}\nissuedAt=${issuedAt}\nexpiresAt=${expiresAt}\nreason=${reason}\nallowedPaths=${allowedPathsLine}\n`
+  if (createHash('sha256').update(canonicalV1WithPaths, 'utf8').digest('hex') === expected) return true
+  const canonicalV1Legacy = `a0-approval-v1\nsha=${sha}\nissuedAt=${issuedAt}\nexpiresAt=${expiresAt}\nreason=${doc.reason ?? ''}\n`
+  if (createHash('sha256').update(canonicalV1Legacy, 'utf8').digest('hex') === expected) return true
+  const legacy = `${sha}|${issuedAt}|${expiresAt}|${doc.reason ?? ''}`
   return createHash('sha256').update(legacy, 'utf8').digest('hex') === expected
 }

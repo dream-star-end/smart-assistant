@@ -1,16 +1,24 @@
 /**
- * Architecture Steward Receipt Signing, Verification, Discovery & Formatters (OCV5-905).
+ * Architecture Steward Receipt Signing, Verification, Discovery & Formatters (OCV5-905 / OCV5-903 B2 & B3).
+ *
+ * Production hardening:
+ *   - Hard-rejects `dryRun === true`, non-production schema (`oc.v5.arch-steward-dry-run/1`),
+ *     placeholder/mock/example/dry-run `jobId`, `sessionKey`, `provider`, `command`, or `[dry-run]` notes.
+ *   - Enforces file trust boundaries on receipt files: regular file, non-symlink, non-group/world-writable,
+ *     root-owned (`uid === 0`) by default, and NEVER accepts unsigned in-repo `.github/steward-receipts/` files.
+ *   - Supports out-of-commit GitHub Commit Status `oc-v5/arch-steward` verification shared across
+ *     hosted CI runners and host release trains.
  */
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { lstatSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 
 import {
+  ARCH_STEWARD_DRY_RUN_SCHEMA_VERSION,
   ARCH_STEWARD_RECEIPT_SCHEMA_VERSION,
   type ArchStewardReceipt,
   DEFAULT_HOST_STEWARD_RECEIPT_DIR,
   DEFAULT_STEWARD_HMAC_KEY_ENV,
-  DEFAULT_STEWARD_RECEIPT_REL_DIR,
   type ReceiptLookupResult,
   SHA40_RE,
   STEWARD_DIMENSION_KEYS,
@@ -28,6 +36,9 @@ import {
 } from './modelFamilyClassifier.js'
 
 const DIGEST_RE = /^(sha256|hmac-sha256):([0-9a-f]{64})$/
+const PLACEHOLDER_ID_RE =
+  /(?:^|[:/_\s-])(?:dry[-_]?run|example|mock|sample|placeholder|fake|stub|dummy)(?:$|[:/_\s-])/i
+const DRY_RUN_CMD_RE = /(?:^|\s)--dry-run(?:\s|$)/
 
 function canonicalSortValue(val: unknown): unknown {
   if (Array.isArray(val)) return val.map(canonicalSortValue)
@@ -70,11 +81,17 @@ export function computeArchStewardReceiptDigest(
   return `sha256:${hash}`
 }
 
-/** Attach computed `receiptDigest` to an unsigned receipt object. */
+/** Attach computed `receiptDigest` to an unsigned production receipt object. Refuses dry-run receipts. */
 export function signArchStewardReceipt(
   unsigned: Omit<ArchStewardReceipt, 'receiptDigest'>,
   hmacKey?: string,
 ): ArchStewardReceipt {
+  const raw = unsigned as Record<string, unknown>
+  if (raw.dryRun === true || raw.schemaVersion !== ARCH_STEWARD_RECEIPT_SCHEMA_VERSION) {
+    throw new Error(
+      `refusing to sign non-production/dry-run steward receipt (schemaVersion=${String(raw.schemaVersion)}, dryRun=${String(raw.dryRun)})`,
+    )
+  }
   return { ...unsigned, receiptDigest: computeArchStewardReceiptDigest(unsigned, hmacKey) }
 }
 
@@ -197,6 +214,11 @@ function verifyDimensionsAndVeto(
           code: 'STEWARD-RECEIPT-SCHEMA-INVALID',
           message: `receipt.dimensions.${key}.notes must be a non-empty string`,
         })
+      } else if (/^\s*\[dry[-_]?run\]/i.test(d.notes)) {
+        violations.push({
+          code: 'STEWARD-DRY-RUN-REJECTED',
+          message: `receipt.dimensions.${key}.notes contains dry-run placeholder marker`,
+        })
       }
     }
   }
@@ -249,13 +271,39 @@ function verifyEvidenceAndDigest(
     })
   } else {
     const ue = obj.usageEvidence as Record<string, unknown>
-    const hasJobOrSession =
-      (typeof ue.jobId === 'string' && ue.jobId.trim().length > 0) ||
-      (typeof ue.sessionKey === 'string' && ue.sessionKey.trim().length > 0)
-    if (!hasJobOrSession) {
+    const jobId = typeof ue.jobId === 'string' ? ue.jobId.trim() : ''
+    const sessionKey = typeof ue.sessionKey === 'string' ? ue.sessionKey.trim() : ''
+    const provider = typeof ue.provider === 'string' ? ue.provider.trim() : ''
+    const command = typeof ue.command === 'string' ? ue.command.trim() : ''
+
+    if (!jobId && !sessionKey) {
       violations.push({
         code: 'STEWARD-MISSING-USAGE-EVIDENCE',
         message: 'receipt.usageEvidence must include non-empty `jobId` or `sessionKey`',
+      })
+    }
+    if (jobId && PLACEHOLDER_ID_RE.test(jobId)) {
+      violations.push({
+        code: 'STEWARD-PLACEHOLDER-EVIDENCE',
+        message: `placeholder/dry-run jobId=${JSON.stringify(jobId)} is forbidden in production receipts`,
+      })
+    }
+    if (sessionKey && PLACEHOLDER_ID_RE.test(sessionKey)) {
+      violations.push({
+        code: 'STEWARD-PLACEHOLDER-EVIDENCE',
+        message: `placeholder/dry-run sessionKey=${JSON.stringify(sessionKey)} is forbidden in production receipts`,
+      })
+    }
+    if (provider && PLACEHOLDER_ID_RE.test(provider)) {
+      violations.push({
+        code: 'STEWARD-PLACEHOLDER-EVIDENCE',
+        message: `placeholder/dry-run provider=${JSON.stringify(provider)} is forbidden in production receipts`,
+      })
+    }
+    if (command && DRY_RUN_CMD_RE.test(command)) {
+      violations.push({
+        code: 'STEWARD-DRY-RUN-REJECTED',
+        message: 'receipt.usageEvidence.command indicates --dry-run execution (rejected in production)',
       })
     }
     if (!isValidIsoTimestamp(ue.timestamp)) {
@@ -298,8 +346,9 @@ function verifyEvidenceAndDigest(
 }
 
 /**
- * Strictly verify an `ArchStewardReceipt` (fail-closed across SHA binding, cross-family,
- * trigger coverage, 4 dimensions, non-overridable hard veto, usage evidence, and digest).
+ * Strictly verify an `ArchStewardReceipt` (fail-closed across dry-run rejection, placeholder
+ * evidence rejection, SHA binding, cross-family, trigger coverage, 4 dimensions, non-overridable
+ * hard veto, usage evidence, and digest).
  */
 export function verifyArchStewardReceipt(
   raw: unknown,
@@ -317,7 +366,19 @@ export function verifyArchStewardReceipt(
   const obj = raw as Record<string, unknown>
   const violations: StewardReceiptViolation[] = []
 
-  if (obj.schemaVersion !== ARCH_STEWARD_RECEIPT_SCHEMA_VERSION) {
+  if (obj.dryRun === true) {
+    violations.push({
+      code: 'STEWARD-DRY-RUN-REJECTED',
+      message: 'dryRun=true receipts are strictly rejected by production Architecture Steward enforcement',
+    })
+  }
+
+  if (obj.schemaVersion === ARCH_STEWARD_DRY_RUN_SCHEMA_VERSION) {
+    violations.push({
+      code: 'STEWARD-DRY-RUN-REJECTED',
+      message: `dry-run schemaVersion=${JSON.stringify(obj.schemaVersion)} cannot satisfy production enforcement`,
+    })
+  } else if (obj.schemaVersion !== ARCH_STEWARD_RECEIPT_SCHEMA_VERSION) {
     violations.push({
       code: 'STEWARD-RECEIPT-SCHEMA-INVALID',
       message: `invalid schemaVersion=${JSON.stringify(obj.schemaVersion)}; expected ${JSON.stringify(ARCH_STEWARD_RECEIPT_SCHEMA_VERSION)}`,
@@ -359,7 +420,7 @@ export function verifyArchStewardReceipt(
   }
 }
 
-// ── Receipt Discovery (dir / default paths / commit trailer) ───────────────────
+// ── Trusted Receipt Discovery (host root-only dir / isolated explicit fixture) ──
 
 export function extractStewardReceiptTrailer(commitMessage: string): string | null {
   const re = new RegExp(`^${STEWARD_RECEIPT_TRAILER_KEY}:\\s*(.+)$`, 'gim')
@@ -372,27 +433,96 @@ export function extractStewardReceiptTrailer(commitMessage: string): string | nu
   return last
 }
 
+function isPathInsideDir(filePath: string, dirPath: string): boolean {
+  const rel = path.relative(path.resolve(dirPath), path.resolve(filePath))
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
+}
+
 export function findStewardReceiptForCommit(opts: {
   root: string
   headSha: string
   explicitReceiptPath?: string
   receiptDirs?: readonly string[]
   commitMessage?: string
+  requireRootOwner?: boolean
+  hmacKey?: string
+  allowUntrustedRepoReceipt?: boolean
   env?: Readonly<Record<string, string | undefined>>
 }): ReceiptLookupResult {
   const env = opts.env ?? process.env
   const sha = opts.headSha.trim().toLowerCase()
+  const requireRootOwner = opts.requireRootOwner ?? true
+  const allowUntrustedRepo = opts.allowUntrustedRepoReceipt ?? false
   const searchedLocations: string[] = []
 
-  const tryReadJsonFile = (filePath: string, label: string): ReceiptLookupResult | null => {
+  const tryReadTrustedJsonFile = (
+    filePath: string,
+    label: string,
+    channel: ReceiptLookupResult['channel'],
+  ): ReceiptLookupResult | null => {
     searchedLocations.push(label)
-    if (!existsSync(filePath)) return null
+    let st: ReturnType<typeof lstatSync>
+    try {
+      st = lstatSync(filePath)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null
+      return {
+        found: true,
+        channel,
+        source: filePath,
+        error: `STEWARD-UNTRUSTED-RECEIPT-SOURCE: unable to stat receipt at ${filePath}: ${(err as Error).message}`,
+        searchedLocations,
+      }
+    }
+
+    if (st.isSymbolicLink() || !st.isFile()) {
+      return {
+        found: true,
+        channel,
+        source: filePath,
+        error: `STEWARD-UNTRUSTED-RECEIPT-SOURCE: steward receipt must be a regular file (no symlinks): ${filePath}`,
+        searchedLocations,
+      }
+    }
+    if ((st.mode & 0o022) !== 0) {
+      return {
+        found: true,
+        channel,
+        source: filePath,
+        error: `STEWARD-UNTRUSTED-RECEIPT-SOURCE: steward receipt must not be group/world writable: ${filePath}`,
+        searchedLocations,
+      }
+    }
+
+    // Production NEVER trusts unsigned files located inside the candidate repository
+    // (including `.github/steward-receipts/`), which the commit author controls.
+    if (isPathInsideDir(filePath, opts.root) && !opts.hmacKey && !allowUntrustedRepo) {
+      return {
+        found: true,
+        channel,
+        source: filePath,
+        error: `STEWARD-UNTRUSTED-RECEIPT-SOURCE: unsigned in-repository receipt file is forbidden in production (${filePath}); use host root-only ${DEFAULT_HOST_STEWARD_RECEIPT_DIR} or GitHub oc-v5/arch-steward status`,
+        searchedLocations,
+      }
+    }
+
+    if (requireRootOwner && st.uid !== 0) {
+      return {
+        found: true,
+        channel,
+        source: filePath,
+        error: `STEWARD-UNTRUSTED-RECEIPT-SOURCE: steward receipt must be owned by root (uid=0, got uid=${st.uid}): ${filePath}`,
+        searchedLocations,
+      }
+    }
+
     try {
       const raw: unknown = JSON.parse(readFileSync(filePath, 'utf8'))
-      return { found: true, source: filePath, raw, searchedLocations }
+      return { found: true, channel, source: filePath, raw, searchedLocations }
     } catch (err) {
       return {
         found: true,
+        channel,
         source: filePath,
         error: `failed to parse receipt JSON at ${filePath}: ${(err as Error).message.split('\n')[0]}`,
         searchedLocations,
@@ -402,40 +532,48 @@ export function findStewardReceiptForCommit(opts: {
 
   if (opts.explicitReceiptPath) {
     const abs = path.resolve(opts.root, opts.explicitReceiptPath)
-    const res = tryReadJsonFile(abs, abs)
+    const res = tryReadTrustedJsonFile(abs, abs, 'explicit-file')
     return res ?? { found: false, error: `explicit receipt file not found: ${abs}`, searchedLocations }
   }
 
   for (const dir of opts.receiptDirs ?? []) {
     const candidate = path.join(path.resolve(opts.root, dir), `${sha}.json`)
-    const res = tryReadJsonFile(candidate, candidate)
+    const res = tryReadTrustedJsonFile(candidate, candidate, 'host-file')
     if (res) return res
   }
 
   const envDir = env.OC_STEWARD_RECEIPT_DIR?.trim()
   if (envDir) {
     const candidate = path.join(path.resolve(envDir), `${sha}.json`)
-    const res = tryReadJsonFile(candidate, candidate)
+    const res = tryReadTrustedJsonFile(candidate, candidate, 'host-file')
     if (res) return res
   }
 
-  const repoCandidate = path.join(opts.root, DEFAULT_STEWARD_RECEIPT_REL_DIR, `${sha}.json`)
-  const repoRes = tryReadJsonFile(repoCandidate, repoCandidate)
-  if (repoRes) return repoRes
-
+  // Authoritative host root-only steward receipt directory (in-repo .github/steward-receipts/ is intentionally excluded!)
   const hostCandidate = path.join(DEFAULT_HOST_STEWARD_RECEIPT_DIR, `${sha}.json`)
-  const hostRes = tryReadJsonFile(hostCandidate, hostCandidate)
+  const hostRes = tryReadTrustedJsonFile(hostCandidate, hostCandidate, 'host-file')
   if (hostRes) return hostRes
 
+  // Commit trailer only allowed when pointing to an external trusted file (never unsigned in-repo/base64 bypass)
   if (opts.commitMessage) {
     const trailer = extractStewardReceiptTrailer(opts.commitMessage)
     if (trailer) {
       if (trailer.startsWith('base64:')) {
         searchedLocations.push(`commit-trailer:${STEWARD_RECEIPT_TRAILER_KEY}:base64`)
+        if (!opts.hmacKey && !allowUntrustedRepo) {
+          return {
+            found: true,
+            channel: 'commit-trailer',
+            source: `commit-trailer:${STEWARD_RECEIPT_TRAILER_KEY}`,
+            error: 'STEWARD-UNTRUSTED-RECEIPT-SOURCE: unsigned base64 commit-trailer receipts are forbidden in production',
+            searchedLocations,
+          }
+        }
         try {
           const decoded = Buffer.from(trailer.slice('base64:'.length).trim(), 'base64').toString('utf8')
           return {
             found: true,
+            channel: 'commit-trailer',
             source: `commit-trailer:${STEWARD_RECEIPT_TRAILER_KEY}`,
             raw: JSON.parse(decoded) as unknown,
             searchedLocations,
@@ -443,6 +581,7 @@ export function findStewardReceiptForCommit(opts: {
         } catch (err) {
           return {
             found: true,
+            channel: 'commit-trailer',
             source: `commit-trailer:${STEWARD_RECEIPT_TRAILER_KEY}`,
             error: `invalid base64 JSON in ${STEWARD_RECEIPT_TRAILER_KEY} trailer: ${(err as Error).message.split('\n')[0]}`,
             searchedLocations,
@@ -450,7 +589,11 @@ export function findStewardReceiptForCommit(opts: {
         }
       }
       const trailerPath = path.isAbsolute(trailer) ? trailer : path.resolve(opts.root, trailer)
-      const trailerRes = tryReadJsonFile(trailerPath, `trailer:${trailerPath}`)
+      const trailerRes = tryReadTrustedJsonFile(
+        trailerPath,
+        `trailer:${trailerPath}`,
+        'commit-trailer',
+      )
       return (
         trailerRes ?? {
           found: false,
@@ -491,22 +634,22 @@ export function formatStewardGateFailure(
   const lines: string[] = [formatStructuralRiskReport(report)]
   if (lookup && !lookup.found) {
     lines.push(
-      `[GATE-ERROR] STEWARD-RECEIPT-MISSING: commit ${headSha.slice(0, 12)} triggered Architecture Steward review (${report.triggers.join(', ')}), but no receipt was found.`,
+      `[GATE-ERROR] STEWARD-RECEIPT-MISSING: commit ${headSha.slice(0, 12)} triggered Architecture Steward review (${report.triggers.join(', ')}), but no trusted receipt or GitHub oc-v5/arch-steward status was found.`,
     )
     if (lookup.error) lines.push(`  Detail  : ${lookup.error}`)
     lines.push(`  Searched: ${lookup.searchedLocations.join(' | ')}`)
   } else if (lookup?.error) {
-    lines.push(`[GATE-ERROR] STEWARD-RECEIPT-SCHEMA-INVALID: ${lookup.error}`)
+    lines.push(`[GATE-ERROR] ${lookup.error}`)
   }
   if (verification) {
     for (const v of verification.violations) lines.push(`[GATE-ERROR] ${v.code}: ${v.message}`)
   }
-  lines.push(`  How to Fix: Run cross-family Architecture Steward review for exact commit ${headSha}:`)
+  lines.push(`  How to Fix: Run real cross-family Architecture Steward review for exact commit ${headSha}:`)
   lines.push(
-    `    scripts/arch-steward-review.sh --base ${baseSha.slice(0, 12)} --head ${headSha} --author-model <your-model>`,
+    `    scripts/arch-steward-review.sh --base ${baseSha.slice(0, 12)} --head ${headSha} --author-model <your-model> [--publish-github-status]`,
   )
   lines.push(
-    '  Policy    : Steward VETO is non-overridable by the dev lead; resolve blockers in a new commit and obtain a fresh cross-family approve receipt.',
+    '  Policy    : Dry-run receipts and unsigned in-repo files are rejected; Steward VETO is non-overridable.',
   )
   return lines.join('\n')
 }

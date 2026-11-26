@@ -19,8 +19,8 @@
  *
  * Usage:
  *   npx tsx scripts/check-debt-ttl.ts [--status] [--enforce] [--json]
- *     [--check-commit-prefix "<msg>"] [--today YYYY-MM-DD] [--root <dir>]
- *     [--policy <rel>] [--mode-file <path>]
+ *     [--check-commit-prefix "<msg>"] [--base <ref>] [--head <ref>]
+ *     [--today YYYY-MM-DD] [--root <dir>] [--policy <rel>] [--mode-file <path>]
  *
  * Exit: 0 ok, 1 policy violation / freeze block, 2 usage/IO error.
  */
@@ -28,65 +28,34 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import {
+  DEFAULT_POLICY_PATH,
+  type DebtExemptionEntry,
+  type DebtTtlPolicy,
+  type GovernorMode,
+  checkCommitPrefixAllowed,
+  checkCommitSubjectsAllowed,
+  classifyCommitPrefix,
+  isNetDebtPayingCommit,
+  parseIsoDateMs,
+  readCommitSubjectsForCheck,
+  readExternalModeFile,
+} from './lib/debtTtlCommitGuard.js'
 
-export const DEFAULT_POLICY_PATH = 'arch/debt-ttl-policy.json'
-const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+export {
+  DEFAULT_POLICY_PATH,
+  type DebtExemptionEntry,
+  type DebtTtlPolicy,
+  type GovernorMode,
+  checkCommitPrefixAllowed,
+  checkCommitSubjectsAllowed,
+  classifyCommitPrefix,
+  parseIsoDateMs,
+  readCommitSubjectsForCheck,
+  readExternalModeFile,
+}
+
 const DAY_MS = 86_400_000
-
-export type GovernorMode = 'autonomous' | 'debt_first' | 'emergency_stop'
-
-export interface DebtExemptionEntry {
-  id: string
-  owner: string
-  reason: string
-  ticket?: string
-  expiresAt: string
-}
-
-export interface DebtTtlPolicy {
-  schema: number
-  note?: string
-  anchorDate: string
-  effectiveFrom: string
-  decayTargets: {
-    violationsBaseline: {
-      path: string
-      anchorTotal: number
-      anchorR2Total: number
-      monthlyTotalDecayRate: number
-      quarterlyTotalDecayRate: number
-      monthlyR2DecayRate: number
-      quarterlyR2DecayRate: number
-    }
-    fileSizeBaseline: {
-      path: string
-      anchorRedFiles: number
-      anchorCssFiles: number
-      anchorYellowFiles: number
-      anchorTotalTrackedLines: number
-      monthlyRedFileReduction: number
-      quarterlyTotalLinesDecayRate: number
-    }
-  }
-  ttlPolicy: {
-    maxExceptionDays: number
-    debtFirstExpiredThreshold: number
-    sources: {
-      fileSizeExceptions: string
-      featureFlagsRegistry: string
-    }
-    debtExemptions: DebtExemptionEntry[]
-  }
-  debtFirstPolicy: {
-    windowWeeks: number
-    triggerReworkRatio: number
-    releaseReworkRatio: number
-    reworkPrefixes: string[]
-    blockedPrefixesInDebtFirst: string[]
-    allowedPrefixesInDebtFirst: string[]
-    defaultModeFile?: string
-  }
-}
 
 export interface CommitRecord {
   subject: string
@@ -159,14 +128,9 @@ export interface DebtTtlEvaluation {
     prefix: string | null
     allowed: boolean
     reason: string
+    checkedCommits?: number
   }
-}
-
-export function parseIsoDateMs(dateStr: string): number {
-  if (!ISO_DATE_RE.test(dateStr)) return Number.NaN
-  const ms = Date.parse(`${dateStr}T00:00:00Z`)
-  if (!Number.isFinite(ms)) return Number.NaN
-  return new Date(ms).toISOString().slice(0, 10) === dateStr ? ms : Number.NaN
+  debtPaydownAllowed?: boolean
 }
 
 export function loadPolicy(root: string, policyRel = DEFAULT_POLICY_PATH): DebtTtlPolicy {
@@ -185,13 +149,6 @@ export function loadPolicy(root: string, policyRel = DEFAULT_POLICY_PATH): DebtT
     throw new Error(`invalid effectiveFrom in ${policyRel}: ${String(raw.effectiveFrom)}`)
   }
   return raw
-}
-
-/** Extracts conventional commit prefix (e.g. `feat(v5): ...` -> `feat`, `bug(v5):` -> `bug`). */
-export function classifyCommitPrefix(subject: string): string | null {
-  const trimmed = subject.trim()
-  const m = /^([a-z][a-z0-9_-]*)(?:\([^)]*\))?!?:\s*/i.exec(trimmed)
-  return m ? m[1]!.toLowerCase() : null
 }
 
 export function computeWeeklyReworkStats(
@@ -453,76 +410,6 @@ export function computeBaselineDecayStatus(
   }
 }
 
-export function readExternalModeFile(modeFilePath?: string): GovernorMode | null {
-  if (!modeFilePath || !existsSync(modeFilePath)) return null
-  try {
-    const parsed = JSON.parse(readFileSync(modeFilePath, 'utf8')) as { mode?: unknown }
-    if (
-      parsed.mode === 'autonomous' ||
-      parsed.mode === 'debt_first' ||
-      parsed.mode === 'emergency_stop'
-    ) {
-      return parsed.mode
-    }
-  } catch {
-    return null
-  }
-  return null
-}
-
-export function checkCommitPrefixAllowed(
-  message: string,
-  effectiveMode: GovernorMode,
-  policy: DebtTtlPolicy,
-): { message: string; prefix: string | null; allowed: boolean; reason: string } {
-  const firstLine = message.split('\n')[0]!.trim()
-  const prefix = classifyCommitPrefix(firstLine)
-
-  if (effectiveMode === 'emergency_stop') {
-    return {
-      message: firstLine,
-      prefix,
-      allowed: false,
-      reason: 'emergency_stop mode active — all automated merges blocked',
-    }
-  }
-  if (effectiveMode === 'autonomous') {
-    return {
-      message: firstLine,
-      prefix,
-      allowed: true,
-      reason: 'autonomous mode — commit prefix permitted',
-    }
-  }
-
-  // debt_first mode: block `feat` (and any unknown prefix outside allowed list)
-  const blocked = new Set(policy.debtFirstPolicy.blockedPrefixesInDebtFirst.map((p) => p.toLowerCase()))
-  const allowed = new Set(policy.debtFirstPolicy.allowedPrefixesInDebtFirst.map((p) => p.toLowerCase()))
-
-  if (prefix !== null && blocked.has(prefix)) {
-    return {
-      message: firstLine,
-      prefix,
-      allowed: false,
-      reason: `debt_first feature freeze active: "${prefix}" commits are blocked until rework < ${Math.round(policy.debtFirstPolicy.releaseReworkRatio * 100)}% and expired TTLs === 0`,
-    }
-  }
-  if (prefix !== null && allowed.has(prefix)) {
-    return {
-      message: firstLine,
-      prefix,
-      allowed: true,
-      reason: `debt_first mode permits maintenance/fix prefix "${prefix}"`,
-    }
-  }
-  return {
-    message: firstLine,
-    prefix,
-    allowed: false,
-    reason: `debt_first mode only permits prefixes [${policy.debtFirstPolicy.allowedPrefixesInDebtFirst.join(', ')}]`,
-  }
-}
-
 export function evaluateDebtTtlPolicy(opts: {
   root: string
   policy: DebtTtlPolicy
@@ -530,6 +417,7 @@ export function evaluateDebtTtlPolicy(opts: {
   commits?: readonly CommitRecord[]
   externalMode?: GovernorMode | null
   commitMessage?: string
+  commitMessages?: readonly string[]
 }): DebtTtlEvaluation {
   const todayMs = parseIsoDateMs(opts.today)
   if (!Number.isFinite(todayMs)) {
@@ -598,9 +486,11 @@ export function evaluateDebtTtlPolicy(opts: {
           : recommendedMode
 
   const commitCheck =
-    opts.commitMessage !== undefined
-      ? checkCommitPrefixAllowed(opts.commitMessage, effectiveMode, opts.policy)
-      : undefined
+    opts.commitMessages !== undefined
+      ? checkCommitSubjectsAllowed(opts.commitMessages, effectiveMode, opts.policy)
+      : opts.commitMessage !== undefined
+        ? checkCommitPrefixAllowed(opts.commitMessage, effectiveMode, opts.policy)
+        : undefined
 
   return {
     schema: 1,
@@ -648,6 +538,9 @@ export function main(argv: string[]): number {
   let jsonOut = false
   let modeFile: string | undefined = process.env.OC_GOVERNOR_MODE_FILE
   let commitMessage: string | undefined
+  let baseRef: string | undefined
+  let headRef = 'HEAD'
+  let sawHeadOrBase = false
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!
@@ -667,6 +560,12 @@ export function main(argv: string[]): number {
       modeFile = argv[++i] ?? ''
     } else if (arg === '--check-commit-prefix') {
       commitMessage = argv[++i] ?? ''
+    } else if (arg === '--base') {
+      baseRef = argv[++i] ?? ''
+      sawHeadOrBase = true
+    } else if (arg === '--head') {
+      headRef = argv[++i] ?? 'HEAD'
+      sawHeadOrBase = true
     } else {
       console.error(`[debt-ttl] unknown argument: ${arg}`)
       return 2
@@ -682,6 +581,11 @@ export function main(argv: string[]): number {
   }
 
   const externalMode = readExternalModeFile(modeFile ?? policy.debtFirstPolicy.defaultModeFile)
+  let commitMessages: string[] | undefined
+  if (commitMessage === undefined && (enforce || sawHeadOrBase)) {
+    commitMessages = readCommitSubjectsForCheck(root, baseRef, headRef)
+  }
+
   let evaluation: DebtTtlEvaluation
   try {
     evaluation = evaluateDebtTtlPolicy({
@@ -690,26 +594,51 @@ export function main(argv: string[]): number {
       today,
       externalMode,
       commitMessage,
+      commitMessages,
     })
   } catch (err) {
     console.error(`[debt-ttl] ${(err as Error).message}`)
     return 2
   }
 
+  // B9 decoupling:
+  //   1. `emergency_stop` ALWAYS fails closed (exit 1) whenever enforcing or checking commits.
+  //   2. `debt_first` ONLY blocks disallowed prefixes (e.g. `feat(...)`) — maintenance/fix/refactor
+  //      commits are permitted when budgets & TTLs are met OR when strictly paying down debt!
+  const debtPaydownAllowed = Boolean(
+    enforce &&
+      baseRef &&
+      evaluation.effectiveMode === 'debt_first' &&
+      evaluation.commitCheck?.allowed &&
+      (!evaluation.decay.allOnTrack || evaluation.ttl.expiredCount > 0) &&
+      isNetDebtPayingCommit(root, baseRef, today, policy, evaluation),
+  )
+  if (debtPaydownAllowed) {
+    evaluation.debtPaydownAllowed = true
+  }
+
   if (jsonOut) {
     console.log(JSON.stringify(evaluation, null, 2))
   } else {
     console.log(formatHumanReport(evaluation))
+    if (debtPaydownAllowed) {
+      console.log('[debt-ttl] debt-paydown commit strictly reduces debt/expired TTLs -> permitted in debt_first mode')
+    }
   }
 
-  if (evaluation.commitCheck && !evaluation.commitCheck.allowed) {
+  if (evaluation.effectiveMode === 'emergency_stop' && (enforce || evaluation.commitCheck)) {
     console.error(
-      `[GATE-ERROR] DEBT-FIRST-FREEZE: ${evaluation.commitCheck.reason}`,
+      '[GATE-ERROR] EMERGENCY-STOP: emergency_stop mode active — all automated merges and forward deploys are blocked',
     )
     return 1
   }
 
-  if (enforce && !evaluation.inGraceWindow) {
+  if (evaluation.commitCheck && !evaluation.commitCheck.allowed) {
+    console.error(`[GATE-ERROR] DEBT-FIRST-FREEZE: ${evaluation.commitCheck.reason}`)
+    return 1
+  }
+
+  if (enforce && !evaluation.inGraceWindow && !debtPaydownAllowed) {
     const errors: string[] = []
     if (!evaluation.decay.allOnTrack) {
       errors.push(
@@ -718,11 +647,6 @@ export function main(argv: string[]): number {
     }
     if (evaluation.ttl.expiredCount > 0) {
       errors.push(`expired debt TTL items=${evaluation.ttl.expiredCount}`)
-    }
-    if (evaluation.effectiveMode !== 'autonomous') {
-      errors.push(
-        `effectiveMode=${evaluation.effectiveMode} (${evaluation.triggerReasons.join('; ') || 'debt_first active'})`,
-      )
     }
     if (errors.length > 0) {
       console.error(`[GATE-ERROR] DEBT-TTL-ENFORCE: ${errors.join(' | ')}`)

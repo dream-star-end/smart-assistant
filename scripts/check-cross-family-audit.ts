@@ -1,5 +1,5 @@
 /**
- * Cross-Family T2 Audit & Architecture Steward Enforcement Gate (OCV5-905).
+ * Cross-Family T2 Audit & Architecture Steward Enforcement Gate (OCV5-905 / OCV5-903 B2 & B3).
  *
  * Dual-mode gate with 100% backward compatibility:
  *
@@ -8,25 +8,23 @@
  *      npx tsx scripts/check-cross-family-audit.ts --receipt <path/to/receipt.json>
  *
  * 2. Deterministic Architecture Steward CI / Release-Train Hard Gate:
- *      npx tsx scripts/check-cross-family-audit.ts --enforce-commit [--base <ref>] [--head <ref>] [--receipt-dir <dir>] [--root <dir>] [--json]
- *      npx tsx scripts/check-cross-family-audit.ts --enforce-pr     [--base <ref>] [--head <ref>] [--receipt-dir <dir>] [--root <dir>] [--json]
- *      npx tsx scripts/check-cross-family-audit.ts --check-only     [--base <ref>] [--head <ref>] [--receipt-dir <dir>] [--root <dir>] [--json]
+ *      npx tsx scripts/check-cross-family-audit.ts (--enforce-commit | --enforce-pr | --check-only)
+ *        [--base <ref>] [--head <ref>] [--root <dir>] [--receipt-dir <dir>] [--receipt <file.json>]
+ *        [--hmac-key-env <ENV_VAR>] [--hmac-key-file <path>] [--require-root-owner]
+ *        [--unsafe-test-skip-owner] [--github-repo <owner/repo>] [--github-token-env <ENV>]
+ *        [--trusted-publishers <csv>] [--github-api-url <url>] [--json]
  *
- *    Execution flow:
- *      a) Runs `evaluateStructuralRisk` against `git diff <base>...<head>`:
- *         - If 0/6 structural risk triggers fire (ordinary low-risk T0/T1 edits), exits 0 immediately
- *           with zero LLM/steward overhead.
- *         - If >= 1 trigger fires, locates and strictly verifies an `ArchStewardReceipt` bound to
- *           the exact 40-char `headSha` (anti-tamper digest, no old-SHA reuse, no same-family
- *           self-review, no weak steward model, non-overridable hard veto).
+ *    Trust boundaries:
+ *      - Production rejects dry-run/example/mock receipts, symlinks, group/world-writable files,
+ *        non-root host receipts, and unsigned in-repo `.github/steward-receipts/` files.
+ *      - Out-of-commit authorization channels (shared by hosted CI runners and host release train):
+ *          1. Root-only host receipt at `/opt/openclaude/harness-gate/steward-receipts/<headSha>.json`
+ *          2. Trusted GitHub Commit Status `oc-v5/arch-steward` (`state === "success"`,
+ *             `verdict=approve`, cross-family `stewardFamily !== authorFamily`, valid `receiptDigest`).
  *
  * 3. Steward helper utilities (consumed by `scripts/arch-steward-review.sh`):
  *      npx tsx scripts/check-cross-family-audit.ts --recommend-model <authorSlug>
  *      npx tsx scripts/check-cross-family-audit.ts --sign-receipt <in.json> [--out <out.json>]
- *
- * CLI safety:
- *   - `--receipt <json>` and `--dev-model`/`--audit-model` remain strictly mutually exclusive (exit 2).
- *   - Mixing `--dev-model`/`--audit-model` with `--enforce-commit`/`--enforce-pr`/`--check-only` fails closed (exit 2).
  *
  * Exit: 0 ok, 1 policy violation / missing or invalid steward receipt / hard veto, 2 CLI/git/IO error.
  */
@@ -34,7 +32,9 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
+import { readValidatedHmacKeyFile } from './lib/a0ApprovalReceipt.js'
 import {
+  ARCH_STEWARD_DRY_RUN_SCHEMA_VERSION,
   ARCH_STEWARD_RECEIPT_SCHEMA_VERSION,
   type ArchStewardReceipt,
   DEFAULT_STEWARD_HMAC_KEY_ENV,
@@ -52,6 +52,12 @@ import {
   signArchStewardReceipt,
   verifyArchStewardReceipt,
 } from './lib/archStewardContract.js'
+import {
+  type FetchLike,
+  type GithubStewardStatusResult,
+  resolveGithubToken,
+  verifyGithubStewardStatus,
+} from './lib/githubTrustedApproval.js'
 import {
   type CrossFamilyAuditResult,
   type CrossFamilyViolationCode,
@@ -81,6 +87,7 @@ export type { ModelFamily, CrossFamilyViolationCode, CrossFamilyAuditResult }
 
 // Re-export Architecture Steward contract APIs for downstream consumers
 export {
+  ARCH_STEWARD_DRY_RUN_SCHEMA_VERSION,
   ARCH_STEWARD_RECEIPT_SCHEMA_VERSION,
   collectDiffSummaryFromGit,
   evaluateStructuralRisk,
@@ -101,7 +108,16 @@ export interface StewardGateRunOptions {
   explicitReceiptPath?: string
   gitDir?: string
   hmacKey?: string
+  requireRootOwner?: boolean
+  allowUntrustedRepoReceipt?: boolean
   env?: Readonly<Record<string, string | undefined>>
+  github?: {
+    repo?: string
+    token?: string
+    trustedPublishers?: readonly string[]
+    apiBaseUrl?: string
+    fetchImpl?: FetchLike
+  }
 }
 
 export interface StewardGateRunResult {
@@ -113,9 +129,18 @@ export interface StewardGateRunResult {
   risk: StructuralRiskReport
   receiptLookup?: ReceiptLookupResult
   receiptVerification?: StewardReceiptVerificationResult
+  githubStatus?: GithubStewardStatusResult
 }
 
-export function runStewardGate(opts: StewardGateRunOptions): StewardGateRunResult {
+function runLocalStewardCheck(opts: StewardGateRunOptions): {
+  headSha: string
+  baseSha: string
+  risk: StructuralRiskReport
+  receiptLookup?: ReceiptLookupResult
+  receiptVerification?: StewardReceiptVerificationResult
+  passed: boolean
+  hasHardVeto: boolean
+} {
   const env = opts.env ?? process.env
   const gitDir = opts.gitDir ?? (env.GIT_DIR?.trim() || undefined)
   const headSha = resolveGitSha(opts.root, opts.headRef ?? 'HEAD', gitDir)
@@ -131,14 +156,7 @@ export function runStewardGate(opts: StewardGateRunOptions): StewardGateRunResul
   const risk = evaluateStructuralRisk(diffSummary, { root: opts.root })
 
   if (!risk.requiresSteward) {
-    return {
-      ok: true,
-      exitCode: 0,
-      mode: opts.mode,
-      headSha,
-      baseSha,
-      risk,
-    }
+    return { headSha, baseSha, risk, passed: true, hasHardVeto: false }
   }
 
   const commitMessage = readCommitMessage(opts.root, headSha, gitDir)
@@ -148,6 +166,9 @@ export function runStewardGate(opts: StewardGateRunOptions): StewardGateRunResul
     explicitReceiptPath: opts.explicitReceiptPath,
     receiptDirs: opts.receiptDirs,
     commitMessage,
+    requireRootOwner: opts.requireRootOwner ?? true,
+    hmacKey: opts.hmacKey,
+    allowUntrustedRepoReceipt: opts.allowUntrustedRepoReceipt ?? false,
     env,
   })
 
@@ -162,17 +183,138 @@ export function runStewardGate(opts: StewardGateRunOptions): StewardGateRunResul
   }
 
   const passed = Boolean(receiptLookup.found && !receiptLookup.error && receiptVerification?.ok)
-  const exitCode: 0 | 1 = passed || opts.mode === 'check-only' ? 0 : 1
+  const hasHardVeto = Boolean(
+    receiptVerification?.violations.some((v) => v.code === 'STEWARD-HARD-VETO'),
+  )
+  return { headSha, baseSha, risk, receiptLookup, receiptVerification, passed, hasHardVeto }
+}
 
+/** Synchronous Architecture Steward check (host/explicit receipt verification). */
+export function runStewardGate(opts: StewardGateRunOptions): StewardGateRunResult {
+  const local = runLocalStewardCheck(opts)
+  if (!local.risk.requiresSteward) {
+    return {
+      ok: true,
+      exitCode: 0,
+      mode: opts.mode,
+      headSha: local.headSha,
+      baseSha: local.baseSha,
+      risk: local.risk,
+    }
+  }
+  const exitCode: 0 | 1 = local.passed || opts.mode === 'check-only' ? 0 : 1
   return {
-    ok: passed,
+    ok: local.passed,
     exitCode,
     mode: opts.mode,
-    headSha,
-    baseSha,
-    risk,
-    receiptLookup,
-    receiptVerification,
+    headSha: local.headSha,
+    baseSha: local.baseSha,
+    risk: local.risk,
+    receiptLookup: local.receiptLookup,
+    receiptVerification: local.receiptVerification,
+  }
+}
+
+/**
+ * Asynchronous Architecture Steward check supporting both host root-only receipts
+ * and out-of-commit GitHub Commit Status `oc-v5/arch-steward`.
+ */
+export async function runStewardGateAsync(
+  opts: StewardGateRunOptions,
+): Promise<StewardGateRunResult> {
+  const local = runLocalStewardCheck(opts)
+  if (!local.risk.requiresSteward) {
+    return {
+      ok: true,
+      exitCode: 0,
+      mode: opts.mode,
+      headSha: local.headSha,
+      baseSha: local.baseSha,
+      risk: local.risk,
+    }
+  }
+
+  if (local.passed || local.hasHardVeto) {
+    const exitCode: 0 | 1 = local.passed || opts.mode === 'check-only' ? 0 : 1
+    return {
+      ok: local.passed,
+      exitCode,
+      mode: opts.mode,
+      headSha: local.headSha,
+      baseSha: local.baseSha,
+      risk: local.risk,
+      receiptLookup: local.receiptLookup,
+      receiptVerification: local.receiptVerification,
+    }
+  }
+
+  const ghRepo = opts.github?.repo?.trim()
+  const ghToken = opts.github?.token?.trim()
+  let githubStatus: GithubStewardStatusResult | undefined
+  if (ghRepo && ghToken && !opts.explicitReceiptPath) {
+    githubStatus = await verifyGithubStewardStatus({
+      repo: ghRepo,
+      token: ghToken,
+      headSha: local.headSha,
+      trustedPublishers: opts.github?.trustedPublishers,
+      apiBaseUrl: opts.github?.apiBaseUrl,
+      fetchImpl: opts.github?.fetchImpl,
+    })
+    const searched = [
+      ...(local.receiptLookup?.searchedLocations ?? []),
+      githubStatus.source,
+    ]
+    if (githubStatus.valid) {
+      return {
+        ok: true,
+        exitCode: 0,
+        mode: opts.mode,
+        headSha: local.headSha,
+        baseSha: local.baseSha,
+        risk: local.risk,
+        receiptLookup: {
+          found: true,
+          channel: 'github-status',
+          source: githubStatus.source,
+          searchedLocations: searched,
+        },
+        githubStatus,
+      }
+    }
+    const mergedLookup: ReceiptLookupResult = {
+      found: local.receiptLookup?.found ?? false,
+      channel: local.receiptLookup?.channel,
+      source: local.receiptLookup?.source ?? githubStatus.source,
+      raw: local.receiptLookup?.raw,
+      error: local.receiptLookup?.error
+        ? `${local.receiptLookup.error}; github: ${githubStatus.reason}`
+        : githubStatus.reason,
+      searchedLocations: searched,
+    }
+    const exitCode: 0 | 1 = opts.mode === 'check-only' ? 0 : 1
+    return {
+      ok: false,
+      exitCode,
+      mode: opts.mode,
+      headSha: local.headSha,
+      baseSha: local.baseSha,
+      risk: local.risk,
+      receiptLookup: mergedLookup,
+      receiptVerification: local.receiptVerification,
+      githubStatus,
+    }
+  }
+
+  const exitCode: 0 | 1 = opts.mode === 'check-only' ? 0 : 1
+  return {
+    ok: false,
+    exitCode,
+    mode: opts.mode,
+    headSha: local.headSha,
+    baseSha: local.baseSha,
+    risk: local.risk,
+    receiptLookup: local.receiptLookup,
+    receiptVerification: local.receiptVerification,
   }
 }
 
@@ -187,7 +329,8 @@ function printUsage(): void {
       '  Architecture Steward CI / Release-Train Gate:',
       '    npx tsx scripts/check-cross-family-audit.ts (--enforce-commit | --enforce-pr | --check-only)',
       '      [--base <ref>] [--head <ref>] [--root <dir>] [--receipt-dir <dir>] [--receipt <file.json>]',
-      '      [--hmac-key-env <ENV_VAR>] [--json]',
+      '      [--hmac-key-env <ENV_VAR>] [--hmac-key-file <path>] [--require-root-owner] [--unsafe-test-skip-owner]',
+      '      [--github-repo <owner/repo>] [--github-token-env <ENV>] [--trusted-publishers <csv>] [--github-api-url <url>] [--json]',
       '',
       '  Steward review helpers:',
       '    npx tsx scripts/check-cross-family-audit.ts --recommend-model <authorSlug>',
@@ -196,7 +339,7 @@ function printUsage(): void {
   )
 }
 
-function main(argv: string[]): number {
+async function main(argv: string[]): Promise<number> {
   let devModel: string | undefined
   let auditModel: string | undefined
   let receiptPath: string | undefined
@@ -207,6 +350,13 @@ function main(argv: string[]): number {
   const receiptDirs: string[] = []
   let jsonOut = false
   let hmacKeyEnv = DEFAULT_STEWARD_HMAC_KEY_ENV
+  let hmacKeyFile: string | undefined
+  let requireRootOwner = true
+  let allowUntrustedRepoReceipt = false
+  let githubRepo = process.env.GITHUB_REPOSITORY?.trim() || process.env.GH_REPO?.trim() || undefined
+  let githubTokenEnv: string | undefined
+  let trustedPublishersRaw = process.env.OC_TRUSTED_APPROVERS?.trim() || ''
+  let githubApiUrl = process.env.GITHUB_API_URL?.trim() || undefined
   let recommendAuthorSlug: string | undefined
   let signReceiptPath: string | undefined
   let outPath: string | undefined
@@ -285,6 +435,32 @@ function main(argv: string[]): number {
       const v = takeValue(arg, ++i)
       if (!v) return 2
       hmacKeyEnv = v
+    } else if (arg === '--hmac-key-file') {
+      const v = takeValue(arg, ++i)
+      if (!v) return 2
+      hmacKeyFile = v
+    } else if (arg === '--require-root-owner') {
+      requireRootOwner = true
+    } else if (arg === '--unsafe-test-skip-owner') {
+      requireRootOwner = false
+    } else if (arg === '--unsafe-test-allow-repo-receipt') {
+      allowUntrustedRepoReceipt = true
+    } else if (arg === '--github-repo') {
+      const v = takeValue(arg, ++i)
+      if (!v) return 2
+      githubRepo = v
+    } else if (arg === '--github-token-env') {
+      const v = takeValue(arg, ++i)
+      if (!v) return 2
+      githubTokenEnv = v
+    } else if (arg === '--trusted-publishers') {
+      const v = takeValue(arg, ++i)
+      if (!v) return 2
+      trustedPublishersRaw = v
+    } else if (arg === '--github-api-url') {
+      const v = takeValue(arg, ++i)
+      if (!v) return 2
+      githubApiUrl = v
     } else if (arg === '--json') {
       jsonOut = true
     } else if (arg === '--recommend-model') {
@@ -306,6 +482,22 @@ function main(argv: string[]): number {
       console.error(`[cross-family-audit] unknown arg: ${arg}`)
       return 2
     }
+  }
+
+  const resolveHmacKey = (): string | undefined => {
+    const fromEnv = process.env[hmacKeyEnv]?.trim()
+    if (fromEnv) return fromEnv
+    if (hmacKeyFile) {
+      const keyRes = readValidatedHmacKeyFile(hmacKeyFile, requireRootOwner)
+      if (!keyRes.present) {
+        throw new Error(`HMAC key file not found: ${hmacKeyFile}`)
+      }
+      if (!keyRes.ok) {
+        throw new Error(keyRes.reason)
+      }
+      return keyRes.key
+    }
+    return undefined
   }
 
   // Helper mode: single-process preflight for `scripts/arch-steward-review.sh`
@@ -333,6 +525,7 @@ function main(argv: string[]): number {
         mode: 'check-only',
         baseRef,
         headRef,
+        requireRootOwner: false,
       })
       console.log(
         JSON.stringify({
@@ -373,7 +566,7 @@ function main(argv: string[]): number {
     return 0
   }
 
-  // Helper mode: sign an ArchStewardReceipt JSON atomically
+  // Helper mode: sign an ArchStewardReceipt JSON atomically (refuses dry-run receipts!)
   if (signReceiptPath !== undefined) {
     try {
       const absIn = path.resolve(signReceiptPath)
@@ -385,7 +578,7 @@ function main(argv: string[]): number {
         ArchStewardReceipt,
         'receiptDigest'
       >
-      const hmacKey = process.env[hmacKeyEnv]?.trim() || undefined
+      const hmacKey = resolveHmacKey()
       const signed = signArchStewardReceipt(parsed, hmacKey)
       const rendered = `${JSON.stringify(signed, null, 2)}\n`
       if (outPath) {
@@ -421,8 +614,15 @@ function main(argv: string[]): number {
   // Mode 2: Deterministic Architecture Steward commit/PR hard gate
   if (gateMode !== undefined) {
     try {
-      const hmacKey = process.env[hmacKeyEnv]?.trim() || undefined
-      const result = runStewardGate({
+      const hmacKey = resolveHmacKey()
+      const githubToken = resolveGithubToken(githubTokenEnv)
+      const trustedPublishers = trustedPublishersRaw
+        ? trustedPublishersRaw
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined
+      const result = await runStewardGateAsync({
         root,
         mode: gateMode,
         baseRef,
@@ -430,6 +630,17 @@ function main(argv: string[]): number {
         receiptDirs,
         explicitReceiptPath: receiptPath,
         hmacKey,
+        requireRootOwner,
+        allowUntrustedRepoReceipt,
+        github:
+          githubRepo && githubToken
+            ? {
+                repo: githubRepo,
+                token: githubToken,
+                trustedPublishers,
+                apiBaseUrl: githubApiUrl,
+              }
+            : undefined,
       })
 
       if (jsonOut) {
@@ -442,12 +653,19 @@ function main(argv: string[]): number {
         return 0
       }
 
-      if (result.ok && result.receiptVerification?.receipt) {
-        const rec = result.receiptVerification.receipt
+      if (result.ok) {
         console.log(formatStructuralRiskReport(result.risk))
-        console.log(
-          `[arch-steward] ok (${gateMode}): head=${result.headSha.slice(0, 12)} approved by ${rec.stewardModel} (${rec.stewardFamily}) vs author ${rec.authorModel} (${rec.authorFamily}) [source=${result.receiptLookup?.source}]`,
-        )
+        if (result.receiptVerification?.receipt) {
+          const rec = result.receiptVerification.receipt
+          console.log(
+            `[arch-steward] ok (${gateMode}): head=${result.headSha.slice(0, 12)} approved by ${rec.stewardModel} (${rec.stewardFamily}) vs author ${rec.authorModel} (${rec.authorFamily}) [source=${result.receiptLookup?.source}]`,
+          )
+        } else if (result.githubStatus?.valid) {
+          const gh = result.githubStatus
+          console.log(
+            `[arch-steward] ok (${gateMode}): head=${result.headSha.slice(0, 12)} approved via GitHub status (${gh.authorFamily} -> ${gh.stewardFamily}, digest=${gh.receiptDigest}, publisher=@${gh.publishedBy}) [source=${gh.source}]`,
+          )
+        }
         return 0
       }
 
@@ -509,5 +727,10 @@ function main(argv: string[]): number {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  process.exit(main(process.argv.slice(2)))
+  main(process.argv.slice(2))
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      console.error(`[cross-family-audit] FAIL-CLOSED: ${(err as Error).message.split('\n')[0]}`)
+      process.exit(2)
+    })
 }

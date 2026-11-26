@@ -4,6 +4,7 @@
 import type { ModelFamily } from './modelFamilyClassifier.js'
 
 export const ARCH_STEWARD_RECEIPT_SCHEMA_VERSION = 'oc.v5.arch-steward-receipt/1' as const
+export const ARCH_STEWARD_DRY_RUN_SCHEMA_VERSION = 'oc.v5.arch-steward-dry-run/1' as const
 export const DEFAULT_MAX_NET_PROD_LOC = 400
 export const DEFAULT_MIN_MULTI_MODULE_SPAN = 2
 export const DEFAULT_MAX_FN_LINES = 100
@@ -76,6 +77,8 @@ export interface ArchStewardReceipt {
   blockers: StewardBlocker[]
   usageEvidence: StewardUsageEvidence
   receiptDigest: string
+  /** Non-production flag — MUST NEVER be true on a production receipt; verifier hard-rejects. */
+  dryRun?: boolean
   /** Optional untrusted override fields — NEVER honored; veto/blockers always fail-closed. */
   override?: unknown
   leaderOverride?: unknown
@@ -175,6 +178,9 @@ export interface StructuralRiskReport {
 export type StewardReceiptViolationCode =
   | 'STEWARD-RECEIPT-MISSING'
   | 'STEWARD-RECEIPT-SCHEMA-INVALID'
+  | 'STEWARD-DRY-RUN-REJECTED'
+  | 'STEWARD-PLACEHOLDER-EVIDENCE'
+  | 'STEWARD-UNTRUSTED-RECEIPT-SOURCE'
   | 'STEWARD-RECEIPT-SHA-MISMATCH'
   | 'STEWARD-RECEIPT-BASE-SHA-MISMATCH'
   | 'STEWARD-FAMILY-CLAIM-MISMATCH'
@@ -200,6 +206,7 @@ export interface StewardReceiptVerificationResult {
 
 export interface ReceiptLookupResult {
   found: boolean
+  channel?: 'host-file' | 'explicit-file' | 'github-status' | 'commit-trailer'
   source?: string
   raw?: unknown
   error?: string

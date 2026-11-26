@@ -16,6 +16,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import {
+  computeA0ReceiptDigest,
+  computeA0ReceiptHmac,
+  verifyA0ApprovalFile,
+} from '../lib/a0ApprovalReceipt.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const HARNESS_SCRIPTS = path.join(REPO_ROOT, 'scripts/harness-gate')
@@ -110,8 +115,8 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       assert.equal(doc.expiresAt, '2026-11-27T00:00:00Z')
       assert.match(doc.riskCard, /^\[A0-RISK-CARD\] SHA 120d63ea1c12/)
 
-      // Verify exact canonical hash matches a0-ratchet contract
-      const expectedCanonical = `a0-approval-v1\nsha=${sha}\nissuedAt=2026-11-26T12:00:00Z\nexpiresAt=2026-11-27T00:00:00Z\nreason=One-time baseline split migration\n`
+      // Verify exact canonical hash matches a0-ratchet contract (including allowedPaths=*)
+      const expectedCanonical = `a0-approval-v1\nsha=${sha}\nissuedAt=2026-11-26T12:00:00Z\nexpiresAt=2026-11-27T00:00:00Z\nreason=One-time baseline split migration\nallowedPaths=*\n`
       assert.equal(
         doc.sha256,
         createHash('sha256').update(expectedCanonical, 'utf8').digest('hex'),
@@ -121,15 +126,15 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       const cardTxt = readFileSync(path.join(tmp, `control/a0-approvals/${sha}.card.txt`), 'utf8').trim()
       assert.equal(cardTxt.split('\n').length, 1)
 
-      // Valid before expiry
-      const verifyOk = runBash(GOVERNOR_SH, ['verify-a0', '--sha', sha], {
+      // Valid before expiry (using test-only --unsafe-test-skip-owner in non-root tmpdir)
+      const verifyOk = runBash(GOVERNOR_SH, ['verify-a0', '--sha', sha, '--unsafe-test-skip-owner'], {
         OC_GOVERNOR_ROOT: tmp,
         OC_GOVERNOR_NOW_ISO: '2026-11-26T23:59:59Z',
       })
       assert.equal(verifyOk.status, 0, verifyOk.stderr)
 
       // Expired at/after 12h TTL
-      const verifyExp = runBash(GOVERNOR_SH, ['verify-a0', '--sha', sha], {
+      const verifyExp = runBash(GOVERNOR_SH, ['verify-a0', '--sha', sha, '--unsafe-test-skip-owner'], {
         OC_GOVERNOR_ROOT: tmp,
         OC_GOVERNOR_NOW_ISO: '2026-11-27T00:00:00Z',
       })
@@ -138,7 +143,11 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       // Tamper reason without updating sha256 -> blocked as signature_tampered
       const tampered = { ...doc, reason: 'Tampered reason text' }
       writeFileSync(path.join(tmp, `control/a0-approvals/${sha}.json`), JSON.stringify(tampered))
-      const verifyTamper = runBash(GOVERNOR_SH, ['verify-a0', '--sha', sha], env)
+      const verifyTamper = runBash(
+        GOVERNOR_SH,
+        ['verify-a0', '--sha', sha, '--unsafe-test-skip-owner'],
+        env,
+      )
       assert.equal(verifyTamper.status, 1)
       assert.match(verifyTamper.stderr, /signature_tampered/)
 
@@ -146,6 +155,263 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       const revoke = runBash(GOVERNOR_SH, ['revoke-a0', '--sha', sha], env)
       assert.equal(revoke.status, 0)
       assert.equal(existsSync(path.join(tmp, `control/a0-approvals/${sha}.json`)), false)
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  test('B3 cross-end byte-level parity: oc-governor.sh verify-a0 and a0ApprovalReceipt.ts give 100% identical verdicts across positive & negative matrix + --publish-github-status', () => {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'oc-gov-a0-parity-'))
+    try {
+      const sha = 'abcdef0123456789abcdef0123456789abcdef01'
+      const nowIso = '2026-11-26T15:00:00Z'
+      const nowMs = Date.parse(nowIso)
+      const issuedAt = '2026-11-26T12:00:00Z'
+      const expiresAt = '2026-11-27T12:00:00Z'
+      const ctrlDir = path.join(tmp, 'control')
+      const approvalsDir = path.join(ctrlDir, 'a0-approvals')
+      mkdirSync(approvalsDir, { recursive: true })
+
+      // 1. approve-a0 with padded reason + unsorted allowedPaths + --publish-github-status
+      const fakeBin = path.join(tmp, 'fake-bin')
+      const ghLog = path.join(tmp, 'gh-a0.log')
+      mkdirSync(fakeBin, { recursive: true })
+      writeFileSync(
+        path.join(fakeBin, 'gh'),
+        `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${ghLog}"\n`,
+        { mode: 0o755 },
+      )
+      const approveRes = runBash(
+        GOVERNOR_SH,
+        [
+          'approve-a0',
+          '--sha',
+          sha,
+          '--reason',
+          '   Trimmed valid A0 governance reason   ',
+          '--allowed-path',
+          'scripts/check-a0-monotonic.ts',
+          '--allowed-path',
+          'arch/a0-protected-paths.json',
+          '--publish-github-status',
+          '--github-repo',
+          'dream-star-end/openclaude',
+        ],
+        {
+          OC_GOVERNOR_ROOT: tmp,
+          OC_GOVERNOR_NOW_ISO: issuedAt,
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        },
+      )
+      assert.equal(approveRes.status, 0, approveRes.stderr)
+      const issuedDoc = JSON.parse(approveRes.stdout)
+      assert.equal(issuedDoc.reason, 'Trimmed valid A0 governance reason')
+      assert.deepEqual(issuedDoc.allowedPaths, [
+        'arch/a0-protected-paths.json',
+        'scripts/check-a0-monotonic.ts',
+      ])
+      assert.equal(
+        issuedDoc.sha256,
+        computeA0ReceiptDigest({
+          sha,
+          issuedAt,
+          expiresAt,
+          reason: issuedDoc.reason,
+          allowedPaths: issuedDoc.allowedPaths,
+        }),
+      )
+      const ghLine = readFileSync(ghLog, 'utf8')
+      assert.match(ghLine, /context=oc-v5\/a0-approval/)
+      assert.match(ghLine, new RegExp(`sha=${sha.slice(0, 12)}`))
+
+      // 2. Parity matrix helper: asserts oc-governor verify-a0 and verifyA0ApprovalFile agree 100%!
+      const assertParity = (
+        label: string,
+        receiptPath: string,
+        opts: {
+          wantValid: boolean
+          paths?: string[]
+          hmacKeyFile?: string
+          now?: string
+        },
+      ) => {
+        const checkNow = opts.now ?? nowIso
+        const tsRes = verifyA0ApprovalFile({
+          receiptPath,
+          targetSha: sha,
+          a0Paths: opts.paths ?? [],
+          requireRootOwner: false,
+          hmacKeyFile: opts.hmacKeyFile,
+          nowMs: Date.parse(checkNow),
+        })
+        const shArgs = ['verify-a0', '--sha', sha, '--file', receiptPath, '--unsafe-test-skip-owner']
+        if (opts.hmacKeyFile) shArgs.push('--hmac-key-file', opts.hmacKeyFile)
+        for (const p of opts.paths ?? []) shArgs.push('--path', p)
+        const shRes = runBash(GOVERNOR_SH, shArgs, {
+          OC_GOVERNOR_ROOT: tmp,
+          OC_GOVERNOR_NOW_ISO: checkNow,
+        })
+        assert.equal(tsRes.valid, opts.wantValid, `[TS] ${label}: got ${JSON.stringify(tsRes)}`)
+        assert.equal(shRes.status === 0, opts.wantValid, `[SH] ${label}: stdout=${shRes.stdout} stderr=${shRes.stderr}`)
+        assert.equal(tsRes.valid, shRes.status === 0, `[PARITY MISMATCH] ${label}`)
+      }
+
+      const writeCase = (name: string, obj: unknown, mode = 0o644) => {
+        const p = path.join(approvalsDir, `${name}.json`)
+        writeFileSync(p, `${JSON.stringify(obj, null, 2)}\n`, { mode })
+        chmodSync(p, mode)
+        return p
+      }
+
+      // Case A: issuer-produced receipt with matching path -> BOTH PASS
+      assertParity('valid issuer receipt + covered path', path.join(approvalsDir, `${sha}.json`), {
+        wantValid: true,
+        paths: ['arch/a0-protected-paths.json'],
+      })
+      // Case B: issuer-produced receipt with uncovered path -> BOTH REJECT
+      assertParity('valid issuer receipt + uncovered path', path.join(approvalsDir, `${sha}.json`), {
+        wantValid: false,
+        paths: ['packages/commercial/src/billing/ledger.ts'],
+      })
+      // Case C: reason with spaces trimming to >= 8 chars -> BOTH PASS
+      const paddedReason = '   valid trimmed reason   '
+      assertParity(
+        'padded reason >= 8 after trim',
+        writeCase('padded-ok', {
+          schemaVersion: 1,
+          sha,
+          reason: paddedReason,
+          issuedAt,
+          expiresAt,
+          sha256: computeA0ReceiptDigest({ sha, issuedAt, expiresAt, reason: paddedReason }),
+        }),
+        { wantValid: true },
+      )
+      // Case D: reason with spaces trimming to < 8 chars -> BOTH REJECT (exact bug from R1!)
+      const shortPadded = '   abc   '
+      assertParity(
+        'short padded reason < 8 after trim',
+        writeCase('padded-short', {
+          schemaVersion: 1,
+          sha,
+          reason: shortPadded,
+          issuedAt,
+          expiresAt,
+          sha256: computeA0ReceiptDigest({ sha, issuedAt, expiresAt, reason: shortPadded }),
+        }),
+        { wantValid: false },
+      )
+      // Case E: tampered allowedPaths -> BOTH REJECT
+      assertParity(
+        'tampered allowedPaths',
+        writeCase('tampered-paths', {
+          ...issuedDoc,
+          allowedPaths: ['arch/a0-protected-paths.json', 'changelog.json'],
+        }),
+        { wantValid: false },
+      )
+      // Case F: expired timestamp -> BOTH REJECT
+      assertParity('expired receipt', path.join(approvalsDir, `${sha}.json`), {
+        wantValid: false,
+        now: '2026-11-28T00:00:00Z',
+      })
+      // Case G: expiresAt <= issuedAt -> BOTH REJECT
+      assertParity(
+        'expiresAt <= issuedAt',
+        writeCase('bad-expiry-order', {
+          schemaVersion: 1,
+          sha,
+          reason: 'valid reason text here',
+          issuedAt: '2026-11-26T12:00:00Z',
+          expiresAt: '2026-11-26T12:00:00Z',
+          sha256: computeA0ReceiptDigest({
+            sha,
+            issuedAt: '2026-11-26T12:00:00Z',
+            expiresAt: '2026-11-26T12:00:00Z',
+            reason: 'valid reason text here',
+          }),
+        }),
+        { wantValid: false },
+      )
+      // Case H: group/world writable (0666) -> BOTH REJECT
+      assertParity(
+        'world writable 0666',
+        writeCase(
+          'writable',
+          {
+            schemaVersion: 1,
+            sha,
+            reason: 'valid reason text here',
+            issuedAt,
+            expiresAt,
+            sha256: computeA0ReceiptDigest({ sha, issuedAt, expiresAt, reason: 'valid reason text here' }),
+          },
+          0o666,
+        ),
+        { wantValid: false },
+      )
+      // Case I: symlink receipt -> BOTH REJECT
+      const symPath = path.join(approvalsDir, 'sym-receipt.json')
+      symlinkSync(path.join(approvalsDir, `${sha}.json`), symPath)
+      assertParity('symlink receipt', symPath, { wantValid: false })
+      // Case J: schemaVersion = true (Python bool==int pitfall!) -> BOTH REJECT
+      assertParity(
+        'schemaVersion boolean true',
+        writeCase('bool-schema', {
+          schemaVersion: true,
+          sha,
+          reason: 'valid reason text here',
+          issuedAt,
+          expiresAt,
+          sha256: computeA0ReceiptDigest({ sha, issuedAt, expiresAt, reason: 'valid reason text here' }),
+        }),
+        { wantValid: false },
+      )
+      // Case K & L: active 0600 .hmac-key -> valid HMAC passes, plain sha256 downgrade fails, 0644 key fails!
+      const hmacKeyFile = path.join(ctrlDir, '.hmac-key')
+      const secret = 'parity-test-hmac-secret-9876543210'
+      writeFileSync(hmacKeyFile, `${secret}\n`, { mode: 0o600 })
+      chmodSync(hmacKeyFile, 0o600)
+
+      const hmacApprove = runBash(
+        GOVERNOR_SH,
+        [
+          'approve-a0',
+          '--sha',
+          sha,
+          '--reason',
+          'HMAC sealed approval test',
+          '--unsafe-test-skip-owner',
+        ],
+        { OC_GOVERNOR_ROOT: tmp, OC_GOVERNOR_NOW_ISO: issuedAt },
+      )
+      assert.equal(hmacApprove.status, 0, hmacApprove.stderr)
+      const hmacDoc = JSON.parse(hmacApprove.stdout)
+      assert.equal(
+        hmacDoc.hmacSha256,
+        computeA0ReceiptHmac({ sha, issuedAt, expiresAt, reason: 'HMAC sealed approval test' }, secret),
+      )
+      assertParity('valid HMAC receipt', path.join(approvalsDir, `${sha}.json`), {
+        wantValid: true,
+        hmacKeyFile,
+      })
+      assertParity(
+        'plain sha256 downgrade when HMAC key active',
+        writeCase('plain-downgrade', {
+          schemaVersion: 1,
+          sha,
+          reason: 'HMAC sealed approval test',
+          issuedAt,
+          expiresAt,
+          sha256: computeA0ReceiptDigest({ sha, issuedAt, expiresAt, reason: 'HMAC sealed approval test' }),
+        }),
+        { wantValid: false, hmacKeyFile },
+      )
+      chmodSync(hmacKeyFile, 0o644)
+      assertParity('insecure 0644 HMAC key file', path.join(approvalsDir, `${sha}.json`), {
+        wantValid: false,
+        hmacKeyFile,
+      })
     } finally {
       rmSync(tmp, { recursive: true, force: true })
     }
@@ -418,6 +684,113 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       )
     } finally {
       // Ensure read-only referee dirs can be removed cleanly in test cleanup
+      spawnSync('chmod', ['-R', 'u+w', tmp])
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  test('B1/B4 sync-referee.sh --stage-audited verifies A0 approval bound to exact targetSha and writes TRANSITION_APPROVAL.json + MANIFEST.json', () => {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'oc-sync-transition-'))
+    try {
+      const govRoot = path.join(tmp, 'harness-gate')
+      const candidateSrc = path.join(tmp, 'audited-candidate')
+      const liveRel = path.join(tmp, 'live-rel')
+      const liveLink = path.join(tmp, 'openclaude-v5-selfhost-live')
+      const targetSha = '9'.repeat(40)
+      const wrongSha = '8'.repeat(40)
+
+      mkdirSync(path.join(candidateSrc, 'scripts/lib'), { recursive: true })
+      mkdirSync(path.join(candidateSrc, 'packages/commercial/scripts'), { recursive: true })
+      mkdirSync(path.join(candidateSrc, 'packages/protocol/src'), { recursive: true })
+      mkdirSync(path.join(candidateSrc, '.github/scripts'), { recursive: true })
+      writeFileSync(path.join(candidateSrc, 'scripts/check-a0-monotonic.ts'), '// audited gate\n')
+      writeFileSync(path.join(candidateSrc, 'packages/commercial/scripts/lint-demo.ts'), '// lint\n')
+      writeFileSync(path.join(candidateSrc, 'packages/protocol/src/httpContracts.ts'), '// contracts\n')
+      writeFileSync(path.join(candidateSrc, '.github/scripts/integ-shard-budget.ts'), '// budget\n')
+
+      // Verified live release with node_modules to be linked into transition referee
+      mkdirSync(path.join(liveRel, 'node_modules/tsx'), { recursive: true })
+      writeFileSync(path.join(liveRel, 'node_modules/tsx/index.js'), '// live tsx\n')
+      writeFileSync(
+        path.join(liveRel, '.complete'),
+        JSON.stringify({ schemaVersion: 2, sourceCommit: '1'.repeat(40) }),
+      )
+      symlinkSync(liveRel, liveLink)
+
+      // Issue valid A0 approval for targetSha
+      const env = { OC_GOVERNOR_ROOT: govRoot, OC_GOVERNOR_NOW_ISO: '2026-11-26T12:00:00Z' }
+      const approve = runBash(
+        GOVERNOR_SH,
+        ['approve-a0', '--sha', targetSha, '--reason', 'B1 audited schema transition rollout'],
+        env,
+      )
+      assert.equal(approve.status, 0, approve.stderr)
+      const approvalFile = path.join(govRoot, `control/a0-approvals/${targetSha}.json`)
+
+      // 1. Mismatched --target-sha MUST fail closed
+      const rWrongSha = runBash(
+        SYNC_REFEREE_SH,
+        [
+          '--stage-audited',
+          candidateSrc,
+          '--target-sha',
+          wrongSha,
+          '--approval-file',
+          approvalFile,
+          '--live-link',
+          liveLink,
+        ],
+        env,
+      )
+      assert.equal(rWrongSha.status, 1)
+
+      // 2. Expired approval MUST fail closed
+      const rExpired = runBash(
+        SYNC_REFEREE_SH,
+        [
+          '--stage-audited',
+          candidateSrc,
+          '--target-sha',
+          targetSha,
+          '--approval-file',
+          approvalFile,
+          '--live-link',
+          liveLink,
+        ],
+        { OC_GOVERNOR_ROOT: govRoot, OC_GOVERNOR_NOW_ISO: '2026-12-01T00:00:00Z' },
+      )
+      assert.equal(rExpired.status, 1)
+
+      // 3. Valid --stage-audited succeeds and writes read-only referee + TRANSITION_APPROVAL.json + MANIFEST.json + .github/scripts + node_modules
+      const rOk = runBash(
+        SYNC_REFEREE_SH,
+        [
+          '--stage-audited',
+          candidateSrc,
+          '--target-sha',
+          targetSha,
+          '--approval-file',
+          approvalFile,
+          '--live-link',
+          liveLink,
+        ],
+        env,
+      )
+      assert.equal(rOk.status, 0, rOk.stderr)
+      const refereeDir = path.join(govRoot, 'referee')
+      const transition = JSON.parse(readFileSync(path.join(refereeDir, 'TRANSITION_APPROVAL.json'), 'utf8'))
+      assert.equal(transition.mode, 'transition-audited')
+      assert.equal(transition.targetSha, targetSha)
+      assert.equal(transition.approval.sha, targetSha)
+
+      const manifest = JSON.parse(readFileSync(path.join(refereeDir, 'MANIFEST.json'), 'utf8'))
+      assert.equal(manifest.mode, 'transition-audited')
+      assert.equal(manifest.targetSha, targetSha)
+      assert.ok(manifest.files['TRANSITION_APPROVAL.json'])
+      assert.ok(manifest.files['.github/scripts/integ-shard-budget.ts'])
+      assert.ok(manifest.files['packages/protocol/src/httpContracts.ts'])
+      assert.ok(existsSync(path.join(refereeDir, 'node_modules/tsx/index.js')))
+    } finally {
       spawnSync('chmod', ['-R', 'u+w', tmp])
       rmSync(tmp, { recursive: true, force: true })
     }

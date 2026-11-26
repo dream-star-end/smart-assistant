@@ -14,6 +14,7 @@
         "scripts/check-a0-monotonic.ts",
         "scripts/lib/a0MonotonicRules.ts",
         "scripts/lib/a0ApprovalReceipt.ts",
+        "scripts/lib/githubTrustedApproval.ts",
         "arch/a0-protected-paths.json",
         ".github/CODEOWNERS"
       ]
@@ -36,9 +37,12 @@
         "scripts/lib/archStewardTypes.ts",
         "scripts/lib/modelFamilyClassifier.ts",
         "scripts/check-debt-ttl.ts",
+        "scripts/lib/debtTtlCommitGuard.ts",
         "scripts/check-complexity-ratchet.ts",
         "scripts/check-clones-ratchet.ts",
-        "scripts/check-security-sast.ts"
+        "scripts/check-security-sast.ts",
+        "scripts/lib/prodFileDiscovery.ts",
+        "scripts/lib/restContractLoader.ts"
       ]
     },
     {
@@ -64,12 +68,17 @@
     },
     {
       "id": "host-control-plane-and-deploy",
-      "description": "Host physical governor/referee scripts, selfhost deploy orchestrator, and migration gates",
+      "description": "Host physical governor/referee scripts, selfhost deploy orchestrator, lease worker, debounce, release policy, and migration gates",
       "paths": [
         "scripts/harness-gate/**",
         "scripts/deploy-v5-selfhost.sh",
         "scripts/v5-selfhost-master-release-lib.sh",
         "scripts/v5-selfhost-migration-*.sh",
+        "scripts/v5-lease-worker.sh",
+        "scripts/lib/v5-lease-train-debounce.sh",
+        "scripts/lib/v5-selfhost-train-guards.sh",
+        "scripts/lib/v5-selfhost-governance-gates.sh",
+        "scripts/lib/v5-selfhost-release-policy.sh",
         "scripts/lib/v5-selfhost-*.sh"
       ]
     },

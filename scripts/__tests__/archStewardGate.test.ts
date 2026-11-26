@@ -1,13 +1,24 @@
 import assert from 'node:assert/strict'
-import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import http from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { runStewardGate } from '../check-cross-family-audit.js'
+import { runStewardGate, runStewardGateAsync } from '../check-cross-family-audit.js'
 import {
+  ARCH_STEWARD_DRY_RUN_SCHEMA_VERSION,
   ARCH_STEWARD_RECEIPT_SCHEMA_VERSION,
   type ArchStewardReceipt,
   type DiffSummary,
@@ -19,6 +30,7 @@ import {
   signArchStewardReceipt,
   verifyArchStewardReceipt,
 } from '../lib/archStewardContract.js'
+import type { FetchLike } from '../lib/githubTrustedApproval.js'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const AUDIT_SCRIPT = path.join(ROOT, 'scripts/check-cross-family-audit.ts')
@@ -36,6 +48,31 @@ function runAuditCli(args: string[], env?: Record<string, string>) {
   return spawnSync(process.execPath, spawnArgs, {
     encoding: 'utf8',
     env: env ? { ...process.env, ...env } : process.env,
+  })
+}
+
+function runAuditCliAsync(
+  args: string[],
+  env?: Record<string, string>,
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  const tsxCli = path.join(ROOT, 'node_modules/tsx/dist/cli.mjs')
+  const spawnArgs = existsSync(tsxCli)
+    ? [tsxCli, AUDIT_SCRIPT, ...args]
+    : ['--import', 'tsx', AUDIT_SCRIPT, ...args]
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, spawnArgs, {
+      env: env ? { ...process.env, ...env } : process.env,
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (d) => {
+      stdout += String(d)
+    })
+    child.stderr.on('data', (d) => {
+      stderr += String(d)
+    })
+    child.on('error', reject)
+    child.on('close', (status) => resolve({ status, stdout, stderr }))
   })
 }
 
@@ -696,8 +733,9 @@ describe('Gate engine & CLI end-to-end: check-cross-family-audit.ts --enforce-co
     assert.equal(gCheckOnly.exitCode, 0)
 
     // 3. Stale receipt (bound to lowRiskSha instead of highRiskSha) -> exit 1
-    const receiptDir = path.join(repo.dir, 'custom-receipts')
-    mkdirSync(receiptDir, { recursive: true })
+    // Place receipts OUTSIDE repo.dir so they represent out-of-commit host receipts!
+    const receiptDir = mkdtempSync(path.join(tmpdir(), 'steward-host-receipts-'))
+    t.after(() => rmSync(receiptDir, { recursive: true, force: true }))
     const staleReceipt = signArchStewardReceipt(
       makeUnsignedReceipt({
         headSha: lowRiskSha,
@@ -712,6 +750,7 @@ describe('Gate engine & CLI end-to-end: check-cross-family-audit.ts --enforce-co
       baseRef: lowRiskSha,
       headRef: highRiskSha,
       receiptDirs: [receiptDir],
+      requireRootOwner: false,
     })
     assert.equal(gStale.exitCode, 1)
     assert.ok(
@@ -740,6 +779,7 @@ describe('Gate engine & CLI end-to-end: check-cross-family-audit.ts --enforce-co
     const rVetoCli = runAuditCli(
       [
         '--enforce-commit',
+        '--unsafe-test-skip-owner',
         '--root',
         repo.dir,
         '--base',
@@ -754,7 +794,7 @@ describe('Gate engine & CLI end-to-end: check-cross-family-audit.ts --enforce-co
     assert.equal(rVetoCli.status, 1)
     assert.match(rVetoCli.stderr, /STEWARD-HARD-VETO/)
 
-    // 5. Valid cross-family approve receipt via --receipt-dir -> exit 0 (verified via real CLI too)
+    // 5. Valid cross-family approve receipt via external --receipt-dir -> exit 0 (verified via real CLI too)
     const validReceipt = signArchStewardReceipt(
       makeUnsignedReceipt({
         headSha: highRiskSha,
@@ -765,6 +805,7 @@ describe('Gate engine & CLI end-to-end: check-cross-family-audit.ts --enforce-co
     writeFileSync(path.join(receiptDir, `${highRiskSha}.json`), JSON.stringify(validReceipt, null, 2))
     const rPassCli = runAuditCli([
       '--enforce-commit',
+      '--unsafe-test-skip-owner',
       '--root',
       repo.dir,
       '--base',
@@ -777,8 +818,58 @@ describe('Gate engine & CLI end-to-end: check-cross-family-audit.ts --enforce-co
     assert.equal(rPassCli.status, 0, `expected exit 0 with valid receipt, stderr=${rPassCli.stderr}`)
     assert.match(rPassCli.stdout, /\[arch-steward\] ok \(enforce-commit\):/)
 
-    // 6. Commit trailer `Steward-Receipt:` lookup under enforce-pr
-    const trailerReceiptPath = path.join(repo.dir, 'external-trailer-receipt.json')
+    // 5b. Trust boundary checks: unsigned in-repo .github/steward-receipts/ file, symlink, and world-writable file MUST ALL FAIL!
+    const inRepoDir = path.join(repo.dir, '.github/steward-receipts')
+    mkdirSync(inRepoDir, { recursive: true })
+    writeFileSync(path.join(inRepoDir, `${highRiskSha}.json`), JSON.stringify(validReceipt, null, 2))
+    const gInRepo = runStewardGate({
+      root: repo.dir,
+      mode: 'enforce-commit',
+      baseRef: lowRiskSha,
+      headRef: highRiskSha,
+      requireRootOwner: false,
+    })
+    assert.equal(gInRepo.exitCode, 1, 'unsigned in-repo .github/steward-receipts/ MUST NOT be trusted in production')
+
+    const gInRepoExplicit = runStewardGate({
+      root: repo.dir,
+      mode: 'enforce-commit',
+      baseRef: lowRiskSha,
+      headRef: highRiskSha,
+      explicitReceiptPath: path.join(inRepoDir, `${highRiskSha}.json`),
+      requireRootOwner: false,
+    })
+    assert.equal(gInRepoExplicit.exitCode, 1)
+    assert.match(gInRepoExplicit.receiptLookup?.error ?? '', /STEWARD-UNTRUSTED-RECEIPT-SOURCE/)
+
+    const symPath = path.join(receiptDir, 'symlink-receipt.json')
+    symlinkSync(path.join(receiptDir, `${highRiskSha}.json`), symPath)
+    const gSymlink = runStewardGate({
+      root: repo.dir,
+      mode: 'enforce-commit',
+      baseRef: lowRiskSha,
+      headRef: highRiskSha,
+      explicitReceiptPath: symPath,
+      requireRootOwner: false,
+    })
+    assert.equal(gSymlink.exitCode, 1)
+    assert.match(gSymlink.receiptLookup?.error ?? '', /no symlinks/)
+
+    chmodSync(path.join(receiptDir, `${highRiskSha}.json`), 0o666)
+    const gWritable = runStewardGate({
+      root: repo.dir,
+      mode: 'enforce-commit',
+      baseRef: lowRiskSha,
+      headRef: highRiskSha,
+      receiptDirs: [receiptDir],
+      requireRootOwner: false,
+    })
+    assert.equal(gWritable.exitCode, 1)
+    assert.match(gWritable.receiptLookup?.error ?? '', /writable/)
+    chmodSync(path.join(receiptDir, `${highRiskSha}.json`), 0o644)
+
+    // 6. Commit trailer `Steward-Receipt:` pointing to EXTERNAL receipt path under enforce-pr
+    const trailerReceiptPath = path.join(receiptDir, 'external-trailer-receipt.json')
     repo.write('packages/gateway/src/newCore.ts', 'export const coreFlag = true\n')
     const trailerSha = repo.commit(
       `feat(v5): add gateway core flag\n\nSteward-Receipt: ${trailerReceiptPath}`,
@@ -796,20 +887,25 @@ describe('Gate engine & CLI end-to-end: check-cross-family-audit.ts --enforce-co
       mode: 'enforce-pr',
       baseRef: highRiskSha,
       headRef: trailerSha,
+      requireRootOwner: false,
     })
     assert.equal(gTrailer.ok, true)
     assert.equal(gTrailer.exitCode, 0)
   })
 
-  test('scripts/arch-steward-review.sh --dry-run generates verifiable cross-family receipt and rejects same-family pair', (t) => {
+  test('B3: arch-steward-review.sh --dry-run is HARD REJECTED by --enforce-commit (exit 1); real --channel command APPROVE passes & VETO blocks', (t) => {
     const repo = initTempGitRepo()
-    t.after(() => rmSync(repo.dir, { recursive: true, force: true }))
+    const extDir = mkdtempSync(path.join(tmpdir(), 'steward-review-ext-'))
+    t.after(() => {
+      rmSync(repo.dir, { recursive: true, force: true })
+      rmSync(extDir, { recursive: true, force: true })
+    })
     const baseSha = repo.git(['rev-parse', 'HEAD'])
 
     repo.write('packages/gateway/src/stewardDemo.ts', 'export function demo() { return 42 }\n')
-    const headSha = repo.commit('feat(v5): touch gateway core for dry-run')
+    const headSha = repo.commit('feat(v5): touch gateway core for dry-run & real channel tests')
 
-    // Reject same-family before running review
+    // 1. Reject same-family before running review
     const rSame = spawnSync(
       'bash',
       [
@@ -831,7 +927,27 @@ describe('Gate engine & CLI end-to-end: check-cross-family-audit.ts --enforce-co
     assert.equal(rSame.status, 1)
     assert.match(`${rSame.stdout}\n${rSame.stderr}`, /CROSS-FAMILY-SAME-FAMILY-AUDIT/)
 
-    // Print prompt covers all 4 Architecture Steward dimensions
+    // 2. Refuse combining --dry-run with --publish-github-status
+    const rDryPublish = spawnSync(
+      'bash',
+      [
+        REVIEW_SH,
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--author-model',
+        'gpt-6.2-sol',
+        '--dry-run',
+        '--publish-github-status',
+      ],
+      { encoding: 'utf8' },
+    )
+    assert.equal(rDryPublish.status, 2)
+
+    // 3. Print prompt covers all 4 Architecture Steward dimensions
     const rPrompt = spawnSync(
       'bash',
       [
@@ -855,8 +971,8 @@ describe('Gate engine & CLI end-to-end: check-cross-family-audit.ts --enforce-co
     assert.match(rPrompt.stdout, /complexityDrift/)
     assert.match(rPrompt.stdout, /CLONE_OR_T2_CORE_PATH/)
 
-    // Dry-run produces a signed receipt that passes enforce-commit
-    const outReceipt = path.join(repo.dir, '.github/steward-receipts', `${headSha}.json`)
+    // 4. --dry-run writes non-production schema (dryRun=true, never approve) and is HARD-REJECTED (exit 1)!
+    const dryOut = path.join(extDir, `dry-${headSha}.json`)
     const rDry = spawnSync(
       'bash',
       [
@@ -870,25 +986,324 @@ describe('Gate engine & CLI end-to-end: check-cross-family-audit.ts --enforce-co
         '--author-model',
         'gpt-6.2-sol',
         '--out',
-        outReceipt,
+        dryOut,
         '--dry-run',
       ],
       { encoding: 'utf8' },
     )
-    assert.equal(rDry.status, 0, `dry-run failed: stderr=${rDry.stderr}`)
-    assert.ok(existsSync(outReceipt), 'dry-run must write signed receipt file')
+    assert.equal(rDry.status, 0, `dry-run preview failed: stderr=${rDry.stderr}`)
+    assert.ok(existsSync(dryOut), 'dry-run must write preview artifact')
+    const dryDoc = JSON.parse(readFileSync(dryOut, 'utf8'))
+    assert.equal(dryDoc.schemaVersion, ARCH_STEWARD_DRY_RUN_SCHEMA_VERSION)
+    assert.equal(dryDoc.dryRun, true)
+    assert.notEqual(dryDoc.verdict, 'approve')
 
-    const gEnforce = runStewardGate({
+    const rDryEnforce = runAuditCli([
+      '--enforce-commit',
+      '--unsafe-test-skip-owner',
+      '--root',
+      repo.dir,
+      '--base',
+      baseSha,
+      '--head',
+      headSha,
+      '--receipt',
+      dryOut,
+    ])
+    assert.equal(rDryEnforce.status, 1, `dry-run receipt MUST be hard-rejected (exit 1), got stdout=${rDryEnforce.stdout}`)
+    assert.match(rDryEnforce.stderr, /STEWARD-DRY-RUN-REJECTED/)
+
+    // 4b. Placeholder jobId / example / mock in a forged production-schema receipt MUST ALSO BE REJECTED!
+    for (const badJobId of ['dry-run-1234', 'example-job-01', 'mock-audit-9']) {
+      const forged = signArchStewardReceipt(
+        makeUnsignedReceipt({
+          headSha,
+          baseSha,
+          triggers: ['CLONE_OR_T2_CORE_PATH'],
+          usageEvidence: {
+            jobId: badJobId,
+            sessionKey: 'arch-steward:google-gemini:real',
+            timestamp: '2026-11-26T14:00:00Z',
+            provider: 'agy',
+          },
+        }),
+      )
+      const vRes = verifyArchStewardReceipt(forged, {
+        headSha,
+        baseSha,
+        requiredTriggers: ['CLONE_OR_T2_CORE_PATH'],
+      })
+      assert.equal(vRes.ok, false, `placeholder jobId ${badJobId} must be rejected`)
+      assert.ok(vRes.violations.some((v) => v.code === 'STEWARD-PLACEHOLDER-EVIDENCE'))
+    }
+
+    // 5. Real execution control (APPROVE): --channel command returning valid cross-family approve -> exit 0!
+    const approveOut = path.join(extDir, `${headSha}.json`)
+    const fakeGhBin = path.join(extDir, 'bin')
+    const ghLog = path.join(extDir, 'gh-calls.log')
+    mkdirSync(fakeGhBin, { recursive: true })
+    writeFileSync(
+      path.join(fakeGhBin, 'gh'),
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${ghLog}"\n`,
+      { mode: 0o755 },
+    )
+    const approvePayload = JSON.stringify({
+      verdict: 'approve',
+      dimensions: {
+        godClassAppend: { status: 'pass', notes: 'New isolated module; no append to magnet.' },
+        wheelReinvention: { status: 'pass', notes: 'No duplicate utility introduced.' },
+        boundaryIntegrity: { status: 'pass', notes: 'Respects gateway boundaries.' },
+        complexityDrift: { status: 'pass', notes: 'Trivial 1-line helper.' },
+      },
+      blockers: [],
+    })
+    const rRealApprove = spawnSync(
+      'bash',
+      [
+        REVIEW_SH,
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--author-model',
+        'gpt-6.2-sol',
+        '--channel',
+        'command',
+        '--out',
+        approveOut,
+        '--publish-github-status',
+        '--github-repo',
+        'dream-star-end/openclaude',
+        '--unsafe-test-skip-owner',
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${fakeGhBin}:${process.env.PATH ?? ''}`,
+          OC_STEWARD_REVIEW_CMD: `cat >/dev/null; printf '%s' '${approvePayload}'`,
+        },
+      },
+    )
+    assert.equal(rRealApprove.status, 0, `real APPROVE failed: stdout=${rRealApprove.stdout} stderr=${rRealApprove.stderr}`)
+    const realDoc = JSON.parse(readFileSync(approveOut, 'utf8'))
+    assert.equal(realDoc.schemaVersion, ARCH_STEWARD_RECEIPT_SCHEMA_VERSION)
+    assert.equal(realDoc.dryRun, undefined)
+    assert.equal(realDoc.verdict, 'approve')
+    assert.ok(existsSync(ghLog), 'real APPROVE with --publish-github-status must invoke gh api')
+    const ghCall = readFileSync(ghLog, 'utf8')
+    assert.match(ghCall, /context=oc-v5\/arch-steward/)
+    assert.match(ghCall, /verdict=approve/)
+    assert.match(ghCall, /author=openai-gpt/)
+    assert.match(ghCall, /steward=google-gemini/)
+
+    // 6. Real execution control (VETO): --channel command returning veto -> exit 1 & NEVER publishes status!
+    rmSync(ghLog, { force: true })
+    const vetoOut = path.join(extDir, `veto-${headSha}.json`)
+    const vetoPayload = JSON.stringify({
+      verdict: 'veto',
+      dimensions: {
+        godClassAppend: { status: 'pass', notes: 'ok' },
+        wheelReinvention: { status: 'pass', notes: 'ok' },
+        boundaryIntegrity: { status: 'veto', notes: 'Breaks gateway boundary invariant' },
+        complexityDrift: { status: 'pass', notes: 'ok' },
+      },
+      blockers: [
+        {
+          dimension: 'boundaryIntegrity',
+          severity: 'P1',
+          location: 'packages/gateway/src/stewardDemo.ts:1',
+          reason: 'Direct boundary bypass',
+          remediation: 'Route through protocol contract',
+        },
+      ],
+    })
+    const rRealVeto = spawnSync(
+      'bash',
+      [
+        REVIEW_SH,
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--author-model',
+        'gpt-6.2-sol',
+        '--channel',
+        'command',
+        '--out',
+        vetoOut,
+        '--publish-github-status',
+        '--github-repo',
+        'dream-star-end/openclaude',
+        '--unsafe-test-skip-owner',
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${fakeGhBin}:${process.env.PATH ?? ''}`,
+          OC_STEWARD_REVIEW_CMD: `cat >/dev/null; printf '%s' '${vetoPayload}'`,
+        },
+      },
+    )
+    assert.equal(rRealVeto.status, 1, 'real VETO MUST exit 1')
+    assert.match(rRealVeto.stderr, /STEWARD-HARD-VETO/)
+    assert.equal(existsSync(ghLog), false, 'real VETO must NEVER publish GitHub status')
+  })
+
+  test('B2: out-of-commit GitHub Commit Status oc-v5/arch-steward passes on valid cross-family status and rejects same-family/dry-run/veto/untrusted', async (t) => {
+    const repo = initTempGitRepo()
+    t.after(() => rmSync(repo.dir, { recursive: true, force: true }))
+    const baseSha = repo.git(['rev-parse', 'HEAD'])
+    repo.write('packages/gateway/src/githubStatusTest.ts', 'export const ok = true\n')
+    const headSha = repo.commit('feat(v5): core gateway change verified via GitHub status')
+    const shortSha = headSha.slice(0, 12)
+
+    const makeMockFetch = (statuses: unknown[]): FetchLike => async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => statuses,
+    })
+
+    // 1. Valid trusted cross-family status -> PASS
+    const gOk = await runStewardGateAsync({
+      root: repo.dir,
+      mode: 'enforce-pr',
+      baseRef: baseSha,
+      headRef: headSha,
+      github: {
+        repo: 'dream-star-end/openclaude',
+        token: 'ghs_mock_token',
+        fetchImpl: makeMockFetch([
+          {
+            id: 50,
+            context: 'oc-v5/arch-steward',
+            state: 'success',
+            description: `verdict=approve sha=${shortSha} author=openai-gpt steward=google-gemini digest=hmac-sha256:0123456789abcdef`,
+            creator: { login: 'dream-star-end' },
+            created_at: '2026-11-26T15:00:00Z',
+          },
+        ]),
+      },
+    })
+    assert.equal(gOk.ok, true)
+    assert.equal(gOk.exitCode, 0)
+    assert.equal(gOk.receiptLookup?.channel, 'github-status')
+
+    // 2. Same-family status -> REJECT
+    const gSame = await runStewardGateAsync({
       root: repo.dir,
       mode: 'enforce-commit',
       baseRef: baseSha,
       headRef: headSha,
+      github: {
+        repo: 'dream-star-end/openclaude',
+        token: 'ghs_mock_token',
+        fetchImpl: makeMockFetch([
+          {
+            id: 51,
+            context: 'oc-v5/arch-steward',
+            state: 'success',
+            description: `verdict=approve sha=${shortSha} author=openai-gpt steward=openai-gpt digest=hmac-sha256:0123456789abcdef`,
+            creator: { login: 'dream-star-end' },
+            created_at: '2026-11-26T15:00:00Z',
+          },
+        ]),
+      },
     })
-    assert.equal(
-      gEnforce.exitCode,
-      0,
-      `dry-run receipt failed enforcement: ${JSON.stringify(gEnforce.receiptVerification)}`,
-    )
+    assert.equal(gSame.ok, false)
+    assert.equal(gSame.exitCode, 1)
+
+    // 3. Dry-run marker or untrusted creator or wrong SHA -> REJECT
+    for (const badStatus of [
+      {
+        id: 52,
+        context: 'oc-v5/arch-steward',
+        state: 'success',
+        description: `verdict=approve sha=${shortSha} author=openai-gpt steward=google-gemini digest=sha256:0123456789abcdef dry-run`,
+        creator: { login: 'dream-star-end' },
+      },
+      {
+        id: 53,
+        context: 'oc-v5/arch-steward',
+        state: 'success',
+        description: `verdict=approve sha=${shortSha} author=openai-gpt steward=google-gemini digest=sha256:0123456789abcdef`,
+        creator: { login: 'untrusted-bot' },
+      },
+      {
+        id: 54,
+        context: 'oc-v5/arch-steward',
+        state: 'success',
+        description: 'verdict=approve sha=aaaaaaaaaaaa author=openai-gpt steward=google-gemini digest=sha256:0123456789abcdef',
+        creator: { login: 'dream-star-end' },
+      },
+    ]) {
+      const gBad = await runStewardGateAsync({
+        root: repo.dir,
+        mode: 'enforce-commit',
+        baseRef: baseSha,
+        headRef: headSha,
+        github: {
+          repo: 'dream-star-end/openclaude',
+          token: 'ghs_mock_token',
+          fetchImpl: makeMockFetch([badStatus]),
+        },
+      })
+      assert.equal(gBad.ok, false)
+      assert.equal(gBad.exitCode, 1)
+    }
+
+    // 4. Real CLI subprocess against local HTTP mock GitHub API (hosted runner without host receipt dir)
+    const server = http.createServer((req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      res.setHeader('Connection', 'close')
+      if (req.url?.startsWith(`/repos/dream-star-end/openclaude/commits/${headSha}/statuses`)) {
+        res.end(
+          JSON.stringify([
+            {
+              id: 88,
+              context: 'oc-v5/arch-steward',
+              state: 'success',
+              description: `verdict=approve sha=${shortSha} author=anthropic-claude steward=openai-gpt digest=hmac-sha256:fedcba9876543210`,
+              creator: { login: 'dream-star-end' },
+              created_at: '2026-11-26T15:10:00Z',
+            },
+          ]),
+        )
+        return
+      }
+      res.end('[]')
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const addr = server.address() as { port: number }
+      const rCli = await runAuditCliAsync(
+        [
+          '--enforce-commit',
+          '--root',
+          repo.dir,
+          '--base',
+          baseSha,
+          '--head',
+          headSha,
+          '--github-repo',
+          'dream-star-end/openclaude',
+          '--github-api-url',
+          `http://127.0.0.1:${addr.port}`,
+        ],
+        { GITHUB_TOKEN: 'ghs_test_token' },
+      )
+      assert.equal(rCli.status, 0, `expected exit 0 via GitHub status, stderr=${rCli.stderr}`)
+      assert.match(rCli.stdout, /approved via GitHub status/)
+    } finally {
+      server.closeAllConnections?.()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
   })
 })
 

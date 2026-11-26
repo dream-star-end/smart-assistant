@@ -16,7 +16,7 @@
  * `inputsKey`, compaction/rebuild invalidation, cold-start retry, or
  * `OC_RESUMED_ENVELOPE_DEDUP=off` immediately falls back to full injection.
  */
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import {
   chmodSync,
   mkdirSync,
@@ -28,8 +28,11 @@ import {
   writeFileSync,
 } from 'node:fs'
 import path from 'node:path'
-import { sha256Hex } from '@openclaude/kernel'
 import type { PromptSlotApplied } from '../promptSlots.js'
+
+function sha256Hex(input: string): string {
+  return createHash('sha256').update(input, 'utf8').digest('hex')
+}
 
 export type ResumedDedupEngine = 'cursor' | 'grok' | 'zcode'
 export type ResumedDedupMode = 'on' | 'off'

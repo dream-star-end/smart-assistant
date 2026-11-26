@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import {
   chmodSync,
   copyFileSync,
@@ -10,12 +10,14 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
+import http from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { runCheckA0Monotonic } from '../check-a0-monotonic.js'
-import { computeA0ReceiptDigest } from '../lib/a0ApprovalReceipt.js'
+import { runCheckA0Monotonic, runCheckA0MonotonicAsync } from '../check-a0-monotonic.js'
+import { computeA0ReceiptDigest, computeA0ReceiptHmac } from '../lib/a0ApprovalReceipt.js'
+import type { FetchLike } from '../lib/githubTrustedApproval.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const localTsx = path.join(root, 'node_modules/.bin/tsx')
@@ -54,14 +56,42 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       requireRootOwner: false,
     })
 
-  const cli = (args: string[], extraEnv: Record<string, string> = {}) => {
-    const r = spawnSync(tsx, [refereeScript, '--root', repo, ...args], {
+  const cli = (
+    args: string[],
+    extraEnv: Record<string, string> = {},
+    opts: { skipOwner?: boolean } = {},
+  ) => {
+    const ownerArgs = opts.skipOwner === false ? [] : ['--unsafe-test-skip-owner']
+    const r = spawnSync(tsx, [refereeScript, '--root', repo, ...ownerArgs, ...args], {
       cwd: repo,
       encoding: 'utf8',
       env: { ...process.env, OC_A0_APPROVAL_DIR: approvalDir, ...extraEnv },
     })
     return { status: r.status, stdout: r.stdout, stderr: r.stderr, out: `${r.stdout}${r.stderr}` }
   }
+
+  const cliAsync = (
+    args: string[],
+    extraEnv: Record<string, string> = {},
+    opts: { skipOwner?: boolean } = {},
+  ) =>
+    new Promise<{ status: number | null; stdout: string; stderr: string; out: string }>((resolve, reject) => {
+      const ownerArgs = opts.skipOwner === false ? [] : ['--unsafe-test-skip-owner']
+      const child = spawn(tsx, [refereeScript, '--root', repo, ...ownerArgs, ...args], {
+        cwd: repo,
+        env: { ...process.env, OC_A0_APPROVAL_DIR: approvalDir, ...extraEnv },
+      })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', (d) => {
+        stdout += String(d)
+      })
+      child.stderr.on('data', (d) => {
+        stderr += String(d)
+      })
+      child.on('error', reject)
+      child.on('close', (status) => resolve({ status, stdout, stderr, out: `${stdout}${stderr}` }))
+    })
 
   const writeSignedReceipt = (
     sha: string,
@@ -71,6 +101,8 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       issuedAt: string
       expiresAt: string
       sha256: string
+      hmacSha256: string
+      hmacKey: string
       allowedPaths: string[]
     }> = {},
     fileName?: string,
@@ -79,8 +111,17 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
     const expiresAt = overrides.expiresAt ?? new Date(Date.now() + 3_600_000).toISOString()
     const reason = overrides.reason ?? 'OCV5-904 approved A0 guardrail update'
     const receiptSha = overrides.sha ?? sha
-    const digest =
-      overrides.sha256 ?? computeA0ReceiptDigest({ sha: receiptSha, issuedAt, expiresAt, reason })
+    const fields = {
+      sha: receiptSha,
+      issuedAt,
+      expiresAt,
+      reason,
+      allowedPaths: overrides.allowedPaths,
+    }
+    const digest = overrides.sha256 ?? computeA0ReceiptDigest(fields)
+    const hmacSha256 =
+      overrides.hmacSha256 ??
+      (overrides.hmacKey ? computeA0ReceiptHmac(fields, overrides.hmacKey) : undefined)
     const receipt = {
       schemaVersion: 1,
       sha: receiptSha,
@@ -89,6 +130,7 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       issuedAt,
       expiresAt,
       sha256: digest,
+      ...(hmacSha256 ? { hmacSha256 } : {}),
       ...(overrides.allowedPaths ? { allowedPaths: overrides.allowedPaths } : {}),
     }
     const targetPath = path.join(approvalDir, fileName ?? `${sha}.json`)
@@ -618,7 +660,7 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
     assert.equal(JSON.parse(rApproved.stdout).approval.valid, true)
   })
 
-  test('initial [a0-bootstrap] rollout passes only when base lacks policy & diff is non-weakening; subsequent commits hard-block', () => {
+  test('initial policy rollout requires out-of-commit approval AND enforces non-weakening bootstrap self-check (B2)', () => {
     // Create a clean base commit WITHOUT arch/a0-protected-paths.json
     const bootRepo = mkdtempSync(path.join(tmpdir(), 'a0-bootstrap-repo-'))
     try {
@@ -641,7 +683,7 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       bGit('commit', '-qm', 'pre-a0-base')
       bGit('tag', 'pre-a0')
 
-      // 1. Valid initial introduction of A0 policy + referee + modified existing gate -> bootstrap PASS
+      // 1. Initial rollout WITHOUT approval MUST FAIL CLOSED (no unapproved bootstrap escape hatch!)
       for (const rel of ['arch/a0-protected-paths.json', 'scripts/check-a0-monotonic.ts', '.github/CODEOWNERS']) {
         const dst = path.join(bootRepo, rel)
         mkdirSync(path.dirname(dst), { recursive: true })
@@ -650,12 +692,30 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       bWrite('scripts/check-existing.ts', 'export const x = 2\n')
       bGit('add', '-A')
       bGit('commit', '-qm', 'bootstrap a0')
-      const rBoot = runCheckA0Monotonic({ root: bootRepo, base: 'pre-a0', approvalDir, requireRootOwner: false })
-      assert.equal(rBoot.ok, true)
-      assert.equal(rBoot.bootstrap, true)
+      const bootSha = bGit('rev-parse', 'HEAD')
+      const rBootNoApproval = runCheckA0Monotonic({
+        root: bootRepo,
+        base: 'pre-a0',
+        approvalDir,
+        requireRootOwner: false,
+      })
+      assert.equal(rBootNoApproval.ok, false)
+      assert.equal(rBootNoApproval.bootstrap, true)
+
+      // 2. Initial rollout WITH valid approval for exact bootSha -> PASS!
+      writeSignedReceipt(bootSha)
+      const rBootApproved = runCheckA0Monotonic({
+        root: bootRepo,
+        base: 'pre-a0',
+        approvalDir,
+        requireRootOwner: false,
+      })
+      assert.equal(rBootApproved.ok, true)
+      assert.equal(rBootApproved.bootstrap, true)
+      assert.equal(rBootApproved.approval?.valid, true)
       bGit('tag', 'post-a0')
 
-      // 2. Subsequent commit touching A0 path (now that base has policy) -> 100% HARD-BLOCKED!
+      // 3. Subsequent commit touching A0 path (now that base has policy) -> 100% HARD-BLOCKED!
       bWrite('.github/CODEOWNERS', '* @nobody\n')
       bGit('add', '-A')
       bGit('commit', '-qm', 'post-bootstrap tamper')
@@ -663,18 +723,395 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       assert.equal(rAfter.ok, false)
       assert.notEqual(rAfter.bootstrap, true)
 
-      // 3. Disallowed weakening during bootstrap (deleting existing gate) -> FAILS CLOSED!
+      // 4. Disallowed weakening during bootstrap (deleting existing gate) -> FAILS CLOSED even with receipt!
       bGit('reset', '--hard', 'pre-a0')
       mkdirSync(path.join(bootRepo, 'arch'), { recursive: true })
       copyFileSync(path.join(root, 'arch/a0-protected-paths.json'), path.join(bootRepo, 'arch/a0-protected-paths.json'))
       rmSync(path.join(bootRepo, 'scripts/check-existing.ts'))
       bGit('add', '-A')
       bGit('commit', '-qm', 'bootstrap delete gate')
+      const weakSha = bGit('rev-parse', 'HEAD')
+      writeSignedReceipt(weakSha)
       const rWeak = runCheckA0Monotonic({ root: bootRepo, base: 'pre-a0', approvalDir, requireRootOwner: false })
       assert.equal(rWeak.ok, false)
       assert.ok((rWeak.bootstrapErrors ?? []).some((e) => e.includes('A0-GATE-DELETED')))
     } finally {
       rmSync(bootRepo, { recursive: true, force: true })
+    }
+  })
+
+  test('A0 rename regression: renaming deploy/v5/runtime-image-pin.json or baselines is hard-blocked as A0', () => {
+    // Rename A1 declarative runtime pin -> MUST trigger A0-PIN-DELETED on oldPath!
+    git('mv', 'deploy/v5/runtime-image-pin.json', 'deploy/v5/runtime-image-pin-moved.json')
+    commit('bad: rename runtime image pin')
+    const rPinRename = checkInProcess()
+    assert.equal(rPinRename.ok, false)
+    assert.ok(
+      rPinRename.a0Blocks.some((b) => b.rule === 'A0-PIN-DELETED' && b.path === 'deploy/v5/runtime-image-pin.json'),
+      `expected A0-PIN-DELETED for renamed pin, got ${JSON.stringify(rPinRename.a0Blocks)}`,
+    )
+
+    // Rename arch/modules.json -> MUST trigger A0-MODULES-DELETED!
+    git('reset', '--hard', 'base')
+    git('mv', 'arch/modules.json', 'arch/modules-renamed.json')
+    commit('bad: rename modules.json')
+    const rModRename = checkInProcess()
+    assert.equal(rModRename.ok, false)
+    assert.ok(rModRename.a0Blocks.some((b) => b.rule === 'A0-MODULES-DELETED'))
+  })
+
+  test('B7 A0 protection list covers lease worker, debounce, train guards, governance gates, and release policy', () => {
+    for (const rel of [
+      'scripts/v5-lease-worker.sh',
+      'scripts/lib/v5-lease-train-debounce.sh',
+      'scripts/lib/v5-selfhost-train-guards.sh',
+      'scripts/lib/v5-selfhost-governance-gates.sh',
+      'scripts/lib/v5-selfhost-release-policy.sh',
+    ]) {
+      git('reset', '--hard', 'base')
+      write(rel, '#!/usr/bin/env bash\necho tampered\n')
+      commit(`bad: modify ${rel}`)
+      const res = checkInProcess()
+      assert.equal(res.ok, false, `expected A0 block for ${rel}`)
+      assert.ok(
+        res.a0Blocks.some((b) => b.path === rel && b.category === 'host-control-plane-and-deploy'),
+        `expected host-control-plane-and-deploy block for ${rel}, got ${JSON.stringify(res.a0Blocks)}`,
+      )
+    }
+  })
+
+  test('B3 HMAC enforcement & allowedPaths tamper protection & default root-owner enforcement', () => {
+    write('packages/commercial/src/billing/ledger.ts', 'export const ledgerVersion = 99\n')
+    const headSha = commit('feat: billing core change for hmac test')
+
+    // 1. Tampering allowedPaths after signing MUST fail digest verification
+    const issuedAt = new Date(Date.now() - 60_000).toISOString()
+    const expiresAt = new Date(Date.now() + 3_600_000).toISOString()
+    const reason = 'Authorized single-file A0 update'
+    const digestForOtherPath = computeA0ReceiptDigest({
+      sha: headSha,
+      issuedAt,
+      expiresAt,
+      reason,
+      allowedPaths: ['changelog.json'],
+    })
+    writeSignedReceipt(headSha, {
+      issuedAt,
+      expiresAt,
+      reason,
+      allowedPaths: ['packages/commercial/src/billing/ledger.ts'],
+      sha256: digestForOtherPath,
+    })
+    const rPathTamper = checkInProcess()
+    assert.equal(rPathTamper.ok, false)
+    assert.match(rPathTamper.approval && !rPathTamper.approval.valid ? rPathTamper.approval.reason : '', /digest verification failed/)
+
+    // 2. Active 0600 .hmac-key enforces hmacSha256 and rejects plain sha256 downgrade
+    const hmacDir = mkdtempSync(path.join(tmpdir(), 'a0-hmac-root-'))
+    try {
+      const approvalsSub = path.join(hmacDir, 'a0-approvals')
+      mkdirSync(approvalsSub, { recursive: true })
+      const keyFile = path.join(hmacDir, '.hmac-key')
+      const secretKey = 'super-secret-host-a0-hmac-key-0123456789'
+      writeFileSync(keyFile, `${secretKey}\n`, { mode: 0o600 })
+      chmodSync(keyFile, 0o600)
+
+      // Plain sha256 only -> REJECTED!
+      const plainDoc = {
+        schemaVersion: 1,
+        sha: headSha,
+        reason,
+        approvedBy: 'root',
+        issuedAt,
+        expiresAt,
+        sha256: computeA0ReceiptDigest({ sha: headSha, issuedAt, expiresAt, reason }),
+      }
+      writeFileSync(path.join(approvalsSub, `${headSha}.json`), JSON.stringify(plainDoc, null, 2))
+      const rDowngrade = runCheckA0Monotonic({
+        root: repo,
+        base: 'base',
+        approvalDir: approvalsSub,
+        requireRootOwner: false,
+      })
+      assert.equal(rDowngrade.ok, false)
+      assert.match(rDowngrade.approval && !rDowngrade.approval.valid ? rDowngrade.approval.reason : '', /downgrade rejected/)
+
+      // Valid HMAC receipt -> PASS!
+      const hmacDoc = {
+        ...plainDoc,
+        hmacSha256: computeA0ReceiptHmac({ sha: headSha, issuedAt, expiresAt, reason }, secretKey),
+      }
+      writeFileSync(path.join(approvalsSub, `${headSha}.json`), JSON.stringify(hmacDoc, null, 2))
+      const rHmacOk = runCheckA0Monotonic({
+        root: repo,
+        base: 'base',
+        approvalDir: approvalsSub,
+        requireRootOwner: false,
+      })
+      assert.equal(rHmacOk.ok, true)
+
+      // Insecure 0644 .hmac-key -> REJECTED!
+      chmodSync(keyFile, 0o644)
+      const rBadKeyPerm = runCheckA0Monotonic({
+        root: repo,
+        base: 'base',
+        approvalDir: approvalsSub,
+        requireRootOwner: false,
+      })
+      assert.equal(rBadKeyPerm.ok, false)
+      assert.match(rBadKeyPerm.approval && !rBadKeyPerm.approval.valid ? rBadKeyPerm.approval.reason : '', /0600\/0400/)
+
+      // Overriding --approval-dir WITHOUT --unsafe-test-skip-owner still enforces uid===0 when non-root
+      chmodSync(keyFile, 0o600)
+      if (typeof process.getuid === 'function' && process.getuid() !== 0) {
+        const rNoSkipOwner = cli(['--base', 'base', '--approval-dir', approvalsSub], {}, { skipOwner: false })
+        assert.equal(rNoSkipOwner.status, 1)
+        assert.match(rNoSkipOwner.out, /owned by root/)
+      }
+    } finally {
+      rmSync(hmacDir, { recursive: true, force: true })
+    }
+  })
+
+  test('B2 out-of-commit GitHub A0 approval: Commit Status oc-v5/a0-approval & PR CODEOWNER APPROVED review (positive + negative + CLI HTTP server)', async () => {
+    write('packages/commercial/src/billing/ledger.ts', 'export const ledgerVersion = 77\n')
+    const headSha = commit('feat: A0 change authorized out-of-commit via GitHub')
+    const shortSha = headSha.slice(0, 12)
+    const futureExp = new Date(Date.now() + 3_600_000).toISOString()
+    const pastExp = '2026-01-01T00:00:00Z'
+
+    const makeMockFetch = (routes: Record<string, unknown>): FetchLike => async (url) => {
+      const pathOnly = new URL(url).pathname
+      const data = routes[pathOnly]
+      if (data === undefined) {
+        return { ok: false, status: 404, json: async () => ({ message: 'not found' }) }
+      }
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => data }
+    }
+
+    // 1. Valid Commit Status oc-v5/a0-approval by dream-star-end -> PASS
+    const rStatusOk = await runCheckA0MonotonicAsync({
+      root: repo,
+      base: 'base',
+      head: headSha,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: 'dream-star-end/openclaude',
+        token: 'ghs_test_token',
+        fetchImpl: makeMockFetch({
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/statuses`]: [
+            {
+              id: 20,
+              context: 'oc-v5/a0-approval',
+              state: 'success',
+              description: `sha=${shortSha} exp=${futureExp} | Approved billing ledger migration`,
+              creator: { login: 'dream-star-end' },
+              created_at: '2026-11-26T12:00:00Z',
+            },
+          ],
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/pulls`]: [],
+        }),
+      },
+    })
+    assert.equal(rStatusOk.ok, true)
+    assert.equal(rStatusOk.approval?.valid, true)
+    assert.equal(rStatusOk.approval?.valid ? rStatusOk.approval.source : '', 'github-status')
+
+    // 2. Untrusted publisher -> REJECT
+    const rUntrusted = await runCheckA0MonotonicAsync({
+      root: repo,
+      base: 'base',
+      head: headSha,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: 'dream-star-end/openclaude',
+        token: 'ghs_test_token',
+        fetchImpl: makeMockFetch({
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/statuses`]: [
+            {
+              id: 21,
+              context: 'oc-v5/a0-approval',
+              state: 'success',
+              description: `sha=${shortSha} exp=${futureExp} | Forged by random user`,
+              creator: { login: 'random-attacker' },
+              created_at: '2026-11-26T12:00:00Z',
+            },
+          ],
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/pulls`]: [],
+        }),
+      },
+    })
+    assert.equal(rUntrusted.ok, false)
+
+    // 3. Expired status or latest failure superseding earlier success -> REJECT
+    const rExpiredStatus = await runCheckA0MonotonicAsync({
+      root: repo,
+      base: 'base',
+      head: headSha,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: 'dream-star-end/openclaude',
+        token: 'ghs_test_token',
+        fetchImpl: makeMockFetch({
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/statuses`]: [
+            {
+              id: 22,
+              context: 'oc-v5/a0-approval',
+              state: 'success',
+              description: `sha=${shortSha} exp=${pastExp} | Expired A0 approval`,
+              creator: { login: 'dream-star-end' },
+              created_at: '2026-01-01T00:00:00Z',
+            },
+          ],
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/pulls`]: [],
+        }),
+      },
+    })
+    assert.equal(rExpiredStatus.ok, false)
+
+    const rRevokedStatus = await runCheckA0MonotonicAsync({
+      root: repo,
+      base: 'base',
+      head: headSha,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: 'dream-star-end/openclaude',
+        token: 'ghs_test_token',
+        fetchImpl: makeMockFetch({
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/statuses`]: [
+            {
+              id: 30,
+              context: 'oc-v5/a0-approval',
+              state: 'failure',
+              description: `sha=${shortSha} | Revoked approval`,
+              creator: { login: 'dream-star-end' },
+              created_at: '2026-11-26T13:00:00Z',
+            },
+            {
+              id: 29,
+              context: 'oc-v5/a0-approval',
+              state: 'success',
+              description: `sha=${shortSha} exp=${futureExp} | Earlier approval`,
+              creator: { login: 'dream-star-end' },
+              created_at: '2026-11-26T12:00:00Z',
+            },
+          ],
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/pulls`]: [],
+        }),
+      },
+    })
+    assert.equal(rRevokedStatus.ok, false)
+
+    // 4. PR CODEOWNER APPROVED review bound to exact headSha -> PASS; stale commit_id or CHANGES_REQUESTED -> REJECT
+    const rPrOk = await runCheckA0MonotonicAsync({
+      root: repo,
+      base: 'base',
+      head: headSha,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: 'dream-star-end/openclaude',
+        token: 'ghs_test_token',
+        prNumber: 1450,
+        fetchImpl: makeMockFetch({
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/statuses`]: [],
+          '/repos/dream-star-end/openclaude/pulls/1450/reviews': [
+            {
+              id: 1,
+              state: 'APPROVED',
+              commit_id: headSha,
+              submitted_at: '2026-11-26T12:30:00Z',
+              user: { login: 'dream-star-end' },
+            },
+            {
+              id: 2,
+              state: 'COMMENTED',
+              commit_id: headSha,
+              submitted_at: '2026-11-26T12:31:00Z',
+              user: { login: 'dream-star-end' },
+            },
+          ],
+        }),
+      },
+    })
+    assert.equal(rPrOk.ok, true)
+    assert.equal(rPrOk.approval?.valid ? rPrOk.approval.source : '', 'github-pr-review')
+
+    const rPrStale = await runCheckA0MonotonicAsync({
+      root: repo,
+      base: 'base',
+      head: headSha,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: 'dream-star-end/openclaude',
+        token: 'ghs_test_token',
+        prNumber: 1450,
+        fetchImpl: makeMockFetch({
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/statuses`]: [],
+          '/repos/dream-star-end/openclaude/pulls/1450/reviews': [
+            {
+              id: 1,
+              state: 'APPROVED',
+              commit_id: '0'.repeat(40),
+              submitted_at: '2026-11-26T12:30:00Z',
+              user: { login: 'dream-star-end' },
+            },
+          ],
+        }),
+      },
+    })
+    assert.equal(rPrStale.ok, false)
+
+    // 5. Real CLI subprocess against local mock GitHub HTTP API (clean hosted runner with no host files!)
+    const server = http.createServer((req, res) => {
+      res.setHeader('Content-Type', 'application/json')
+      res.setHeader('Connection', 'close')
+      if (req.url?.startsWith(`/repos/dream-star-end/openclaude/commits/${headSha}/statuses`)) {
+        res.end(
+          JSON.stringify([
+            {
+              id: 100,
+              context: 'oc-v5/a0-approval',
+              state: 'success',
+              description: `sha=${shortSha} exp=${futureExp} | Approved via hosted runner status`,
+              creator: { login: 'dream-star-end' },
+              created_at: '2026-11-26T12:00:00Z',
+            },
+          ]),
+        )
+        return
+      }
+      res.end('[]')
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const addr = server.address() as { port: number }
+      const rCliGh = await cliAsync(
+        [
+          '--base',
+          'base',
+          '--head',
+          headSha,
+          '--github-repo',
+          'dream-star-end/openclaude',
+          '--github-api-url',
+          `http://127.0.0.1:${addr.port}`,
+          '--json',
+        ],
+        { GITHUB_TOKEN: 'ghs_mock_token' },
+      )
+      assert.equal(rCliGh.status, 0, rCliGh.out)
+      const parsed = JSON.parse(rCliGh.stdout)
+      assert.equal(parsed.ok, true)
+      assert.equal(parsed.approval.source, 'github-status')
+    } finally {
+      server.closeAllConnections?.()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
     }
   })
 })

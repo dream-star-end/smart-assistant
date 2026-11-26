@@ -12,10 +12,11 @@
  * function. Supports `<2s` incremental fast mode via `--files <list>` and `--base <ref>`.
  */
 import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import ts from 'typescript'
+import { checkGatewayCoverage, discoverPackagesProdFiles } from './lib/prodFileDiscovery.js'
 
 export const BASELINE_REL_PATH = 'arch/complexity-baseline.json'
 
@@ -107,38 +108,17 @@ export function isProductionTsFile(relPosix: string): boolean {
   )
 }
 
-function walkProdDir(root: string, relDir: string, out: string[]): void {
-  const abs = path.join(root, relDir)
-  if (!existsSync(abs)) return
-  for (const ent of readdirSync(abs, { withFileTypes: true })) {
-    if (SKIP_DIRS.has(ent.name)) continue
-    const nextRel = `${relDir}/${ent.name}`
-    if (ent.isDirectory()) walkProdDir(root, nextRel, out)
-    else if (ent.isFile() && isProductionTsFile(nextRel)) out.push(nextRel)
-  }
+export function discoverProductionFiles(root: string): string[] {
+  return discoverPackagesProdFiles({
+    root,
+    skipDirs: SKIP_DIRS,
+    includeFile: isProductionTsFile,
+    fallbackRootSrc: true,
+  })
 }
 
-export function discoverProductionFiles(root: string): string[] {
-  const out: string[] = []
-  const pkgRoot = path.join(root, 'packages')
-  if (existsSync(pkgRoot)) {
-    for (const pkg of readdirSync(pkgRoot, { withFileTypes: true })) {
-      if (!pkg.isDirectory()) continue
-      if (pkg.name === 'channels') {
-        const chRoot = path.join(pkgRoot, 'channels')
-        if (existsSync(chRoot)) {
-          for (const ch of readdirSync(chRoot, { withFileTypes: true })) {
-            if (ch.isDirectory()) walkProdDir(root, `packages/channels/${ch.name}/src`, out)
-          }
-        }
-      } else {
-        walkProdDir(root, `packages/${pkg.name}/src`, out)
-      }
-    }
-  } else if (existsSync(path.join(root, 'src'))) {
-    walkProdDir(root, 'src', out)
-  }
-  return out.sort()
+export function checkDiscoveryCoverage(root: string, discoveredFiles: readonly string[]): string | null {
+  return checkGatewayCoverage(root, discoveredFiles)
 }
 
 function isNestedFnBoundary(node: ts.Node): boolean {
@@ -724,6 +704,13 @@ export function main(argv = process.argv.slice(2)): number {
     }
 
     const allFiles = sawFilesFlag ? normalizeCliFileList(root, rawFiles) : discoverProductionFiles(root)
+    if (enforce && !sawFilesFlag) {
+      const coverageErr = checkDiscoveryCoverage(root, allFiles)
+      if (coverageErr) {
+        console.error(`[GATE-ERROR] COMPLEXITY-RATCHET (coverage-zero): ${coverageErr}`)
+        return 1
+      }
+    }
     const metrics = scanComplexity(root, allFiles)
     violations.push(...evaluateComplexityRatchet(metrics, headBaseline, renames))
 

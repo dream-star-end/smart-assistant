@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Architecture Steward Cross-Family Review Wrapper (OCV5-905).
+# Architecture Steward Cross-Family Review Wrapper (OCV5-905 / OCV5-903 B2 & B3).
 #
 # Encapsulates the standardized 4-dimension Architecture Steward prompt:
 #   1. godClassAppend    — prevents appending new branches/features into Top-20 append magnets
@@ -8,13 +8,20 @@
 #   4. complexityDrift   — blocks >100L / CC_direct > 20 / unnecessary state or branching bloat
 #
 # Calls a verified CROSS-FAMILY strong model (hard-verified before spending any tokens),
-# writes a tamper-evident signed `ArchStewardReceipt` JSON (`receiptDigest`), and validates
-# it via `scripts/check-cross-family-audit.ts --enforce-commit`.
+# writes a tamper-evident signed production `ArchStewardReceipt` JSON outside the repo
+# (default `/opt/openclaude/harness-gate/steward-receipts/<headSha>.json`), validates it via
+# `scripts/check-cross-family-audit.ts --enforce-commit`, and optionally publishes an
+# out-of-commit GitHub Commit Status `oc-v5/arch-steward` (`--publish-github-status`).
+#
+# Security invariant (B3):
+#   - `--dry-run` emits a non-production schema (`oc.v5.arch-steward-dry-run/1`, `dryRun: true`,
+#     never `verdict: "approve"`), NEVER signs a production receipt, and NEVER publishes a GitHub status.
 #
 # Usage:
 #   scripts/arch-steward-review.sh --author-model <slug> [--steward-model <slug>]
 #     [--base <ref>] [--head <ref>] [--out <path.json>] [--root <repo>]
-#     [--channel auto|codex|agy|command] [--dry-run] [--print-prompt]
+#     [--channel auto|codex|agy|command] [--publish-github-status] [--github-repo <owner/repo>]
+#     [--dry-run] [--print-prompt] [--unsafe-test-skip-owner]
 #
 # Exit: 0 approved (or low-risk fast pass / --dry-run / --print-prompt),
 #       1 cross-family violation or Steward VETO (non-overridable),
@@ -25,6 +32,7 @@ die() { echo "✗ [arch-steward-review] $*" >&2; exit 2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DEFAULT_HOST_RECEIPT_DIR="/opt/openclaude/harness-gate/steward-receipts"
 
 root=""
 base_ref=""
@@ -35,6 +43,9 @@ out_path=""
 channel="auto"
 dry_run=0
 print_prompt=0
+publish_gh=0
+gh_repo=""
+unsafe_test_skip_owner=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,15 +56,22 @@ while [[ $# -gt 0 ]]; do
     --steward-model) steward_model="${2:-}"; shift 2 ;;
     --out) out_path="${2:-}"; shift 2 ;;
     --channel) channel="${2:-}"; shift 2 ;;
+    --publish-github-status) publish_gh=1; shift ;;
+    --github-repo) gh_repo="${2:-}"; shift 2 ;;
     --dry-run) dry_run=1; shift ;;
     --print-prompt) print_prompt=1; shift ;;
+    --unsafe-test-skip-owner) unsafe_test_skip_owner=1; shift ;;
     -h|--help)
-      sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) die "未知参数: $1" ;;
   esac
 done
+
+if [[ "$dry_run" == 1 && "$publish_gh" == 1 ]]; then
+  die "--dry-run 禁止与 --publish-github-status 联用（绝不向 GitHub 发布干跑状态）"
+fi
 
 if [[ -z "$root" ]]; then
   root="$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$DEFAULT_ROOT")"
@@ -80,6 +98,30 @@ fi
 
 run_tsx() {
   "${TSX_CMD[@]}" "$@"
+}
+
+resolve_github_repo_slug() {
+  local explicit="${1:-}"
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
+    printf '%s\n' "$GITHUB_REPOSITORY"
+    return 0
+  fi
+  if [[ -n "${GH_REPO:-}" ]]; then
+    printf '%s\n' "$GH_REPO"
+    return 0
+  fi
+  local origin_url=""
+  origin_url="$(git -C "$root" remote get-url origin 2>/dev/null || true)"
+  if [[ -n "$origin_url" ]]; then
+    node -e '
+      const m = (process.argv[1] || "").trim().match(/github\.com[:/]([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+?)(?:\.git)?$/);
+      if (m) console.log(m[1]);
+    ' "$origin_url"
+  fi
 }
 
 # 1. Single-process preflight: verify cross-family strong model pair + evaluate structural risk
@@ -115,11 +157,15 @@ hits_markdown="$(node -e '
 diff_stat="$(git -C "$root" diff --shortstat "${base_sha}..${head_sha}" 2>/dev/null || true)"
 
 if [[ -z "$out_path" ]]; then
-  receipt_dir="${OC_STEWARD_RECEIPT_DIR:-$root/.github/steward-receipts}"
-  out_path="$receipt_dir/${head_sha}.json"
+  if [[ "$dry_run" == 1 ]]; then
+    out_path="${TMPDIR:-/tmp}/arch-steward-dry-run-${head_sha:0:12}.json"
+  else
+    receipt_dir="${OC_STEWARD_RECEIPT_DIR:-$DEFAULT_HOST_RECEIPT_DIR}"
+    out_path="$receipt_dir/${head_sha}.json"
+  fi
 fi
 
-# 4. Build standardized 4-dimension Architecture Steward prompt
+# 2. Build standardized 4-dimension Architecture Steward prompt
 prompt="$(cat <<EOF
 你是 OpenClaude V5 的「跨家族架构看护员（Architecture Steward）」。
 你的职责与开发实现者严格分离：你是独立、只读、具备**不可被开发队长单方驳回的硬否决权（Hard Veto）**的架构守门员。
@@ -168,33 +214,30 @@ if [[ "$print_prompt" == 1 ]]; then
   exit 0
 fi
 
-# 5. Dry-run mode: emit prompt summary + valid signed dry-run receipt without external LLM call
+# 3. Dry-run mode: emit NON-PRODUCTION dry-run preview artifact ONLY (never approve, never sign, never publish!)
 if [[ "$dry_run" == 1 ]]; then
   now_iso="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-  dry_triggers="$triggers_json"
-  if [[ "$requires_steward" == "0" ]]; then
-    # Even for low-risk commits, include a placeholder trigger only if generating a sample receipt
-    dry_triggers='["CLONE_OR_T2_CORE_PATH"]'
-  fi
-  tmp_unsigned="$(mktemp)"
-  trap 'rm -f "$tmp_unsigned"' EXIT
+  mkdir -p "$(dirname "$out_path")"
   node -e '
-    const [headSha, baseSha, authorModel, authorFamily, stewardModel, stewardFamily, triggersJson, nowIso] = process.argv.slice(1);
-    const receipt = {
-      schemaVersion: "oc.v5.arch-steward-receipt/1",
+    const fs = require("node:fs");
+    const [outFile, headSha, baseSha, authorModel, authorFamily, stewardModel, stewardFamily, triggersJson, nowIso] = process.argv.slice(1);
+    const preview = {
+      schemaVersion: "oc.v5.arch-steward-dry-run/1",
+      dryRun: true,
+      note: "NON-PRODUCTION DRY-RUN PREVIEW ONLY — hard-rejected by check-cross-family-audit.ts --enforce-commit/--enforce-pr.",
       headSha,
       baseSha,
       authorModel,
       authorFamily,
       stewardModel,
       stewardFamily,
-      verdict: "approve",
+      verdict: "dry-run-preview",
       triggers: JSON.parse(triggersJson),
       dimensions: {
-        godClassAppend: { status: "pass", notes: "[dry-run] verified no unapproved append to Top-20 magnets" },
-        wheelReinvention: { status: "pass", notes: "[dry-run] verified no duplicate utility or 12-line clone" },
-        boundaryIntegrity: { status: "pass", notes: "[dry-run] verified arch/modules.json layering and gate couplings" },
-        complexityDrift: { status: "pass", notes: "[dry-run] verified function lines <= 100 and CC_direct <= 20" }
+        godClassAppend: { status: "concern", notes: "[dry-run] preview only — no cross-family model executed" },
+        wheelReinvention: { status: "concern", notes: "[dry-run] preview only — no cross-family model executed" },
+        boundaryIntegrity: { status: "concern", notes: "[dry-run] preview only — no cross-family model executed" },
+        complexityDrift: { status: "concern", notes: "[dry-run] preview only — no cross-family model executed" }
       },
       blockers: [],
       usageEvidence: {
@@ -205,27 +248,25 @@ if [[ "$dry_run" == 1 ]]; then
         command: "scripts/arch-steward-review.sh --dry-run"
       }
     };
-    process.stdout.write(JSON.stringify(receipt, null, 2));
-  ' "$head_sha" "$base_sha" "$author_model" "$author_family" "$steward_model" "$steward_family" "$dry_triggers" "$now_iso" > "$tmp_unsigned"
+    fs.writeFileSync(outFile, `${JSON.stringify(preview, null, 2)}\n`, "utf8");
+  ' "$out_path" "$head_sha" "$base_sha" "$author_model" "$author_family" "$steward_model" "$steward_family" "$triggers_json" "$now_iso"
 
-  mkdir -p "$(dirname "$out_path")"
-  run_tsx "$AUDIT_SCRIPT" --sign-receipt "$tmp_unsigned" --out "$out_path"
-  echo "[arch-steward-review] DRY-RUN complete:"
+  echo "[arch-steward-review] DRY-RUN preview written (NON-PRODUCTION; rejected by --enforce-commit):"
   echo "  headSha      : $head_sha"
   echo "  baseSha      : $base_sha"
   echo "  pair         : $author_model ($author_family) -> $steward_model ($steward_family)"
   echo "  triggers     : ${triggers_csv:-none (low-risk)}"
-  echo "  receiptOut   : $out_path"
+  echo "  previewOut   : $out_path"
   exit 0
 fi
 
-# 6. Fast exit if zero structural risk triggers fired (Red Team Rule #5: zero overhead on low-risk edits)
+# 4. Fast exit if zero structural risk triggers fired (zero overhead on low-risk edits)
 if [[ "$requires_steward" == "0" ]]; then
   echo "[arch-steward-review] LOW-RISK FAST PASS: 0/6 structural risk triggers fired for ${base_sha:0:12}..${head_sha:0:12}; skipping LLM review."
   exit 0
 fi
 
-# 7. Select cross-family execution channel
+# 5. Select cross-family execution channel
 effective_channel="$channel"
 if [[ "$effective_channel" == "auto" ]]; then
   if [[ -n "${OC_STEWARD_REVIEW_CMD:-}" ]]; then
@@ -273,7 +314,7 @@ case "$effective_channel" in
     ;;
 esac
 
-# 8. Parse steward structured JSON response and assemble signed ArchStewardReceipt
+# 6. Parse real cross-family model JSON verdict and assemble production ArchStewardReceipt
 now_iso="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 node -e '
   const fs = require("node:fs");
@@ -287,6 +328,9 @@ node -e '
     throw new Error("steward output did not contain a valid JSON object");
   }
   const parsed = JSON.parse(candidate.slice(start, end + 1));
+  if (parsed.verdict !== "approve" && parsed.verdict !== "veto") {
+    throw new Error(`steward verdict must be "approve" or "veto", got ${JSON.stringify(parsed.verdict)}`);
+  }
   const receipt = {
     schemaVersion: "oc.v5.arch-steward-receipt/1",
     headSha,
@@ -312,7 +356,27 @@ node -e '
 
 mkdir -p "$(dirname "$out_path")"
 run_tsx "$AUDIT_SCRIPT" --sign-receipt "$tmp_unsigned" --out "$out_path"
-echo "[arch-steward-review] Receipt written: $out_path"
+chmod 0644 "$out_path" 2>/dev/null || true
+echo "[arch-steward-review] Production receipt written: $out_path"
 
-# 9. Mechanically enforce the produced receipt (exits 1 on veto / invalid receipt!)
-run_tsx "$AUDIT_SCRIPT" --enforce-commit --root "$root" --base "$base_sha" --head "$head_sha" --receipt "$out_path"
+# 7. Mechanically enforce the produced receipt (exits 1 on veto / invalid receipt!)
+enforce_args=(--enforce-commit --root "$root" --base "$base_sha" --head "$head_sha" --receipt "$out_path")
+if [[ "$unsafe_test_skip_owner" == 1 || "${OC_STEWARD_UNSAFE_TEST_SKIP_OWNER:-0}" == 1 ]]; then
+  enforce_args+=(--unsafe-test-skip-owner)
+fi
+run_tsx "$AUDIT_SCRIPT" "${enforce_args[@]}"
+
+# 8. Optionally publish out-of-commit GitHub Commit Status `oc-v5/arch-steward` (ONLY after enforce passed!)
+if [[ "$publish_gh" == 1 ]]; then
+  resolved_repo="$(resolve_github_repo_slug "$gh_repo")"
+  [[ -n "$resolved_repo" ]] || die "--publish-github-status 需要 --github-repo <owner/repo>（或 GITHUB_REPOSITORY / GH_REPO）"
+  command -v gh >/dev/null 2>&1 || die "--publish-github-status 需要 PATH 中可用的 gh CLI"
+  receipt_digest="$(node -e 'const d = JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).receiptDigest || ""; console.log(d);' "$out_path")"
+  digest_short="$(node -e 'const d = process.argv[1]; const [a, h] = d.split(":"); console.log(`${a}:${(h || "").slice(0, 16)}`);' "$receipt_digest")"
+  gh_desc="verdict=approve sha=${head_sha:0:12} author=${author_family} steward=${steward_family} digest=${digest_short}"
+  gh api -X POST "repos/${resolved_repo}/statuses/${head_sha}" \
+    -f state=success \
+    -f context="oc-v5/arch-steward" \
+    -f description="${gh_desc:0:140}" >/dev/null || die "发布 GitHub status oc-v5/arch-steward 失败 (${resolved_repo}@${head_sha})"
+  echo "[arch-steward-review] Published GitHub status oc-v5/arch-steward on ${resolved_repo}@${head_sha:0:12}"
+fi
