@@ -484,6 +484,7 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-ai-smells-ratchet.ts tsx "$staging" "$pinned_gitdir" "$staging" "" 1 -- --enforce || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-complexity-ratchet.ts tsx "$staging" "$pinned_gitdir" "$staging" "" 1 -- --enforce || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-clones-ratchet.ts tsx "$staging" "$pinned_gitdir" "$staging" "" 1 -- --enforce || return 1
+  _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-security-sast.ts tsx "$staging" "$pinned_gitdir" "$staging" "" 1 -- --enforce || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-cross-family-audit.ts tsx "$staging" "$pinned_gitdir" "$staging" "--enforce-commit" 1 -- --enforce-commit --root "$staging" --base "$base_ref" --head "$full_sha" || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-debt-ttl.ts tsx "$staging" "$pinned_gitdir" "$staging" "" 1 -- --enforce || return 1
 

@@ -617,4 +617,64 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
     assert.equal(rApproved.status, 0, rApproved.out)
     assert.equal(JSON.parse(rApproved.stdout).approval.valid, true)
   })
+
+  test('initial [a0-bootstrap] rollout passes only when base lacks policy & diff is non-weakening; subsequent commits hard-block', () => {
+    // Create a clean base commit WITHOUT arch/a0-protected-paths.json
+    const bootRepo = mkdtempSync(path.join(tmpdir(), 'a0-bootstrap-repo-'))
+    try {
+      const bWrite = (rel: string, content: string) => {
+        const abs = path.join(bootRepo, rel)
+        mkdirSync(path.dirname(abs), { recursive: true })
+        writeFileSync(abs, content)
+      }
+      const bGit = (...args: string[]) => {
+        const r = spawnSync('git', ['-C', bootRepo, ...args], { encoding: 'utf8' })
+        assert.equal(r.status, 0, `git ${args.join(' ')} failed: ${r.stderr}`)
+        return r.stdout.trim()
+      }
+      bWrite('scripts/check-existing.ts', 'export const x = 1\n')
+      bWrite('.github/CODEOWNERS', '* @dream-star-end\n')
+      bGit('init', '-q', '-b', 'main')
+      bGit('config', 'user.email', 't@t')
+      bGit('config', 'user.name', 't')
+      bGit('add', '-A')
+      bGit('commit', '-qm', 'pre-a0-base')
+      bGit('tag', 'pre-a0')
+
+      // 1. Valid initial introduction of A0 policy + referee + modified existing gate -> bootstrap PASS
+      for (const rel of ['arch/a0-protected-paths.json', 'scripts/check-a0-monotonic.ts', '.github/CODEOWNERS']) {
+        const dst = path.join(bootRepo, rel)
+        mkdirSync(path.dirname(dst), { recursive: true })
+        copyFileSync(path.join(root, rel), dst)
+      }
+      bWrite('scripts/check-existing.ts', 'export const x = 2\n')
+      bGit('add', '-A')
+      bGit('commit', '-qm', 'bootstrap a0')
+      const rBoot = runCheckA0Monotonic({ root: bootRepo, base: 'pre-a0', approvalDir, requireRootOwner: false })
+      assert.equal(rBoot.ok, true)
+      assert.equal(rBoot.bootstrap, true)
+      bGit('tag', 'post-a0')
+
+      // 2. Subsequent commit touching A0 path (now that base has policy) -> 100% HARD-BLOCKED!
+      bWrite('.github/CODEOWNERS', '* @nobody\n')
+      bGit('add', '-A')
+      bGit('commit', '-qm', 'post-bootstrap tamper')
+      const rAfter = runCheckA0Monotonic({ root: bootRepo, base: 'post-a0', approvalDir, requireRootOwner: false })
+      assert.equal(rAfter.ok, false)
+      assert.notEqual(rAfter.bootstrap, true)
+
+      // 3. Disallowed weakening during bootstrap (deleting existing gate) -> FAILS CLOSED!
+      bGit('reset', '--hard', 'pre-a0')
+      mkdirSync(path.join(bootRepo, 'arch'), { recursive: true })
+      copyFileSync(path.join(root, 'arch/a0-protected-paths.json'), path.join(bootRepo, 'arch/a0-protected-paths.json'))
+      rmSync(path.join(bootRepo, 'scripts/check-existing.ts'))
+      bGit('add', '-A')
+      bGit('commit', '-qm', 'bootstrap delete gate')
+      const rWeak = runCheckA0Monotonic({ root: bootRepo, base: 'pre-a0', approvalDir, requireRootOwner: false })
+      assert.equal(rWeak.ok, false)
+      assert.ok((rWeak.bootstrapErrors ?? []).some((e) => e.includes('A0-GATE-DELETED')))
+    } finally {
+      rmSync(bootRepo, { recursive: true, force: true })
+    }
+  })
 })

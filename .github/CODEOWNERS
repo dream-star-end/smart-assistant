@@ -30,11 +30,18 @@ scripts/lib/a0ApprovalReceipt.ts                        @dream-star-end
 
 # === A0-2. Core Monotonic, Ratchet, Architecture & Parity Checkers ===
 scripts/check-monotonic-baselines.ts                    @dream-star-end
+scripts/lib/monotonicExtraBaselines.ts                  @dream-star-end
 scripts/check-file-size-ratchet.ts                      @dream-star-end
 scripts/check-ai-smells-ratchet.ts                      @dream-star-end
 scripts/check-architecture.ts                           @dream-star-end
+scripts/lib/archMapUpgrades.ts                          @dream-star-end
 scripts/check-release-gate-parity.ts                    @dream-star-end
 scripts/check-cross-family-audit.ts                     @dream-star-end
+scripts/lib/archStewardContract.ts                      @dream-star-end
+scripts/lib/archStewardGitDiff.ts                       @dream-star-end
+scripts/lib/archStewardReceipt.ts                       @dream-star-end
+scripts/lib/archStewardTypes.ts                         @dream-star-end
+scripts/lib/modelFamilyClassifier.ts                    @dream-star-end
 scripts/check-debt-ttl.ts                               @dream-star-end
 scripts/check-complexity-ratchet.ts                     @dream-star-end
 scripts/check-clones-ratchet.ts                         @dream-star-end

@@ -82,12 +82,67 @@ export interface DiffEntry {
 
 export interface CheckA0Result {
   ok: boolean
+  bootstrap?: boolean
+  bootstrapErrors?: string[]
   mode: 'base' | 'staged'
   targetSha: string
   changedFiles: number
   a1Passes: A0Finding[]
   a0Blocks: A0Finding[]
   approval?: ApprovalVerification
+}
+
+const REQUIRED_BOOTSTRAP_CATEGORIES = [
+  'a0-meta-referee',
+  'monotonic-baseline-checkers',
+  'ci-workflows-and-gate-manifests',
+  'host-control-plane-and-deploy',
+  'billing-accounting-core',
+  'permission-and-contract-core',
+] as const
+
+const DISALLOWED_BOOTSTRAP_RULES = new Set([
+  'A0-PROTECTED-DELETED',
+  'A0-PROTECTED-RENAMED',
+  'A0-GATE-DELETED',
+  'A0-GATE-RENAMED',
+  'A0-FILESIZE-SLACK-NONZERO',
+  'A0-PIN-DELETED',
+  'A0-PIN-INVALID-JSON',
+  'A0-PIN-SCHEMA-INVALID',
+  'A0-BUDGET-RAISED',
+  'A0-BUDGET-REMOVED',
+  'A0-FLAG-TTL-EXTENDED',
+  'A0-FLAG-MADE-PERMANENT',
+  'A0-EXCEPTION-ADDED',
+  'A0-EXCEPTION-RENEWED',
+  'A0-EXCEPTION-RAISED',
+])
+
+export function validateBootstrapNonWeakening(
+  policy: A0Policy,
+  a0Blocks: readonly A0Finding[],
+): string[] {
+  const errors: string[] = []
+  const byId = new Map(policy.a0Categories.map((c) => [c.id, c]))
+  for (const catId of REQUIRED_BOOTSTRAP_CATEGORIES) {
+    const cat = byId.get(catId)
+    if (!cat || (!cat.paths?.length && !cat.gateGlobs?.length)) {
+      errors.push(`bootstrap policy missing required A0 category "${catId}"`)
+    }
+  }
+  const metaPaths = new Set(byId.get('a0-meta-referee')?.paths ?? [])
+  for (const reqPath of [POLICY_PATH, 'scripts/check-a0-monotonic.ts', '.github/CODEOWNERS']) {
+    if (!metaPaths.has(reqPath)) {
+      errors.push(`bootstrap policy a0-meta-referee must protect "${reqPath}"`)
+    }
+  }
+  for (const blk of a0Blocks) {
+    if (DISALLOWED_BOOTSTRAP_RULES.has(blk.rule)) {
+      errors.push(`bootstrap disallowed weakening rule ${blk.rule} at ${blk.path}: ${blk.detail}`)
+    }
+  }
+  return errors
 }
 
 export function parsePolicy(raw: unknown): A0Policy {
@@ -387,6 +442,35 @@ export function runCheckA0Monotonic(opts: {
     }
   }
 
+  // One-time initial bootstrap: ONLY when base lacks arch/a0-protected-paths.json (first rollout).
+  // Still fail-closed against any self-weakening (hollow policy, deleted gate, non-zero slack,
+  // raised budget/flag/exception). Once arch/a0-protected-paths.json lands on base, this branch
+  // permanently stops triggering and every subsequent A0 edit is 100% hard-blocked without receipt.
+  if (mode === 'base' && basePolicyText === null) {
+    const bootstrapErrors = validateBootstrapNonWeakening(policy, a0Blocks)
+    if (bootstrapErrors.length === 0) {
+      return {
+        ok: true,
+        bootstrap: true,
+        mode,
+        targetSha,
+        changedFiles: diffEntries.length,
+        a1Passes,
+        a0Blocks,
+      }
+    }
+    return {
+      ok: false,
+      bootstrap: false,
+      bootstrapErrors,
+      mode,
+      targetSha,
+      changedFiles: diffEntries.length,
+      a1Passes,
+      a0Blocks,
+    }
+  }
+
   const envDir = process.env[policy.approvalDefaults?.envApprovalDir ?? 'OC_A0_APPROVAL_DIR']
   const hostDir = policy.approvalDefaults?.hostApprovalDir ?? DEFAULT_HOST_APPROVAL_DIR
   const approvalDir = opts.approvalDir ?? (envDir?.trim() ? envDir.trim() : hostDir)
@@ -477,6 +561,19 @@ function main(argv: string[]): number {
 
   for (const pass of result.a1Passes) {
     console.log(`[A1-PASS] ${pass.rule} ${pass.path}: ${pass.detail}`)
+  }
+
+  if (result.bootstrap && result.ok) {
+    console.log(
+      `[a0-bootstrap] base ${base} lacks ${POLICY_PATH}; initial A0 meta-layer rollout validated (non-weakening, ${result.a1Passes.length} A1 auto-pass, ${result.a0Blocks.length} initial A0 path(s)) -> PASS`,
+    )
+    return 0
+  }
+
+  if (result.bootstrapErrors && result.bootstrapErrors.length > 0) {
+    for (const err of result.bootstrapErrors) {
+      console.error(`[GATE-ERROR] A0-BOOTSTRAP-WEAKENED: ${err}`)
+    }
   }
 
   if (result.a0Blocks.length > 0 && result.ok && result.approval?.valid) {

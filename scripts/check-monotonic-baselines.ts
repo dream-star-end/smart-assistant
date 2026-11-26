@@ -1,28 +1,16 @@
 /**
- * Cross-Baseline Monotonic Anti-Tamper Gate (Governance Blueprint §4.2 ⑤ Defense 2).
+ * Cross-Baseline Monotonic Anti-Tamper Gate (Governance Blueprint §4.2 ⑤ Defense 2, OCV5-903).
  *
  * Compares working-tree governance baseline/budget/registry files against `<base>:<path>`
- * (default `--base origin/feat/v5-selfhost`). When a file does not yet exist at `<base>`
- * (initial introduction PR), it validates the JSON schema and PASSES. Once present at `<base>`,
- * it enforces strict monotonicity:
+ * (default `--base origin/feat/v5-selfhost`). Initial introduction validates schema and PASSES;
+ * once present at `<base>`, enforces strict monotonicity (shrink/tighten-only):
+ *   - `packages/web-react/budgets.json`, `design-tokens-counts.json`, `ui-static-baseline.json`,
+ *     `layout-invariants-baseline.json`, `deploy/v5/feature-flags-registry.json`
+ *   - `arch/ai-smells-baseline.json`, `arch/file-cycles-baseline.json`,
+ *     `arch/subdomain-violations-baseline.json`, `arch/complexity-baseline.json`,
+ *     `arch/clones-baseline.json`, `arch/security-sast-baseline.json`
  *
- *   1. `packages/web-react/budgets.json`:
- *        All numeric budgets must stay `<= base` (and existing budget keys cannot be dropped).
- *   2. `packages/web-react/design-tokens-counts.json` &
- *      `packages/web-react/ui-static-baseline.json`:
- *        Every category/file count must stay `<= base` (deleting entries or lowering counts
- *        for debt cleanup is allowed; adding new entries or raising any count is forbidden).
- *   3. `packages/web-react/layout-invariants-baseline.json`:
- *        `{ schemaVersion: 1, counts: { "scene|viewport|theme|ruleId": count } }` —
- *        every count must stay `<= base` and no new baseline keys may be added once present
- *        at `<base>` (debt cleanup by lowering counts or deleting keys is allowed).
- *   4. `deploy/v5/feature-flags-registry.json`:
- *        Existing flags must not extend `expireAt` past `<base>` and must not flip
- *        `permanent: false` -> `permanent: true`.
- *
- * Usage:
- *   npx tsx scripts/check-monotonic-baselines.ts [--root <repo>] [--base <git-ref>]
- *
+ * Usage: npx tsx scripts/check-monotonic-baselines.ts [--root <repo>] [--base <git-ref>]
  * Exit: 0 ok, 1 monotonic/schema violation, 2 git/usage error (fail-closed).
  */
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -30,6 +18,37 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import ts from 'typescript'
+import {
+  AI_SMELLS_BASELINE_PATH,
+  CLONES_BASELINE_PATH,
+  COMPLEXITY_BASELINE_PATH,
+  FILE_CYCLES_BASELINE_PATH,
+  type MonotonicBaselineSpec,
+  SECURITY_SAST_BASELINE_PATH,
+  SUBDOMAIN_VIOLATIONS_BASELINE_PATH,
+  buildExtraMonotonicSpecs,
+  compareAiSmellsMonotonic,
+  compareClonesMonotonic,
+  compareComplexityMonotonic,
+  compareFileCyclesMonotonic,
+  compareSecuritySastMonotonic,
+  compareSubdomainMonotonic,
+} from './lib/monotonicExtraBaselines.js'
+
+export {
+  AI_SMELLS_BASELINE_PATH,
+  CLONES_BASELINE_PATH,
+  COMPLEXITY_BASELINE_PATH,
+  FILE_CYCLES_BASELINE_PATH,
+  SECURITY_SAST_BASELINE_PATH,
+  SUBDOMAIN_VIOLATIONS_BASELINE_PATH,
+  compareAiSmellsMonotonic,
+  compareClonesMonotonic,
+  compareComplexityMonotonic,
+  compareFileCyclesMonotonic,
+  compareSecuritySastMonotonic,
+  compareSubdomainMonotonic,
+}
 
 export const DEFAULT_BASE_REF = 'origin/feat/v5-selfhost'
 
@@ -64,46 +83,20 @@ function parseIsoDateMs(s: unknown): number {
 
 export function validateBudgetsSchema(raw: unknown, file = BUDGETS_PATH): MonotonicViolation[] {
   if (!isPlainObject(raw)) {
-    return [
-      {
-        rule: 'MONOTONIC-SCHEMA-INVALID',
-        file,
-        key: '<root>',
-        baseValue: '-',
-        headValue: typeof raw,
-        detail: `${file} must be a JSON object mapping budget names to non-negative numbers`,
-        howToFix: `Restore valid numeric budget entries in ${file}.`,
-      },
-    ]
+    return [{ rule: 'MONOTONIC-SCHEMA-INVALID', file, key: '<root>', baseValue: '-', headValue: typeof raw, detail: `${file} must be a JSON object mapping budget names to non-negative numbers`, howToFix: `Restore valid numeric budget entries in ${file}.` }]
   }
   const out: MonotonicViolation[] = []
   let numericKeys = 0
   for (const [k, v] of Object.entries(raw)) {
     if (k === 'note' || k === 'schema') continue
     if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
-      out.push({
-        rule: 'MONOTONIC-SCHEMA-INVALID',
-        file,
-        key: k,
-        baseValue: '-',
-        headValue: JSON.stringify(v),
-        detail: `budget ${k} must be a finite non-negative number`,
-        howToFix: `Set ${k} to a valid non-negative number in ${file}.`,
-      })
+      out.push({ rule: 'MONOTONIC-SCHEMA-INVALID', file, key: k, baseValue: '-', headValue: JSON.stringify(v), detail: `budget ${k} must be a finite non-negative number`, howToFix: `Set ${k} to a valid non-negative number in ${file}.` })
     } else {
       numericKeys++
     }
   }
   if (numericKeys === 0) {
-    out.push({
-      rule: 'MONOTONIC-SCHEMA-INVALID',
-      file,
-      key: '<root>',
-      baseValue: '-',
-      headValue: '{}',
-      detail: `${file} must define at least one numeric budget`,
-      howToFix: `Restore numeric budget definitions in ${file}.`,
-    })
+    out.push({ rule: 'MONOTONIC-SCHEMA-INVALID', file, key: '<root>', baseValue: '-', headValue: '{}', detail: `${file} must define at least one numeric budget`, howToFix: `Restore numeric budget definitions in ${file}.` })
   }
   return out
 }
@@ -690,37 +683,13 @@ export function checkMonotonicBaselines(opts: {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
 
-  const specs: Array<{
-    file: string
-    validate: (head: unknown) => MonotonicViolation[]
-    compare: (base: unknown, head: unknown) => MonotonicViolation[]
-  }> = [
-    {
-      file: BUDGETS_PATH,
-      validate: (h) => validateBudgetsSchema(h, BUDGETS_PATH),
-      compare: (b, h) => compareBudgets(b, h, BUDGETS_PATH),
-    },
-    {
-      file: DESIGN_TOKENS_COUNTS_PATH,
-      validate: (h) => validateCountRatchetSchema(h, DESIGN_TOKENS_COUNTS_PATH),
-      compare: (b, h) => compareCountRatchet(b, h, DESIGN_TOKENS_COUNTS_PATH),
-    },
-    {
-      file: UI_STATIC_BASELINE_PATH,
-      validate: (h) => validateCountRatchetSchema(h, UI_STATIC_BASELINE_PATH),
-      compare: (b, h) => compareCountRatchet(b, h, UI_STATIC_BASELINE_PATH),
-    },
-    {
-      file: LAYOUT_INVARIANTS_BASELINE_PATH,
-      validate: (h) => validateLayoutInvariantsBaselineSchema(h, LAYOUT_INVARIANTS_BASELINE_PATH),
-      compare: (b, h) => compareLayoutInvariantsBaseline(b, h, LAYOUT_INVARIANTS_BASELINE_PATH),
-    },
-    {
-      file: FEATURE_FLAGS_REGISTRY_PATH,
-      validate: (h) => validateFeatureFlagsSchema(h, FEATURE_FLAGS_REGISTRY_PATH),
-      compare: (b, h) =>
-        compareFeatureFlagsRegistry(b, h, FEATURE_FLAGS_REGISTRY_PATH, { root: opts.root }),
-    },
+  const specs: MonotonicBaselineSpec[] = [
+    { file: BUDGETS_PATH, validate: (h) => validateBudgetsSchema(h, BUDGETS_PATH), compare: (b, h) => compareBudgets(b, h, BUDGETS_PATH) },
+    { file: DESIGN_TOKENS_COUNTS_PATH, validate: (h) => validateCountRatchetSchema(h, DESIGN_TOKENS_COUNTS_PATH), compare: (b, h) => compareCountRatchet(b, h, DESIGN_TOKENS_COUNTS_PATH) },
+    { file: UI_STATIC_BASELINE_PATH, validate: (h) => validateCountRatchetSchema(h, UI_STATIC_BASELINE_PATH), compare: (b, h) => compareCountRatchet(b, h, UI_STATIC_BASELINE_PATH) },
+    { file: LAYOUT_INVARIANTS_BASELINE_PATH, validate: (h) => validateLayoutInvariantsBaselineSchema(h, LAYOUT_INVARIANTS_BASELINE_PATH), compare: (b, h) => compareLayoutInvariantsBaseline(b, h, LAYOUT_INVARIANTS_BASELINE_PATH) },
+    { file: FEATURE_FLAGS_REGISTRY_PATH, validate: (h) => validateFeatureFlagsSchema(h, FEATURE_FLAGS_REGISTRY_PATH), compare: (b, h) => compareFeatureFlagsRegistry(b, h, FEATURE_FLAGS_REGISTRY_PATH, { root: opts.root }) },
+    ...buildExtraMonotonicSpecs(compareCountRatchet),
   ]
 
   const results: CheckedFileStatus[] = []

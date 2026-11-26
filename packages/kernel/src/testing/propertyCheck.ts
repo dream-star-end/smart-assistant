@@ -342,6 +342,7 @@ export function oneof<const T extends readonly WeightedArbitrary<any>[]>(
           }
         } catch {
           // Variant arbitrary did not match this runtime value; skip safely.
+          continue
         }
       }
     },
@@ -445,13 +446,17 @@ export function tuple<T extends readonly unknown[]>(
   ...arbs: { [K in keyof T]: Arbitrary<T[K]> }
 ): Arbitrary<T> {
   return createArbitrary(
-    (rng) => arbs.map((arb) => arb.generate(rng)) as unknown as T,
+    (rng) => {
+      const generated: readonly unknown[] = arbs.map((arb) => arb.generate(rng))
+      return generated as T
+    },
     function* (value) {
       for (let i = 0; i < arbs.length; i += 1) {
         for (const shrunk of arbs[i]!.shrink(value[i])) {
-          const copy = value.slice() as unknown[]
+          const copy: unknown[] = value.slice()
           copy[i] = shrunk
-          yield copy as unknown as T
+          const next: readonly unknown[] = copy
+          yield next as T
         }
       }
     },
