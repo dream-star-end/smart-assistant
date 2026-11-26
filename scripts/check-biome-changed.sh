@@ -21,19 +21,34 @@
 # Exit: 0 no new errors / 1 new errors (listed) / 2 usage or environment problem.
 set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
-BIOME="$ROOT/node_modules/.bin/biome"
-[[ -x "$BIOME" ]] || { echo "✗ biome not installed ($BIOME)" >&2; exit 2; }
+SCRIPT_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$SCRIPT_REPO_ROOT"
+BIOME=""
 
 base=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --base) base="${2:-}"; shift 2 ;;
+    --root) ROOT="${2:-}"; shift 2 ;;
+    --root=*) ROOT="${1#--root=}"; shift ;;
+    --biome-bin) BIOME="${2:-}"; shift 2 ;;
+    --biome-bin=*) BIOME="${1#--biome-bin=}"; shift ;;
     -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+[[ -n "$ROOT" && -d "$ROOT" ]] || { echo "✗ invalid --root ($ROOT)" >&2; exit 2; }
+ROOT="$(cd "$ROOT" && pwd)"
+if [[ -z "$BIOME" ]]; then
+  if [[ -x "$SCRIPT_REPO_ROOT/node_modules/.bin/biome" ]]; then
+    BIOME="$SCRIPT_REPO_ROOT/node_modules/.bin/biome"
+  else
+    BIOME="$ROOT/node_modules/.bin/biome"
+  fi
+fi
+[[ -x "$BIOME" ]] || { echo "✗ biome not installed ($BIOME)" >&2; exit 2; }
+cd "$ROOT"
 
 if [[ -z "$base" && -n "${GITHUB_BASE_REF:-}" ]]; then base="origin/$GITHUB_BASE_REF"; fi
 if [[ -z "$base" ]]; then

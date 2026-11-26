@@ -1,40 +1,57 @@
 /**
- * OCV5-904: Host Pinned Referee, Pre-Dispatch CI Green Gate, Trailer Escape Removal,
- * Declarative Runtime Image Pin, Host Governor Mode Gate, Post-Cutover Retention
- * Auto-Rollback + Breaker Trip, 45s Train Debounce, and Planned Auto Fast-Forward.
+ * OCV5-903 / OCV5-904: Comprehensive Real State-Machine & Isolation Test Suite for:
+ *   - B1: Safe first-rollout & host root-staged audited transition referee (3-step E2E)
+ *   - B4: Complete external referee execution chain isolation & zero-missed-file candidate scanning
+ *   - B5: 45s debounce, 3-state CI classification (queued -> in_progress -> success / failed),
+ *         trusted CI events (reject workflow_dispatch), and safe FF CAS (changes() == 1)
+ *   - B6: Post-cutover retention gate BEFORE committed (legacy & user-impact-only policy paths),
+ *         mid-retention worker tick non-settlement, verified rollback -> failed, rollback failure -> recovery_required
+ *   - B7 (+ Non-blocker 2): Shared forward cutover guard boundary (cmd_deploy & standalone cmd_cutover),
+ *         physical oc-governor check-blast-radius, trusted 3-workflow CI green, trailer escape removal
+ *   - B8: Commit-bound runtime image pin (immune to dirty worktree corruption) & rollback isolation
  */
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { createHash, createHmac } from 'node:crypto'
 import {
   chmodSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const GOV_LIB = join(REPO_ROOT, 'scripts/lib/v5-selfhost-governance-gates.sh')
 const TRAIN_GUARDS_LIB = join(REPO_ROOT, 'scripts/lib/v5-selfhost-train-guards.sh')
+const RELEASE_POLICY_LIB = join(REPO_ROOT, 'scripts/lib/v5-selfhost-release-policy.sh')
+const RELEASE_POLICY_PY = join(REPO_ROOT, 'scripts/lib/v5-release-policy.py')
+const PREPARE_LIB = join(REPO_ROOT, 'scripts/lib/v5-selfhost-prepare.sh')
+const ROLLBACK_LIB = join(REPO_ROOT, 'scripts/lib/v5-selfhost-rollback.sh')
 const DEPLOY_SCRIPT = join(REPO_ROOT, 'scripts/deploy-v5-selfhost.sh')
 const MASTER_LIB = join(REPO_ROOT, 'scripts/v5-selfhost-master-release-lib.sh')
+const SURVIVOR_SCRIPT = join(REPO_ROOT, 'scripts/v5-selfhost-cutover-survivor.sh')
 const LEASE_WORKER = join(REPO_ROOT, 'scripts/v5-lease-worker.sh')
 const LEASE_CLI = join(REPO_ROOT, 'scripts/oc-lease.sh')
 const LEASE_LIB = join(REPO_ROOT, 'scripts/v5-lease-lib.sh')
 const DEBOUNCE_LIB = join(REPO_ROOT, 'scripts/lib/v5-lease-train-debounce.sh')
+const OC_GOVERNOR = join(REPO_ROOT, 'scripts/harness-gate/oc-governor.sh')
 
 const q = (s: string) => `'${s.replaceAll("'", "'\\''")}'`
 
-function makeSandbox(t: { after: (fn: () => void) => void }, prefix = 'ocv5-904-') {
+function makeSandbox(t: { after: (fn: () => void) => void }, prefix = 'ocv5-903-') {
   const dir = mkdtempSync(join(tmpdir(), prefix))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const env: NodeJS.ProcessEnv = {
@@ -48,13 +65,13 @@ function makeSandbox(t: { after: (fn: () => void) => void }, prefix = 'ocv5-904-
   return { dir, env }
 }
 
-function makeTempGitRepo(t: { after: (fn: () => void) => void }) {
-  const sb = makeSandbox(t, 'ocv5-904-git-')
+function makeTempGitRepo(t: { after: (fn: () => void) => void }, branch = 'feat/v5-selfhost') {
+  const sb = makeSandbox(t, 'ocv5-903-git-')
   const repo = join(sb.dir, 'repo')
   mkdirSync(repo, { recursive: true })
   const git = (...args: string[]) =>
     execFileSync('git', ['-C', repo, ...args], { env: sb.env, encoding: 'utf8' }).trim()
-  git('init', '-q', '-b', 'feat/v5-selfhost')
+  git('init', '-q', '-b', branch)
   git('config', 'user.name', 'referee-test')
   git('config', 'user.email', 'referee-test@example.invalid')
   return { ...sb, repo, git }
@@ -131,7 +148,115 @@ function seedGovStubs(root: string, markerLogPath?: string) {
   chmodSync(biome, 0o755)
 }
 
-function exportArchive(repo: string, sha: string, staging: string, env: NodeJS.ProcessEnv) {
+function writeRefereeManifest(
+  refDir: string,
+  extraMeta: Record<string, unknown> = {},
+): Record<string, string> {
+  const files: Record<string, string> = {}
+  const walk = (dir: string) => {
+    for (const ent of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = join(dir, ent.name)
+      const rel = relative(refDir, full).replaceAll('\\', '/')
+      if (rel === 'MANIFEST.json' || rel === 'node_modules') continue
+      if (ent.isDirectory()) walk(full)
+      else if (ent.isFile()) {
+        files[rel] = createHash('sha256').update(readFileSync(full)).digest('hex')
+      }
+    }
+  }
+  walk(refDir)
+  writeFileSync(
+    join(refDir, 'MANIFEST.json'),
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        fileCount: Object.keys(files).length,
+        files,
+        ...extraMeta,
+      },
+      null,
+      2,
+    )}\n`,
+  )
+  chmodSync(join(refDir, 'MANIFEST.json'), 0o444)
+  return files
+}
+
+function writeA0ApprovalReceipt(opts: {
+  approvalFile: string
+  sha: string
+  reason: string
+  issuedAt?: string
+  expiresAt?: string
+  allowedPaths?: string[]
+  hmacKey?: string
+}): string {
+  mkdirSync(dirname(opts.approvalFile), { recursive: true })
+  const issuedAt = opts.issuedAt ?? new Date(Date.now() - 60_000).toISOString().replace(/\.\d+Z$/, 'Z')
+  const expiresAt = opts.expiresAt ?? new Date(Date.now() + 3_600_000).toISOString().replace(/\.\d+Z$/, 'Z')
+  const apStr = opts.allowedPaths
+    ? JSON.stringify([...new Set(opts.allowedPaths.map((p) => p.trim()))].sort())
+    : '*'
+  const canonical =
+    `a0-approval-v1\nsha=${opts.sha}\nissuedAt=${issuedAt}\nexpiresAt=${expiresAt}\nreason=${opts.reason.trim()}\nallowedPaths=${apStr}\n`
+  const sha256 = createHash('sha256').update(canonical, 'utf8').digest('hex')
+  const doc: Record<string, unknown> = {
+    schemaVersion: 1,
+    sha: opts.sha,
+    reason: opts.reason,
+    approvedBy: 'root-test',
+    issuedAt,
+    expiresAt,
+    sha256,
+  }
+  if (opts.allowedPaths) doc.allowedPaths = opts.allowedPaths
+  if (opts.hmacKey) {
+    doc.hmacSha256 = createHmac('sha256', opts.hmacKey).update(canonical, 'utf8').digest('hex')
+  }
+  const raw = `${JSON.stringify(doc, null, 2)}\n`
+  writeFileSync(opts.approvalFile, raw)
+  chmodSync(opts.approvalFile, 0o644)
+  return createHash('sha256').update(raw, 'utf8').digest('hex')
+}
+
+function stageAuditedTransitionReferee(opts: {
+  refDir: string
+  targetSha: string
+  approvalFile: string
+  approvalSha256: string
+}) {
+  const transitionPath = join(opts.refDir, 'TRANSITION_APPROVAL.json')
+  writeFileSync(
+    transitionPath,
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        mode: 'transition-audited',
+        targetSha: opts.targetSha,
+        stagedAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+        stagedBy: 'root-test',
+        approvalFile: opts.approvalFile,
+        approvalSha256: opts.approvalSha256,
+      },
+      null,
+      2,
+    )}\n`,
+  )
+  chmodSync(transitionPath, 0o444)
+  writeRefereeManifest(opts.refDir, {
+    mode: 'transition-audited',
+    targetSha: opts.targetSha,
+    sourceCommit: opts.targetSha,
+  })
+}
+
+function exportArchive(
+  repo: string,
+  sha: string,
+  staging: string,
+  env: NodeJS.ProcessEnv,
+  linkNodeModules = true,
+) {
   rmSync(staging, { recursive: true, force: true })
   mkdirSync(staging, { recursive: true })
   const r = spawnSync(
@@ -140,545 +265,460 @@ function exportArchive(repo: string, sha: string, staging: string, env: NodeJS.P
     { env, encoding: 'utf8' },
   )
   assert.equal(r.status, 0, r.stderr)
-  symlinkSync(join(REPO_ROOT, 'node_modules'), join(staging, 'node_modules'))
+  if (linkNodeModules) {
+    symlinkSync(join(REPO_ROOT, 'node_modules'), join(staging, 'node_modules'))
+  }
 }
 
-describe('1. Host Pinned Referee physical isolation & first-roll bootstrap (OCV5-904)', () => {
-  test('prefers external REFEREE_ROOT over staging/live and blocks forged staging script', (t) => {
+function extractBashFn(src: string, name: string): string {
+  const m = src.match(new RegExp(`^${name}\\(\\) \\{[^\\n]*\\n[\\s\\S]*?^\\}`, 'm'))
+  assert.ok(m, `missing bash function ${name}`)
+  return m[0]
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// B1: 3-Step E2E Acceptance — Old Referee Rejects -> Audited Transition Referee
+//     (exact SHA only, bad baseline still red) -> Permanent New Referee
+// ═════════════════════════════════════════════════════════════════════════════
+describe('B1. Safe first-rollout & host-staged audited transition referee (3-step E2E)', () => {
+  test('Step 1 old referee blocks unauthorized schema upgrade -> Step 2 audited transition referee passes exact SHA only & blocks tampered baseline -> Step 3 permanent new referee blocks bad baseline', (t) => {
     const f = makeTempGitRepo(t)
     const staging = join(f.dir, 'staging')
     const gateTmp = join(f.dir, 'gate-tmp')
-    const extRef = join(f.dir, 'ext-referee')
-    const liveRel = join(f.dir, 'rel-live')
-    const liveLink = join(f.dir, 'live')
-    const invokedLog = join(f.dir, 'referee-invoked.log')
+    const ctrlDir = join(f.dir, 'governor/control')
+    const approvalsDir = join(ctrlDir, 'a0-approvals')
+    const refDir = join(f.dir, 'referee')
+    const noLive = join(f.dir, 'no-live')
     mkdirSync(gateTmp, { recursive: true })
-    mkdirSync(extRef, { recursive: true })
-    mkdirSync(liveRel, { recursive: true })
+    mkdirSync(approvalsDir, { recursive: true })
+    mkdirSync(refDir, { recursive: true })
 
-    // Candidate repo: forge check-docs-links.ts to always pass (exit 0)
+    // Create 0600 HMAC key next to approvalsDir (<dirname(approvalDir)>/.hmac-key)
+    const hmacKey = 'test-root-hmac-secret-key-0123456789abcdef'
+    const hmacKeyFile = join(ctrlDir, '.hmac-key')
+    writeFileSync(hmacKeyFile, `${hmacKey}\n`)
+    chmodSync(hmacKeyFile, 0o600)
+
+    // Schema validator script simulating base v1 referee vs upgraded v2 referee:
+    // - v1 referee: ONLY accepts schemaVersion===1 and maxBudget<=500
+    // - v2 referee: accepts schemaVersion===2 AND still strictly enforces maxBudget<=500
+    const v1CheckerSrc = `
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+const rootIdx = process.argv.indexOf('--root')
+const root = rootIdx >= 0 ? process.argv[rootIdx + 1]! : process.cwd()
+const doc = JSON.parse(readFileSync(join(root, 'arch/schema-budget.json'), 'utf8'))
+if (doc.schemaVersion !== 1) {
+  console.error('OLD-REFEREE-V1-REJECTED-SCHEMA:' + doc.schemaVersion)
+  process.exit(1)
+}
+if (doc.maxBudget > 500) {
+  console.error('BUDGET-EXCEEDED:' + doc.maxBudget)
+  process.exit(1)
+}
+process.exit(0)
+`
+    const v2CheckerSrc = `
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+const rootIdx = process.argv.indexOf('--root')
+const root = rootIdx >= 0 ? process.argv[rootIdx + 1]! : process.cwd()
+const doc = JSON.parse(readFileSync(join(root, 'arch/schema-budget.json'), 'utf8'))
+if (doc.schemaVersion !== 2) {
+  console.error('NEW-REFEREE-V2-REJECTED-SCHEMA:' + doc.schemaVersion)
+  process.exit(1)
+}
+if (doc.maxBudget > 500) {
+  console.error('NEW-REFEREE-V2-BAD-BASELINE-RED:' + doc.maxBudget)
+  process.exit(1)
+}
+process.exit(0)
+`
+
+    // Base commit (schema v1)
     seedGovStubs(f.repo)
+    mkdirSync(join(f.repo, 'arch'), { recursive: true })
     writeFileSync(join(f.repo, 'changelog.json'), '[]\n')
+    writeFileSync(join(f.repo, 'scripts/check-monotonic-baselines.ts'), v1CheckerSrc)
+    writeFileSync(join(f.repo, 'arch/schema-budget.json'), JSON.stringify({ schemaVersion: 1, maxBudget: 500 }))
     f.git('add', '.')
-    f.git('commit', '-qm', 'chore(v5): base')
+    f.git('commit', '-qm', 'chore(v5): base schema v1')
     const baseSha = f.git('rev-parse', 'HEAD')
 
-    writeFileSync(join(f.repo, 'README.md'), 'updated\n')
-    writeFileSync(join(f.repo, 'scripts/check-docs-links.ts'), 'console.log("FAKE-STAGING-PASSED"); process.exit(0)\n')
+    // Candidate commit: upgrades schema to v2 AND updates its own staging script to v2
+    writeFileSync(join(f.repo, 'scripts/check-monotonic-baselines.ts'), v2CheckerSrc)
+    writeFileSync(join(f.repo, 'arch/schema-budget.json'), JSON.stringify({ schemaVersion: 2, maxBudget: 480 }))
     f.git('add', '.')
-    f.git('commit', '-qm', 'feat(v5): candidate tries to tamper gate')
-    const headSha = f.git('rev-parse', 'HEAD')
-    exportArchive(f.repo, headSha, staging, f.env)
+    f.git('commit', '-qm', 'feat(v5): upgrade baseline schema v1 -> v2')
+    const upgradeSha = f.git('rev-parse', 'HEAD')
 
-    // Verified live release has benign stubs, while external referee has strict check that catches violation
-    seedGovStubs(liveRel)
-    writeFileSync(join(liveRel, '.complete'), JSON.stringify({ sourceCommit: baseSha }))
-    symlinkSync(liveRel, liveLink)
-
-    seedGovStubs(extRef, invokedLog)
-    writeFileSync(
-      join(extRef, 'scripts/check-docs-links.ts'),
-      'console.error("REFEREE-CAUGHT-STAGING-TAMPER"); process.exit(1)\n',
-    )
-
-    const res = runBash(
-      [
-        'mlog() { echo "$*" >&2; }',
-        'tsum_note() { :; }',
-        `source ${q(GOV_LIB)}`,
-        `REPO_ROOT=${q(f.repo)}`,
-        `MASTER_LIVE_LINK=${q(liveLink)}`,
-        `OC_V5_REFEREE_ROOT=${q(extRef)}`,
-        `MASTER_GATE_TMPDIR=${q(gateTmp)}`,
-        `OC_V5_GOVERNANCE_BASE_REF=${q(baseSha)}`,
-        `master_run_governance_fast_gates ${q(staging)} ${q(headSha)}`,
-      ].join('\n'),
-      f.env,
-    )
-    assert.notEqual(res.status, 0, 'referee must override forged staging script and reject')
-    assert.match(res.stderr, /REFEREE-CAUGHT-STAGING-TAMPER/)
-    assert.doesNotMatch(res.stdout + res.stderr, /FAKE-STAGING-PASSED/)
-
-    // Now make external referee pass and verify all newly wired flags + first-roll bootstrap of new gates
-    writeFileSync(
-      join(extRef, 'scripts/check-docs-links.ts'),
-      `import { appendFileSync } from 'node:fs'\nappendFileSync(${JSON.stringify(invokedLog)}, 'referee:check-docs-links ' + process.argv.slice(2).join(' ') + '\\n')\nprocess.exit(0)\n`,
-    )
-    // Add NEW gates ONLY in candidate staging (not in extRef) -> must bootstrap with [referee-bootstrap]
-    writeFileSync(
-      join(f.repo, 'scripts/check-a0-monotonic.ts'),
-      `import { appendFileSync } from 'node:fs'\nappendFileSync(${JSON.stringify(invokedLog)}, 'bootstrap:check-a0-monotonic ' + process.argv.slice(2).join(' ') + '\\n')\nprocess.exit(0)\n`,
-    )
-    writeFileSync(
-      join(f.repo, 'scripts/check-ai-smells-ratchet.ts'),
-      `import { appendFileSync } from 'node:fs'\nappendFileSync(${JSON.stringify(invokedLog)}, 'bootstrap:check-ai-smells ' + process.argv.slice(2).join(' ') + '\\n')\nprocess.exit(0)\n`,
-    )
-    writeFileSync(
-      join(f.repo, 'scripts/check-complexity-ratchet.ts'),
-      `import { appendFileSync } from 'node:fs'\nappendFileSync(${JSON.stringify(invokedLog)}, 'bootstrap:check-complexity ' + process.argv.slice(2).join(' ') + '\\n')\nprocess.exit(0)\n`,
-    )
-    writeFileSync(
-      join(f.repo, 'scripts/check-clones-ratchet.ts'),
-      `import { appendFileSync } from 'node:fs'\nappendFileSync(${JSON.stringify(invokedLog)}, 'bootstrap:check-clones ' + process.argv.slice(2).join(' ') + '\\n')\nprocess.exit(0)\n`,
-    )
-    writeFileSync(
-      join(f.repo, 'scripts/check-cross-family-audit.ts'),
-      `// supports --enforce-commit\nimport { appendFileSync } from 'node:fs'\nappendFileSync(${JSON.stringify(invokedLog)}, 'bootstrap:check-cross-family ' + process.argv.slice(2).join(' ') + '\\n')\nprocess.exit(0)\n`,
-    )
-    writeFileSync(
-      join(f.repo, 'scripts/check-debt-ttl.ts'),
-      `import { appendFileSync } from 'node:fs'\nappendFileSync(${JSON.stringify(invokedLog)}, 'bootstrap:check-debt-ttl ' + process.argv.slice(2).join(' ') + '\\n')\nprocess.exit(0)\n`,
-    )
+    // Another commit (bad baseline on schema v2, budget raised to 999)
+    writeFileSync(join(f.repo, 'arch/schema-budget.json'), JSON.stringify({ schemaVersion: 2, maxBudget: 999 }))
     f.git('add', '.')
-    f.git('commit', '-qm', 'feat(v5): introduce new gates on first roll')
-    const rollSha = f.git('rev-parse', 'HEAD')
-    exportArchive(f.repo, rollSha, staging, f.env)
-    rmSync(invokedLog, { force: true })
+    f.git('commit', '-qm', 'feat(v5): tamper bad baseline on v2')
+    const badBaselineSha = f.git('rev-parse', 'HEAD')
 
-    const res2 = runBash(
-      [
-        'mlog() { echo "$*" >&2; }',
-        'tsum_note() { :; }',
-        `source ${q(GOV_LIB)}`,
-        `REPO_ROOT=${q(f.repo)}`,
-        `MASTER_LIVE_LINK=${q(liveLink)}`,
-        `OC_V5_REFEREE_ROOT=${q(extRef)}`,
-        `MASTER_GATE_TMPDIR=${q(gateTmp)}`,
-        `OC_V5_GOVERNANCE_BASE_REF=${q(baseSha)}`,
-        `master_run_governance_fast_gates ${q(staging)} ${q(rollSha)}`,
-      ].join('\n'),
-      f.env,
-    )
-    assert.equal(res2.status, 0, res2.stderr)
-    const logText = readFileSync(invokedLog, 'utf8')
-    assert.match(logText, /referee:check-docs-links --root/)
-    assert.match(logText, /scripts\/check-feature-flags-ttl\.ts .*--fail-on-expired/)
-    assert.match(logText, /scripts\/check-context-static\.ts --skip-sub-evals/)
-    assert.match(logText, /scripts\/check-file-size-ratchet\.ts --base .* --head /)
-    assert.match(logText, /scripts\/check-gate-couplings\.ts --root .* --check/)
-    assert.match(logText, /scripts\/check-biome-changed\.sh --base /)
-    assert.match(logText, /bootstrap:check-a0-monotonic --base /)
-    assert.match(logText, /bootstrap:check-ai-smells --enforce/)
-    assert.match(logText, /bootstrap:check-complexity --enforce/)
-    assert.match(logText, /bootstrap:check-clones --enforce/)
-    assert.match(logText, /bootstrap:check-cross-family --enforce-commit --root .* --base .* --head /)
-    assert.match(logText, /bootstrap:check-debt-ttl --enforce/)
-    assert.match(res2.stderr, /\[referee-bootstrap\] scripts\/check-a0-monotonic\.ts/)
-    assert.match(res2.stderr, /\[referee-bootstrap\] scripts\/check-ai-smells-ratchet\.ts/)
+    // Clean follow-up commit on v2 (after upgradeSha)
+    f.git('checkout', '-q', upgradeSha)
+    writeFileSync(join(f.repo, 'arch/schema-budget.json'), JSON.stringify({ schemaVersion: 2, maxBudget: 450 }))
+    f.git('add', '.')
+    f.git('commit', '-qm', 'refactor(v5): shrink v2 budget further')
+    const cleanFollowupSha = f.git('rev-parse', 'HEAD')
 
-    // Once check-a0-monotonic.ts is synced into extRef, candidate staging tamper is physically ignored
-    writeFileSync(
-      join(extRef, 'scripts/check-a0-monotonic.ts'),
-      'console.error("REFEREE-A0-REJECTED-SELF-LOOSEN"); process.exit(1)\n',
-    )
-    const res3 = runBash(
-      [
-        'mlog() { echo "$*" >&2; }',
-        'tsum_note() { :; }',
-        `source ${q(GOV_LIB)}`,
-        `REPO_ROOT=${q(f.repo)}`,
-        `MASTER_LIVE_LINK=${q(liveLink)}`,
-        `OC_V5_REFEREE_ROOT=${q(extRef)}`,
-        `MASTER_GATE_TMPDIR=${q(gateTmp)}`,
-        `OC_V5_GOVERNANCE_BASE_REF=${q(baseSha)}`,
-        `master_run_governance_fast_gates ${q(staging)} ${q(rollSha)}`,
-      ].join('\n'),
-      f.env,
-    )
-    assert.notEqual(res3.status, 0, 'once present in referee, check-a0-monotonic must execute referee copy')
-    assert.match(res3.stderr, /REFEREE-A0-REJECTED-SELF-LOOSEN/)
-  })
-
-  test('master_referee_prepare_exec_root isolates check-architecture.ts against forged staging', (t) => {
-    const sb = makeSandbox(t, 'ocv5-904-archref-')
-    const staging = join(sb.dir, 'staging')
-    const extRef = join(sb.dir, 'referee')
-    const gateTmp = join(sb.dir, 'gate-tmp')
-    mkdirSync(join(staging, 'scripts'), { recursive: true })
-    mkdirSync(join(extRef, 'scripts'), { recursive: true })
-    mkdirSync(gateTmp, { recursive: true })
-    symlinkSync(join(REPO_ROOT, 'node_modules'), join(staging, 'node_modules'))
-
-    writeFileSync(join(staging, 'scripts/check-architecture.ts'), 'console.log("STAGING-FAKE-ARCH"); process.exit(0)\n')
-    writeFileSync(join(extRef, 'scripts/check-architecture.ts'), 'console.error("REFEREE-REAL-ARCH-FAIL"); process.exit(1)\n')
-
-    const res = runBash(
-      [
-        'mlog() { echo "$*" >&2; }',
-        `source ${q(GOV_LIB)}`,
-        `OC_V5_REFEREE_ROOT=${q(extRef)}`,
-        `MASTER_LIVE_LINK=${q(join(sb.dir, 'no-live'))}`,
-        `MASTER_GATE_TMPDIR=${q(gateTmp)}`,
-        `exec_root="$(master_referee_prepare_exec_root ${q(staging)} scripts/check-architecture.ts)"`,
-        `cd "$exec_root" && node "$exec_root/node_modules/tsx/dist/cli.mjs" scripts/check-architecture.ts --root ${q(staging)}`,
-      ].join('\n'),
-      sb.env,
-    )
-    assert.notEqual(res.status, 0)
-    assert.match(res.stderr, /REFEREE-REAL-ARCH-FAIL/)
-    assert.doesNotMatch(res.stdout, /STAGING-FAKE-ARCH/)
-  })
-})
-
-describe('2. Declarative Runtime Image Pin & Pre-Dispatch CI Green + Trailer Escape Removal', () => {
-  test('loads runtimeImage from deploy/v5/runtime-image-pin.json, falls back when absent, fails closed when corrupt', (t) => {
-    const sb = makeSandbox(t, 'ocv5-904-pin-')
-    const pinFile = join(sb.dir, 'runtime-image-pin.json')
-
-    // Absent file -> fallback default
-    let res = runBash(
-      `source ${q(TRAIN_GUARDS_LIB)}; OC_V5_RUNTIME_IMAGE_PIN_FILE=${q(pinFile)}; v5_selfhost_load_runtime_image_pin; printf '%s|%s\n' "$RUNTIME_IMAGE" "$RUNTIME_IMAGE_PIN_SOURCE"`,
-      sb.env,
-    )
-    assert.equal(res.status, 0, res.stderr)
-    assert.match(res.stdout, /^openclaude\/openclaude-runtime:.*\|fallback-default/)
-
-    // Valid pin JSON -> loads exact runtimeImage + previous + cliVersions
-    writeFileSync(
-      pinFile,
-      JSON.stringify({
-        schemaVersion: 1,
-        channel: 'v5-selfhost',
-        runtimeImage: 'openclaude/openclaude-runtime:v5-test-pin-20261126',
-        previousRuntimeImage: 'openclaude/openclaude-runtime:v5-prev-pin',
-        cliVersions: { claudeCode: '2.1.332', codex: '0.172.0' },
-      }),
-    )
-    res = runBash(
-      `source ${q(TRAIN_GUARDS_LIB)}; OC_V5_RUNTIME_IMAGE_PIN_FILE=${q(pinFile)}; v5_selfhost_load_runtime_image_pin; printf '%s|%s|%s\n' "$RUNTIME_IMAGE" "$RUNTIME_IMAGE_PIN_PREVIOUS" "$RUNTIME_IMAGE_PIN_CLI_VERSIONS"`,
-      sb.env,
-    )
-    assert.equal(res.status, 0, res.stderr)
-    assert.equal(
-      res.stdout.trim(),
-      'openclaude/openclaude-runtime:v5-test-pin-20261126|openclaude/openclaude-runtime:v5-prev-pin|{"claudeCode":"2.1.332","codex":"0.172.0"}',
-    )
-
-    // Corrupt pin JSON -> fail-closed
-    writeFileSync(pinFile, '{"schemaVersion": 99, "runtimeImage": ""}\n')
-    res = runBash(
-      `source ${q(TRAIN_GUARDS_LIB)}; OC_V5_RUNTIME_IMAGE_PIN_FILE=${q(pinFile)}; v5_selfhost_load_runtime_image_pin`,
-      sb.env,
-    )
-    assert.notEqual(res.status, 0, 'corrupt pin file must fail closed')
-  })
-
-  test('v5_selfhost_verify_ci_green enforces completed/success, blocks red/missing/env-bypass, allows --rollback & root break-glass', (t) => {
-    const sb = makeSandbox(t, 'ocv5-904-ci-')
-    const ctrl = join(sb.dir, 'control')
-    const bin = join(sb.dir, 'bin')
-    mkdirSync(ctrl, { recursive: true })
-    mkdirSync(bin, { recursive: true })
-    const sha = 'a'.repeat(40)
-    const ghStub = join(bin, 'gh')
-    const respFile = join(sb.dir, 'gh-resp.json')
-    writeFileSync(ghStub, `#!/usr/bin/env bash\ncat ${q(respFile)}\n`)
-    chmodSync(ghStub, 0o755)
-
-    const runCi = (extra = '') =>
-      runBash(
+    const runGates = (sha: string, extraEnv: Record<string, string> = {}) => {
+      exportArchive(f.repo, sha, staging, f.env, false)
+      return runBash(
         [
-          `source ${q(TRAIN_GUARDS_LIB)}`,
-          `REPO_ROOT=${q(REPO_ROOT)}`,
-          `OC_V5_GH_BIN=${q(ghStub)}`,
-          'OC_V5_GH_REPO=dream-star-end/smart-assistant',
-          `OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
-          extra,
-          `v5_selfhost_verify_ci_green ${q(sha)}`,
-        ].join('\n'),
-        sb.env,
-      )
-
-    // 1) All required workflows completed/success -> PASS
-    writeFileSync(
-      respFile,
-      JSON.stringify({
-        workflow_runs: [
-          { id: 1, name: 'V5 selfhost gates', head_sha: sha, status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
-          { id: 2, name: 'V5 selfhost release gates', head_sha: sha, status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:01:00Z' },
-        ],
-      }),
-    )
-    let r = runCi()
-    assert.equal(r.status, 0, r.stderr + r.stdout)
-
-    // 2) Latest run of required workflow failed -> FAIL
-    writeFileSync(
-      respFile,
-      JSON.stringify({
-        workflow_runs: [
-          { id: 1, name: 'V5 selfhost gates', head_sha: sha, status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
-          { id: 3, name: 'V5 selfhost gates', head_sha: sha, status: 'completed', conclusion: 'failure', created_at: '2026-11-26T10:05:00Z' },
-          { id: 2, name: 'V5 selfhost release gates', head_sha: sha, status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:01:00Z' },
-        ],
-      }),
-    )
-    r = runCi()
-    assert.notEqual(r.status, 0, 'failed workflow must reject dispatch')
-    assert.match(r.stderr + r.stdout, /V5 selfhost gates: status=completed conclusion=failure/)
-
-    // 3) Missing workflow -> FAIL
-    writeFileSync(
-      respFile,
-      JSON.stringify({
-        workflow_runs: [
-          { id: 1, name: 'V5 selfhost gates', head_sha: sha, status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
-        ],
-      }),
-    )
-    r = runCi()
-    assert.notEqual(r.status, 0, 'missing required workflow must reject dispatch')
-    assert.match(r.stderr + r.stdout, /V5 selfhost release gates: missing/)
-
-    // 4) Env var OC_V5_SKIP_CI_GATE=1 MUST be rejected!
-    r = runCi('OC_V5_SKIP_CI_GATE=1')
-    assert.notEqual(r.status, 0, 'env bypass must fail closed')
-
-    // 5) --rollback mode (CUTOVER_ROLLBACK=1) exempts CI check
-    r = runCi('CUTOVER_ROLLBACK=1')
-    assert.equal(r.status, 0, r.stderr)
-    assert.match(r.stdout, /--rollback 模式豁免/)
-
-    // 6) Host break-glass file bound to exact SHA exempts (empty or wrong SHA rejected)
-    const wrongBg = join(ctrl, `ci-breakglass-${'b'.repeat(40)}`)
-    writeFileSync(wrongBg, 'wrong sha reason\n')
-    r = runCi()
-    assert.notEqual(r.status, 0, 'break-glass for different SHA must not exempt')
-
-    const bg = join(ctrl, `ci-breakglass-${sha}`)
-    writeFileSync(bg, '')
-    r = runCi()
-    assert.notEqual(r.status, 0, 'empty break-glass file must fail closed')
-
-    writeFileSync(bg, 'emergency-hotfix-approved-by-root\n')
-    r = runCi()
-    assert.equal(r.status, 0, r.stderr)
-    assert.match(r.stdout, /break-glass 豁免/)
-  })
-
-  test('removes OC_V5_SKIP_TRAILER_GATE=1 env escape hatch while allowing exact-SHA host break-glass file', (t) => {
-    const sb = makeSandbox(t, 'ocv5-904-trailer-')
-    const ctrl = join(sb.dir, 'control')
-    mkdirSync(ctrl, { recursive: true })
-    const sha = 'c'.repeat(40)
-    const deploySrc = readFileSync(DEPLOY_SCRIPT, 'utf8')
-    const fnMatch = deploySrc.match(/^assert_fix_trailers\(\) \{[\s\S]*?^\}/m)
-    assert.ok(fnMatch, 'assert_fix_trailers must exist in deploy-v5-selfhost.sh')
-
-    const fakeGate = join(sb.dir, 'fake-trailer-gate.sh')
-    writeFileSync(fakeGate, '#!/usr/bin/env bash\necho "TRAILER-GATE-FAILED" >&2\nexit 1\n')
-    chmodSync(fakeGate, 0o755)
-
-    // 1) Setting OC_V5_SKIP_TRAILER_GATE=1 MUST fail loudly (never bypass!)
-    let r = runBash(
-      [
-        `source ${q(TRAIN_GUARDS_LIB)}`,
-        'log() { echo "$*"; }',
-        'die() { echo "✗ $*" >&2; exit 1; }',
-        `REPO_ROOT=${q(REPO_ROOT)}`,
-        `FIX_TRAILER_GATE=${q(fakeGate)}`,
-        `OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
-        fnMatch[0],
-        `OC_V5_SKIP_TRAILER_GATE=1 assert_fix_trailers ${q(sha)}`,
-      ].join('\n'),
-      sb.env,
-    )
-    assert.notEqual(r.status, 0, 'OC_V5_SKIP_TRAILER_GATE=1 must be physically rejected')
-    assert.match(r.stderr, /OC_V5_SKIP_TRAILER_GATE=1 环境变量逃生口已物理移除/)
-
-    // 2) Without break-glass file, real gate runs and blocks
-    r = runBash(
-      [
-        `source ${q(TRAIN_GUARDS_LIB)}`,
-        'log() { echo "$*"; }',
-        'die() { echo "✗ $*" >&2; exit 1; }',
-        `REPO_ROOT=${q(REPO_ROOT)}`,
-        `FIX_TRAILER_GATE=${q(fakeGate)}`,
-        `OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
-        fnMatch[0],
-        `assert_fix_trailers ${q(sha)}`,
-      ].join('\n'),
-      sb.env,
-    )
-    assert.notEqual(r.status, 0)
-    assert.match(r.stderr, /TRAILER-GATE-FAILED/)
-
-    // 3) Valid exact-SHA host break-glass file exempts
-    writeFileSync(join(ctrl, `trailer-breakglass-${sha}`), 'p0-outage-root-override\n')
-    r = runBash(
-      [
-        `source ${q(TRAIN_GUARDS_LIB)}`,
-        'log() { echo "$*"; }',
-        'die() { echo "✗ $*" >&2; exit 1; }',
-        `REPO_ROOT=${q(REPO_ROOT)}`,
-        `FIX_TRAILER_GATE=${q(fakeGate)}`,
-        `OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
-        fnMatch[0],
-        `assert_fix_trailers ${q(sha)}`,
-      ].join('\n'),
-      sb.env,
-    )
-    assert.equal(r.status, 0, r.stderr)
-    assert.match(r.stdout, /trailer-gate.*break-glass/)
-  })
-})
-
-describe('3. Host Governor Mode Gate (emergency_stop & debt_first)', () => {
-  test('emergency_stop rejects all deploys; debt_first blocks feat(v5): and allows refactor/bug/chore', (t) => {
-    const f = makeTempGitRepo(t)
-    const modeFile = join(f.dir, 'mode.json')
-
-    writeFileSync(join(f.repo, 'a.txt'), '1\n')
-    f.git('add', '.')
-    f.git('commit', '-qm', 'chore(v5): init base')
-    const baseSha = f.git('rev-parse', 'HEAD')
-
-    writeFileSync(join(f.repo, 'a.txt'), '2\n')
-    f.git('commit', '-qam', 'refactor(v5): extract clean helper')
-    const refactorSha = f.git('rev-parse', 'HEAD')
-
-    writeFileSync(join(f.repo, 'a.txt'), '3\n')
-    f.git('commit', '-qam', 'feat(v5): add brand new feature')
-    const featSha = f.git('rev-parse', 'HEAD')
-
-    const checkMode = (sha: string, base: string) =>
-      runBash(
-        [
-          `source ${q(TRAIN_GUARDS_LIB)}`,
+          'mlog() { echo "$*" >&2; }',
+          'tsum_note() { :; }',
+          `source ${q(GOV_LIB)}`,
           `REPO_ROOT=${q(f.repo)}`,
-          `OC_V5_GOVERNOR_MODE_FILE=${q(modeFile)}`,
-          `v5_selfhost_check_governor_mode ${q(sha)} ${q(base)}`,
+          `MASTER_LIVE_LINK=${q(noLive)}`,
+          `OC_V5_REFEREE_ROOT=${q(refDir)}`,
+          `OC_V5_REFEREE_NODE_MODULES=${q(join(REPO_ROOT, 'node_modules'))}`,
+          `MASTER_GATE_TMPDIR=${q(gateTmp)}`,
+          `OC_V5_GOVERNANCE_BASE_REF=${q(baseSha)}`,
+          `master_run_governance_fast_gates ${q(staging)} ${q(sha)}`,
         ].join('\n'),
-        f.env,
+        { ...f.env, ...extraEnv },
       )
+    }
 
-    // emergency_stop blocks even refactor
-    writeFileSync(modeFile, JSON.stringify({ mode: 'emergency_stop', reason: 'sev1 freeze' }))
-    let r = checkMode(refactorSha, baseSha)
-    assert.notEqual(r.status, 0, 'emergency_stop must block deploy')
-    assert.match(r.stderr, /emergency_stop.*sev1 freeze/)
+    // ── STEP ①: Base old v1 referee checks unauthorized schema v2 candidate → MUST FAIL (NEVER fallback to staging!)
+    seedGovStubs(refDir)
+    writeFileSync(join(refDir, 'scripts/check-monotonic-baselines.ts'), v1CheckerSrc)
+    writeRefereeManifest(refDir, { sourceCommit: baseSha })
+    chmodSync(refDir, 0o755)
 
-    // debt_first blocks feat(v5):
-    writeFileSync(modeFile, JSON.stringify({ mode: 'debt_first', reason: 'rework > 40%' }))
-    r = checkMode(featSha, baseSha)
-    assert.notEqual(r.status, 0, 'debt_first must block feat(v5):')
-    assert.match(r.stderr, /debt_first/)
-    assert.match(r.stderr, /feat\(v5\): add brand new feature/)
+    let r = runGates(upgradeSha)
+    assert.notEqual(r.status, 0, 'Step 1: base v1 referee MUST reject unauthorized schema v2 upgrade')
+    assert.match(r.stderr, /OLD-REFEREE-V1-REJECTED-SCHEMA:2/)
 
-    // debt_first allows refactor(v5):
-    r = checkMode(refactorSha, baseSha)
-    assert.equal(r.status, 0, r.stderr)
-    assert.match(r.stdout, /debt_first 校验通过/)
-
-    // autonomous allows feat(v5):
-    writeFileSync(modeFile, JSON.stringify({ mode: 'autonomous', reason: 'healthy' }))
-    r = checkMode(featSha, baseSha)
-    assert.equal(r.status, 0, r.stderr)
-  })
-})
-
-describe('4. Post-Cutover Retention Gate + Auto-Rollback + Breaker Trip', () => {
-  test('triggers official auto-rollback and notifies oc-governor breaker when retention runner fails', async (t) => {
-    const sb = makeSandbox(t, 'ocv5-904-ret-')
-    const ctrl = join(sb.dir, 'control')
-    const bin = join(sb.dir, 'bin')
-    mkdirSync(ctrl, { recursive: true })
-    mkdirSync(bin, { recursive: true })
-
-    // Local loopback /healthz 200 server
-    const server = http.createServer((_req, res) => {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end('{"ok":true}')
+    // ── STEP ②: Host root pre-stages audited v2 transition referee bound to exact upgradeSha
+    rmSync(refDir, { recursive: true, force: true })
+    mkdirSync(refDir, { recursive: true })
+    seedGovStubs(refDir)
+    writeFileSync(join(refDir, 'scripts/check-monotonic-baselines.ts'), v2CheckerSrc)
+    const approvalFile = join(approvalsDir, `${upgradeSha}.json`)
+    const approvalSha256 = writeA0ApprovalReceipt({
+      approvalFile,
+      sha: upgradeSha,
+      reason: 'OCV5-903 audited schema v1->v2 transition rollout',
+      allowedPaths: ['arch/schema-budget.json', 'scripts/check-monotonic-baselines.ts'],
+      hmacKey,
     })
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
-    t.after(() => server.close())
-    const addr = server.address() as { port: number }
-    const healthzUrl = `http://127.0.0.1:${addr.port}/healthz`
+    stageAuditedTransitionReferee({ refDir, targetSha: upgradeSha, approvalFile, approvalSha256 })
 
-    const rollbackLog = join(sb.dir, 'rollback.log')
-    const breakerLog = join(sb.dir, 'breaker.log')
-    const trainFinishLog = join(sb.dir, 'train-finish.log')
-    const retentionRunner = join(bin, 'run-retention.sh')
-    const govBin = join(bin, 'oc-governor')
-    const sha = 'd'.repeat(40)
+    // ②-a: Exact bound upgradeSha passes!
+    r = runGates(upgradeSha)
+    assert.equal(r.status, 0, `Step 2a failed: ${r.stderr}`)
+    assert.match(r.stderr, /\[referee-transition\] audited transition referee verified/)
 
-    // Mock oc-governor supporting record-rollback (verifies trip-breaker -> record-rollback fallback too)
-    writeFileSync(
-      govBin,
-      [
-        '#!/usr/bin/env bash',
-        `if [[ "$1" == "trip-breaker" && "\${MOCK_NO_TRIP_ALIAS:-0}" == 1 ]]; then exit 2; fi`,
-        `echo "$*" >> ${q(breakerLog)}`,
-        'exit 0',
-      ].join('\n'),
-    )
-    chmodSync(govBin, 0o755)
+    // ②-b: Different SHA (cleanFollowupSha != targetSha) MUST be rejected by transition referee!
+    r = runGates(cleanFollowupSha)
+    assert.notEqual(r.status, 0, 'Step 2b: transition referee MUST reject non-matching SHA')
+    assert.match(r.stderr, /仅绑定 targetSha=.*拒绝用于非匹配候选/)
 
-    // Case A: Retention PASS -> exit 0, no rollback, no breaker call
-    writeFileSync(retentionRunner, '#!/usr/bin/env bash\necho "retention 6/6 PASS"\nexit 0\n')
-    chmodSync(retentionRunner, 0o755)
-    let r = await runBashAsync(
-      [
-        `source ${q(TRAIN_GUARDS_LIB)}`,
-        `OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
-        `OC_V5_GOVERNOR_BIN=${q(govBin)}`,
-        `OC_V5_RETENTION_RUNNER=${q(retentionRunner)}`,
-        'OC_V5_RETENTION_SETTLE_SEC=0',
-        `OC_V5_RETENTION_HEALTHZ_URL=${q(healthzUrl)}`,
-        `OC_V5_RETENTION_ROLLBACK_CMD=${q(`echo "RB:$1:$2:$3" >> ${q(rollbackLog)}`)}`,
-        'LEASE_TRAIN_ID=tr-test-pass',
-        `v5_selfhost_post_cutover_retention_gate /opt/rel-new ${q(sha)}`,
-      ].join('\n'),
-      sb.env,
-    )
-    assert.equal(r.status, 0, r.stderr + r.stdout)
-    assert.equal(existsSync(rollbackLog), false)
-    assert.equal(existsSync(breakerLog), false)
+    // ②-c: Even if transition referee is staged for badBaselineSha, bad baseline MUST STILL FAIL (RED)!
+    rmSync(refDir, { recursive: true, force: true })
+    mkdirSync(refDir, { recursive: true })
+    seedGovStubs(refDir)
+    writeFileSync(join(refDir, 'scripts/check-monotonic-baselines.ts'), v2CheckerSrc)
+    const badApprovalFile = join(approvalsDir, `${badBaselineSha}.json`)
+    const badApprovalSha = writeA0ApprovalReceipt({
+      approvalFile: badApprovalFile,
+      sha: badBaselineSha,
+      reason: 'OCV5-903 test audited transition against bad baseline',
+      hmacKey,
+    })
+    stageAuditedTransitionReferee({
+      refDir,
+      targetSha: badBaselineSha,
+      approvalFile: badApprovalFile,
+      approvalSha256: badApprovalSha,
+    })
+    r = runGates(badBaselineSha)
+    assert.notEqual(r.status, 0, 'Step 2c: audited transition referee MUST STILL block bad baseline!')
+    assert.match(r.stderr, /NEW-REFEREE-V2-BAD-BASELINE-RED:999/)
 
-    // Case B: Retention FAIL -> marks train failed, triggers official rollback, notifies oc-governor breaker, exits non-zero
-    writeFileSync(retentionRunner, '#!/usr/bin/env bash\necho "retention FAIL 02-min-chat-loop" >&2\nexit 1\n')
-    chmodSync(retentionRunner, 0o755)
-    r = await runBashAsync(
-      [
-        `source ${q(TRAIN_GUARDS_LIB)}`,
-        `lease_train_finish() { echo "$1|$2" >> ${q(trainFinishLog)}; }`,
-        `OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
-        `OC_V5_GOVERNOR_BIN=${q(govBin)}`,
-        `OC_V5_RETENTION_RUNNER=${q(retentionRunner)}`,
-        'OC_V5_RETENTION_SETTLE_SEC=0',
-        `OC_V5_RETENTION_HEALTHZ_URL=${q(healthzUrl)}`,
-        `OC_V5_RETENTION_ROLLBACK_CMD=${q(`echo "RB:$1:$2:$3" >> ${q(rollbackLog)}`)}`,
-        'LEASE_TRAIN_ID=tr-test-fail',
-        `v5_selfhost_post_cutover_retention_gate /opt/rel-bad ${q(sha)}`,
-      ].join('\n'),
-      sb.env,
-    )
-    assert.notEqual(r.status, 0, 'retention failure must exit non-zero after auto-rollback')
-    assert.match(readFileSync(trainFinishLog, 'utf8'), /^failed\|post-cutover retention gate failed/)
-    assert.match(readFileSync(rollbackLog, 'utf8'), new RegExp(`RB:/opt/rel-bad:${sha}:1`))
-    assert.match(readFileSync(breakerLog, 'utf8'), /trip-breaker --train tr-test-fail/)
-    assert.equal(existsSync(join(ctrl, 'retention-rollbacks.jsonl')), true)
+    // ②-d: Security hardening checks on TRANSITION_APPROVAL.json / MANIFEST.json / HMAC downgrade
+    // Tamper MANIFEST (modify script without updating MANIFEST) -> fail closed
+    chmodSync(join(refDir, 'scripts/check-monotonic-baselines.ts'), 0o644)
+    writeFileSync(join(refDir, 'scripts/check-monotonic-baselines.ts'), 'process.exit(0)\n')
+    r = runGates(badBaselineSha)
+    assert.notEqual(r.status, 0, 'tampered referee script vs MANIFEST must fail closed')
+    assert.match(r.stderr, /MANIFEST\.json SHA-256 不匹配/)
 
-    // Case C: Verify fallback to `oc-governor record-rollback` when `trip-breaker` is absent
-    rmSync(breakerLog, { force: true })
-    r = runBash(
-      [
-        `source ${q(TRAIN_GUARDS_LIB)}`,
-        `OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
-        `OC_V5_GOVERNOR_BIN=${q(govBin)}`,
-        'export MOCK_NO_TRIP_ALIAS=1',
-        'v5_selfhost_notify_governor_breaker tr-test-fallback retention-failed',
-      ].join('\n'),
-      sb.env,
-    )
-    assert.equal(r.status, 0, r.stderr)
-    assert.match(readFileSync(breakerLog, 'utf8'), /record-rollback --train tr-test-fallback/)
+    // Strip TRANSITION_APPROVAL.json while MANIFEST declares mode="transition-audited" -> fail closed
+    rmSync(refDir, { recursive: true, force: true })
+    mkdirSync(refDir, { recursive: true })
+    seedGovStubs(refDir)
+    writeFileSync(join(refDir, 'scripts/check-monotonic-baselines.ts'), v2CheckerSrc)
+    stageAuditedTransitionReferee({ refDir, targetSha: upgradeSha, approvalFile, approvalSha256 })
+    rmSync(join(refDir, 'TRANSITION_APPROVAL.json'))
+    r = runGates(upgradeSha)
+    assert.notEqual(r.status, 0, 'stripped TRANSITION_APPROVAL.json must fail closed')
+
+    // Missing HMAC when .hmac-key exists (plain sha256 downgrade) -> fail closed
+    rmSync(refDir, { recursive: true, force: true })
+    mkdirSync(refDir, { recursive: true })
+    seedGovStubs(refDir)
+    writeFileSync(join(refDir, 'scripts/check-monotonic-baselines.ts'), v2CheckerSrc)
+    const noHmacFile = join(approvalsDir, `${upgradeSha}.json`)
+    const noHmacSha = writeA0ApprovalReceipt({
+      approvalFile: noHmacFile,
+      sha: upgradeSha,
+      reason: 'plain sha256 downgrade attempt',
+      // omit hmacKey while .hmac-key exists!
+    })
+    stageAuditedTransitionReferee({ refDir, targetSha: upgradeSha, approvalFile: noHmacFile, approvalSha256: noHmacSha })
+    r = runGates(upgradeSha)
+    assert.notEqual(r.status, 0, 'plain sha256 downgrade when .hmac-key exists must fail closed')
+    assert.match(r.stderr, /hmacSha256/)
+
+    // ── STEP ③: Permanent new v2 referee (no TRANSITION_APPROVAL.json) evaluates follow-up commits
+    rmSync(refDir, { recursive: true, force: true })
+    mkdirSync(refDir, { recursive: true })
+    seedGovStubs(refDir)
+    writeFileSync(join(refDir, 'scripts/check-monotonic-baselines.ts'), v2CheckerSrc)
+    writeRefereeManifest(refDir, { sourceCommit: upgradeSha })
+
+    // ③-a: Clean follow-up commit passes
+    r = runGates(cleanFollowupSha)
+    assert.equal(r.status, 0, `Step 3a failed: ${r.stderr}`)
+
+    // ③-b: Bad baseline follow-up commit fails
+    r = runGates(badBaselineSha)
+    assert.notEqual(r.status, 0, 'Step 3b: permanent new referee MUST reject bad baseline')
+    assert.match(r.stderr, /NEW-REFEREE-V2-BAD-BASELINE-RED:999/)
   })
 })
 
-describe('5. 45s Train Debounce, Governor emergency_stop Pause & Planned Auto Fast-Forward', () => {
-  test('coalesces burst pushes within 45s debounce window, respects emergency_stop, and fast-forwards planned train to newest CI-green SHA', (t) => {
-    const sb = makeSandbox(t, 'ocv5-904-worker-')
+// ═════════════════════════════════════════════════════════════════════════════
+// B4: Complete Referee Execution Chain Isolation & Zero-Missed Candidate Files
+// ═════════════════════════════════════════════════════════════════════════════
+describe('B4. External referee isolated execution chain & zero-missed candidate scanning', () => {
+  test('never loads staging tsx/scripts/packages/protocol, strips loader env, scans real staging gatewayFiles > 0, and passes --base/--head to check-debt-ttl', (t) => {
+    const f = makeTempGitRepo(t)
+    const staging = join(f.dir, 'staging')
+    const gateTmp = join(f.dir, 'gate-tmp')
+    const refDir = join(f.dir, 'referee')
+    const noLive = join(f.dir, 'no-live')
+    const poisonMarker = join(f.dir, 'POISON_TRIGGERED.log')
+    const debtArgsLog = join(f.dir, 'debt-args.log')
+    const envProbeLog = join(f.dir, 'env-probe.log')
+    mkdirSync(gateTmp, { recursive: true })
+    mkdirSync(refDir, { recursive: true })
+
+    // Candidate repo contains real packages/gateway/src files + poisoned staging scripts & packages/protocol!
+    seedGovStubs(f.repo)
+    mkdirSync(join(f.repo, 'packages/gateway/src'), { recursive: true })
+    mkdirSync(join(f.repo, 'packages/protocol/src'), { recursive: true })
+    mkdirSync(join(f.repo, 'arch'), { recursive: true })
+    writeFileSync(join(f.repo, 'changelog.json'), '[]\n')
+    writeFileSync(
+      join(f.repo, 'packages/gateway/src/health.ts'),
+      'export function pingGateway(x: number): number { return x + 1 }\n',
+    )
+    writeFileSync(
+      join(f.repo, 'packages/protocol/src/httpContracts.ts'),
+      `import { appendFileSync } from 'node:fs'\nappendFileSync(${JSON.stringify(poisonMarker)}, 'POISONED_STAGING_PROTOCOL\\n')\nexport function serializeRestContractSnapshot() { return {} }\n`,
+    )
+    writeFileSync(
+      join(f.repo, 'scripts/check-security-sast.ts'),
+      `import { appendFileSync } from 'node:fs'\nappendFileSync(${JSON.stringify(poisonMarker)}, 'POISONED_STAGING_SCRIPT\\n')\nprocess.exit(0)\n`,
+    )
+    writeFileSync(
+      join(f.repo, 'arch/security-sast-baseline.json'),
+      `${JSON.stringify({ schemaVersion: 1, summary: { totalEntries: 0, totalCount: 0, byRule: {} }, entries: {} }, null, 2)}\n`,
+    )
+    f.git('add', '.')
+    f.git('commit', '-qm', 'chore(v5): base clean gateway')
+    const baseSha = f.git('rev-parse', 'HEAD')
+
+    writeFileSync(
+      join(f.repo, 'packages/gateway/src/service.ts'),
+      'export function runGatewayService(): string { return "ok" }\n',
+    )
+    f.git('add', '.')
+    f.git('commit', '-qm', 'refactor(v5): add clean gateway service')
+    const cleanSha = f.git('rev-parse', 'HEAD')
+
+    // Build isolated trusted referee directory with REAL check-security-sast.ts, protocol import check, & check-debt-ttl probe
+    seedGovStubs(refDir)
+    mkdirSync(join(refDir, 'packages/protocol/src'), { recursive: true })
+    writeFileSync(
+      join(refDir, 'packages/protocol/src/httpContracts.ts'),
+      'export const REFEREE_PROTOCOL_MARKER = "TRUSTED_REFEREE_PROTOCOL"\nexport function serializeRestContractSnapshot() { return { marker: REFEREE_PROTOCOL_MARKER } }\n',
+    )
+    writeFileSync(
+      join(refDir, 'scripts/check-rest-contract-compat.ts'),
+      `import { appendFileSync } from 'node:fs'
+import { REFEREE_PROTOCOL_MARKER } from '../packages/protocol/src/httpContracts.js'
+if (REFEREE_PROTOCOL_MARKER !== 'TRUSTED_REFEREE_PROTOCOL') process.exit(9)
+appendFileSync(${JSON.stringify(envProbeLog)}, JSON.stringify({
+  marker: REFEREE_PROTOCOL_MARKER,
+  nodeOptions: process.env.NODE_OPTIONS ?? null,
+  nodePath: process.env.NODE_PATH ?? null,
+  tsxTsconfig: process.env.TSX_TSCONFIG_PATH ?? null,
+  cwd: process.cwd(),
+  argv: process.argv.slice(2),
+}) + '\\n')
+process.exit(0)
+`,
+    )
+    // Copy REAL check-security-sast.ts into referee to prove real --root "$staging" scanning finds gatewayFiles > 0!
+    cpSync(join(REPO_ROOT, 'scripts/check-security-sast.ts'), join(refDir, 'scripts/check-security-sast.ts'))
+    writeFileSync(
+      join(refDir, 'scripts/check-debt-ttl.ts'),
+      `// supports --base --head
+import { appendFileSync } from 'node:fs'
+appendFileSync(${JSON.stringify(debtArgsLog)}, process.argv.slice(2).join(' ') + '\\n')
+process.exit(0)
+`,
+    )
+    writeRefereeManifest(refDir, { sourceCommit: baseSha })
+    // Attach trusted node_modules to referee
+    symlinkSync(join(REPO_ROOT, 'node_modules'), join(refDir, 'node_modules'))
+
+    const poisonStagingNodeModules = (stg: string) => {
+      const fakeBin = join(stg, 'node_modules/.bin')
+      const fakeTsx = join(stg, 'node_modules/tsx/dist')
+      mkdirSync(fakeBin, { recursive: true })
+      mkdirSync(fakeTsx, { recursive: true })
+      writeFileSync(
+        join(fakeBin, 'tsx'),
+        `#!/usr/bin/env bash\necho "POISONED_STAGING_TSX_BIN" >> ${q(poisonMarker)}\nexit 0\n`,
+      )
+      chmodSync(join(fakeBin, 'tsx'), 0o755)
+      writeFileSync(
+        join(fakeTsx, 'cli.mjs'),
+        `import { appendFileSync } from 'node:fs'\nappendFileSync(${JSON.stringify(poisonMarker)}, 'POISONED_STAGING_TSX_CLI\\n')\nprocess.exit(0)\n`,
+      )
+    }
+
+    exportArchive(f.repo, cleanSha, staging, f.env, false)
+    poisonStagingNodeModules(staging)
+
+    const res = runBash(
+      [
+        'mlog() { echo "$*" >&2; }',
+        'tsum_note() { :; }',
+        `source ${q(GOV_LIB)}`,
+        `REPO_ROOT=${q(f.repo)}`,
+        `MASTER_LIVE_LINK=${q(noLive)}`,
+        `OC_V5_REFEREE_ROOT=${q(refDir)}`,
+        `MASTER_GATE_TMPDIR=${q(gateTmp)}`,
+        `OC_V5_GOVERNANCE_BASE_REF=${q(baseSha)}`,
+        `master_run_governance_fast_gates ${q(staging)} ${q(cleanSha)}`,
+      ].join('\n'),
+      {
+        ...f.env,
+        NODE_OPTIONS: '--require=/nonexistent/poison-preload.cjs',
+        NODE_PATH: '/nonexistent/poison-node-path',
+        TSX_TSCONFIG_PATH: '/nonexistent/poison-tsconfig.json',
+      },
+    )
+    assert.equal(res.status, 0, res.stderr + res.stdout)
+    assert.equal(existsSync(poisonMarker), false, 'MUST NEVER execute poisoned staging tsx, script, or protocol!')
+
+    // Verify env vars stripped & trusted protocol loaded & --root "$staging" passed
+    const probe = JSON.parse(readFileSync(envProbeLog, 'utf8').trim())
+    assert.equal(probe.marker, 'TRUSTED_REFEREE_PROTOCOL')
+    assert.equal(probe.nodeOptions, null, 'NODE_OPTIONS must be stripped')
+    assert.equal(probe.nodePath, null, 'NODE_PATH must be stripped')
+    assert.equal(probe.tsxTsconfig, null, 'TSX_TSCONFIG_PATH must be stripped')
+    assert.ok(!probe.cwd.startsWith(realpathSync(staging)), 'referee cwd must NOT be inside staging')
+    assert.ok(probe.argv.includes('--root') && probe.argv.includes(staging), 'must pass --root $staging')
+
+    // Verify check-debt-ttl received --root $staging --enforce --base $baseSha --head $cleanSha
+    const debtArgs = readFileSync(debtArgsLog, 'utf8').trim()
+    assert.match(debtArgs, new RegExp(`--root ${staging.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+    assert.match(debtArgs, new RegExp(`--base ${baseSha}`))
+    assert.match(debtArgs, new RegExp(`--head ${cleanSha}`))
+
+    // Verify real check-security-sast scanned >= 2 files in $staging/packages/gateway/src!
+    const sastMatch = (res.stdout + res.stderr).match(/\[security-sast\] files=(\d+)/)
+    assert.ok(sastMatch, `expected security-sast output in:\n${res.stdout}\n${res.stderr}`)
+    assert.ok(Number(sastMatch[1]) >= 2, `expected gatewayFiles >= 2 scanned, got ${sastMatch[1]}`)
+
+    // Verify isolated referee view has ZERO symlinks pointing into $staging!
+    const viewDir = join(gateTmp, readdirSync(gateTmp).find((d) => d.startsWith('referee-view-'))!)
+    const stagingReal = realpathSync(staging)
+    const walkCheck = (d: string) => {
+      for (const ent of readdirSync(d, { withFileTypes: true })) {
+        const p = join(d, ent.name)
+        const lst = lstatSync(p)
+        if (lst.isSymbolicLink()) {
+          const targetReal = realpathSync(p)
+          assert.ok(
+            !targetReal.startsWith(stagingReal),
+            `referee view symlink ${p} must NEVER point into staging (${targetReal})`,
+          )
+        } else if (ent.isDirectory()) {
+          walkCheck(p)
+        }
+      }
+    }
+    walkCheck(viewDir)
+
+    // Inject real secret leak in $staging/packages/gateway/src/leak.ts -> real referee SAST MUST catch it!
+    const syntheticAwsKey = ['AKIA', '9K7M2P4Q', '8R6T3V5W'].join('')
+    writeFileSync(
+      join(f.repo, 'packages/gateway/src/leak.ts'),
+      `export const realLeak = "${syntheticAwsKey}"\n`,
+    )
+    f.git('add', '.')
+    f.git('commit', '-qm', 'feat(v5): leak secret in gateway')
+    const leakSha = f.git('rev-parse', 'HEAD')
+    exportArchive(f.repo, leakSha, staging, f.env, false)
+    poisonStagingNodeModules(staging)
+
+    const leakRes = runBash(
+      [
+        'mlog() { echo "$*" >&2; }',
+        'tsum_note() { :; }',
+        `source ${q(GOV_LIB)}`,
+        `REPO_ROOT=${q(f.repo)}`,
+        `MASTER_LIVE_LINK=${q(noLive)}`,
+        `OC_V5_REFEREE_ROOT=${q(refDir)}`,
+        `MASTER_GATE_TMPDIR=${q(gateTmp)}`,
+        `OC_V5_GOVERNANCE_BASE_REF=${q(baseSha)}`,
+        `master_run_governance_fast_gates ${q(staging)} ${q(leakSha)}`,
+      ].join('\n'),
+      f.env,
+    )
+    assert.notEqual(leakRes.status, 0, 'real referee SAST must catch secret leak in $staging/packages/gateway/src')
+    assert.match(leakRes.stderr + leakRes.stdout, /SECURITY-SAST|SEC-SECRET/)
+    assert.equal(existsSync(poisonMarker), false)
+
+    // Missing trusted referee node_modules MUST fail closed (never borrow $staging/node_modules!)
+    rmSync(join(refDir, 'node_modules'))
+    const noNmRes = runBash(
+      [
+        'mlog() { echo "$*" >&2; }',
+        'tsum_note() { :; }',
+        `source ${q(GOV_LIB)}`,
+        `REPO_ROOT=${q(f.repo)}`,
+        `MASTER_LIVE_LINK=${q(noLive)}`,
+        `OC_V5_REFEREE_ROOT=${q(refDir)}`,
+        `MASTER_GATE_TMPDIR=${q(gateTmp)}`,
+        `master_resolve_referee_node_modules ${q(refDir)} ${q(staging)}`,
+      ].join('\n'),
+      f.env,
+    )
+    assert.notEqual(noNmRes.status, 0, 'referee mode without trusted node_modules MUST fail closed')
+    assert.match(noNmRes.stderr, /严禁借用候选 \$staging\/node_modules/)
+  })
+})
+
+// ═════════════════════════════════════════════════════════════════════════════
+// B5: 45s Debounce + 3-State CI (queued -> in_progress -> success / failed)
+//     + Trusted Events (reject workflow_dispatch) + Safe FF CAS (changes()==1)
+// ═════════════════════════════════════════════════════════════════════════════
+describe('B5. 45s debounce, 3-state CI classification, trusted events & safe FF CAS', () => {
+  test('full ride state machine: queued -> in_progress (stays registered!) -> workflow_dispatch rejected -> trusted push success -> dispatched -> satisfied with zero re-registration', (t) => {
+    const sb = makeSandbox(t, 'ocv5-903-b5-')
     const origin = join(sb.dir, 'origin.git')
     const wt = join(sb.dir, 'wt')
     const pushWt = join(sb.dir, 'push-wt')
@@ -689,8 +729,10 @@ describe('5. 45s Train Debounce, Governor emergency_stop Pause & Planned Auto Fa
     const db = join(sb.dir, 'lease.db')
     const modeFile = join(sb.dir, 'mode.json')
     const startsLog = join(sb.dir, 'deploy-starts.log')
+    const ghRespFile = join(sb.dir, 'gh-runs.json')
     const fakeDeploy = join(bin, 'fake-deploy.sh')
     const fakeTask = join(bin, 'fake-oc-task')
+    const fakeGh = join(bin, 'gh')
     mkdirSync(releases, { recursive: true })
     mkdirSync(bin, { recursive: true })
     mkdirSync(logs, { recursive: true })
@@ -705,7 +747,7 @@ describe('5. 45s Train Debounce, Governor emergency_stop Pause & Planned Auto Fa
     const mk = (cwd: string, name: string) => {
       writeFileSync(join(cwd, name), `${name}\n`)
       g(cwd, 'add', '-A')
-      g(cwd, 'commit', '-qm', `chore(v5): ${name}`)
+      g(cwd, 'commit', '-qm', `bug(v5): ${name}`)
       return g(cwd, 'rev-parse', 'HEAD')
     }
     const c0 = mk(wt, 'c0')
@@ -714,18 +756,34 @@ describe('5. 45s Train Debounce, Governor emergency_stop Pause & Planned Auto Fa
     g(wt, 'remote', 'add', 'origin', origin)
     g(wt, 'push', '-q', 'origin', 'feat/v5-selfhost')
 
-    // Live at c0
+    // Live starts at c0
     const rel0 = join(releases, `rel-${c0}`)
     mkdirSync(rel0, { recursive: true })
     writeFileSync(join(rel0, '.complete'), JSON.stringify({ sourceCommit: c0 }))
     symlinkSync(rel0, join(sb.dir, 'live'))
-    writeFileSync(join(runDir, 'survivor.state'), JSON.stringify({ phase: 'committed' }))
-    writeFileSync(join(runDir, 'survivor.committed'), '')
+    writeFileSync(join(runDir, 'survivor.state'), 'phase=committed\n')
+    writeFileSync(join(runDir, 'survivor.committed'), 'committed_at=2026-11-26T00:00:00Z\n')
 
-    writeFileSync(fakeDeploy, `#!/usr/bin/env bash\necho "$*" >> ${q(startsLog)}\nexit 0\n`)
+    // Fake deploy records launch AND simulates commit of c2 (updates live & train status to committed)
+    const rel2 = join(releases, `rel-${c2}`)
+    mkdirSync(rel2, { recursive: true })
+    writeFileSync(join(rel2, '.complete'), JSON.stringify({ sourceCommit: c2 }))
+    writeFileSync(
+      fakeDeploy,
+      [
+        '#!/usr/bin/env bash',
+        `echo "$*" >> ${q(startsLog)}`,
+        `ln -sfn ${q(rel2)} ${q(join(sb.dir, 'live'))}`,
+        `printf 'phase=committed\\n' > ${q(join(runDir, 'survivor.state'))}`,
+        `sqlite3 ${q(db)} "UPDATE train SET status='committed', rel_path='${rel2}', finished_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id='$OC_V5_LEASE_TRAIN_ID';"`,
+        'exit 0',
+      ].join('\n'),
+    )
     chmodSync(fakeDeploy, 0o755)
     writeFileSync(fakeTask, '#!/usr/bin/env bash\necho "{}"\nexit 0\n')
     chmodSync(fakeTask, 0o755)
+    writeFileSync(fakeGh, `#!/usr/bin/env bash\ncat ${q(ghRespFile)}\n`)
+    chmodSync(fakeGh, 0o755)
 
     const workerEnv: NodeJS.ProcessEnv = {
       ...sb.env,
@@ -745,21 +803,29 @@ describe('5. 45s Train Debounce, Governor emergency_stop Pause & Planned Auto Fa
       OC_V5_LEASE_TASK_CLI: fakeTask,
       OC_V5_GOVERNOR_MODE_FILE: modeFile,
       OC_V5_TRAIN_DEBOUNCE_SEC: '45',
+      OC_V5_GH_BIN: fakeGh,
+      OC_V5_GH_REPO: 'dream-star-end/openclaude',
+      OC_V5_WORKER_CI_REQUIRED: '1',
       OC_USER_ID: '3',
       INVOCATION_ID: '',
     }
 
-    // Register ride 1 (c1) & ride 2 (c2)
-    let r = spawnSync('bash', [LEASE_CLI, 'register', '--resource', 'deploy:selfhost', '--mode', 'ride', '--sha', c1, '--owner', 'a1', '--callback', 'none'], { env: workerEnv, encoding: 'utf8' })
+    // Register ONE ride for c2 (never re-registered!)
+    let r = spawnSync(
+      'bash',
+      [LEASE_CLI, 'register', '--resource', 'deploy:selfhost', '--mode', 'ride', '--sha', c2, '--owner', 'agent-b5', '--callback', 'none'],
+      { env: workerEnv, encoding: 'utf8' },
+    )
     assert.equal(r.status, 0, r.stderr)
-    r = spawnSync('bash', [LEASE_CLI, 'register', '--resource', 'deploy:selfhost', '--mode', 'ride', '--sha', c2, '--owner', 'a2', '--callback', 'none'], { env: workerEnv, encoding: 'utf8' })
-    assert.equal(r.status, 0, r.stderr)
-
+    const rideId = execFileSync('sqlite3', ['-noheader', db, 'SELECT id FROM lease;'], { encoding: 'utf8' }).trim()
     const minEpoch = Number(
-      execFileSync('sqlite3', ['-noheader', db, "SELECT CAST(strftime('%s', MIN(created_at)) AS INTEGER) FROM lease;"], { encoding: 'utf8' }).trim(),
+      execFileSync('sqlite3', ['-noheader', db, "SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM lease;"], { encoding: 'utf8' }).trim(),
     )
 
-    const runWorkerTick = (nowEpoch: number) =>
+    const sqlVal = (qStr: string) =>
+      execFileSync('sqlite3', ['-noheader', db, qStr], { encoding: 'utf8' }).trim()
+
+    const tick = (nowEpoch: number, extraEnv: Record<string, string> = {}) =>
       spawnSync(
         'bash',
         [
@@ -770,105 +836,1017 @@ describe('5. 45s Train Debounce, Governor emergency_stop Pause & Planned Auto Fa
           '-c',
           `source ${q(LEASE_WORKER)}; lease_deploy_process_running() { return 1; }; main`,
         ],
-        { env: { ...workerEnv, OC_V5_NOW_EPOCH: String(nowEpoch) }, encoding: 'utf8', timeout: 60_000 },
+        { env: { ...workerEnv, ...extraEnv, OC_V5_NOW_EPOCH: String(nowEpoch) }, encoding: 'utf8', timeout: 60_000 },
       )
 
-    // Tick at +15s (< 45s debounce window): MUST NOT dispatch!
-    r = runWorkerTick(minEpoch + 15)
-    assert.equal(r.status, 0, r.stderr)
-    assert.match(r.stdout, /合流防抖窗口中/)
-    assert.equal(existsSync(startsLog), false, 'must not spawn deploy before 45s debounce elapses')
+    const setRuns = (runs: Array<Record<string, unknown>>) => {
+      writeFileSync(ghRespFile, JSON.stringify({ workflow_runs: runs }))
+    }
 
-    // Tick at +46s (>= 45s), BUT governor mode is emergency_stop: MUST pause with clear reason!
-    writeFileSync(modeFile, JSON.stringify({ mode: 'emergency_stop', reason: 'operator-halt' }))
-    r = runWorkerTick(minEpoch + 46)
+    // Tick 1 (+15s): inside 45s debounce -> stays registered, 0 trains
+    setRuns([
+      { id: 1, name: 'V5 selfhost gates', path: '.github/workflows/v5-selfhost-gates.yml', head_sha: c2, event: 'push', status: 'queued', conclusion: null, created_at: '2026-11-26T10:00:00Z' },
+    ])
+    r = tick(minEpoch + 15)
     assert.equal(r.status, 0, r.stderr)
-    assert.match(r.stdout, /emergency_stop.*operator-halt/)
-    assert.equal(existsSync(startsLog), false, 'emergency_stop must block worker dispatch')
+    assert.equal(sqlVal('SELECT status FROM lease;'), 'registered')
+    assert.equal(sqlVal('SELECT COUNT(*) FROM train;'), '0')
 
-    // Lift emergency_stop to autonomous and tick at +46s -> coalesced single train launches targeting c2!
-    writeFileSync(modeFile, JSON.stringify({ mode: 'autonomous', reason: 'resumed' }))
-    r = runWorkerTick(minEpoch + 46)
+    // Tick 2 (+50s): CI queued -> pending! MUST NOT create train, MUST keep ride registered!
+    r = tick(minEpoch + 50)
     assert.equal(r.status, 0, r.stderr)
-    assert.match(r.stdout, /合流防抖窗口已满/)
-    const lines = readFileSync(startsLog, 'utf8').trim().split('\n')
-    assert.equal(lines.length, 1, 'both rides must coalesce into 1 single train')
-    assert.match(lines[0]!, new RegExp(`--target-sha=${c2}`))
+    assert.match(r.stdout, /CI 仍在运行\/排队/)
+    assert.equal(sqlVal('SELECT status FROM lease;'), 'registered', 'queued CI must keep ride registered')
+    assert.equal(sqlVal('SELECT COUNT(*) FROM train;'), '0', 'queued CI must NOT create train')
 
-    // Now test planned-phase auto fast-forward to latest pushed CI-green SHA (skipping ungreen tip):
-    // Clone pushWt, push c3 (CI green) and c4 (CI NOT green) to origin while wt stays at c2.
+    // Tick 3 (+80s): CI in_progress -> pending! MUST keep ride registered!
+    setRuns([
+      { id: 1, name: 'V5 selfhost gates', path: '.github/workflows/v5-selfhost-gates.yml', head_sha: c2, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+      { id: 2, name: 'V5 selfhost release gates', path: '.github/workflows/v5-selfhost-release-gates.yml', head_sha: c2, event: 'push', status: 'in_progress', conclusion: null, created_at: '2026-11-26T10:01:00Z' },
+      { id: 3, name: 'V5 selfhost commercial', path: '.github/workflows/v5-selfhost-commercial.yml', head_sha: c2, event: 'push', status: 'queued', conclusion: null, created_at: '2026-11-26T10:01:00Z' },
+    ])
+    r = tick(minEpoch + 80)
+    assert.equal(r.status, 0, r.stderr)
+    assert.equal(sqlVal('SELECT status FROM lease;'), 'registered', 'in_progress CI must keep ride registered')
+    assert.equal(sqlVal('SELECT COUNT(*) FROM train;'), '0')
+
+    // Tick 4 (+110s): workflow_dispatch green ONLY for commercial -> MUST REJECT untrusted event!
+    setRuns([
+      { id: 1, name: 'V5 selfhost gates', path: '.github/workflows/v5-selfhost-gates.yml', head_sha: c2, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+      { id: 2, name: 'V5 selfhost release gates', path: '.github/workflows/v5-selfhost-release-gates.yml', head_sha: c2, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:01:00Z' },
+      { id: 3, name: 'V5 selfhost commercial', path: '.github/workflows/v5-selfhost-commercial.yml', head_sha: c2, event: 'workflow_dispatch', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:02:00Z' },
+    ])
+    r = tick(minEpoch + 110)
+    assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stdout, /ignored untrusted event=workflow_dispatch/)
+    assert.equal(sqlVal('SELECT COUNT(*) FROM train;'), '0', 'workflow_dispatch MUST NOT unlock train dispatch')
+    assert.equal(sqlVal('SELECT status FROM lease;'), 'registered')
+
+    // Tick 4b: Pending beyond grace -> pending_timeout alert emitted, still NOT marked failed!
+    r = tick(minEpoch + 3000, { OC_V5_CI_PENDING_GRACE_SEC: '2700' })
+    assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stdout, /CI pending 超出宽限/)
+    assert.equal(sqlVal('SELECT status FROM lease;'), 'registered', 'pending timeout must stay distinct from terminal red')
+    assert.equal(sqlVal('SELECT COUNT(*) FROM train;'), '0')
+
+    // Tick 4c: Terminal CI failure -> clear terminal red logged, NO doomed deploy spawned!
+    setRuns([
+      { id: 1, name: 'V5 selfhost gates', path: '.github/workflows/v5-selfhost-gates.yml', head_sha: c2, event: 'push', status: 'completed', conclusion: 'failure', created_at: '2026-11-26T10:03:00Z' },
+      { id: 2, name: 'V5 selfhost release gates', path: '.github/workflows/v5-selfhost-release-gates.yml', head_sha: c2, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:01:00Z' },
+      { id: 3, name: 'V5 selfhost commercial', path: '.github/workflows/v5-selfhost-commercial.yml', head_sha: c2, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:02:00Z' },
+    ])
+    r = tick(minEpoch + 120)
+    assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stdout, /必需 CI 终态失败/)
+    assert.equal(sqlVal('SELECT COUNT(*) FROM train;'), '0', 'terminal CI failure must NOT spawn doomed deploy')
+
+    // Tick 5 (+140s): All 3 required workflows green on trusted push/pull_request -> DISPATCHED!
+    setRuns([
+      { id: 10, name: 'V5 selfhost gates', path: '.github/workflows/v5-selfhost-gates.yml', head_sha: c2, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:05:00Z' },
+      { id: 11, name: 'V5 selfhost release gates', path: '.github/workflows/v5-selfhost-release-gates.yml', head_sha: c2, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:05:00Z' },
+      { id: 12, name: 'V5 selfhost commercial', path: '.github/workflows/v5-selfhost-commercial.yml', head_sha: c2, event: 'pull_request', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:05:00Z' },
+    ])
+    r = tick(minEpoch + 140)
+    assert.equal(r.status, 0, r.stderr)
+    assert.equal(sqlVal('SELECT COUNT(*) FROM train;'), '1', 'green CI must dispatch 1 train')
+
+    // Wait briefly for fakeDeploy background process to finish commit
+    for (let i = 0; i < 40; i++) {
+      if (sqlVal('SELECT status FROM train;') === 'committed') break
+      spawnSync('sleep', ['0.05'])
+    }
+    assert.equal(sqlVal('SELECT status FROM train;'), 'committed')
+    assert.equal(readFileSync(startsLog, 'utf8').trim().split('\n').length, 1)
+
+    // Tick 6: Settle -> SAME ride transitions to satisfied with ZERO re-registration!
+    r = tick(minEpoch + 170)
+    assert.equal(r.status, 0, r.stderr)
+    assert.equal(sqlVal(`SELECT status FROM lease WHERE id='${rideId}';`), 'satisfied')
+    assert.equal(sqlVal('SELECT COUNT(*) FROM lease;'), '1', 'zero re-registration required')
+
+    // ── Safe FF CAS tests ──
     execFileSync('git', ['clone', '-q', '-b', 'feat/v5-selfhost', origin, pushWt], { env: sb.env })
     g(pushWt, 'config', 'user.name', 'worker-test')
     g(pushWt, 'config', 'user.email', 'worker-test@example.invalid')
-    const c3 = mk(pushWt, 'c3-green')
-    const c4 = mk(pushWt, 'c4-red')
+    const c3 = mk(pushWt, 'c3-old-green')
+    const c4 = mk(pushWt, 'c4-new-tip')
     g(pushWt, 'push', '-q', 'origin', 'feat/v5-selfhost')
 
-    // Seed a clean planned train at c2 plus an extra ride wanting c3
     const trainId = 'tr-20261126T120000Z-abcdef123456'
-    execFileSync(
-      'sqlite3',
-      [
-        db,
-        `DELETE FROM train;
-         INSERT INTO train(id,resource,target_sha,status,owner,created_at,updated_at)
-           VALUES('${trainId}','deploy:selfhost','${c2}','planned','worker:test','2026-11-26T12:00:00Z','2026-11-26T12:00:00Z');
-         INSERT INTO lease(id,resource,mode,status,owner,owner_uid,want_sha,created_at,updated_at)
-           VALUES('ls-20261126T120001Z-111111111111','deploy:selfhost','ride','registered','a3','3','${c3}','2026-11-26T12:00:01Z','2026-11-26T12:00:01Z');`,
-      ],
-    )
+    execFileSync('sqlite3', [
+      db,
+      `DELETE FROM train; DELETE FROM event;
+       INSERT INTO train(id,resource,target_sha,status,owner,created_at,updated_at)
+         VALUES('${trainId}','deploy:selfhost','${c2}','planned','worker:test','2026-11-26T12:00:00Z','2026-11-26T12:00:00Z');`,
+    ])
 
-    // Invoke worker_planned_fast_forward_green_tip where only c3 is CI-green (c4 is red/pending)
-    const ffRes = runBash(
-      [
-        `source ${q(LEASE_LIB)}`,
-        `source ${q(DEBOUNCE_LIB)}`,
-        'RESOURCE=deploy:selfhost; ACTOR=worker:test',
-        'wlog() { echo "$*"; }',
-        // Extract real canonical_fast_forward from v5-lease-worker.sh
-        readFileSync(LEASE_WORKER, 'utf8').match(/^canonical_fast_forward\(\) \{[\s\S]*?^\}/m)![0],
-        `tip=${q(c2)}`,
-        `worker_planned_fast_forward_green_tip ${q(trainId)} tip`,
-        'echo "FINAL_TIP=$tip"',
-      ].join('\n'),
-      {
-        ...workerEnv,
-        OC_V5_WORKER_CI_CHECK_CMD: `[[ "$1" == "${c3}" ]]`,
-      },
-    )
-    assert.equal(ffRes.status, 0, ffRes.stderr + ffRes.stdout)
-    assert.match(ffRes.stdout, new RegExp(`FINAL_TIP=${c3}`), 'must fast-forward to newest CI-green c3 and skip red c4')
-    assert.match(ffRes.stdout, /planned 自动快进.*合并覆盖祖先 rides=3/)
-    assert.equal(g(wt, 'rev-parse', 'HEAD'), c3, 'canonical worktree HEAD must fast-forward to c3')
-    const dbTarget = execFileSync('sqlite3', ['-noheader', db, `SELECT target_sha FROM train WHERE id='${trainId}';`], { encoding: 'utf8' }).trim()
-    assert.equal(dbTarget, c3, 'train.target_sha in lease.db must update to c3')
-    const evCount = execFileSync('sqlite3', ['-noheader', db, `SELECT COUNT(*) FROM event WHERE subject_id='${trainId}' AND event='train-fast-forward';`], { encoding: 'utf8' }).trim()
-    assert.equal(evCount, '1', 'train-fast-forward event must be recorded')
+    const runFf = (ciStatusCmd: string) =>
+      runBash(
+        [
+          `source ${q(LEASE_LIB)}`,
+          `source ${q(DEBOUNCE_LIB)}`,
+          'RESOURCE=deploy:selfhost; ACTOR=worker:test',
+          'wlog() { echo "$*"; }',
+          extractBashFn(readFileSync(LEASE_WORKER, 'utf8'), 'canonical_fast_forward'),
+          `tip=${q(c2)}`,
+          `worker_planned_fast_forward_green_tip ${q(trainId)} tip`,
+          'echo "FINAL_TIP=$tip"',
+        ].join('\n'),
+        { ...workerEnv, OC_V5_WORKER_CI_STATUS_CMD: ciStatusCmd },
+      )
+
+    // FF-1: Remote tip is c4 (pending) while older c3 is green -> MUST NOT pick non-tip c3!
+    r = runFf(`if [[ "$1" == "${c3}" ]]; then echo "success"; else echo "pending"; fi`)
+    assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stdout, new RegExp(`FINAL_TIP=${c2}`), 'must NOT select older green c3 when remote tip is c4')
+    assert.match(r.stdout, /禁止反选非 tip 旧绿提交/)
+    assert.equal(sqlVal(`SELECT target_sha FROM train WHERE id='${trainId}';`), c2)
+    assert.equal(sqlVal(`SELECT COUNT(*) FROM event WHERE event='train-fast-forward';`), '0')
+
+    // FF-2: Concurrent CAS conflict (status changed to 'building' before UPDATE) -> changes()==0 aborts, NO event, NO memory mutation!
+    execFileSync('sqlite3', [db, `UPDATE train SET status='building' WHERE id='${trainId}';`])
+    r = runFf(`echo "success"`)
+    assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stdout, /快进 CAS 失败/)
+    assert.match(r.stdout, new RegExp(`FINAL_TIP=${c2}`), 'CAS failure MUST NOT mutate in-memory tip')
+    assert.equal(sqlVal(`SELECT target_sha FROM train WHERE id='${trainId}';`), c2)
+    assert.equal(sqlVal(`SELECT COUNT(*) FROM event WHERE event='train-fast-forward';`), '0')
+
+    // FF-3: Train back to planned & remote tip c4 is green -> FFs cleanly to c4 with changes()==1!
+    execFileSync('sqlite3', [db, `UPDATE train SET status='planned' WHERE id='${trainId}';`])
+    g(wt, 'reset', '--hard', '-q', c2)
+    r = runFf(`[[ "$1" == "${c4}" ]] && echo "success" || echo "pending"`)
+    assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stdout, new RegExp(`FINAL_TIP=${c4}`), 'must FF to latest green remote tip c4')
+    assert.match(r.stdout, /CAS=1/)
+    assert.equal(g(wt, 'rev-parse', 'HEAD'), c4)
+    assert.equal(sqlVal(`SELECT target_sha FROM train WHERE id='${trainId}';`), c4)
+    assert.equal(sqlVal(`SELECT COUNT(*) FROM event WHERE event='train-fast-forward';`), '1')
   })
 })
 
-describe('6. Static wiring & syntax integrity across all modified scripts', () => {
-  test('all modified bash scripts pass bash -n and deploy/master-lib keep required wiring', () => {
+// ═════════════════════════════════════════════════════════════════════════════
+// B6: Post-Cutover Retention Gate BEFORE committed + Real State Transitions
+//     (Legacy & Policy paths, mid-retention worker tick, rollback -> failed,
+//      rollback fail/unhealthy -> recovery_required)
+// ═════════════════════════════════════════════════════════════════════════════
+describe('B6. Post-cutover retention before committed & real rollback terminal states (NO log stubs)', () => {
+  test('preflight fails closed before live mutation when retention runner is missing', (t) => {
+    const sb = makeSandbox(t, 'ocv5-903-b6-preflight-')
+    const missing = join(sb.dir, 'does-not-exist-run-retention.sh')
+    const r = runBash(
+      [
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        `OC_V5_RETENTION_RUNNER=${q(missing)}`,
+        'v5_selfhost_preflight_retention_runner',
+      ].join('\n'),
+      sb.env,
+    )
+    assert.notEqual(r.status, 0, 'missing retention runner must fail closed before live mutation')
+    assert.match(r.stderr, /切流前预检失败.*禁止缺失时静默当作成功跳过/)
+  })
+
+  test('legacy & user-impact-only policy paths: blocks worker settlement during retention, commits on PASS, marks failed on verified rollback, marks recovery_required on rollback failure', async (t) => {
+    // Local loopback /healthz server with controllable status code
+    let healthzStatus = 200
+    const server = http.createServer((_req, res) => {
+      res.writeHead(healthzStatus, { 'Content-Type': 'application/json' })
+      res.end(healthzStatus === 200 ? '{"ok":true}' : '{"ok":false}')
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const addr = server.address() as { port: number }
+    const healthzUrl = `http://127.0.0.1:${addr.port}/healthz`
+
+    const setupScenario = (name: string, policyMode: boolean) => {
+      const sb = makeSandbox(t, `ocv5-903-b6-${name}-`)
+      const repo = join(sb.dir, 'repo')
+      const releases = join(sb.dir, 'releases')
+      const runDir = join(sb.dir, 'run')
+      const ctrl = join(sb.dir, 'control')
+      const bin = join(sb.dir, 'bin')
+      const policyDir = join(sb.dir, 'policy')
+      const db = join(sb.dir, 'lease.db')
+      const liveLink = join(sb.dir, 'live')
+      const activeCtx = join(policyDir, 'unresolved.json')
+      const survivorState = join(runDir, 'survivor.state')
+      const survivorCommitted = join(runDir, 'survivor.committed')
+      const breakerLog = join(sb.dir, 'breaker.log')
+      const midRetentionWitness = join(sb.dir, 'mid-retention.json')
+      mkdirSync(repo, { recursive: true })
+      mkdirSync(releases, { recursive: true })
+      mkdirSync(runDir, { recursive: true })
+      mkdirSync(ctrl, { recursive: true })
+      mkdirSync(bin, { recursive: true })
+      mkdirSync(policyDir, { recursive: true })
+
+      const g = (...args: string[]) =>
+        execFileSync('git', ['-C', repo, ...args], { env: sb.env, encoding: 'utf8' }).trim()
+      g('init', '-q', '-b', 'feat/v5-selfhost')
+      g('config', 'user.name', 'b6-test')
+      g('config', 'user.email', 'b6-test@example.invalid')
+      writeFileSync(join(repo, 'v.txt'), 'v1\n')
+      g('add', '.')
+      g('commit', '-qm', 'chore(v5): prev')
+      const prevSha = g('rev-parse', 'HEAD')
+      writeFileSync(join(repo, 'v.txt'), 'v2\n')
+      g('commit', '-qam', 'bug(v5): cand')
+      const candSha = g('rev-parse', 'HEAD')
+
+      const prevRel = join(releases, 'rel-prev')
+      const candRel = join(releases, 'rel-cand')
+      mkdirSync(prevRel, { recursive: true })
+      mkdirSync(candRel, { recursive: true })
+      const prevComplete = `${JSON.stringify({ sourceCommit: prevSha })}\n`
+      const candComplete = `${JSON.stringify({ sourceCommit: candSha })}\n`
+      writeFileSync(join(prevRel, '.complete'), prevComplete)
+      writeFileSync(join(candRel, '.complete'), candComplete)
+      writeFileSync(join(releases, '.prev-release'), `${prevRel}\n`)
+      // Live currently points to newly flipped candidate (post-smoke, pre-committed!)
+      symlinkSync(candRel, liveLink)
+      writeFileSync(survivorState, 'phase=smoked\nexecutor_pid=999999999\nbackup_dir=/tmp/b\narmed_at=x\n')
+
+      const govBin = join(bin, 'oc-governor')
+      writeFileSync(govBin, `#!/usr/bin/env bash\necho "$*" >> ${q(breakerLog)}\nexit 0\n`)
+      chmodSync(govBin, 0o755)
+
+      const env: NodeJS.ProcessEnv = {
+        ...sb.env,
+        OC_V5_LEASE_DB: db,
+        OC_V5_LEASE_LOCK: join(runDir, 'lease-db.lock'),
+        OC_V5_LEASE_WORKER_LOCK: join(runDir, 'worker.lock'),
+        OC_V5_SELFHOST_DEPLOY_LOCK: join(runDir, 'deploy.lock'),
+        OC_V5_LEASE_REPO_ROOT: repo,
+        OC_V5_LEASE_LIVE_LINK: liveLink,
+        OC_V5_LEASE_SURVIVOR_STATE: survivorState,
+        OC_V5_LEASE_SURVIVOR_COMMITTED: survivorCommitted,
+        OC_V5_LEASE_CUTOVER_GRACE_FILE: join(runDir, 'grace'),
+        OC_V5_RELEASE_POLICY_CONTEXT: activeCtx,
+        OC_V5_GOVERNOR_CONTROL_DIR: ctrl,
+        OC_V5_GOVERNOR_BIN: govBin,
+        OC_V5_RETENTION_SETTLE_SEC: '0',
+        OC_V5_RETENTION_HEALTHZ_URL: healthzUrl,
+        MASTER_LIVE_LINK: liveLink,
+        MASTER_RELEASES_ROOT: releases,
+        SURVIVOR_STATE: survivorState,
+        SURVIVOR_COMMITTED: survivorCommitted,
+      }
+
+      // Initialize real SQLite schema via real v5-lease-lib.sh
+      const initR = runBash(`source ${q(LEASE_LIB)}; lease_init_db`, env)
+      assert.equal(initR.status, 0, initR.stderr)
+
+      const trainId = 'tr-20261126T150000Z-111122223333'
+      const rideId = 'ls-20261126T150000Z-444455556666'
+      const nonce = 'b6-nonce-903'
+      const stamp = '2026-11-26T15:00:00Z'
+
+      let targetStackDigest = ''
+      if (policyMode) {
+        // Seed real unresolved.json via real scripts/lib/v5-release-policy.py!
+        const req = {
+          edition: 'selfhost',
+          operationId: trainId,
+          candidateSha: candSha,
+          owner: { deploymentId: trainId, nonce },
+          before: {
+            masterRelease: prevRel,
+            currentTarget: 'bundles/prev',
+            tuple: { OC_RUNTIME_IMAGE: 'img', OC_RUNTIME_IMAGE_ID: `sha256:${'a'.repeat(64)}`, OC_RUNTIME_RELEASE: '/r/prev', OC_PLATFORM_BUNDLE: '/b/prev' },
+            sourceCommit: prevSha,
+            sourceDigest: createHash('sha256').update(prevComplete).digest('hex'),
+            port: addr.port,
+          },
+          target: {
+            masterRelease: candRel,
+            currentTarget: 'bundles/cand',
+            tuple: { OC_RUNTIME_IMAGE: 'img', OC_RUNTIME_IMAGE_ID: `sha256:${'a'.repeat(64)}`, OC_RUNTIME_RELEASE: '/r/cand', OC_PLATFORM_BUNDLE: '/b/cand' },
+            sourceCommit: candSha,
+            sourceDigest: createHash('sha256').update(candComplete).digest('hex'),
+            port: addr.port,
+          },
+          history: { path: join(sb.dir, 'history.jsonl'), predecessorSha256: createHash('sha256').update('').digest('hex'), transitionKind: 'joint' },
+        }
+        const pyRes = spawnSync(
+          'python3',
+          [
+            '-c',
+            `
+import importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location('rp', sys.argv[1])
+rp = importlib.util.module_from_spec(spec); spec.loader.exec_module(rp)
+active = pathlib.Path(sys.argv[2])
+req = json.loads(sys.argv[3])
+rp.prepare(active, req)
+d = rp.stack_digest(req['target'])
+rp.checkpoint(active, req['operationId'], {'phase': 'exposure-armed', 'mayHaveServed': True, 'observations': {
+  'identity': 'exact', 'service': 'usable', 'authority': 'unobserved', 'allRequiredPassed': True,
+  'lineageCoherent': True, 'verifiedDirection': 'target', 'verifiedStackSha256': d,
+}})
+print(d)
+`,
+            RELEASE_POLICY_PY,
+            activeCtx,
+            JSON.stringify(req),
+          ],
+          { env, encoding: 'utf8' },
+        )
+        assert.equal(pyRes.status, 0, pyRes.stderr)
+        targetStackDigest = pyRes.stdout.trim()
+      }
+
+      const evDoc = policyMode
+        ? {
+            releasePolicy: { schema: 1, mode: 'user-impact-only', sourceSha: candSha, leaseIds: [rideId] },
+            releasePolicyOwner: { nonce, pid: 1, startTicks: '1' },
+            releasePolicyAcceptance: {
+              schema: 1,
+              operationId: trainId,
+              candidateSha: candSha,
+              nonce,
+              targetStackSha256: targetStackDigest,
+              resolution: 'forward',
+            },
+          }
+        : { mode: 'legacy' }
+
+      const rideDoc = policyMode
+        ? {
+            request: { releasePolicy: { schema: 1, mode: 'user-impact-only', sourceSha: candSha } },
+            releasePolicyBinding: { schema: 1, trainId, sourceSha: candSha },
+          }
+        : {}
+
+      execFileSync('sqlite3', [
+        db,
+        `INSERT INTO train(id,resource,target_sha,status,owner,executor_pid,rel_path,evidence_json,created_at,updated_at)
+           VALUES('${trainId}','deploy:selfhost','${candSha}','building','worker:test',1,'${candRel}','${JSON.stringify(evDoc)}','${stamp}','${stamp}');
+         INSERT INTO lease(id,resource,mode,status,owner,owner_uid,want_sha,result_json,created_at,updated_at)
+           VALUES('${rideId}','deploy:selfhost','ride','registered','agent-b6','3','${candSha}','${JSON.stringify(rideDoc)}','${stamp}','${stamp}');`,
+      ])
+
+      const sql = (qStr: string) => execFileSync('sqlite3', ['-noheader', db, qStr], { encoding: 'utf8' }).trim()
+
+      // Build a retention runner that ALSO runs a REAL `v5-lease-worker.sh` `settle_rides` tick MID-RETENTION!
+      const makeRunner = (exitCode: number) => {
+        const runner = join(bin, `run-retention-${exitCode}.sh`)
+        writeFileSync(
+          runner,
+          [
+            '#!/usr/bin/env bash',
+            'set -euo pipefail',
+            // Execute REAL worker settle_rides tick right in the middle of retention!
+            `bash -euo pipefail -c 'source ${q(LEASE_WORKER)}; settle_rides' >/dev/null 2>&1 || true`,
+            `phase="$(sed -n 's/^phase=//p' ${q(survivorState)} | head -1)"`,
+            `train_st="$(sqlite3 -noheader ${q(db)} "SELECT status FROM train WHERE id='${trainId}';")"`,
+            `ride_st="$(sqlite3 -noheader ${q(db)} "SELECT status FROM lease WHERE id='${rideId}';")"`,
+            `active_exists=0; [[ -e ${q(activeCtx)} ]] && active_exists=1`,
+            `jq -cn --arg p "$phase" --arg t "$train_st" --arg r "$ride_st" --argjson a "$active_exists" '{phase:$p,trainStatus:$t,rideStatus:$r,activeContextPresent:($a==1)}' > ${q(midRetentionWitness)}`,
+            `exit ${exitCode}`,
+          ].join('\n'),
+        )
+        chmodSync(runner, 0o755)
+        return runner
+      }
+
+      return {
+        sb,
+        repo,
+        releases,
+        prevRel,
+        candRel,
+        prevSha,
+        candSha,
+        liveLink,
+        activeCtx,
+        survivorState,
+        survivorCommitted,
+        breakerLog,
+        midRetentionWitness,
+        db,
+        trainId,
+        rideId,
+        nonce,
+        env,
+        sql,
+        makeRunner,
+      }
+    }
+
+    const runCutoverRetentionAndFinalize = async (
+      sc: ReturnType<typeof setupScenario>,
+      opts: { policyMode: boolean; runner: string; rollbackCmd: string },
+    ) => {
+      // Run REAL retention gate + REAL finalize/state transitions using REAL v5-lease-lib.sh + REAL v5-selfhost-release-policy.sh!
+      return runBashAsync(
+        [
+          `SCRIPT_DIR=${q(join(REPO_ROOT, 'scripts'))}`,
+          `REPO_ROOT=${q(sc.repo)}`,
+          `source ${q(LEASE_LIB)}`,
+          `source ${q(RELEASE_POLICY_LIB)}`,
+          `source ${q(TRAIN_GUARDS_LIB)}`,
+          'log() { echo "$*"; }',
+          'cutover_clog() { echo "$*"; }',
+          'die() { echo "✗ $*" >&2; exit 1; }',
+          'tsum_note() { :; }',
+          'deploy_alert() { :; }',
+          'cutover_persist_phase() { printf "phase=%s\\nexecutor_pid=%s\\n" "$1" "$$" >"$SURVIVOR_STATE"; }',
+          'cutover_disarm_survivor() { printf "phase=committed\\nexecutor_pid=%s\\n" "$$" >"$SURVIVOR_STATE"; printf "committed_at=now\\n" >"$SURVIVOR_COMMITTED"; }',
+          // Bind real owner PID in SQLite so real release_policy_require_owner / lease_train_finish guards succeed
+          `sqlite3 ${q(sc.db)} "UPDATE train SET executor_pid=$$ WHERE id='${sc.trainId}';"`,
+          opts.policyMode
+            ? `RELEASE_POLICY_MODE=user-impact-only; RELEASE_POLICY_OPERATION=${q(sc.trainId)}; RELEASE_POLICY_NONCE=${q(sc.nonce)}; RELEASE_POLICY_CLAIMED=1; release_policy_require_owner() { return 0; }`
+            : 'RELEASE_POLICY_MODE=""',
+          `LEASE_TRAIN_ID=${q(sc.trainId)}`,
+          `LEASE_TARGET_SHA=${q(sc.candSha)}`,
+          'LEASE_TRAIN_ACTIVE=1',
+          'CUTOVER_MUTATED=1',
+          `CUTOVER_PREV_LIVE=${q(sc.prevRel)}`,
+          `CUTOVER_REL=${q(sc.candRel)}`,
+          `OC_V5_RETENTION_RUNNER=${q(opts.runner)}`,
+          `OC_V5_RETENTION_ROLLBACK_CMD=${q(opts.rollbackCmd)}`,
+          // Exact post-smoke -> retention -> finalize order matching cmd_cutover!
+          `v5_selfhost_post_cutover_retention_gate ${q(sc.candRel)} ${q(sc.candSha)} || exit $?`,
+          // Only reached if retention PASSED (exit 0)!
+          'cutover_persist_phase committed',
+          'cutover_disarm_survivor',
+          `lease_train_finish committed "cutover committed live=${sc.candRel}"`,
+          opts.policyMode ? 'release_policy_py resolve forward' : ':',
+        ].join('\n'),
+        sc.env,
+      )
+    }
+
+    // ── Case 1 & 2: Retention PASS in BOTH legacy and user-impact-only policy paths ──
+    for (const policyMode of [false, true]) {
+      healthzStatus = 200
+      const sc = setupScenario(policyMode ? 'policy-pass' : 'legacy-pass', policyMode)
+      const runner = sc.makeRunner(0)
+      const r = await runCutoverRetentionAndFinalize(sc, {
+        policyMode,
+        runner,
+        rollbackCmd: 'exit 99',
+      })
+      assert.equal(r.status, 0, `${policyMode ? 'policy' : 'legacy'} PASS failed: ${r.stderr}\n${r.stdout}`)
+
+      // Verify mid-retention snapshot: worker tick ran DURING retention and DID NOT settle ride!
+      const mid = JSON.parse(readFileSync(sc.midRetentionWitness, 'utf8'))
+      assert.equal(mid.phase, 'verifying', 'phase MUST be verifying during retention')
+      assert.equal(mid.trainStatus, 'cutover', 'train MUST NOT be committed during retention')
+      assert.equal(mid.rideStatus, 'registered', 'worker tick during retention MUST NOT settle ride to satisfied!')
+      if (policyMode) {
+        assert.equal(mid.activeContextPresent, true, 'policy unresolved.json MUST remain present during retention')
+      }
+
+      // After retention PASS + finalize: train is committed, policy resolved forward, next worker tick settles ride!
+      assert.equal(sc.sql(`SELECT status FROM train WHERE id='${sc.trainId}';`), 'committed')
+      if (policyMode) {
+        assert.equal(existsSync(sc.activeCtx), false, 'unresolved.json must be resolved after retention PASS')
+      }
+      const settleR = runBash(`source ${q(LEASE_WORKER)}; settle_rides`, sc.env)
+      assert.equal(settleR.status, 0, settleR.stderr)
+      assert.equal(sc.sql(`SELECT status FROM lease WHERE id='${sc.rideId}';`), 'satisfied')
+    }
+
+    // ── Case 3: Retention FAIL + Rollback SUCCEEDS & old live verified healthy (BOTH legacy & policy) ──
+    for (const policyMode of [false, true]) {
+      healthzStatus = 200
+      const sc = setupScenario(policyMode ? 'policy-rb-ok' : 'legacy-rb-ok', policyMode)
+      const runner = sc.makeRunner(1)
+      // Rollback command flips live back to prevRel
+      const r = await runCutoverRetentionAndFinalize(sc, {
+        policyMode,
+        runner,
+        rollbackCmd: `ln -sfn ${q(sc.prevRel)} ${q(sc.liveLink)}`,
+      })
+      assert.notEqual(r.status, 0, 'retention failure must exit non-zero')
+      assert.equal(realpathSync(sc.liveLink), realpathSync(sc.prevRel), 'live must be rolled back to prevRel')
+      assert.equal(
+        sc.sql(`SELECT status FROM train WHERE id='${sc.trainId}';`),
+        'failed',
+        `original train MUST end in failed (NEVER committed!) for ${policyMode ? 'policy' : 'legacy'}`,
+      )
+      assert.equal(sc.sql(`SELECT status FROM lease WHERE id='${sc.rideId}';`), 'registered')
+      assert.match(readFileSync(sc.breakerLog, 'utf8'), new RegExp(`trip-breaker --train ${sc.trainId}`))
+    }
+
+    // ── Case 4a: Retention FAIL + Rollback FAILS (rc!=0) -> recovery_required & forward dispatch paused! ──
+    for (const policyMode of [false, true]) {
+      healthzStatus = 200
+      const sc = setupScenario(policyMode ? 'policy-rb-fail' : 'legacy-rb-fail', policyMode)
+      const runner = sc.makeRunner(1)
+      const r = await runCutoverRetentionAndFinalize(sc, {
+        policyMode,
+        runner,
+        rollbackCmd: 'echo "ROLLBACK-CRASHED" >&2; exit 2',
+      })
+      assert.equal(r.status, 79, 'rollback failure must exit 79 (recovery_required)')
+      assert.equal(
+        sc.sql(`SELECT status FROM train WHERE id='${sc.trainId}';`),
+        'recovery_required',
+        `failed rollback MUST transition original train to recovery_required (${policyMode ? 'policy' : 'legacy'})`,
+      )
+      assert.match(readFileSync(sc.survivorState, 'utf8'), /^phase=compensate-failed/m)
+      assert.equal(existsSync(join(sc.releases, '.manual-recovery-required')), true)
+      assert.equal(sc.sql("SELECT COUNT(*) FROM outbox WHERE kind='train_alert';"), '1')
+      // Verify worker settle_rides CANNOT settle ride AND dispatch_train is blocked by recovery_required!
+      const workerCheck = runBash(
+        `source ${q(LEASE_WORKER)}; lease_deploy_process_running() { return 1; }; settle_rides; dispatch_train`,
+        { ...sc.env, OC_V5_AUTORECOVER: 'off', OC_V5_TRAIN_DEBOUNCE_SEC: '0' },
+      )
+      assert.equal(workerCheck.status, 0, workerCheck.stderr)
+      assert.equal(sc.sql(`SELECT status FROM lease WHERE id='${sc.rideId}';`), 'registered')
+      assert.equal(sc.sql('SELECT COUNT(*) FROM train;'), '1', 'recovery_required MUST block new forward trains')
+    }
+
+    // ── Case 4b: Rollback exits 0 BUT old live /healthz is 500 (unhealthy) -> recovery_required! ──
+    {
+      healthzStatus = 200
+      const sc = setupScenario('rb-unhealthy', false)
+      // Runner flips healthz to fail right after retention fails by using a custom verify cmd returning 1
+      const runner = sc.makeRunner(1)
+      const r = await runBashAsync(
+        [
+          `SCRIPT_DIR=${q(join(REPO_ROOT, 'scripts'))}`,
+          `REPO_ROOT=${q(sc.repo)}`,
+          `source ${q(LEASE_LIB)}`,
+          `source ${q(RELEASE_POLICY_LIB)}`,
+          `source ${q(TRAIN_GUARDS_LIB)}`,
+          'log() { echo "$*"; }; cutover_clog() { echo "$*"; }; die() { echo "✗ $*" >&2; exit 1; }',
+          'tsum_note() { :; }; deploy_alert() { :; }',
+          'cutover_persist_phase() { printf "phase=%s\\n" "$1" >"$SURVIVOR_STATE"; }',
+          'cutover_disarm_survivor() { printf "phase=committed\\n" >"$SURVIVOR_STATE"; }',
+          `LEASE_TRAIN_ID=${q(sc.trainId)}; LEASE_TARGET_SHA=${q(sc.candSha)}; LEASE_TRAIN_ACTIVE=1; CUTOVER_MUTATED=1`,
+          `CUTOVER_PREV_LIVE=${q(sc.prevRel)}; CUTOVER_REL=${q(sc.candRel)}`,
+          `OC_V5_RETENTION_RUNNER=${q(runner)}`,
+          `OC_V5_RETENTION_ROLLBACK_CMD=${q(`ln -sfn ${q(sc.prevRel)} ${q(sc.liveLink)}`)}`,
+          'OC_V5_RETENTION_ROLLBACK_VERIFY_CMD="exit 1"',
+          `v5_selfhost_post_cutover_retention_gate ${q(sc.candRel)} ${q(sc.candSha)}`,
+        ].join('\n'),
+        sc.env,
+      )
+      assert.equal(r.status, 79)
+      assert.equal(sc.sql(`SELECT status FROM train WHERE id='${sc.trainId}';`), 'recovery_required')
+    }
+  })
+})
+
+// ═════════════════════════════════════════════════════════════════════════════
+// B7 (+ Non-blocker 2): Shared Forward Cutover Guard Boundary, Physical
+// oc-governor check-blast-radius, Trusted 3-Workflow CI Green & Trailer Escape
+// ═════════════════════════════════════════════════════════════════════════════
+describe('B7. Shared forward cutover guard boundary, physical blast-radius & trusted CI events', () => {
+  test('enforces governor mode, real oc-governor check-blast-radius (commercial branch, DDL, billing + voucher), trusted 3-workflow CI, and rollback exemption', (t) => {
+    const f = makeTempGitRepo(t)
+    const govRoot = join(f.dir, 'governor')
+    const ctrl = join(govRoot, 'control')
+    const bin = join(f.dir, 'bin')
+    const modeFile = join(ctrl, 'mode.json')
+    const ghResp = join(f.dir, 'gh.json')
+    const ghStub = join(bin, 'gh')
+    const retentionStub = join(bin, 'run-retention.sh')
+    mkdirSync(ctrl, { recursive: true })
+    mkdirSync(bin, { recursive: true })
+
+    writeFileSync(ghStub, `#!/usr/bin/env bash\ncat ${q(ghResp)}\n`)
+    chmodSync(ghStub, 0o755)
+    writeFileSync(retentionStub, '#!/usr/bin/env bash\nexit 0\n')
+    chmodSync(retentionStub, 0o755)
+
+    // Base commit
+    writeFileSync(join(f.repo, 'README.md'), 'base\n')
+    f.git('add', '.')
+    f.git('commit', '-qm', 'chore(v5): base')
+    const baseSha = f.git('rev-parse', 'HEAD')
+
+    // Clean bugfix commit
+    writeFileSync(join(f.repo, 'README.md'), 'clean bugfix\n')
+    f.git('commit', '-qam', 'bug(v5): clean fix')
+    const cleanSha = f.git('rev-parse', 'HEAD')
+
+    // Feature commit (blocked in debt_first)
+    writeFileSync(join(f.repo, 'README.md'), 'new feat\n')
+    f.git('commit', '-qam', 'feat(v5): shiny new feature')
+    const featSha = f.git('rev-parse', 'HEAD')
+
+    // Billing core commit (blocked by oc-governor check-blast-radius without voucher!)
+    f.git('checkout', '-q', cleanSha)
+    mkdirSync(join(f.repo, 'packages/commercial/src/billing'), { recursive: true })
+    writeFileSync(join(f.repo, 'packages/commercial/src/billing/ledger.ts'), 'export const x = 1\n')
+    f.git('add', '.')
+    f.git('commit', '-qm', 'bug(v5): touch billing ledger')
+    const billingSha = f.git('rev-parse', 'HEAD')
+
+    // Destructive DDL migration commit (blocked by oc-governor check-blast-radius without voucher!)
+    f.git('checkout', '-q', cleanSha)
+    mkdirSync(join(f.repo, 'packages/commercial/src/db/migrations'), { recursive: true })
+    writeFileSync(
+      join(f.repo, 'packages/commercial/src/db/migrations/9999_drop.sql'),
+      'DROP TABLE old_sessions;\n',
+    )
+    f.git('add', '.')
+    f.git('commit', '-qm', 'bug(v5): destructive drop migration')
+    const ddlSha = f.git('rev-parse', 'HEAD')
+
+    const setAllGreen = (sha: string, event = 'push') => {
+      writeFileSync(
+        ghResp,
+        JSON.stringify({
+          workflow_runs: [
+            { id: 1, name: 'V5 selfhost gates', path: '.github/workflows/v5-selfhost-gates.yml', head_sha: sha, event, status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+            { id: 2, name: 'V5 selfhost release gates', path: '.github/workflows/v5-selfhost-release-gates.yml', head_sha: sha, event, status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+            { id: 3, name: 'V5 selfhost commercial', path: '.github/workflows/v5-selfhost-commercial.yml', head_sha: sha, event, status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+          ],
+        }),
+      )
+    }
+
+    const runGuards = (sha: string, extra = '', branch = 'feat/v5-selfhost') =>
+      runBash(
+        [
+          `source ${q(TRAIN_GUARDS_LIB)}`,
+          `REPO_ROOT=${q(f.repo)}`,
+          `OC_GOVERNOR_ROOT=${q(govRoot)}`,
+          `OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
+          `OC_V5_GOVERNOR_MODE_FILE=${q(modeFile)}`,
+          `OC_V5_GOVERNOR_BIN=${q(OC_GOVERNOR)}`,
+          `OC_V5_GH_BIN=${q(ghStub)}`,
+          'OC_V5_GH_REPO=dream-star-end/openclaude',
+          `OC_V5_RETENTION_RUNNER=${q(retentionStub)}`,
+          extra,
+          `v5_selfhost_enforce_forward_cutover_guards ${q(sha)} ${q(baseSha)} ${q(branch)}`,
+        ].join('\n'),
+        f.env,
+      )
+
+    // 1. Clean commit + autonomous + 3 trusted CI green -> PASS
+    writeFileSync(modeFile, JSON.stringify({ mode: 'autonomous', reason: 'ok' }))
+    setAllGreen(cleanSha, 'push')
+    let r = runGuards(cleanSha)
+    assert.equal(r.status, 0, r.stderr + r.stdout)
+
+    // 2. workflow_dispatch green ONLY -> REJECTED!
+    setAllGreen(cleanSha, 'workflow_dispatch')
+    r = runGuards(cleanSha)
+    assert.notEqual(r.status, 0, 'workflow_dispatch MUST be rejected')
+    assert.match(r.stderr, /rejected untrusted event\(s\)=workflow_dispatch/)
+
+    // 3. Missing 3rd default workflow (V5 selfhost commercial) -> REJECTED!
+    writeFileSync(
+      ghResp,
+      JSON.stringify({
+        workflow_runs: [
+          { id: 1, name: 'V5 selfhost gates', path: '.github/workflows/v5-selfhost-gates.yml', head_sha: cleanSha, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+          { id: 2, name: 'V5 selfhost release gates', path: '.github/workflows/v5-selfhost-release-gates.yml', head_sha: cleanSha, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+        ],
+      }),
+    )
+    r = runGuards(cleanSha)
+    assert.notEqual(r.status, 0, 'missing V5 selfhost commercial workflow must fail closed')
+    assert.match(r.stderr, /V5 selfhost commercial: missing/)
+
+    // 4. Spoofed workflow display name with wrong path -> REJECTED!
+    writeFileSync(
+      ghResp,
+      JSON.stringify({
+        workflow_runs: [
+          { id: 1, name: 'V5 selfhost gates', path: '.github/workflows/spoofed.yml', head_sha: cleanSha, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+          { id: 2, name: 'V5 selfhost release gates', path: '.github/workflows/v5-selfhost-release-gates.yml', head_sha: cleanSha, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+          { id: 3, name: 'V5 selfhost commercial', path: '.github/workflows/v5-selfhost-commercial.yml', head_sha: cleanSha, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+        ],
+      }),
+    )
+    r = runGuards(cleanSha)
+    assert.notEqual(r.status, 0, 'spoofed workflow name with wrong path must fail closed')
+
+    // 5. emergency_stop blocks even clean commit
+    setAllGreen(cleanSha, 'push')
+    writeFileSync(modeFile, JSON.stringify({ mode: 'emergency_stop', reason: 'sev1 freeze' }))
+    r = runGuards(cleanSha)
+    assert.notEqual(r.status, 0)
+    assert.match(r.stderr, /emergency_stop/)
+
+    // 6. debt_first blocks feat(...) and allows bug(...)
+    writeFileSync(modeFile, JSON.stringify({ mode: 'debt_first', reason: 'rework high' }))
+    setAllGreen(featSha, 'push')
+    r = runGuards(featSha)
+    assert.notEqual(r.status, 0)
+    assert.match(r.stderr, /debt_first/)
+    setAllGreen(cleanSha, 'push')
+    r = runGuards(cleanSha)
+    assert.equal(r.status, 0, r.stderr)
+
+    // 7. Physical oc-governor check-blast-radius:
+    writeFileSync(modeFile, JSON.stringify({ mode: 'autonomous', reason: 'ok' }))
+    // 7a: Commercial branch hard-lock
+    r = runGuards(cleanSha, '', 'feat/v5-aurora-rewrite')
+    assert.notEqual(r.status, 0, 'commercial branch MUST be hard-locked by oc-governor')
+    assert.match(r.stderr, /COMMERCIAL_BRANCH_HARD_LOCK/)
+
+    // 7b: Unvouchered billing core change blocked!
+    setAllGreen(billingSha, 'push')
+    r = runGuards(billingSha)
+    assert.notEqual(r.status, 0, 'unvouchered billing core edit MUST be blocked')
+    assert.match(r.stderr, /BILLING_CORE_LOCKED/)
+
+    // 7c: Issue valid root voucher -> billing core change allowed!
+    const vRes = spawnSync(
+      'bash',
+      [
+        OC_GOVERNOR,
+        'issue-blast-voucher',
+        '--scope',
+        'billing',
+        '--files',
+        'packages/commercial/src/billing/ledger.ts',
+        '--reason',
+        'OCV5-903 audited billing fix',
+      ],
+      { env: { ...f.env, OC_GOVERNOR_ROOT: govRoot }, encoding: 'utf8' },
+    )
+    assert.equal(vRes.status, 0, vRes.stderr)
+    const voucherId = JSON.parse(vRes.stdout).id
+    r = runGuards(billingSha, `OC_V5_BLAST_VOUCHER=${q(voucherId)}`)
+    assert.equal(r.status, 0, `vouchered billing edit should pass: ${r.stderr}`)
+
+    // 7d: Unvouchered destructive DDL blocked!
+    setAllGreen(ddlSha, 'push')
+    r = runGuards(ddlSha)
+    assert.notEqual(r.status, 0, 'unvouchered destructive DDL MUST be blocked')
+    assert.match(r.stderr, /DESTRUCTIVE_DDL_LOCKED/)
+
+    // 8. Verified rollback (CUTOVER_ROLLBACK=1) takes emergency exemption even under emergency_stop + red CI!
+    writeFileSync(modeFile, JSON.stringify({ mode: 'emergency_stop', reason: 'incident' }))
+    r = runGuards(ddlSha, 'CUTOVER_ROLLBACK=1')
+    assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stdout, /应急回滚豁免/)
+  })
+
+  test('removes OC_V5_SKIP_TRAILER_GATE=1 env escape hatch while allowing exact-SHA host break-glass file', (t) => {
+    const sb = makeSandbox(t, 'ocv5-903-trailer-')
+    const ctrl = join(sb.dir, 'control')
+    mkdirSync(ctrl, { recursive: true })
+    const sha = 'c'.repeat(40)
+    const fnSrc = extractBashFn(readFileSync(DEPLOY_SCRIPT, 'utf8'), 'assert_fix_trailers')
+    const fakeGate = join(sb.dir, 'fake-trailer-gate.sh')
+    writeFileSync(fakeGate, '#!/usr/bin/env bash\necho "TRAILER-GATE-FAILED" >&2\nexit 1\n')
+    chmodSync(fakeGate, 0o755)
+
+    let r = runBash(
+      [
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        'log() { echo "$*"; }; die() { echo "✗ $*" >&2; exit 1; }',
+        `REPO_ROOT=${q(REPO_ROOT)}; FIX_TRAILER_GATE=${q(fakeGate)}; OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
+        fnSrc,
+        `OC_V5_SKIP_TRAILER_GATE=1 assert_fix_trailers ${q(sha)}`,
+      ].join('\n'),
+      sb.env,
+    )
+    assert.notEqual(r.status, 0)
+    assert.match(r.stderr, /OC_V5_SKIP_TRAILER_GATE=1 环境变量逃生口已物理移除/)
+
+    writeFileSync(join(ctrl, `trailer-breakglass-${sha}`), 'p0-outage-root-override\n')
+    r = runBash(
+      [
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        'log() { echo "$*"; }; die() { echo "✗ $*" >&2; exit 1; }',
+        `REPO_ROOT=${q(REPO_ROOT)}; FIX_TRAILER_GATE=${q(fakeGate)}; OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
+        fnSrc,
+        `assert_fix_trailers ${q(sha)}`,
+      ].join('\n'),
+      sb.env,
+    )
+    assert.equal(r.status, 0, r.stderr)
+  })
+})
+
+// ═════════════════════════════════════════════════════════════════════════════
+// B8: Commit-Bound Runtime Image Pin & Rollback Isolation
+// ═════════════════════════════════════════════════════════════════════════════
+describe('B8. Commit-bound runtime image pin & rollback isolation from broken worktree pin', () => {
+  test('reads runtime-image-pin from exact target commit even when dirty worktree pin is corrupt, and enforces full runtimeImagePin schema', (t) => {
+    const f = makeTempGitRepo(t)
+
+    // Historical commit without pin file -> fallback default
+    writeFileSync(join(f.repo, 'a.txt'), 'v0\n')
+    f.git('add', '.')
+    f.git('commit', '-qm', 'chore(v5): pre-pin commit')
+    const legacySha = f.git('rev-parse', 'HEAD')
+
+    // Target commit with valid pin file
+    mkdirSync(join(f.repo, 'deploy/v5'), { recursive: true })
+    const validPin = {
+      schemaVersion: 1,
+      channel: 'v5-selfhost',
+      runtimeImage: 'openclaude/openclaude-runtime:v5-commit-pinned-20261126',
+      previousRuntimeImage: 'openclaude/openclaude-runtime:v5-prev-pinned-20261120',
+      cliVersions: { claudeCode: '2.1.332', codex: '0.172.0' },
+      ticket: 'OCV5-903',
+    }
+    writeFileSync(join(f.repo, 'deploy/v5/runtime-image-pin.json'), `${JSON.stringify(validPin, null, 2)}\n`)
+    f.git('add', '.')
+    f.git('commit', '-qm', 'chore(v5): add valid commit pin')
+    const validSha = f.git('rev-parse', 'HEAD')
+
+    // Bad commit with floating :latest tag -> MUST fail closed!
+    writeFileSync(
+      join(f.repo, 'deploy/v5/runtime-image-pin.json'),
+      JSON.stringify({ ...validPin, runtimeImage: 'openclaude/openclaude-runtime:latest' }),
+    )
+    f.git('commit', '-qam', 'chore(v5): bad latest tag')
+    const latestSha = f.git('rev-parse', 'HEAD')
+
+    // Bad commit with non-allowlisted repo prefix -> MUST fail closed!
+    writeFileSync(
+      join(f.repo, 'deploy/v5/runtime-image-pin.json'),
+      JSON.stringify({ ...validPin, runtimeImage: 'evil.example/pwn:v1' }),
+    )
+    f.git('commit', '-qam', 'chore(v5): bad repo prefix')
+    const evilSha = f.git('rev-parse', 'HEAD')
+
+    // Now CORRUPT the dirty working tree pin file completely!
+    f.git('checkout', '-q', validSha)
+    writeFileSync(join(f.repo, 'deploy/v5/runtime-image-pin.json'), '{{{ BROKEN WORKTREE JSON ; rm -rf /')
+
+    // 1. Commit-bound loader on validSha SUCCEEDS using exact commit pin (ignoring corrupt worktree!)
+    let r = runBash(
+      [
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        `REPO_ROOT=${q(f.repo)}`,
+        `v5_selfhost_load_runtime_image_pin_for_commit ${q(validSha)}`,
+        'printf "%s|%s|%s\\n" "$RUNTIME_IMAGE" "$RUNTIME_IMAGE_PIN_SOURCE" "$RUNTIME_IMAGE_PIN_SHA256"',
+      ].join('\n'),
+      f.env,
+    )
+    assert.equal(r.status, 0, r.stderr)
+    const [img, src, digest] = r.stdout.trim().split('|')
+    assert.equal(img, 'openclaude/openclaude-runtime:v5-commit-pinned-20261126')
+    assert.equal(src, `commit:${validSha}:deploy/v5/runtime-image-pin.json`)
+    assert.match(digest!, /^[0-9a-f]{64}$/)
+
+    // 2. Commit without pin file falls back to built-in default (still ignoring corrupt worktree!)
+    r = runBash(
+      [
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        `REPO_ROOT=${q(f.repo)}`,
+        `v5_selfhost_load_runtime_image_pin_for_commit ${q(legacySha)}`,
+        'printf "%s|%s\\n" "$RUNTIME_IMAGE" "$RUNTIME_IMAGE_PIN_SOURCE"',
+      ].join('\n'),
+      f.env,
+    )
+    assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stdout, new RegExp(`fallback-default:${legacySha}`))
+
+    // 3. :latest and non-allowlisted repo prefix fail closed
+    r = runBash(
+      `source ${q(TRAIN_GUARDS_LIB)}; REPO_ROOT=${q(f.repo)}; v5_selfhost_load_runtime_image_pin_for_commit ${q(latestSha)}`,
+      f.env,
+    )
+    assert.notEqual(r.status, 0, ':latest tag must fail closed')
+    assert.match(r.stderr, /:latest/)
+
+    r = runBash(
+      `source ${q(TRAIN_GUARDS_LIB)}; REPO_ROOT=${q(f.repo)}; v5_selfhost_load_runtime_image_pin_for_commit ${q(evilSha)}`,
+      f.env,
+    )
+    assert.notEqual(r.status, 0, 'untrusted image repo prefix must fail closed')
+    assert.match(r.stderr, /允许的镜像仓库前缀/)
+  })
+
+  test('cmd_rollback resolves historical runtime image BEFORE preflight_common and succeeds even when worktree runtime-image-pin.json is corrupted', (t) => {
+    const f = makeTempGitRepo(t)
+    const releases = join(f.dir, 'releases')
+    const rtReleases = join(f.dir, 'runtime-releases')
+    const bundles = join(f.dir, 'platform/bundles')
+    const envFile = join(f.dir, 'selfhost.env')
+    const historyFile = join(f.dir, 'runtime-tuple.history')
+    const liveLink = join(f.dir, 'live')
+    const witnessLog = join(f.dir, 'rollback-witness.log')
+    mkdirSync(releases, { recursive: true })
+    mkdirSync(rtReleases, { recursive: true })
+    mkdirSync(bundles, { recursive: true })
+
+    // Corrupt working tree runtime-image-pin.json!
+    mkdirSync(join(f.repo, 'deploy/v5'), { recursive: true })
+    writeFileSync(join(f.repo, 'deploy/v5/runtime-image-pin.json'), 'CORRUPT FORWARD WORKTREE PIN {{{')
+
+    const prevSha = '1'.repeat(40)
+    const curSha = '2'.repeat(40)
+    const prevRel = join(releases, 'rel-prev')
+    const curRel = join(releases, 'rel-cur')
+    const prevRt = join(rtReleases, 'rel-rt-prev')
+    const prevBundle = join(bundles, 'b-prev')
+    mkdirSync(prevRel, { recursive: true })
+    mkdirSync(curRel, { recursive: true })
+    mkdirSync(prevRt, { recursive: true })
+    mkdirSync(prevBundle, { recursive: true })
+    writeFileSync(join(prevRel, '.complete'), JSON.stringify({ sourceCommit: prevSha }))
+    writeFileSync(join(curRel, '.complete'), JSON.stringify({ sourceCommit: curSha }))
+    writeFileSync(join(releases, '.prev-release'), `${prevRel}\n`)
+    writeFileSync(envFile, 'COMMERCIAL_AUTO_MIGRATE=0\n')
+    symlinkSync(curRel, liveLink)
+
+    const histImg = 'openclaude/openclaude-runtime:v5-known-good-historical'
+    const histImgId = `sha256:${'a'.repeat(64)}`
+    const beforeRec = JSON.stringify({
+      masterRelease: prevRel,
+      transitionKind: 'joint',
+      image: histImg,
+      image_id: histImgId,
+      release: prevRt,
+      bundle: prevBundle,
+    })
+    const lastRec = JSON.stringify({
+      masterRelease: curRel,
+      transitionKind: 'joint',
+      previousMasterRelease: prevRel,
+      image: 'openclaude/openclaude-runtime:v5-bad-forward',
+      image_id: `sha256:${'b'.repeat(64)}`,
+      release: prevRt,
+      bundle: prevBundle,
+    })
+
+    const r = runBash(
+      [
+        `REPO_ROOT=${q(f.repo)}`,
+        `V5_ENV=${q(envFile)}`,
+        `MASTER_LIVE_LINK=${q(liveLink)}`,
+        `MASTER_RELEASES_ROOT=${q(releases)}`,
+        `OC_HOTCFG_RELEASES_ROOT=${q(rtReleases)}`,
+        `OC_HOTCFG_PLATFORM_ROOT=${q(join(f.dir, 'platform'))}`,
+        `OC_HOTCFG_HISTORY=${q(historyFile)}`,
+        'DRY=0; CUTOVER_ROLLBACK=0; ROLLBACK_SHA=""; ROLLBACK_FROM=""; ROLLBACK_ORIG_PREV=""',
+        'log() { echo "$*"; }; mlog() { echo "$*" >&2; }; die() { echo "✗ $*" >&2; exit 1; }',
+        'require_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing $1"; }',
+        `canonicalize_prev_release() { printf '%s\\n' "$1"; }`,
+        `oc_hotcfg_history_nth_committed() { if [[ "$2" == 1 ]]; then printf '%s\\n' ${q(lastRec)}; else printf '%s\\n' ${q(beforeRec)}; fi; }`,
+        'oc_hotcfg_assert_tuple_viable() { return 0; }',
+        // Assert preflight_common sees RUNTIME_IMAGE ALREADY bound to historical image!
+        `preflight_common() { echo "PREFLIGHT_RUNTIME_IMAGE=$RUNTIME_IMAGE|SOURCE=$RUNTIME_IMAGE_PIN_SOURCE" >> ${q(witnessLog)}; }`,
+        'lease_train_begin() { :; }; lease_train_finish() { :; }',
+        `cmd_cutover() { echo "CUTOVER_ROLLBACK=$CUTOVER_ROLLBACK|IMAGE=$RUNTIME_IMAGE|MASTER=$DEPLOY_BUILT_RELEASE" >> ${q(witnessLog)}; }`,
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        `source ${q(ROLLBACK_LIB)}`,
+        'cmd_rollback',
+      ].join('\n'),
+      f.env,
+    )
+    assert.equal(r.status, 0, r.stderr + r.stdout)
+    const witness = readFileSync(witnessLog, 'utf8')
+    assert.match(witness, new RegExp(`PREFLIGHT_RUNTIME_IMAGE=${histImg}\\|SOURCE=rollback-history:`))
+    assert.match(witness, new RegExp(`CUTOVER_ROLLBACK=1\\|IMAGE=${histImg}\\|MASTER=${prevRel}`))
+  })
+})
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Static Wiring & Syntax Integrity Across All Modified Scripts
+// ═════════════════════════════════════════════════════════════════════════════
+describe('Static wiring & syntax integrity across all modified scripts', () => {
+  test('all modified bash scripts pass bash -n and deploy/master-lib enforce shared forward guards & commit-bound pin', () => {
     for (const rel of [
       'scripts/deploy-v5-selfhost.sh',
       'scripts/lib/v5-selfhost-governance-gates.sh',
       'scripts/lib/v5-selfhost-train-guards.sh',
+      'scripts/lib/v5-selfhost-release-policy.sh',
+      'scripts/lib/v5-selfhost-prepare.sh',
+      'scripts/lib/v5-selfhost-rollback.sh',
+      'scripts/lib/v5-selfhost-prewarm.sh',
       'scripts/v5-selfhost-master-release-lib.sh',
       'scripts/v5-lease-worker.sh',
       'scripts/lib/v5-lease-train-debounce.sh',
+      'scripts/v5-selfhost-cutover-survivor.sh',
+      'scripts/check-biome-changed.sh',
     ]) {
       const r = spawnSync('bash', ['-n', join(REPO_ROOT, rel)], { encoding: 'utf8' })
       assert.equal(r.status, 0, `bash -n failed for ${rel}: ${r.stderr}`)
     }
     const deploySrc = readFileSync(DEPLOY_SCRIPT, 'utf8')
     assert.match(deploySrc, /source "\$SCRIPT_DIR\/lib\/v5-selfhost-train-guards\.sh"/)
-    assert.match(deploySrc, /v5_selfhost_load_runtime_image_pin/)
-    assert.match(deploySrc, /v5_selfhost_check_governor_mode "\$sha"/)
-    assert.match(deploySrc, /v5_selfhost_verify_ci_green "\$sha"/)
-    assert.match(deploySrc, /v5_selfhost_post_cutover_retention_gate "\$DEPLOY_BUILT_RELEASE" "\$sha"/)
+    // B8: MUST NOT eagerly call v5_selfhost_load_runtime_image_pin at top level before mode/SHA!
+    assert.doesNotMatch(deploySrc, /^v5_selfhost_load_runtime_image_pin$/m)
+    assert.match(deploySrc, /v5_selfhost_load_runtime_image_pin_for_commit "\$sha"/)
     assert.match(deploySrc, /^FIX_TRAILER_GATE="\$SCRIPT_DIR\/check-v5-fix-trailers\.sh"$/m)
 
+    // B7: BOTH cmd_deploy AND cmd_cutover invoke shared v5_selfhost_enforce_forward_cutover_guards!
+    const fnDeploy = extractBashFn(deploySrc, 'cmd_deploy')
+    const fnCutover = extractBashFn(deploySrc, 'cmd_cutover')
+    assert.match(fnDeploy, /v5_selfhost_enforce_forward_cutover_guards "\$sha"/)
+    assert.match(fnCutover, /v5_selfhost_enforce_forward_cutover_guards "\$head"/)
+    assert.ok(
+      fnCutover.indexOf('v5_selfhost_enforce_forward_cutover_guards "$head"') <
+        fnCutover.indexOf('atomic_flip_live_symlink'),
+      'forward cutover guards MUST run BEFORE live mutation in cmd_cutover',
+    )
+
+    // B6: retention gate runs INSIDE cmd_cutover BEFORE committed & release_policy_finalize_forward!
+    assert.doesNotMatch(fnDeploy, /v5_selfhost_post_cutover_retention_gate/)
+    const retIdx = fnCutover.indexOf('v5_selfhost_post_cutover_retention_gate "$rel" "$head"')
+    const polIdx = fnCutover.indexOf('release_policy_finalize_forward "$rel"')
+    const comIdx = fnCutover.indexOf('cutover_persist_phase "committed"')
+    assert.ok(retIdx > 0 && retIdx < polIdx && retIdx < comIdx, 'retention MUST run BEFORE finalize_forward and committed')
+
     const masterSrc = readFileSync(MASTER_LIB, 'utf8')
-    assert.match(masterSrc, /master_referee_prepare_exec_root "\$staging" scripts\/check-architecture\.ts/)
+    assert.match(masterSrc, /master_referee_prepare_exec_root "\$staging" scripts\/check-architecture\.ts "\$full_sha"/)
+    assert.match(masterSrc, /env -u NODE_OPTIONS -u NODE_PATH -u TSX_TSCONFIG_PATH npx --no-install tsx scripts\/check-architecture\.ts/)
   })
 })

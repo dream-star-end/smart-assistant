@@ -18,7 +18,28 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-const ROOT = resolve(import.meta.dirname, "..");
+function parseRoot(argv: string[]): string {
+  let root = resolve(import.meta.dirname, "..");
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--root") {
+      const val = argv[++i];
+      if (!val) {
+        console.error("[e2e-selectors] --root requires a directory");
+        process.exit(2);
+      }
+      root = resolve(val);
+    } else if (arg?.startsWith("--root=")) {
+      root = resolve(arg.slice("--root=".length));
+    } else {
+      console.error(`[e2e-selectors] unknown argument: ${arg}`);
+      process.exit(2);
+    }
+  }
+  return root;
+}
+
+const ROOT = parseRoot(process.argv.slice(2));
 const E2E_DIR = join(ROOT, "e2e/session-display");
 const SRC_DIR = join(ROOT, "packages/web-react/src");
 

@@ -884,6 +884,24 @@ release_policy_restore_live_before() { # called only by the original guarded sag
   oc_hotcfg_fsync_path "$(dirname "$MASTER_LIVE_LINK")" || return 79
 }
 
+# 切流后置保留集验收期间把活跃列车标为不可结算的 cutover/verifying 中间态（绝不写 committed！）。
+lease_train_mark_verifying() { # <candidate-rel>
+  [[ "${LEASE_TRAIN_ACTIVE:-0}" == 1 && -n "${LEASE_TRAIN_ID:-}" ]] || return 0
+  release_policy_guard_owner || return 86
+  local rel="${1:-}" ev="" ev_merge="" now=""
+  ev="$(jq -cn --arg rel "$rel" '{retentionPhase:"verifying",verifyingRel:$rel}')" || return 1
+  ev_merge="$(lease_json_object_merge_sql evidence_json "$ev")" || return 1
+  now="$(lease_now)"
+  lease_tx <<SQL || return 1
+.bail on
+BEGIN IMMEDIATE;
+UPDATE train SET status='cutover', evidence_json=$ev_merge, updated_at='$now'
+ WHERE id='$(lease_q "$LEASE_TRAIN_ID")' AND status NOT IN ('committed','failed','recovery_required');
+$(lease_event_sql "$LEASE_TRAIN_ID" train-verifying "deploy:$$" "post-cutover retention verifying rel=$rel")
+COMMIT;
+SQL
+}
+
 # 终态:成功由 cmd_deploy 末尾调 committed;失败由 EXIT trap 调(未 committed 即 failed/recovery_required)。
 lease_train_finish() { # <committed|failed> <reason>
   [[ "${LEASE_TRAIN_ACTIVE:-0}" == 1 && -n "$LEASE_TRAIN_ID" ]] || return 0
@@ -896,12 +914,12 @@ lease_train_finish() { # <committed|failed> <reason>
     local phase=""
     if [[ "${CUTOVER_MUTATED:-0}" == 1 ]]; then
       phase="$(survivor_state_phase)"
-      # kept-failed(OCV5-418)是有意留在新版的确定性失败,不是需人工恢复的半截 mutation。
-      case "${phase:-}" in armed|pre-install|pre-mutation|smoked|committed|kept-failed) ;; *) st=recovery_required ;; esac
+      # kept-failed(OCV5-418) / rolled-back(B6 已验证回滚恢复旧 live)不是需人工恢复的半截 mutation。
+      case "${phase:-}" in armed|pre-install|pre-mutation|smoked|committed|kept-failed|rolled-back) ;; *) st=recovery_required ;; esac
     fi
-    # 补偿本身失败:survivor --disarm 会把 phase 写成 committed,所以单独带标记(OCV5-420)。
-    [[ "${CUTOVER_RECOVERY_REQUIRED:-0}" == 1 ]] && st=recovery_required
     if release_policy_enabled && release_policy_context_present; then st=failed; fi
+    # 补偿/回滚本身失败:即使 policy hold 仍在或 survivor --disarm 改写了 phase，也必须进入 recovery_required(OCV5-420/B6)！
+    [[ "${CUTOVER_RECOVERY_REQUIRED:-0}" == 1 ]] && st=recovery_required
     rel="${CUTOVER_KEPT_FAILED_REL:-}"
   else
     rel="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
@@ -988,6 +1006,7 @@ lease_train_on_exit() {
 # after acquiring it: a failed publisher may have left an intent meanwhile.
 release_policy_mutation_barrier() {
   [[ "${RELEASE_POLICY_RESUME:-0}" == 1 ]] && return 0
+  [[ "${MODE:-}" == rollback && "${OC_V5_RETENTION_INTERNAL_ROLLBACK:-0}" == 1 && "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-0}" == 1 ]] && return 0
   release_policy_context_present && return 79
   return 0
 }

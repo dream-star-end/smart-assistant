@@ -1557,8 +1557,8 @@ build_master_release() {
   master_job_architecture() {
     local exec_root
     mlog "  architecture guardrails (enforced, host-pinned referee) @ pinned staging"
-    exec_root="$(master_referee_prepare_exec_root "$staging" scripts/check-architecture.ts)" || return 1
-    if ! ( cd "$exec_root" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-architecture.ts \
+    exec_root="$(master_referee_prepare_exec_root "$staging" scripts/check-architecture.ts "$full_sha")" || return 1
+    if ! ( cd "$exec_root" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u TSX_TSCONFIG_PATH npx --no-install tsx scripts/check-architecture.ts \
         --root "$staging" --enforce --json "$MASTER_GATE_TMPDIR/architecture.json" ); then
       mlog "pinned architecture guardrails 失败(新增/增长/过期基线违规或检查器 fail-closed)"
       return 1
