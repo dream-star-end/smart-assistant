@@ -1429,7 +1429,8 @@ export class Gateway {
         // 503:master 不可达/投影拉不到 —— 拒新 turn(无 baked 回落),可重试。
         return { code, httpStatus: 503, message: `MODEL_CATALOG_UNAVAILABLE: ${detail}` }
       case 'DELEGATE_MODEL_UNKNOWN':
-        return { code, httpStatus: 400, message: `DELEGATE_MODEL_UNKNOWN: ${detail}` }
+      case 'DELEGATE_MODEL_FAMILY_NOT_ALLOWED':
+        return { code, httpStatus: 400, message: `${code}: ${detail}` }
     }
   }
   /** 500 兜底收口:真实错误进日志(可排障),响应只回受控文案 —— 此前 39 处

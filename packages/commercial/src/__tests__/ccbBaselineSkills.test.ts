@@ -298,7 +298,18 @@ describe('ccb-baseline skills ↔ manifest', () => {
     assert.match(sciAuditSkill, /--scientific-gate/)
     assert.match(sciAuditSkill, /chao1Residual<0\.5/)
     assert.match(sciAuditSkill, /PASS_READY/)
-    assert.match(sciAuditSkill, /box-api-claude-sonnet-5-5/)
+    assert.match(sciAuditSkill, /gpt-6\.2-astra/)
+    assert.match(sciAuditSkill, /gpt-6\.2-sol/)
+    assert.match(sciAuditSkill, /antigravity-gemini-4-neon/)
+    assert.match(sciAuditSkill, /antigravity-gemini-4-carbon/)
+    assert.match(sciAuditSkill, /grok-build/)
+    assert.match(sciAuditSkill, /deepseek-v4-flash/)
+    assert.match(sciAuditSkill, /excludedReviewers/)
+    assert.doesNotMatch(sciAuditSkill, /box-api-claude-/)
+    assert.doesNotMatch(sciAuditSkill, /gpt-5\.6-sol/)
+    assert.doesNotMatch(sciAuditSkill, /k3\.1-pro/)
+    assert.doesNotMatch(sciAuditSkill, /minimax-m3-go/)
+    assert.doesNotMatch(sciAuditSkill, /qwen3\.7-plus-go/)
 
     const verifyTemplatePath = join(
       skillsDir,
@@ -335,6 +346,18 @@ describe('ccb-baseline skills ↔ manifest', () => {
     assert.match(reviewSkill, /--verification/)
     assert.match(reviewSkill, /--scientific-gate/)
     assert.match(reviewSkill, /500\/429/)
+    assert.match(reviewSkill, /gpt-6\.2-astra/)
+    assert.match(reviewSkill, /gpt-6\.2-sol/)
+    assert.match(reviewSkill, /antigravity-gemini-4-neon/)
+    assert.match(reviewSkill, /antigravity-gemini-4-carbon/)
+    assert.match(reviewSkill, /grok-build/)
+    assert.match(reviewSkill, /deepseek-v4-flash/)
+    assert.doesNotMatch(reviewSkill, /box-api-claude-/)
+    assert.doesNotMatch(reviewSkill, /gpt-5\.6-sol/)
+    assert.doesNotMatch(reviewSkill, /k3\.1-pro/)
+    assert.doesNotMatch(reviewSkill, /minimax-m3-go/)
+    assert.doesNotMatch(reviewSkill, /qwen3\.7-plus-go/)
+    assert.doesNotMatch(reviewSkill, /kimi\/gpt\/deepseek\/glm/)
 
     const dockerfile = readFileSync(
       join(here, '..', '..', 'agent-sandbox', 'Dockerfile.openclaude-runtime'),

@@ -41,6 +41,7 @@ import {
   parseVerificationReport,
   resolveModelFamily,
   verifyWitnessesInDir,
+  type ExcludedScientificReviewer,
   type MachineVerificationStatus,
   type ScientificGateStatus,
   type ScientificMetrics,
@@ -50,6 +51,7 @@ import {
 } from './ocReviewVerify.js'
 
 export type {
+  ExcludedScientificReviewer,
   MachineVerificationStatus,
   ScientificGateStatus,
   ScientificMetrics,
@@ -141,7 +143,7 @@ export const REVIEW_JSON_SCHEMA = `{
       "type": "object",
       "required": ["model"],
       "properties": {
-        "model": { "type": "string", "minLength": 1, "description": "评审员模型 slug,如 kimi-k3" },
+        "model": { "type": "string", "minLength": 1, "description": "评审员模型 slug,四大家族强档如 gpt-6.2-astra / antigravity-gemini-4-neon / grok-build / deepseek-v4-flash" },
         "role": { "type": "string", "description": "评审员角色,如 方法学审查" },
         "model_family": { "type": "string", "description": "展示用模型家族标注(可选;科学深审独立家族严格按权威 reviewer.model 归类,自填标签不提升覆盖率)" }
       }
@@ -1168,6 +1170,14 @@ export function renderSummaryMd(result: CollateResult): string {
     lines.push(
       `- Chao1 残余估算: ${m.chao1Residual} (阈值 < ${m.maxResidual}; 独立高危桶=${m.observedDefectBuckets}, f1=${m.f1}, f2=${m.f2})`,
     )
+    if (m.excludedReviewers.length > 0) {
+      lines.push(
+        `- 已排除非强档/非四大家族评审员（不计入跨家族覆盖与 Chao1 捕获，共 ${m.excludedReviewers.length} 位）:`,
+      )
+      for (const ex of m.excludedReviewers) {
+        lines.push(`  - \`${ex.model}\` (family=\`${ex.family}\`, reason=\`${ex.reason}\`)`)
+      }
+    }
     lines.push('')
   }
   const t = result.totals

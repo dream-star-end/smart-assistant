@@ -196,7 +196,7 @@ import {
   makeCronOriginInjectHandler,
   type CronOriginInjectHandler,
 } from "../http/internalCronOriginInject.js";
-import { DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH, isDelegateAntigravityRoutePath } from "../http/internalDelegateAntigravityRoute.js";
+import { isDelegateAntigravityRoutePath } from "../http/internalDelegateAntigravityRoute.js";
 import {
   isDelegateEngineBillingInternalPath,
   makeDelegateEngineBillingHandler,
@@ -758,9 +758,8 @@ export async function bootstrapInternalProxyAndListeners(
         appendCostCredits: deps.appendCostCreditsForUser,
         ...antigravityRelayConcurrencyFromConfig(deps.cfg),
       });
-      // B8: Mount RENEW_PATH unconditionally so Commercial main Antigravity turns & FIFO queued
-      // swarms can renew already-minted route leases, while keeping MINT/RELEASE selfhost-only.
-      const allowDelegateAntigravityMint = deps.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1";
+      // OCV5-897: Mount mint/renew/release unconditionally across selfhost and commercial;
+      // authorization is enforced by container identity + owned inflight delegate_antigravity journal.
       const delegateAntigravityRouteHandler = antigravityRouteRuntime.makeDelegateHandler();
       const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
         identityRepo,
@@ -1154,12 +1153,7 @@ export async function bootstrapInternalProxyAndListeners(
         if (delegateGrokRouteHandler && isDelegateGrokRoutePath(path)) {
           return delegateGrokRouteHandler(req, res, ctx);
         }
-        if (
-          delegateAntigravityRouteHandler &&
-          (allowDelegateAntigravityMint
-            ? isDelegateAntigravityRoutePath(path)
-            : path === DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH)
-        ) {
+        if (delegateAntigravityRouteHandler && isDelegateAntigravityRoutePath(path)) {
           return delegateAntigravityRouteHandler(req, res, ctx);
         }
         if (

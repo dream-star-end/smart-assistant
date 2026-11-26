@@ -176,11 +176,38 @@ describe('acquireDelegateAntigravityRoute', () => {
     )
   })
 
-  it('maps every unusable mint outcome to a fail-closed 503', async () => {
+  it('maps every unusable mint outcome to fail-closed status, tagging alreadyMinted and preserving 402 (OCV5-897 B2/B4)', async () => {
     const cases = [
-      { status: 409, body: { error: { code: 'DELEGATE_ANTIGRAVITY_ROUTE_ALREADY_MINTED', message: 'ALREADY_MINTED' } } },
-      { status: 404, body: { error: { message: 'not found' } } },
-      { status: 503, body: { error: { code: 'ANTIGRAVITY_NO_ACCOUNT', message: 'no account' } } },
+      {
+        status: 409,
+        body: { error: { code: 'DELEGATE_ANTIGRAVITY_ROUTE_ALREADY_MINTED', message: 'route already minted' } },
+        expectedStatus: 503,
+        expectedAlreadyMinted: true as const,
+      },
+      {
+        status: 409,
+        body: { error: { code: 'DELEGATE_ANTIGRAVITY_ROUTE_JOURNAL_INVALID', message: 'not owned' } },
+        expectedStatus: 503,
+        expectedAlreadyMinted: undefined,
+      },
+      {
+        status: 402,
+        body: { error: { code: 'ANTIGRAVITY_BUDGET_UNAVAILABLE', message: 'insufficient spendable balance' } },
+        expectedStatus: 402,
+        expectedAlreadyMinted: undefined,
+      },
+      {
+        status: 404,
+        body: { error: { message: 'not found' } },
+        expectedStatus: 503,
+        expectedAlreadyMinted: undefined,
+      },
+      {
+        status: 503,
+        body: { error: { code: 'ANTIGRAVITY_NO_ACCOUNT', message: 'no account' } },
+        expectedStatus: 503,
+        expectedAlreadyMinted: undefined,
+      },
     ]
     for (const c of cases) {
       const { fn } = fetcher(() => response(c.status, c.body))
@@ -192,8 +219,9 @@ describe('acquireDelegateAntigravityRoute', () => {
         heartbeatMs: 60_000,
       })
       assert.equal(result.ok, false, `status ${c.status}`)
-      const failed = result as { httpStatus: number }
-      assert.equal(failed.httpStatus, 503, `status ${c.status} must fail closed as 503`)
+      const failed = result as { httpStatus: number; alreadyMinted?: true }
+      assert.equal(failed.httpStatus, c.expectedStatus, `status ${c.status}`)
+      assert.equal(failed.alreadyMinted, c.expectedAlreadyMinted, `alreadyMinted for ${c.status}`)
     }
   })
 

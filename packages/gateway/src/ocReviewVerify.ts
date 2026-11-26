@@ -33,6 +33,12 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import {
+  SCIENTIFIC_AUDIT_STRONG_POOL_LABEL,
+  evaluateScientificAuditReviewer,
+  resolveCanonicalModelFamily,
+  type ScientificAuditRejectReason,
+} from '@openclaude/protocol'
 
 export const VERIFICATION_STATUSES = ['confirmed', 'refuted', 'unverified'] as const
 export type MachineVerificationStatus = (typeof VERIFICATION_STATUSES)[number]
@@ -216,24 +222,9 @@ export function hasEnforcedSandboxExecutor(): boolean {
   return false
 }
 
-/** 确定性归类模型家族(归一常见简写与大小写);未命中已知家族时退回归一小写 model slug。 */
+/** 确定性归类模型家族(委托 @openclaude/protocol 单源权威规则);未命中已知家族时退回归一小写 model slug。 */
 export function inferModelFamily(model: string): string {
-  const raw = model.trim().toLowerCase()
-  if (!raw) return 'unknown'
-  if (/cleanroom|sympy|octave|deterministic-verifier/.test(raw)) return 'cleanroom'
-  if (/claude|anthropic/.test(raw)) return 'anthropic'
-  if (/gemini|gemma|palm|google/.test(raw)) return 'google'
-  if (/grok|xai|x-ai/.test(raw)) return 'xai'
-  if (/deepseek/.test(raw)) return 'deepseek'
-  if (/kimi|moonshot|(?:^|[-_/:])k\d+(?:\.\d+)?(?:$|[-_/:])/.test(raw)) return 'moonshot'
-  if (/qwen|tongyi|qwq/.test(raw)) return 'qwen'
-  if (/glm|zhipu|chatglm/.test(raw)) return 'zhipu'
-  if (/minimax|abab/.test(raw)) return 'minimax'
-  if (/stepfun|(?:^|[-_/:])step(?:$|[-_/:.\d])/.test(raw)) return 'step'
-  if (/openai|codex|chatgpt|(?:^|[-_/:])gpt(?:$|[-_/:.\d])|(?:^|[-_/:])o[134](?:$|[-_/:.])/.test(raw)) {
-    return 'openai'
-  }
-  return raw
+  return resolveCanonicalModelFamily(model)
 }
 
 /**
@@ -1268,10 +1259,17 @@ export type ComputeScientificMetricsInput = {
   maxResidual?: number
 }
 
+export type ExcludedScientificReviewer = {
+  model: string
+  family: string
+  reason: ScientificAuditRejectReason
+}
+
 export type ScientificMetrics = {
   distinctFamilies: string[]
   familyCount: number
   minFamilies: number
+  excludedReviewers: ExcludedScientificReviewer[]
   f1: number
   f2: number
   observedDefectBuckets: number
@@ -1317,11 +1315,14 @@ function isSameScientificDefect(
 
 /**
  * 捕获-重捕(Chao1)残余 P0 风险估算与科学深审四态闸门:
- *   - `distinctFamilies` 仅按实际参与评审的 `ReviewFile` 集合的 `reviewer.model` 1 票/文件归类(B6);
- *   - Chao1 缺陷矩阵按 Union-Find 合并跨评审等价缺陷(规范化主题/问题 + 相交锚点),
- *     避免一方补写章节号(如 `Fig. 4` → `Fig. 4 / §2`)把双家族重合拆成两个 f1 桶;
+ *   - `distinctFamilies` 仅按实际参与评审且通过四大家族强档准入(`evaluateScientificAuditReviewer`)的
+ *     `ReviewFile.reviewer.model` 1 票/文件归类(B6 + OCV5-897);非四大家族或弱档记入 `excludedReviewers`;
+ *   - Fail-Closed P0 铁律: 所有 `activeFindings`(即使来自被排除的弱档/非四大家族评审员)均计入
+ *     `confirmedP0`/`unverifiedP0`,绝不静默吞掉已发现的 P0 硬伤;
+ *   - 防弱档注水 Chao1 矩阵: 仅将强档准入评审员的高危发现写入 `bucketFamilies` 参与 Union-Find 与
+ *     `f1`/`f2`/`chao1Residual` 计算,防止靠弱模型或非四大家族伪造 `f2` 重叠拉低残余估算;
  *   - `FIX_REQUIRED`: `confirmedP0 > 0 || unverifiedP0 > 0`;
- *   - `INSUFFICIENT_COVERAGE`: 活跃 P0=0 但 `familyCount < minFamilies`(默认 2);
+ *   - `INSUFFICIENT_COVERAGE`: 活跃 P0=0 但强档 `familyCount < minFamilies`(默认 2);
  *   - `RESIDUAL_RISK_HIGH`: 活跃 P0=0 且家族达标,但 `chao1Residual >= maxResidual`(默认 0.5);
  *   - `PASS_READY`: 全部满足。
  */
@@ -1335,20 +1336,35 @@ export function computeScientificMetrics(input: ComputeScientificMetricsInput): 
       ? input.maxResidual
       : 0.5
 
-  // B6: 独立家族严格只由实际参与评审的 ReviewFile.reviewer.model 决定,忽略自报 model_family
+  // B6 + OCV5-897: 仅四大家族强档模型计入独立覆盖,非四大家族与弱档记入 excludedReviewers
   const familySet = new Set<string>()
+  const excludedByModel = new Map<string, ExcludedScientificReviewer>()
   for (const file of input.files) {
-    familySet.add(resolveModelFamily(file.reviewer.model))
+    const model = file.reviewer.model.trim()
+    const evalRes = evaluateScientificAuditReviewer(model)
+    if (evalRes.eligible) {
+      familySet.add(evalRes.family)
+    } else if (!excludedByModel.has(model)) {
+      excludedByModel.set(model, {
+        model,
+        family: evalRes.family,
+        reason: evalRes.reason ?? 'family_not_allowed',
+      })
+    }
   }
 
   const distinctFamilies = [...familySet].sort()
   const familyCount = distinctFamilies.length
+  const excludedReviewers = [...excludedByModel.values()].sort((a, b) =>
+    a.model < b.model ? -1 : a.model > b.model ? 1 : 0,
+  )
 
   let confirmedP0 = 0
   let unverifiedP0 = 0
-  const highRisk: ScientificMetricsActiveFinding[] = []
+  const strongHighRisk: Array<{ finding: ScientificMetricsActiveFinding; family: string }> = []
 
   for (const af of input.activeFindings) {
+    // Fail-Closed: 所有评审员(含被排除的弱档/非四大家族)报出的 P0 必须计入闸门,绝不静默吞掉
     if (af.resolvedPriority === 'P0') {
       if (af.verifiedByMachine === 'confirmed') confirmedP0 += 1
       else unverifiedP0 += 1
@@ -1356,11 +1372,16 @@ export function computeScientificMetrics(input: ComputeScientificMetricsInput): 
     const isHighRisk =
       af.resolvedPriority === 'P0' ||
       (af.category !== undefined && SCIENTIFIC_RISK_CATEGORIES.has(af.category))
-    if (isHighRisk) highRisk.push(af)
+    if (isHighRisk) {
+      const evalRes = evaluateScientificAuditReviewer(af.reviewer)
+      if (evalRes.eligible) {
+        strongHighRisk.push({ finding: af, family: evalRes.family })
+      }
+    }
   }
 
-  // Union-Find 合并跨评审同一缺陷(确定性、与输入顺序无关)
-  const parent = highRisk.map((_, idx) => idx)
+  // Union-Find 合并强档跨评审同一缺陷(确定性、与输入顺序无关,排除弱档/非四大家族防伪造 f2)
+  const parent = strongHighRisk.map((_, idx) => idx)
   const find = (x: number): number => {
     let cur = x
     while (parent[cur] !== cur) {
@@ -1374,19 +1395,18 @@ export function computeScientificMetrics(input: ComputeScientificMetricsInput): 
     const rb = find(b)
     if (ra !== rb) parent[rb] = ra
   }
-  for (let i = 0; i < highRisk.length; i++) {
-    for (let j = i + 1; j < highRisk.length; j++) {
-      if (isSameScientificDefect(highRisk[i]!, highRisk[j]!)) {
+  for (let i = 0; i < strongHighRisk.length; i++) {
+    for (let j = i + 1; j < strongHighRisk.length; j++) {
+      if (isSameScientificDefect(strongHighRisk[i]!.finding, strongHighRisk[j]!.finding)) {
         union(i, j)
       }
     }
   }
 
   const bucketFamilies = new Map<number, Set<string>>()
-  for (let i = 0; i < highRisk.length; i++) {
+  for (let i = 0; i < strongHighRisk.length; i++) {
     const root = find(i)
-    const af = highRisk[i]!
-    const fam = resolveModelFamily(af.reviewer || af.modelFamily)
+    const fam = strongHighRisk[i]!.family
     let set = bucketFamilies.get(root)
     if (!set) {
       set = new Set<string>()
@@ -1421,6 +1441,7 @@ export function computeScientificMetrics(input: ComputeScientificMetricsInput): 
     distinctFamilies,
     familyCount,
     minFamilies,
+    excludedReviewers,
     f1,
     f2,
     observedDefectBuckets: bucketFamilies.size,
@@ -1438,8 +1459,13 @@ export function formatScientificGateMessage(m: ScientificMetrics): string {
   switch (m.scientificGateStatus) {
     case 'FIX_REQUIRED':
       return `仍有 ${m.confirmedP0} 条机器确认 P0 与 ${m.unverifiedP0} 条未核验 P0 待处理，暂不可放行`
-    case 'INSUFFICIENT_COVERAGE':
-      return `活跃 P0 已归零，但仅覆盖 ${m.familyCount} 个独立模型家族（要求 ≥ ${m.minFamilies}），跨家族盲审覆盖不足`
+    case 'INSUFFICIENT_COVERAGE': {
+      const base = `活跃 P0 已归零，但仅覆盖 ${m.familyCount} 个独立模型家族（要求 ≥ ${m.minFamilies}），跨家族盲审覆盖不足`
+      if (m.excludedReviewers.length > 0) {
+        return `${base}；已排除 ${m.excludedReviewers.length} 位非四大家族或非强档评审员，请使用强档审计池（${SCIENTIFIC_AUDIT_STRONG_POOL_LABEL}）补足`
+      }
+      return base
+    }
     case 'RESIDUAL_RISK_HIGH':
       return `活跃 P0 已归零且覆盖 ${m.familyCount} 个独立家族，但 Chao1 残余估计 ${m.chao1Residual} ≥ 阈值 ${m.maxResidual}（f1=${m.f1}, f2=${m.f2}），建议追加异构复审`
     case 'PASS_READY':

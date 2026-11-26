@@ -280,16 +280,16 @@ function memberBody(extra: Record<string, unknown>): Record<string, unknown> {
   assert.equal(settled.kind, undefined, "settle payload must not leak the stream event kind");
 }
 
-// ---------------------------------------------------------------- (3) glm delegate: no admit / no requestId
+// ---------------------------------------------------------------- (3) ccb delegate (deepseek): no admit / no requestId
 {
   const billing = makeBillingClient();
   const gw = makeGateway({ billing });
-  const r = await delegate(gw, "coding-assistant", memberBody({ model: "glm-5.3-zai" }));
-  assert.equal(r.status, 200, `glm delegate HTTP ${r.status}: ${JSON.stringify(r.body)}`);
-  assert.equal(gw._lastSubmitRequestId, undefined, "glm delegate must not mint a requestId");
-  assert.equal(billing.admits.length, 0, "glm delegate must not admit");
-  assert.equal(billing.settles.length, 0, "glm delegate must not settle");
-  assert.equal(billing.abandons.length, 0, "glm delegate must not abandon");
+  const r = await delegate(gw, "coding-assistant", memberBody({ model: "deepseek-v4-flash" }));
+  assert.equal(r.status, 200, `deepseek ccb delegate HTTP ${r.status}: ${JSON.stringify(r.body)}`);
+  assert.equal(gw._lastSubmitRequestId, undefined, "ccb delegate must not mint a requestId");
+  assert.equal(billing.admits.length, 0, "ccb delegate must not admit");
+  assert.equal(billing.settles.length, 0, "ccb delegate must not settle");
+  assert.equal(billing.abandons.length, 0, "ccb delegate must not abandon");
 }
 
 // ---------------------------------------------------------------- (4) submit failure → abandon same requestId
@@ -514,15 +514,16 @@ async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000,
   }
 }
 
-// INC-20261029-DELEGATE-CATALOG-ROUTE: execute the actual prompt and billing truth table.
+// INC-20261029-DELEGATE-CATALOG-ROUTE / OCV5-897: execute the actual prompt and billing truth table.
 {
   const { renderDelegateModelSection } = await import("../packages/gateway/src/delegateModelCatalogPrompt.js");
   const { decideLocalExecution } = await import("../packages/gateway/src/localExecution.js");
   const { parseCatalogResponse } = await import("../packages/gateway/src/modelCatalogClient.js");
   const models = [
     ["deepseek-v4-flash", "ccb"], ["grok-build", "grok"], ["gpt-6-astra", "codex"],
-    ["cursor-grok-4.6-high", "cursor"], ["zcode-glm-5.3", "zcode"],
-    ["antigravity-gemini-4-argon", "antigravity"],
+    ["antigravity-gemini-4-neon", "antigravity"], ["cursor-grok-4.6-high", "cursor"],
+    ["zcode-glm-5.3", "zcode"], ["glm-5.3-flash-go", "ccb"],
+    ["antigravity-claude-sonnet-5.5", "antigravity"],
   ] as const;
   const view = parseCatalogResponse({ projection_revision: "proof", security_epoch: "1",
     models: models.map(([model_id, engine]) => ({ model_id, engine, display_name: model_id,
@@ -532,14 +533,24 @@ async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000,
   const text = renderDelegateModelSection(input, {});
   const advertised = [...text.matchAll(/^- [^:]+: (.+)$/gm)]
     .flatMap(line => [...line[1]!.matchAll(/`([^`]+)`/g)].map(match => match[1]!));
-  assert.deepEqual(advertised, ["deepseek-v4-flash", "gpt-6-astra", "grok-build"]);
+  assert.deepEqual(advertised, ["deepseek-v4-flash", "gpt-6-astra", "grok-build", "antigravity-gemini-4-neon"]);
   for (const model of advertised) {
     assert.doesNotThrow(() => decideLocalExecution({ view, agent: { id: "member" },
       model, kind: "billed_delegate", env: {} }));
   }
   const personal = renderDelegateModelSection(input, { OC_SELFHOST_ENGINE_LOCAL_TURNS: "1" });
-  for (const [model] of models) assert.ok(personal.includes(model), model);
-  console.log("[delegate-catalog-route] PASS — commercial slugs execute under billed_delegate and selfhost retains every engine");
+  for (const model of ["deepseek-v4-flash", "grok-build", "gpt-6-astra", "antigravity-gemini-4-neon", "cursor-grok-4.6-high"]) {
+    assert.ok(personal.includes(model), model);
+  }
+  for (const forbidden of ["zcode-glm-5.3", "glm-5.3-flash-go", "antigravity-claude-sonnet-5.5"]) {
+    assert.ok(!text.includes(forbidden), `commercial must exclude ${forbidden}`);
+    assert.ok(!personal.includes(forbidden), `selfhost must exclude ${forbidden}`);
+    assert.throws(
+      () => decideLocalExecution({ view, agent: { id: "member" }, model: forbidden, kind: "billed_delegate", env: {} }),
+      (err: unknown) => (err as { code?: string })?.code === "DELEGATE_MODEL_FAMILY_NOT_ALLOWED",
+    );
+  }
+  console.log("[delegate-catalog-route] PASS — commercial 4-family slugs (incl. Antigravity Gemini) execute under billed_delegate and non-4-family models are rejected");
 }
 
 await runWaitCloseProof(root);

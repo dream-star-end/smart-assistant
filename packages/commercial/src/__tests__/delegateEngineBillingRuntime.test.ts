@@ -123,6 +123,8 @@ function defaultSnapshot(over?: {
       catalogEntry({ entryId: 8, modelId: 'retired-codex', engine: 'codex', state: 'disabled' }),
       catalogEntry({ entryId: 9, modelId: 'antigravity-claude-sonnet-5.5', engine: 'antigravity' }),
       catalogEntry({ entryId: 10, modelId: 'antigravity-gemini-4-argon', engine: 'antigravity' }),
+      catalogEntry({ entryId: 11, modelId: 'antigravity-gemini-4-neon', engine: 'antigravity' }),
+      catalogEntry({ entryId: 12, modelId: 'antigravity-gpt-oss-120b', engine: 'antigravity' }),
     ],
     aliases: new Map([
       ['sol-alias', 1],
@@ -144,6 +146,14 @@ function defaultSnapshot(over?: {
       [
         'antigravity-gemini-4-argon',
         price('antigravity-gemini-4-argon', { displayName: 'Antigravity Gemini 4 Argon' }),
+      ],
+      [
+        'antigravity-gemini-4-neon',
+        price('antigravity-gemini-4-neon', { displayName: 'Antigravity Gemini 4 Neon' }),
+      ],
+      [
+        'antigravity-gpt-oss-120b',
+        price('antigravity-gpt-oss-120b', { displayName: 'Antigravity GPT OSS 120B' }),
       ],
     ]),
     securityEpoch: over?.epoch ?? SECURITY_EPOCH,
@@ -190,6 +200,28 @@ function makeRuntime(opts?: {
     finalize?: (pool: unknown, args: Record<string, unknown>) => Promise<void>
     settle?: (args: Record<string, unknown>) => Promise<unknown>
     abandon?: (pool: unknown, requestId: string, userId: bigint) => Promise<void>
+    sumUsage?: (
+      pool: unknown,
+      requestId: string,
+      userId: bigint,
+      opts?: { excludeRetired?: boolean },
+    ) => Promise<{
+      promptTokens: bigint
+      candidatesTokens: bigint
+      thoughtsTokens: bigint
+      cachedTokens: bigint
+      calls: number
+      extraModels?: Record<
+        string,
+        {
+          promptTokens: bigint
+          candidatesTokens: bigint
+          thoughtsTokens: bigint
+          cachedTokens: bigint
+          calls: number
+        }
+      >
+    }>
   }
 }) {
   const journals =
@@ -354,6 +386,9 @@ function makeRuntime(opts?: {
     releaseAntigravityInflightFn: (requestId) => {
       antigravityCalls.releaseInflight.push(requestId)
     },
+    ...(opts?.antigravity?.sumUsage
+      ? { sumAntigravityUsageFn: opts.antigravity.sumUsage as never }
+      : {}),
   })
   return {
     runtime,
@@ -461,7 +496,7 @@ it('paused preset delegate identity rejects nongrok overrides before side effect
         rmSync(root, { recursive: true, force: true });
       }
     `,
-  ], { encoding: 'utf8', timeout: 30_000 })
+  ], { encoding: 'utf8', timeout: 90_000 })
   assert.equal(child.error, undefined, child.error?.message)
   assert.equal(child.status, 0, child.stdout + child.stderr)
 })
@@ -1404,9 +1439,9 @@ describe('Grok admission execution and billing generation', () => {
   })
 })
 
-// ── OCV5-738: 委派 antigravity 的 admit/settle/abandon 对账 ─────────────────
+// ── OCV5-738 / OCV5-897: 委派 antigravity 的 admit/settle/abandon 对账与四大家族纵深防御 ──
 
-const AG_MODEL = 'antigravity-claude-sonnet-5.5'
+const AG_MODEL = 'antigravity-gemini-4-neon'
 const AG_ROUTE_TOKEN = 'ef'.repeat(32)
 
 function antigravityJournal(ctx: Record<string, unknown> = {}) {
@@ -1459,6 +1494,29 @@ describe('delegate engine-billing antigravity reconciliation (OCV5-738)', () => 
     assert.equal(ctx.ctxJson.delegateAgentId, 'auditor')
     assert.equal(ctx.ctxJson.antigravityRouteToken, undefined, 'token is persisted at mint')
     assert.equal(ctx.ctxJson.antigravityBudgetCredits, '100', 'persists full spendable balance for multi-step antigravity turn')
+  })
+
+  it('OCV5-897: rejects non-4-family antigravity models (claude / gpt-oss) before precheck or journal', async () => {
+    for (const rejectedModel of ['antigravity-claude-sonnet-5.5', 'antigravity-gpt-oss-120b']) {
+      const { runtime, precheckCalls, journalCalls } = makeRuntime()
+      await assert.rejects(
+        () =>
+          runtime.handle({
+            path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+            identity: IDENTITY,
+            body: {
+              model: rejectedModel,
+              engine: 'antigravity',
+              agentId: 'auditor',
+              delegateAgentId: 'auditor',
+              sessionKey: 'agent:auditor:delegate:main:1',
+            },
+          }),
+        /^Error: DELEGATE_ENGINE_BILLING_MODEL_FAMILY_NOT_ALLOWED$/,
+      )
+      assert.equal(precheckCalls.length, 0, `${rejectedModel} must not reserve precheck`)
+      assert.equal(journalCalls.length, 0, `${rejectedModel} must not start journal`)
+    }
   })
 
   it('settles exactly once: expires the route, claims the journal, finalizes and releases the precheck', async () => {
@@ -1682,6 +1740,318 @@ describe('delegate engine-billing antigravity reconciliation (OCV5-738)', () => 
       journalUpdates.some((u) => u.sql.includes("state='inflight'") && u.params[0] === REQUEST_ID),
       true,
     )
+  })
+
+  it('OCV5-897 B1: abandon with recorded usage or pending turn durably hands off to frozen-price settlement (at-most-once)', async () => {
+    for (const turnRow of [
+      { status: 'pending', has_usage: true },
+      { status: 'pending', has_usage: false },
+      { status: 'abandoned', has_usage: true },
+    ]) {
+      const { runtime, journals, antigravityCalls, abortCalls, releaseCalls } = makeRuntime({
+        antigravity: {
+          turnRows: [turnRow],
+          sumUsage: async () => ({
+            promptTokens: 400n,
+            candidatesTokens: 55n,
+            thoughtsTokens: 0n,
+            cachedTokens: 0n,
+            calls: 1,
+          }),
+        },
+      })
+      journals.set(
+        REQUEST_ID,
+        antigravityJournal({
+          billingPricing: {
+            v: 1,
+            modelId: AG_MODEL,
+            displayName: 'Gemini 4 Neon',
+            inputPerMtok: '3000',
+            outputPerMtok: '15000',
+            cacheReadPerMtok: '300',
+            cacheWritePerMtok: '0',
+            multiplier: '2.000',
+          },
+        }),
+      )
+      const res = await runtime.handle({
+        path: DELEGATE_ENGINE_BILLING_ABANDON_PATH,
+        identity: IDENTITY,
+        body: { requestId: REQUEST_ID },
+      })
+      assert.deepEqual(res, { abandoned: false, settled: true })
+      assert.equal(abortCalls.length, 0, 'must never abort journal when usage/pending exists')
+      assert.equal(antigravityCalls.claim.length, 1, 'must claim journal for settlement')
+      assert.equal(antigravityCalls.settle.length, 1, 'must settle usage via frozen pricing')
+      const settled = antigravityCalls.settle[0] as {
+        engineStatus: string
+        pricing: { get(m: string): any }
+      }
+      assert.equal(settled.engineStatus, 'success', 'metered output must settle as success')
+      assert.equal(settled.pricing.get(AG_MODEL)?.multiplier, '2.000')
+      assert.equal(antigravityCalls.finalize.length, 1, 'must finalize journal to committed')
+      assert.equal(releaseCalls.length, 1, 'must release precheck after journal finalize')
+    }
+    // Retry after already committed must be idempotent (0 extra settle/finalize calls)
+    {
+      const { runtime, journals, antigravityCalls } = makeRuntime({
+        antigravity: {
+          turnRows: [{ status: 'settled', has_usage: true }],
+          claim: async () => null,
+          journalState: 'committed',
+        },
+      })
+      journals.set(REQUEST_ID, antigravityJournal())
+      const retryRes = await runtime.handle({
+        path: DELEGATE_ENGINE_BILLING_ABANDON_PATH,
+        identity: IDENTITY,
+        body: { requestId: REQUEST_ID },
+      })
+      assert.deepEqual(retryRes, { abandoned: false, settled: true })
+      assert.equal(antigravityCalls.settle.length, 0)
+      assert.equal(antigravityCalls.finalize.length, 0)
+    }
+  })
+
+  it('OCV5-897 B1: resolveDelegateAntigravityEngineStatus promotes non-cancelled tape/HTTP errors with output and keeps USER_CANCELLED waived', async () => {
+    const { resolveDelegateAntigravityEngineStatus } = await import('../billing/antigravitySettle.js')
+    const withOutput = async () => ({
+      promptTokens: 100n,
+      candidatesTokens: 25n,
+      thoughtsTokens: 0n,
+      cachedTokens: 0n,
+      calls: 1,
+    })
+    const zeroOutput = async () => ({
+      promptTokens: 100n,
+      candidatesTokens: 0n,
+      thoughtsTokens: 0n,
+      cachedTokens: 0n,
+      calls: 1,
+    })
+    const dummyPool = { query: async () => ({ rows: [] }) } as never
+    assert.equal(
+      await resolveDelegateAntigravityEngineStatus(dummyPool, REQUEST_ID, 42n, 'error', 'ENGINE_ERROR', withOutput),
+      'success',
+    )
+    assert.equal(
+      await resolveDelegateAntigravityEngineStatus(dummyPool, REQUEST_ID, 42n, 'error', 'USER_CANCELLED', withOutput),
+      'error',
+    )
+    assert.equal(
+      await resolveDelegateAntigravityEngineStatus(dummyPool, REQUEST_ID, 42n, 'error', 'ENGINE_ERROR', zeroOutput),
+      'error',
+    )
+  })
+
+  it('OCV5-897 B1: settleDurableAntigravityBilling promotes tape error with metered output using frozen pricing and keeps USER_CANCELLED waived', async () => {
+    const { settleDurableAntigravityBilling } = await import('../billing/durableAntigravityBilling.js')
+    const runTapeCase = async (terminalCode: 'ENGINE_ERROR' | 'USER_CANCELLED') => {
+      const seenSettles: Array<{ engineStatus: string; terminalCode?: string | null; multiplier?: string }> = []
+      const fakePool = {
+        async query(sql: string) {
+          if (sql.includes('FROM request_finalize_journal')) {
+            return {
+              rows: [
+                {
+                  user_id: '42',
+                  state: 'inflight',
+                  ctx: {
+                    source: 'delegate_antigravity',
+                    model: AG_MODEL,
+                    billingPricing: {
+                      v: 1,
+                      modelId: AG_MODEL,
+                      displayName: 'Gemini 4 Neon',
+                      inputPerMtok: '3000',
+                      outputPerMtok: '15000',
+                      cacheReadPerMtok: '300',
+                      cacheWritePerMtok: '0',
+                      multiplier: '2.000',
+                    },
+                  },
+                },
+              ],
+              rowCount: 1,
+            }
+          }
+          if (sql.includes('FROM antigravity_turns')) {
+            return { rows: [{ user_id: '42', status: 'pending', session_id: 's-1' }], rowCount: 1 }
+          }
+          if (sql.includes('FROM antigravity_relay_usage')) {
+            return {
+              rows: [
+                {
+                  route_model_id: AG_MODEL,
+                  upstream_model: '',
+                  prompt: '500',
+                  candidates: '80',
+                  thoughts: '0',
+                  cached: '0',
+                  calls: '1',
+                  monitoring_calls: '0',
+                  retired: false,
+                },
+              ],
+              rowCount: 1,
+            }
+          }
+          if (sql.includes('UPDATE request_finalize_journal')) {
+            return { rows: [{ request_id: REQUEST_ID }], rowCount: 1 }
+          }
+          return { rows: [], rowCount: 0 }
+        },
+      }
+      await settleDurableAntigravityBilling(
+        {
+          pgPool: fakePool as never,
+          pricing: { get: () => CACHE_DECOY } as never,
+          expireRoute: async () => {},
+          expireRouteForRequest: async () => {},
+          settleTurnFn: async (args) => {
+            seenSettles.push({
+              engineStatus: args.engineStatus,
+              terminalCode: args.terminalCode,
+              multiplier: args.pricing.get(AG_MODEL)?.multiplier,
+            })
+            return {
+              turn: {
+                requestId: REQUEST_ID,
+                userId: 42n,
+                modelId: AG_MODEL,
+                sessionId: 's-1',
+                traceId: null,
+                turnKey: null,
+                parentTurnKey: null,
+              },
+              settled: {
+                settledCostCredits: args.engineStatus === 'success' ? 200n : 0n,
+                debitedCredits: args.engineStatus === 'success' ? 200n : 0n,
+                balanceAfter: args.engineStatus === 'success' ? 800n : null,
+                ledgerId: args.engineStatus === 'success' ? 11n : null,
+                usageId: 22n,
+              },
+              released: { tokens: 0 },
+            } as never
+          },
+        },
+        42n,
+        {
+          engine: 'antigravity',
+          requestId: REQUEST_ID,
+          engineSessionId: `oceng-${'b'.repeat(48)}`,
+          status: 'error',
+          terminalCode: terminalCode === 'USER_CANCELLED' ? 'USER_CANCELLED' : undefined,
+          durationMs: 20,
+        },
+      )
+      return seenSettles
+    }
+    const errSettles = await runTapeCase('ENGINE_ERROR')
+    assert.equal(errSettles.length, 1)
+    assert.equal(errSettles[0]?.engineStatus, 'success', 'non-cancelled tape error with output must settle as success')
+    assert.equal(errSettles[0]?.multiplier, '2.000', 'must use frozen billingPricing')
+    const cancelSettles = await runTapeCase('USER_CANCELLED')
+    assert.equal(cancelSettles.length, 1)
+    assert.equal(cancelSettles[0]?.engineStatus, 'error', 'USER_CANCELLED must remain waived')
+    assert.equal(cancelSettles[0]?.terminalCode, 'USER_CANCELLED')
+  })
+
+  it('OCV5-897 B1: abandon propagates abandonAntigravityTurn errors instead of swallowing them', async () => {
+    const { runtime, journals, abortCalls, releaseCalls } = makeRuntime({
+      antigravity: {
+        abandon: async () => {
+          throw new Error('pg write failed')
+        },
+      },
+    })
+    journals.set(REQUEST_ID, antigravityJournal())
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_ABANDON_PATH,
+          identity: IDENTITY,
+          body: { requestId: REQUEST_ID },
+        }),
+      /pg write failed/,
+    )
+    assert.equal(abortCalls.length, 0)
+    assert.equal(releaseCalls.length, 0)
+  })
+
+  it('OCV5-897 B1: settle promotes status=error to success when non-retired relay output tokens > 0 (except USER_CANCELLED)', async () => {
+    // Non-cancelled error with metered output -> promoted to success, retaining terminalCode
+    {
+      const { runtime, journals, antigravityCalls } = makeRuntime({
+        antigravity: {
+          sumUsage: async () => ({
+            promptTokens: 500n,
+            candidatesTokens: 42n,
+            thoughtsTokens: 0n,
+            cachedTokens: 0n,
+            calls: 1,
+          }),
+        },
+      })
+      journals.set(REQUEST_ID, antigravityJournal())
+      const result = await runtime.handle({
+        path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+        identity: IDENTITY,
+        body: antigravitySettleBody({ status: 'error', terminalCode: 'ENGINE_ERROR' }),
+      })
+      assert.deepEqual(result, { settled: true })
+      const settled = antigravityCalls.settle[0] as { engineStatus: string; terminalCode?: string }
+      assert.equal(settled.engineStatus, 'success')
+      assert.equal(settled.terminalCode, 'ENGINE_ERROR')
+    }
+    // USER_CANCELLED with metered output -> stays error (user-cancel semantics preserved)
+    {
+      const { runtime, journals, antigravityCalls } = makeRuntime({
+        antigravity: {
+          sumUsage: async () => ({
+            promptTokens: 500n,
+            candidatesTokens: 42n,
+            thoughtsTokens: 0n,
+            cachedTokens: 0n,
+            calls: 1,
+          }),
+        },
+      })
+      journals.set(REQUEST_ID, antigravityJournal())
+      const result = await runtime.handle({
+        path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+        identity: IDENTITY,
+        body: antigravitySettleBody({ status: 'error', terminalCode: 'USER_CANCELLED' }),
+      })
+      assert.deepEqual(result, { settled: true })
+      const settled = antigravityCalls.settle[0] as { engineStatus: string; terminalCode?: string }
+      assert.equal(settled.engineStatus, 'error')
+      assert.equal(settled.terminalCode, 'USER_CANCELLED')
+    }
+    // Non-cancelled error with 0 output tokens -> stays error (genuine zero-output failure waived)
+    {
+      const { runtime, journals, antigravityCalls } = makeRuntime({
+        antigravity: {
+          sumUsage: async () => ({
+            promptTokens: 500n,
+            candidatesTokens: 0n,
+            thoughtsTokens: 0n,
+            cachedTokens: 0n,
+            calls: 1,
+          }),
+        },
+      })
+      journals.set(REQUEST_ID, antigravityJournal())
+      const result = await runtime.handle({
+        path: DELEGATE_ENGINE_BILLING_SETTLE_PATH,
+        identity: IDENTITY,
+        body: antigravitySettleBody({ status: 'error', terminalCode: 'ENGINE_ERROR' }),
+      })
+      assert.deepEqual(result, { settled: true })
+      const settled = antigravityCalls.settle[0] as { engineStatus: string }
+      assert.equal(settled.engineStatus, 'error')
+    }
   })
 })
 

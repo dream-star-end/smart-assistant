@@ -31,6 +31,7 @@ import {
 } from './antigravityRouteContext.js'
 import { antigravityOwnerProtectedSql } from './antigravityRouteAuthority.js'
 import {
+  resolveDelegateAntigravityEngineStatus,
   settleAntigravityTurnRecord,
   settleLateAntigravityRelayUsage,
 } from './antigravitySettle.js'
@@ -55,6 +56,8 @@ export interface DurableAntigravityBillingDeps {
   broadcastToUser?: (userId: bigint, payload: Record<string, unknown>) => void
   expireRoute?: (token: string) => Promise<unknown>
   expireRouteForRequest?: (requestId: string, expectedUserId?: bigint) => Promise<unknown>
+  /** Optional test seam overriding settleAntigravityTurnRecord. */
+  settleTurnFn?: typeof settleAntigravityTurnRecord
 }
 
 export function isAntigravityDurableBilling(frame: DurableCodexBilling): boolean {
@@ -282,7 +285,7 @@ export async function settleDurableAntigravityBilling(
   }
   await Promise.resolve(expireByReq(requestId, userId)).catch(() => {})
 
-  const engineStatus = frame.status === 'success' ? 'success' : 'error'
+  const rawEngineStatus = frame.status === 'success' ? 'success' : 'error'
   const terminalCode =
     frame.status === 'success'
       ? null
@@ -291,6 +294,18 @@ export async function settleDurableAntigravityBilling(
           frame.terminalCode === 'QUOTA_UNAVAILABLE'
         ? frame.terminalCode
         : 'ENGINE_ERROR'
+  // OCV5-897 B1: Tape settle shares the same delegate terminal-status authority
+  // as HTTP settle — non-cancelled error frames with metered non-retired output
+  // settle as 'success' under frozen pricing while USER_CANCELLED stays waived.
+  const engineStatus = isDelegateJournal
+    ? await resolveDelegateAntigravityEngineStatus(
+        deps.pgPool,
+        requestId,
+        userId,
+        rawEngineStatus,
+        terminalCode,
+      )
+    : rawEngineStatus
 
   const ctxParentSessionId =
     typeof journalRow?.ctx?.parentSessionId === 'string' ? journalRow.ctx.parentSessionId : null
@@ -417,7 +432,7 @@ export async function settleDurableAntigravityBilling(
 
   let done: Awaited<ReturnType<typeof settleAntigravityTurnRecord>> = null
   try {
-    done = await settleAntigravityTurnRecord({
+    done = await (deps.settleTurnFn ?? settleAntigravityTurnRecord)({
       pool: deps.pgPool,
       pricing: settlePricing,
       requestId,
@@ -636,6 +651,7 @@ export async function runAntigravityTurnReconcileTick(
   const hasLiveRoute = opts.hasActiveRouteForRequest ?? hasActiveAntigravityRelayRouteForRequest
   for (const row of due.rows) {
     const uid = BigInt(row.user_id)
+    let tickClaimId: string | null = null
     try {
       // B1: Legacy turns (no durable dispatch or delegate journal) remain protected
       // while their bounded relay route lease is still live in Redis / memory.
@@ -643,16 +659,120 @@ export async function runAntigravityTurnReconcileTick(
         const routeAlive = await Promise.resolve(hasLiveRoute(row.request_id, uid, now))
         if (routeAlive) continue
       }
+      // OCV5-897 B1 R2: Orphan delegate_antigravity turns (past 24h journal guard)
+      // must still respect live routes, apply frozen journal billingPricing,
+      // finalize request_finalize_journal, and release preCheckRedis.
+      let tickPricing: Pick<PricingCache, 'get'> = opts.pricing
+      let delegateAttribution:
+        | {
+            delegateAgentId?: string
+            parentSessionId?: string
+            parentTurnKey?: string
+          }
+        | undefined
+      let isOrphanDelegate = false
+      if (row.has_durable_owner) {
+        const jRes = await opts.pgPool.query<{
+          state: string
+          ctx: Record<string, unknown> | null
+        }>(
+          'SELECT state, ctx FROM request_finalize_journal WHERE request_id = $1 AND user_id = $2',
+          [row.request_id, row.user_id],
+        )
+        const jRow = jRes.rows[0]
+        if (jRow?.ctx?.source === 'delegate_antigravity') {
+          isOrphanDelegate = true
+          const routeAlive = await Promise.resolve(hasLiveRoute(row.request_id, uid, now))
+          if (routeAlive) continue
+          if (jRow.state === 'aborted') {
+            await forceAbandonAntigravityTurn(opts.pgPool, row.request_id, uid)
+            releaseInflight(row.request_id)
+            if (opts.preCheckRedis) {
+              await releasePreCheck(opts.preCheckRedis, { userId: row.user_id, requestId: row.request_id }).catch(() => {})
+            }
+            continue
+          }
+          const frozenModel = typeof jRow.ctx.model === 'string' ? jRow.ctx.model : undefined
+          const hasFrozenPricing = jRow.ctx.billingPricing !== undefined
+          const frozenPricing =
+            frozenModel && hasFrozenPricing
+              ? parseBillingPricing(jRow.ctx.billingPricing, frozenModel)
+              : null
+          if (hasFrozenPricing && frozenPricing === null) {
+            await abortInflightJournal(
+              opts.pgPool,
+              row.request_id,
+              'durable_billing_pricing_invalid',
+              'INTERNAL_ERROR',
+            )
+            await forceAbandonAntigravityTurn(opts.pgPool, row.request_id, uid)
+            releaseInflight(row.request_id)
+            if (opts.preCheckRedis) {
+              await releasePreCheck(opts.preCheckRedis, { userId: row.user_id, requestId: row.request_id }).catch(() => {})
+            }
+            continue
+          }
+          if (frozenPricing) {
+            tickPricing = {
+              get: (modelId: string) =>
+                modelId === frozenPricing.model_id ? frozenPricing : opts.pricing.get(modelId),
+            }
+          }
+          if (jRow.state !== 'committed') {
+            tickClaimId = await claimInflightJournalForSettlement(opts.pgPool, row.request_id)
+            if (tickClaimId === null) continue
+          }
+          const delegateAgentId =
+            typeof jRow.ctx.delegateAgentId === 'string' ? jRow.ctx.delegateAgentId : undefined
+          const parentSessionId =
+            typeof jRow.ctx.parentSessionId === 'string' ? jRow.ctx.parentSessionId : undefined
+          const parentTurnKey = canonicalTurnKey(jRow.ctx.parentTurnKey) ?? undefined
+          if (delegateAgentId || parentSessionId || parentTurnKey) {
+            delegateAttribution = {
+              ...(delegateAgentId ? { delegateAgentId } : {}),
+              ...(parentSessionId ? { parentSessionId } : {}),
+              ...(parentTurnKey ? { parentTurnKey } : {}),
+            }
+          }
+        }
+      }
       await Promise.resolve(expireByReq(row.request_id, uid)).catch(() => {})
       const done = await settleAntigravityTurnRecord({
         pool: opts.pgPool,
-        pricing: opts.pricing,
+        pricing: tickPricing,
         requestId: row.request_id,
         userId: uid,
         engineStatus: 'unknown',
         staleBefore,
+        ...(delegateAttribution ? { attribution: delegateAttribution } : {}),
       })
-      if (!done) continue
+      if (!done) {
+        if (tickClaimId) {
+          await opts.pgPool
+            .query(
+              `UPDATE request_finalize_journal
+                  SET state = 'inflight', ctx = ctx - 'settlementClaimId', updated_at = NOW()
+                WHERE request_id = $1 AND state = 'finalizing' AND ctx->>'settlementClaimId' = $2`,
+              [row.request_id, tickClaimId],
+            )
+            .catch(() => {})
+          tickClaimId = null
+        }
+        continue
+      }
+      if (isOrphanDelegate && tickClaimId) {
+        await finalizeInflightJournal(opts.pgPool, {
+          requestId: row.request_id,
+          finalCredits: done.settled.settledCostCredits ?? 0n,
+          ledgerId: done.settled.ledgerId,
+          usageId: done.settled.usageId,
+          settlementClaimId: tickClaimId,
+        })
+        tickClaimId = null
+        if (opts.preCheckRedis) {
+          await releasePreCheck(opts.preCheckRedis, { userId: row.user_id, requestId: row.request_id }).catch(() => {})
+        }
+      }
       await publishZcodeCatalogSettle({
         settled: done.settled,
         requestId: row.request_id,
@@ -661,7 +781,9 @@ export async function runAntigravityTurnReconcileTick(
         sessionId: done.turn.sessionId,
         traceId: done.turn.traceId,
         turnKey: done.turn.turnKey ?? null,
-        parentTurnKey: done.turn.parentTurnKey ?? null,
+        parentTurnKey: done.turn.parentTurnKey ?? delegateAttribution?.parentTurnKey ?? null,
+        ...(delegateAttribution?.parentSessionId ? { parentSessionId: delegateAttribution.parentSessionId } : {}),
+        ...(delegateAttribution?.delegateAgentId ? { delegateAgentId: delegateAttribution.delegateAgentId } : {}),
         persist: opts.appendCostCredits,
         publish: (event) => {
           opts.broadcastToUser?.(uid, event as unknown as Record<string, unknown>)
@@ -669,6 +791,16 @@ export async function runAntigravityTurnReconcileTick(
       })
       settledCount += 1
     } catch (err) {
+      if (tickClaimId) {
+        await opts.pgPool
+          .query(
+            `UPDATE request_finalize_journal
+                SET state = 'inflight', ctx = ctx - 'settlementClaimId', updated_at = NOW()
+              WHERE request_id = $1 AND state = 'finalizing' AND ctx->>'settlementClaimId' = $2`,
+            [row.request_id, tickClaimId],
+          )
+          .catch(() => {})
+      }
       errors += 1
       opts.logger?.warn('antigravity turn reconciler row failed', {
         requestId: row.request_id,

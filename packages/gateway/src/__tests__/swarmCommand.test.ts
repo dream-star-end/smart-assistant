@@ -550,6 +550,14 @@ describe("Swarm playbook templates & command parser", () => {
     assert.ok(expandedSci);
     assert.ok(expandedSci.prompt.includes("oc-docx extract --latex"));
     assert.ok(expandedSci.prompt.includes("gpt-6.2-astra"));
+    assert.ok(expandedSci.prompt.includes("gpt-6.2-sol"));
+    assert.ok(expandedSci.prompt.includes("antigravity-gemini-4-neon"));
+    assert.ok(expandedSci.prompt.includes("antigravity-gemini-4-carbon"));
+    assert.ok(expandedSci.prompt.includes("grok-build"));
+    assert.ok(expandedSci.prompt.includes("deepseek-v4-flash"));
+    assert.ok(expandedSci.prompt.includes("非四大家族与弱档/轻量档"));
+    assert.ok(!expandedSci.prompt.includes("DeepSeek-MiniMax-Qwen"));
+    assert.ok(!expandedSci.prompt.includes("/ Claude /"));
     assert.ok(expandedSci.prompt.includes("oc-review verify"));
     assert.ok(expandedSci.prompt.includes("--unsafe-local-exec"));
     assert.ok(expandedSci.prompt.includes("OC_WITNESS_VERDICT"));

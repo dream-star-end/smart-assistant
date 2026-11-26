@@ -1143,12 +1143,17 @@ describe('T2 审计阻断修复回归 (#4/#5/#6, OCV5-878)', () => {
 describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', () => {
   it('inferModelFamily 确定性归类 11 类独立家族(含简写/大小写)并保留未知 slug 回退', () => {
     assert.equal(inferModelFamily('gemini-4-pro'), 'google')
+    assert.equal(inferModelFamily('antigravity-gemini-4-neon'), 'google')
+    assert.equal(inferModelFamily('antigravity-gemini-4-carbon'), 'google')
+    assert.equal(inferModelFamily('antigravity-orchestrator-neon'), 'google')
     assert.equal(inferModelFamily('Gemini'), 'google')
     assert.equal(inferModelFamily('box-api-claude-opus-5-5'), 'anthropic')
     assert.equal(inferModelFamily('Claude'), 'anthropic')
     assert.equal(inferModelFamily('gpt-6.2-astra'), 'openai')
     assert.equal(inferModelFamily('GPT'), 'openai')
     assert.equal(inferModelFamily('o3-mini'), 'openai')
+    assert.equal(inferModelFamily('antigravity-gpt-oss-120b'), 'gpt_oss')
+    assert.equal(inferModelFamily('cursor-auto'), 'cursor_auto')
     assert.equal(inferModelFamily('grok-build'), 'xai')
     assert.equal(inferModelFamily('Grok'), 'xai')
     assert.equal(inferModelFamily('deepseek-v4-flash'), 'deepseek')
@@ -1166,6 +1171,10 @@ describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', (
     const schemaRes = runOcReviewCli(['schema'])
     assert.equal(schemaRes.exitCode, 0)
     const schema = JSON.parse(schemaRes.stdout)
+    assert.match(
+      schema.properties.reviewer.properties.model.description,
+      /gpt-6\.2-astra.*antigravity-gemini-4-neon.*grok-build.*deepseek-v4-flash/,
+    )
     assert.equal(schema.properties.reviewer.properties.model_family.type, 'string')
     const fProps = schema.properties.findings.items.properties
     assert.equal(fProps.repro_script.type, 'string')
@@ -1513,7 +1522,7 @@ describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', (
               issue: '声称 Beutler 放大应为 1.66x',
             },
           ]),
-          review('gemini-4-pro', 'accept', []),
+          review('antigravity-gemini-4-neon', 'accept', []),
         ],
         [],
         { scientificGate: true },
@@ -1554,7 +1563,7 @@ describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', (
       writeFileSync(
         join(dir, 'reviews-gemini.json'),
         JSON.stringify({
-          reviewer: { model: 'gemini-4-pro', role: '切片2审查' },
+          reviewer: { model: 'antigravity-gemini-4-neon', role: '切片2审查' },
           verdict: 'reject',
           findings: [
             {
@@ -1737,7 +1746,7 @@ describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', (
       )
       writeFileSync(
         join(dir, 'reviews-gemini.json'),
-        JSON.stringify({ reviewer: { model: 'gemini-4-pro' }, verdict: 'accept', findings: [] }),
+        JSON.stringify({ reviewer: { model: 'antigravity-gemini-4-carbon' }, verdict: 'accept', findings: [] }),
       )
       assert.equal(runOcReviewCli(['verify', '--dir', dir, '--unsafe-local-exec']).exitCode, 0)
       const conflictRun = runOcReviewCli([
@@ -1826,7 +1835,7 @@ describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', (
         review('gpt-6.2-astra', 'minor', [
           { location: '§2', severity: 'minor', category: 'math_physics', topic: '量纲说明', issue: '量纲推导边界需补注' },
         ]),
-        review('box-api-claude-opus-5-5', 'accept', []),
+        review('antigravity-gemini-4-neon', 'accept', []),
       ],
       [],
       { scientificGate: true },
@@ -1836,7 +1845,7 @@ describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', (
         review('gpt-6.2-astra', 'minor', [
           { location: '§2 Fig. 4', severity: 'minor', category: 'math_physics', topic: '量纲说明', issue: '量纲推导边界需补注' },
         ]),
-        review('box-api-claude-opus-5-5', 'accept', []),
+        review('antigravity-gemini-4-neon', 'accept', []),
       ],
       [],
       { scientificGate: true },
@@ -1856,7 +1865,7 @@ describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', (
         review('gpt-6.2-astra', 'minor', [
           { location: 'Fig. 4', severity: 'minor', category: 'math_physics', topic: '误差棒尺度', issue: 'Fig. 4 纵轴误差棒未注明 1-sigma' },
         ]),
-        review('box-api-claude-opus-5-5', 'minor', [
+        review('antigravity-gemini-4-carbon', 'minor', [
           { location: 'Fig. 4', severity: 'minor', category: 'math_physics', topic: '误差棒尺度', issue: 'Fig. 4 纵轴误差棒未注明 1-sigma' },
         ]),
       ],
@@ -1868,7 +1877,7 @@ describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', (
         review('gpt-6.2-astra', 'minor', [
           { location: 'Fig. 4', severity: 'minor', category: 'math_physics', topic: '误差棒尺度', issue: 'Fig. 4 纵轴误差棒未注明 1-sigma' },
         ]),
-        review('box-api-claude-opus-5-5', 'minor', [
+        review('antigravity-gemini-4-carbon', 'minor', [
           { location: 'Fig. 4 / §2', severity: 'minor', category: 'math_physics', topic: '误差棒尺度', issue: 'Fig. 4 纵轴误差棒未注明 1-sigma' },
         ]),
       ],
@@ -1891,7 +1900,7 @@ describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', (
         review('gpt-6.2-astra', 'minor', [
           { location: '§2', severity: 'minor', category: 'math_physics', topic: '量纲说明', issue: '量纲推导边界需补注' },
         ]),
-        review('box-api-claude-opus-5-5', 'minor', [
+        review('grok-build', 'minor', [
           { location: '§2', severity: 'minor', category: 'consistency', topic: '有效位数', issue: '表2与正文有效位数存在舍入差异' },
         ]),
       ],
@@ -1908,15 +1917,15 @@ describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', (
     const passMetrics = computeScientificMetrics({
       files: [
         { reviewer: { model: 'gpt-6.2-astra' } },
-        { reviewer: { model: 'box-api-claude-opus-5-5' } },
+        { reviewer: { model: 'deepseek-v4-flash' } },
       ],
       activeFindings: [
         { reviewer: 'gpt-6.2-astra', modelFamily: 'openai', defectKey: computeDefectIdentityKey(['sec:1'], '§1', 't1'), resolvedPriority: 'P2', category: 'consistency' },
-        { reviewer: 'box-api-claude-opus-5-5', modelFamily: 'anthropic', defectKey: computeDefectIdentityKey(['sec:2'], '§2', 't2'), resolvedPriority: 'P2', category: 'math_physics' },
+        { reviewer: 'deepseek-v4-flash', modelFamily: 'deepseek', defectKey: computeDefectIdentityKey(['sec:2'], '§2', 't2'), resolvedPriority: 'P2', category: 'math_physics' },
         { reviewer: 'gpt-6.2-astra', modelFamily: 'openai', defectKey: computeDefectIdentityKey(['sec:3'], '§3', 't3'), resolvedPriority: 'P2', category: 'consistency' },
-        { reviewer: 'box-api-claude-opus-5-5', modelFamily: 'anthropic', defectKey: computeDefectIdentityKey(['sec:3'], '§3', 't3'), resolvedPriority: 'P2', category: 'consistency' },
+        { reviewer: 'deepseek-v4-flash', modelFamily: 'deepseek', defectKey: computeDefectIdentityKey(['sec:3'], '§3', 't3'), resolvedPriority: 'P2', category: 'consistency' },
         { reviewer: 'gpt-6.2-astra', modelFamily: 'openai', defectKey: computeDefectIdentityKey(['sec:4'], '§4', 't4'), resolvedPriority: 'P2', category: 'code_data_mismatch' },
-        { reviewer: 'box-api-claude-opus-5-5', modelFamily: 'anthropic', defectKey: computeDefectIdentityKey(['sec:4'], '§4', 't4'), resolvedPriority: 'P2', category: 'code_data_mismatch' },
+        { reviewer: 'deepseek-v4-flash', modelFamily: 'deepseek', defectKey: computeDefectIdentityKey(['sec:4'], '§4', 't4'), resolvedPriority: 'P2', category: 'code_data_mismatch' },
       ],
       machineRefuted: [],
     })
@@ -1924,6 +1933,7 @@ describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', (
     assert.equal(passMetrics.f2, 2)
     assert.equal(passMetrics.chao1Residual, 0.333)
     assert.equal(passMetrics.scientificGateStatus, 'PASS_READY')
+    assert.deepEqual(passMetrics.excludedReviewers, [])
 
     // computeFindingDigest 确定性与完整证据敏感性验证(含 evidence/priority/new_evidence/inputDigest)
     const d1 = computeFindingDigest('reviews-a.json', 'gpt-6.2-astra', {
@@ -1971,5 +1981,168 @@ describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', (
     } finally {
       rmSync(emptyDir, { recursive: true, force: true })
     }
+  })
+
+  it('OCV5-897 四大家族强档准入门禁: 弱档与非四大家族记入 excludedReviewers、不计覆盖、不虚增 Chao1 f2，但 P0 仍 fail-closed 拦截', () => {
+    // 1. 正例: 四大家族强档（含后缀变体）全部准入，excludedReviewers 为空，达到 PASS_READY
+    const allFourStrong = collateReviews(
+      [
+        review('gpt-6.2-sol', 'accept', []),
+        review('antigravity-gemini-4-neon', 'accept', []),
+        review('grok-build', 'accept', []),
+        review('deepseek-v4-flash', 'accept', []),
+      ],
+      [],
+      { scientificGate: true },
+    )
+    assert.deepEqual(allFourStrong.scientificMetrics?.distinctFamilies, [
+      'deepseek',
+      'google',
+      'openai',
+      'xai',
+    ])
+    assert.equal(allFourStrong.scientificMetrics?.familyCount, 4)
+    assert.deepEqual(allFourStrong.scientificMetrics?.excludedReviewers, [])
+    assert.equal(allFourStrong.gate.status, 'PASS_READY')
+
+    // 2. 反例: 弱档(non_strong_tier) + 非四大家族(family_not_allowed) 均进 excludedReviewers(去重且按 model 字典序)
+    //    且不计入 familyCount → 仅有 1 位强档(gpt-6.2-astra)时触发 INSUFFICIENT_COVERAGE 并提示强档审计池
+    const excludedMix = collateReviews(
+      [
+        review('gpt-6.2-astra', 'accept', []),
+        review('gpt-6-luna', 'accept', []),
+        review('gpt-6-luna', 'accept', []), // 重复 model 去重
+        review('antigravity-gemini-4-hydrogen', 'accept', []),
+        review('antigravity-orchestrator-neon', 'accept', []),
+        review('grok-build-fast', 'accept', []),
+        review('box-api-claude-opus-5-5', 'accept', []),
+        review('glm-5.3-flash-go', 'accept', []),
+        review('qwen3.7-plus-go', 'accept', []),
+        review('k3.1-pro', 'accept', []),
+        review('minimax-m3-go', 'accept', []),
+      ],
+      [],
+      { scientificGate: true },
+    )
+    assert.deepEqual(excludedMix.scientificMetrics?.distinctFamilies, ['openai'])
+    assert.equal(excludedMix.scientificMetrics?.familyCount, 1)
+    assert.deepEqual(excludedMix.scientificMetrics?.excludedReviewers, [
+      { model: 'antigravity-gemini-4-hydrogen', family: 'google', reason: 'non_strong_tier' },
+      { model: 'antigravity-orchestrator-neon', family: 'google', reason: 'non_strong_tier' },
+      { model: 'box-api-claude-opus-5-5', family: 'anthropic', reason: 'family_not_allowed' },
+      { model: 'glm-5.3-flash-go', family: 'zhipu', reason: 'family_not_allowed' },
+      { model: 'gpt-6-luna', family: 'openai', reason: 'non_strong_tier' },
+      { model: 'grok-build-fast', family: 'xai', reason: 'non_strong_tier' },
+      { model: 'k3.1-pro', family: 'moonshot', reason: 'family_not_allowed' },
+      { model: 'minimax-m3-go', family: 'minimax', reason: 'family_not_allowed' },
+      { model: 'qwen3.7-plus-go', family: 'qwen', reason: 'family_not_allowed' },
+    ])
+    assert.equal(excludedMix.gate.status, 'INSUFFICIENT_COVERAGE')
+    assert.match(excludedMix.gate.message, /已排除 9 位非四大家族或非强档评审员/)
+    assert.match(excludedMix.gate.message, /gpt-6\.2-astra \/ gpt-6\.2-sol/)
+    assert.match(excludedMix.gate.message, /antigravity-gemini-4-neon \/ antigravity-gemini-4-carbon/)
+
+    const excludedMd = renderSummaryMd(excludedMix)
+    assert.match(excludedMd, /已排除非强档\/非四大家族评审员/)
+    assert.match(excludedMd, /`gpt-6-luna` \(family=`openai`, reason=`non_strong_tier`\)/)
+    assert.match(excludedMd, /`box-api-claude-opus-5-5` \(family=`anthropic`, reason=`family_not_allowed`\)/)
+
+    // 3. 防弱档注水 Chao1 矩阵: 弱档与非四大家族模型绝不能把单强档桶虚增为 f2 拉低 chao1Residual,
+    //    且仅有非强档模型命中的高危桶不进入强档 Chao1 桶计数
+    const antiPadding = collateReviews(
+      [
+        review('gpt-6.2-astra', 'minor', [
+          { location: '§2', severity: 'minor', category: 'math_physics', topic: '量纲检查', issue: '§2 量纲边界需补注' },
+        ]),
+        review('antigravity-gemini-4-neon', 'minor', [
+          { location: '§3', severity: 'minor', category: 'consistency', topic: '符号约定', issue: '§3 符号上下标不一致' },
+        ]),
+        // 弱档与非四大家族对 §2 和 §3 复读，试图把 f2 从 0 注水到 2，并额外报 §4
+        review('gpt-6-luna', 'minor', [
+          { location: '§2', severity: 'minor', category: 'math_physics', topic: '量纲检查', issue: '§2 量纲边界需补注' },
+        ]),
+        review('antigravity-gemini-4-hydrogen', 'minor', [
+          { location: '§2', severity: 'minor', category: 'math_physics', topic: '量纲检查', issue: '§2 量纲边界需补注' },
+        ]),
+        review('box-api-claude-opus-5-5', 'minor', [
+          { location: '§2', severity: 'minor', category: 'math_physics', topic: '量纲检查', issue: '§2 量纲边界需补注' },
+          { location: '§3', severity: 'minor', category: 'consistency', topic: '符号约定', issue: '§3 符号上下标不一致' },
+          { location: '§4', severity: 'minor', category: 'math_physics', topic: '仅非强档桶', issue: '§4 仅非强档发现' },
+        ]),
+        review('grok-build-fast', 'minor', [
+          { location: '§3', severity: 'minor', category: 'consistency', topic: '符号约定', issue: '§3 符号上下标不一致' },
+        ]),
+      ],
+      [],
+      { scientificGate: true },
+    )
+    assert.deepEqual(antiPadding.scientificMetrics?.distinctFamilies, ['google', 'openai'])
+    assert.equal(antiPadding.scientificMetrics?.observedDefectBuckets, 2)
+    assert.equal(antiPadding.scientificMetrics?.f1, 2)
+    assert.equal(antiPadding.scientificMetrics?.f2, 0)
+    assert.equal(antiPadding.scientificMetrics?.chao1Residual, 1)
+    assert.equal(antiPadding.gate.status, 'RESIDUAL_RISK_HIGH')
+
+    // 4. Fail-Closed P0 铁律: 被排除的弱档/非四大家族评审员报出的 P0 仍必须严格触发 FIX_REQUIRED，绝不静默吞掉!
+    const failClosedP0 = collateReviews(
+      [
+        review('gpt-6.2-astra', 'accept', []),
+        review('antigravity-gemini-4-neon', 'accept', []),
+        review('gpt-6-luna', 'reject', [
+          { location: '§5.1', severity: 'blocker', category: 'math_physics', issue: '弱档抓出的真实符号反号 P0' },
+        ]),
+        review('box-api-claude-opus-5-5', 'reject', [
+          { location: '§6.2', severity: 'major', category: 'code_data_mismatch', issue: '非四大家族抓出的代码常数漂移 P0' },
+        ]),
+      ],
+      [],
+      { scientificGate: true },
+    )
+    assert.equal(failClosedP0.activePriorityTotals.P0, 2)
+    assert.equal(failClosedP0.scientificMetrics?.unverifiedP0, 2)
+    assert.equal(failClosedP0.scientificMetrics?.familyCount, 2)
+    assert.equal(failClosedP0.scientificMetrics?.excludedReviewers.length, 2)
+    assert.equal(failClosedP0.gate.status, 'FIX_REQUIRED')
+
+    // 5. B8 回归: gpt-6.2-sol-pro / gpt-6.2-astra-pro 与不匹配前缀 anthropic/gpt-6.2-astra 必须拒入 familyCount;
+    //    合法同族 provider 前缀(openai/gpt-6.2-sol-1m、google/gemini-4-neon、xai/grok-build、deepseek/deepseek-v4-flash)正常放行
+    const rejectedProPair = collateReviews(
+      [
+        review('gpt-6.2-sol-pro', 'accept', []),
+        review('gpt-6.2-astra-pro', 'accept', []),
+        review('anthropic/gpt-6.2-astra', 'accept', []),
+        review('deepseek-v4-flash', 'accept', []),
+      ],
+      [],
+      { scientificGate: true },
+    )
+    assert.deepEqual(rejectedProPair.scientificMetrics?.distinctFamilies, ['deepseek'])
+    assert.equal(rejectedProPair.scientificMetrics?.familyCount, 1)
+    assert.deepEqual(rejectedProPair.scientificMetrics?.excludedReviewers, [
+      { model: 'anthropic/gpt-6.2-astra', family: 'anthropic', reason: 'family_not_allowed' },
+      { model: 'gpt-6.2-astra-pro', family: 'openai', reason: 'non_strong_tier' },
+      { model: 'gpt-6.2-sol-pro', family: 'openai', reason: 'non_strong_tier' },
+    ])
+    assert.equal(rejectedProPair.gate.status, 'INSUFFICIENT_COVERAGE')
+
+    const prefixedStrongFour = collateReviews(
+      [
+        review('openai/gpt-6.2-sol-1m', 'accept', []),
+        review('google/gemini-4-neon', 'accept', []),
+        review('xai/grok-build', 'accept', []),
+        review('deepseek/deepseek-v4-flash', 'accept', []),
+      ],
+      [],
+      { scientificGate: true },
+    )
+    assert.deepEqual(prefixedStrongFour.scientificMetrics?.distinctFamilies, [
+      'deepseek',
+      'google',
+      'openai',
+      'xai',
+    ])
+    assert.equal(prefixedStrongFour.scientificMetrics?.familyCount, 4)
+    assert.deepEqual(prefixedStrongFour.scientificMetrics?.excludedReviewers, [])
+    assert.equal(prefixedStrongFour.gate.status, 'PASS_READY')
   })
 })

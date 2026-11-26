@@ -81,6 +81,8 @@ function makeHarness(overrides: {
   authOk?: boolean
   canUseModel?: boolean
   placement?: 'local' | 'remote_pool'
+  canonicalModel?: string
+  engine?: 'ccb' | 'codex' | 'antigravity'
   failAdmit?: boolean
   failBind?: boolean
   laneReleaseState?: 'released' | 'not_found' | 'mismatch' | 'unknown'
@@ -245,8 +247,8 @@ function makeHarness(overrides: {
   }
 
   const entry = {
-    canonicalModel: 'antigravity-gemini-4-neon-remote',
-    engine: 'antigravity',
+    canonicalModel: overrides.canonicalModel ?? 'antigravity-gemini-4-neon-remote',
+    engine: overrides.engine ?? 'antigravity',
     placement: overrides.placement ?? 'remote_pool',
     contextWindow: 1_000_000,
     capabilitySchemaVersion: 1,
@@ -583,6 +585,34 @@ describe('internalDelegateRemoteLane (OCV5-835)', () => {
       assert.equal(r.json().state, 'unknown')
     } finally {
       hUnknownStop.restore()
+    }
+  })
+
+  it('OCV5-897 B5: rejects non-4-family remote_pool delegate models with 400 before lane ensure or dispatch', async () => {
+    const ctx = { hostUuid: 'host-1', boundIp: '172.18.0.5' }
+    for (const [model, engine] of [
+      ['box-claude-opus-5-5', 'ccb'],
+      ['antigravity-claude-sonnet-5.5', 'antigravity'],
+    ] as const) {
+      const h = makeHarness({ canonicalModel: model, engine })
+      try {
+        const r = makeRes()
+        await h.handler(
+          makeReq('POST', { sessionKey: VALID_DELEGATE_KEY, model }),
+          r.res,
+          ctx,
+          DELEGATE_REMOTE_LANE_ENSURE_PATH,
+        )
+        assert.equal(r.status, 400, model)
+        assert.equal(
+          (r.json().error as { code?: string } | undefined)?.code,
+          'DELEGATE_REMOTE_LANE_MODEL_FAMILY_NOT_ALLOWED',
+        )
+        assert.equal(h.ensuredCalls.length, 0, `${model} must not call ensureLane`)
+        assert.equal(h.getStoredDispatch(), null, `${model} must not insert turn_dispatches`)
+      } finally {
+        h.restore()
+      }
     }
   })
 })

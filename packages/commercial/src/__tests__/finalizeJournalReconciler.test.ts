@@ -6,7 +6,11 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { describe, test } from 'node:test'
+import { antigravityOwnerProtectedSql } from '../billing/antigravityRouteAuthority.js'
 import {
   alertStuckDurableFinalizing,
   DEFAULT_DURABLE_FINALIZING_ALERT_AGE_MS,
@@ -429,5 +433,27 @@ describe('clearGatewayShutdownEvidenceByDispatchIds', () => {
     assert.ok(!sql.includes('request_id = ANY'), '不得按 billing/request_id 清,会漏掉调用级 journal')
     assert.deepEqual(params[0], ['11111111-1111-1111-1111-111111111111'])
     assert.equal(params[1], GATEWAY_EXITED_AT_CTX_KEY)
+  })
+})
+
+describe('OCV5-897 B1: delegate_antigravity SLA waiver guard & 24h owner protection bound', () => {
+  test('reconcileStaleJournals durableWaivedRes never waives delegate_antigravity journals with antigravity_relay_usage', () => {
+    const srcPath = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      '../billing/finalizeJournalReconciler.ts',
+    )
+    const src = readFileSync(srcPath, 'utf8')
+    const idx = src.indexOf('const durableWaivedRes = await query')
+    assert.ok(idx > 0, 'durableWaivedRes query must exist')
+    const snippet = src.slice(idx, idx + 1200)
+    assert.match(snippet, /rfj\.ctx->>'source'\s*=\s*'delegate_antigravity'/)
+    assert.match(snippet, /EXISTS\s*\(\s*SELECT 1 FROM antigravity_relay_usage aru/)
+    assert.match(snippet, /aru\.request_id = rfj\.request_id AND aru\.user_id = rfj\.user_id/)
+  })
+
+  test('antigravityOwnerProtectedSql bounds delegate_antigravity journal protection to 24 hours', () => {
+    const sql = antigravityOwnerProtectedSql('antigravity_turns')
+    assert.match(sql, /j\.ctx->>'source'='delegate_antigravity'/)
+    assert.match(sql, /j\.updated_at >= NOW\(\) - INTERVAL '24 hours'/)
   })
 })

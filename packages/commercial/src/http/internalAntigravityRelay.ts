@@ -38,6 +38,7 @@ import {
   classifyAntigravityUpstream,
   reportAntigravityOutcome,
 } from '../account-pool/antigravityPool.js'
+import { renewInflight } from '../account-pool/policy/affinity.js'
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import {
   ContainerIdentityError,
@@ -60,7 +61,8 @@ import {
   settleLateAntigravityRelayUsage,
   sumAntigravityRelayUsage,
 } from '../billing/antigravitySettle.js'
-import type { PricingCache } from '../billing/pricing.js'
+import { parseBillingPricing } from '../billing/persistedBillingPricing.js'
+import type { ModelPricing, PricingCache } from '../billing/pricing.js'
 import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
@@ -148,6 +150,7 @@ export interface AntigravityRelayDeps {
   requestFn?: typeof request
   dispatcher?: Dispatcher
   resolveRoute?: typeof resolveAntigravityRelayRoute
+  renewInflightFn?: typeof renewInflight
   freshToken?: (accountId: bigint) => Promise<Buffer>
   reportOutcome?: (
     accountId: bigint,
@@ -551,21 +554,41 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
   const reportModelOutcome = deps.reportModelOutcome ?? reportAntigravityModelOutcome
   const modelCoolingUntil = deps.modelCoolingUntil ?? antigravityModelCoolingUntil
   const recordUsage = deps.recordUsage ?? recordAntigravityRelayUsage
+  const resolvePrimaryPricing = (route: AntigravityRelayRoute): ModelPricing | null => {
+    if (route.pricingOverride) {
+      const frozen = parseBillingPricing({ v: 1, ...route.pricingOverride }, route.modelId)
+      if (frozen) return frozen
+    }
+    return deps.pricing?.get(route.modelId) ?? null
+  }
+  const resolvePricingLookup = (
+    route: AntigravityRelayRoute,
+  ): Pick<PricingCache, 'get'> | undefined => {
+    const frozen = route.pricingOverride
+      ? parseBillingPricing({ v: 1, ...route.pricingOverride }, route.modelId)
+      : null
+    if (!frozen) return deps.pricing ?? undefined
+    return {
+      get: (modelId: string) =>
+        modelId === route.modelId ? frozen : (deps.pricing?.get(modelId) ?? null),
+    }
+  }
   const meteredCost =
     deps.meteredCost ??
     (async (route: AntigravityRelayRoute) => {
-      const pricing = deps.pricing?.get(route.modelId) ?? null
+      const pricing = resolvePrimaryPricing(route)
       if (pricing === null) return null
       const totals = await sumAntigravityRelayUsage(getPool(), route.requestId, route.userId)
-      return antigravityUsageCostOrNull(totals, pricing, deps.pricing ?? undefined)
+      return antigravityUsageCostOrNull(totals, pricing, resolvePricingLookup(route))
     })
   const refreshWaived =
     deps.refreshWaived ??
     (async (route: AntigravityRelayRoute) => {
-      if (!deps.pricing) return
+      const lookup = resolvePricingLookup(route)
+      if (!lookup) return
       await refreshWaivedAntigravityUsage({
         pool: getPool(),
-        pricing: deps.pricing,
+        pricing: lookup,
         requestId: route.requestId,
         userId: route.userId,
       })
@@ -573,10 +596,11 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
   const settleLateUsage =
     deps.settleLateUsage ??
     (async (route: AntigravityRelayRoute) => {
-      if (!deps.pricing) return
+      const lookup = resolvePricingLookup(route)
+      if (!lookup) return
       await settleLateAntigravityRelayUsage({
         pool: getPool(),
-        pricing: deps.pricing,
+        pricing: lookup,
         requestId: route.requestId,
         userId: route.userId,
         appendCostCredits: deps.appendCostCredits,
@@ -590,8 +614,9 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       upstreamModel?: string,
     ) => {
       const target = resolveAntigravityBillableTarget(route.modelId, upstreamModel)
-      const pricing = deps.pricing?.get(route.modelId) ?? null
+      const pricing = resolvePrimaryPricing(route)
       if (pricing === null) return null
+      const lookup = resolvePricingLookup(route)
       const promptTokens = BigInt(Math.ceil(bodyBytes / 4))
       const candidatesTokens = BigInt(RESERVED_OUTPUT_TOKENS)
       if (target.bucket === 'aux') {
@@ -611,11 +636,11 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
             },
           },
           pricing,
-          deps.pricing ?? undefined,
+          lookup,
         )
       }
       if (target.bucket === 'model') {
-        const targetPricing = deps.pricing?.get(target.modelId) ?? null
+        const targetPricing = lookup?.get(target.modelId) ?? null
         if (targetPricing === null) return null
         return antigravityUsageCost(
           {
@@ -644,11 +669,11 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
   const totalsCost =
     deps.totalsCost ??
     ((route: AntigravityRelayRoute, totals: AntigravityUsageTotals) => {
-      const pricing = deps.pricing?.get(route.modelId) ?? null
+      const pricing = resolvePrimaryPricing(route)
       if (pricing === null) {
         return totals.extraModels && Object.keys(totals.extraModels).length > 0 ? null : 0n
       }
-      return antigravityUsageCostOrNull(totals, pricing, deps.pricing ?? undefined)
+      return antigravityUsageCostOrNull(totals, pricing, resolvePricingLookup(route))
     })
 
   return async (req, res, ctx) => {
@@ -700,6 +725,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       error(res, 404, 'ANTIGRAVITY_ROUTE_EXPIRED', requestId)
       return
     }
+    ;(deps.renewInflightFn ?? renewInflight)(route.requestId, now())
     const stage = createPassiveRelayTiming(deps.logger, {
       engine: 'antigravity', requestId, ...egressTraceFields(req), turnRequestId: route.requestId,
       uid: String(identity.userId), model: route.modelId, rpc,

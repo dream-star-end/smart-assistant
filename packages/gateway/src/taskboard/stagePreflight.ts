@@ -102,18 +102,19 @@ export function createTaskboardPreflight(deps: {
           return missingAgent(id)
         }
       }
-      const agentDefault = agent.model && agent.model !== AGENT_MODEL_AUTO ? agent.model : undefined
-      const requestedModel = stage.model || agentDefault
+      const explicitStageModel = stage.model || undefined
+      const hasAgentDefault = Boolean(agent.model && agent.model !== AGENT_MODEL_AUTO)
       try {
         await (deps.resolveExecution ?? resolveLocalExecutionIfEnforced)({
-          agent: requestedModel ? { ...agent, model: requestedModel } : agent,
-          kind: 'turn',
-          model: requestedModel,
+          agent: explicitStageModel ? { ...agent, model: explicitStageModel } : agent,
+          kind: 'billed_delegate',
+          model: explicitStageModel,
           defaultModel: deps.defaultModel,
           preferredModels:
-            !requestedModel && isEngineLocalTurnExempt(env)
+            !explicitStageModel && isEngineLocalTurnExempt(env)
               ? DELEGATE_DEFAULT_PREFERRED_MODELS
               : undefined,
+          preferAgentModelOverPreferred: !explicitStageModel && hasAgentDefault,
           env,
         })
       } catch (error) {

@@ -925,6 +925,70 @@ describe('Antigravity relay budget rounding (Codex r2 P1)', () => {
       assert.equal(res.status, 200, `call ${i + 1}`)
     }
   })
+
+  test('OCV5-897 B2: frozen route pricingOverride enforces higher multiplier cutoff even when live pricing cache is 1x', async () => {
+    const livePricing = {
+      model_id: 'antigravity-gemini-3.8-flash',
+      display_name: 'Gemini 3.8 Flash',
+      input_per_mtok: 100_000n,
+      output_per_mtok: 1_000_000n,
+      cache_read_per_mtok: 0n,
+      cache_write_per_mtok: 0n,
+      multiplier: '1.000',
+      enabled: true,
+    } as unknown as ModelPricing
+    const { token } = await mintAntigravityRelayRoute({
+      containerId: 11,
+      userId: 42,
+      requestId: REQUEST_ID,
+      modelId: 'antigravity-gemini-3.8-flash',
+      accountId: 7n,
+      budgetCredits: 100n,
+      relayPort: 18789,
+      pricingOverride: {
+        modelId: 'antigravity-gemini-3.8-flash',
+        displayName: 'Gemini 3.8 Flash',
+        inputPerMtok: '100000',
+        outputPerMtok: '1000000',
+        cacheReadPerMtok: '0',
+        cacheWritePerMtok: '0',
+        multiplier: '2.000',
+      },
+    })
+    const resolved = await resolveAntigravityRelayRoute({ token, containerId: 11, userId: 42 })
+    assert.equal(resolved?.pricingOverride?.multiplier, '2.000')
+    const path = `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`
+    // 60k output tokens @ 1,000,000/Mtok = 60 fen at 1x, 120 fen at frozen 2x (> 100 fen budget).
+    const heavy = [
+      'data: {"response":{"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":60000}}}\n\n',
+    ]
+    const renewedTokens: string[] = []
+    const deps: Partial<AntigravityRelayDeps> = {
+      pricing: { get: () => livePricing },
+      meteredCost: async () => 0n,
+      estimateCost: undefined,
+      renewInflightFn: (tok: string) => {
+        renewedTokens.push(tok)
+        return true
+      },
+    }
+    const first = await relay(
+      path,
+      { body: generateBody('gemini-3.8-flash-low') },
+      { status: 200, body: heavy },
+      deps,
+    )
+    assert.equal(first.status, 200)
+    assert.deepEqual(renewedTokens, [REQUEST_ID], 'active relay call must slide account inflight slot TTL (OCV5-897 B3)')
+    const second = await relay(
+      path,
+      { body: generateBody('gemini-3.8-flash-low') },
+      { status: 200, body: heavy },
+      deps,
+    )
+    assert.equal(second.status, 402, 'frozen 2x multiplier must trip budget exhaustion at 120 > 100')
+    assert.equal(second.captured.calls, 0)
+  })
 })
 
 describe('Antigravity route context', () => {

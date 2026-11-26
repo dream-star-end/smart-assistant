@@ -17,7 +17,8 @@ export function antigravityOwnerProtectedSql(turn: string): string {
     OR EXISTS (SELECT 1 FROM request_finalize_journal j
       WHERE j.request_id=${turn}.request_id AND j.user_id=${turn}.user_id
         AND j.ctx->>'source'='delegate_antigravity'
-        AND j.state IN ('inflight','finalizing'))
+        AND j.state IN ('inflight','finalizing')
+        AND j.updated_at >= NOW() - INTERVAL '24 hours')
   )`
 }
 

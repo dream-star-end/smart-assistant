@@ -249,10 +249,10 @@ describe('handleDelegateTask engine-reported billing', () => {
     assert.equal(settled.kind, undefined)
   })
 
-  it('(c) glm 委派仍不签 requestId、不调 admit', async () => {
+  it('(c) CCB(deepseek) 委派仍不签 requestId、不调 admit', async () => {
     const billing = makeBillingClient()
     const gw = makeGateway({ billing })
-    const r = await delegate(gw, 'coding-assistant', memberBody({ model: 'glm-5.3-zai' }))
+    const r = await delegate(gw, 'coding-assistant', memberBody({ model: 'deepseek-v4-flash' }))
     assert.equal(r.status, 200, JSON.stringify(r.body))
     assert.equal(gw._lastSubmitRequestId, undefined)
     assert.equal(billing.admits.length, 0)
@@ -384,7 +384,7 @@ describe('handleDelegateTask engine-reported billing', () => {
 
 // ── OCV5-738:委派到 antigravity 引擎必须有 master 签发的 relay route ──────────
 
-const ANTIGRAVITY_MODEL = 'antigravity-claude-sonnet-5.5'
+const ANTIGRAVITY_MODEL = 'antigravity-gemini-4-neon'
 const ANTIGRAVITY_ROUTE_TOKEN = 'ef'.repeat(32)
 const ANTIGRAVITY_BASE_URL = `http://127.0.0.1:18789/internal/v5/antigravity-relay/route/${ANTIGRAVITY_ROUTE_TOKEN}`
 
@@ -594,5 +594,75 @@ describe('handleDelegateTask antigravity delegate route (OCV5-738)', () => {
     } finally {
       gw.sessions.getOrCreate = origGetOrCreate
     }
+  })
+
+  it('(n) 409 ALREADY_MINTED (alreadyMinted: true) 绝不 abandon winner 的共享账本，仍释放 slot/leaseTimer/quota (OCV5-897 B4)', async () => {
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing })
+    gw._acquireDelegateAntigravityRoute = async () => ({
+      ok: false as const,
+      httpStatus: 503,
+      reason: '该委派已申请过 Antigravity route,不能重复铸造',
+      alreadyMinted: true as const,
+    })
+    const intervals: Array<ReturnType<typeof setInterval>> = []
+    const original = gw._runDelegateTask
+    gw._runDelegateTask = async function (this: unknown, input: any) {
+      const handle = setInterval(() => {}, 60_000)
+      handle.unref()
+      intervals.push(handle)
+      input._leaseTimer = handle
+      return original.call(this, input)
+    }
+    try {
+      const r = await delegate(gw, 'auditor', memberBody({ model: ANTIGRAVITY_MODEL }))
+      assert.equal(r.status, 503, JSON.stringify(r.body))
+      assert.equal(gw._lastSubmitRequestId, 'UNSET', 'must not submit runner')
+      assert.deepEqual(billing.abandons, [], 'alreadyMinted must NEVER abandon winner admission')
+      assert.equal(gw._activeDelegations, 0, 'delegate slot must be released')
+      assert.equal(
+        (intervals[0] as unknown as { _destroyed?: boolean })?._destroyed,
+        true,
+        'lease heartbeat timer must be cleared',
+      )
+    } finally {
+      gw._runDelegateTask = original
+    }
+  })
+
+  it('(o) 取消竞态下 409 ALREADY_MINTED + taskboardControl.signal.aborted 绝不 abandon 共享账本 (OCV5-897 B4)', async () => {
+    const { TaskboardRunControl } = await import('../taskboard/runControl.js')
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing })
+    gw.sessions.interrupt = () => false
+    const control = new TaskboardRunControl(
+      'run-b4',
+      'ticket-b4',
+      'owner-b4',
+      'agent:auditor:taskboard:ticket-b4:s1:run-b4',
+    )
+    gw._acquireDelegateAntigravityRoute = async () => {
+      control.requestStop()
+      return {
+        ok: false as const,
+        httpStatus: 503,
+        reason: '该委派已申请过 Antigravity route,不能重复铸造',
+        alreadyMinted: true as const,
+      }
+    }
+    const r = await gw._runDelegateTask({
+      targetAgentId: 'auditor',
+      goal: 'cancelled during 409 ALREADY_MINTED',
+      sourceAgent: 'main',
+      model: ANTIGRAVITY_MODEL,
+      sessionKey: control.rootSessionKey,
+      taskboardControl: control,
+    })
+    assert.equal(r.kind, 'rejected')
+    assert.equal(r.httpStatus, 409)
+    assert.match(String(r.message), /USER_CANCELLED/)
+    assert.equal(gw._lastSubmitRequestId, 'UNSET')
+    assert.deepEqual(billing.abandons, [], 'aborted + alreadyMinted must NEVER abandon winner admission')
+    assert.equal(gw._activeDelegations, 0)
   })
 })

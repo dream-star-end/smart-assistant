@@ -66,8 +66,12 @@ describe('OCV5-22 delegation protocol', () => {
     assert.equal(isDelegateTerminalState('running'), false)
   })
 
-  it('maps DELEGATE_MODEL_UNKNOWN onto invalid_model and builds cron/callback keys', () => {
+  it('maps DELEGATE_MODEL_UNKNOWN and DELEGATE_MODEL_FAMILY_NOT_ALLOWED onto invalid_model and builds cron/callback keys', () => {
     assert.equal(failureClassFromLocalExecutionCode('DELEGATE_MODEL_UNKNOWN'), 'invalid_model')
+    assert.equal(
+      failureClassFromLocalExecutionCode('DELEGATE_MODEL_FAMILY_NOT_ALLOWED'),
+      'invalid_model',
+    )
     assert.equal(
       cronDelegateIdempotencyKey('remind-mtd9f0ng-pgki', 1767225600),
       'cron:remind-mtd9f0ng-pgki:1767225600',

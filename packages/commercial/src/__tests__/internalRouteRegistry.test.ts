@@ -260,9 +260,9 @@ describe('internalRouteRegistry — dispatchInternal 挂载', () => {
       /isDelegateAntigravityRoutePath\(path\)/,
       'dispatchInternal 里没有 delegate antigravity-route 的挂载引用(放行了 forwarder 却 404)',
     )
-    // OCV5-477:两版都挂载(不再受 OC_SELFHOST_ENGINE_LOCAL_TURNS 门控);mint 不等于计费,
-    // 所以 grok relay 必须对 kind=delegate 的路由校验 inflight 计费 journal。
-    // Antigravity route remains selfhost-gated.
+    // OCV5-477 / OCV5-897:grok 与 antigravity delegate route 两版都挂载(不再受
+    // OC_SELFHOST_ENGINE_LOCAL_TURNS 门控);mint 不等于计费,所以 relay / mint 必须
+    // 强制校验 inflight 计费 journal 与容器身份。
     const gateIdx = source.indexOf('const delegateGrokRouteHandler')
     assert.ok(gateIdx >= 0 && gateIdx < start, 'delegateGrokRouteHandler 装配点丢失')
     assert.doesNotMatch(
@@ -276,20 +276,49 @@ describe('internalRouteRegistry — dispatchInternal 挂载', () => {
       /context\.kind === 'delegate'[\s\S]{0,200}hasInflightDelegateGrokBilling/,
       'grok relay 不再对 delegate 路由校验计费 journal(mint 后不准入即可白跑)',
     )
-    const antigravityGateIdx = source.indexOf('const allowDelegateAntigravityMint')
-    assert.ok(antigravityGateIdx >= 0 && antigravityGateIdx < start, 'allowDelegateAntigravityMint 装配点丢失')
-    assert.match(
-      source.slice(antigravityGateIdx, antigravityGateIdx + 400),
-      /OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"[\s\S]{0,160}const delegateAntigravityRouteHandler = antigravityRouteRuntime\.makeDelegateHandler\(\)/,
-      'delegate antigravity-route mint/release 的 selfhost 门控或 handler 装配被改动',
+    const antigravityGateIdx = source.indexOf('const delegateAntigravityRouteHandler')
+    assert.ok(antigravityGateIdx >= 0 && antigravityGateIdx < start, 'delegateAntigravityRouteHandler 装配点丢失')
+    assert.doesNotMatch(
+      source.slice(Math.max(0, antigravityGateIdx - 200), antigravityGateIdx + 400),
+      /OC_SELFHOST_ENGINE_LOCAL_TURNS/,
+      'delegate antigravity-route 挂载又被 selfhost 门控(商业团队模式的 Gemini 成员会 404)',
+    )
+    assert.doesNotMatch(
+      dispatch,
+      /allowDelegateAntigravityMint/,
+      'dispatchInternal 不得再按 selfhost 门控 antigravity delegate route(OCV5-897)',
     )
     assert.match(
       dispatch,
-      /allowDelegateAntigravityMint\s*\?\s*isDelegateAntigravityRoutePath\(path\)\s*:\s*path === DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH/,
-      'dispatchInternal 必须对 mint/release 保持 selfhost 门控且双版挂载 renew(OCV5-887 B8)',
+      /delegateAntigravityRouteHandler\s*&&\s*isDelegateAntigravityRoutePath\(path\)/,
+      'dispatchInternal 必须双版无条件挂载 isDelegateAntigravityRoutePath(path)',
     )
-    const renewEntry = registryEntries.find((e) => e.path === DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH)
-    assert.equal(renewEntry?.selfhostOnly, undefined, 'renew 已对商业版开放,注册表不得保留 selfhostOnly')
+    for (const path of [
+      DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH,
+      DELEGATE_ANTIGRAVITY_ROUTE_RELEASE_PATH,
+      DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH,
+    ]) {
+      const entry = registryEntries.find((e) => e.path === path)
+      assert.equal(entry?.selfhostOnly, undefined, `${path} 已对商业版开放,注册表不得保留 selfhostOnly`)
+    }
+    const agRouteSrc = await readFile(
+      new URL('../http/internalDelegateAntigravityRoute.ts', import.meta.url),
+      'utf8',
+    )
+    assert.match(
+      agRouteSrc,
+      /row\.state !== 'inflight'[\s\S]{0,160}source !== 'delegate_antigravity'/,
+      'internalDelegateAntigravityRoute.ts 必须强制校验 inflight delegate_antigravity journal',
+    )
+    const agAuthoritySrc = await readFile(
+      new URL('../billing/antigravityRouteAuthority.ts', import.meta.url),
+      'utf8',
+    )
+    assert.match(
+      agAuthoritySrc,
+      /j\.state='inflight'[\s\S]{0,120}j\.ctx->>'source'='delegate_antigravity'/,
+      'antigravityRouteAuthority.ts 必须强制校验 inflight delegate_antigravity journal',
+    )
     const remoteLaneHandler = await readFile(
       new URL('../http/internalDelegateRemoteLane.ts', import.meta.url),
       'utf8',

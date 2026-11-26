@@ -277,6 +277,8 @@ export function failureClassFromLocalExecutionCode(code: string | undefined): De
   switch (code) {
     case 'DELEGATE_MODEL_UNKNOWN':
       return 'invalid_model'
+    case 'DELEGATE_MODEL_FAMILY_NOT_ALLOWED':
+      return 'invalid_model'
     case 'DELEGATE_CODEX_UNSUPPORTED':
       return 'invalid_model'
     case 'MODEL_NOT_AVAILABLE':

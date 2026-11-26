@@ -138,6 +138,7 @@ function installCatalog(
     fail?: boolean
     calls?: string[]
     extraModels?: Array<Record<string, unknown>>
+    aliases?: Record<string, string>
     agentCostOverrides?: Record<string, string>
   } = {},
 ): void {
@@ -155,7 +156,7 @@ function installCatalog(
           ],
           projection_revision: 'proj-1',
           security_epoch: '7',
-          aliases: { 'glm-latest': 'glm-5.2' },
+          aliases: { 'glm-latest': 'glm-5.2', ...(opts.aliases ?? {}) },
           ...(opts.agentCostOverrides ? { agent_cost_overrides: opts.agentCostOverrides } : {}),
         },
         opts,
@@ -591,8 +592,13 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
     assert.equal(d.canonicalModel, 'gpt-5.6-sol')
   })
 
-  for (const code of ['DELEGATE_CODEX_UNSUPPORTED', 'DELEGATE_MODEL_UNKNOWN',
-    'MODEL_NOT_AVAILABLE', 'MODEL_CATALOG_UNAVAILABLE']) {
+  for (const code of [
+    'DELEGATE_CODEX_UNSUPPORTED',
+    'DELEGATE_MODEL_UNKNOWN',
+    'DELEGATE_MODEL_FAMILY_NOT_ALLOWED',
+    'MODEL_NOT_AVAILABLE',
+    'MODEL_CATALOG_UNAVAILABLE',
+  ]) {
     test(`preflight quota: ${code} leaves all member attempts available`, async () => {
       const prev = process.env.OC_MODEL_AUTHORITY
       const prevExempt = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
@@ -606,13 +612,19 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
         } else {
           installCatalog({
             fail: code === 'MODEL_CATALOG_UNAVAILABLE',
-            extraModels: [row('antigravity-gemini-4-argon', 'antigravity')],
+            extraModels: [row('cursor-grok-4.6-high', 'cursor')],
           })
         }
         const gw = makeDelegateGateway()
         const parentSessionKey = 'agent:main:webchat:dm:preflight-quota'
-        const model = code === 'DELEGATE_CODEX_UNSUPPORTED' ? 'antigravity-gemini-4-argon'
-          : code === 'DELEGATE_MODEL_UNKNOWN' ? 'missing-model' : undefined
+        const model =
+          code === 'DELEGATE_CODEX_UNSUPPORTED'
+            ? 'cursor-grok-4.6-high'
+            : code === 'DELEGATE_MODEL_UNKNOWN'
+              ? 'missing-model'
+              : code === 'DELEGATE_MODEL_FAMILY_NOT_ALLOWED'
+                ? 'glm-5.2'
+                : undefined
         for (let i = 0; i < MEMBER_DELEGATIONS_PER_TURN_DEFAULT + 1; i++) {
           const rejected = await runDelegate(gw, 'coding-assistant', {
             goal: 'preflight reject', sourceAgent: 'main', parentSessionKey, model,
@@ -624,13 +636,13 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
         installCatalog()
         for (let i = 0; i < MEMBER_DELEGATIONS_PER_TURN_DEFAULT; i++) {
           const accepted = await runDelegate(gw, 'coding-assistant', {
-            goal: 'valid member', sourceAgent: 'main', parentSessionKey, model: 'glm-5.2',
+            goal: 'valid member', sourceAgent: 'main', parentSessionKey, model: 'deepseek-v4-flash',
           })
           assert.equal(accepted.status, 200, JSON.stringify(accepted))
         }
         assert.equal(gw.sessions.getOrCreateCalls, MEMBER_DELEGATIONS_PER_TURN_DEFAULT)
         const blocked = await runDelegate(gw, 'coding-assistant', {
-          goal: 'over-limit real attempt', sourceAgent: 'main', parentSessionKey, model: 'glm-5.2',
+          goal: 'over-limit real attempt', sourceAgent: 'main', parentSessionKey, model: 'deepseek-v4-flash',
         })
         assert.equal(blocked.status, 429)
       } finally {
@@ -735,7 +747,7 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
     }
   })
 
-  test('HTTP delegate:flag 未开 + 显式合法 slug 通过,仍不查 catalog', async () => {
+  test('HTTP delegate:flag 未开 + 显式合法四大家族 slug 通过,非四大家族拒 400 DELEGATE_MODEL_FAMILY_NOT_ALLOWED,均不查 catalog', async () => {
     _setModelCatalogClientForTests({
       getView: () => {
         throw new Error('catalog must NOT be consulted while flag is off')
@@ -745,7 +757,7 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
     Reflect.deleteProperty(process.env, 'OC_MODEL_AUTHORITY')
     try {
       const gw = makeDelegateGateway()
-      for (const model of ['glm-5.3-zai', 'cursor-grok-4.6-high-fast']) {
+      for (const model of ['deepseek-v4-flash', 'cursor-grok-4.6-high-fast']) {
         gw.sessions.getOrCreateCalls = 0
         const r = await runDelegate(gw, 'coding-assistant', {
           goal: 'x',
@@ -755,6 +767,15 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
         assert.equal(r.status, 200, model)
         assert.equal(gw.sessions.getOrCreateCalls, 1, model)
       }
+      gw.sessions.getOrCreateCalls = 0
+      const rejected = await runDelegate(gw, 'coding-assistant', {
+        goal: 'x',
+        sourceAgent: 'main',
+        model: 'glm-5.3-zai',
+      })
+      assert.equal(rejected.status, 400)
+      assert.equal(rejected.body.code, 'DELEGATE_MODEL_FAMILY_NOT_ALLOWED')
+      assert.equal(gw.sessions.getOrCreateCalls, 0, 'flag-off 非四大家族显式委派不得绕过')
     } finally {
       restoreFlag(prev)
     }
@@ -931,7 +952,7 @@ describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落
     })
   })
 
-  test('显式 model: glm-5.3-zai → 不碰 grok(mint 不被调用)', async () => {
+  test('显式 model: deepseek-v4-flash → 不碰 grok(mint 不被调用); 显式 glm-5.3-zai → 400 DELEGATE_MODEL_FAMILY_NOT_ALLOWED', async () => {
     installCatalog({ extraModels: GROK_ROWS })
     await withFlags({ authority: true, exempt: true }, async () => {
       const gw = makeDelegateGateway()
@@ -941,18 +962,27 @@ describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落
         return okMint()
       }
       const r = await runDelegate(gw, 'coding-assistant', {
+        goal: '显式 deepseek',
+        sourceAgent: 'main',
+        model: 'deepseek-v4-flash',
+      })
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(mintCalls, 0)
+      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'deepseek-v4-flash')
+      assert.equal(gw.sessions.getOrCreateArgs[0].executionAuthority?.engine, 'ccb')
+
+      const rejected = await runDelegate(gw, 'coding-assistant', {
         goal: '显式 glm',
         sourceAgent: 'main',
         model: 'glm-5.3-zai',
       })
-      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(rejected.status, 400)
+      assert.equal(rejected.body.code, 'DELEGATE_MODEL_FAMILY_NOT_ALLOWED')
       assert.equal(mintCalls, 0)
-      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'glm-5.3-zai')
-      assert.equal(gw.sessions.getOrCreateArgs[0].executionAuthority?.engine, 'ccb')
     })
   })
 
-  test('引擎本地豁免未开 → 默认不选 grok-build(走 agent.model 旧梯子,mint 不被调用)', async () => {
+  test('引擎本地豁免未开 → 默认不选 grok-build,旧非四大家族 agent.model 平滑回落 deepseek-v4-flash(mint 不被调用)', async () => {
     installCatalog({ extraModels: GROK_ROWS })
     await withFlags({ authority: true, exempt: false }, async () => {
       const gw = makeDelegateGateway()
@@ -964,12 +994,12 @@ describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落
       const r = await runDelegate(gw, 'coding-assistant', { goal: '默认子任务', sourceAgent: 'main' })
       assert.equal(r.status, 200, JSON.stringify(r.body))
       assert.equal(mintCalls, 0)
-      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'glm-5.2')
+      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'deepseek-v4-flash')
       assert.equal(gw.sessions.getOrCreateArgs[0].executionAuthority?.engine, 'ccb')
     })
   })
 
-  test('catalog 没有 grok-build 行 → 默认静默落 agent.model(不 throw、mint 不被调用)', async () => {
+  test('catalog 没有 grok-build 行 → 默认跳过旧非四大家族 agent.model 平滑回落 deepseek-v4-flash(不 throw、mint 不被调用)', async () => {
     installCatalog({ extraModels: [row('glm-5.3-zai', 'ccb', { provider_id: 'zai' })] })
     await withFlags({ authority: true, exempt: true }, async () => {
       const gw = makeDelegateGateway()
@@ -981,7 +1011,7 @@ describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落
       const r = await runDelegate(gw, 'coding-assistant', { goal: '默认子任务', sourceAgent: 'main' })
       assert.equal(r.status, 200, JSON.stringify(r.body))
       assert.equal(mintCalls, 0)
-      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'glm-5.2')
+      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'deepseek-v4-flash')
     })
   })
 
@@ -1239,9 +1269,11 @@ function makeDelegateGateway(): any {
       }
     },
     submitExtras: [] as unknown[],
+    submitModels: [] as Array<string | undefined>,
     submit: async (_s: unknown, _p: string, onEvent: (e: any) => void, ...rest: unknown[]) => {
-      // rest[5] = 第 9 个位置参数 { platformGoal, grokRoute? }(server.ts submit 调用形参:
+      // rest[1] = model; rest[5] = 第 9 个位置参数 { platformGoal, grokRoute? }(server.ts submit 调用形参:
       // session, prompt, onEvent, effort, model, requestId, undefined, undefined, extras)。
+      gw.sessions.submitModels.push(rest[1] as string | undefined)
       gw.sessions.submitExtras.push(rest[5])
       onEvent({ kind: 'block', block: { kind: 'text', text: 'done' } })
       onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
@@ -1272,19 +1304,24 @@ async function runDelegate(
   return { status, body: raw ? JSON.parse(raw) : {} }
 }
 
-// ── OCV5-477 / OCV5-895 billed kinds: commercial grok/codex delegate & codex advisor without the exemption ──
+// ── OCV5-477 / OCV5-895 / OCV5-897 billed kinds: commercial grok/codex/antigravity delegate & 4-family gate ──
 
 describe('OCV5-477 billed_delegate / billed_advisor', () => {
   const billedView = () =>
     view(
       [
         row('glm-5.2', 'ccb'),
+        row('MiniMax-M3', 'ccb'),
+        row('deepseek-v4-flash', 'ccb'),
         row('gpt-5.6-sol', 'codex'),
         row('gpt-6.2-astra', 'codex'),
         row('grok-build', 'grok'),
         row('cursor-grok-4.6-high', 'cursor'),
         row('zcode-glm-5.3', 'zcode'),
         row('antigravity-gemini-4-argon', 'antigravity'),
+        row('antigravity-gemini-4-neon', 'antigravity'),
+        row('antigravity-claude-sonnet-5.5', 'antigravity'),
+        row('antigravity-gpt-oss-120b', 'antigravity'),
       ],
       {},
     )
@@ -1335,19 +1372,185 @@ describe('OCV5-477 billed_delegate / billed_advisor', () => {
     }
   })
 
-  test('OCV5-895: billed_delegate still rejects cursor / zcode / antigravity without selfhost exemption', () => {
-    for (const model of ['cursor-grok-4.6-high', 'zcode-glm-5.3', 'antigravity-gemini-4-argon']) {
+  test('OCV5-897: billed_delegate admits antigravity Gemini without selfhost exemption, while plain turn still rejects antigravity', () => {
+    for (const model of ['antigravity-gemini-4-neon', 'antigravity-gemini-4-argon']) {
+      const d = decideLocalExecution({
+        view: billedView(),
+        agent: { id: 'member', model: 'glm-5.2' },
+        model,
+        kind: 'billed_delegate',
+        env: {} as NodeJS.ProcessEnv,
+      })
+      assert.equal(d.engine, 'antigravity')
+      assert.equal(d.canonicalModel, model)
       assert.throws(
         () =>
           decideLocalExecution({
             view: billedView(),
-            agent: { id: 'member', model: 'glm-5.2' },
+            agent: { id: 'member', model },
             model,
-            kind: 'billed_delegate',
+            kind: 'turn',
             env: {} as NodeJS.ProcessEnv,
           }),
         (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_CODEX_UNSUPPORTED',
       )
+    }
+  })
+
+  test('OCV5-897: billed_delegate rejects cursor (unsupported commercial engine) and non-4-family models (both commercial & selfhost)', () => {
+    assert.throws(
+      () =>
+        decideLocalExecution({
+          view: billedView(),
+          agent: { id: 'member', model: 'glm-5.2' },
+          model: 'cursor-grok-4.6-high',
+          kind: 'billed_delegate',
+          env: {} as NodeJS.ProcessEnv,
+        }),
+      (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_CODEX_UNSUPPORTED',
+    )
+    for (const env of [{} as NodeJS.ProcessEnv, { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' } as NodeJS.ProcessEnv]) {
+      for (const model of [
+        'glm-5.2',
+        'zcode-glm-5.3',
+        'antigravity-claude-sonnet-5.5',
+        'antigravity-gpt-oss-120b',
+      ]) {
+        assert.throws(
+          () =>
+            decideLocalExecution({
+              view: billedView(),
+              agent: { id: 'member', model: 'glm-5.2' },
+              model,
+              kind: 'billed_delegate',
+              env,
+            }),
+          (err: unknown) => {
+            const e = err as { code?: string; message?: string }
+            assert.equal(e.code, 'DELEGATE_MODEL_FAMILY_NOT_ALLOWED', model)
+            assert.match(String(e.message), /Grok \/ Gemini \/ GPT \/ DeepSeek/)
+            const hintPart = String(e.message).split('四大家族。')[1] ?? ''
+            assert.doesNotMatch(
+              hintPart,
+              /'glm-5\.2'|'MiniMax-M3'|'zcode-glm-5\.3'|'antigravity-claude-sonnet-5\.5'|'antigravity-gpt-oss-120b'/,
+            )
+            return true
+          },
+        )
+      }
+    }
+  })
+
+  test('OCV5-897: DELEGATE_MODEL_UNKNOWN under billed_delegate never suggests non-4-family models', () => {
+    assert.throws(
+      () =>
+        decideLocalExecution({
+          view: billedView(),
+          agent: { id: 'member', model: 'glm-5.2' },
+          model: 'glm-5',
+          kind: 'billed_delegate',
+          env: {} as NodeJS.ProcessEnv,
+        }),
+      (err: unknown) => {
+        const e = err as { code?: string; message?: string }
+        assert.equal(e.code, 'DELEGATE_MODEL_UNKNOWN')
+        assert.doesNotMatch(String(e.message), /glm-5\.2|zcode-glm-5\.3/)
+        return true
+      },
+    )
+    assert.throws(
+      () =>
+        decideLocalExecution({
+          view: billedView(),
+          agent: { id: 'member', model: 'glm-5.2' },
+          model: 'antigravity-gemini-4',
+          kind: 'billed_delegate',
+          env: {} as NodeJS.ProcessEnv,
+        }),
+      (err: unknown) => {
+        const e = err as { code?: string; message?: string }
+        assert.equal(e.code, 'DELEGATE_MODEL_UNKNOWN')
+        assert.match(String(e.message), /antigravity-gemini-4-neon/)
+        assert.doesNotMatch(String(e.message), /antigravity-claude|antigravity-gpt-oss/)
+        return true
+      },
+    )
+  })
+
+  test('OCV5-897: implicit billed_delegate skips legacy non-4-family config and falls back safely; all skipped -> MODEL_NOT_AVAILABLE', () => {
+    const fallback = decideLocalExecution({
+      view: billedView(),
+      agent: { id: 'legacy-member', model: 'glm-5.2' },
+      defaultModel: 'MiniMax-M3',
+      kind: 'billed_delegate',
+      env: {} as NodeJS.ProcessEnv,
+    })
+    assert.equal(fallback.canonicalModel, 'deepseek-v4-flash')
+    assert.equal(fallback.engine, 'ccb')
+
+    assert.throws(
+      () =>
+        decideLocalExecution({
+          view: view([row('glm-5.2', 'ccb'), row('MiniMax-M3', 'ccb')]),
+          agent: { id: 'legacy-member', model: 'glm-5.2' },
+          defaultModel: 'MiniMax-M3',
+          kind: 'billed_delegate',
+          env: {} as NodeJS.ProcessEnv,
+        }),
+      (err: unknown) => (err as { code?: string })?.code === 'MODEL_NOT_AVAILABLE',
+    )
+  })
+
+  test('OCV5-897: foreground/non-delegate kinds (turn/synthetic/prewarm/auto_dream/billed_advisor) retain non-4-family models', () => {
+    for (const kind of ['turn', 'synthetic', 'prewarm', 'auto_dream', 'billed_advisor'] as const) {
+      const d = decideLocalExecution({
+        view: billedView(),
+        agent: { id: 'main', model: 'glm-5.2' },
+        model: 'glm-5.2',
+        kind,
+        env: {} as NodeJS.ProcessEnv,
+      })
+      assert.equal(d.canonicalModel, 'glm-5.2', kind)
+      assert.equal(d.engine, 'ccb', kind)
+    }
+  })
+
+  test('OCV5-897: HTTP commercial delegate admits antigravity-gemini-4-neon without selfhost exemption', async () => {
+    installCatalog({ extraModels: [row('antigravity-gemini-4-neon', 'antigravity')] })
+    const prev = process.env.OC_MODEL_AUTHORITY
+    const prevExempt = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+    process.env.OC_MODEL_AUTHORITY = '1'
+    Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+    try {
+      const gw = makeDelegateGateway()
+      const routeToken = 'ef'.repeat(32)
+      gw._acquireDelegateAntigravityRoute = async () => ({
+        ok: true as const,
+        lease: {
+          route: {
+            baseUrl: `http://127.0.0.1:18789/internal/v5/antigravity-relay/route/${routeToken}`,
+            routeToken,
+            accessToken: 'A'.repeat(48),
+            accessTokenExpiresAt: '2026-11-27T00:00:00.000Z',
+          },
+          routeToken,
+          release: async () => {},
+        },
+      })
+      const r = await runDelegate(gw, 'coding-assistant', {
+        goal: 'commercial antigravity gemini audit',
+        sourceAgent: 'main',
+        model: 'antigravity-gemini-4-neon',
+      })
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(gw.sessions.getOrCreateCalls, 1)
+      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'antigravity-gemini-4-neon')
+      assert.equal(gw.sessions.getOrCreateArgs[0].executionAuthority?.engine, 'antigravity')
+      assert.ok(gw.sessions.submitExtras[0]?.antigravityRoute, 'commercial antigravity delegate must carry master-issued antigravityRoute')
+    } finally {
+      restoreFlag(prev)
+      if (prevExempt === undefined) Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+      else process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = prevExempt
     }
   })
 
@@ -1544,6 +1747,119 @@ describe('OCV5-477 billed_delegate / billed_advisor', () => {
       assert.equal(settles[0]?.requestId, requestId)
       assert.equal(settles[0]?.status, 'success')
       assert.deepEqual(settles[0]?.usage, { input_tokens: 1_000_000, output_tokens: 0 })
+    } finally {
+      restoreFlag(prev)
+      if (prevExempt === undefined) Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+      else process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = prevExempt
+    }
+  })
+
+  test('OCV5-897 B5: flag-off implicit delegate with legacy GLM agent falls back to 4-family deepseek-v4-flash', async () => {
+    const prev = process.env.OC_MODEL_AUTHORITY
+    const prevExempt = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+    process.env.OC_MODEL_AUTHORITY = '0'
+    Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+    try {
+      const gw = makeDelegateGateway()
+      const r = await runDelegate(gw, 'coding-assistant', {
+        goal: 'flag-off implicit delegate',
+        sourceAgent: 'main',
+      })
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(gw.sessions.getOrCreateCalls, 1)
+      assert.equal(gw.sessions.getOrCreateArgs[0].agent.model, 'deepseek-v4-flash')
+      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'deepseek-v4-flash')
+      assert.equal(gw.sessions.submitModels[0], 'deepseek-v4-flash')
+    } finally {
+      restoreFlag(prev)
+      if (prevExempt === undefined) Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+      else process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = prevExempt
+    }
+  })
+
+  test('OCV5-897 B6: taskboard-stage-agent-auto executes commercial explicit antigravity Gemini and safely falls back legacy GLM member', async () => {
+    installCatalog({ extraModels: [row('antigravity-gemini-4-neon', 'antigravity')] })
+    const prev = process.env.OC_MODEL_AUTHORITY
+    const prevExempt = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+    process.env.OC_MODEL_AUTHORITY = '1'
+    Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+    try {
+      const gw = makeDelegateGateway()
+      const routeToken = 'ef'.repeat(32)
+      gw._acquireDelegateAntigravityRoute = async () => ({
+        ok: true as const,
+        lease: {
+          route: {
+            baseUrl: `http://127.0.0.1:18789/internal/v5/antigravity-relay/route/${routeToken}`,
+            routeToken,
+            accessToken: 'A'.repeat(48),
+            accessTokenExpiresAt: '2026-11-27T00:00:00.000Z',
+          },
+          routeToken,
+          release: async () => {},
+        },
+      })
+      // Case 1: taskboard stage with no stage.model + legacy GLM agent -> falls back cleanly to deepseek-v4-flash
+      const fallbackRes = await gw._runDelegateTask({
+        targetAgentId: 'coding-assistant',
+        goal: 'taskboard stage without explicit model',
+        sourceAgent: 'main',
+        modelPolicy: 'taskboard-stage-agent-auto',
+      })
+      assert.equal(fallbackRes.kind, 'completed', JSON.stringify(fallbackRes))
+      assert.equal(fallbackRes.ok, true, JSON.stringify(fallbackRes))
+      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'deepseek-v4-flash')
+
+      // Case 2: taskboard stage with explicit antigravity-gemini-4-neon -> executes on commercial antigravity
+      const agRes = await gw._runDelegateTask({
+        targetAgentId: 'coding-assistant',
+        goal: 'taskboard stage with explicit antigravity gemini',
+        sourceAgent: 'main',
+        model: 'antigravity-gemini-4-neon',
+        modelPolicy: 'taskboard-stage-agent-auto',
+      })
+      assert.equal(agRes.kind, 'completed', JSON.stringify(agRes))
+      assert.equal(agRes.ok, true, JSON.stringify(agRes))
+      assert.equal(gw.sessions.getOrCreateArgs[1].model, 'antigravity-gemini-4-neon')
+      assert.equal(gw.sessions.getOrCreateArgs[1].executionAuthority?.engine, 'antigravity')
+    } finally {
+      restoreFlag(prev)
+      if (prevExempt === undefined) Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+      else process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = prevExempt
+    }
+  })
+
+  test('OCV5-897 B6: selfhost taskboard member bound to catalog alias (sol-alias -> gpt-6.2-sol) wins over grok-build preference', async () => {
+    installCatalog({
+      extraModels: [row('grok-build', 'grok'), row('gpt-6.2-sol', 'codex')],
+      aliases: { 'sol-alias': 'gpt-6.2-sol' },
+    })
+    const prev = process.env.OC_MODEL_AUTHORITY
+    const prevExempt = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+    process.env.OC_MODEL_AUTHORITY = '1'
+    process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = '1'
+    try {
+      const gw = makeDelegateGateway()
+      const origGetCfg = gw._getAgentsConfig
+      gw._getAgentsConfig = async () => {
+        const cfg = await origGetCfg()
+        return {
+          ...cfg,
+          agents: cfg.agents.map((a: any) =>
+            a.id === 'coding-assistant' ? { ...a, model: 'sol-alias' } : a,
+          ),
+        }
+      }
+      const res = await gw._runDelegateTask({
+        targetAgentId: 'coding-assistant',
+        goal: 'taskboard stage with alias member',
+        sourceAgent: 'main',
+        modelPolicy: 'taskboard-stage-agent-auto',
+      })
+      assert.equal(res.kind, 'completed', JSON.stringify(res))
+      assert.equal(res.ok, true)
+      assert.equal(gw.sessions.getOrCreateArgs[0].model, 'gpt-6.2-sol')
+      assert.equal(gw.sessions.getOrCreateArgs[0].executionAuthority?.engine, 'codex')
     } finally {
       restoreFlag(prev)
       if (prevExempt === undefined) Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')

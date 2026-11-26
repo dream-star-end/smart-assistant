@@ -400,15 +400,47 @@ export function reserveInflight(
   cap: number,
   now = Date.now(),
   ratePerMin: number | null = null,
+  strictCapacity = false,
 ): string | null {
   if (order.length === 0) return null
   const roomy = (m: string) => inflightCount(service, m, now) < cap
   const rated = (m: string) => ratePerMin === null || underRateCap(service, m, ratePerMin, now)
-  // In order: room and under the per-minute cap; then room only; then the first.
-  const id = order.find((m) => roomy(m) && rated(m)) ?? order.find(roomy) ?? order[0]
+  // Strict mode (delegation, OCV5-897 B3) refuses when no account has capacity;
+  // default foreground mode preserves soft-spillover to order[0].
+  const id = strictCapacity
+    ? (order.find((m) => roomy(m) && rated(m)) ?? null)
+    : (order.find((m) => roomy(m) && rated(m)) ?? order.find(roomy) ?? order[0])
+  if (!id) return null
   acquireInflight(service, id, token, now)
   noteAdmission(service, id, now)
   return id
+}
+
+/**
+ * Slide the expiry window of an active in-flight unit (OCV5-897 B3).
+ * Returns true if the token is still live and was renewed; false if already
+ * released or expired past its TTL (cleaning up stale entries).
+ */
+export function renewInflight(
+  token: string,
+  now = Date.now(),
+  ttlMs = INFLIGHT_TTL_MS,
+): boolean {
+  const k = inflightOwner.get(token)
+  if (!k) return false
+  const m = inflight.get(k)
+  if (!m) {
+    inflightOwner.delete(token)
+    return false
+  }
+  const exp = m.get(token)
+  if (exp === undefined || exp <= now) {
+    m.delete(token)
+    inflightOwner.delete(token)
+    return false
+  }
+  m.set(token, now + ttlMs)
+  return true
 }
 
 export function releaseInflight(token: string): void {

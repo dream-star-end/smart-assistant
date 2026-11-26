@@ -137,7 +137,8 @@ import {
   type TeamReviewMode,
 } from './teamMode.js'
 import { resolveLocalExecutionIfEnforced, localExecutionOverride, _buildTurnStatusFrame } from './server.js'
-import { DELEGATE_DEFAULT_PREFERRED_MODELS, DELEGATE_GROK_FALLBACK_MODEL, assertKnownExplicitDelegateModel, DELEGATE_QUEUE_MAX_WAITERS, MAX_HIDDEN_DELEGATIONS_PER_TURN, MEMBER_DELEGATIONS_PER_TURN_DEFAULT, PerTurnDelegationGuard, resolveDelegateParentClientSessionId } from './delegatePolicy.js'
+import { preflightExplicitDelegateModel, resolveDelegateFlagOffModel } from './localExecution.js'
+import { DELEGATE_DEFAULT_PREFERRED_MODELS, DELEGATE_GROK_FALLBACK_MODEL, DELEGATE_QUEUE_MAX_WAITERS, MAX_HIDDEN_DELEGATIONS_PER_TURN, MEMBER_DELEGATIONS_PER_TURN_DEFAULT, PerTurnDelegationGuard, resolveDelegateParentClientSessionId } from './delegatePolicy.js'
 import type { Gateway, LocalExecutionDecision } from './server.js'
 import type { DelegateGateBlock, RunDelegateInput } from './delegatePolicy.js'
 
@@ -614,18 +615,19 @@ export async function handleDelegateTask(
   if (!goal) return this.sendError(res, 400, DELEGATE_GOAL_REQUIRED_ERROR)
   const modelNorm = parseDelegateModel(parsed.model)
   if (!modelNorm.ok) return this.sendError(res, 400, modelNorm.error)
-  // Flag-off: reject unknown explicit slugs before async job creation / spawn.
-  // Flag-on: catalog projection in resolveLocalExecutionIfEnforced remains
-  // the authority (catalog-only slugs, catalog-unavailable ≠ unknown).
-  if (modelNorm.model && !isModelAuthorityRequired()) {
+  // Entry-gate explicit model preflight (OCV5-897 B7): runs for both flag-on
+  // (catalog projection) and flag-off (baked allowlist + 4-family policy) BEFORE
+  // creating async jobs, reserving slots, or minting resume claims.
+  if (modelNorm.model && !isTeamReviewExecution(targetAgentId)) {
     try {
-      assertKnownExplicitDelegateModel(modelNorm.model)
+      await preflightExplicitDelegateModel({ model: modelNorm.model, agentId: targetAgentId })
     } catch (err) {
       const mapped = this._mapLocalExecutionError(err)
       if (mapped) {
         return this.sendJson(res, mapped.httpStatus, {
           error: mapped.message,
           code: mapped.code,
+          failure_class: failureClassFromLocalExecutionCode(mapped.code),
         })
       }
       throw err
@@ -1327,14 +1329,17 @@ export async function _runDelegateTaskCore(
   // 被 spawn(方案 §3 要求的"创建 runner 前拒",测试 ④/⑤ 断言未 spawn)。
   // 审查委派:调用方 model 忽略,改用 gateway 按「≠ 队长 / ≠ panel 家族」选出的审查员型号
   // (选不出 → undefined → 沿用 hidden-reviewer 成员绑定)。
-  const taskboardDefault = input.modelPolicy === 'taskboard-stage-agent-auto' &&
-    delegatedAgent.model && delegatedAgent.model !== AGENT_MODEL_AUTO
-    ? delegatedAgent.model : undefined
-  const requestedModel = isReview ? reviewerModelOverride : input.model || taskboardDefault
+  const isTaskboardAuto = input.modelPolicy === 'taskboard-stage-agent-auto' && !input.model
+  const hasTaskboardAgentDefault = Boolean(
+    isTaskboardAuto && delegatedAgent.model && delegatedAgent.model !== AGENT_MODEL_AUTO,
+  )
+  const requestedModel = isReview ? reviewerModelOverride : input.model || undefined
   let execAgent = requestedModel ? { ...delegatedAgent, model: requestedModel } : delegatedAgent
   let delegateExec: LocalExecutionDecision | undefined
   // 默认(未显式指定 model、非 review)委派优先 grok-build;只在 selfhost 引擎本地豁免门
   // 开着时插入(生产没有 grok 本地 turn),catalog 无该行时候选循环自然跳过。
+  // 任务板成员有非 auto 默认时,通过 preferAgentModelOverPreferred 把 agent.model 排在
+  // preferredModels 之前,在 catalog 归一后再判定四大家族与可路由性(OCV5-897 B6)。
   const preferGrokDefault = !requestedModel && !isReview && isEngineLocalTurnExempt(process.env)
   try {
     delegateExec = await resolveLocalExecutionIfEnforced({
@@ -1343,6 +1348,7 @@ export async function _runDelegateTaskCore(
       model: requestedModel,
       defaultModel: this.deps.config.defaults.model,
       preferredModels: preferGrokDefault ? DELEGATE_DEFAULT_PREFERRED_MODELS : undefined,
+      preferAgentModelOverPreferred: hasTaskboardAgentDefault,
     })
   } catch (err) {
     const mapped = this._mapLocalExecutionError(err)
@@ -1354,6 +1360,23 @@ export async function _runDelegateTaskCore(
       code: mapped.code,
     }
   }
+  let flagOffDelegateModel: string | undefined
+  if (!delegateExec && !isModelAuthorityRequired()) {
+    flagOffDelegateModel = resolveDelegateFlagOffModel({
+      requestedModel,
+      agentModel: execAgent.model,
+      defaultModel: this.deps.config.defaults.model,
+      preferredModels: preferGrokDefault ? DELEGATE_DEFAULT_PREFERRED_MODELS : undefined,
+      preferAgentModelOverPreferred: hasTaskboardAgentDefault,
+    })
+    execAgent = { ...execAgent, model: flagOffDelegateModel }
+  }
+  const explicitTaskboardAgentMatch = Boolean(
+    hasTaskboardAgentDefault &&
+      (delegateExec
+        ? delegateExec.selectedFromAgent === true
+        : delegatedAgent.model === flagOffDelegateModel),
+  )
 
   // Per-turn 委派熔断(两条策略共用 PerTurnDelegationGuard,互斥分派):
   //   - hidden 系统 agent(隐藏审查员)→ 串行硬上限(env OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN,默认 3);
@@ -1958,7 +1981,7 @@ export async function _runDelegateTaskCore(
     if (input.taskboardControl?.signal.aborted) {
       return cancelPreparation(acquired.ok ? acquired.lease : null, null, null, remoteLaneLease)
     }
-    if (!acquired.ok && !requestedModel) {
+    if (!acquired.ok && !requestedModel && !explicitTaskboardAgentMatch) {
       // 默认路径(用户没显式要 grok):mint 失败(订阅并发满 / 容器租约上限 / 无账号 /
       // master 通道缺失)不拒,同一请求内回落到 ccb 的 DELEGATE_GROK_FALLBACK_MODEL,
       // 名额继续持有,下方 billing admit(ccb 不进 engine-reported)与 getOrCreate 照常。
@@ -1972,7 +1995,7 @@ export async function _runDelegateTaskCore(
       try {
         delegateExec = await resolveLocalExecutionIfEnforced({
           agent: { ...delegatedAgent, model: DELEGATE_GROK_FALLBACK_MODEL },
-          kind: 'turn',
+          kind: 'billed_delegate',
           model: DELEGATE_GROK_FALLBACK_MODEL,
           defaultModel: this.deps.config.defaults.model,
         })
@@ -1995,6 +2018,9 @@ export async function _runDelegateTaskCore(
       }
       // 之后 grokRoute/grokRouteLease 保持 null:submit 不注入 grok route,ccb runner 正常起。
       execAgent = { ...delegatedAgent, model: DELEGATE_GROK_FALLBACK_MODEL }
+      if (!delegateExec && !isModelAuthorityRequired()) {
+        flagOffDelegateModel = DELEGATE_GROK_FALLBACK_MODEL
+      }
     } else if (!acquired.ok) {
       // 显式 model 指定 grok:与排队被拒同形,已过闸的并发名额必须在此释放(下方 finally 不会执行)。
       refundMemberQuota()
@@ -2174,7 +2200,9 @@ export async function _runDelegateTaskCore(
     })
     if (input.taskboardControl?.signal.aborted) {
       if (acquired.ok) await acquired.lease.release().catch(() => {})
-      return cancelPreparation(grokRouteLease, engineBillingAdmission, null, remoteLaneLease)
+      const admissionToCancel =
+        !acquired.ok && acquired.alreadyMinted ? null : engineBillingAdmission
+      return cancelPreparation(grokRouteLease, admissionToCancel, null, remoteLaneLease)
     }
     if (acquired.ok) {
       // Mirror chat's inbound projection: the agent/model pair already resolves
@@ -2206,7 +2234,9 @@ export async function _runDelegateTaskCore(
         reason,
       })
       if (acquired.ok) await acquired.lease.release().catch(() => {})
-      await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
+      if (acquired.ok || !acquired.alreadyMinted) {
+        await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
+      }
       if (input._leaseTimer) clearInterval(input._leaseTimer)
       if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
@@ -2251,7 +2281,11 @@ export async function _runDelegateTaskCore(
           }
         : {
             ...localExecutionOverride(delegateExec),
-            ...(delegateExec || !requestedModel ? {} : { model: requestedModel }),
+            ...(delegateExec
+              ? {}
+              : requestedModel || flagOffDelegateModel
+                ? { model: requestedModel ?? flagOffDelegateModel }
+                : {}),
           }),
       channel: input.channel ?? 'delegate',
       peerId: remoteLaneLease
@@ -2503,7 +2537,7 @@ export async function _runDelegateTaskCore(
     // P2 批次4 — effort 透传:子会话是新建的,首次 submit 的 effortLevel 在 runner
     // spawn 前生效(与顶层会话 safeEffortLevel 同法)。undefined = 不指定 → 成员默认档位。
     input.effort,
-    remoteLaneLease?.canonicalModel ?? delegateExec?.canonicalModel ?? requestedModel,
+    remoteLaneLease?.canonicalModel ?? delegateExec?.canonicalModel ?? requestedModel ?? flagOffDelegateModel,
     remoteLaneLease?.billingRequestId ?? engineBillingAdmission?.requestId,
     input.traceId,
     undefined,

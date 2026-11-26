@@ -50,6 +50,19 @@ export * from './grokExecution.js'
 export * from './serverFeatures.js'
 
 export { measureLogWrite, takeLogWriteTimingSnapshot } from './logWriteTiming.js'
+export {
+  DELEGATE_ALLOWED_MODEL_FAMILIES,
+  SCIENTIFIC_AUDIT_STRONG_POOL_LABEL,
+  resolveCanonicalModelFamily,
+  isAllowedDelegateModelFamily,
+  isAllowedDelegateModel,
+  evaluateScientificAuditReviewer,
+} from './delegateModelPolicy.js'
+export type {
+  DelegateAllowedModelFamily,
+  ScientificAuditRejectReason,
+  ScientificAuditEligibility,
+} from './delegateModelPolicy.js'
 
 export * from './upstreamRetryHint.js'
 

@@ -33,6 +33,7 @@ import {
   DELEGATE_REMOTE_LANE_ENSURE_PATH,
   DELEGATE_REMOTE_LANE_RELEASE_PATH,
   TURN_LEASE_TTL_MS,
+  isAllowedDelegateModel,
   isDelegateRemoteLaneInternalPath,
   isRemoteDriverChildSessionKey,
   isRemoteDriverExecutionBackend,
@@ -130,6 +131,7 @@ function statusForError(code: string): number {
     code === 'DELEGATE_REMOTE_LANE_INVALID_BODY' ||
     code === 'DELEGATE_REMOTE_LANE_INVALID_SESSION_KEY' ||
     code === 'DELEGATE_REMOTE_LANE_INVALID_MODEL' ||
+    code === 'DELEGATE_REMOTE_LANE_MODEL_FAMILY_NOT_ALLOWED' ||
     code === 'DELEGATE_REMOTE_LANE_NOT_REMOTE_POOL' ||
     code === 'DELEGATE_REMOTE_LANE_INVALID_RELEASE_SCOPE'
   ) {
@@ -527,6 +529,9 @@ export function makeDelegateRemoteLaneHandler(
         !['ccb', 'codex', 'antigravity'].includes(entry.engine)
       ) {
         throw new Error('DELEGATE_REMOTE_LANE_NOT_REMOTE_POOL')
+      }
+      if (!isAllowedDelegateModel(entry.canonicalModel)) {
+        throw new Error('DELEGATE_REMOTE_LANE_MODEL_FAMILY_NOT_ALLOWED')
       }
 
       const authz = await deps.loadUserModelAuthz(BigInt(identity.userId))

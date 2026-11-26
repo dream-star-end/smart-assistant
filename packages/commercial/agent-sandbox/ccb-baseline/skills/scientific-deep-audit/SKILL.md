@@ -47,17 +47,17 @@ tags: [research, scientific-audit, physics, verification, multi-model, swarm]
 - **切片 D（补丁影响面与次生回归）**：全量生产调用链、可选开关默认值与降级路径。
 - **硬约束**：每条 `P0/P1` finding 必须附 `repro_script`（`.py` 或 `.m` 相对路径，位于评审目录 `scriptRoot` 内）。脚本必须正常 `exit 0` 并通过 `OC_WITNESS_VERDICT_FILE` / stdout `OC_WITNESS_VERDICT: {"status":"confirmed"|"refuted","summary":"...","finding_digest":"<OC_WITNESS_FINDING_DIGEST>"}` 明确裁决（可用 `cleanroom_verify_template.emit_witness_verdict`，自动附带 `finding_digest`）；评审 JSON 中作者自填的 `verified_by_machine` 仅作展示，绝不影响仲裁闸门。
 
-### Step 3：第三层——真跨家族盲审红队
-1. 使用 `delegate_tasks`（同一批不超过 4 路）并行委派 **4 个不同模型家族**进行只读盲审，输出落盘至 `/home/agent/.openclaude/generated/review-<ts>/reviews-<family>.json`（遵循 `oc-review schema`，显式填写 `model_family` 与 `repro_script`）：
-   - 推荐异构组合：`gpt-6.2-astra`（OpenAI/Codex） + `box-api-claude-opus-5-5`（Anthropic） + `grok-build`（xAI） + `deepseek-v4-flash` / `minimax-m3-go` / `qwen3.7-plus-go`（DeepSeek / MiniMax / Qwen）。
-2. **上游 500/429 自动替补表**（遇故障立即切换备选，禁止原地反复重试烧光轮次配额）：
+### Step 3：第三层——真跨家族强档盲审红队
+1. 使用 `delegate_tasks`（同一批不超过 4 路）并行委派 **四大家族强档模型**进行只读盲审，输出落盘至 `/home/agent/.openclaude/generated/review-<ts>/reviews-<family>.json`（遵循 `oc-review schema`，显式填写 `model_family` 与 `repro_script`）：
+   - 推荐异构强档组合：`gpt-6.2-astra`（OpenAI/GPT） + `antigravity-gemini-4-neon`（Google/Gemini） + `grok-build`（xAI/Grok） + `deepseek-v4-flash`（DeepSeek）；同家族强档替补：`gpt-6.2-sol`（GPT）、`antigravity-gemini-4-carbon`（Gemini）。
+2. **上游 500/429 自动替补表**（全部限定于四大家族强档池，遇故障立即切换备选，禁止原地反复重试烧光轮次配额，亦不得降级到弱档/非四大家族模型）：
 
-| 主选模型 | 故障类型 | 第一替补（同家族优先） | 第二替补（跨家族兜底） |
+| 主选模型 | 故障类型 | 第一替补（同家族强档优先） | 第二替补（跨家族强档互替） |
 | :--- | :--- | :--- | :--- |
-| `box-api-claude-opus-5-5` | 500 / 上游熔断 | `box-api-claude-sonnet-5-5` | `k3.1-pro` 或 `minimax-m3-go` |
-| `gpt-6.2-astra` | 429 / 超时 / 不可用 | `gpt-5.6-sol` | `deepseek-v4-flash` |
-| `grok-build` | 429 / 超时 | — | `qwen3.7-plus-go` 或 `k3.1-pro` |
-| `deepseek-v4-flash` | 429 / 超时 | — | `minimax-m3-go` 或 `qwen3.7-plus-go` |
+| `gpt-6.2-astra` | 429 / 超时 / 不可用 | `gpt-6.2-sol` | `antigravity-gemini-4-neon` / `grok-build` / `deepseek-v4-flash` |
+| `antigravity-gemini-4-neon` | 500 / 429 / 上游熔断 | `antigravity-gemini-4-carbon` | `gpt-6.2-astra` / `grok-build` / `deepseek-v4-flash` |
+| `grok-build` | 429 / 超时 | — | `gpt-6.2-sol` / `antigravity-gemini-4-carbon` / `deepseek-v4-flash` |
+| `deepseek-v4-flash` | 429 / 超时 | — | `gpt-6.2-astra` / `antigravity-gemini-4-neon` / `grok-build` |
 
 ### Step 4：第四层——机器反例法庭与 Chao1 停机闸门
 1. **运行机器反例法庭（`oc-review verify` 安全边界与诚实隔离契约）**：
@@ -95,10 +95,11 @@ tags: [research, scientific-audit, physics, verification, multi-model, swarm]
      --ledger /home/agent/.openclaude/generated/review-<ts>/decision-ledger.json \
      --scientific-gate
    ```
-3. **量化封版停机条件**：
+3. **量化封版停机条件（四大家族强档硬门禁）**：
+   `oc-review collate --scientific-gate` 硬门禁**仅认四大家族强档池**（`gpt-6.2-astra` / `gpt-6.2-sol`、`antigravity-gemini-4-neon` / `antigravity-gemini-4-carbon`、`grok-build`、`deepseek-v4-flash`）：弱档/轻量档模型（如 `gpt-6-luna`、`antigravity-gemini-4-hydrogen`、`antigravity-orchestrator-*`、`grok-build-fast`）与非四大家族模型（Claude / GLM / Qwen / Kimi / MiniMax 等）会被记入 `excludedReviewers`，**不计入 `familyCount` 与 Chao1 捕获矩阵**（但其报出的 P0 硬伤仍按 fail-closed 铁律触发 `FIX_REQUIRED` 绝不静默吞掉）。
    仅当同时满足 **`confirmedP0=0 && unverifiedP0=0 && familyCount>=2 && chao1Residual<0.5`** 时，`gate.status` 达到 **`PASS_READY`** 方可封版交付：
    - `FIX_REQUIRED`：存在已实证 `confirmedP0` 或待核验 `unverifiedP0`，必须修稿/补证人并同步重跑 Step 1 调用链影响面回归；
-   - `INSUFFICIENT_COVERAGE`：活跃 P0 已清零但独立家族数 `< 2`，需按替补表补足异构盲审；
+   - `INSUFFICIENT_COVERAGE`：活跃 P0 已清零但有效强档独立家族数 `< 2`，需按 Step 3 四大家族强档替补表补足异构盲审；
    - `RESIDUAL_RISK_HIGH`：跨家族 Capture-Recapture 估算残余 P0 期望 $\hat{f}_0 = \frac{f_1(f_1-1)}{2(f_2+1)} \ge 0.5$，需补充定向切片复审直至收敛。
 
 ---

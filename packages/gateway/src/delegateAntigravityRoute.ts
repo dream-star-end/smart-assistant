@@ -10,9 +10,10 @@
  * releases it at turn end.
  *
  * The container never mints credentials: it only forwards the route the
- * master signed for this container/user/admission. Master-side mount is
- * selfhost-exemption-gated; production containers reject antigravity delegate
- * turns in decideLocalExecution and never reach this client.
+ * master signed for this container/user/admission. Master mounts mint/renew/
+ * release across both selfhost and commercial deployments (OCV5-897), guarded
+ * by container identity and an owned inflight `delegate_antigravity` billing
+ * journal.
  */
 
 import {
@@ -58,7 +59,7 @@ export interface DelegateAntigravityRouteLease {
 
 export type DelegateAntigravityRouteAcquire =
   | { ok: true; lease: DelegateAntigravityRouteLease }
-  | { ok: false; httpStatus: number; reason: string }
+  | { ok: false; httpStatus: number; reason: string; alreadyMinted?: true }
 
 export interface DelegateAntigravityRouteLog {
   warn: (msg: string, fields?: Record<string, unknown>) => void
@@ -98,6 +99,18 @@ async function postJson(
     chunks.push(bytes)
   }
   return { statusCode: response.statusCode, text: Buffer.concat(chunks, total).toString('utf8') }
+}
+
+function errorCode(result: FetchResult): string | undefined {
+  try {
+    const parsed = JSON.parse(result.text) as { error?: { code?: unknown } }
+    if (parsed.error && typeof parsed.error.code === 'string' && parsed.error.code) {
+      return parsed.error.code
+    }
+  } catch {
+    /* ignore */
+  }
+  return undefined
 }
 
 function errorText(result: FetchResult): string {
@@ -284,17 +297,28 @@ export async function acquireDelegateAntigravityRoute(args: {
     return { ok: true, lease }
   }
 
+  if (mint.statusCode === 402) {
+    return {
+      ok: false,
+      httpStatus: 402,
+      reason: errorText(mint) || '余额不足，无法铸造 Antigravity route',
+    }
+  }
   if (mint.statusCode === 409) {
     // The admission row is unusable (already minted / moved on). Like every
-    // other missing-route outcome this is a fail-closed 503: the caller must
-    // abandon and never start the turn bare.
+    // other missing-route outcome this is a fail-closed 503; flag alreadyMinted
+    // so a losing retry does NOT abandon an active winner's shared admission.
+    const code = errorCode(mint)
     const text = errorText(mint)
+    const alreadyMinted =
+      code === 'DELEGATE_ANTIGRAVITY_ROUTE_ALREADY_MINTED' || text.includes('ALREADY_MINTED')
     return {
       ok: false,
       httpStatus: 503,
-      reason: text.includes('ALREADY_MINTED')
+      reason: alreadyMinted
         ? '该委派已申请过 Antigravity route,不能重复铸造'
         : `Antigravity 委派准入不可用: ${text}`,
+      ...(alreadyMinted ? { alreadyMinted: true as const } : {}),
     }
   }
   if (mint.statusCode === 503) {
@@ -304,7 +328,7 @@ export async function acquireDelegateAntigravityRoute(args: {
     return {
       ok: false,
       httpStatus: 503,
-      reason: 'master 未开放 delegate antigravity route(需要 selfhost 引擎本地豁免)',
+      reason: 'master 未开放 delegate antigravity route',
     }
   }
   return {

@@ -1,9 +1,9 @@
 /**
- * Engine capability predicates for billed commercial delegation (OCV5-895).
+ * Engine capability predicates for billed commercial delegation (OCV5-895 / OCV5-897).
  *
- * Encapsulated inside `gateway-engines` so `localExecution.ts` and
- * `delegateModelCatalogPrompt.ts` share a single source of truth without
- * branching on raw engine literals outside the adapter layer (R3-special-case).
+ * Encapsulated inside `gateway-engines` so `localExecution.ts`,
+ * `delegateModelCatalogPrompt.ts`, and `teamMode.ts` share a single source of
+ * truth without branching on raw engine literals outside the adapter layer (R3-special-case).
  */
 
 /** Engines eligible for commercial `billed_delegate` preflight & prompt advertisement. */
@@ -11,6 +11,7 @@ const COMMERCIAL_BILLED_DELEGATE_ENGINES: ReadonlySet<string> = new Set([
   'ccb',
   'grok',
   'codex',
+  'antigravity',
 ])
 
 /**
@@ -20,6 +21,7 @@ const COMMERCIAL_BILLED_DELEGATE_ENGINES: ReadonlySet<string> = new Set([
 const BILLED_DELEGATE_MASTER_ADMITTED_ENGINES: ReadonlySet<string> = new Set([
   'grok',
   'codex',
+  'antigravity',
 ])
 
 export function isCommercialBilledDelegateEngine(engine: string): boolean {

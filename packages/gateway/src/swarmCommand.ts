@@ -1050,7 +1050,7 @@ export const SWARM_PLAYBOOK_TEMPLATES: readonly SwarmPlaybookTemplate[] = Object
     ],
     category: "research",
     summary:
-      "四层正交科研零硬伤审查流水线：净室非零大参数确定性引擎 + 正交物理/公式代码/影响面切片蜂群 + 四家族跨模型盲审红队 + oc-review verify 机器反例法庭与 Chao1 残余风险门禁。",
+      "四层正交科研零硬伤审查流水线：净室非零大参数确定性引擎 + 正交物理/公式代码/影响面切片蜂群 + 四大家族强档跨模型盲审红队 + oc-review verify 机器反例法庭与 Chao1 残余风险门禁。",
     channels: [
       { name: "main", topic: "基线 SHA-256 冻结、四层汇合进度、跨家族盲审裁决与科学深审放行结论" },
       { name: "cleanroom", topic: "第一层净室引擎：SymPy/Octave/pint/hypothesis 非零大参数核验与 SSOT 全表对账" },
@@ -1063,7 +1063,7 @@ export const SWARM_PLAYBOOK_TEMPLATES: readonly SwarmPlaybookTemplate[] = Object
         role: "coordinator",
         workspace: "inherit",
         responsibility:
-          "冻结稿件/代码/数据基线 SHA-256 并用 `oc-docx extract --latex` 保真分片读稿；统筹四层节奏并在第三层并行调用 `delegate_tasks` 发起 4 家族跨模型盲审（Codex `gpt-6.2-astra` / Claude / Grok / DeepSeek-MiniMax-Qwen，上游 500/429 自动切换同家族或备选家族替补）；第四层运行 `oc-review verify --dir <dir> --script-root <dir> --exec`（显式 `OC_WITNESS_VERDICT` 协议）与 `oc-review collate --scientific-gate --verification ...`（首轮先 `oc-review ledger init` 或省略 `--ledger`，复核轮次挂载 `--ledger`），仅在 `confirmedP0=0 && unverifiedP0=0 && familyCount>=2 && chao1Residual<0.5`（PASS_READY）时放行。",
+          "冻结稿件/代码/数据基线 SHA-256 并用 `oc-docx extract --latex` 保真分片读稿；统筹四层节奏并在第三层并行调用 `delegate_tasks` 发起四大家族强档跨模型盲审（GPT `gpt-6.2-astra`/`gpt-6.2-sol`、Gemini `antigravity-gemini-4-neon`/`antigravity-gemini-4-carbon`、Grok `grok-build`、DeepSeek `deepseek-v4-flash`；非四大家族与弱档/轻量档在 `--scientific-gate` 中不计入跨家族覆盖，上游 500/429 自动切换同家族强档或其余三大家族强档替补）；第四层运行 `oc-review verify --dir <dir> --script-root <dir>`（默认只采集，经审计或净室脚本显式 `--unsafe-local-exec`，显式 `OC_WITNESS_VERDICT` 协议）与 `oc-review collate --scientific-gate --verification ...`（首轮先 `oc-review ledger init` 或省略 `--ledger`，复核轮次挂载 `--ledger`），仅在 `confirmedP0=0 && unverifiedP0=0 && familyCount>=2 && chao1Residual<0.5`（PASS_READY）时放行。",
       },
       {
         name: "cleanroom-verifier",
@@ -1102,14 +1102,14 @@ export const SWARM_PLAYBOOK_TEMPLATES: readonly SwarmPlaybookTemplate[] = Object
       "1. @coordinator 冻结稿件/代码/指标表基线 SHA-256，使用 `oc-docx extract --latex`（大稿按 `--toc`/`--section` 分片）保真提取公式与正文，并先执行 `oc-review ledger init --file <dir>/decision-ledger.json`（或首轮 `collate` 省略 `--ledger`，复核轮次再挂 `--ledger`）后广播 @all。",
       "2. 第一层（#cleanroom）：@cleanroom-verifier 执行 SymPy/Octave/pint/hypothesis 非零大参数净室引擎与 SSOT 全表数值对账，产出遵循 `OC_WITNESS_VERDICT` 协议的反例脚本（`repro_script`）并同步至 #slices。",
       "3. 第二层（#slices）：@physics-slice-auditor、@math-code-parity-auditor、@impact-regression-guard 按零交集物理/代码/影响面边界并行只读深审，严格遵循「零反例不立项」，每条 P0/P1 必附 `.py`/`.m` 反例脚本（正常 `exit 0` 并经 `OC_WITNESS_VERDICT_FILE` 或 stdout `OC_WITNESS_VERDICT: {\"status\":\"confirmed\"|\"refuted\",\"summary\":\"...\"}` 输出裁决）。",
-      "4. 第三层（#redteam）：@coordinator 并行调用 `delegate_tasks` 发起 4 家族跨模型独立盲审（Codex `gpt-6.2-astra` / Claude / Grok / DeepSeek-MiniMax-Qwen）；若任一上游返回 500/429，立即切同家族次档或备选独立家族替补，保住跨家族正交覆盖。",
+      "4. 第三层（#redteam）：@coordinator 并行调用 `delegate_tasks` 发起四大家族强档跨模型独立盲审（GPT `gpt-6.2-astra`/`gpt-6.2-sol`、Gemini `antigravity-gemini-4-neon`/`antigravity-gemini-4-carbon`、Grok `grok-build`、DeepSeek `deepseek-v4-flash`）；非四大家族与弱档/轻量档在 `--scientific-gate` 中不计入跨家族覆盖与 Chao1 捕获，若任一上游返回 500/429，立即切同家族强档或其余三大家族强档替补，保住跨家族正交覆盖。",
       "5. 第四层（#redteam → #main）：@coordinator 先运行 `oc-review verify --dir <dir> --script-root <dir> --manuscript <file>` 默认安全只采集（绝不直接执行未审计的外部评审脚本；无内核沙箱时 `--exec` 亦自动退回只采集）；仅当脚本由 `@cleanroom-verifier` 自写或经逐行审计无越界读写/外联后，方可显式加 `--unsafe-local-exec` 在当前容器内运行（明确不提供内核级文件系统/网络隔离；要求 `exit 0` + 携带匹配 `finding_digest` 的 `OC_WITNESS_VERDICT`，崩溃/非零退出/截断一律 `unverified` 绝不降级 P0），再执行 `oc-review collate --dir <dir> --script-root <dir> --manuscript <file> --scientific-gate --verification <dir>/verification-report.json [--ledger <dir>/decision-ledger.json]`；仅当 `confirmedP0=0 && unverifiedP0=0 && familyCount>=2 && chao1Residual<0.5`（`PASS_READY`）方可封版放行。",
     ],
     guardrails: [
       "全体审查员与净室验证员严格只读，审计阶段禁止私自改动稿件或业务源码。",
       "零反例不立项与诚实执行边界：所有数学/物理/代码 P0/P1 主张必须附 `.py`/`.m` `repro_script`；外部未审计脚本默认只采集不执行，仅经 `@cleanroom-verifier` 重写或逐行审计后才允许 `--unsafe-local-exec` 按 `OC_WITNESS_VERDICT`（必含匹配 `finding_digest`）协议仲裁；评审 JSON 自填 `verified_by_machine` 仅作展示、绝不能降级 P0，唯有绑定 `findingDigest` + `scriptSha256` + 稿件版本的机器证伪报告方可自动排除误判。",
       "根治修 1 破 2：每轮修订后必须过 `@impact-regression-guard` 调用链与门控穿透检查及非零大参数净室往返回归，杜绝半拉子补丁静默退回旧模型。",
-      "严格执行科学深审量化停机门禁：上游 500/429 立即切同家族或备选家族替补，必须经 `oc-review collate --scientific-gate` 达成 `confirmedP0=0 && unverifiedP0=0 && familyCount>=2 && chao1Residual<0.5`（`PASS_READY`）后方可交付。",
+      "严格执行科学深审量化停机门禁：仅四大家族强档（GPT `gpt-6.2-astra`/`gpt-6.2-sol`、Gemini `antigravity-gemini-4-neon`/`antigravity-gemini-4-carbon`、Grok `grok-build`、DeepSeek `deepseek-v4-flash`）计入跨家族覆盖（非四大家族与弱档/轻量档在 `--scientific-gate` 中不计入覆盖），上游 500/429 立即切同家族强档或其余三大家族强档替补，必须经 `oc-review collate --scientific-gate` 达成 `confirmedP0=0 && unverifiedP0=0 && familyCount>=2 && chao1Residual<0.5`（`PASS_READY`）后方可交付。",
     ],
   },
 ]);

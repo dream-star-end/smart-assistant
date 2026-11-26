@@ -17,14 +17,13 @@ tags: [research, review, multi-model]
 0. **前置：保真读稿 + 机器静态门禁**（不把机械纠错浪费在 LLM 审稿上）：
    - 若待审稿件为 `.docx`，**严禁裸抽纯文本丢公式或把大文件塞满请求体**；必须先用 `oc-docx extract <file.docx> --latex` 无损还原 OMML 公式为 LaTeX 与表格结构（大稿先 `oc-docx extract <file.docx> --toc`，再按 `--section` 分片或向评审员传递轻引用路径）；
    - 送审前先跑三道确定性静态门禁：`oc-docx check <file.docx> --expect-formulas`（清零占位符/断号引用/OMML 异常/行尾标点丢失）、`oc-cite verify`（核验真 DOI 与题录匹配）与 `oc-stylecheck <file.docx>`（去 AI 味），通过后再派异构模型盲审。
-1. **定评审员**（模型×角色，两者正交）：默认从 catalog 挑 3 个不同家族模型；用户点名的用点名的
-   （如 kimi/gpt/deepseek/glm 四家）。角色预设：方法学审查 / 统计与数据 / 写作与逻辑 / 领域专家（写进 goal）。
+1. **定评审员**（模型×角色，两者正交）：默认从四大家族强档审计池（GPT `gpt-6.2-astra` / `gpt-6.2-sol`、Gemini `antigravity-gemini-4-neon` / `antigravity-gemini-4-carbon`、Grok `grok-build`、DeepSeek `deepseek-v4-flash`）挑 3 个不同家族模型；用户点名且属于四大家族的用点名的。角色预设：方法学审查 / 统计与数据 / 写作与逻辑 / 领域专家（写进 goal）。
    上限 4 位（delegate_tasks 单次上限）。
 2. **要 schema 与 P0/P1/P2 硬分级**：`oc-review schema` 打印评审员必须遵守的 JSON 契约，原样贴进每个委派 goal，并要求评审员按硬分级标注 `priority`（科研/数学/代码评审同步填写 `model_family` 与可复现反例 `repro_script`）：
    - **`P0`（阻断放行）**：数学/物理推导错误、代码与正文数值矛盾、引文失实/张冠李戴、前后硬矛盾；涉及物理/数学/代码一致性硬伤时须附带 `repro_script`（`.py`/`.m` 反例脚本：必须正常 `exit 0` 并通过 `OC_WITNESS_VERDICT_FILE` 或 stdout `OC_WITNESS_VERDICT: {"status":"confirmed"|"refuted","summary":"..."}` 明确裁决；**严禁凭退出码 1 判证伪**，任何非零退出均保持 `unverified`，零反例不立项；评审 JSON 自填 `verified_by_machine` 仅作展示不入闸门）；
    - **`P1/P2`（非阻断）**：论证结构完善（`P1`）与风格措辞偏好（`P2`）。
 3. **并行委派**（只评不改）：Cursor 等多回合同一并发起 `oc-memory delegate --model <slug> --goal "..."`
-   （每位评审员一条）；CCB 引擎走 MCP `delegate_tasks`，tasks[] 每项填 `model` + `goal`（遇上游 500/429 熔断立即按备选家族替补，如 `box-api-claude-opus-5-5` 500 切 `box-api-claude-sonnet-5-5` 或 `k3.1-pro`/`minimax-m3-go`，`gpt-6.2-astra` 切 `gpt-5.6-sol`/`deepseek-v4-flash`，`grok-build` 切 `qwen3.7-plus-go`）。
+   （每位评审员一条）；CCB 引擎走 MCP `delegate_tasks`，tasks[] 每项填 `model` + `goal`（仅限四大家族强档审计池；遇上游 500/429 熔断立即在强档池内替补：如 `gpt-6.2-astra` 切 `gpt-6.2-sol` 或其余三大家族强档，`antigravity-gemini-4-neon` 切 `antigravity-gemini-4-carbon` 或其余三大家族强档，`grok-build` / `deepseek-v4-flash` 跨家族强档互替）。
    goal 模板："你是<角色>。严格按下方 JSON schema 输出评审，只输出 JSON，不要改写稿件。
    稿件：<路径或经 oc-docx extract --latex 提取的保真文本/章节切片>。schema：<oc-review schema 输出>"。
 4. **落盘**：把每位评审员的 JSON 存为 `/home/agent/.openclaude/generated/review-<ts>/reviews-<model>.json`
@@ -70,7 +69,7 @@ tags: [research, review, multi-model]
 - **积分护栏**：每位评审员按其模型正常计费（≈一次读全文的委派）。发起前先向用户报预估
   （评审员数 × 稿件量级）；超过默认 3 位或稿件 >2 万字先确认再发。
 - **反例仲裁防多模型共识误判**：数学/物理/代码争端严禁凭多模型投票直接改稿；对外部未审计脚本用 `oc-review verify --dir <dir> --script-root <dir> --manuscript <file>` 只采集不执行，仅对经逐行审计或协调者自写净室脚本显式加 `--unsafe-local-exec`（无 OS 隔离）仲裁，再配合 `oc-review collate --verification ... --scientific-gate`，仅有匹配 `findingDigest` + `scriptSha256` + 稿件版本且显式 `OC_WITNESS_VERDICT`（含匹配 `finding_digest`）判为 `refuted` 的发现才隔离出活跃 P0（非零退出/缺依赖/stdout 截断/自填 `verified_by_machine` 均不降级 P0）。
-- **上游 500/429 自动替补**：某家族模型返回 500/429 时不死等重试，立即切换同家族次级型号或备选家族（如 `box-api-claude-opus-5-5` → `box-api-claude-sonnet-5-5` / `k3.1-pro` / `minimax-m3-go`），保证 `familyCount >= 2` 的独立异构覆盖率。
+- **上游 500/429 自动替补**：某家族模型返回 500/429 时不死等重试，立即切换四大家族强档审计池内的同家族强档或跨家族强档（如 `gpt-6.2-astra` → `gpt-6.2-sol`、`antigravity-gemini-4-neon` → `antigravity-gemini-4-carbon`、或与 `grok-build` / `deepseek-v4-flash` 跨家族互替），保证 `--scientific-gate` 下有效强档 `familyCount >= 2` 的独立异构覆盖率（弱档与非四大家族模型不计入覆盖）。
 - **一位评审员故障不作废全局**：某位评审员 429/超时/输出非 JSON 时，`oc-review collate` 默认跳过该文件、
   在汇总卡顶部标注"缺席 N 位"（COLLATE 行追加 `skipped=<n>`），其余评审员照常汇总。交付时把缺席如实告知
   用户；若用户要求补齐，修文件或重派该评审员后重跑即可（`--strict` 可恢复任一坏文件即失败）。

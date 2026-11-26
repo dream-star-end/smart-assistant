@@ -17,9 +17,14 @@
  *
  * 不做:不做硬编排、不扣 final、不动委派闸(那些留在 server.ts,已有测试锁定)。
  */
-import type { DurableAgentGroup } from '@openclaude/protocol'
+import {
+  isAllowedDelegateModel,
+  resolveCanonicalModelFamily,
+  type DurableAgentGroup,
+} from '@openclaude/protocol'
 import type { AgentDef } from '@openclaude/storage'
 
+import { isCommercialBilledDelegateEngine } from './engine/engineDelegateCapabilities.js'
 import type { LocalCatalogModel, LocalCatalogView } from './modelCatalogClient.js'
 
 // ───────────────────────────────────────────────
@@ -41,53 +46,23 @@ export function parseTeamReviewMode(raw: unknown): TeamReviewMode {
  * 不要把两个真不同的模型误合并)。
  */
 export function modelFamily(modelId: string): string {
-  const id = modelId.toLowerCase()
-  if (id.startsWith('cursor-')) return 'cursor'
-  if (
-    id.startsWith('antigravity-gemini') ||
-    id.startsWith('antigravity-orchestrator') ||
-    id.startsWith('gemini')
-  )
-    return 'google'
-  if (id.startsWith('antigravity-claude') || id.startsWith('box-claude') || id.startsWith('claude'))
-    return 'anthropic'
-  if (
-    id.startsWith('box-gpt') ||
-    id.startsWith('gpt-') ||
-    id.startsWith('o1') ||
-    id.startsWith('o3') ||
-    id.startsWith('o4')
-  )
-    return 'openai'
-  if (id.startsWith('glm-')) return 'zhipu'
-  if (id.startsWith('grok')) return 'xai'
-  if (id.startsWith('deepseek')) return 'deepseek'
-  if (id.startsWith('kimi') || id.startsWith('k3') || id.startsWith('moonshot')) return 'moonshot'
-  if (id.startsWith('minimax')) return 'minimax'
-  if (id.startsWith('qwen')) return 'qwen'
-  return id
+  return resolveCanonicalModelFamily(modelId)
 }
 
 /** panel 默认规模(= Fusion 默认 3 模型 panel;delegate_tasks 单次上限 4,留 1 给余量)。 */
 export const DELIBERATION_PANEL_SIZE_DEFAULT = 3
 /**
- * 审议 panel 的优先顺序(Quality 档)。规则:每家族只取一个;按此表优先;表外可路由型号补位。
- * cursor-* 排除:那是另一条 CLI 链路,在 delegate 子会话里做 panel 成员既慢又贵,且与
- * grok-build 家族重叠(都是 xAI 路线)时反而降低多样性。
+ * 审议 panel 的优先顺序(OCV5-897 四大家族强档优先)。规则:每家族只取一个;按此表优先;
+ * 表外四大家族可路由型号补位。cursor-* 排除:那是另一条 CLI 链路,在 delegate 子会话里
+ * 做 panel 成员既慢又贵,且与 grok-build 家族重叠(都是 xAI 路线)时反而降低多样性。
  */
 export const DELIBERATION_PANEL_PREFERENCE = [
   'gpt-6.2-astra',
-  'gpt-6-astra',
+  'gpt-6.2-sol',
   'antigravity-gemini-4-neon',
   'antigravity-gemini-4-carbon',
-  'box-claude-opus-5-5',
   'grok-build',
-  'glm-5.3',
-  'deepseek-v4-pro',
   'deepseek-v4-flash',
-  'kimi-k3',
-  'qwen3.8-max',
-  'MiniMax-M3',
 ] as const
 
 export interface DeliberationPanelMember {
@@ -100,6 +75,7 @@ export interface DeliberationPanelMember {
 function isPanelEligible(m: LocalCatalogModel): boolean {
   if (!m.available) return false
   if (m.engine === 'cursor') return false
+  if (!isAllowedDelegateModel(m.modelId)) return false
   return true
 }
 
@@ -126,9 +102,9 @@ export function pickDeliberationPanel(
     if (!view.isRoutable(canonical)) return
     const m = view.resolve(canonical)
     if (!m || !isPanelEligible(m)) return
-    // 生产(非 selfhost 豁免)上 codex/grok 引擎不能在本地 delegate turn 跑;调用方按
-    // isEngineLocalTurnExempt 决定是否只收 ccb。
-    if (opts.requireLocalEngines && m.engine !== 'ccb') return
+    // 生产(非 selfhost 豁免)只收商业可委派引擎(ccb/grok/codex/antigravity);调用方按
+    // isEngineLocalTurnExempt 决定是否启用该约束。
+    if (opts.requireLocalEngines && !isCommercialBilledDelegateEngine(m.engine)) return
     const fam = modelFamily(canonical)
     if (seenFamilies.has(fam)) return
     seenFamilies.add(fam)
@@ -182,7 +158,7 @@ export function pickReviewerModel(
       if (!view.isRoutable(c)) continue
       const m = view.resolve(c)
       if (!m || !isPanelEligible(m)) continue
-      if (opts.requireLocalEngines && m.engine !== 'ccb') continue
+      if (opts.requireLocalEngines && !isCommercialBilledDelegateEngine(m.engine)) continue
       return c
     }
   }

@@ -381,6 +381,34 @@ export async function sumAntigravityRelayUsage(
   return totals
 }
 
+/**
+ * Shared terminal status authority for delegate_antigravity settlement (OCV5-897 B1).
+ * Both HTTP settle and durable tape settle call this so a container-reported error
+ * cannot waive real non-aux, non-retired output already metered by the master relay,
+ * while USER_CANCELLED retains its waiver contract and zero-output errors stay waived.
+ */
+export async function resolveDelegateAntigravityEngineStatus(
+  pool: Pick<Pool, 'query'>,
+  requestId: string,
+  userId: bigint,
+  requestedStatus: 'success' | 'error',
+  terminalCode?: string | null,
+  sumUsageFn: typeof sumAntigravityRelayUsage = sumAntigravityRelayUsage,
+): Promise<'success' | 'error'> {
+  if (requestedStatus === 'success' || terminalCode === 'USER_CANCELLED') {
+    return requestedStatus
+  }
+  const metered = await sumUsageFn(pool, requestId, userId, { excludeRetired: true })
+  let extraOutput = 0n
+  if (metered.extraModels) {
+    for (const extra of Object.values(metered.extraModels)) {
+      extraOutput += extra.candidatesTokens + extra.thoughtsTokens
+    }
+  }
+  const nonAuxOutput = metered.candidatesTokens + metered.thoughtsTokens + extraOutput
+  return nonAuxOutput > 0n ? 'success' : 'error'
+}
+
 function scaledTokenCost(
   usage: TokenUsage,
   pricing: Pick<
