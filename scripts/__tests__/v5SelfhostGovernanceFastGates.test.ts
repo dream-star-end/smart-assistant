@@ -252,10 +252,14 @@ describe('build_master_release wiring & zero-side-effect execution (OCV5-859)', 
       'scripts/check-v5-test-retries.ts',
       'scripts/check-integ-tiers.ts',
       'scripts/check-v5-e2e-selectors.ts',
+      'scripts/check-context-static.ts',
+      'scripts/check-file-size-ratchet.ts',
+      'scripts/check-gate-couplings.ts',
       'scripts/check-rest-contract-compat.ts',
     ]) {
       writeFileSync(join(f.repo, rel), 'process.exit(0)\n')
     }
+    writeFileSync(join(f.repo, 'scripts/check-biome-changed.sh'), '#!/usr/bin/env bash\nexit 0\n')
     for (const rel of [
       'scripts/check-monotonic-baselines.ts',
       'scripts/check-pg-migration-safety.ts',
@@ -265,7 +269,7 @@ describe('build_master_release wiring & zero-side-effect execution (OCV5-859)', 
     }
 
     writeFileSync(join(f.repo, 'changelog.json'), '[]\n')
-    writeFileSync(join(webDir, 'budgets.json'), JSON.stringify({ mainJsBytes: 500_000 }, null, 2) + '\n')
+    writeFileSync(join(webDir, 'budgets.json'), `${JSON.stringify({ mainJsBytes: 500_000 }, null, 2)}\n`)
     writeFileSync(join(migDir, '0001_init.sql'), 'CREATE TABLE t (id BIGSERIAL PRIMARY KEY, col TEXT);\n')
     f.git('add', '.')
     f.git('commit', '-qm', 'base')
@@ -286,7 +290,7 @@ describe('build_master_release wiring & zero-side-effect execution (OCV5-859)', 
 
     const invoke = (sha: string, extraEnv: Record<string, string> = {}) =>
       runBash(
-        `REPO_ROOT=${q(f.repo)}; MASTER_LIVE_LINK=${q(join(f.dir, 'no-live'))}; MASTER_GATE_TMPDIR=${q(gateTmp)}; OC_V5_GOVERNANCE_BASE_REF=${q(baseSha)}; master_run_governance_fast_gates ${q(staging)} ${q(sha)}`,
+        `REPO_ROOT=${q(f.repo)}; MASTER_LIVE_LINK=${q(join(f.dir, 'no-live'))}; OC_V5_REFEREE_ROOT=${q(join(f.dir, 'no-referee'))}; MASTER_GATE_TMPDIR=${q(gateTmp)}; OC_V5_GOVERNANCE_BASE_REF=${q(baseSha)}; master_run_governance_fast_gates ${q(staging)} ${q(sha)}`,
         { ...f.env, ...extraEnv },
       )
 
@@ -319,7 +323,7 @@ describe('build_master_release wiring & zero-side-effect execution (OCV5-859)', 
     const aheadSha = f.git('rev-parse', 'HEAD')
     f.git('update-ref', 'refs/remotes/origin/feat/v5-selfhost', aheadSha)
     const resAhead = runBash(
-      `REPO_ROOT=${q(f.repo)}; MASTER_LIVE_LINK=${q(join(f.dir, 'no-live'))}; MASTER_GATE_TMPDIR=${q(gateTmp)}; master_run_governance_fast_gates ${q(staging)} ${q(unsafeMigSha)}`,
+      `REPO_ROOT=${q(f.repo)}; MASTER_LIVE_LINK=${q(join(f.dir, 'no-live'))}; OC_V5_REFEREE_ROOT=${q(join(f.dir, 'no-referee'))}; MASTER_GATE_TMPDIR=${q(gateTmp)}; master_run_governance_fast_gates ${q(staging)} ${q(unsafeMigSha)}`,
       f.env,
     )
     assert.notEqual(
@@ -331,7 +335,7 @@ describe('build_master_release wiring & zero-side-effect execution (OCV5-859)', 
 
     // Case 3 (RED): raised monotonic budget blocks
     f.git('reset', '--hard', safeSha)
-    writeFileSync(join(webDir, 'budgets.json'), JSON.stringify({ mainJsBytes: 999_999 }, null, 2) + '\n')
+    writeFileSync(join(webDir, 'budgets.json'), `${JSON.stringify({ mainJsBytes: 999_999 }, null, 2)}\n`)
     f.git('commit', '-qam', 'raise-budget')
     const budgetSha = f.git('rev-parse', 'HEAD')
     exportArchive(budgetSha)

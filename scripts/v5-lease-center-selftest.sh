@@ -20,6 +20,9 @@ assert_eq() { [[ "$1" == "$2" ]] && ok "$3 ($1)" || bad "$3: got '$1' want '$2'"
 mkdir -p "$T/run" "$T/lib" "$T/logs" "$T/bin" "$T/releases"
 # OCV5-420:测试夹具不得触发宿主上的自动恢复动作。
 export OC_V5_AUTORECOVER=off
+# OCV5-904: 原有单 tick 沙箱自测验证立即发车语义，关闭 45s 生产防抖窗口(防抖逻辑由 v5TrainRefereeAndDebounce.test.ts 专测)。
+export OC_V5_TRAIN_DEBOUNCE_SEC=0
+export OC_V5_GOVERNOR_MODE_FILE="$T/run/no-governor-mode.json"
 export OC_V5_LEASE_DB="$T/lib/lease.db"
 export OC_V5_LEASE_LOCK="$T/run/lease-db.lock"
 export OC_V5_LEASE_WORKER_LOCK="$T/run/lease-worker.lock"
