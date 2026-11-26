@@ -144,6 +144,7 @@ import {
   RuntimeRecycleDrainingError,
 } from './sessionManager.js'
 import { ackPendingCheckpointIfTurnSucceeded, applyPendingCheckpointToSession, beginCheckpointTurnOutcome, isSessionCompacting, peekPendingCheckpoint, resetUnackedCheckpointSessionFlags, resolveMigrationAwareStoredResume, type PersistedCheckpointRecord } from './sessionCheckpointStore.js'
+import { notifyAuthorityCheckpointAck, prepareSessionAuthorityBeforeCreate } from './sessionAuthorityHook.js'
 import { beginTurnOverflowContext, clearTurnOverflowContext, getTurnActiveCheckpointGeneration, maybeAutoCompactBeforeTurn } from './sessionAutoCompact.js'
 import type {
   SessionManager,
@@ -185,6 +186,9 @@ export interface SessionSubmitHost {
   _sessionIdToKey: SessionManager['_sessionIdToKey']
   _trackPersistence: SessionManager['_trackPersistence']
   applyIdleResetIfRequested: SessionManager['applyIdleResetIfRequested']
+  authorityStateRuntime?: SessionManager['authorityStateRuntime']
+  capsuleRuntime?: SessionManager['capsuleRuntime']
+  getResumeStore?: SessionManager['getResumeStore']
   awaitResumeMapFlush: SessionManager['awaitResumeMapFlush']
   beginClientTurn: SessionManager['beginClientTurn']
   config: SessionManager['config']
@@ -1071,11 +1075,7 @@ export async function submit(
         : []
     if (opts?.resetNativeSession === true && session.providerTag === 'grok') {
       await session.runner.shutdown()
-      this._resumeMap.delete(session.sessionKey)
-      this._resumeMapTimestamps.delete(session.sessionKey)
-      this._resumeMapProvider.delete(session.sessionKey)
-      this._resumeMapLastCost.delete(session.sessionKey)
-      this._resumeMapHistory.delete(session.sessionKey)
+      this._forgetResumeEntry(session.sessionKey)
       session.ccbSessionId = null
       session.runner.clearSessionId()
       this._saveResumeMap()
@@ -1191,12 +1191,7 @@ export async function submit(
         injectionKey,
       })
       await session.runner.shutdown()
-      this._resumeMap.delete(session.sessionKey)
-      this._resumeMapTimestamps.delete(session.sessionKey)
-      this._resumeMapProvider.delete(session.sessionKey)
-      this._resumeMapLastCost.delete(session.sessionKey)
-      this._resumeMapCostImprecise.delete(session.sessionKey)
-      this._resumeMapHistory.delete(session.sessionKey)
+      this._forgetResumeEntry(session.sessionKey)
       session.ccbSessionId = null
       session.runner.clearSessionId?.()
       this._saveResumeMap()
@@ -1415,7 +1410,11 @@ export async function submit(
     try {
       await Promise.race([logicalTurnRun, livenessPromise])
       const activeCkptGen = getTurnActiveCheckpointGeneration(session) ?? pendingCheckpoint?.generation
-      if (activeCkptGen && ackPendingCheckpointIfTurnSucceeded(session, activeCkptGen)) checkpointAcked = true
+      const ckptTurnKey = opts?.dispatchContext?.dispatchId ?? opts?.replayLifecycle?.clientMessageId ?? requestId ?? 'turn-ack'
+      if (activeCkptGen && ackPendingCheckpointIfTurnSucceeded(session, activeCkptGen, undefined, () => this.authorityStateRuntime?.persistPendingCheckpointAckIntent?.(session.sessionKey, activeCkptGen, ckptTurnKey))) {
+        checkpointAcked = true
+        notifyAuthorityCheckpointAck({ authorityRuntime: this.authorityStateRuntime, sessionKey: session.sessionKey, checkpointGeneration: activeCkptGen, turnKey: ckptTurnKey })
+      }
     } finally {
       if (livenessTimer) clearInterval(livenessTimer)
     }
@@ -1640,6 +1639,7 @@ export async function _getOrCreateExclusive(
     poolMigration?.allowBackendTransition && poolMigration.migrationId.trim().length >= 8 &&
       Number.isSafeInteger(poolMigration.placementEpoch) && poolMigration.placementEpoch >= 1,
   )
+  if (this.authorityStateRuntime && this.getResumeStore) await prepareSessionAuthorityBeforeCreate({ authorityRuntime: this.authorityStateRuntime, capsuleRuntime: this.capsuleRuntime, resumeStore: this.getResumeStore(), sessionKey: opts.sessionKey, engine: engineId as 'ccb' | 'codex' | 'antigravity' | 'grok' | 'cursor' | 'zcode', workspaceCwd: opts.workspaceCwd ?? opts.agent.cwd, placementEpoch: hasAuthorizedMigration ? poolMigration?.placementEpoch : undefined, existingSession: existing })
   const executionBackend = cc5SessionBackend({ ...opts, engineId, executionModel,
     storedResumeId: this._resumeMap.get(opts.sessionKey), poolMigration })
   const backendChanged = !sameRemoteExecutionBackend(existing?.runner.executionBackend, executionBackend)
@@ -1909,7 +1909,7 @@ export async function _getOrCreateExclusive(
     const { effectiveStoredResumeId: storedResumeForCreate, clearStaleResume } = resolveMigrationAwareStoredResume({
       storedResumeId: this._resumeMap.get(opts.sessionKey), executionBackend, hasAuthorizedMigration,
     })
-    if (clearStaleResume) { this._resumeMap.delete(opts.sessionKey); this._resumeMapProvider.delete(opts.sessionKey); this._saveResumeMap() }
+    if (clearStaleResume) { this._forgetResumeEntry(opts.sessionKey); this._saveResumeMap() }
     const cc5Backend = executionBackend?.kind === 'cc5-interactive-v1' ? executionBackend : undefined
     const v4Backend = executionBackend?.kind === 'remote-driver-v4' ? executionBackend : undefined
     const hadSameProviderResume =
@@ -2878,12 +2878,7 @@ export async function recordExternalTurn(
     // The native provider thread did not execute this turn. Force a clean
     // resume so the next user message receives master history (including
     // the external assistant row) instead of continuing a stale thread.
-    this._resumeMap.delete(session.sessionKey)
-    this._resumeMapTimestamps.delete(session.sessionKey)
-    this._resumeMapProvider.delete(session.sessionKey)
-    this._resumeMapLastCost.delete(session.sessionKey)
-    this._resumeMapCostImprecise.delete(session.sessionKey)
-    this._resumeMapHistory.delete(session.sessionKey)
+    this._forgetResumeEntry(session.sessionKey)
     session.ccbSessionId = null
     session.runner.clearSessionId?.()
     this._saveResumeMap()

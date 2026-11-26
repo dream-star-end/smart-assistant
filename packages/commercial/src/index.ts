@@ -39,6 +39,7 @@ import { makeSystemRuntimeStatusRead } from './system-assistant/runtimeStatusRea
 import { assembleSystemActions, type SystemSessionReadBackend } from './system-assistant/assemble.js';
 import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js';
 import { getV3ContainerStatus } from './agent-sandbox/v3supervisor.js';
+import type { LocalCasArtifactBlobStore } from './agent-sandbox/artifactBlobStore.js';
 import { startLogTimingReporter } from './logging/logTimingReporter.js';
 import { setContentReviewAlerter, setContentReviewPrefilter } from '@openclaude/gateway';
 import { omniHardHit } from './openai/omniModeration.js';
@@ -893,6 +894,7 @@ export async function registerCommercial(
   // reads this forward ref at request time; startup windows fail closed 503.
   let modelAuthoritySigner: AuthoritySigner | undefined;
   let modelCatalogCache: ModelCatalogCache | undefined;
+  let artifactBlobStore: LocalCasArtifactBlobStore | undefined;
   // 前向引用占位:userChatBridge 在下方创建,但 anthropicProxy 在这里就要它的 broadcastToUser。
   // 给 proxy 的 dep 是稳定的闭包(总是调 bridgeBroadcastRef.current),创建 bridge 后赋值。
   // 在 bridge 初始化完成前到达的 cost_charged broadcast 会走到 noop,不 throw 也不落盘(前端
@@ -1157,6 +1159,7 @@ export async function registerCommercial(
     qqOutboundRef,
     qqProactiveRef,
     getModelAuthoritySigner: () => modelAuthoritySigner,
+    getArtifactBlobStore: () => artifactBlobStore,
     getCronOriginBridge: () => cronOriginBridgeRef,
     getSystemActions: () => systemActions,
     setDesktopTlsClose: (fn) => { desktopTlsClose = fn; },
@@ -1200,10 +1203,12 @@ export async function registerCommercial(
     mediaSignKey,
     wechatLiveLinkKey,
     thumbnailCache,
+    artifactBlobStore: bootArtifactBlobStore,
     modelAuthorityProvisionRequired,
     modelAuthoritySigner: bootModelAuthoritySigner,
     modelCatalogCache: bootModelCatalogCache,
   } = await bootstrapMailerBridgeAndAuthority({ env: process.env });
+  artifactBlobStore = bootArtifactBlobStore;
   modelAuthoritySigner = bootModelAuthoritySigner;
   modelCatalogCache = bootModelCatalogCache;
 

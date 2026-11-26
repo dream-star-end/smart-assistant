@@ -281,6 +281,117 @@ export function resumeArtifactExists(
   return probeResumeArtifact(engine, resumeId, ctx).exists
 }
 
+/** Major-versioned capsule schema contract for production export/import compatibility checks. */
+export const ENGINE_CAPSULE_SCHEMA_VERSION = '1.0.0'
+
+const CAPSULE_SUPPORTED_ENGINES: ReadonlySet<string> = new Set<ResumeArtifactEngine>([
+  'ccb',
+  'cursor',
+  'codex',
+  'grok',
+  'zcode',
+  'antigravity',
+])
+
+export function isCapsuleSupportedEngine(tag: string): tag is ResumeArtifactEngine {
+  return CAPSULE_SUPPORTED_ENGINES.has(tag)
+}
+
+/**
+ * Resolve the actual on-disk native state root that each engine consumes
+ * (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `OPENCLAUDE_HOME/antigravity-cli/...`, etc.).
+ */
+export function resolveEngineNativeStateRoot(
+  engine: ResumeArtifactEngine,
+  ctx: ResumeArtifactContext = {},
+): string {
+  const { claudeConfigDir, codexHome, openclaudeHome } = resolveCtx(ctx)
+  switch (engine) {
+    case 'ccb':
+      return claudeConfigDir || join(homedir(), '.claude')
+    case 'codex':
+      return codexHome
+    case 'antigravity':
+      return join(openclaudeHome, 'antigravity-cli', 'home', '.gemini', 'antigravity-cli')
+    case 'grok':
+      return join(openclaudeHome, 'grok-build')
+    case 'zcode':
+      return join(openclaudeHome, 'zcode-cli')
+    case 'cursor':
+      return join(homedir(), '.cursor')
+  }
+}
+
+/**
+ * Strict probe for Tier 1.5 warm-capsule recovery (OCV5-907 B7).
+ * Unlike conservative `probeResumeArtifact`, a brand-new clean container volume
+ * where `<claudeConfigDir>/projects` or `<codexHome>/sessions` does not yet
+ * exist is reported as `'missing'` (NOT `'unknown'` -> `exists:true`), so
+ * warm-capsule import runs reliably on fresh volumes.
+ */
+export function probeResumeArtifactForCapsule(
+  engine: string,
+  resumeId: string,
+  ctx: ResumeArtifactContext = {},
+): 'present' | 'missing' | 'unprobeable' {
+  if (isCc5ResumeId(resumeId) || isRemoteV4ResumeId(resumeId)) return 'missing'
+  const { claudeConfigDir, codexHome, openclaudeHome } = resolveCtx(ctx)
+  switch (engine) {
+    case 'ccb': {
+      if (!UUID_RE.test(resumeId)) return 'unprobeable'
+      const root = claudeConfigDir || join(homedir(), '.claude')
+      if (!existsSync(join(root, 'projects'))) return 'missing'
+      const r = ccbJsonlArtifact(resumeId, root)
+      return r === null ? 'missing' : r === 'unknown' ? 'unprobeable' : 'present'
+    }
+    case 'codex': {
+      if (!UUID_RE.test(resumeId)) return 'unprobeable'
+      if (!existsSync(join(codexHome, 'sessions'))) return 'missing'
+      const r = codexRolloutArtifact(resumeId, codexHome)
+      return r === null ? 'missing' : r === 'unknown' ? 'unprobeable' : 'present'
+    }
+    case 'antigravity': {
+      if (!UUID_RE.test(resumeId)) return 'unprobeable'
+      const r = antigravitySessionArtifact(resumeId, openclaudeHome)
+      return r === null ? 'missing' : r === 'unknown' ? 'unprobeable' : 'present'
+    }
+    case 'grok': {
+      if (!UUID_RE.test(resumeId)) return 'unprobeable'
+      const r = grokSessionArtifact(resumeId, openclaudeHome)
+      if (r === 'unknown') {
+        const roots = [
+          join(openclaudeHome, 'grok-build', 'sessions'),
+          join(openclaudeHome, 'grok-build', 'fast', 'sessions'),
+        ]
+        return roots.some((dir) => existsSync(dir)) ? 'unprobeable' : 'missing'
+      }
+      return r === null ? 'missing' : 'present'
+    }
+    case 'zcode': {
+      if (!ZCODE_SESS_RE.test(resumeId)) return 'unprobeable'
+      const db = join(openclaudeHome, 'zcode-cli', 'cli', 'db', 'db.sqlite')
+      return nonEmptyFile(db) ? 'present' : 'missing'
+    }
+    case 'cursor': {
+      if (isCursorSandBoxCcResumeId(resumeId)) {
+        return cursorSandBoxCcResumeInnerId(resumeId) ? 'present' : 'missing'
+      }
+      const inner = cursorSandResumeInnerId(resumeId) ?? cursorSandOfficialCcResumeInnerId(resumeId)
+      if (inner) {
+        const root = claudeConfigDir || join(homedir(), '.claude')
+        if (!existsSync(join(root, 'projects'))) return 'missing'
+        const r = ccbJsonlArtifact(inner, root)
+        return r === null ? 'missing' : r === 'unknown' ? 'unprobeable' : 'present'
+      }
+      const ws = typeof ctx.workspacePath === 'string' ? ctx.workspacePath.trim() : ''
+      if (!ws || !UUID_RE.test(resumeId)) return 'unprobeable'
+      return nonEmptyFile(cursorResumeStorePath(ws, resumeId)) ? 'present' : 'missing'
+    }
+    default:
+      return 'unprobeable'
+  }
+}
+
 /** Upper bound on remembered prior ids per session. Small on purpose: this is
  *  a fallback ladder for "the newest id never landed", not an archive. */
 export const RESUME_HISTORY_MAX = 4
