@@ -1716,20 +1716,13 @@ export class PgArtifactBlobMetaStore {
     index: number,
     sizeBytes: number,
     partSha256: string,
+    expectedTenantId?: string,
   ): Promise<RecordBlobPartResult> {
     assertCondition(IDENT_8_128_RE.test(uploadId), 'BLOB_UPLOAD_ID_INVALID')
-    assertCondition(
-      typeof index === 'number' && Number.isSafeInteger(index) && index >= 0,
-      'BLOB_PART_INDEX_INVALID',
-    )
-    assertCondition(
-      typeof sizeBytes === 'number' && Number.isSafeInteger(sizeBytes) && sizeBytes >= 0,
-      'BLOB_PART_SIZE_INVALID',
-    )
-    assertCondition(
-      typeof partSha256 === 'string' && SHA256_RE.test(partSha256),
-      'BLOB_PART_SHA256_INVALID',
-    )
+    if (expectedTenantId !== undefined) assertCondition(TENANT_ID_RE.test(expectedTenantId), 'BLOB_TENANT_ID_INVALID')
+    assertCondition(typeof index === 'number' && Number.isSafeInteger(index) && index >= 0, 'BLOB_PART_INDEX_INVALID')
+    assertCondition(typeof sizeBytes === 'number' && Number.isSafeInteger(sizeBytes) && sizeBytes >= 0, 'BLOB_PART_SIZE_INVALID')
+    assertCondition(typeof partSha256 === 'string' && SHA256_RE.test(partSha256), 'BLOB_PART_SHA256_INVALID')
 
     return withTransaction(this.pool, async (client) => {
       const res = await client.query<BlobUploadRow>(
@@ -1743,6 +1736,7 @@ export class PgArtifactBlobMetaStore {
       )
       const row = res.rows[0]
       assertCondition(row !== undefined, 'BLOB_UPLOAD_NOT_FOUND')
+      if (expectedTenantId !== undefined) assertCondition(String(row.tenant_id) === expectedTenantId, 'BLOB_UPLOAD_TENANT_MISMATCH')
       assertCondition(row.status === 'open', 'BLOB_UPLOAD_NOT_OPEN')
       assertCondition(index < Number(row.chunk_count), 'BLOB_PART_INDEX_OUT_OF_RANGE')
       assertCondition(sizeBytes <= Number(row.chunk_bytes), 'BLOB_PART_SIZE_EXCEEDED')
@@ -1775,6 +1769,23 @@ export class PgArtifactBlobMetaStore {
         [uploadId, JSON.stringify(parts)],
       )
       return 'recorded'
+    })
+  }
+
+  async abortUpload(tenantId: string, uploadId: string): Promise<boolean> {
+    assertCondition(TENANT_ID_RE.test(tenantId), 'BLOB_TENANT_ID_INVALID')
+    assertCondition(IDENT_8_128_RE.test(uploadId), 'BLOB_UPLOAD_ID_INVALID')
+    return withTransaction(this.pool, async (client) => {
+      const res = await client.query<{ tenant_id: string; status: string }>(
+        `SELECT tenant_id, status FROM artifact_blob_uploads WHERE upload_id = $1 FOR UPDATE`,
+        [uploadId],
+      )
+      const row = res.rows[0]
+      if (!row) return false
+      assertCondition(String(row.tenant_id) === tenantId, 'BLOB_UPLOAD_TENANT_MISMATCH')
+      if (row.status !== 'open') return false
+      await client.query(`UPDATE artifact_blob_uploads SET status = 'aborted', updated_at = NOW() WHERE upload_id = $1 AND tenant_id = $2 AND status = 'open'`, [uploadId, tenantId])
+      return true
     })
   }
 
@@ -1950,48 +1961,20 @@ export class PgArtifactBlobMetaStore {
   }
 
   async gcUnreferencedBlobs(opts: GcUnreferencedBlobsOptions): Promise<GcUnreferencedBlobsResult> {
-    if (opts.completeReferenceProof !== true) {
-      throw new Error('BLOB_GC_INCOMPLETE_REFERENCE_PROOF')
-    }
-    assertCondition(
-      typeof opts.olderThanMs === 'number' &&
-        Number.isFinite(opts.olderThanMs) &&
-        opts.olderThanMs >= 0,
-      'BLOB_GC_OLDER_THAN_INVALID',
-    )
-    if (opts.tenantId !== undefined) {
-      assertCondition(TENANT_ID_RE.test(opts.tenantId), 'BLOB_TENANT_ID_INVALID')
-    }
-
+    if (opts.completeReferenceProof !== true) throw new Error('BLOB_GC_INCOMPLETE_REFERENCE_PROOF')
+    assertCondition(typeof opts.olderThanMs === 'number' && Number.isFinite(opts.olderThanMs) && opts.olderThanMs >= 0, 'BLOB_GC_OLDER_THAN_INVALID')
+    if (opts.tenantId !== undefined) assertCondition(TENANT_ID_RE.test(opts.tenantId), 'BLOB_TENANT_ID_INVALID')
     const nowMs = opts.nowMs ?? Date.now()
     const cutoffIso = new Date(nowMs - opts.olderThanMs).toISOString()
-    const liveIds = Array.isArray(opts.liveBlobIds)
-      ? dedupeCapStrings(opts.liveBlobIds)
-      : dedupeCapStrings([...opts.liveBlobIds])
-
+    const liveIds = Array.isArray(opts.liveBlobIds) ? dedupeCapStrings(opts.liveBlobIds) : dedupeCapStrings([...opts.liveBlobIds])
     const params: unknown[] = [cutoffIso, liveIds]
     const tenantClause = opts.tenantId !== undefined ? ' AND tenant_id = $3' : ''
     if (opts.tenantId !== undefined) params.push(opts.tenantId)
-
     const sql = opts.dryRun
-      ? `SELECT blob_id
-           FROM artifact_blobs
-          WHERE deleted_at IS NULL
-            AND created_at < $1::timestamptz
-            AND NOT (blob_id = ANY($2::text[]))${tenantClause}`
-      : `UPDATE artifact_blobs
-            SET deleted_at = NOW()
-          WHERE deleted_at IS NULL
-            AND created_at < $1::timestamptz
-            AND NOT (blob_id = ANY($2::text[]))${tenantClause}
-          RETURNING blob_id`
-
+      ? `SELECT blob_id FROM artifact_blobs WHERE deleted_at IS NULL AND created_at < $1::timestamptz AND NOT (blob_id = ANY($2::text[]))${tenantClause}`
+      : `UPDATE artifact_blobs SET deleted_at = NOW() WHERE deleted_at IS NULL AND created_at < $1::timestamptz AND NOT (blob_id = ANY($2::text[]))${tenantClause} RETURNING blob_id`
     const res = await this.pool.query<{ blob_id: string }>(sql, params)
     const markedDeletedBlobIds = Object.freeze(res.rows.map((r) => String(r.blob_id)))
-    return Object.freeze({
-      markedDeletedBlobIds,
-      markedDeletedCount: markedDeletedBlobIds.length,
-      cutoffIso,
-    })
+    return Object.freeze({ markedDeletedBlobIds, markedDeletedCount: markedDeletedBlobIds.length, cutoffIso })
   }
 }

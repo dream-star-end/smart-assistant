@@ -668,16 +668,21 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
     this.writeStagingManifest(uploadId, manifest)
 
     if (this.metaStore) {
-      await this.metaStore.initiateUpload({
-        uploadId,
-        tenantId: input.tenantId,
-        kind: input.kind,
-        filename: input.filename,
-        mimeType: input.mimeType,
-        expectedSizeBytes: input.expectedSizeBytes,
-        chunkBytes,
-        chunkCount,
-      })
+      try {
+        await this.metaStore.initiateUpload({
+          uploadId,
+          tenantId: input.tenantId,
+          kind: input.kind,
+          filename: input.filename,
+          mimeType: input.mimeType,
+          expectedSizeBytes: input.expectedSizeBytes,
+          chunkBytes,
+          chunkCount,
+        })
+      } catch (err) {
+        rmSync(uploadDir, { recursive: true, force: true })
+        throw err
+      }
     }
 
     return Object.freeze({
@@ -731,6 +736,7 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
             input.index,
             input.bytes.byteLength,
             actualSha256,
+            input.tenantId,
           )
         }
         return Object.freeze({
@@ -766,6 +772,7 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
         input.index,
         input.bytes.byteLength,
         actualSha256,
+        input.tenantId,
       )
     }
 
@@ -893,15 +900,21 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
     assertCondition(TENANT_ID_RE.test(tenantId), 'BLOB_TENANT_ID_INVALID')
     assertCondition(BLOB_ID_RE.test(uploadId), 'BLOB_UPLOAD_ID_INVALID')
     const uploadDir = this.stagingUploadDir(uploadId)
-    if (!existsSync(uploadDir)) return
-    const manifestPath = path.join(uploadDir, 'manifest.json')
-    if (existsSync(manifestPath)) {
-      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as StagingManifest
-      if (manifest.tenantId !== tenantId) {
-        throw new Error('BLOB_UPLOAD_TENANT_MISMATCH')
+    if (existsSync(uploadDir)) {
+      const manifestPath = path.join(uploadDir, 'manifest.json')
+      if (existsSync(manifestPath)) {
+        const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as StagingManifest
+        if (manifest.tenantId !== tenantId) {
+          throw new Error('BLOB_UPLOAD_TENANT_MISMATCH')
+        }
       }
     }
-    rmSync(uploadDir, { recursive: true, force: true })
+    if (this.metaStore) {
+      await this.metaStore.abortUpload(tenantId, uploadId)
+    }
+    if (existsSync(uploadDir)) {
+      rmSync(uploadDir, { recursive: true, force: true })
+    }
   }
 
   async stat(tenantId: string, blobId: string): Promise<ArtifactBlobRef | null> {

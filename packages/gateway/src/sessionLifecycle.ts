@@ -58,10 +58,14 @@ import {
 } from './cgroupMemoryGuard.js'
 import { isTempSessionKey, resolveEnginePreheatDeadlineMs } from './sessionManager.js'
 import type { SessionManager, AgentSession, PreheatOutcome, PromptQueueExecutionFence } from './sessionManager.js'
+import { exportSessionCapsuleOnSafeBoundary } from './sessionAuthorityHook.js'
 
 export interface SessionLifecycleHost {
+  authorityStateRuntime?: SessionManager['authorityStateRuntime']
+  capsuleRuntime?: SessionManager['capsuleRuntime']
   _enterSessionCreateGate?: SessionManager['_enterSessionCreateGate']
   _flushTailFolding: SessionManager['_flushTailFolding']
+  _forgetResumeEntry?: SessionManager['_forgetResumeEntry']
   _getRepoSnapshot: SessionManager['_getRepoSnapshot']
   _maxResidentRunners?: number
   _memoryPressureThreshold?: number
@@ -105,6 +109,19 @@ const NATIVE_MODEL_HANDOFF_MAX_CHARS = 256_000
 const NATIVE_MODEL_SWITCH_TTL_MS = 30 * 60_000
 
 const PREHEAT_DEADLINE_CODE = 'PREHEAT_DEADLINE'
+
+function forgetResumeEntryOnHost(host: SessionLifecycleHost, key: string): void {
+  if (typeof host._forgetResumeEntry === 'function') {
+    host._forgetResumeEntry(key)
+    return
+  }
+  host._resumeMap.delete(key)
+  host._resumeMapTimestamps.delete(key)
+  host._resumeMapProvider.delete(key)
+  host._resumeMapLastCost.delete(key)
+  host._resumeMapCostImprecise.delete(key)
+  host._resumeMapHistory.delete(key)
+}
 
 function withPreheatDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -321,12 +338,7 @@ export async function recyclePeerForRepoChange(
     //   只清 _resumeMap 不够,必须同时清 session.ccbSessionId + 调 runner.clearSessionId
     //   再 _saveResumeMap()。setExecutionTarget 已经是这套模式(Codex Round 2 BLOCKER)。
     if (isCodex) {
-      this._resumeMap.delete(sessionKey)
-      this._resumeMapTimestamps.delete(sessionKey)
-      this._resumeMapProvider.delete(sessionKey)
-      this._resumeMapLastCost.delete(sessionKey)
-      this._resumeMapCostImprecise.delete(sessionKey)
-      this._resumeMapHistory.delete(sessionKey)
+      forgetResumeEntryOnHost(this, sessionKey)
       session.ccbSessionId = null
       session.runner.clearSessionId?.()
       this._saveResumeMap()
@@ -620,6 +632,20 @@ export async function shutdownAll(this: SessionLifecycleHost): Promise<void> {
   // A1:底座已全部停产出,flush 各 session 折叠 tail 的 pending(其持久化随后被
   // awaitPendingPersistence 一并排空)。
   await Promise.all([...this.sessions.values()].map((s) => this._flushTailFolding(s)))
+  // B7: Consistent stopped-runner boundary capsule export for planned shutdown.
+  if (this.capsuleRuntime?.isEnabled) {
+    await Promise.allSettled(
+      [...this.sessions.values()].map((s) =>
+        exportSessionCapsuleOnSafeBoundary({
+          capsuleRuntime: this.capsuleRuntime,
+          sessionKey: s.sessionKey,
+          engine: s.providerTag,
+          nativeSessionId: s.ccbSessionId ?? this._resumeMap.get(s.sessionKey),
+          sourceCwd: (s.runner as { cwd?: string } | undefined)?.cwd,
+        }),
+      ),
+    )
+  }
   // Drain server-authored persistence promises (turn-end fan-outs +
   // handleExit setTimeout-150ms partial flushes registered while the
   // runners were being torn down). Must complete before server.ts
@@ -689,14 +715,9 @@ export async function destroySession(
       await cleanupSessionArtifacts(dir, sessionKey).catch(() => {})
     }
   }
-  // Always clear resume-map (handles both live and evicted sessions)
-  if (this._resumeMap.has(sessionKey)) {
-    this._resumeMap.delete(sessionKey)
-    this._resumeMapTimestamps.delete(sessionKey)
-    this._resumeMapLastCost.delete(sessionKey)
-    this._resumeMapCostImprecise.delete(sessionKey)
-    this._resumeMapProvider.delete(sessionKey)
-    this._resumeMapHistory.delete(sessionKey)
+  // Always clear resume-map (handles both live, evicted, and remote-only authority pointers)
+  if (this._resumeMap.has(sessionKey) || this.authorityStateRuntime?.isRemoteEnabled) {
+    forgetResumeEntryOnHost(this, sessionKey)
     this._saveResumeMap()
   }
   // Medium#G1:让 server.ts 的 outboundRing 也清掉这个 key(两个 server.ts
@@ -744,6 +765,16 @@ export async function retireKeepResume(
         await this._flushTailFolding(s)
       } catch (err) {
         log.warn('retireKeepResume flush failed', { sessionKey }, err)
+      }
+      // B7: Export native engine state capsule on consistent stopped-runner boundary.
+      if (this.capsuleRuntime?.isEnabled) {
+        await exportSessionCapsuleOnSafeBoundary({
+          capsuleRuntime: this.capsuleRuntime,
+          sessionKey,
+          engine: s.providerTag,
+          nativeSessionId: s.ccbSessionId ?? this._resumeMap.get(sessionKey),
+          sourceCwd: (s.runner as { cwd?: string } | undefined)?.cwd,
+        })
       }
       if (s.executionTarget.kind === 'remote' && s.userId) {
         await this._remoteTargetController
@@ -844,12 +875,7 @@ export async function applyIdleResetIfRequested(
   const sessionKey = session.sessionKey
   clearFrozenPrompt(paths.home, sessionKey)
   cancelIdlePreExpiry(session)
-  this._resumeMap.delete(sessionKey)
-  this._resumeMapTimestamps.delete(sessionKey)
-  this._resumeMapProvider.delete(sessionKey)
-  this._resumeMapLastCost.delete(sessionKey)
-  this._resumeMapCostImprecise.delete(sessionKey)
-  this._resumeMapHistory.delete(sessionKey)
+  forgetResumeEntryOnHost(this, sessionKey)
   session.ccbSessionId = null
   session.runner.clearSessionId?.()
   this._saveResumeMap()
@@ -986,12 +1012,7 @@ export async function setExecutionTarget(
     // 任何一步抛 → release 新 mux 做 rollback;session.executionTarget 不提交。
     try {
       await session.runner.shutdown()
-      this._resumeMap.delete(sessionKey)
-      this._resumeMapTimestamps.delete(sessionKey)
-      this._resumeMapProvider.delete(sessionKey)
-      this._resumeMapLastCost.delete(sessionKey)
-      this._resumeMapCostImprecise.delete(sessionKey)
-      this._resumeMapHistory.delete(sessionKey)
+      forgetResumeEntryOnHost(this, sessionKey)
       session.ccbSessionId = null
       session.runner.clearSessionId?.()
       this._saveResumeMap()
@@ -1431,12 +1452,7 @@ export async function compactSession(
       }
 
       const key = session.sessionKey
-      this._resumeMap.delete(key)
-      this._resumeMapTimestamps.delete(key)
-      this._resumeMapProvider.delete(key)
-      this._resumeMapLastCost.delete(key)
-      this._resumeMapCostImprecise.delete(key)
-      this._resumeMapHistory.delete(key)
+      forgetResumeEntryOnHost(this, key)
       session.ccbSessionId = null
       session.runner.clearSessionId?.()
       this._saveResumeMap()

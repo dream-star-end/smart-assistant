@@ -24,6 +24,7 @@ import { join } from 'node:path'
 import type { RemoteExecutionBackend } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
 import type { AgentSession } from './sessionTypes.js'
+import { log } from './sessionManagerLog.js'
 import { reconcileAntigravitySwarmDirectiveAfterCompaction } from './engine/antigravitySwarmDirective.js'
 import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 
@@ -224,17 +225,195 @@ export function savePendingCheckpointWithGeneration(
   return record
 }
 
+type LocalCheckpointSavedObserver = (record: PersistedCheckpointRecord) => void
+let localCheckpointSavedObserver: LocalCheckpointSavedObserver | null = null
+
+export function setLocalCheckpointSavedObserver(
+  observer: LocalCheckpointSavedObserver | null,
+): void {
+  localCheckpointSavedObserver = observer
+}
+
 /** Atomically persist a rolling checkpoint (0600) before invalidating native resume handles. */
 export function savePendingCheckpoint(
   sessionKey: string,
   summary: string,
   opts?: { instructions?: string; baseDir?: string },
 ): PersistedCheckpointRecord {
-  return savePendingCheckpointWithGeneration(sessionKey, summary, {
+  const record = savePendingCheckpointWithGeneration(sessionKey, summary, {
     generation: `${Date.now()}-${randomBytes(6).toString('hex')}`,
     ...(opts?.instructions !== undefined ? { instructions: opts.instructions } : {}),
     ...(opts?.baseDir !== undefined ? { baseDir: opts.baseDir } : {}),
   })
+  if (localCheckpointSavedObserver) {
+    try {
+      localCheckpointSavedObserver(record)
+    } catch {
+      /* fail-open: never disrupt local compaction checkpoint durability */
+    }
+  }
+  return record
+}
+
+export interface PendingAuthorityAckEntry {
+  readonly sessionKey: string
+  readonly generation: string
+  readonly turnKey: string
+  readonly createdAt: number
+}
+
+const MAX_PENDING_AUTHORITY_ACKS = 1024
+
+function pendingAuthorityAcksPath(baseDir?: string): string {
+  return join(checkpointRootDir(baseDir), 'pending-authority-acks.json')
+}
+
+export function listPendingAuthorityAcks(baseDir?: string): PendingAuthorityAckEntry[] {
+  const filePath = pendingAuthorityAcksPath(baseDir)
+  try {
+    const st = lstatSync(filePath)
+    if (st.isSymbolicLink() || !st.isFile()) return []
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8'))
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (x): x is PendingAuthorityAckEntry =>
+        Boolean(x) &&
+        typeof x.sessionKey === 'string' &&
+        typeof x.generation === 'string' &&
+        typeof x.turnKey === 'string' &&
+        typeof x.createdAt === 'number',
+    )
+  } catch {
+    return []
+  }
+}
+
+function writeAtomicAuthorityQueueFile(filePath: string, payload: unknown, baseDir?: string): void {
+  const dir = checkpointRootDir(baseDir)
+  ensureSafeCheckpointDir(dir)
+  ensureNotSymlinkIfExists(filePath)
+  const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+  const realDir = realpathSync(dir)
+  writeFileSync(tmpPath, JSON.stringify(payload), { encoding: 'utf8', mode: 0o600 })
+  if (!realpathSync(tmpPath).startsWith(realDir)) {
+    rmSync(tmpPath, { force: true })
+    throw new Error('CHECKPOINT_PATH_ESCAPE')
+  }
+  renameSync(tmpPath, filePath)
+}
+
+function writePendingAuthorityAcks(entries: PendingAuthorityAckEntry[], baseDir?: string): void {
+  writeAtomicAuthorityQueueFile(pendingAuthorityAcksPath(baseDir), entries, baseDir)
+}
+
+export function enqueuePendingAuthorityAck(
+  entry: PendingAuthorityAckEntry,
+  baseDir?: string,
+): void {
+  const list = listPendingAuthorityAcks(baseDir)
+  if (list.some((x) => x.sessionKey === entry.sessionKey && x.generation === entry.generation)) {
+    return
+  }
+  if (list.length >= MAX_PENDING_AUTHORITY_ACKS) {
+    // W1: Never silently evict unconfirmed acks; log saturation and retain existing entries.
+    log.warn('pending authority ack queue reached cap; retaining existing unconfirmed entries', {
+      cap: MAX_PENDING_AUTHORITY_ACKS,
+      sessionKey: entry.sessionKey,
+      generation: entry.generation,
+    })
+    return
+  }
+  list.push(entry)
+  writePendingAuthorityAcks(list, baseDir)
+}
+
+export function removePendingAuthorityAck(
+  sessionKey: string,
+  generation: string,
+  baseDir?: string,
+): void {
+  const list = listPendingAuthorityAcks(baseDir)
+  const next = list.filter((x) => !(x.sessionKey === sessionKey && x.generation === generation))
+  if (next.length !== list.length) {
+    writePendingAuthorityAcks(next, baseDir)
+  }
+}
+
+export type PendingAuthorityOpEntry =
+  | {
+      readonly kind: 'checkpoint'
+      readonly id: string
+      readonly sessionKey: string
+      readonly generation: string
+      readonly summary: string
+      readonly instructions?: string
+      readonly engine: string
+      readonly placementEpoch: number
+      readonly createdAt: number
+    }
+  | {
+      readonly kind: 'reset'
+      readonly id: string
+      readonly sessionKey: string
+      readonly engine: string
+      readonly expectedPlacementEpoch?: number
+      readonly afterCheckpointGeneration?: string
+      readonly createdAt: number
+    }
+
+const MAX_PENDING_AUTHORITY_OPS = 512
+
+function pendingAuthorityOpsPath(baseDir?: string): string {
+  return join(checkpointRootDir(baseDir), 'pending-authority-ops.json')
+}
+
+export function listPendingAuthorityOps(baseDir?: string): PendingAuthorityOpEntry[] {
+  const filePath = pendingAuthorityOpsPath(baseDir)
+  try {
+    const st = lstatSync(filePath)
+    if (st.isSymbolicLink() || !st.isFile()) return []
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8'))
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (x): x is PendingAuthorityOpEntry =>
+        Boolean(x) &&
+        typeof x.id === 'string' &&
+        typeof x.sessionKey === 'string' &&
+        (x.kind === 'checkpoint' || x.kind === 'reset'),
+    )
+  } catch {
+    return []
+  }
+}
+
+export function enqueuePendingAuthorityOp(
+  entry: PendingAuthorityOpEntry,
+  baseDir?: string,
+): void {
+  const list = listPendingAuthorityOps(baseDir)
+  const idx = list.findIndex((x) => x.id === entry.id)
+  if (idx >= 0) {
+    list[idx] = entry
+  } else {
+    if (list.length >= MAX_PENDING_AUTHORITY_OPS) {
+      log.warn('pending authority ops queue reached cap; retaining existing durable ops', {
+        cap: MAX_PENDING_AUTHORITY_OPS,
+        kind: entry.kind,
+        sessionKey: entry.sessionKey,
+      })
+      return
+    }
+    list.push(entry)
+  }
+  writeAtomicAuthorityQueueFile(pendingAuthorityOpsPath(baseDir), list, baseDir)
+}
+
+export function removePendingAuthorityOp(id: string, baseDir?: string): void {
+  const list = listPendingAuthorityOps(baseDir)
+  const next = list.filter((x) => x.id !== id)
+  if (next.length !== list.length) {
+    writeAtomicAuthorityQueueFile(pendingAuthorityOpsPath(baseDir), next, baseDir)
+  }
 }
 
 /** Read pending checkpoint without deleting it. Fail-open on ENOENT or corrupt JSON. */
@@ -392,10 +571,18 @@ export function ackPendingCheckpointIfTurnSucceeded(
   session: AgentSession,
   generation: string,
   baseDir?: string,
+  beforeLocalAck?: () => void,
 ): boolean {
   const outcome = checkpointTurnOutcomes.get(session)
   checkpointTurnOutcomes.delete(session)
   if (outcome !== 'completed') return false
+  if (beforeLocalAck) {
+    try {
+      beforeLocalAck()
+    } catch {
+      /* fail-open: never block local checkpoint consumption */
+    }
+  }
   return ackPendingCheckpoint(session.sessionKey, generation, baseDir)
 }
 

@@ -1503,12 +1503,7 @@ export async function _runOneTurn(
           ...(traceId ? { traceId } : {}),
         })
         await runner.shutdown()
-        this._resumeMap.delete(session.sessionKey)
-        this._resumeMapTimestamps.delete(session.sessionKey)
-        this._resumeMapProvider.delete(session.sessionKey)
-        this._resumeMapLastCost.delete(session.sessionKey)
-        this._resumeMapCostImprecise.delete(session.sessionKey)
-        this._resumeMapHistory.delete(session.sessionKey)
+        this._forgetResumeEntry(session.sessionKey)
         session.ccbSessionId = null
         runner.clearSessionId?.()
         this._saveResumeMap()

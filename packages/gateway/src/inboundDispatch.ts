@@ -1,6 +1,7 @@
 import { freezeGrokExecutionDescriptor, takeSystemHelpBootstrap } from '@openclaude/protocol'
 import { finalizeInboundCrossPoolMigration } from './crossPoolCheckpoint.js'
 import { savePendingCheckpointWithGeneration } from './sessionCheckpointStore.js'
+export { installTurnAuthorityRuntime, type EngineCapsuleRuntime } from './turnCapsuleRuntime.js'
 import { getSystemHelpBootstrap } from './systemHelpFrames.js'
 /**
  * Gateway inbound dispatch: the per-frame chat dispatch path (dispatchInbound)

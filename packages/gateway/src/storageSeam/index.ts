@@ -75,3 +75,21 @@ export type {
   WritePromptStateInput,
   WritePromptStateResult,
 } from './authorityStateBridge.js'
+
+export {
+  CodedAuthorityRpcError,
+  RemoteSessionAuthorityStore,
+  isAuthorityEndpointUnsupportedError,
+} from './remoteSessionAuthorityClient.js'
+export type {
+  AuthorityFetchImpl,
+  NarrowCapsulePatchInput,
+  NarrowResumePatchInput,
+  RemoteSessionAuthorityStoreOptions,
+} from './remoteSessionAuthorityClient.js'
+
+export { RemoteArtifactBlobStore } from './remoteArtifactBlobClient.js'
+export type {
+  ArtifactBlobFetchImpl,
+  RemoteArtifactBlobStoreOptions,
+} from './remoteArtifactBlobClient.js'

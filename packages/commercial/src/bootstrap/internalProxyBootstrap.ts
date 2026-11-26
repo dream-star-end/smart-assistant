@@ -11,7 +11,12 @@ import type {
   ServerResponse,
 } from "node:http";
 import type { Server as HttpsServer } from "node:https";
-import { SITES_AGENT_INTERNAL_PREFIX, type DurableCodexBilling } from "@openclaude/protocol";
+import {
+  ARTIFACT_BLOB_INTERNAL_PREFIX,
+  AUTHORITY_STATE_INTERNAL_PREFIX,
+  SITES_AGENT_INTERNAL_PREFIX,
+  type DurableCodexBilling,
+} from "@openclaude/protocol";
 import {
   appendServerAuthoredMessage,
   appendServerAuthoredMessageDrainByUser,
@@ -42,11 +47,12 @@ import type { AccountScheduler } from "../account-pool/scheduler.js";
 import { getProviderRoutingAvailability } from "../admin/providerHealthGate.js";
 import { getResearchConfigPublic } from "../admin/researchConfig.js";
 import { getPhase6AccountUuidEnforce, getSessionPinMode } from "../admin/runtimeFlags.js";
+import type { LocalCasArtifactBlobStore } from "../agent-sandbox/artifactBlobStore.js";
 import type { CronWakeRunner } from "../agent-sandbox/cronWake.js";
 import { V3_CONTAINER_PORT } from "../agent-sandbox/v3supervisor.js";
 import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from "../auth/apiKeyIdentity.js";
 import { makePgApiKeyRepo } from "../auth/apiKeyRepo.js";
-import { createPgIdentityRepo } from "../auth/containerIdentity.js";
+import { createPgIdentityRepo, makeContainerRequestVerifier } from "../auth/containerIdentity.js";
 import { makeDesktopIdentityStrategy } from "../auth/desktopIdentity.js";
 import { stubMailer } from "../auth/mail.js";
 import { makeContainerIdentityStrategy } from "../auth/proxyIdentity.js";
@@ -87,6 +93,7 @@ import {
 } from "../connectors/rpc.js";
 import { makeCcbTranscriptRestoreReader } from "../db/ccbTranscriptRestoreReader.js";
 import { getPool } from "../db/index.js";
+import { PgSessionAuthorityStateStore } from "../db/threeLayerStateStore.js";
 import {
   lookupLeaseCallbackSession,
   type DispatchAdmissionBackend,
@@ -154,6 +161,8 @@ import {
 } from "../http/desktopTlsListener.js";
 import type { CommercialHttpDeps } from "../http/handlers.js";
 import { ANTIGRAVITY_RELAY_PREFIX } from "../http/internalAntigravityRelay.js";
+import { makeInternalArtifactBlobsHandler } from "../http/internalArtifactBlobs.js";
+import { makeInternalAuthorityStateHandler } from "../http/internalAuthorityState.js";
 import {
   isAutoDreamOptimizerInternalPath,
   makeAutoDreamOptimizerHandler,
@@ -479,6 +488,7 @@ export interface InternalProxyBootstrapDeps {
   qqOutboundRef: { current: ReturnType<typeof makeQqOutboundReceiver> | null };
   qqProactiveRef: { current: ReturnType<typeof makeQqProactiveReceiver> | null };
   getModelAuthoritySigner: () => AuthoritySigner | undefined;
+  getArtifactBlobStore?: () => LocalCasArtifactBlobStore | undefined;
   getCronOriginBridge: () => UserChatBridgeHandler | null;
   getSystemActions: () => ReturnType<typeof assembleSystemActions> | undefined;
   setDesktopTlsClose: (fn: () => Promise<void>) => void;
@@ -654,6 +664,16 @@ export async function bootstrapInternalProxyAndListeners(
       const sitesInternalHandler = makeSitesInternalHandler({
         identityRepo,
         sites: deps.sitesService,
+      });
+      const containerRequestVerifier = makeContainerRequestVerifier(identityRepo);
+      const authorityStateHandler = makeInternalAuthorityStateHandler({
+        verify: containerRequestVerifier,
+        store: new PgSessionAuthorityStateStore(getPool()),
+        pgPool: getPool(),
+      });
+      const artifactBlobsHandler = makeInternalArtifactBlobsHandler({
+        verify: containerRequestVerifier,
+        getStore: () => deps.getArtifactBlobStore?.(),
       });
       const tavilyWebSearchHandler: TavilyWebSearchHandler = makeTavilyWebSearchHandler({
         identityRepo,
@@ -1132,6 +1152,12 @@ export async function bootstrapInternalProxyAndListeners(
         }
         if (path.startsWith(SITES_AGENT_INTERNAL_PREFIX)) {
           return sitesInternalHandler(req, res, ctx);
+        }
+        if (path.startsWith(AUTHORITY_STATE_INTERNAL_PREFIX)) {
+          return authorityStateHandler(req, res, ctx);
+        }
+        if (path.startsWith(ARTIFACT_BLOB_INTERNAL_PREFIX)) {
+          return artifactBlobsHandler(req, res, ctx);
         }
         if (path === TAVILY_WEB_SEARCH_PATH) return tavilyWebSearchHandler(req, res, ctx);
         if (path === MINIMAX_WEB_SEARCH_PATH) return minimaxWebSearchHandler(req, res, ctx);
