@@ -76,10 +76,13 @@ import argparse
 import datetime as dt
 import gzip
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+DEFAULT_ARCH_TELEMETRY_JSON = "/var/lib/openclaude-v5-selfhost/arch-telemetry-snapshot.json"
 
 ACCEPTANCE_UID = 765
 PERSONAL_DB = "openclaude_v5_selfhost"
@@ -876,7 +879,115 @@ def _classes(cohort) -> dict:
     return {key: int(value) for key, value in classes.items()}
 
 
-def assemble(window: dict, uids: list[int] | None, sql_results: dict, log_stats: dict | None) -> dict:
+def load_arch_telemetry_snapshot(raw_path: str | Path | None) -> dict | None:
+    """Read optional runtime archTelemetry snapshot JSON; return None when absent/invalid."""
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def assemble_arch_telemetry(sql_results: dict, arch_snapshot: dict | None) -> dict:
+    """Build runtime dead-code, EL/N+1, and sourceCommit rewrite attribution section.
+
+    Gracefully returns 0 / N/A when runtime telemetry snapshot or DB rows are absent.
+    """
+    dead_by_kind = {"route": 0, "featureFlag": 0, "skill": 0, "cron": 0}
+    dead_candidates: list[dict] = []
+    dead_status = "N/A"
+    el_section = {
+        "status": "N/A",
+        "alert_count": 0,
+        "p95_ms": "N/A",
+        "p99_ms": "N/A",
+        "max_ms": "N/A",
+    }
+    pg_budget_section = {
+        "status": "N/A",
+        "observed_requests": 0,
+        "observed_queries": 0,
+        "n_plus_one_alerts": 0,
+        "duration_budget_alerts": 0,
+        "offenders_by_route": [],
+    }
+    runtime_commits: list[dict] = []
+    regressing_commits: list[str] = []
+
+    if isinstance(arch_snapshot, dict):
+        dead_raw = arch_snapshot.get("deadCode")
+        if isinstance(dead_raw, dict):
+            dead_status = "ok"
+            by_kind = dead_raw.get("byKind") or {}
+            for kind in dead_by_kind:
+                kind_obj = by_kind.get(kind)
+                if isinstance(kind_obj, dict):
+                    dead_by_kind[kind] = int(kind_obj.get("zeroHitWindowCount") or 0)
+            raw_list = dead_raw.get("deadCandidates")
+            if isinstance(raw_list, list):
+                dead_candidates = [item for item in raw_list[:50] if isinstance(item, dict)]
+
+        el_raw = arch_snapshot.get("eventLoop")
+        if isinstance(el_raw, dict):
+            latest = el_raw.get("latestSample") if isinstance(el_raw.get("latestSample"), dict) else {}
+            el_section = {
+                "status": "ok",
+                "alert_count": int(el_raw.get("alertCount") or 0),
+                "p95_ms": latest.get("p95Ms", "N/A") if latest else "N/A",
+                "p99_ms": latest.get("p99Ms", "N/A") if latest else "N/A",
+                "max_ms": latest.get("maxMs", "N/A") if latest else "N/A",
+            }
+
+        pg_raw = arch_snapshot.get("pgQueryBudget")
+        if isinstance(pg_raw, dict):
+            offenders = pg_raw.get("offendersByRoute")
+            pg_budget_section = {
+                "status": "ok",
+                "observed_requests": int(pg_raw.get("observedRequests") or 0),
+                "observed_queries": int(pg_raw.get("observedQueries") or 0),
+                "n_plus_one_alerts": int(pg_raw.get("nPlusOneAlertCount") or 0),
+                "duration_budget_alerts": int(pg_raw.get("durationBudgetAlertCount") or 0),
+                "offenders_by_route": offenders[:20] if isinstance(offenders, list) else [],
+            }
+
+        ca_raw = arch_snapshot.get("commitAttribution")
+        if isinstance(ca_raw, dict):
+            raw_reg = ca_raw.get("regressingCommits")
+            if isinstance(raw_reg, list):
+                regressing_commits = [str(c) for c in raw_reg]
+            raw_commits = ca_raw.get("commits")
+            if isinstance(raw_commits, list):
+                runtime_commits = [c for c in raw_commits[:20] if isinstance(c, dict)]
+
+    return {
+        "dead_code_30d": {
+            "status": dead_status,
+            "total_candidates": len(dead_candidates) if dead_candidates else sum(dead_by_kind.values()),
+            "by_kind": dead_by_kind,
+            "candidates": dead_candidates,
+        },
+        "event_loop_blocking": el_section,
+        "pg_query_budget": pg_budget_section,
+        "commit_rewrite_attribution": {
+            "status": "ok" if runtime_commits or regressing_commits else "N/A",
+            "regressing_commits": regressing_commits,
+            "runtime_commits": runtime_commits,
+        },
+    }
+
+
+def assemble(
+    window: dict,
+    uids: list[int] | None,
+    sql_results: dict,
+    log_stats: dict | None,
+    arch_snapshot: dict | None = None,
+) -> dict:
     cohort_row = sql_results.get("cohort")
     classes = _classes(cohort_row)
     # GROUP BY omits a class whose count is zero. A successful cohort with no
@@ -1030,6 +1141,7 @@ def assemble(window: dict, uids: list[int] | None, sql_results: dict, log_stats:
             "continuation_rejects": continuation,
             "note": "非 completed 率的分母是该模型的人发回合。续接拒绝头条只计 scope=web 的 journal 行。",
         },
+        "arch_telemetry": assemble_arch_telemetry(sql_results, arch_snapshot),
     }
 
 
@@ -1295,6 +1407,47 @@ def render_markdown(report: dict) -> str:
         for row in cont:
             lines.append(f"- {row.get('scope')} / {row.get('code')}：{row.get('n')}")
     lines.append("")
+    arch = report.get("arch_telemetry") or {}
+    dead = arch.get("dead_code_30d") or {}
+    el = arch.get("event_loop_blocking") or {}
+    pg_b = arch.get("pg_query_budget") or {}
+    ca = arch.get("commit_rewrite_attribution") or {}
+    lines.append("## 架构与运行时死码遥测（OCV5-906）")
+    lines.append("")
+    by_kind = dead.get("by_kind") or {}
+    lines.append(
+        f"- 30 天零命中死码候选：{dead.get('total_candidates', 0)}（状态={dead.get('status', 'N/A')}；"
+        f"route={by_kind.get('route', 0)}, featureFlag={by_kind.get('featureFlag', 0)}, "
+        f"skill={by_kind.get('skill', 0)}, cron={by_kind.get('cron', 0)}）"
+    )
+    lines.append(
+        f"- Event Loop 阻塞探针：告警 {el.get('alert_count', 0)} 次"
+        f"（p95={el.get('p95_ms', 'N/A')} ms, p99={el.get('p99_ms', 'N/A')} ms, "
+        f"max={el.get('max_ms', 'N/A')} ms；状态={el.get('status', 'N/A')}）"
+    )
+    lines.append(
+        f"- 单请求 PG 查询预算（N+1 探针）：N+1 超限告警 {pg_b.get('n_plus_one_alerts', 0)} 次，"
+        f"耗时预算告警 {pg_b.get('duration_budget_alerts', 0)} 次"
+        f"（观测查询 {pg_b.get('observed_queries', 0)}；状态={pg_b.get('status', 'N/A')}）"
+    )
+    reg_commits = ca.get("regressing_commits") or []
+    lines.append(f"- 标记劣化提交（regressing commits）：{', '.join(reg_commits) if reg_commits else '0 (N/A)'}")
+    lines.append("")
+    lines.append("按 `sourceCommit` 归因的用户改写/重发率：")
+    lines.append("")
+    rt_commits = ca.get("runtime_commits") or []
+    if rt_commits:
+        for row in rt_commits:
+            rate = row.get("rewriteResendRate")
+            rate_str = f"{(100.0 * float(rate)):.1f}%" if isinstance(rate, (int, float)) else "N/A"
+            flag = " [REGRESSING]" if row.get("regressing") else ""
+            lines.append(
+                f"- {row.get('sourceCommit')}：{rate_str} "
+                f"({row.get('rewriteResendCount', 0)}/{row.get('turns', 0)}){flag}"
+            )
+    else:
+        lines.append("0 / N/A")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -1382,6 +1535,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--md-out", required=True)
     parser.add_argument("--log-dir", default="/var/log")
     parser.add_argument("--skip-logs", action="store_true", help="skip the 15-day master log scan")
+    parser.add_argument(
+        "--arch-telemetry-json",
+        default=os.environ.get("OC_V5_ARCH_TELEMETRY_JSON", DEFAULT_ARCH_TELEMETRY_JSON),
+        help="optional runtime archTelemetry snapshot JSON path",
+    )
     args = parser.parse_args(argv)
     uids = parse_uids(args.uid)
     since_sql = sql_ts(args.since)
@@ -1433,11 +1591,13 @@ def main(argv: list[str] | None = None) -> int:
         }
     # drain_turns is an input to the log scan, not a published table
     published = {key: value for key, value in sql_results.items() if key != "drain_turns"}
+    arch_snapshot = load_arch_telemetry_snapshot(args.arch_telemetry_json)
     report = assemble(
         {"since": args.since, "until": args.until, "tz": "timestamptz"},
         uids,
         published,
         None if _failed(log_stats) else log_stats,
+        arch_snapshot=arch_snapshot,
     )
     if _failed(log_stats):
         report["w1"]["disconnect_over_drain"] = log_stats
