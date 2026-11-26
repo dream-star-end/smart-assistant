@@ -1127,7 +1127,7 @@ export function createSelfhostReturnToRemoteGrantResolver(
       try {
         const rbRes = await deps.pool.query<{ operation_id?: string | null }>(
           `SELECT operation_id FROM remote_agent_bindings
-            WHERE user_id = $1 AND session_key = $2
+            WHERE uid = $1 AND session_key = $2
             LIMIT 1`,
           [input.uid, input.sessionKey],
         )
@@ -1506,7 +1506,7 @@ export function createSelfhostForcedLocalMigrationResolver(
         }>(
           `SELECT operation_id, profile_id
              FROM remote_agent_bindings
-            WHERE user_id = $1 AND session_key = $2
+            WHERE uid = $1 AND session_key = $2
             ORDER BY updated_at DESC
             LIMIT 1`,
           [input.uid, input.sessionKey],

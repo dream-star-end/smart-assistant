@@ -343,7 +343,10 @@ class InMemoryContinuityPgPool implements PgTransactionPool {
       row.completed_at = this.nowIso(db)
       return { rows: [JSON.parse(JSON.stringify(row))], rowCount: 1 }
     }
-    if (sql.includes('FROM remote_agent_bindings')) {
+    if (sql.includes('FROM remote_agent_bindings') && !sql.includes('FROM request_finalize_journal')) {
+      if (/\buser_id\b/i.test(sql) || !/\buid\s*=\s*\$1\b/i.test(sql)) {
+        throw new Error('column "user_id" does not exist on remote_agent_bindings (schema uses uid)')
+      }
       const rb = db.remoteBindings.get(`${params[0]}::${params[1]}`)
       return rb ? { rows: [JSON.parse(JSON.stringify(rb))], rowCount: 1 } : { rows: [], rowCount: 0 }
     }
