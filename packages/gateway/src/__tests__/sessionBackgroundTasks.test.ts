@@ -141,8 +141,8 @@ describe('sessionBgCommands', () => {
         updatedAt: now,
         maxLifetimeAt: now + 60_000,
       })
-      // Expired entry (reaped)
-      const expiredPath = writeSnap(dir, {
+      // Dead expired entry (process already gone → reaped on list)
+      const expiredDeadPath = writeSnap(dir, {
         id: '3000-ocb_1',
         jobId: 'ocb_1',
         pid: 6002,
@@ -151,9 +151,24 @@ describe('sessionBgCommands', () => {
         startTimeTicks: 8888,
         sessionKey: 'agent:main:webchat:dm:sess-A',
         sessionId: 'sess-A',
-        commandPreview: 'expired',
+        commandPreview: 'expired-dead',
         startedAt: now - 10_000,
         updatedAt: now - 10_000,
+        maxLifetimeAt: now - 1,
+      })
+      // Live expired entry (B07: must NOT be silently unlinked while still alive; left for sweeper)
+      const expiredLivePath = writeSnap(dir, {
+        id: '3500-ocb_1',
+        jobId: 'ocb_expired_live',
+        pid: 6004,
+        pgid: 6004,
+        ownerPid: 3500,
+        startTimeTicks: 8899,
+        sessionKey: 'agent:main:webchat:dm:sess-A',
+        sessionId: 'sess-A',
+        commandPreview: 'expired-live',
+        startedAt: now - 60_000,
+        updatedAt: now - 60_000,
         maxLifetimeAt: now - 1,
       })
       // PID-reused entry (ticks mismatch → reaped)
@@ -175,11 +190,12 @@ describe('sessionBgCommands', () => {
       const items = listSessionBgCommands('sess-A', dir, {
         now: () => now,
         platform: 'linux',
-        isProcessAlive: () => true,
+        isProcessAlive: (pid) => pid !== 6002,
         readStartTimeTicks: (pid) => {
           if (pid === 6003) return 2222 // PID reused!
           if (pid === 6001) return 7777
           if (pid === 6002) return 8888
+          if (pid === 6004) return 8899
           return 9000 + (pid - 5000)
         },
       })
@@ -188,7 +204,8 @@ describe('sessionBgCommands', () => {
       assert.equal(items[0]!.jobId, 'ocb_22', 'newest first')
       assert.equal(items[19]!.jobId, 'ocb_3')
       assert.equal(existsSync(otherPath), true, 'other session entry preserved')
-      assert.equal(existsSync(expiredPath), false, 'expired entry reaped')
+      assert.equal(existsSync(expiredDeadPath), false, 'dead expired entry reaped')
+      assert.equal(existsSync(expiredLivePath), true, 'live expired entry preserved for active sweeper (B07)')
       assert.equal(existsSync(reusedPath), false, 'PID-reused entry reaped')
     } finally {
       rmSync(dir, { recursive: true, force: true })

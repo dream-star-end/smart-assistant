@@ -22,6 +22,7 @@ import {
   type RemoteCcTarget,
 } from '@openclaude/gateway/cc5-container-runtime'
 import { codexExecutionReady, projectCodexRemoteCapabilities, parseCodexExecutionSnapshot, codexManifestHash } from './codexRemoteProfile.js'
+import { assertLegacyTrackNotRetiredTx } from './remotePool/legacyRetirementRuntime.js'
 import type { CodexLaneSpec } from '@openclaude/gateway/cc5-container-runtime'
 import { getPool } from '../db/index.js'
 import { query, type QueryRunner } from '../db/queries.js'
@@ -905,9 +906,8 @@ export async function placeRemoteLane(
   const engine = input.engine === 'codex' ? 'codex' : 'cc'
   const client = await pool.connect()
   try {
-    await client.query('BEGIN')
+    await client.query('BEGIN'); await assertLegacyTrackNotRetiredTx(client, 'placement')
     await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, [`remote-chat:${input.uid}:${input.sessionKey}`])
-    // Unknown is occupied. Neither timeout nor a lost process PID proves release.
     const busy = await client.query(`SELECT operation_id FROM remote_agent_bindings
       WHERE uid=$1 AND session_key=$2 AND state<>'released' LIMIT 1`, [input.uid,input.sessionKey])
     if (busy.rows.length) throw new Error('REMOTE_LANE_STOP_UNPROVEN')

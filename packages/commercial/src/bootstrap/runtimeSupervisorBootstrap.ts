@@ -28,6 +28,7 @@ import {
   type AccountScheduler,
 } from "../account-pool/scheduler.js";
 import { syncLogicalModelPoolBindingsFromCatalog } from "../account-pool/remotePool/logicalModelBindingsSync.js";
+import { bootstrapLegacyRetirementGate, type LegacyTrackRetirementGate } from "../account-pool/remotePool/legacyRetirementRuntime.js";
 import type { LocalCasArtifactBlobStore } from "../agent-sandbox/artifactBlobStore.js";
 import { createMasterArtifactBlobStore } from "../agent-sandbox/artifactBlobRuntime.js";
 import { createMasterCc5Runtime } from "../agent-sandbox/cc5Runtime.js";
@@ -424,6 +425,7 @@ export function assembleV3SupervisorCore(deps: {
   v3Docker: Docker;
   v3Deps: V3SupervisorDeps;
   cc5Runtime: ReturnType<typeof createMasterCc5Runtime>;
+  legacyRetirementGate: LegacyTrackRetirementGate;
 } {
   const v3Docker = deps.cfg.AGENT_DOCKER_SOCKET
     ? new Docker({ socketPath: deps.cfg.AGENT_DOCKER_SOCKET })
@@ -510,25 +512,20 @@ export function assembleV3SupervisorCore(deps: {
       });
   }
 
+  const legacyRetirementGate = bootstrapLegacyRetirementGate({ queryable: getPool(), rawFlag: deps.env.OC_LEGACY_REMOTE_TRACKS_RETIRED, isSelfhostV5, log: rootLogger });
   const cc5Runtime = createMasterCc5Runtime({
     selfhost: isSelfhostV5,
-    authorityReady:
-      deps.modelAuthoritySigner !== null &&
-      deps.modelAuthoritySigner !== undefined &&
-      deps.modelAuthorityProvisionRequired,
-    env: deps.env,
-    egressSecret: deps.cfg.OC_EGRESS_SECRET,
+    authorityReady: Boolean(deps.modelAuthoritySigner) && deps.modelAuthorityProvisionRequired,
+    env: deps.env, egressSecret: deps.cfg.OC_EGRESS_SECRET, legacyRetirementGate,
     ...(deps.modelAuthoritySigner && deps.modelCatalogCache
       ? {
           financeFactory: (_binding, lane) =>
             createRemoteNativeTurnFinance({
-              pool: getPool(),
-              preCheckRedis: deps.preCheckRedis,
-              catalog: deps.modelCatalogCache!,
+              pool: getPool(), preCheckRedis: deps.preCheckRedis, catalog: deps.modelCatalogCache!,
               keyring: () => deps.modelAuthoritySigner!.publicKeyring(),
               loadUserModelAuthz: deps.loadUserModelAuthz,
               log: rootLogger.child({ subsys: "remoteNativeBilling" }),
-              upstreamModel: lane.upstreamModel,
+              upstreamModel: lane.upstreamModel, legacyRetirementGate,
             }),
         }
       : {}),
@@ -634,7 +631,7 @@ export function assembleV3SupervisorCore(deps: {
     );
   }
 
-  return { v3Docker, v3Deps, cc5Runtime };
+  return { v3Docker, v3Deps, cc5Runtime, legacyRetirementGate };
 }
 
 export function wireRemoteMuxDeps(): void {

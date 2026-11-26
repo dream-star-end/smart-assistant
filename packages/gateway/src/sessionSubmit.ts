@@ -15,6 +15,7 @@ import { cc5SessionBackend, assertFreshCc5Session, type CrossPoolMigrationGrant 
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
 import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
+import { reapEphemeralBgCommandsSafe } from './sessionBgCommands.js'
 /**
  * Session submit path: submit, getOrCreate / exclusive create, idle finish, external turns, resume-id resolution
  *
@@ -1838,19 +1839,11 @@ export async function _getOrCreateExclusive(
             // current-input budgeting can legitimately select [] for old chats.
             contextRebuildNotice = hadPriorProviderState ? replacementNotice : undefined
           } catch (historyErr) {
-            // Failure to prove freshness must preserve the exceptional notice.
-            // Suppressing a real provider switch is worse than a best-effort
-            // notice; runner replacement itself must still continue.
-            log.warn(
-              'session-replacement prior-turn read failed; preserving rebuild notice',
-              {
-                sessionKey: opts.sessionKey,
-                replacementNotice,
-              },
-              historyErr,
-            )
+            // Preserve exceptional notice on history read failure; runner replacement still continues.
+            log.warn('session-replacement prior-turn read failed; preserving rebuild notice', { sessionKey: opts.sessionKey, replacementNotice }, historyErr)
           }
           await existing.runner.shutdown()
+          await reapEphemeralBgCommandsSafe(opts.sessionKey, identityRefreshSession, log)
         } catch (err) {
           if (executionBackend || existing.runner.executionBackend) {
             existing._replacing = false

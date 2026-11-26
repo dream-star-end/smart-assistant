@@ -48,6 +48,31 @@ export type {
   LegacyRetirementReadiness,
 } from './legacyRetirement.js'
 export {
+  LEGACY_REMOTE_TRACK_RETIRED,
+  LEGACY_RETIREMENT_ADVISORY_LOCK_KEY,
+  LEGACY_RETIREMENT_BLOCKED,
+  LEGACY_RETIREMENT_SETTING_KEY,
+  LegacyRetirementBlockedError,
+  LegacyTrackRetirementGate,
+  assertLegacyBillingGateAllowed,
+  assertLegacyTrackNotRetiredTx,
+  bootstrapLegacyRetirementGate,
+  bootstrapLegacyRetirementGateAsync,
+  parseLegacyRetirementMode,
+  parsePersistedLegacyRetirementState,
+  readPersistedLegacyRetirementState,
+} from './legacyRetirementRuntime.js'
+export type {
+  LegacyBillingGatePort,
+  LegacyRetirementGateLogger,
+  LegacyRetirementGateStatus,
+  LegacyRetirementMode,
+  LegacyRetirementPoolClient,
+  LegacyRetirementPoolLike,
+  LegacyTrackRetirementGateOptions,
+  PersistedLegacyRetirementState,
+} from './legacyRetirementRuntime.js'
+export {
   EXTENDED_RED_CONTROL_IDS,
   FULL_RED_CONTROL_IDS,
   buildExtendedRedProofArtifact,

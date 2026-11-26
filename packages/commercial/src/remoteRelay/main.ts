@@ -57,6 +57,7 @@ import {
 } from '../account-pool/remoteLaneRecovery.js'
 import {
   RemoteReleaseDrainCoordinator,
+  bootstrapLegacyRetirementGateAsync,
   isReservedVerificationSessionKey,
   legacyBindingEngineForAuthority,
   legacyProfileEngineForAuthority,
@@ -829,6 +830,7 @@ export async function startRemoteRelayDaemon(): Promise<void> {
   const baseRoot = process.env[REMOTE_RELAY_BASE_ROOT_ENV]?.trim() || DEFAULT_BASE_ROOT
   const evidenceRoot = process.env[REMOTE_RELAY_EVIDENCE_ROOT_ENV]?.trim() || DEFAULT_EVIDENCE_ROOT
   const ownLaneGenerations = new OwnLaneGenerationTracker()
+  const legacyRetirementGate = await bootstrapLegacyRetirementGateAsync({ queryable: pool, rawFlag: process.env.OC_LEGACY_REMOTE_TRACKS_RETIRED, isSelfhostV5: true, log })
   let shuttingDown = false
 
   const runPlaceOnce = async (request: {
@@ -884,13 +886,8 @@ export async function startRemoteRelayDaemon(): Promise<void> {
     if (requestedEngine !== undefined && !isLegacyRemoteEngine(requestedEngine)) {
       throw new Error('REMOTE_LANE_UNAVAILABLE')
     }
-    const legacy = await placeRemoteLane(
-      {
-        ...request,
-        engine: requestedEngine,
-      },
-      { controllerPath, pool },
-    )
+    await legacyRetirementGate.assertLegacyPlacementAllowedAsync()
+    const legacy = await placeRemoteLane({ ...request, engine: requestedEngine }, { controllerPath, pool })
     ownLaneGenerations.record(legacy.operationId, legacy.generation)
     return legacy
   }
@@ -925,6 +922,7 @@ export async function startRemoteRelayDaemon(): Promise<void> {
             loadUserModelAuthz,
             log: rootLogger.child({ subsys: 'remoteNativeBilling' }),
             upstreamModel: lane.upstreamModel,
+            legacyRetirementGate,
           })
         },
         configuration: (): DualSlotConfiguration => ({

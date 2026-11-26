@@ -224,7 +224,7 @@ interface FinalizeDeps {
  * 也有这条 inflight 记录,reconciler 后续可以扫到并兜底退预扣(P1)。
  */
 export async function startInflightJournal(
-  pool: Pool,
+  pool: Pick<Pool, "query">,
   ctx: Pick<FinalizeContext, "requestId" | "userId" | "containerId" | "model" | "precheckCredits"> & {
     /** PR2 v1.0.66 — codex 路径透传 agent/account/source 到 ctx JSONB，reconciler
      *  重跑 / 排障可复原 turn 上下文。模型权威开启后还会持久化 server-owned 的精确

@@ -20,10 +20,12 @@ import {
   KILL_GRACE_MS,
   OC_BASH_MAX_OUTPUT_BYTES,
   OcBashJobManager,
+  isJobLifecycleClass,
   killChildProcessGroup,
   type OcBashAction,
   type OcBashCallOutcome,
 } from './ocBashJobManager.js'
+import type { JobLifecycleClass } from '@openclaude/protocol'
 
 export {
   OC_BASH_HEAD_BYTES,
@@ -208,12 +210,12 @@ function installProcessGroupCleanup(): void {
   if (processGroupCleanupInstalled) return
   processGroupCleanupInstalled = true
   process.on('exit', () => {
-    defaultOcBashManager.cleanupSnapshotsSync()
+    defaultOcBashManager.shutdown({ preserveSurvivors: true })
     killTrackedProcessGroups('SIGKILL')
   })
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     const onSignal = () => {
-      defaultOcBashManager.cleanupSnapshotsSync()
+      defaultOcBashManager.shutdown({ preserveSurvivors: true })
       killTrackedProcessGroups('SIGKILL')
       process.removeListener(sig, onSignal)
       process.kill(process.pid, sig)
@@ -326,9 +328,14 @@ const defaultOcBashManager = new OcBashJobManager({
   untrackProcessGroup,
 })
 
-/** Reap all active oc_bash / oc_* child process groups on MCP shutdown or stdin disconnect. */
-export function shutdownLocalCliTools(): void {
-  defaultOcBashManager.shutdown()
+/**
+ * Reap ephemeral `oc_bash` / `oc_*` child process groups on MCP shutdown or stdin disconnect.
+ * By default (`preserveSurvivors: true`) preserves `managed_job` and `daemon_service` process
+ * groups and their disk snapshots across brain switches; pass `{ preserveSurvivors: false }`
+ * for full container teardown.
+ */
+export function shutdownLocalCliTools(opts?: { preserveSurvivors?: boolean }): void {
+  defaultOcBashManager.shutdown({ preserveSurvivors: opts?.preserveSurvivors ?? true })
   killTrackedProcessGroups('SIGKILL')
   activeProcessGroups.clear()
 }
@@ -346,6 +353,33 @@ function appendStreamSections(
   if (stderr) text += `\n--- stderr ---\n${stderr}`
   if (footer) text += `\n---\n${footer}`
   return text
+}
+
+function formatTombstoneOutcome(t: Extract<OcBashCallOutcome, { kind: 'tombstone' }>['tombstone']): ToolTextResult {
+  const bits = [`exit=${t.exitCode ?? 'none'}`]
+  if (t.signal) bits.push(`signal=${t.signal}`)
+  if (t.reason === 'idle_timeout') {
+    return textResult(
+      `status=terminated_idle job_id=${t.jobId} ${bits.join(' ')} elapsed_ms=${t.elapsedMs}\n[oc_bash] 任务因无人续等超过空闲租约已被自动终止（${t.commandPreview}）。`,
+      true,
+    )
+  }
+  if (t.reason === 'max_lifetime') {
+    return textResult(
+      `status=terminated_max_lifetime job_id=${t.jobId} ${bits.join(' ')} elapsed_ms=${t.elapsedMs}\n[oc_bash] 任务超过总运行上限已被自动终止（${t.commandPreview}）。`,
+      true,
+    )
+  }
+  if (t.reason === 'env_migrated') {
+    return textResult(
+      `status=terminated_env_migrated job_id=${t.jobId} elapsed_ms=${t.elapsedMs}\n[oc_bash] 任务因执行环境迁移已被终止（${t.commandPreview}）。`,
+      true,
+    )
+  }
+  const statusLabel = t.reason === 'killed' ? 'already_killed' : 'already_collected'
+  return textResult(
+    `status=${statusLabel} job_id=${t.jobId} ${bits.join(' ')} elapsed_ms=${t.elapsedMs}\n[oc_bash] 该任务结果此前已回收。`,
+  )
 }
 
 function formatOcBashOutcome(outcome: OcBashCallOutcome): ToolTextResult {
@@ -366,27 +400,8 @@ function formatOcBashOutcome(outcome: OcBashCallOutcome): ToolTextResult {
       )
     case 'busy':
       return textResult(`oc_bash: 任务 job_id=${outcome.jobId} 正在等待中，请勿并发重复 wait`, true)
-    case 'tombstone': {
-      const t = outcome.tombstone
-      const bits = [`exit=${t.exitCode ?? 'none'}`]
-      if (t.signal) bits.push(`signal=${t.signal}`)
-      if (t.reason === 'idle_timeout') {
-        return textResult(
-          `status=terminated_idle job_id=${t.jobId} ${bits.join(' ')} elapsed_ms=${t.elapsedMs}\n[oc_bash] 任务因无人续等超过空闲租约已被自动终止（${t.commandPreview}）。`,
-          true,
-        )
-      }
-      if (t.reason === 'max_lifetime') {
-        return textResult(
-          `status=terminated_max_lifetime job_id=${t.jobId} ${bits.join(' ')} elapsed_ms=${t.elapsedMs}\n[oc_bash] 任务超过总运行上限已被自动终止（${t.commandPreview}）。`,
-          true,
-        )
-      }
-      const statusLabel = t.reason === 'killed' ? 'already_killed' : 'already_collected'
-      return textResult(
-        `status=${statusLabel} job_id=${t.jobId} ${bits.join(' ')} elapsed_ms=${t.elapsedMs}\n[oc_bash] 该任务结果此前已回收。`,
-      )
-    }
+    case 'tombstone':
+      return formatTombstoneOutcome(outcome.tombstone)
     case 'finished': {
       const bits = [`exit=${outcome.exitCode ?? 'none'}`]
       if (outcome.signal) bits.push(`signal=${outcome.signal}`)
@@ -429,6 +444,9 @@ function formatOcBashOutcome(outcome: OcBashCallOutcome): ToolTextResult {
     }
     case 'running': {
       const bits = ['status=running', `job_id=${outcome.jobId}`, `elapsed_ms=${outcome.elapsedMs}`]
+      if (outcome.lifecycleClass && outcome.lifecycleClass !== 'ephemeral_turn') {
+        bits.push(`lifecycle_class=${outcome.lifecycleClass}`)
+      }
       if (outcome.truncated) bits.push('truncated')
       const footer = [
         '[oc_bash] 命令仍在运行（进度已保留，未强杀）。',
@@ -453,6 +471,8 @@ export async function handleOcBash(
   const jobId = asText(input.job_id).trim()
   const rawAction = input.action === undefined ? 'wait' : asText(input.action).trim()
   const killOnTimeout = input.kill_on_timeout === true
+  const rawLifecycleClass =
+    input.lifecycle_class === undefined ? undefined : asText(input.lifecycle_class).trim()
 
   if (!command && !jobId) {
     return textResult('oc_bash: command 不能为空（或传入 job_id 操作在途任务）', true)
@@ -465,6 +485,19 @@ export async function handleOcBash(
   }
   if (command && rawAction !== 'wait') {
     return textResult('oc_bash: 启动新 command 时不能指定 action="status" 或 "kill"', true)
+  }
+  let lifecycleClass: JobLifecycleClass | undefined
+  if (rawLifecycleClass !== undefined) {
+    if (!command) {
+      return textResult('oc_bash: 续等已有 job_id 时不能修改 lifecycle_class', true)
+    }
+    if (!isJobLifecycleClass(rawLifecycleClass)) {
+      return textResult(
+        `oc_bash: 无效的 lifecycle_class "${rawLifecycleClass}"（仅支持 ephemeral_turn / managed_job / daemon_service）`,
+        true,
+      )
+    }
+    lifecycleClass = rawLifecycleClass
   }
 
   const action: OcBashAction = rawAction
@@ -481,6 +514,7 @@ export async function handleOcBash(
         cwd: optionalCwd(input.cwd),
         timeoutMs,
         killOnTimeout,
+        ...(lifecycleClass !== undefined ? { lifecycleClass } : {}),
       })
     : await manager.continueJob({
         jobId,

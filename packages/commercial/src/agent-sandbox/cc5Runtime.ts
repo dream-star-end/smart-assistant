@@ -255,8 +255,7 @@ export function createMasterCc5Runtime(
       OC_REMOTE_RELAY_STATE_FILE?: string
       OC_EGRESS_SECRET?: string
     }
-    egressSecret?: string
-    financeFactory?: RemoteFinanceFactory
+    egressSecret?: string; financeFactory?: RemoteFinanceFactory; legacyRetirementGate?: { assertLegacyPlacementAllowedAsync(): Promise<void> }
   },
   fixture: {
     create?: typeof createRemoteLaneRuntime
@@ -402,6 +401,7 @@ export function createMasterCc5Runtime(
       if (request.engine === 'antigravity') {
         throw new Error('REMOTE_LANE_UNAVAILABLE')
       }
+      await input.legacyRetirementGate?.assertLegacyPlacementAllowedAsync()
       return placeRemoteLane(
         {
           ...request,
