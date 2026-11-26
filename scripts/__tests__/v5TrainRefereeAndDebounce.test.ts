@@ -567,8 +567,10 @@ appendFileSync(${JSON.stringify(envProbeLog)}, JSON.stringify({
 process.exit(0)
 `,
     )
-    // Copy REAL check-security-sast.ts into referee to prove real --root "$staging" scanning finds gatewayFiles > 0!
+    // Copy REAL check-security-sast.ts + its prodFileDiscovery helper into referee to prove real --root "$staging" scanning finds gatewayFiles > 0!
     cpSync(join(REPO_ROOT, 'scripts/check-security-sast.ts'), join(refDir, 'scripts/check-security-sast.ts'))
+    mkdirSync(join(refDir, 'scripts/lib'), { recursive: true })
+    cpSync(join(REPO_ROOT, 'scripts/lib/prodFileDiscovery.ts'), join(refDir, 'scripts/lib/prodFileDiscovery.ts'))
     writeFileSync(
       join(refDir, 'scripts/check-debt-ttl.ts'),
       `// supports --base --head
