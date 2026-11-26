@@ -32,13 +32,13 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { readValidatedHmacKeyFile } from './lib/a0ApprovalReceipt.js'
 import {
   ARCH_STEWARD_DRY_RUN_SCHEMA_VERSION,
   ARCH_STEWARD_RECEIPT_SCHEMA_VERSION,
   type ArchStewardReceipt,
   DEFAULT_STEWARD_HMAC_KEY_ENV,
   type ReceiptLookupResult,
+  type StewardHmacKeyState,
   type StewardReceiptVerificationResult,
   type StructuralRiskReport,
   collectDiffSummaryFromGit,
@@ -49,6 +49,7 @@ import {
   readCommitMessage,
   resolveDefaultBaseRef,
   resolveGitSha,
+  resolveStewardHmacKeyState,
   signArchStewardReceipt,
   verifyArchStewardReceipt,
 } from './lib/archStewardContract.js'
@@ -94,10 +95,17 @@ export {
   findStewardReceiptForCommit,
   formatStewardGateFailure,
   formatStructuralRiskReport,
+  resolveStewardHmacKeyState,
   signArchStewardReceipt,
   verifyArchStewardReceipt,
 }
-export type { ArchStewardReceipt, ReceiptLookupResult, StewardReceiptVerificationResult, StructuralRiskReport }
+export type {
+  ArchStewardReceipt,
+  ReceiptLookupResult,
+  StewardHmacKeyState,
+  StewardReceiptVerificationResult,
+  StructuralRiskReport,
+}
 
 export interface StewardGateRunOptions {
   root: string
@@ -496,21 +504,16 @@ async function main(argv: string[]): Promise<number> {
     }
   }
 
-  const resolveHmacKey = (): string | undefined => {
-    const fromEnv = process.env[hmacKeyEnv]?.trim()
-    if (fromEnv) return fromEnv
-    if (hmacKeyFile) {
-      const keyRes = readValidatedHmacKeyFile(hmacKeyFile, requireRootOwner)
-      if (!keyRes.present) {
-        throw new Error(`HMAC key file not found: ${hmacKeyFile}`)
-      }
-      if (!keyRes.ok) {
-        throw new Error(keyRes.reason)
-      }
-      return keyRes.key
-    }
-    return undefined
-  }
+  const resolveHmacKeyState = (allowHostDefault = false): StewardHmacKeyState =>
+    resolveStewardHmacKeyState({
+      hmacKeyEnv,
+      hmacKeyFile,
+      requireRootOwner,
+      allowHostDefault,
+      root,
+      explicitReceiptPath: receiptPath,
+      receiptDirs,
+    })
 
   // Helper mode: single-process preflight for `scripts/arch-steward-review.sh`
   if (stewardPreflight) {
@@ -590,7 +593,7 @@ async function main(argv: string[]): Promise<number> {
         ArchStewardReceipt,
         'receiptDigest'
       >
-      const hmacKey = resolveHmacKey()
+      const { hmacKey } = resolveHmacKeyState(false)
       const signed = signArchStewardReceipt(parsed, hmacKey)
       const rendered = `${JSON.stringify(signed, null, 2)}\n`
       if (outPath) {
@@ -626,7 +629,7 @@ async function main(argv: string[]): Promise<number> {
   // Mode 2: Deterministic Architecture Steward commit/PR hard gate
   if (gateMode !== undefined) {
     try {
-      const hmacKey = resolveHmacKey()
+      const hmacState = resolveHmacKeyState(true)
       const githubToken = resolveGithubToken(githubTokenEnv)
       const trustedPublishers = trustedPublishersRaw
         ? trustedPublishersRaw
@@ -641,7 +644,8 @@ async function main(argv: string[]): Promise<number> {
         headRef,
         receiptDirs,
         explicitReceiptPath: receiptPath,
-        hmacKey,
+        hmacKey: hmacState.hmacKey,
+        requireHmac: hmacState.requireHmac || process.env.OC_STEWARD_REQUIRE_HMAC === '1',
         requireRootOwner,
         allowUntrustedRepoReceipt,
         github:

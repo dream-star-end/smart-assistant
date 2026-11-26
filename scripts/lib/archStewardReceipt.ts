@@ -1,17 +1,13 @@
 /**
  * Architecture Steward Receipt Signing, Verification, Discovery & Formatters (OCV5-905 / OCV5-903 B2 & B3).
- *
- * Production hardening:
- *   - Hard-rejects `dryRun === true`, non-production schema (`oc.v5.arch-steward-dry-run/1`),
- *     placeholder/mock/example/dry-run `jobId`, `sessionKey`, `provider`, `command`, or `[dry-run]` notes.
- *   - Enforces file trust boundaries on receipt files: regular file, non-symlink, non-group/world-writable,
- *     root-owned (`uid === 0`) by default, and NEVER accepts unsigned in-repo `.github/steward-receipts/` files.
- *   - Supports out-of-commit GitHub Commit Status `oc-v5/arch-steward` verification shared across
- *     hosted CI runners and host release trains.
+ * Rejects dry-run receipts, symlinks, writable/non-root host receipts, and unsigned in-repo files;
+ * supports out-of-commit GitHub Commit Status `oc-v5/arch-steward` and host `.hmac-key` verification.
  */
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
-import { lstatSync, readFileSync } from 'node:fs'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import path from 'node:path'
+
+import { type HmacKeyLoadResult, readValidatedHmacKeyFile } from './a0ApprovalReceipt.js'
 
 import {
   ARCH_STEWARD_DRY_RUN_SCHEMA_VERSION,
@@ -588,8 +584,18 @@ export function findStewardReceiptForCommit(opts: {
     if (res) return res
   }
 
+  // Exclusive override boundary: when --receipt-dir or OC_STEWARD_RECEIPT_DIR was explicitly
+  // configured and missed, stop local lookup immediately (never fall through to default host dir
+  // or commit trailer; upper-layer GitHub oc-v5/arch-steward status remains independent).
+  if (!usesDefaultHostStewardDir({ explicitReceiptPath: opts.explicitReceiptPath, receiptDirs: opts.receiptDirs, env })) {
+    return { found: false, searchedLocations }
+  }
+
   // Authoritative host root-only steward receipt directory (in-repo .github/steward-receipts/ is intentionally excluded!)
-  const hostCandidate = path.join(DEFAULT_HOST_STEWARD_RECEIPT_DIR, `${sha}.json`)
+  const hostReceiptDir = env.OC_GOVERNOR_ROOT?.trim()
+    ? path.join(path.resolve(env.OC_GOVERNOR_ROOT.trim()), 'steward-receipts')
+    : DEFAULT_HOST_STEWARD_RECEIPT_DIR
+  const hostCandidate = path.join(hostReceiptDir, `${sha}.json`)
   const hostRes = tryReadTrustedJsonFile(hostCandidate, hostCandidate, 'host-file')
   if (hostRes) return hostRes
 
@@ -644,6 +650,103 @@ export function findStewardReceiptForCommit(opts: {
   }
 
   return { found: false, searchedLocations }
+}
+
+function usesDefaultHostStewardDir(opts: {
+  explicitReceiptPath?: string
+  receiptDirs?: readonly string[]
+  env: NodeJS.ProcessEnv
+}): boolean {
+  if (opts.explicitReceiptPath) return false
+  if (opts.receiptDirs && opts.receiptDirs.length > 0) return false
+  if (opts.env.OC_STEWARD_RECEIPT_DIR?.trim()) return false
+  return true
+}
+
+export interface StewardHmacKeyState {
+  hmacKey?: string
+  /** True whenever an HMAC key is configured or exists on disk (prevents sha256 downgrade even if non-root gets EACCES). */
+  requireHmac: boolean
+  source?: 'env' | 'file' | 'host-default'
+}
+
+function canonicalizePath(p: string): string {
+  try {
+    return realpathSync(p)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return path.resolve(p)
+    throw err
+  }
+}
+
+function targetsHostGovRoot(opts: {
+  root?: string
+  explicitReceiptPath?: string
+  receiptDirs?: readonly string[]
+  env: NodeJS.ProcessEnv
+  govRoot: string
+}): boolean {
+  if (usesDefaultHostStewardDir(opts)) return true
+  const baseRoot = opts.root ?? process.cwd()
+  const realGovRoot = canonicalizePath(opts.govRoot)
+  const paths: string[] = []
+  if (opts.explicitReceiptPath) paths.push(canonicalizePath(path.resolve(baseRoot, opts.explicitReceiptPath)))
+  for (const d of opts.receiptDirs ?? []) paths.push(canonicalizePath(path.resolve(baseRoot, d)))
+  if (opts.env.OC_STEWARD_RECEIPT_DIR?.trim()) {
+    paths.push(canonicalizePath(path.resolve(opts.env.OC_STEWARD_RECEIPT_DIR.trim())))
+  }
+  return paths.some((p) => isPathInsideDir(p, realGovRoot))
+}
+
+/** Single source of truth for Steward HMAC key resolution across CLI, wrapper, and train gates. */
+export function resolveStewardHmacKeyState(opts: {
+  hmacKeyEnv: string
+  hmacKeyFile?: string
+  requireRootOwner: boolean
+  allowHostDefault: boolean
+  root?: string
+  explicitReceiptPath?: string
+  receiptDirs?: readonly string[]
+  env?: NodeJS.ProcessEnv
+  isRoot?: boolean
+  loadKeyFile?: (keyFilePath: string, requireRootOwner: boolean) => HmacKeyLoadResult
+}): StewardHmacKeyState {
+  const env = opts.env ?? process.env
+  const loadKeyFile = opts.loadKeyFile ?? readValidatedHmacKeyFile
+  const fromEnv = env[opts.hmacKeyEnv]?.trim()
+  if (fromEnv) return { hmacKey: fromEnv, requireHmac: true, source: 'env' }
+
+  if (opts.hmacKeyFile) {
+    const keyRes = loadKeyFile(opts.hmacKeyFile, opts.requireRootOwner)
+    if (!keyRes.present) throw new Error(`HMAC key file not found: ${opts.hmacKeyFile}`)
+    if (!keyRes.ok) throw new Error(keyRes.reason)
+    return { hmacKey: keyRes.key, requireHmac: true, source: 'file' }
+  }
+
+  const govRoot = path.resolve(env.OC_GOVERNOR_ROOT?.trim() || '/opt/openclaude/harness-gate')
+  if (
+    !opts.allowHostDefault ||
+    !targetsHostGovRoot({
+      root: opts.root,
+      explicitReceiptPath: opts.explicitReceiptPath,
+      receiptDirs: opts.receiptDirs,
+      env,
+      govRoot,
+    })
+  ) {
+    return { requireHmac: false }
+  }
+
+  const candidate = path.join(govRoot, 'control', '.hmac-key')
+  const keyRes = loadKeyFile(candidate, opts.requireRootOwner)
+  if (!keyRes.present) return { requireHmac: false }
+  if (keyRes.ok) return { hmacKey: keyRes.key, requireHmac: true, source: 'host-default' }
+
+  const isRoot = opts.isRoot ?? (typeof process.getuid === 'function' && process.getuid() === 0)
+  if (!isRoot && /failed to read HMAC key file .*(?:EACCES|EPERM)/i.test(keyRes.reason)) {
+    return { hmacKey: undefined, requireHmac: true, source: 'host-default' }
+  }
+  throw new Error(keyRes.reason)
 }
 
 // ── Human-readable formatters ──────────────────────────────────────────────────

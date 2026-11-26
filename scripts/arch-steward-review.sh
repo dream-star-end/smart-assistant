@@ -32,7 +32,8 @@ die() { echo "✗ [arch-steward-review] $*" >&2; exit 2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DEFAULT_HOST_RECEIPT_DIR="/opt/openclaude/harness-gate/steward-receipts"
+GOV_ROOT="${OC_GOVERNOR_ROOT:-/opt/openclaude/harness-gate}"
+DEFAULT_HOST_RECEIPT_DIR="${GOV_ROOT}/steward-receipts"
 
 root=""
 base_ref=""
@@ -40,6 +41,7 @@ head_ref="HEAD"
 author_model="${OC_AUTHOR_MODEL:-}"
 steward_model="${OC_STEWARD_MODEL:-}"
 out_path=""
+hmac_key_file=""
 channel="auto"
 dry_run=0
 print_prompt=0
@@ -55,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --author-model) author_model="${2:-}"; shift 2 ;;
     --steward-model) steward_model="${2:-}"; shift 2 ;;
     --out) out_path="${2:-}"; shift 2 ;;
+    --hmac-key-file) hmac_key_file="${2:-}"; shift 2 ;;
     --channel) channel="${2:-}"; shift 2 ;;
     --publish-github-status) publish_gh=1; shift ;;
     --github-repo) gh_repo="${2:-}"; shift 2 ;;
@@ -355,26 +358,53 @@ node -e '
 ' "$tmp_raw" "$head_sha" "$base_sha" "$author_model" "$author_family" "$steward_model" "$steward_family" "$triggers_json" "$job_id" "$session_key" "$now_iso" "$effective_channel" "$invoked_cmd" > "$tmp_unsigned"
 
 mkdir -p "$(dirname "$out_path")"
-run_tsx "$AUDIT_SCRIPT" --sign-receipt "$tmp_unsigned" --out "$out_path"
-chmod 0644 "$out_path" 2>/dev/null || true
-echo "[arch-steward-review] Production receipt written: $out_path"
+effective_hmac_key_file="$hmac_key_file"
+if [[ -z "$effective_hmac_key_file" && -z "${OC_STEWARD_HMAC_KEY:-}" ]]; then
+  host_hmac_match="$(node -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const canon = (p) => { try { return fs.realpathSync(p); } catch (e) { if (e && e.code === "ENOENT") return path.resolve(p); throw e; } };
+    const outDir = canon(path.dirname(path.resolve(process.argv[1])));
+    const govRoot = canon(path.resolve(process.argv[2]));
+    const rel = path.relative(govRoot, outDir);
+    const inside = rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+    process.stdout.write(inside ? path.join(govRoot, "control", ".hmac-key") : "");
+  ' "$out_path" "$GOV_ROOT")"
+  if [[ -n "$host_hmac_match" && ( -e "$host_hmac_match" || -L "$host_hmac_match" ) ]]; then
+    effective_hmac_key_file="$host_hmac_match"
+  fi
+fi
 
-# 7. Mechanically enforce the produced receipt and (if --publish-github-status) publish atomic approve/veto status!
+hmac_args=()
+if [[ -n "$effective_hmac_key_file" ]]; then
+  hmac_args+=(--hmac-key-file "$effective_hmac_key_file")
+fi
+if [[ "$unsafe_test_skip_owner" == 1 || "${OC_STEWARD_UNSAFE_TEST_SKIP_OWNER:-0}" == 1 ]]; then
+  hmac_args+=(--unsafe-test-skip-owner)
+fi
+
+tmp_signed="${out_path}.tmp.$$"
+trap 'rm -f "$tmp_raw" "$tmp_unsigned" "$tmp_signed"' EXIT
+run_tsx "$AUDIT_SCRIPT" --sign-receipt "$tmp_unsigned" --out "$tmp_signed" "${hmac_args[@]}"
+chmod 0644 "$tmp_signed" 2>/dev/null || true
+
+# 7. Mechanically enforce the produced receipt BEFORE atomically installing it, and (if --publish-github-status) publish atomic approve/veto status!
 # B3: On VETO or enforcement failure, publish `state=failure` (`verdict=veto`) to `oc-v5/arch-steward` BEFORE exiting 1
 # so any earlier approve status on the same SHA is immediately superseded across CI and host channels.
-enforce_args=(--enforce-commit --root "$root" --base "$base_sha" --head "$head_sha" --receipt "$out_path")
-if [[ "$unsafe_test_skip_owner" == 1 || "${OC_STEWARD_UNSAFE_TEST_SKIP_OWNER:-0}" == 1 ]]; then
-  enforce_args+=(--unsafe-test-skip-owner)
-fi
+enforce_args=(--enforce-commit --root "$root" --base "$base_sha" --head "$head_sha" --receipt "$tmp_signed" "${hmac_args[@]}")
 enforce_rc=0
 run_tsx "$AUDIT_SCRIPT" "${enforce_args[@]}" || enforce_rc=$?
+receipt_meta="$(node -e 'const d = JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")); const dg = String(d.receiptDigest || ""); const [a, h] = dg.split(":"); console.log([String(d.verdict || "veto"), `${a}:${(h || "").slice(0, 16)}`].join("\t"));' "$tmp_signed")"
+IFS=$'\t' read -r receipt_verdict digest_short <<<"$receipt_meta"
+if [[ "$enforce_rc" == 0 || "$receipt_verdict" == "veto" ]]; then
+  mv -f "$tmp_signed" "$out_path"
+  echo "[arch-steward-review] Production receipt written: $out_path"
+fi
 
 if [[ "$publish_gh" == 1 ]]; then
   resolved_repo="$(resolve_github_repo_slug "$gh_repo")"
   [[ -n "$resolved_repo" ]] || die "--publish-github-status 需要 --github-repo <owner/repo>（或 GITHUB_REPOSITORY / GH_REPO）"
   command -v gh >/dev/null 2>&1 || die "--publish-github-status 需要 PATH 中可用的 gh CLI"
-  receipt_meta="$(node -e 'const d = JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")); const dg = String(d.receiptDigest || ""); const [a, h] = dg.split(":"); console.log([String(d.verdict || "veto"), `${a}:${(h || "").slice(0, 16)}`].join("\t"));' "$out_path")"
-  IFS=$'\t' read -r receipt_verdict digest_short <<<"$receipt_meta"
   if [[ "$enforce_rc" == 0 && "$receipt_verdict" == "approve" ]]; then
     gh_state="success"
     gh_verdict="approve"

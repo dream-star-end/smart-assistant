@@ -297,6 +297,7 @@ WHITELIST_EXACT = {
 }
 WHITELIST_PREFIXES = (
     "scripts/lib/",
+    "scripts/arch-measure/",
     "packages/commercial/scripts/",
     "packages/protocol/src/",
     ".github/scripts/",
@@ -349,6 +350,7 @@ else
       cp -a "$f" "$STAGING_DIR/scripts/"
     done
     copy_rel_path "scripts/lib"
+    copy_rel_path "scripts/arch-measure"
   fi
 
   # 2. Package-level lint/gate scripts, .github/scripts helpers, & protocol definitions imported by gates

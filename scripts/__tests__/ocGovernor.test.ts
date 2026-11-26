@@ -725,9 +725,11 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       const govRoot = path.join(tmp, 'harness-gate')
 
       mkdirSync(path.join(fakeRel, 'scripts/lib'), { recursive: true })
+      mkdirSync(path.join(fakeRel, 'scripts/arch-measure'), { recursive: true })
       mkdirSync(path.join(fakeRel, 'arch'), { recursive: true })
       mkdirSync(path.join(fakeRel, '.github'), { recursive: true })
       writeFileSync(path.join(fakeRel, 'scripts/check-architecture.ts'), '// gate v1\n')
+      writeFileSync(path.join(fakeRel, 'scripts/arch-measure/lib.mjs'), 'export function scc() { return [] }\n')
       writeFileSync(path.join(fakeRel, 'scripts/check-v5-fix-trailers.sh'), '#!/usr/bin/env bash\necho ok\n')
       chmodSync(path.join(fakeRel, 'scripts/check-v5-fix-trailers.sh'), 0o755)
       writeFileSync(path.join(fakeRel, 'arch/modules.json'), '{"schema":1,"modules":{}}\n')
@@ -758,6 +760,10 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       assert.equal(
         manifest1.files['scripts/check-architecture.ts'],
         createHash('sha256').update('// gate v1\n', 'utf8').digest('hex'),
+      )
+      assert.equal(
+        manifest1.files['scripts/arch-measure/lib.mjs'],
+        createHash('sha256').update('export function scc() { return [] }\n', 'utf8').digest('hex'),
       )
 
       // Verify synced files are read-only (no write bits)
@@ -802,10 +808,12 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
 
       // Build a REAL Git repo so --stage-audited exports strictly via `git archive $targetSha`
       mkdirSync(path.join(candidateSrc, 'scripts/lib'), { recursive: true })
+      mkdirSync(path.join(candidateSrc, 'scripts/arch-measure'), { recursive: true })
       mkdirSync(path.join(candidateSrc, 'packages/commercial/scripts'), { recursive: true })
       mkdirSync(path.join(candidateSrc, 'packages/protocol/src'), { recursive: true })
       mkdirSync(path.join(candidateSrc, '.github/scripts'), { recursive: true })
       writeFileSync(path.join(candidateSrc, 'scripts/check-a0-monotonic.ts'), '// audited gate v1\n')
+      writeFileSync(path.join(candidateSrc, 'scripts/arch-measure/lib.mjs'), 'export function scc() { return [] }\n')
       writeFileSync(path.join(candidateSrc, 'packages/commercial/scripts/lint-demo.ts'), '// lint\n')
       writeFileSync(path.join(candidateSrc, 'packages/protocol/src/httpContracts.ts'), '// contracts\n')
       writeFileSync(path.join(candidateSrc, '.github/scripts/integ-shard-budget.ts'), '// budget\n')
@@ -953,6 +961,7 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       assert.equal(manifest.targetSha, targetSha)
       assert.equal(manifest.treeSha, transition.treeSha)
       assert.ok(manifest.files['TRANSITION_APPROVAL.json'])
+      assert.ok(manifest.files['scripts/arch-measure/lib.mjs'])
       assert.ok(manifest.files['.github/scripts/integ-shard-budget.ts'])
       assert.ok(manifest.files['packages/protocol/src/httpContracts.ts'])
       assert.ok(existsSync(path.join(refereeDir, 'node_modules/tsx/index.js')))
