@@ -150,7 +150,7 @@ function initTempGitRepo(): {
   )
   write(
     'packages/commercial/src/ws/userChatBridge.ts',
-    Array.from({ length: 40 }, (_, i) => `export const line${i} = ${i}`).join('\n') + '\n',
+    `${Array.from({ length: 40 }, (_, i) => `export const line${i} = ${i}`).join('\n')}\n`,
   )
   write('scripts/check-sample-gate.ts', 'export const target = "packages/web-react/src/components/Widget.tsx"\n')
   commit('chore(v5): seed baseline repo')

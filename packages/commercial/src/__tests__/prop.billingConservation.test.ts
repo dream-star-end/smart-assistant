@@ -46,7 +46,12 @@ const TEST_PRICING: ModelPricing = {
   cache_read_per_mtok: 30_000n,
   cache_write_per_mtok: 375_000n,
   multiplier: '1.000',
-  active: true,
+  enabled: true,
+  sort_order: 0,
+  visibility: 'public',
+  extra_system_prompt: null,
+  default_effort: null,
+  updated_at: new Date('2026-11-26T00:00:00Z'),
 }
 
 const NOOP_LOGGER: Logger = {
@@ -544,7 +549,7 @@ class InMemoryBillingPool {
       j.ledgerId = params[2] ? BigInt(String(params[2])) : null
       j.usageId = BigInt(String(params[3]))
       j.failureCode = null
-      delete j.ctx.settlementClaimId
+      j.ctx.settlementClaimId = undefined
       return ok([], 1)
     }
     if (sql.startsWith("UPDATE request_finalize_journal SET state='aborted'")) {
@@ -561,7 +566,7 @@ class InMemoryBillingPool {
       j.state = 'aborted'
       j.finalCredits = 0n
       j.failureCode = failureCode
-      delete j.ctx.settlementClaimId
+      j.ctx.settlementClaimId = undefined
       return ok([], 1)
     }
 
@@ -931,7 +936,6 @@ describe('Property: 4-pool billing ledger conservation & idempotency', () => {
         const reservation: ReservationHandle = {
           userId: r.userId.toString(),
           requestId: reqId,
-          credits: 100n,
         }
         const fin = makeFinalizer(
           { pgPool: r.pg, preCheckRedis: NOOP_REDIS, scheduler: NOOP_SCHEDULER },
@@ -1010,7 +1014,7 @@ describe('Property: 4-pool billing ledger conservation & idempotency', () => {
               model: TEST_PRICING.model_id,
               pricing: TEST_PRICING,
               precheckCredits: 100n,
-              preCheckReservation: { userId: r.userId.toString(), requestId: reqId, credits: 100n },
+              preCheckReservation: { userId: r.userId.toString(), requestId: reqId },
               log: NOOP_LOGGER,
               sessionId: 'sess-pbt',
             },

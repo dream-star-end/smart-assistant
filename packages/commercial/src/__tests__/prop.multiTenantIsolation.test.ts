@@ -373,10 +373,11 @@ describe('Property: Multi-tenant routing, container/session isolation & SQL guar
           headers: { authorization: `Bearer ${tenantTokens.get(uid)!}` },
         } as unknown as IncomingMessage
 
-        const active = member !== undefined && member.orgActive && member.memberActive
+        const active = Boolean(member?.orgActive && member.memberActive)
         const rank: Record<OrgRole, number> = { member: 1, admin: 2, owner: 3 }
         const allowed =
           active &&
+          member !== undefined &&
           (this.minRole === 'billing'
             ? member.role === 'owner' || member.billingDelegate
             : rank[member.role] >= rank[this.minRole])

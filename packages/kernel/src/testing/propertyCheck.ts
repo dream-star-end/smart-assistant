@@ -340,9 +340,9 @@ export function oneof<const T extends readonly WeightedArbitrary<any>[]>(
           for (const candidate of entry.arbitrary.shrink(value)) {
             yield candidate
           }
-        } catch {
+        } catch (err) {
           // Variant arbitrary did not match this runtime value; skip safely.
-          continue
+          void err
         }
       }
     },
@@ -630,7 +630,14 @@ export function resolvePbtRuns(defaultRuns = DEFAULT_PBT_RUNS, rawEnv?: string):
   return parsed
 }
 
-function trySyncPredicate<T>(predicate: (value: T) => boolean | void, value: T): unknown | null {
+export type SyncPredicate<T> = ((value: T) => boolean) | ((value: T) => void)
+export type AsyncPredicate<T> =
+  | ((value: T) => Promise<boolean>)
+  | ((value: T) => Promise<void>)
+  | ((value: T) => boolean)
+  | ((value: T) => void)
+
+function trySyncPredicate<T>(predicate: SyncPredicate<T>, value: T): unknown | null {
   try {
     const result = predicate(value)
     if (result === false) {
@@ -643,7 +650,7 @@ function trySyncPredicate<T>(predicate: (value: T) => boolean | void, value: T):
 }
 
 async function tryAsyncPredicate<T>(
-  predicate: (value: T) => Promise<boolean | void> | boolean | void,
+  predicate: AsyncPredicate<T>,
   value: T,
 ): Promise<unknown | null> {
   try {
@@ -659,7 +666,7 @@ async function tryAsyncPredicate<T>(
 
 export function assertProperty<T>(
   arb: Arbitrary<T>,
-  predicate: (value: T) => boolean | void,
+  predicate: SyncPredicate<T>,
   opts: PropertyOptions = {},
 ): { seed: number; numRuns: number } {
   const numRuns = opts.numRuns ?? DEFAULT_PBT_RUNS
@@ -711,7 +718,7 @@ export function assertProperty<T>(
 
 export async function assertAsyncProperty<T>(
   arb: Arbitrary<T>,
-  predicate: (value: T) => Promise<boolean | void> | boolean | void,
+  predicate: AsyncPredicate<T>,
   opts: PropertyOptions = {},
 ): Promise<{ seed: number; numRuns: number }> {
   const numRuns = opts.numRuns ?? DEFAULT_PBT_RUNS

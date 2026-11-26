@@ -130,7 +130,7 @@ describe('Property: Journal / Tape crash truncation & out-of-order idempotent re
         // 3. Inject an uncommitted crash-truncated JSON record at the tail.
         const uncommittedLine = JSON.stringify({
           seq: committed.length + 1,
-          id: `evt-uncommitted`,
+          id: 'evt-uncommitted',
           turn: 99,
           text: 'this-write-crashed-mid-flush-without-newline',
         })
@@ -193,8 +193,8 @@ describe('Property: Journal / Tape crash truncation & out-of-order idempotent re
         const filePath = join(projectsDir, `${sid}.jsonl`)
         const scope = { projectsDir, sessionId: sid }
 
-        const initialText = s.initialLines.map((l) => JSON.stringify({ phase: 'init', l })).join('\n') + '\n'
-        const appendText = s.appendLines.map((l) => JSON.stringify({ phase: 'append', l })).join('\n') + '\n'
+        const initialText = `${s.initialLines.map((l) => JSON.stringify({ phase: 'init', l })).join('\n')}\n`
+        const appendText = `${s.appendLines.map((l) => JSON.stringify({ phase: 'append', l })).join('\n')}\n`
         await appendSessionFile(filePath, initialText, scope)
 
         // Simulate a crash right after intent.json + blobs were fsynced and target was partially written.
