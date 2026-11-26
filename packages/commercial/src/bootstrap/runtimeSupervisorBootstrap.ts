@@ -489,6 +489,7 @@ export function assembleV3SupervisorCore(deps: {
       deps.modelAuthoritySigner !== undefined &&
       deps.modelAuthorityProvisionRequired,
     env: deps.env,
+    egressSecret: deps.cfg.OC_EGRESS_SECRET,
     ...(deps.modelAuthoritySigner && deps.modelCatalogCache
       ? {
           financeFactory: (_binding, lane) =>

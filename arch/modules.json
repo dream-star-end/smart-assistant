@@ -903,6 +903,48 @@
     "egress"
    ]
   },
+  "remote-relay-protocol": {
+   "layer": "L1",
+   "match": [
+    "packages/commercial/src/remoteRelay/protocol.ts"
+   ],
+   "scope": [
+    "master",
+    "remote-relay"
+   ],
+   "authorities": [
+    "crypto"
+   ],
+   "note": "Shared AF_UNIX RPC protocol, error codec, and constant-time secret helper for master and standalone remote-relay daemon"
+  },
+  "remote-relay-client": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/agent-sandbox/remoteRelayClient.ts"
+   ],
+   "scope": [
+    "master"
+   ],
+   "authorities": [
+    "net"
+   ],
+   "note": "AF_UNIX HTTP RPC client for standalone remote-relay daemon (imported by L4 app-container and L6 remote-relay)"
+  },
+  "remote-relay": {
+   "layer": "L6",
+   "match": [
+    "packages/commercial/src/remoteRelay/**"
+   ],
+   "scope": [
+    "remote-relay"
+   ],
+   "authorities": [
+    "env",
+    "net",
+    "crypto"
+   ],
+   "note": "Standalone blue-green remote-relay daemon entrypoint and AF_UNIX RPC server"
+  },
   "gateway-shell": {
    "layer": "L6",
    "match": [

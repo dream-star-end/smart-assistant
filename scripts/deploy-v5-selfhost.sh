@@ -86,17 +86,8 @@ CATALOG_ADMIN_ROLE="${PG_ROLE}_catalog_admin"
 # NOLOGIN deploy role. The catalog admin role is read-only on deploy_state.
 MODEL_AUTHORITY_DEPLOY_ROLE="${PG_ROLE}_model_deploy"
 REDIS_URL="redis://127.0.0.1:6379/3"
-# Runtime image pin. Rebuild with:
-#   OC_FLAVOR=selfhost OC_RUNTIME_SOURCE_COMMIT=$(git rev-parse HEAD) \
-#     packages/commercial/agent-sandbox/build-image.sh v5-cli-cc2302-codex01630-grok1062-zcode3153-agy140-slim
-# which sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1, OC_INCLUDE_ANTIGRAVITY=1).
-# cc2280 = official Claude Code 2.1.280 (recognizes claude-opus-5-5). The
-# previous tag stays on the 2.1.278 image so a tuple flip can roll back.
-# agy134 (OCV5-415) = patch of the v5-cli-cc2280-codex01592-grok1013-zcode381-slim image that adds the official
-# Antigravity CLI 1.3.4 (same RUN block as Dockerfile.openclaude-runtime, sha512-pinned);
-# the previous tag stays for rollback.
-# cc2325/codex01710/grok1077/zcode3153/agy1515-chrome-octave (OCV5-880) = OCV5-860 CLI + Chrome 158 stack +
-# GNU Octave 7.3 with gnuplot-nox and core Forge packages (control/image/optim/signal/statistics); previous agy1515-chrome-slim tag stays for rollback.
+# Runtime image pin (OCV5-880: OCV5-860 CLI + Chrome 158 + GNU Octave 7.3; rebuild via
+# OC_FLAVOR=selfhost packages/commercial/agent-sandbox/build-image.sh; previous tag kept for rollback).
 RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2325-codex01710-grok1077-zcode3153-agy1515-chrome-octave-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
@@ -139,21 +130,15 @@ CUTOVER_ROLLBACK=0
 ROLLBACK_SHA=""
 ROLLBACK_FROM=""
 ROLLBACK_ORIG_PREV=""
-# Lease Center(OCV5-131):worker 发车时传 --lease-train=<tr-*> --target-sha=<sha>;
-# 人工直跑 --deploy 时脚本自己登记一条 manual train,让 worker 能对账、不会在同一窗口再发一班。
+# Lease Center(OCV5-131):worker 发车传 --lease-train/--target-sha;人工直跑登记 manual train。
 LEASE_TRAIN_ID=""
 LEASE_TARGET_SHA=""
 RELEASE_POLICY_RESUME=0
 RELEASE_POLICY_SAMPLER_RESTORE=0
 LEASE_LIB="$SCRIPT_DIR/v5-lease-lib.sh"
-# Incident trailer 发布前快检(2026-09-09):selfhost 此前从不跑 trailer 门,坏 trailer 一律
-# 上线后才被 CI 发现,已上线源提交不可 amend,只能一次次冻结 tip(已冻 18 条)。这里在构建
-# 三面制品之前 fail-closed;规则与 check-v5-incident-regressions.ts 逐条对齐(有单测交叉对拍)。
-# 豁免只给真·止血:OC_V5_SKIP_TRAILER_GATE=1(会打 ⚠ 并写进 deploy 日志,不静默)。
+# Incident trailer 发布前快检(fail-closed;止血豁免 OC_V5_SKIP_TRAILER_GATE=1)。
 FIX_TRAILER_GATE="$SCRIPT_DIR/check-v5-fix-trailers.sh"
-# OCV5-418 门禁失败策略(只个人版):rollback(默认)= 现有补偿;stay = 新版已切换且在跑时
-# 门禁/冒烟失败不回滚,留在新版排查(用户 2026-10-14 02:54:个人版只有本人在用)。
-# 取值顺序:环境变量 > 策略文件(KEY=VALUE 解析,不 source;须本用户所有、组/他人不可写)。
+# OCV5-418 门禁失败策略(个人版):rollback(默认)|stay,优先级 env > 策略文件。
 SELFHOST_POLICY_FILE="${OC_V5_SELFHOST_POLICY_FILE:-/etc/openclaude/selfhost-deploy-policy.env}"
 V5_WATCH_MAINT="${V5_WATCH_MAINT:-/run/openclaude-v5-selfhost/planned-maintenance}"
 CUTOVER_GATE_FAILED=""
@@ -161,19 +146,12 @@ CUTOVER_LAST_FAIL=""
 CUTOVER_KEPT_FAILED_REL=""
 CUTOVER_RECOVERY_REQUIRED=0
 
-# 本实例专属发布锁。禁止复用:
-#   /var/lock/oc-v5-deploy.lock                      V5 商业版生产(deploy-v5.sh / 发布队列 / 自愈)
-#   /run/openclaude-v5/production-mutation.lock      V5 商业版生产 mutation lease
-#   /var/lock/openclaude-v5-deploy.lock              宿主遗留(2026-07-27起),现网脚本已不引用
-#   /var/lock/openclaude-v5-production-mutation.lock 宿主遗留(2026-07-24起),现网脚本已不引用
-# 锁目录必须在 /run 下本实例专属路径: /run 为 0755 root:root,非特权用户无法在此创建/替换条目;
-# /run/lock(以及 /var/lock→/run/lock)是 1777,不能再当锁目录。/run 是 tmpfs,每次运行自愈创建。
+# 本实例专属发布锁(禁止复用商业版生产锁或 /run/lock;root 专属 /run 目录)。
 SELFHOST_DEPLOY_LOCK_DIR="/run/openclaude-v5-selfhost"
 SELFHOST_DEPLOY_LOCK="${OC_V5_SELFHOST_DEPLOY_LOCK:-${SELFHOST_DEPLOY_LOCK_DIR}/deploy.lock}"
 SELFHOST_DEPLOY_LOCK_WAIT="${OC_V5_SELFHOST_DEPLOY_LOCK_WAIT:-2400}"
 SELFHOST_DEPLOY_LOCK_POLL="${OC_V5_SELFHOST_DEPLOY_LOCK_POLL:-15}"
-# 个人版 PG 备份(scripts/v5-selfhost-pg-backup.sh)整次运行共享持锁(OCV5-600),每周全量可超过
-# 一小时。持锁者是活着的备份时,等待不计入上面的超时,改按这个上限排队。
+# PG 备份(OCV5-600)持锁等待上限。
 SELFHOST_DEPLOY_LOCK_BACKUP_WAIT="${OC_V5_SELFHOST_DEPLOY_LOCK_BACKUP_WAIT:-14400}"
 SELFHOST_DEPLOY_LOCK_HOLDER=""
 SELFHOST_DEPLOY_LOCK_HOLDER_OWNED=0
@@ -187,6 +165,7 @@ die() {
 # shellcheck disable=SC1091
 source "$MASTER_RELEASE_LIB"
 source "$SCRIPT_DIR/v5-selfhost-dual-slot-lib.sh"       # OCV5-854: dual-slot master + tiered idle gate
+source "$SCRIPT_DIR/v5-selfhost-remote-relay-lib.sh"    # OCV5-855: blue-green remote-relay
 source "$SCRIPT_DIR/lib/v5-selfhost-prewarm.sh"
 source "$SCRIPT_DIR/lib/v5-selfhost-runtime-build.sh"
 # shellcheck source=lib/v5-selfhost-env.sh
@@ -205,8 +184,7 @@ WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-
 source "$SCRIPT_DIR/v5-web-overlay-lib.sh"
 # shellcheck source=scripts/v5-selfhost-p0-web-lib.sh
 source "$SCRIPT_DIR/v5-selfhost-p0-web-lib.sh"
-# /assets 资产池(OCV5-633,X-P1-1):master 在 spa 模式 /assets 未命中 webRoot 时回落 <pool>/assets
-# (网关侧 PR-a #1146)。--deploy 切流前播种 live 资产,cutover 收尾按保护集 GC,--smoke 验回落面。
+# /assets 资产池(OCV5-633):spa 模式未命中 webRoot 时回落 <pool>/assets。
 WEB_ASSETS_POOL="${OC_V5_WEB_ASSETS_POOL:-/opt/openclaude/openclaude-v5-selfhost-assets}"
 # shellcheck source=scripts/v5-web-assets-pool-lib.sh
 source "$SCRIPT_DIR/v5-web-assets-pool-lib.sh"
@@ -1378,6 +1356,7 @@ install_units() {
   install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
   install_unit "$UNIT_DIR/$V5_EGRESS_UNIT"
   install_egress_slot_units_from "$UNIT_DIR" || [[ $? == 2 ]] || die "安装双槽 egress unit 失败"
+  install_remote_relay_slot_unit_from "$UNIT_DIR" || [[ $? == 2 ]] || die "安装双槽 remote-relay unit 失败"
   install_unit "$UNIT_DIR/$V5_UNIT"
   install_unit "$UNIT_DIR/$V5_TUNNEL_UNIT"
   run "systemctl daemon-reload"
@@ -1828,10 +1807,13 @@ egress_assert_no_orphan_listener() {
 }
 
 egress_slot_flip_then_master_restart() {
-  # The generic saga still calls restart after an extra-revert error. Fail closed
-  # here, before either service effect, unless the two-key receipt proves safety.
+  # Fail closed before any service effect unless the two-key receipt proves safety.
   cc5_activation_restart_guard || return "$?"
-  egress_slot_flip && selfhost_master_restart_or_flip
+  if declare -F selfhost_flip_egress_relay_and_master >/dev/null 2>&1; then
+    selfhost_flip_egress_relay_and_master
+  else
+    egress_slot_flip && selfhost_master_restart_or_flip
+  fi
 }
 
 # 当前对外服务的 egress 描述(status / 日志用)。
@@ -2975,6 +2957,19 @@ cmd_cutover() {
       2) cutover_clog "  · 候选无双槽 egress 模板,翻转后走 legacy 单 unit" ;;
       *) cutover_compensate "install-egress-slot-units"; return $? ;;
     esac
+    if declare -F install_remote_relay_slot_unit_from >/dev/null 2>&1; then
+      local rr_rc=0; install_remote_relay_slot_unit_from "$unit_snap" || rr_rc=$?
+      case "$rr_rc" in
+        0) cutover_clog "  ✓ 双槽 remote-relay 模板已装" ;;
+        2)
+          if [[ -f "$rel/deploy/v5-selfhost/${V5_REMOTE_RELAY_SLOT_TPL:-openclaude-v5-selfhost-remote-relay@.service}" ]]; then
+            cutover_clog "  ✗ 候选源含 remote-relay 模板但快照缺失，拒绝跳过"
+            cutover_compensate "missing-remote-relay-unit-in-snap"; return $?
+          fi
+          cutover_clog "  · 候选无 remote-relay 模板,跳过" ;;
+        *) cutover_compensate "install-remote-relay-unit"; return $? ;;
+      esac
+    fi
     cutover_persist_phase_or_compensate "units-partial" "units-partial" || return $?
     release_policy_guard_owner || return 86
     if ! install_unit "$unit_snap/$V5_UNIT"; then cutover_compensate "install-master-unit"; return $?; fi
@@ -3138,11 +3133,7 @@ cmd_cutover() {
   if [[ "${SELFHOST_SPLIT_PREPARED:-0}" == 1 ]]; then
     selfhost_prepared_complete "$head" "$rel" || cutover_clog "  ⚠ prepared receipt cleanup deferred"
   fi
-  # 收尾 GC(镜像 deploy-v5.sh gc_releases/oc_hotcfg_gc 同款:仅告警,不回滚)。
-  # master release:引用感知 v5-release-gc.sh,keep 3(OCV5-376:当前 + 上一个 + 一个回滚点;根盘曾 96%,
-  # <8GiB 时发布拒绝构建);live/.prev-release/unit cwd/
-  # 容器 baseline bind 全在保护集,校验失败 rc=75 整轮安全跳过零删除。
-  # runtime tuple:oc_hotcfg_gc,history 最近 N 条 committed + env tuple + 容器 label 保护。
+  # 收尾 GC(仅告警,不回滚):master keep 3(OCV5-376) + runtime/overlay/assets 保护集 GC。
   selfhost_prepared_gc bash "$SCRIPT_DIR/v5-release-gc.sh" \
     "$MASTER_RELEASES_ROOT" 3 \
     "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" \

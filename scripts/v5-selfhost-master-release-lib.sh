@@ -2292,12 +2292,12 @@ backup_installed_units_for_cutover() { # <out-var>
   mkdir -p -- "$dest" || return 1
   cp -a -- "${sysdir}/${V5_UNIT}" "$dest/" || return 1
   cp -a -- "${sysdir}/${V5_EGRESS_UNIT}" "$dest/" || return 1
-  # 双槽 egress 模板(已装才备;forensics 用,恢复脚本不依赖它们)。
+  # 双槽 egress + remote-relay 模板(已装才备;forensics 用,恢复脚本可按需消费)。
   local sf
-  for sf in "${V5_EGRESS_SLOT_SOCKET_TPL:-openclaude-v5-selfhost-egress@.socket}" \
-            "${V5_EGRESS_SLOT_SERVICE_TPL:-openclaude-v5-selfhost-egress@.service}"; do
+  for sf in "${V5_EGRESS_SLOT_SOCKET_TPL:-openclaude-v5-selfhost-egress@.socket}" "${V5_EGRESS_SLOT_SERVICE_TPL:-openclaude-v5-selfhost-egress@.service}" \
+            "${V5_REMOTE_RELAY_SLOT_TPL:-openclaude-v5-selfhost-remote-relay@.service}"; do
     if [[ -f "${sysdir}/$sf" ]]; then
-      cp -a -- "${sysdir}/$sf" "$dest/" || return 1
+      cp -a -- "${sysdir}/$sf" "$dest/" && fsync_path "$dest/$sf" || return 1
     fi
   done
   if [[ -n "${UNIT_DIR:-}" && -f "${UNIT_DIR}/${V5_UNIT}" ]]; then

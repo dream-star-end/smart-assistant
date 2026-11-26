@@ -21,6 +21,12 @@
 [[ -n "${__OC_SELFHOST_DUAL_SLOT_LIB_LOADED:-}" ]] && return 0
 __OC_SELFHOST_DUAL_SLOT_LIB_LOADED=1
 
+_SELFHOST_DS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${_SELFHOST_DS_LIB_DIR}/v5-selfhost-remote-relay-lib.sh" ]]; then
+  # shellcheck source=scripts/v5-selfhost-remote-relay-lib.sh
+  source "${_SELFHOST_DS_LIB_DIR}/v5-selfhost-remote-relay-lib.sh"
+fi
+
 V5_FRONTDOOR_UNIT="${V5_FRONTDOOR_UNIT:-openclaude-v5-selfhost-frontdoor.service}"
 V5_MASTER_SLOT_TPL="${V5_MASTER_SLOT_TPL:-openclaude-v5-selfhost@.service}"
 V5_FRONTDOOR_CONTROL_SOCKET="${OC_FRONTDOOR_CONTROL_SOCKET:-/run/openclaude-v5-selfhost/frontdoor.sock}"
@@ -369,6 +375,10 @@ render_selfhost_master_slot_unit() {
 [Unit]
 # OCV5-854: V5 selfhost blue-green Master slot (%i = A|B).
 # WorkingDirectory points to immutable slot symlink (never the git worktree).
+# N1: NEVER add After=openclaude-v5-selfhost-remote-relay@{A,B}.service here:
+# systemd job_compare() would block candidate Master start on an outgoing relay slot's
+# stop/retirement lifecycle. Cold-boot safety is enforced by persisted remote-relay-state.json
+# + Master anti-split-brain external routing + active slot symlink auto-recovery.
 Description=OpenClaude Gateway (v5 selfhost, slot %i)
 After=network.target postgresql.service redis-server.service docker.service openclaude.service openclaude-v5-selfhost-boot-guard.service
 Wants=postgresql.service redis-server.service docker.service openclaude-v5-selfhost-boot-guard.service
@@ -583,14 +593,18 @@ selfhost_docker_container_running() { # <container_id_or_name>
   [[ "$out" == "true" ]]
 }
 
-# Prints: non_acc|total_acc|cand_surv_acc|remote_bind|block_journal|cand_container_refs_csv
+# Prints 9 columns (backwards-compatible with legacy 6-column test mocks):
+#   non_acc|total_acc|cand_surv_acc|rem_bind_strict|block_j_strict|cand_refs|rem_bind_v4_cand|rem_j_v4_cand|rem_v4_refs
 # Matches packages/commercial/src/ws/containerLinkEndpoint.ts:13-33:
 #   - ac.bound_ip IS NOT NULL AND host(ac.bound_ip) <> ''
 #   - ac.port IS NOT NULL AND ac.port > 0
 #   - ac.host_id IS NULL AND (ac.host_uuid IS NULL OR compute_hosts.name = 'self')
 #   - strict COALESCE(..., FALSE) IS TRUE so NULL runtime_kind never vanishes.
 selfhost_query_tiered_idle_pg() {
-  local has_rab="false" has_ac="false" has_ch="false" rab_sql="0" survivable_expr="FALSE" refs_sql="''" host_cond="ac.host_uuid IS NULL"
+  local has_rab="false" has_rab_v4="false" has_rab_proto="false" has_ac="false" has_ch="false"
+  local rem_bind_strict_sql="0" rem_bind_v4_cand_sql="0" rem_bind_v4_refs_sql="''"
+  local survivable_expr="FALSE" refs_sql="''" host_cond="ac.host_uuid IS NULL"
+  local j_v4_surv_expr="FALSE" rem_j_v4_refs_sql="''"
   has_rab="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
 SELECT (to_regclass('public.remote_agent_bindings') IS NOT NULL)::text;" 2>/dev/null || printf 'err')"
   [[ "$has_rab" == "true" || "$has_rab" == "false" ]] || return 1
@@ -601,14 +615,41 @@ SELECT (to_regclass('public.agent_containers') IS NOT NULL)::text;" 2>/dev/null 
 SELECT (to_regclass('public.compute_hosts') IS NOT NULL)::text;" 2>/dev/null || printf 'err')"
   [[ "$has_ch" == "true" || "$has_ch" == "false" ]] || return 1
   if [[ "$has_rab" == "true" ]]; then
-    rab_sql="(SELECT count(*) FROM public.remote_agent_bindings WHERE state <> 'released')"
+    has_rab_v4="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
+SELECT (
+  EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'driver_id')
+  AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'container_db_id')
+  AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'uid')
+  AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'docker_id')
+  AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'operation_id')
+  AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'generation')
+)::text;" 2>/dev/null || printf 'err')"
+    [[ "$has_rab_v4" == "true" || "$has_rab_v4" == "false" ]] || return 1
+    has_rab_proto="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
+SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'remote_agent_bindings' AND column_name = 'remote_protocol_version')::text;" 2>/dev/null || printf 'err')"
+    [[ "$has_rab_proto" == "true" || "$has_rab_proto" == "false" ]] || return 1
   fi
   if [[ "$has_ch" == "true" ]]; then
     host_cond="(ac.host_uuid IS NULL OR EXISTS (SELECT 1 FROM public.compute_hosts ch WHERE ch.id = ac.host_uuid AND ch.name = 'self'))"
   fi
   if [[ "$has_ac" == "true" ]]; then
-    survivable_expr="COALESCE(d.runtime_kind = 'docker' AND d.agent_container_id IS NOT NULL AND EXISTS (SELECT 1 FROM public.agent_containers ac WHERE ac.id = d.agent_container_id AND ac.user_id = d.user_id AND ac.state = 'active' AND ac.runtime_channel = 'v5' AND ac.runtime_kind = 'docker' AND ac.host_id IS NULL AND ${host_cond} AND ac.bound_ip IS NOT NULL AND host(ac.bound_ip) <> '' AND ac.port IS NOT NULL AND ac.port > 0 AND COALESCE(NULLIF(ac.container_internal_id, ''), NULLIF(ac.docker_id, '')) IS NOT NULL), FALSE)"
+    local local_ac_cond="ac.state = 'active' AND ac.runtime_channel = 'v5' AND ac.runtime_kind = 'docker' AND ac.host_id IS NULL AND ${host_cond} AND ac.bound_ip IS NOT NULL AND host(ac.bound_ip) <> '' AND ac.port IS NOT NULL AND ac.port > 0 AND COALESCE(NULLIF(ac.container_internal_id, ''), NULLIF(ac.docker_id, '')) IS NOT NULL"
+    survivable_expr="COALESCE(d.runtime_kind = 'docker' AND d.agent_container_id IS NOT NULL AND EXISTS (SELECT 1 FROM public.agent_containers ac WHERE ac.id = d.agent_container_id AND ac.user_id = d.user_id AND ${local_ac_cond}), FALSE)"
     refs_sql="COALESCE((SELECT string_agg(COALESCE(NULLIF(ac.container_internal_id, ''), NULLIF(ac.docker_id, '')), ',') FROM turn_dispatches d JOIN public.agent_containers ac ON ac.id = d.agent_container_id WHERE d.status = 'accepted' AND (${survivable_expr}) IS TRUE), '')"
+    if [[ "$has_rab" == "true" && "$has_rab_v4" == "true" ]]; then
+      local proto_cond="FALSE"
+      [[ "$has_rab_proto" == "true" ]] && proto_cond="b.remote_protocol_version = 4"
+      local b_v4_surv_expr="COALESCE(b.driver_id IS NOT NULL AND ${proto_cond} AND b.container_db_id IS NOT NULL AND EXISTS (SELECT 1 FROM public.agent_containers ac WHERE ac.id = b.container_db_id AND ac.user_id = b.uid AND ${local_ac_cond} AND b.docker_id = COALESCE(NULLIF(ac.docker_id, ''), NULLIF(ac.container_internal_id, ''))), FALSE)"
+      rem_bind_v4_cand_sql="(SELECT count(*) FROM public.remote_agent_bindings b WHERE b.state <> 'released' AND (${b_v4_surv_expr}) IS TRUE)"
+      rem_bind_strict_sql="(SELECT count(*) FROM public.remote_agent_bindings b WHERE b.state <> 'released' AND NOT ((${b_v4_surv_expr}) IS TRUE))"
+      rem_bind_v4_refs_sql="COALESCE((SELECT string_agg(COALESCE(NULLIF(ac.container_internal_id, ''), NULLIF(ac.docker_id, '')), ',') FROM public.remote_agent_bindings b JOIN public.agent_containers ac ON ac.id = b.container_db_id AND ac.user_id = b.uid WHERE b.state <> 'released' AND (${b_v4_surv_expr}) IS TRUE), '')"
+      j_v4_surv_expr="COALESCE(j.ctx->>'remoteNativeBillingRecovery' = 'remote-native-v4' AND j.state = 'inflight' AND NULLIF(j.ctx#>>'{remoteDriverV4,scope,operationId}', '') IS NOT NULL AND NULLIF(j.ctx#>>'{remoteDriverV4,scope,generation}', '') IS NOT NULL AND EXISTS (SELECT 1 FROM public.remote_agent_bindings b WHERE b.state <> 'released' AND b.operation_id::text = j.ctx#>>'{remoteDriverV4,scope,operationId}' AND b.generation::text = j.ctx#>>'{remoteDriverV4,scope,generation}' AND (${b_v4_surv_expr}) IS TRUE) AND EXISTS (SELECT 1 FROM turn_dispatches d WHERE d.dispatch_id = j.dispatch_id AND d.status = 'accepted' AND (${survivable_expr}) IS TRUE), FALSE)"
+      rem_j_v4_refs_sql="COALESCE((SELECT string_agg(COALESCE(NULLIF(ac.container_internal_id, ''), NULLIF(ac.docker_id, '')), ',') FROM request_finalize_journal j JOIN turn_dispatches d ON d.dispatch_id = j.dispatch_id JOIN public.agent_containers ac ON ac.id = d.agent_container_id WHERE (${j_v4_surv_expr}) IS TRUE), '')"
+    elif [[ "$has_rab" == "true" ]]; then
+      rem_bind_strict_sql="(SELECT count(*) FROM public.remote_agent_bindings WHERE state <> 'released')"
+    fi
+  elif [[ "$has_rab" == "true" ]]; then
+    rem_bind_strict_sql="(SELECT count(*) FROM public.remote_agent_bindings WHERE state <> 'released')"
   fi
   psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
 BEGIN READ ONLY;
@@ -617,29 +658,41 @@ SELECT
   (SELECT count(*) FROM turn_dispatches WHERE status IN ('admitted','rejecting')),
   (SELECT count(*) FROM turn_dispatches WHERE status = 'accepted'),
   (SELECT count(*) FROM turn_dispatches d WHERE d.status = 'accepted' AND (${survivable_expr}) IS TRUE),
-  ${rab_sql},
+  ${rem_bind_strict_sql},
   (SELECT count(*) FROM request_finalize_journal j
-    WHERE (j.ctx ? 'remoteNativeBillingRecovery' AND j.state IN ('inflight','finalizing'))
-       OR j.state = 'finalizing'
-       OR (j.state NOT IN ('aborted','committed') AND NOT EXISTS (
-            SELECT 1 FROM turn_dispatches d
-             WHERE d.dispatch_id = j.dispatch_id
-               AND ((d.status = 'terminal' AND d.terminal_at IS NOT NULL)
-                 OR (d.status = 'accepted' AND (${survivable_expr}) IS TRUE))))),
-  ${refs_sql};
+    WHERE NOT ((${j_v4_surv_expr}) IS TRUE)
+      AND ((j.ctx ? 'remoteNativeBillingRecovery' AND j.state IN ('inflight','finalizing'))
+        OR j.state = 'finalizing'
+        OR (j.state NOT IN ('aborted','committed') AND NOT EXISTS (
+             SELECT 1 FROM turn_dispatches d
+              WHERE d.dispatch_id = j.dispatch_id
+                AND ((d.status = 'terminal' AND d.terminal_at IS NOT NULL)
+                  OR (d.status = 'accepted' AND (${survivable_expr}) IS TRUE)))))),
+  ${refs_sql},
+  ${rem_bind_v4_cand_sql},
+  (SELECT count(*) FROM request_finalize_journal j WHERE (${j_v4_surv_expr}) IS TRUE),
+  concat_ws(',', NULLIF(${rem_bind_v4_refs_sql}, ''), NULLIF(${rem_j_v4_refs_sql}, ''));
 COMMIT;"
 }
 
-# Evaluates PG tiered snapshot + local Docker Running check.
-# Sets SELFHOST_PG_BLOCKING, SELFHOST_PG_VERIFIED_SURV, SELFHOST_PG_SUMMARY.
+# Evaluates PG tiered snapshot + local Docker Running check (supports both legacy 6-col & new 9-col format).
+# Sets SELFHOST_PG_BLOCKING_STRICT, SELFHOST_PG_VERIFIED_REMOTE_V4_SURV,
+# SELFHOST_PG_BLOCKING (= STRICT + VERIFIED_REMOTE_V4_SURV for fail-closed default),
+# SELFHOST_PG_VERIFIED_SURV, SELFHOST_PG_SUMMARY.
 selfhost_eval_pg_blocking_once() {
-  local row non_acc total_acc cand_surv rem_bind block_j cand_refs=""
+  local row non_acc total_acc cand_surv rem_bind_strict block_j_strict cand_refs=""
+  local rem_bind_v4_cand="" rem_j_v4_cand="" rem_v4_refs=""
   SELFHOST_PG_BLOCKING=1
+  SELFHOST_PG_BLOCKING_STRICT=1
   SELFHOST_PG_VERIFIED_SURV=0
+  SELFHOST_PG_VERIFIED_REMOTE_V4_SURV=0
   SELFHOST_PG_SUMMARY="query-error"
   if ! row="$(selfhost_query_tiered_idle_pg)"; then return 1; fi
   if [[ ! "$row" =~ ^[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+(\|.*)?$ ]]; then return 1; fi
-  IFS='|' read -r non_acc total_acc cand_surv rem_bind block_j cand_refs <<<"$row"
+  IFS='|' read -r non_acc total_acc cand_surv rem_bind_strict block_j_strict cand_refs rem_bind_v4_cand rem_j_v4_cand rem_v4_refs <<<"$row"
+  rem_bind_v4_cand="${rem_bind_v4_cand:-0}"
+  rem_j_v4_cand="${rem_j_v4_cand:-0}"
+  [[ "$rem_bind_v4_cand" =~ ^[0-9]+$ && "$rem_j_v4_cand" =~ ^[0-9]+$ ]] || return 1
 
   local verified_surv=0 dead_local=0
   if (( cand_surv > 0 )); then
@@ -663,9 +716,122 @@ selfhost_eval_pg_blocking_once() {
   fi
   local non_surv=$(( total_acc - verified_surv ))
   (( non_surv < 0 )) && non_surv=0
+
+  local rem_v4_total=$(( rem_bind_v4_cand + rem_j_v4_cand ))
+  local verified_rem_v4=0 dead_rem_v4=0
+  if (( rem_v4_total > 0 )); then
+    if [[ -z "$rem_v4_refs" ]]; then
+      dead_rem_v4="$rem_v4_total"
+    else
+      local IFS_SAVE="$IFS" rref rchecked=0
+      IFS=',' read -ra _rrefs <<<"$rem_v4_refs"
+      IFS="$IFS_SAVE"
+      for rref in "${_rrefs[@]}"; do
+        [[ -n "$rref" ]] || continue
+        rchecked=$(( rchecked + 1 ))
+        if selfhost_docker_container_running "$rref"; then
+          verified_rem_v4=$(( verified_rem_v4 + 1 ))
+        else
+          dead_rem_v4=$(( dead_rem_v4 + 1 ))
+        fi
+      done
+      (( rchecked < rem_v4_total )) && dead_rem_v4=$(( dead_rem_v4 + rem_v4_total - rchecked ))
+    fi
+  fi
+  (( verified_rem_v4 > rem_v4_total )) && verified_rem_v4="$rem_v4_total"
+
   SELFHOST_PG_VERIFIED_SURV="$verified_surv"
-  SELFHOST_PG_BLOCKING=$(( non_acc + non_surv + rem_bind + block_j ))
-  SELFHOST_PG_SUMMARY="non_acc=${non_acc} total_acc=${total_acc} verified_surv=${verified_surv} dead_docker=${dead_local} blocking_acc=${non_surv} remote_bind=${rem_bind} block_journal=${block_j}"
+  SELFHOST_PG_VERIFIED_REMOTE_V4_SURV="$verified_rem_v4"
+  SELFHOST_PG_BLOCKING_STRICT=$(( non_acc + non_surv + rem_bind_strict + block_j_strict + dead_rem_v4 ))
+  SELFHOST_PG_BLOCKING=$(( SELFHOST_PG_BLOCKING_STRICT + verified_rem_v4 ))
+  SELFHOST_PG_SUMMARY="non_acc=${non_acc} total_acc=${total_acc} verified_surv=${verified_surv} dead_docker=${dead_local} blocking_acc=${non_surv} remote_bind_strict=${rem_bind_strict} block_journal_strict=${block_j_strict} rem_v4_surv=${verified_rem_v4} rem_v4_dead=${dead_rem_v4}"
+  return 0
+}
+
+# OCV5-855: Bidirectional attestation that independent remote-relay keeps v4 alive across Master flip.
+# Returns 0 ONLY when ALL conditions hold (fail-closed otherwise):
+#   1) old_slot /internal/v5/cutover-readiness reports ok, remoteRelayExternal, remoteRelayHealthy, non-empty remoteRelayInstanceId
+#   2) cand_slot (if given) reports ok, remoteRelayExternal, remoteRelayHealthy, and EXACT same remoteRelayInstanceId
+#   3) Direct probe of V5_REMOTE_RELAY_ACTIVE_SOCK reports healthy + accepting + EXACT same instanceId
+SELFHOST_REMOTE_RELAY_INSTANCE_ID=""
+selfhost_check_remote_relay_independent() { # <old_slot> [cand_slot]
+  local old_slot="$1" cand_slot="${2:-}" raw code body old_inst
+  SELFHOST_REMOTE_RELAY_INSTANCE_ID=""
+  selfhost_valid_slot "$old_slot" || return 1
+
+  raw="$(selfhost_priv_control_call "$old_slot" GET /internal/v5/cutover-readiness || printf '000\n')"
+  code="${raw%%$'\n'*}"
+  if [[ "$raw" == *$'\n'* ]]; then body="${raw#*$'\n'}"; else body=""; fi
+  [[ "$code" == "200" && -n "$body" ]] || return 1
+  if ! printf '%s\n' "$body" | jq -e '.ok == true and .remoteRelayExternal == true and .remoteRelayHealthy == true and (.remoteRelayInstanceId | type == "string" and length > 0)' >/dev/null 2>&1; then
+    return 1
+  fi
+  old_inst="$(printf '%s\n' "$body" | jq -r '.remoteRelayInstanceId')"
+
+  if [[ -n "$cand_slot" ]]; then
+    selfhost_valid_slot "$cand_slot" || return 1
+    local c_raw c_code c_body cand_inst
+    c_raw="$(selfhost_priv_control_call "$cand_slot" GET /internal/v5/cutover-readiness || printf '000\n')"
+    c_code="${c_raw%%$'\n'*}"
+    if [[ "$c_raw" == *$'\n'* ]]; then c_body="${c_raw#*$'\n'}"; else c_body=""; fi
+    [[ "$c_code" == "200" && -n "$c_body" ]] || return 1
+    if ! printf '%s\n' "$c_body" | jq -e '.ok == true and .remoteRelayExternal == true and .remoteRelayHealthy == true and (.remoteRelayInstanceId | type == "string" and length > 0)' >/dev/null 2>&1; then
+      return 1
+    fi
+    cand_inst="$(printf '%s\n' "$c_body" | jq -r '.remoteRelayInstanceId')"
+    [[ "$cand_inst" == "$old_inst" ]] || return 1
+  fi
+
+  declare -F remote_relay_probe_health >/dev/null 2>&1 || return 1
+  local relay_inst
+  relay_inst="$(remote_relay_probe_health "${V5_REMOTE_RELAY_ACTIVE_SOCK:-/run/openclaude-v5-selfhost/remote-relay-active.sock}" 2>/dev/null)" || return 1
+  [[ -n "$relay_inst" && "$relay_inst" == "$old_inst" ]] || return 1
+
+  SELFHOST_REMOTE_RELAY_INSTANCE_ID="$relay_inst"
+  return 0
+}
+
+# B7: Single strict survivability verifier used by BOTH pre-switch tiered gate AND
+# post-switch old-slot drain. Re-verifies containerLinkEnabled==true on BOTH old & cand
+# slots (fail-closed if cand_slot omitted/invalid or either slot false/404/unreachable),
+# and additionally verifies 3-way remote-relay attestation when remote-v4 items exist.
+SELFHOST_SURV_GATES_LOCAL_OK=0
+SELFHOST_SURV_GATES_REMOTE_V4_OK=0
+selfhost_verify_survivable_gates() { # <old_slot> <cand_slot> [fresh_old_body]
+  local old_slot="$1" cand_slot="${2:-}" old_body="${3:-}"
+  local raw code c_raw c_code c_body old_inst="" cand_inst="" relay_inst=""
+  SELFHOST_SURV_GATES_LOCAL_OK=0
+  SELFHOST_SURV_GATES_REMOTE_V4_OK=0
+  selfhost_valid_slot "$old_slot" || return 1
+  selfhost_valid_slot "$cand_slot" || return 1
+
+  if [[ -z "$old_body" ]]; then
+    raw="$(selfhost_priv_control_call "$old_slot" GET /internal/v5/cutover-readiness || printf '000\n')"
+    code="${raw%%$'\n'*}"
+    if [[ "$raw" == *$'\n'* ]]; then old_body="${raw#*$'\n'}"; else old_body=""; fi
+    [[ "$code" == "200" && -n "$old_body" ]] || return 1
+  fi
+  printf '%s\n' "$old_body" | jq -e '.ok == true and .containerLinkEnabled == true' >/dev/null 2>&1 || return 1
+
+  c_raw="$(selfhost_priv_control_call "$cand_slot" GET /internal/v5/cutover-readiness || printf '000\n')"
+  c_code="${c_raw%%$'\n'*}"
+  if [[ "$c_raw" == *$'\n'* ]]; then c_body="${c_raw#*$'\n'}"; else c_body=""; fi
+  [[ "$c_code" == "200" && -n "$c_body" ]] || return 1
+  printf '%s\n' "$c_body" | jq -e '.ok == true and .containerLinkEnabled == true' >/dev/null 2>&1 || return 1
+  SELFHOST_SURV_GATES_LOCAL_OK=1
+
+  if printf '%s\n' "$old_body" | jq -e '.remoteRelayExternal == true and .remoteRelayHealthy == true and (.remoteRelayInstanceId | type == "string" and length > 0)' >/dev/null 2>&1 \
+     && printf '%s\n' "$c_body" | jq -e '.remoteRelayExternal == true and .remoteRelayHealthy == true and (.remoteRelayInstanceId | type == "string" and length > 0)' >/dev/null 2>&1; then
+    old_inst="$(printf '%s\n' "$old_body" | jq -r '.remoteRelayInstanceId')"
+    cand_inst="$(printf '%s\n' "$c_body" | jq -r '.remoteRelayInstanceId')"
+    if [[ -n "$old_inst" && "$cand_inst" == "$old_inst" ]] && declare -F remote_relay_probe_health >/dev/null 2>&1; then
+      if relay_inst="$(remote_relay_probe_health "${V5_REMOTE_RELAY_ACTIVE_SOCK:-/run/openclaude-v5-selfhost/remote-relay-active.sock}" 2>/dev/null)" \
+         && [[ -n "$relay_inst" && "$relay_inst" == "$old_inst" ]]; then
+        SELFHOST_SURV_GATES_REMOTE_V4_OK=1
+        SELFHOST_REMOTE_RELAY_INSTANCE_ID="$relay_inst"
+      fi
+    fi
+  fi
   return 0
 }
 
@@ -714,7 +880,7 @@ selfhost_cutover_wait_for_safe_window() { # [--strict] [--slot=<A|B>] [--candida
       return 1
     fi
 
-    local non_surv_mem=0 readiness_state="skip-legacy" allow_survivable="$dual_mode"
+    local non_surv_mem=0 readiness_state="skip-legacy" allow_survivable="$dual_mode" remote_relay_independent=0
     if (( dual_mode == 1 )); then
       local raw_resp http_code body cl_old="false" cl_new="true"
       raw_resp="$(selfhost_priv_control_call "$old_slot" GET /internal/v5/cutover-readiness || printf '000\n')"
@@ -739,33 +905,39 @@ selfhost_cutover_wait_for_safe_window() { # [--strict] [--slot=<A|B>] [--candida
         non_surv_mem=1; readiness_state="http-${http_code}"
       fi
 
-      # B05: When candidate slot is running, also verify candidate reports containerLinkEnabled == true
-      if (( allow_survivable == 1 )) && selfhost_valid_slot "$cand_slot"; then
-        local c_raw c_code c_body
-        c_raw="$(selfhost_priv_control_call "$cand_slot" GET /internal/v5/cutover-readiness || printf '000\n')"
-        c_code="${c_raw%%$'\n'*}"
-        c_body="${c_raw#*$'\n'}"
-        if [[ "$c_code" == "200" && -n "$c_body" ]] \
-           && printf '%s\n' "$c_body" | jq -e '.ok == true and .containerLinkEnabled == true' >/dev/null 2>&1; then
-          cl_new="true"
-        else
-          cl_new="false"
-          allow_survivable=0
+      # B05 + B7: When candidate slot is specified, use unified selfhost_verify_survivable_gates
+      # so pre-switch gate and post-switch old-slot drain enforce the exact same attestation.
+      if (( allow_survivable == 1 )); then
+        if selfhost_valid_slot "$cand_slot"; then
+          if selfhost_verify_survivable_gates "$old_slot" "$cand_slot" "$body"; then
+            cl_new="true"
+            remote_relay_independent="$SELFHOST_SURV_GATES_REMOTE_V4_OK"
+          else
+            cl_new="false"
+            allow_survivable=0
+            remote_relay_independent=0
+          fi
+          readiness_state+=",cl_new=${cl_new}"
+        elif selfhost_check_remote_relay_independent "$old_slot"; then
+          remote_relay_independent=1
         fi
-        readiness_state+=",cl_new=${cl_new}"
       fi
     fi
 
-    local blocking_total=$(( SELFHOST_PG_BLOCKING + non_surv_mem ))
-    if (( allow_survivable == 0 )); then
-      blocking_total=$(( blocking_total + SELFHOST_PG_VERIFIED_SURV ))
+    local blocking_total
+    if (( allow_survivable == 1 && remote_relay_independent == 1 )); then
+      blocking_total=$(( SELFHOST_PG_BLOCKING_STRICT + non_surv_mem ))
+    elif (( allow_survivable == 1 )); then
+      blocking_total=$(( SELFHOST_PG_BLOCKING + non_surv_mem ))
+    else
+      blocking_total=$(( SELFHOST_PG_BLOCKING + SELFHOST_PG_VERIFIED_SURV + non_surv_mem ))
     fi
 
-    selfhost_ds_log "  tiered-idle UTC=$(date -u +%FT%TZ) dual=${dual_mode} allow_surv=${allow_survivable} ${SELFHOST_PG_SUMMARY} mem_probe=${readiness_state} elapsed=$((SECONDS - started))s"
+    selfhost_ds_log "  tiered-idle UTC=$(date -u +%FT%TZ) dual=${dual_mode} allow_surv=${allow_survivable} rem_relay_indep=${remote_relay_independent} ${SELFHOST_PG_SUMMARY} mem_probe=${readiness_state} elapsed=$((SECONDS - started))s"
 
     if (( blocking_total == 0 )); then
-      if (( allow_survivable == 1 && SELFHOST_PG_VERIFIED_SURV > 0 )); then
-        selfhost_ds_log "  ✓ 分级门禁放行: ${SELFHOST_PG_VERIFIED_SURV} 个本机 Docker Running 的 v5 accepted 回合将在新槽无感 re-attach (containerLinkEnabled=true, 其余阻断项全 0)"
+      if (( allow_survivable == 1 && (SELFHOST_PG_VERIFIED_SURV > 0 || SELFHOST_PG_VERIFIED_REMOTE_V4_SURV > 0) )); then
+        selfhost_ds_log "  ✓ 分级门禁放行: ${SELFHOST_PG_VERIFIED_SURV} 个本机 Docker Running 的 v5 accepted 回合 + ${SELFHOST_PG_VERIFIED_REMOTE_V4_SURV} 个独立 remote-relay 保活的 v4 绑定/inflight 记账将无感延续 (rem_relay_indep=${remote_relay_independent}, 其余阻断项全 0)"
       fi
       return 0
     fi
@@ -816,17 +988,20 @@ selfhost_wait_slot_leader_vip() { # <slot> [timeout_ms]
   done
 }
 
-# B04: After frontdoor switches away from old_slot and drain-ws succeeds, wait
-# for BOTH old_slot nonSurvivableInFlight == 0 AND PG blocking counts == 0
-# (draining any admitted/rejecting/non-survivable turn that slipped in before drain-ws).
-selfhost_wait_old_slot_drained() { # <old_slot> [timeout_s]
-  local slot="$1" timeout_s="${2:-${OC_SELFHOST_OLD_SLOT_DRAIN_TIMEOUT_SEC:-60}}"
+# B04 + B7: After frontdoor switches away from old_slot and drain-ws succeeds, wait
+# for BOTH old_slot nonSurvivableInFlight == 0 AND PG blocking counts == 0.
+# Whenever ANY survivable local or remote-v4 items exist, unconditionally re-verify
+# BOTH old_slot AND new_slot containerLinkEnabled==true (and 3-way remote-relay
+# attestation for v4 items). Missing new_slot with live survivable items fails closed!
+selfhost_wait_old_slot_drained() { # <old_slot> [new_slot] [timeout_s]
+  local slot="$1" new_slot="${2:-}" timeout_s="${3:-}"
+  [[ -n "$timeout_s" ]] || timeout_s="${OC_SELFHOST_OLD_SLOT_DRAIN_TIMEOUT_SEC:-60}"
   local started=$SECONDS deadline=$((SECONDS + timeout_s)) raw code body inflight mem_ok=0
   while :; do
     mem_ok=0
     raw="$(selfhost_priv_control_call "$slot" GET /internal/v5/cutover-readiness || printf '000\n')"
     code="${raw%%$'\n'*}"
-    body="${raw#*$'\n'}"
+    if [[ "$raw" == *$'\n'* ]]; then body="${raw#*$'\n'}"; else body=""; fi
     if [[ "$code" == "404" ]]; then
       mem_ok=1
     elif [[ "$code" == "200" && -n "$body" ]] \
@@ -843,14 +1018,27 @@ selfhost_wait_old_slot_drained() { # <old_slot> [timeout_s]
       if [[ "${ALLOW_INFLIGHT:-0}" == 1 ]]; then
         return 0
       fi
-      if selfhost_eval_pg_blocking_once && (( SELFHOST_PG_BLOCKING == 0 )); then
-        return 0
+      if selfhost_eval_pg_blocking_once; then
+        local blocking_now="$SELFHOST_PG_BLOCKING_STRICT"
+        if (( SELFHOST_PG_VERIFIED_SURV > 0 || SELFHOST_PG_VERIFIED_REMOTE_V4_SURV > 0 )); then
+          local fresh_old=""
+          [[ "$code" == "200" ]] && fresh_old="$body"
+          selfhost_verify_survivable_gates "$slot" "$new_slot" "$fresh_old" || true
+          if (( SELFHOST_SURV_GATES_LOCAL_OK != 1 )); then
+            blocking_now=$(( blocking_now + SELFHOST_PG_VERIFIED_SURV + SELFHOST_PG_VERIFIED_REMOTE_V4_SURV ))
+          elif (( SELFHOST_PG_VERIFIED_REMOTE_V4_SURV > 0 && SELFHOST_SURV_GATES_REMOTE_V4_OK != 1 )); then
+            blocking_now=$(( blocking_now + SELFHOST_PG_VERIFIED_REMOTE_V4_SURV ))
+          fi
+        fi
+        if (( blocking_now == 0 )); then
+          return 0
+        fi
       fi
-      selfhost_ds_log "  master-dual-slot: 等待停槽前 PG 阻断项归零 (${SELFHOST_PG_SUMMARY}, elapsed=$((SECONDS - started))s)"
+      selfhost_ds_log "  master-dual-slot: 等待停槽前 PG 阻断项归零 (${SELFHOST_PG_SUMMARY} local_ok=${SELFHOST_SURV_GATES_LOCAL_OK} v4_ok=${SELFHOST_SURV_GATES_REMOTE_V4_OK}, elapsed=$((SECONDS - started))s)"
     fi
 
     if (( SECONDS >= deadline )); then
-      selfhost_ds_log "  ✗ 旧槽 ${slot} 在 ${timeout_s}s 内未排空 (mem_ok=${mem_ok} pg_blocking=${SELFHOST_PG_BLOCKING:-?} code=${code})"
+      selfhost_ds_log "  ✗ 旧槽 ${slot} 在 ${timeout_s}s 内未排空 (mem_ok=${mem_ok} pg_blocking=${SELFHOST_PG_BLOCKING:-?} pg_strict=${SELFHOST_PG_BLOCKING_STRICT:-?} local_ok=${SELFHOST_SURV_GATES_LOCAL_OK} v4_ok=${SELFHOST_SURV_GATES_REMOTE_V4_OK} code=${code})"
       return 1
     fi
     sleep "${OC_SELFHOST_DRAIN_POLL_SEC:-0.5}"
@@ -916,9 +1104,10 @@ selfhost_master_dual_slot_flip() { # <rel>
   fi
 
   # B11: Safe abort before switch — MUST verify old slot fencing==false before stopping @NEW!
+  local remote_relay_indep=0
   _abort_before_switch() {
     local reason="${1:-pre_switch_abort}"
-    if declare -F remote_v4_cutover_reopen >/dev/null 2>&1; then
+    if (( remote_relay_indep == 0 )) && declare -F remote_v4_cutover_reopen >/dev/null 2>&1; then
       OC_REMOTE_V4_DRAIN_SOCKET="$(selfhost_master_slot_drain_sock "$old_slot")" remote_v4_cutover_reopen || true
     fi
     if ! selfhost_slot_unfence_and_verify "$old_slot"; then
@@ -929,8 +1118,8 @@ selfhost_master_dual_slot_flip() { # <rel>
     return 1
   }
 
-  # 2) Open admission fence on @OLD + drain remote-v4 on @OLD
-  selfhost_ds_log "  master-dual-slot: [2/5] 对旧槽 ${old_slot} 开启 cutover-fence 与 remote-v4 drain"
+  # 2) Open admission fence on @OLD + drain remote-v4 on @OLD (skip drain if independent remote-relay keeps v4 alive)
+  selfhost_ds_log "  master-dual-slot: [2/5] 对旧槽 ${old_slot} 开启 cutover-fence 与 remote-v4 校验"
   local fence_rc=0
   selfhost_slot_set_fence "$old_slot" true || fence_rc=$?
   if (( fence_rc == 0 )); then
@@ -942,7 +1131,10 @@ selfhost_master_dual_slot_flip() { # <rel>
     _abort_before_switch "fence_enable_uncertain"
     return $?
   fi
-  if declare -F remote_v4_cutover_drain >/dev/null 2>&1; then
+  if selfhost_check_remote_relay_independent "$old_slot" "$new_slot"; then
+    remote_relay_indep=1
+    selfhost_ds_log "  ✓ 独立 remote-relay (instanceId=${SELFHOST_REMOTE_RELAY_INSTANCE_ID}) 双向证真健康，跳过旧槽 ${old_slot} 的 remote_v4_cutover_drain"
+  elif declare -F remote_v4_cutover_drain >/dev/null 2>&1; then
     if ! OC_REMOTE_V4_DRAIN_SOCKET="$(selfhost_master_slot_drain_sock "$old_slot")" remote_v4_cutover_drain; then
       _abort_before_switch "remote_v4_drain_failed"
       return $?
@@ -1010,7 +1202,7 @@ selfhost_master_dual_slot_flip() { # <rel>
   fi
   selfhost_ds_log "  master-dual-slot: 旧槽 ${old_slot} drain-ws ok ${drain_body:0:120}"
 
-  if ! selfhost_wait_old_slot_drained "$old_slot"; then
+  if ! selfhost_wait_old_slot_drained "$old_slot" "$new_slot"; then
     selfhost_mark_dual_slot_recovery_required "old_slot_drain_timeout" "old=${old_slot} new=${new_slot}"
     return 79
   fi

@@ -7,17 +7,19 @@ snapshot_cutover_units_from_release() { # <rel> <out-var>
   src_dir="$rel/deploy/v5-selfhost"
   [[ -d "$src_dir" ]] || { mlog "候选缺 $src_dir"; return 1; }
   assert_unit_templates_live_wd "$src_dir"
-  snap="/run/openclaude-v5-selfhost/cutover-unit-snap.$$"
+  local snap_root="${V5_CUTOVER_SNAP_DIR:-/run/openclaude-v5-selfhost}"
+  snap="${snap_root}/cutover-unit-snap.$$"
   rm -rf -- "$snap"
   mkdir -p -- "$snap" || return 1
   chmod 0700 -- "$snap" || return 1
   cp -a -- "$src_dir/${V5_UNIT}" "$snap/" || { rm -rf -- "$snap"; return 1; }
   cp -a -- "$src_dir/${V5_EGRESS_UNIT}" "$snap/" || { rm -rf -- "$snap"; return 1; }
-  # 双槽 egress 模板 + sysctl(候选自带才快照)。
+  # 双槽 egress + remote-relay 模板与 sysctl(候选自带才快照)。
   local f
   for f in "${V5_EGRESS_SLOT_SOCKET_TPL:-openclaude-v5-selfhost-egress@.socket}" \
            "${V5_EGRESS_SLOT_SERVICE_TPL:-openclaude-v5-selfhost-egress@.service}" \
-           "${V5_EGRESS_SYSCTL_FILE:-99-openclaude-v5-selfhost-egress.sysctl.conf}"; do
+           "${V5_EGRESS_SYSCTL_FILE:-99-openclaude-v5-selfhost-egress.sysctl.conf}" \
+           "${V5_REMOTE_RELAY_SLOT_TPL:-openclaude-v5-selfhost-remote-relay@.service}"; do
     if [[ -f "$src_dir/$f" && ! -L "$src_dir/$f" ]]; then
       cp -a -- "$src_dir/$f" "$snap/" || { rm -rf -- "$snap"; return 1; }
       fsync_path "$snap/$f" || { rm -rf -- "$snap"; return 1; }
@@ -39,7 +41,7 @@ cleanup_cutover_unit_snap() {
   CUTOVER_UNIT_SNAP=""
   [[ -n "$snap" ]] || return 0
   case "$snap" in
-    /run/openclaude-v5-selfhost/cutover-unit-snap.*)
+    /run/openclaude-v5-selfhost/cutover-unit-snap.*|"${V5_CUTOVER_SNAP_DIR:-/run/openclaude-v5-selfhost}/cutover-unit-snap."*)
       rm -rf -- "$snap"
       ;;
   esac

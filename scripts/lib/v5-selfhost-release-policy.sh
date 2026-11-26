@@ -486,8 +486,13 @@ release_policy_flip_live() { # saga extra_apply, after real prechecks/context ar
   release_policy_assert_no_service_jobs || return $?
   # A user may have begun a turn while the old reader was draining. Apply the
   # existing real idle gate again before runtime/egress/master are restarted.
-  if declare -F remote_v4_cutover_drain >/dev/null 2>&1; then remote_v4_cutover_drain || return 79; fi
-  cutover_wait_for_user_idle || return 79
+  # OCV5-855 (B5): In dual-slot mode, defer to selfhost_flip_egress_relay_and_master
+  # (which enforces fence+drain for first migration and candidate-preheat +
+  # bidirectional attestation + fenced tiered idle gate in steady-state blue-green).
+  if ! (declare -F selfhost_master_dual_slot_active >/dev/null 2>&1 && selfhost_master_dual_slot_active); then
+    if declare -F remote_v4_cutover_drain >/dev/null 2>&1; then remote_v4_cutover_drain || return 79; fi
+    cutover_wait_for_user_idle || return 79
+  fi
   release_policy_require_owner || return 86
 }
 

@@ -206,7 +206,10 @@ import {
   isDelegateRemoteLaneInternalPath,
   makeDelegateRemoteLaneHandler,
 } from "../http/internalDelegateRemoteLane.js";
-import type { createMasterCc5Runtime } from "../agent-sandbox/cc5Runtime.js";
+import {
+  probeMasterCc5RemoteRelayReadiness,
+  type createMasterCc5Runtime,
+} from "../agent-sandbox/cc5Runtime.js";
 import {
   isDelegateGrokRoutePath,
   makeDelegateGrokRouteHandler,
@@ -1366,6 +1369,8 @@ export async function bootstrapInternalProxyAndListeners(
             getActiveBrowserWs: () => deps.getCronOriginBridge()?.registry.total() ?? 0,
             drainBrowserWebSockets: () => deps.getCronOriginBridge()?.drainBrowserWebSockets?.() ?? 0,
             getContainerLinkEnabled: () => deps.getCronOriginBridge()?.containerLinkEnabled === true,
+            probeRemoteRelayReadiness: () =>
+              probeMasterCc5RemoteRelayReadiness(deps.cc5RuntimeRef.current),
           })
         ) {
           return;
