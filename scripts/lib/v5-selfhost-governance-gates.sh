@@ -1054,7 +1054,7 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   steward_args=(--enforce-commit --root "$staging" --base "$base_ref" --head "$full_sha")
   steward_gov_root="${OC_GOVERNOR_ROOT:-/opt/openclaude/harness-gate}"
   steward_hmac_key="$steward_gov_root/control/.hmac-key"
-  if [[ -z "${OC_STEWARD_HMAC_KEY:-}" && "$(id -u)" == 0 && ( -e "$steward_hmac_key" || -L "$steward_hmac_key" ) && -f "$steward_script" ]] \
+  if [[ -z "${OC_STEWARD_HMAC_KEY:-}" && -z "${OC_STEWARD_RECEIPT_DIR:-}" && "$(id -u)" == 0 && ( -e "$steward_hmac_key" || -L "$steward_hmac_key" ) && -f "$steward_script" ]] \
     && grep -qF -- '--hmac-key-file' "$steward_script" 2>/dev/null; then
     steward_args+=(--hmac-key-file "$steward_hmac_key")
   fi

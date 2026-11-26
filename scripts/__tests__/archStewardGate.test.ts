@@ -1804,5 +1804,97 @@ describe('Host .hmac-key single-source resolution & arch-steward-review.sh parit
       0,
       `default host auto-discovery rejected wrapper receipt: ${rTrainAuto.stdout}\n${rTrainAuto.stderr}`,
     )
+
+    // Parity 2: OC_STEWARD_RECEIPT_DIR as parent-dir symlink alias into host governor root -> BOTH sign & verify use hmac-sha256
+    const hostAlias = path.join(tmpdir(), `steward-b1-alias-${process.pid}-${Date.now()}`)
+    symlinkSync(path.join(govRoot, 'steward-receipts'), hostAlias)
+    t.after(() => rmSync(hostAlias, { force: true }))
+    rmSync(producedPath, { force: true })
+    const rAliasWrap = spawnSync(
+      'bash',
+      [
+        REVIEW_SH,
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--author-model',
+        'gemini-4-neon',
+        '--steward-model',
+        'gpt-6.2-astra',
+        '--channel',
+        'command',
+        '--unsafe-test-skip-owner',
+      ],
+      { env: { ...cleanEnv, OC_STEWARD_RECEIPT_DIR: hostAlias }, encoding: 'utf8' },
+    )
+    assert.equal(rAliasWrap.status, 0, `alias wrapper failed: ${rAliasWrap.stdout}\n${rAliasWrap.stderr}`)
+    const aliasDoc = JSON.parse(readFileSync(producedPath, 'utf8'))
+    assert.match(String(aliasDoc.receiptDigest ?? ''), /^hmac-sha256:[0-9a-f]{64}$/)
+    const rAliasVerify = spawnSync(
+      'npx',
+      [
+        '--no-install',
+        'tsx',
+        AUDIT_SCRIPT,
+        '--enforce-commit',
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--unsafe-test-skip-owner',
+      ],
+      { cwd: ROOT, env: { ...cleanEnv, OC_STEWARD_RECEIPT_DIR: hostAlias }, encoding: 'utf8' },
+    )
+    assert.equal(rAliasVerify.status, 0, `alias verify failed: ${rAliasVerify.stdout}\n${rAliasVerify.stderr}`)
+
+    // Parity 3: OC_STEWARD_RECEIPT_DIR outside host governor root -> wrapper & verifier agree on sha256 (no host key leak)
+    const extReceiptDir = mkdtempSync(path.join(tmpdir(), 'steward-b1-ext-'))
+    t.after(() => rmSync(extReceiptDir, { recursive: true, force: true }))
+    const rExtWrap = spawnSync(
+      'bash',
+      [
+        REVIEW_SH,
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--author-model',
+        'gemini-4-neon',
+        '--steward-model',
+        'gpt-6.2-astra',
+        '--channel',
+        'command',
+        '--unsafe-test-skip-owner',
+      ],
+      { env: { ...cleanEnv, OC_STEWARD_RECEIPT_DIR: extReceiptDir }, encoding: 'utf8' },
+    )
+    assert.equal(rExtWrap.status, 0, `external wrapper failed: ${rExtWrap.stdout}\n${rExtWrap.stderr}`)
+    const extDoc = JSON.parse(readFileSync(path.join(extReceiptDir, `${headSha}.json`), 'utf8'))
+    assert.match(String(extDoc.receiptDigest ?? ''), /^sha256:[0-9a-f]{64}$/)
+    const rExtVerify = spawnSync(
+      'npx',
+      [
+        '--no-install',
+        'tsx',
+        AUDIT_SCRIPT,
+        '--enforce-commit',
+        '--root',
+        repo.dir,
+        '--base',
+        baseSha,
+        '--head',
+        headSha,
+        '--unsafe-test-skip-owner',
+      ],
+      { cwd: ROOT, env: { ...cleanEnv, OC_STEWARD_RECEIPT_DIR: extReceiptDir }, encoding: 'utf8' },
+    )
+    assert.equal(rExtVerify.status, 0, `external verify failed: ${rExtVerify.stdout}\n${rExtVerify.stderr}`)
   })
 })
