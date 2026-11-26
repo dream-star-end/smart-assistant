@@ -178,7 +178,6 @@ source "$SCRIPT_DIR/lib/v5-selfhost-workspace-links.sh"  # OCV5-549: ws_links_en
 source "$SCRIPT_DIR/lib/v5-selfhost-prepare.sh"       # P4: lock-free prepare, locked flip
 source "$SCRIPT_DIR/lib/v5-selfhost-backup-lock.sh"     # OCV5-600: selfhost_backup_lock_holder
 source "$SCRIPT_DIR/lib/v5-selfhost-train-guards.sh"    # OCV5-904: pin/governor/ci-green/retention-rollback
-v5_selfhost_load_runtime_image_pin
 # P0-Web 前端热切换(OCV5-489):overlay 指针根 + 纯函数库 + --p0-web* 编排。
 WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-overlay}"
 # shellcheck source=scripts/v5-web-overlay-lib.sh
@@ -665,7 +664,7 @@ fi
 if [[ "$DRY" != 1 ]]; then
   case "$MODE" in
     deploy|prepare|bootstrap|build-master-only|cutover|rollback|p0-web|p0-web-revert)
-      if [[ "$RELEASE_POLICY_RESUME" != 1 ]]; then
+      if [[ "$RELEASE_POLICY_RESUME" != 1 && ! ( "$MODE" == rollback && "${OC_V5_RETENTION_INTERNAL_ROLLBACK:-0}" == 1 && "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-0}" == 1 ) ]]; then
         release_policy_context_present && { log "unresolved release-policy context blocks mutation"; exit 79; }
       fi ;;
   esac
@@ -780,7 +779,7 @@ preflight_common() {
 
 cmd_preflight() {
   log "══ selfhost preflight(只读) ══"
-  preflight_common
+  if declare -F v5_selfhost_load_runtime_image_pin_for_commit >/dev/null 2>&1; then v5_selfhost_load_runtime_image_pin_for_commit "$(source_commit)"; fi; preflight_common
   preflight_residue
   preflight_ports_idle
   log "✓ preflight 通过:无 V5 残留,端口空闲,密钥在,个人版仍 active。"
@@ -2087,7 +2086,7 @@ cmd_deploy() {
   log "流程: 构建 master release(Wave 1/2 治理快门 + staging vite) → runtime-release → platform bundle"
   log "      → 复用 --cutover 同一套状态机翻转(survivor / 两级回滚 / 候选 snapshot unit)"
   log "      前端不再吃工作树;masterRelease/transitionKind 记新 live rel-*"
-  preflight_common
+  sha="$(source_commit)"; if declare -F v5_selfhost_load_runtime_image_pin_for_commit >/dev/null 2>&1; then v5_selfhost_load_runtime_image_pin_for_commit "$sha"; fi; preflight_common
   explain_dirty_semantics
   dirty="$(git -C "$REPO_ROOT" status --porcelain)"
   if [[ -n "$dirty" && "$ALLOW_DIRTY" != 1 ]]; then
@@ -2109,7 +2108,7 @@ $dirty
   sha="$(source_commit)"
   if [[ "$PLATFORM_FROM_HEAD" == 1 && "$DRY" != 1 ]]; then
     lease_train_begin "$sha"
-    if declare -F v5_selfhost_check_governor_mode >/dev/null 2>&1; then v5_selfhost_check_governor_mode "$sha"; v5_selfhost_verify_ci_green "$sha"; fi
+    if declare -F v5_selfhost_enforce_forward_cutover_guards >/dev/null 2>&1; then v5_selfhost_enforce_forward_cutover_guards "$sha"; fi
     assert_fix_trailers "$sha"
     selfhost_prepare_candidate "$sha"
     selfhost_prepared_enter_flip "$sha"
@@ -2143,7 +2142,7 @@ $dirty
   if [[ "$SELFHOST_SPLIT_PREPARED" != 1 ]]; then
     selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"
   fi
-  if declare -F v5_selfhost_check_governor_mode >/dev/null 2>&1; then v5_selfhost_check_governor_mode "$sha"; v5_selfhost_verify_ci_green "$sha"; fi
+  if declare -F v5_selfhost_enforce_forward_cutover_guards >/dev/null 2>&1; then v5_selfhost_enforce_forward_cutover_guards "$sha"; fi
   assert_fix_trailers "$sha"
   assert_p0_web_overlay_contained "$sha"
   log "── source=$sha 构建三面制品(失败则 live 不动) ──"
@@ -2167,7 +2166,6 @@ $dirty
   CUTOVER_JOINT=1
   log "── 进入 --cutover 翻转窗口(同一套状态机,不是第二份逻辑) release=$DEPLOY_BUILT_RELEASE ──"
   cmd_cutover
-  if declare -F v5_selfhost_post_cutover_retention_gate >/dev/null 2>&1; then v5_selfhost_post_cutover_retention_gate "$DEPLOY_BUILT_RELEASE" "$sha"; fi
   lease_train_finish committed "cutover committed live=$DEPLOY_BUILT_RELEASE"
   log "✓ --deploy 完成 live → $DEPLOY_BUILT_RELEASE"
 }
@@ -2826,6 +2824,7 @@ cmd_cutover() {
     model_policy_require_forward_release "$rel" || die "正向发布需要完整 generation 1 model policy。尚未改任何运行面。"
   fi
   assert_master_release_tsx_selfcheck "$rel"
+  if declare -F v5_selfhost_enforce_forward_cutover_guards >/dev/null 2>&1; then v5_selfhost_enforce_forward_cutover_guards "$head"; fi
   if [[ "${SELFHOST_SPLIT_PREPARED:-0}" == 1 ]]; then
     # E1 has verified the sealed candidate before the first live setup write.
     ensure_selfhost_env_keys
@@ -3107,6 +3106,7 @@ cmd_cutover() {
     cutover_clog "  log=$CUTOVER_LOG"
     return 0
   fi
+  if [[ "${CUTOVER_ROLLBACK:-0}" != 1 ]] && declare -F v5_selfhost_post_cutover_retention_gate >/dev/null 2>&1; then v5_selfhost_post_cutover_retention_gate "$rel" "$head" || return $?; fi
   if release_policy_enabled; then
     local finalize_rc=0
     release_policy_finalize_forward "$rel" || finalize_rc=$?

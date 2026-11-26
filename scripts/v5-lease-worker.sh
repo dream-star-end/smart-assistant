@@ -316,6 +316,10 @@ dispatch_train() {
   miss="$(lease_sql "SELECT want_sha FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';" \
           | while read -r w; do lease_sha_contained "$w" "$tip" || echo "$w"; done)"
   [[ -z "$miss" ]] || { wlog "tip ${tip:0:12} 不含 pending sha: $miss;不发车"; return 0; }
+  # B5: 对当前远端 tip 做 CI 三态分类（success / pending / failed），在建 train 与结算 failed 之前执行
+  if declare -F worker_pre_dispatch_ci_gate >/dev/null 2>&1; then
+    worker_pre_dispatch_ci_gate "$tip" || return 0
+  fi
   # 同一 target 上一班由执行器自己上报 failed(门禁/构建拒绝 = 确定性失败)→ 不自动重发
   # (2026-09-05 实测:0274 迁移门拒绝后 worker 每 15min 烧一班)。worker 对账判的 failed(planned 超时、执行器被外力杀)不受此限。
   # 在那班结束前登记的 ride 置 failed 并回调(design-v2 §2.2:train failed 且无法自动重发 → failed);

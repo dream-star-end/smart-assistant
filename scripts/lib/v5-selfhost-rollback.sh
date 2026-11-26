@@ -136,21 +136,24 @@ rollback_restore_prev_if_unchanged() {
 cmd_rollback() {
   local live
   log "══ v5 selfhost --rollback(退回 .prev-release 与它当时的运行四元组,一次一步) ══"
-  preflight_common
   [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是已安装实例。"
+  require_cmd jq
   live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+  # B8: 先从已知良好的历史 release 元数据解析镜像，绝不读脏工作树 runtime-image-pin.json 阻断紧急回滚！
   rollback_resolve_target || die "回退目标不成立,未改任何东西。现场: live=${live:-?} .prev-release 与 $OC_HOTCFG_HISTORY"
   CUTOVER_ROLLBACK=1
   ROLLBACK_FROM="$live"
   ROLLBACK_ORIG_PREV="$ROLLBACK_MASTER"
+  RUNTIME_IMAGE="$ROLLBACK_IMAGE"
+  RUNTIME_IMAGE_ID="$ROLLBACK_IMAGE_ID"
+  RUNTIME_IMAGE_PIN_SOURCE="rollback-history:${ROLLBACK_MASTER}"
+  preflight_common
   log "  live   = $live"
   log "  目标   = $ROLLBACK_MASTER (sourceCommit ${ROLLBACK_SHA:0:12})"
   log "  四元组 = image=$ROLLBACK_IMAGE id=${ROLLBACK_IMAGE_ID:7:12} runtime=${ROLLBACK_RUNTIME_RELEASE##*/} bundle=${ROLLBACK_BUNDLE##*/}"
   oc_hotcfg_assert_tuple_viable "$ROLLBACK_IMAGE" "$ROLLBACK_IMAGE_ID" "$ROLLBACK_RUNTIME_RELEASE" \
     || die "上一版运行四元组不可激活(镜像缺失/被重打或地板不满足),未改任何东西。"
   lease_train_begin "$ROLLBACK_SHA"
-  RUNTIME_IMAGE="$ROLLBACK_IMAGE"
-  RUNTIME_IMAGE_ID="$ROLLBACK_IMAGE_ID"
   BUILT_RUNTIME_RELEASE="$ROLLBACK_RUNTIME_RELEASE"
   BUILT_BUNDLE_REV="${ROLLBACK_BUNDLE##*/}"
   CUTOVER_TUPLE_BUNDLE="$ROLLBACK_BUNDLE"

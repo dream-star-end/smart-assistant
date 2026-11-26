@@ -626,6 +626,7 @@ function formatViolationMessages(v: Violation, headBaseline: Baseline): {
 function main(argv: string[]): number {
   let base = ''
   let head = 'HEAD'
+  let rootOverride = ''
   let update = false
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--base') {
@@ -635,13 +636,23 @@ function main(argv: string[]): number {
         return 2
       }
     } else if (argv[i] === '--head') head = argv[++i] ?? ''
-    else if (argv[i] === '--update-baseline') update = true
+    else if (argv[i] === '--root') {
+      rootOverride = argv[++i] ?? ''
+      if (!rootOverride) {
+        console.error('--root requires a directory')
+        return 2
+      }
+    } else if (argv[i]?.startsWith('--root=')) {
+      rootOverride = argv[i]!.slice('--root='.length)
+    } else if (argv[i] === '--update-baseline') update = true
     else {
       console.error(`unknown arg: ${argv[i]}`)
       return 2
     }
   }
-  const root = git(process.cwd(), ['rev-parse', '--show-toplevel']).trim()
+  const root = rootOverride
+    ? path.resolve(rootOverride)
+    : git(process.cwd(), ['rev-parse', '--show-toplevel']).trim()
   if (update) return updateBaseline(root)
 
   const today = new Date().toISOString().slice(0, 10)

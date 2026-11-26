@@ -330,6 +330,9 @@ cmd_prewarm_artifacts() {
   mkdir -p "$TMPDIR"
   # The normal builder is used unchanged below its cache entry. NEVER launch a Docker install
   # from speculation: killing a Docker client does not prove its daemon-owned container stopped.
+  if declare -F v5_selfhost_load_runtime_image_pin_for_commit >/dev/null 2>&1; then
+    v5_selfhost_load_runtime_image_pin_for_commit "$sha"
+  fi
   image="$(docker image inspect --format '{{.Id}}' "$RUNTIME_IMAGE")" || die 'prewarm image inspect failed'
   caps="$(runtime_caps_from_metadata "$sha")" || die 'prewarm capabilities unavailable'
   if prewarm_private_runtime_ready "$sha" "$image" "$caps"; then
