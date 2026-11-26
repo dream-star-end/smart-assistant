@@ -49,7 +49,8 @@ describe("OCV5-70 时间线 hydration 容错", () => {
     expect(screen.queryByTestId("timeline-fatal-error")).not.toBeInTheDocument();
     expect(screen.getByText("继续")).toBeInTheDocument();
     expect(screen.getByText("已处理完毕。")).toBeInTheDocument();
-    // 畸形 steps 的签名与卡渲染不得抛到整棵时间线。
+    // 畸形 steps（非数组 / 含 null 条目）安全跳过，不向边界或控制台抛错。
+    expect(err).not.toHaveBeenCalled();
     expect(() => childSignature({ kind: "plan", steps: { not: "array" } as never })).not.toThrow();
     err.mockRestore();
   });

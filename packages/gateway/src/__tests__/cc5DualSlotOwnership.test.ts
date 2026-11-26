@@ -152,7 +152,7 @@ function createSlotFixture(options: {
   baseRoot: string
   ownerSlot?: string
   ownerInstanceId?: string
-  failStop?: boolean
+  failStop?: boolean | (() => boolean)
   admitReservationMs?: number
   isProcessAlive?: (pid: number, expectedStartTicks: string | null) => boolean
   isSocketListening?: (sockPath: string) => boolean
@@ -244,7 +244,8 @@ function createSlotFixture(options: {
         },
         async stop() {
           events.push(`stop:${config.operationId}`)
-          if (options.failStop) throw new Error('fixture stop failed')
+          const fail = typeof options.failStop === 'function' ? options.failStop() : options.failStop
+          if (fail) throw new Error('fixture stop failed')
           return { remoteStopped: true as const }
         },
       }),
@@ -573,6 +574,7 @@ test('same-sessionKey cross-slot handover: busy/unavailable/no-callback fail clo
   const baseRoot = join(tmp, 'r')
   const { key, publicKeyring } = makeKeyring()
   let openReq: ReturnType<typeof request> | undefined
+  let shouldFailStop = true
   const runtimesToCleanup: RemoteLaneRuntimePort[] = []
   try {
     const blue = createSlotFixture({ baseRoot, ownerSlot: 'blue', ownerInstanceId: 'blue-1' })
@@ -721,11 +723,12 @@ test('same-sessionKey cross-slot handover: busy/unavailable/no-callback fail clo
     openReq = undefined
 
     // 5. Verify stop failure returns status: 'unknown' from releaseSessionIfIdle (after a launched turn settles to idle).
+    shouldFailStop = true
     const failing = createSlotFixture({
       baseRoot,
       ownerSlot: 'amber',
       ownerInstanceId: 'amber-1',
-      failStop: true,
+      failStop: () => shouldFailStop,
     })
     runtimesToCleanup.push(failing.runtime)
     const failingLane = await failing.lane(SESSION_B, '91')
@@ -817,6 +820,7 @@ test('same-sessionKey cross-slot handover: busy/unavailable/no-callback fail clo
     assert.equal(existsSync(join(handle.mountSource, deadViewOp)), false)
   } finally {
     openReq?.destroy()
+    shouldFailStop = false
     for (const rt of runtimesToCleanup) {
       await rt.release('91').catch(() => {})
     }

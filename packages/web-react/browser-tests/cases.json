@@ -100,7 +100,7 @@
     },
     {
       "id": "T25",
-      "proves": "390×844 整页聊天:顶栏入口(含会话内查找)不被挤出视口、宽正文(长 URL/宽代码/宽表格/长命令)要么放得下要么可横滑、汉堡与回形针附件与发送受信可点；无目标时「+」为禁用锚点且无「添加附件」菜单项"
+      "proves": "390×844 整页聊天:顶栏入口(汉堡/智能体胶囊/更多操作菜单含会话内查找)与底栏模型选择不被挤出视口、宽正文(长 URL/宽代码/宽表格/长命令)要么放得下要么可横滑、汉堡与回形针附件与发送受信可点；无目标时「+」为禁用锚点且无「添加附件」菜单项"
     },
     {
       "id": "T26",
@@ -148,7 +148,7 @@
     },
     {
       "id": "T37",
-      "proves": "真 Chromium 中连续点击新建只保留一个未持久化空白草稿态；已有部分消息时真实内容与明确的会话加载占位同时可见"
+      "proves": "真 Chromium 中连续点击新建只保留一个未持久化空白草稿态；已有部分消息时后台历史同步静默合并，不中断可见性也不在尾部闪烁假回复骨架"
     },
     {
       "id": "T38",
@@ -164,7 +164,7 @@
     },
     {
       "id": "T41",
-      "proves": "PR1 Codex 密度 token：Composer 与 ToolCard 视觉、Sidebar 单行会话/累计用时/活跃竖条与顶栏入口在 1440/390 明暗主题均成立，账号菜单保留管理/市场/组织/后台/视频任务，底栏保留教程与主题"
+      "proves": "PR1 Codex 密度 token：Composer(oc-composer-dock 实体边框与 :focus-within 暖光晕)与 ToolCard 视觉、Sidebar 单行会话/累计用时/选中卡片与一级主导航(管理中心/市场)在 1440/390 明暗主题均成立，账号菜单保留主题切换/设置/帮助与案例/组织/后台/视频任务"
     },
     {
       "id": "T42",
@@ -180,7 +180,7 @@
     },
     {
       "id": "T45",
-      "proves": "中断 turn 只用服务端回显字段仍可取到 requestId/积分（OCV5-359:桌面 hover 行尾淡显且在「更多操作」菜单明细里）与已产生正文；records_unpublished 空窗给出非正文占位且 fallback 有 usage 时仍显示 requestId/积分，不渲染红卡或重试"
+      "proves": "中断 turn 只用服务端回显字段仍可取到 requestId/积分（OCV5-359:桌面 hover 行尾淡显且在「更多操作」菜单明细里）与已产生正文；records_unpublished 空窗静默补齐（不叠显「过程记录整理中」状态条、不渲染正文占位）且 fallback 有 usage 时仍显示 requestId/积分，不渲染红卡或重试"
     },
     {
       "id": "T46",
@@ -192,7 +192,7 @@
     },
     {
       "id": "T48",
-      "proves": "engine_starting/engine_resuming wire 帧经真实 ChatSocket→reducer→MessageList 后活动行显示「正在启动引擎/正在恢复会话」而非误标思考中；首内容清除、终态不粘"
+      "proves": "engine_starting/engine_resuming wire 帧经真实 ChatSocket→reducer→MessageList 后活动行显示「正在准备中」而非误标思考中或暴露引擎术语；首内容清除、终态不粘"
     },
     {
       "id": "T49",
@@ -280,7 +280,7 @@
     },
     {
       "id": "T70",
-      "proves": "引擎冷启动后模型开始思考(思考正文为空)时，活动行从「正在启动引擎」切到「深度思考中 (Ns)」，不再挂着启动文案，也不显示无新数据；思考结束复位帧到达后不残留深度思考或执行操作文案(INC-20261007-ENGINE-STARTING-THINKING)"
+      "proves": "引擎冷启动后模型开始思考(思考正文为空)时，活动行从「正在准备中」切到「深度思考中 (Ns)」，不再挂着启动文案，也不显示无新数据；思考结束复位帧到达后不残留深度思考或执行操作文案(INC-20261007-ENGINE-STARTING-THINKING)"
     },
     {
       "id": "T71",
@@ -296,7 +296,7 @@
     },
     {
       "id": "T74",
-      "proves": "回合在途切回会话时：启动态已超过 30 秒无新数据，经真实 ChatSocket→reducer→MessageList 的活动行不再显示「正在启动引擎」而是诚实文案；收到 hello 的 meta.detached 快照显示「后台运行中」；下一条真实帧到达即切回实时阶段，终态不粘(INC-20261028-STALE-ENGINE-STARTING)"
+      "proves": "回合在途切回会话时：启动态已超过 30 秒无新数据，经真实 ChatSocket→reducer→MessageList 的活动行不再显示「正在准备中/启动引擎」而是温和诚实文案；收到 hello 的 meta.detached 快照显示「正在后台处理中」；下一条真实帧到达即切回实时阶段，终态不粘(INC-20261028-STALE-ENGINE-STARTING)"
     }
   ]
 }

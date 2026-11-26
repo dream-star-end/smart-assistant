@@ -386,7 +386,7 @@ describe('Wave 3 PG perf, model projection, Auto-Dream, Law 2 & tutorial batchin
     )
     assert.match(
       bridgeSrc,
-      /delete p\._masterHistoricalMessages;/,
+      /(?:delete p\._masterHistoricalMessages;|Reflect\.deleteProperty\(p,\s*['"]_masterHistoricalMessages['"]\))/,
       'userChatBridge binary JSON branch must also strip _masterHistoricalMessages',
     )
     assert.match(

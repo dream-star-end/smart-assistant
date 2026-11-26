@@ -55,6 +55,7 @@ EXPECTED_SKILLS=(
   ths
   blog-writer
   site-publishing
+  scientific-deep-audit
 )
 
 # MIN_SECURITY_POLICY: applied to every release, independent of that release's
@@ -77,7 +78,8 @@ LEGACY_RETIRED_SKILLS=(oc-vision)
 # before the OCV5-388 sync (da13df566) may lack the 同花顺 plugin skill ths;
 # serving releases before OCV5-577 D2 may lack blog-writer; serving releases
 # before OCV5-750 (Muse relay, #1383/#1388) may lack muse-media; serving
-# releases before OCV5-802 sync may lack site-publishing. New releases
+# releases before OCV5-802 sync may lack site-publishing; serving releases
+# before OCV5-895 may lack scientific-deep-audit. New releases
 # remain exact-manifest strict.
 ALLOW_LEGACY_BASELINE_GAPS=0
 
@@ -171,7 +173,7 @@ assert_structure() { # <baseline-dir>
     # Serving releases before 2026-09-05 sync (2887d6d4b) have no
     # multi-model-review in baseline; legacy mode allows only that extra gap.
     # New releases remain exact-manifest strict.
-    for skill in cursor-cli manage-taskboard ssh multi-model-review ths blog-writer muse-media site-publishing; do
+    for skill in cursor-cli manage-taskboard ssh multi-model-review ths blog-writer muse-media site-publishing scientific-deep-audit; do
       if [[ ! -e "$root/skills/$skill" ]]; then
         skills_expected="$(grep -vx "$skill" <<<"$skills_expected")"
       fi
@@ -194,7 +196,7 @@ assert_structure() { # <baseline-dir>
   for skill in "${EXPECTED_SKILLS[@]}"; do
     if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 && ! -e "$root/skills/$skill" ]]; then
       case "$skill" in
-        cursor-cli|manage-taskboard|ssh|multi-model-review|ths|blog-writer|muse-media|site-publishing) continue ;;
+        cursor-cli|manage-taskboard|ssh|multi-model-review|ths|blog-writer|muse-media|site-publishing|scientific-deep-audit) continue ;;
       esac
     fi
     assert_skill_inner "$root" "$skill"

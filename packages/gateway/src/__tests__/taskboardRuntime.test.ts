@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { DelegateResumeRegistry } from '../delegateResume.js'
-import { Gateway, PerTurnDelegationGuard } from '../server.js'
+import { Gateway, MEMBER_DELEGATIONS_PER_TURN_DEFAULT, PerTurnDelegationGuard } from '../server.js'
 import { _setPlatformPricingLookupForTests } from '../usageCost.js'
 import { openTaskboardDb } from '../taskboard/db/index.js'
 import { createPipeline, createStage } from '../taskboard/db/pipelines.js'
@@ -75,15 +75,15 @@ function fixture(runTurn: (session: any, emit: (event: any) => void) => Promise<
         version: 1,
         gateway: { bind: '127.0.0.1', port: 0, accessToken: 'fixture' },
         auth: { mode: 'subscription', claudeCodePath: '/tmp/fixture-ccb' },
-        defaults: { model: 'glm-5.2', permissionMode: 'default' },
+        defaults: { model: 'deepseek-v4-flash', permissionMode: 'default' },
         channels: { webchat: { enabled: true } },
       },
     },
     _getAgentsConfig: async () => ({
       default: 'coding-assistant',
       agents: [
-        { id: 'coding-assistant', model: 'glm-5.2' },
-        { id: 'worker', model: 'glm-5.2' },
+        { id: 'coding-assistant', model: 'deepseek-v4-flash' },
+        { id: 'worker', model: 'deepseek-v4-flash' },
       ],
     }),
   })
@@ -180,7 +180,7 @@ function fixture(runTurn: (session: any, emit: (event: any) => void) => Promise<
     quietHoursEnd: 0,
     onSuccess: 'wait_human',
     onFailure: 'retry',
-    model: 'glm-5.2',
+    model: 'deepseek-v4-flash',
   })
   const ticket = createTicket(db, {
     projectId: project.id,
@@ -596,7 +596,7 @@ test(
     const ticking = f.engine.tick()
     try {
       await waitPoint(rootStarted, 'rootStarted')
-      for (let index = 0; index < 9; index += 1) {
+      for (let index = 0; index <= MEMBER_DELEGATIONS_PER_TURN_DEFAULT; index += 1) {
         const result = await f.gw._runDelegateTask({
           targetAgentId: 'worker',
           sourceAgent: 'coding-assistant',
@@ -605,7 +605,7 @@ test(
           goal: `member ${index}`,
           depth: 1,
         })
-        if (index < 8) assert.equal(result.kind, 'completed', JSON.stringify(result))
+        if (index < MEMBER_DELEGATIONS_PER_TURN_DEFAULT) assert.equal(result.kind, 'completed', JSON.stringify(result))
         else {
           assert.equal(result.kind, 'rejected')
           assert.equal(result.httpStatus, 429)
@@ -614,7 +614,10 @@ test(
       }
       rootGate.resolve()
       await ticking
-      assert.equal(listRuns(f.db, { ticketId: f.ticket.id }).items[0]!.tokensIn, 9)
+      assert.equal(
+        listRuns(f.db, { ticketId: f.ticket.id }).items[0]!.tokensIn,
+        MEMBER_DELEGATIONS_PER_TURN_DEFAULT + 1,
+      )
     } finally {
       rootGate.resolve()
       await Promise.allSettled([ticking])
