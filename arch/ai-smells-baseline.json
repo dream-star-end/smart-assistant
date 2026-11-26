@@ -1,0 +1,4832 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-11-26",
+  "note": "Zero-net-increase ratchet for 4 AI code smells (emptyCatch, typeEscape, syncIo, lintSuppress). Monotonic shrink-only per file and in total (OCV5-904).",
+  "categories": [
+    "emptyCatch",
+    "typeEscape",
+    "syncIo",
+    "lintSuppress"
+  ],
+  "totals": {
+    "emptyCatch": 1583,
+    "typeEscape": 910,
+    "syncIo": 2228,
+    "lintSuppress": 177,
+    "all": 4898
+  },
+  "files": {
+    "packages/channels/feishu/src/client.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/channels/telegram/src/index.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/channels/wechat/src/iLinkImage.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 4,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/channels/wechat/src/iLinkMedia.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/channels/wechat/src/manager.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/channels/wechat/src/worker.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/cli/src/commands/doctor.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/cli/src/commands/gateway.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/cli/src/commands/onboard.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/cli/src/commands/pairing.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/accountSlotReaper.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 2
+    },
+    "packages/commercial/src/account-pool/antigravityOAuth.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/antigravityQuota.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/apiKeyPool.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/codexAccountActor.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/account-pool/codexCommissioning.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/codexCommissioningEvidence.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 15,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/codexCommissioningStore.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/codexDisableFanout.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/account-pool/cooldownRecoveryActor.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/account-pool/cursorMaterializer.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 48,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/cursorSandActor.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/cursorSandInstaller.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/cursorSandState.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 12,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/egressAssignment.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/egressDispatcher.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/grokOAuth.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/policy/events.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/account-pool/policy/registry.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/account-pool/proxy.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/quota.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/refresh.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/account-pool/refreshEventsSweeper.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/account-pool/remoteBrainPool.ts": {
+      "emptyCatch": 10,
+      "typeEscape": 2,
+      "syncIo": 21,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remoteLaneRecovery.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/drainGate.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 5,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/liveProbe.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/migrationCoordinator.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 18,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/placement.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/profileCutover.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 13,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/registry.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/sandboxRedProof.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/verificationEvidence.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 5,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/verificationExecutor.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/verificationLaneHost.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/remotePool/verificationRuntimeProof.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/account-pool/scheduler.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/admin/alertChannels.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/admin/alertRules.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 8,
+      "syncIo": 0,
+      "lintSuppress": 7
+    },
+    "packages/commercial/src/admin/alerts.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 2
+    },
+    "packages/commercial/src/admin/containers.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/admin/contentReviewAlert.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/admin/grokDeviceAuth.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/admin/ilinkAlertWorker.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/admin/modelGrants.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/admin/observabilityIdentity.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/admin/telegramAlertSender.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/admin/wecomAibotConnection.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/admin/wecomAlertDispatcher.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/admin/wecomAlertSender.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/artifactBlobStore.ts": {
+      "emptyCatch": 9,
+      "typeEscape": 0,
+      "syncIo": 63,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/cc5Runtime.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/cronWake.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/desktopEnsure.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/draftPreparation.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/platformBundle.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 20,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/supervisor.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/syntheticEvalOverlay.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/syntheticEvalOverlayRuntime.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 32,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/v3containerEvents.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/v3ensureRunning.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/v3idleSweep.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/v3migrationReconciler.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/v3orphanReconcile.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/v3prewarm.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/v3readiness.ts": {
+      "emptyCatch": 9,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/v3supervisor.ts": {
+      "emptyCatch": 6,
+      "typeEscape": 1,
+      "syncIo": 14,
+      "lintSuppress": 9
+    },
+    "packages/commercial/src/agent-sandbox/v3volumeGc.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent-sandbox/workspacePreparation.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/agent/lifecycle.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/auth/desktopIdentity.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/auth/login.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/auth/mail.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/auth/socialLogin.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/auth/verify.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/billing/codexFinalizer.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/billing/cursorAuditReconciler.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/billing/cursorExternalApiOutbox.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 2,
+      "syncIo": 11,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/billing/cursorExternalSettle.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/billing/durableAntigravityBilling.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/billing/modelAvailability.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/billing/modelCatalog.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/billing/pricing.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/billing/proxyBilling.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/billing/remoteDriverTurnBilling.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 1,
+      "syncIo": 10,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/billing/remoteNativeTurnBilling.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 3,
+      "syncIo": 5,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/billing/subscriptionRolloverSweeper.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/bootstrap/channelsAndAutoDreamBootstrap.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/bootstrap/chatBridgeBootstrap.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/bootstrap/internalProxyBootstrap.ts": {
+      "emptyCatch": 11,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/bootstrap/runtimeSupervisorBootstrap.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 11
+    },
+    "packages/commercial/src/bootstrap/shutdownBootstrap.ts": {
+      "emptyCatch": 32,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/bootstrap/v5WorkersBootstrap.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/bridgeSecret.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/chatgptProxy/server.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/compute-pool/baselineServer.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/compute-pool/computeHostsDiskMonitor.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/compute-pool/containerService.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/compute-pool/imageDistribute.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/compute-pool/imagePromote.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/compute-pool/nodeAgentClient.ts": {
+      "emptyCatch": 6,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/compute-pool/nodeBootstrap.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/compute-pool/queries.ts": {
+      "emptyCatch": 9,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/compute-pool/sshExec.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/connectors/engine/catalog.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/connectors/engine/credentialBag.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/connectors/engine/oauth2.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/connectors/engine/placement.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/connectors/engine/requestPlan.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/connectors/engine/tokenExchange.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/connectors/handlers.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/connectors/outboundPolicy.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/connectors/platformOauthApps.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/connectors/providers/feishu.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/connectors/providers/github.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/connectors/providers/imap.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/connectors/providers/notion.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/connectors/providers/shared.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/connectors/rpc.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/connectors/spec/compiler.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/db/boundedReadOnly.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/db/liveFrameMaintenanceScheduler.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/db/liveTurnFrames.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/db/liveUnitCheckpoints.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/db/migrate.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/db/modelSwitchCostContextReader.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/db/pgSessionsBackend.ts": {
+      "emptyCatch": 18,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/db/queries.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/db/serviceRestartLiveFold.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/db/sessionRecoveryEvidence.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/db/sessionSnapshot.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/db/threeLayerStateStore.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/deploy/controlListener.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/deploy/deployState.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/deploy/leaderBundle.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/deploy/leaderLease.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/desktop/deviceCa.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/dispatch/enginePreheatClient.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/dispatch/enginePreheatPreparation.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/dispatch/turnControlStore.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/dispatch/turnDispatchReconciler.ts": {
+      "emptyCatch": 12,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/egress/boxReplaySetup.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/egress/forwarder.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/egress/main.ts": {
+      "emptyCatch": 11,
+      "typeEscape": 1,
+      "syncIo": 7,
+      "lintSuppress": 2
+    },
+    "packages/commercial/src/egress/recoveryProber.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/flavor/assertFlavor.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 10,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/github/tokenStore.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/goal/goalStateService.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/admin/boxClaudePool.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/admin/codexCommissioning.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/admin/modelCatalog.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/admin/pools.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/adminStats.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/codexModelsFallbackCache.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/codexRelayTiming.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/containerApiProxy.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/containerFileProxy.ts": {
+      "emptyCatch": 12,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/containerInternalClient.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/coreMemoryLocalRanker.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/desktopBootstrap.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/desktopEnroll.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/desktopTlsListener.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/handlers.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/internalCodexRelay.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 4,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/internalCodexTokenRefresh.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/internalServerAuthored.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/internalSkillEmbed.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/internalSkillUsage.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/internalToolFailureAudit.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/losslessTurnTape.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/mediaSign.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 2
+    },
+    "packages/commercial/src/http/mediaThumbnail.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/officePreviewRoutes.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 12,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/org/membersRoutes.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/passiveRelayTiming.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxAccountResolver.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 5,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxCliVersion.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxExecTransport.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxExpiredClose.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxFailureDiagnosticSchema.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxFailureDiagnosticStore.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxMessagesMapper.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxNativeContextDiagnosis.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxNativeFile.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxNativePointer.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxPrelaunchControl.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxPreparedContinuation.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxProfileHealth.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxReplayCompleted.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxReplayMessageFile.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxStoredToolHandoff.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxSwitchCompaction.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxTerminalProof.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxTextFetch.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxTextUnknownObserver.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxToolCatalog.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxToolContinuation.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxToolFetch.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxToolFirstRound.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxToolResultPlan.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxToolResumePublish.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/boxUserStopCoordinator.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/claudeIdentityGuard.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/core.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/geminiGoBridge.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/openAiChatGoBridge.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/openAiResponsesGoBridge.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/providerHealthSink.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/shared.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/testing/boxContextTransportHarness.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/proxy/upstream.ts": {
+      "emptyCatch": 12,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/tunnelHealthzProbe.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/http/tunnelHttpReader.ts": {
+      "emptyCatch": 35,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/inbox/assets.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/inbox/email.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/index.ts": {
+      "emptyCatch": 10,
+      "typeEscape": 1,
+      "syncIo": 2,
+      "lintSuppress": 3
+    },
+    "packages/commercial/src/literatureProxy.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/literatureSkill.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/marketplace/aiReview.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/marketplace/marketplaceDb.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 8,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/marketplace/marketplaceRoutes.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/marketplace/platformPresets.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/media-generation/service.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/media-generation/store.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/media-generation/workerClient.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/media-studio/assemble.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/media-studio/compose/ass.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/media-studio/compose/runner.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/media-studio/http.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/media-studio/providers/registry.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/middleware/rateLimit.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/minimax/mediaBilling.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/minimax/mediaKey.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/muse/boxExecVideo.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/muse/delivery.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/muse/durable.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/muse/hub.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/muse/publicListener.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ocr/scnetFileUpload.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ocr/scnetResultDownload.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/openai/omniModeration.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/org/memberships.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/org/orgInvoices.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/org/orgLowBalance.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/org/orgSubscriptions.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/org/orgs.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/payment/hupijiao/client.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/payment/pendingOrdersExpirer.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/commercial/src/pendingDecisions/connectorActionPolicy.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/pendingDecisions/pgBrowserHandoffStore.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/pendingDecisions/sources.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/platform/platformEnvelopeBuilder.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/biliAccount.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 4,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/biliAccountObservability.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/browserRuntime.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/contracts.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/douyin.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 4,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/douyinObservability.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/knowledgePlanet.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 6,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/literatureDb/accountState.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/literatureDb/artifactStore.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/literatureDb/localCaptchaReader.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/literatureDb/login.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/literatureDb/observability.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/literatureDb/officialCaptchaReader.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/localBroker.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/localPlugins.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/localSandbox.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/runtime.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/weibo.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 6,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/weiboWriteObservability.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/zhihu.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 6,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/plugins/zhihuWriteObservability.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/projectLayerHostPorts.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 8,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/promptQueue/pgPromptQueueStore.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/qqbot/mediaIngest.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/qqbot/receiver.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/qqbot/service.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/remoteHosts/sshMux.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/remoteRelay/main.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 16,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/remoteRelay/server.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/research/externalExtract.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/research/fetchFulltext.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/research/ingest.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/research/minicheck.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/research/researchHandlers.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/research/researchProxy.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/selfheal/reconciler.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/selfheal/repairDispatcher.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/selfheal/sweeper.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/sites/browserHttp.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/sites/edgeAnalytics.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/sites/edgeClient.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/sites/edgeSandbox.ts": {
+      "emptyCatch": 14,
+      "typeEscape": 0,
+      "syncIo": 45,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/sites/edgeServer.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 74,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/sites/edgeSqlite.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/sites/repo.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/system-assistant/executorIdentity.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 11,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/system-assistant/helpBridge.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/system-assistant/pgReceipts.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/system-assistant/privateState.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 14,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/system-assistant/projectFormalInit.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/system-assistant/runtime.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/tutorials/communityTutorialRoutes.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/user/promptPrivacySupport.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/wechat/broker.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/wechat/imageIngest.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/wechat/inboundDispatcher.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/wechat/outboxWorker.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/authoritySigner.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 16,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/connections.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/containerLink.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/containerLinkRebuild.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/containerLinkTransport.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/containerPreviewBridge.ts": {
+      "emptyCatch": 13,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/desktopMux.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/desktopMuxResponder.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/desktopRegister.ts": {
+      "emptyCatch": 7,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/desktopTunnelRegistry.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/directContainerPreview.ts": {
+      "emptyCatch": 14,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/frontendBuild.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/liveBrowserBridge.ts": {
+      "emptyCatch": 15,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/seedDeclarationLoader.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/sessionRepoBindBridge.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/tunnelContainerSocket.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/turnPerformance.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/userChatBridge.ts": {
+      "emptyCatch": 92,
+      "typeEscape": 6,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/userChatBridgeLocalFallbackTransport.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/userErrorFrames.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/commercial/src/ws/voiceTranscribe.ts": {
+      "emptyCatch": 34,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/actionPolicyEngine.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/advisorConfigStore.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/advisorConsultStore.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/advisorHandlers.ts": {
+      "emptyCatch": 8,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/advisorMode.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/agentEfficiencyGuard.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/agentHandlers.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/agentMessage.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/agentRemote/nativeState.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 65,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/askUserPermissions.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/askUserSanitize.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/gateway/src/autoDream.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/autoDreamOptimizerClient.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/autoDreamSemanticConsolidator.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/boxContextBudget.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/boxIdleCompact.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 29,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cc5BridgePort.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 14,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cc5ContainerRuntime.ts": {
+      "emptyCatch": 10,
+      "typeEscape": 0,
+      "syncIo": 89,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cc5FixedTool.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 19,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cc5LaneOwnership.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 14,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cc5NativeToolExecutor.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cc5Relay.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 27,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cc5SshHost.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cc5StdioBridge.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cc5ToolCatalogCache.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 25,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cc5ToolHost.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cc5ToolObservation.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ccbMessageParser.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 32,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/channelHandlers.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 8,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/codexCommissioningWorker.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/codexRemoteHost.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/codexRemoteLane.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/codexRemotePort.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/codexRemoteRelay.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/codexRemoteTransport.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/containerPreview.ts": {
+      "emptyCatch": 26,
+      "typeEscape": 4,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/contentReviewStore.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 8,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cron.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 25,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cronDeliver.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/cronTaskWebhook.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/delegateAntigravityRoute.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/delegateCallbacks.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/delegateCancel.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/delegateDurable.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/delegateEngineBilling.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/delegateGrokRoute.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/delegateInflightSurface.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/delegateJobs.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/delegateProgress.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/delegateRemoteLane.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/delegateRuntime.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 1,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/delegateSupervision.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/documentParser.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/efficiencyHookConfig.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/antigravityAdapter.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/antigravityNativeTrajectory.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/antigravityPlatform.ts": {
+      "emptyCatch": 10,
+      "typeEscape": 0,
+      "syncIo": 29,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/antigravityPromptState.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 16,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/antigravityReadOnlyGuard.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 23,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/antigravitySwarmConcurrency.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 24,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/antigravitySwarmDirective.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/antigravitySwarmTelemetry.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 14,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/antigravitySwarmWatcher.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/antigravityToolBackfill.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 10,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/antigravityToolNormalize.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/boxIdleProofClient.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/boxLoginClient.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/boxUserStopClient.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/ccbAdapter.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/ccbFactory.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/ccbTranscriptRelocate.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/codexAdapter.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 4,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/codexAppServerNotifications.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 11,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/codexAppServerRunner.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 49,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/codexDelegateContext.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/codexLifecycle.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/codexRpcTransport.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 8,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/contextReference.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/cursorAdapter.ts": {
+      "emptyCatch": 13,
+      "typeEscape": 1,
+      "syncIo": 56,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/cursorBoxCc.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/cursorBoxCcAdapter.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/cursorBoxCcBridge.ts": {
+      "emptyCatch": 7,
+      "typeEscape": 0,
+      "syncIo": 5,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/cursorBoxCcInteractive.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/cursorBoxGptWeb.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 10,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/cursorCredentialSelection.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 5,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/cursorSandAdapter.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/cursorSandBox.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/cursorSandRelay.ts": {
+      "emptyCatch": 6,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/grokAdapter.ts": {
+      "emptyCatch": 8,
+      "typeEscape": 1,
+      "syncIo": 30,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/grokPlatform.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/resumeArtifacts.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 13,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/resumedEnvelopeDedup.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 11,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/swarmStallMonitor.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/zcodeAdapter.ts": {
+      "emptyCatch": 7,
+      "typeEscape": 2,
+      "syncIo": 10,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engine/zcodePlatform.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 10,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/engineNotifier.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/envProbe.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/eventBus.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/execEnv/containerLinkBrokerTransport.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/execEnv/jobRegistry.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/execEnv/toolBroker.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 14,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/execEnv/toolBrokerDiskSpill.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 27,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/figcheckRounds.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 12,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/gatewayFilePolicy.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 3
+    },
+    "packages/gateway/src/gatewayHttp.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 3,
+      "syncIo": 9,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/gatewayLifecycle.ts": {
+      "emptyCatch": 10,
+      "typeEscape": 6,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/gateway/src/httpMiscHandlers.ts": {
+      "emptyCatch": 24,
+      "typeEscape": 2,
+      "syncIo": 33,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/httpRange.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/httpUploadChunks.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 8,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/httpUploadStatic.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/inboundDispatch.ts": {
+      "emptyCatch": 8,
+      "typeEscape": 73,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/inferencePool/durableSettlementStore.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 17,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/inferencePool/localPoolDriver.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/jevContentReview.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/liveBrowserAutoResume.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/liveBrowserCdpHelpers.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 1,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/liveBrowserController.ts": {
+      "emptyCatch": 14,
+      "typeEscape": 0,
+      "syncIo": 26,
+      "lintSuppress": 1
+    },
+    "packages/gateway/src/liveBrowserSecurity.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/liveBrowserStream.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/localExecution.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 2
+    },
+    "packages/gateway/src/masterTurnLease.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/mcpMemoryEntry.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/mcpStdioGuard.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/mcpVisionServer.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 26,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/mcpWebContextServer.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/memoryTurnObserver.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/memoryTurnPolicyLease.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/modelCatalogClient.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 5,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocCiteCli.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocConnectCli.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocFigCheckCli.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocLitCli.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocMarketCli.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocOcrCli.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocOcrClient.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocPosterCli.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocRankCli.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocReportCli.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocResearchClient.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocReviewCli.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 22,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocReviewVerify.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 27,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocSlidesCli.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 21,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/ocTaskCli.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/officePreview.ts": {
+      "emptyCatch": 13,
+      "typeEscape": 0,
+      "syncIo": 44,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/openaiCompat.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/openedPath.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/passiveStageTiming.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/payloadOffloadGate.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 13,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/platformPrompts.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/presentRender.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/gateway/src/processGroupShutdown.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/projectAssetCollector.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/projectContextPreview.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/projectWorkspace.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/promptFreeze.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 11,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/promptQueueClient.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/promptQueueCoordinator.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/promptQueueDispatch.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/promptSlots.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/releaseJobStore.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/remotePool/containerLane.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 2,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/remotePool/driverWorkerClient.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/remotePool/relay.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/remotePool/remoteEngineAdapter.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 4,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/remotePool/remoteMediaMaterializer.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 18,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/remotePool/verificationWorker.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 5,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/remotePool/verificationWorkerHost.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/remoteSwarmLocal.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/remoteSwarmLocks.ts": {
+      "emptyCatch": 10,
+      "typeEscape": 0,
+      "syncIo": 42,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/remoteSwarmReconcile.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 31,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/remoteSwarmRuntime.ts": {
+      "emptyCatch": 6,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/remoteSwarmTools.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/resumeStore.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 14,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/routes/clientSessions.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/routes/officePreviewRoute.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/routes/platform.ts": {
+      "emptyCatch": 20,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/routes/preAuth.ts": {
+      "emptyCatch": 10,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/routes/sessionBackgroundRoute.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/routes/swarmCommandRoute.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 2,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/routes/system.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/routes/workspaceApi.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/runContextPersist.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/server.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 229,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/sessionAutoCompact.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/sessionBgCommands.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/sessionCheckpointStore.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 12,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/sessionLifecycle.ts": {
+      "emptyCatch": 6,
+      "typeEscape": 1,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/sessionManager.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 46,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/sessionRepoWorkspace.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/sessionSubmit.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 8,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/sessionTurnRunner.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 4,
+      "syncIo": 3,
+      "lintSuppress": 1
+    },
+    "packages/gateway/src/skillEvalGen.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/skillEvalGenJobs.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 5,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/skillEvalJobs.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/skillHandlers.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/skillTrainJobs.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/skillTrainRuns.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/gateway/src/storageSeam/engineStateCapsuleStore.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 55,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/subprocessRunner.ts": {
+      "emptyCatch": 6,
+      "typeEscape": 1,
+      "syncIo": 17,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/swarmCommand.ts": {
+      "emptyCatch": 6,
+      "typeEscape": 0,
+      "syncIo": 27,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/systemHelpRelay.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/taskboard/db/index.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/taskboard/guardrails.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/taskboard/http.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/taskboard/notify.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/taskboard/patrol.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/taskboard/projectWorkspaceFiles.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/taskboard/runSnapshots.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/turnDispatch.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/turnDispatchInbox.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/uploadChunkStore.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 20,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/uploadRetention.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/uploadTmpCleanup.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v3CodexRelay.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v3CronIndexPush.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v3InboxAlert.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v3InboxPost.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v3MarketplaceRelay.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v3MasterRetryQueue.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v3MasterSink.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v3ToolFailureReporter.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v3WechatOutbound.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v3WechatProactive.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v3WechatRetryQueue.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v5AntigravityRelay.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v5GrokRelay.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/v5ZcodeRelay.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/webContextBrowser.ts": {
+      "emptyCatch": 12,
+      "typeEscape": 0,
+      "syncIo": 17,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/webContextSafety.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 4,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/webRootOverlay.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 3,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/webSearchClient.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/webhooks.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/wsConnection.ts": {
+      "emptyCatch": 16,
+      "typeEscape": 57,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/kernel/src/log.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/mcp-memory/src/coreMemorySemantic.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/mcp-memory/src/delegateStartCli.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/mcp-memory/src/gatewayClient.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/mcp-memory/src/index.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 23,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/mcp-memory/src/localCliTools.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/mcp-memory/src/mcpStdioGuard.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/mcp-memory/src/memoryTools.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/mcp-memory/src/ocBashJobManager.ts": {
+      "emptyCatch": 8,
+      "typeEscape": 0,
+      "syncIo": 9,
+      "lintSuppress": 0
+    },
+    "packages/mcp-memory/src/ocMemoryCli.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/mcp-memory/src/remoteSwarmMcp.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/mcp-memory/src/skillReadTools.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/mcp-memory/src/taskboardMcp.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/protocol/src/containerPreviewAuth.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 6,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/protocol/src/cursorSessionAuth.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/protocol/src/dispatchAuthority.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/protocol/src/g8ReplayJudge.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/protocol/src/liveUnits.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 17,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/protocol/src/modelAuthority.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 5,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/clientSessionsPlan.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/contextArchive.ts": {
+      "emptyCatch": 7,
+      "typeEscape": 0,
+      "syncIo": 19,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/contextJanitor.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/hubStore.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/identityCompatAssets.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 5,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/idleNativeLock.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/idleRollback.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 9,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/indexPipeline.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/jsonl.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/kernelFileLock.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/marketplaceSync.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/memoryDedup.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/memoryDir.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/memoryDistill.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/memoryShared.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/migrateFtsCjk.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/multimodalSummary.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/profileControlBroker.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/projectContext.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 21,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/projectContextMigrate.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/projectFormalLedger.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 6,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/projectMemoryDir.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 5,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/projectMemoryLedger.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/projectRunSnapshot.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/projectSkillLedger.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 2,
+      "syncIo": 7,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/runtimeHygieneGc.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/sessionFileIo.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/sessionsDb.ts": {
+      "emptyCatch": 28,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/sessionsDbProjects.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 2
+    },
+    "packages/storage/src/sessionsMigrate.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/skillDraftStore.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 9,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/skillStore.ts": {
+      "emptyCatch": 5,
+      "typeEscape": 0,
+      "syncIo": 42,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/systemActions.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 9,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/taskStore.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/vectorStore.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/verifyFtsCjkCorpus.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 1,
+      "lintSuppress": 0
+    },
+    "packages/storage/src/wechatBindings.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/App.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/admin/lib/useAdminPoll.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/admin/pages/accountGroups/form.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/admin/pages/accounts/AccountFormModal.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/admin/pages/accounts/AccountInfoModals.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/admin/pages/accounts/form.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/admin/pages/alerts/formBits.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/admin/pages/alerts/useReloadable.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 2
+    },
+    "packages/web-react/src/admin/pages/audit/AdminAuditTab.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/admin/pages/audit/TraceLookup.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/admin/pages/audit/diff.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/admin/pages/dashboard/index.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/admin/pages/dashboard/useLoad.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/admin/pages/egressProxies/form.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/admin/pages/pools/ApiKeyFormModal.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/admin/pages/users/AdjustCreditsModal.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/admin/pages/users/UserDetailSheet.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/admin/pages/users/useLoad.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/AuthGate.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/CodeBlock.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/ComposerPrediction.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/ContainerWebPreview.tsx": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/DialogFallback.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/HtmlEmbed.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/ImageAnnotationEditor.tsx": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/ImageViewer.tsx": {
+      "emptyCatch": 6,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/InspectorPanel.tsx": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/MarkdownImpl.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/MediaTaskCenter.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/RichBlocks.tsx": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 2
+    },
+    "packages/web-react/src/components/SettingsCenter.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/ShareDialog.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/Sidebar.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 4
+    },
+    "packages/web-react/src/components/TurnstileWidget.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/charts.tsx": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/chat/InlineVideoActive.tsx": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/chat/LiveBrowserCanvas.tsx": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/chat/OutputPreview.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/chat/OutputsAuxParts.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/chat/PinnedTaskTracker.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 2
+    },
+    "packages/web-react/src/components/chat/ProcessDisclosure.tsx": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/chat/QuickAskWindow.tsx": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/chat/TurnActivity.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/chat/inlineVideoSlot.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/chat/inspectorState.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/chat/lazyTimelineCards.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 7,
+      "syncIo": 0,
+      "lintSuppress": 6
+    },
+    "packages/web-react/src/components/chat/lazyTurnErrorNotice.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/chat/phaseTimeline.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/chat/researchEvidence.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/iui/BiliBlocks.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/iui/GalleryLightbox.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/iui/InteractiveBlocks.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/iui/MediaBlocks.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/iui/StudioBlocks.tsx": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/iui/TableBlock.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/iui/TextBlocks.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/iui/blocks.tsx": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/iui/blogChat.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/iui/shell.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/lazyModelSelectorPanel.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/manage/CronPanel.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/marketplace/DetailModal.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 2
+    },
+    "packages/web-react/src/components/marketplace/PublishPanel.tsx": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/marketplace/ReviewPanel.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/marketplace/useMarketplaceRevision.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/org/InvoicesTab.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/org/OrgPayQr.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/org/OrgTopupDialog.tsx": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/org/ReportsTab.tsx": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/payment/PendingPaymentRecovery.tsx": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/project/ProjectHome.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/settings/FeedbackTab.tsx": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/settings/SubscriptionDialog.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/settings/UsageTab.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/settings/plugins/BindDialogs.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/settings/plugins/shared.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/sidebar/PendingDecisionsDock.tsx": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/sites/SiteSettingsTab.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/studio/Waveform.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/studio/music/MusicEditor.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/studio/music/usePagedSearch.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/studio/pages/Review.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/taskboard/TicketDrawer.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/taskboard/useTaskboard.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/tool/BrowserStepCard.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 2
+    },
+    "packages/web-react/src/components/tool/bodies.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tool/browserDetect.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tool/browserSteps.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/tool/connectorCards.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tool/delegateFanoutCard.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/tool/expandable.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/tool/format.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tool/highlight.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tool/lazyToolBody.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tool/meta.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tool/partialJson.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tool/releaseCards.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tool/researchCards.tsx": {
+      "emptyCatch": 3,
+      "typeEscape": 4,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tool/status.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tool/taskApprovalCoalesce.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tutorials/CommunityTutorials.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/tutorials/PracticalGuideView.tsx": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tutorials/QuickLookupView.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/tutorials/blog/CommunityBlog.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/tutorials/blog/blogLib.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/ui/CopyChip.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/components/ui/SegmentedControl.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/components/ui/Tabs.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 3
+    },
+    "packages/web-react/src/components/ui/retryableLazy.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/hooks/useAppDeepLinks.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 2
+    },
+    "packages/web-react/src/hooks/useAppNavigationActions.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 12
+    },
+    "packages/web-react/src/hooks/useAuth.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/hooks/useChatCardActions.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 4
+    },
+    "packages/web-react/src/hooks/useChatProjects.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/hooks/useChatScroll.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 9
+    },
+    "packages/web-react/src/hooks/useComposerSend.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/hooks/useContainerPreview.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/hooks/useInbox.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/hooks/useInflightDelegates.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/hooks/useLocalComposerPrefs.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/hooks/useProjectScope.tsx": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/hooks/useResizableWidth.ts": {
+      "emptyCatch": 3,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/hooks/useSessionBackgroundTasks.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/hooks/useSessionList.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/hooks/useSessionModelAndCollab.tsx": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 3
+    },
+    "packages/web-react/src/hooks/useStudioProviders.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/hooks/useTheme.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/hooks/useUnreadSessions.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/hooks/useVoiceInput.ts": {
+      "emptyCatch": 10,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/api.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/api/http.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/api/lazyDomain.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 3,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/api/systemActionsApi.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/api/uploadChunkClient.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/api/uploadTransport.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/appUpdate.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/authBroadcast.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/authHint.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/authSession.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/blogDraftClear.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/chat/order.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/chat/pure.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/chat/reducer.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/chat/sessionBackgroundTasks.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/chat/shareCard.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/chat/socket.ts": {
+      "emptyCatch": 10,
+      "typeEscape": 4,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/chat/tapePayloadCore.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/chat/timelineBlankProbe.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/chat/timelinePaint.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/collaborationSend.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/composerDraft.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/intelligentUi.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/liveBrowserStreamClient.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/marketplace.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/paletteRecents.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/pendingPayment.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/persist.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 2,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/recentModels.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/refreshCrossTabLock.ts": {
+      "emptyCatch": 4,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/sessionContextTier.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/sessionEffort.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/sessionServiceTier.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/sessionSwarmMode.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/sidebarCollapsed.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/studio/annotations.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/taskboard.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/teamMode.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/timeline/shadowLifecycle.ts": {
+      "emptyCatch": 2,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/tutorialCaseCatalog.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/tutorialProgress.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/unfiledSuggest.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/web-react/src/lib/usePluginDirectory.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 1
+    },
+    "packages/web-react/src/test/setup.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 1,
+      "syncIo": 0,
+      "lintSuppress": 0
+    }
+  }
+}
