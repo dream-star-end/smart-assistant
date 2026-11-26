@@ -836,7 +836,7 @@ describe('B5. 45s debounce, 3-state CI classification, trusted events & safe FF 
         `echo "$*" >> ${q(startsLog)}`,
         `ln -sfn ${q(rel2)} ${q(join(sb.dir, 'live'))}`,
         `printf 'phase=committed\\n' > ${q(join(runDir, 'survivor.state'))}`,
-        `sqlite3 ${q(db)} "UPDATE train SET status='committed', rel_path='${rel2}', finished_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id='$OC_V5_LEASE_TRAIN_ID';"`,
+        `sqlite3 -cmd ".timeout 10000" ${q(db)} "UPDATE train SET status='committed', rel_path='${rel2}', finished_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id='$OC_V5_LEASE_TRAIN_ID';"`,
         'exit 0',
       ].join('\n'),
     )
@@ -971,8 +971,8 @@ describe('B5. 45s debounce, 3-state CI classification, trusted events & safe FF 
     assert.equal(r.status, 0, r.stderr)
     assert.equal(sqlVal('SELECT COUNT(*) FROM train;'), '1', 'green CI must dispatch 1 train')
 
-    // Wait briefly for fakeDeploy background process to finish commit
-    for (let i = 0; i < 40; i++) {
+    // Wait for fakeDeploy background process to finish commit (CI runners may take >2s under load)
+    for (let i = 0; i < 200; i++) {
       if (sqlVal('SELECT status FROM train;') === 'committed') break
       spawnSync('sleep', ['0.05'])
     }
@@ -1547,6 +1547,13 @@ print(d)
     writeFileSync(failRunner, '#!/usr/bin/env bash\nexit 1\n')
     chmodSync(failRunner, 0o755)
 
+    const b6GovRoot = join(sb.dir, 'b6-governor')
+    const b6GovCtrl = join(b6GovRoot, 'control')
+    const b6GovBin = join(sb.dir, 'b6-fake-oc-governor')
+    mkdirSync(b6GovCtrl, { recursive: true })
+    writeFileSync(b6GovBin, '#!/usr/bin/env bash\nexit 0\n')
+    chmodSync(b6GovBin, 0o755)
+
     const env = {
       ...sb.env,
       LEASE_DB: db,
@@ -1555,6 +1562,9 @@ print(d)
       MASTER_RELEASES_ROOT: releases,
       MASTER_LIVE_LINK: liveLink,
       SURVIVOR_STATE: survState,
+      OC_GOVERNOR_ROOT: b6GovRoot,
+      OC_V5_GOVERNOR_CONTROL_DIR: b6GovCtrl,
+      OC_V5_GOVERNOR_BIN: b6GovBin,
       OC_V5_RETENTION_SETTLE_SEC: '0',
       OC_V5_RETENTION_HEALTHZ_URL: healthzUrl,
       OC_V5_RETENTION_HEALTHZ_ATTEMPTS: '2',
