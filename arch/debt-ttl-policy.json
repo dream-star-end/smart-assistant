@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "note": "OCV5-906 Debt TTL Decay Ratchet & Auto Debt-First Feature Freeze Policy. Effective from 2026-12-03 so the initial landing window on 2026-11-26 (W47-48 41.9% rework rate) calibrates in advisory mode before auto-freeze activates.",
+  "anchorDate": "2026-11-26",
+  "effectiveFrom": "2026-12-03",
+  "decayTargets": {
+    "violationsBaseline": {
+      "path": "arch/violations-baseline.json",
+      "anchorTotal": 3448,
+      "anchorR2Total": 1191,
+      "monthlyTotalDecayRate": 0.03,
+      "quarterlyTotalDecayRate": 0.10,
+      "monthlyR2DecayRate": 0.05,
+      "quarterlyR2DecayRate": 0.15
+    },
+    "fileSizeBaseline": {
+      "path": ".github/file-size-baseline.json",
+      "anchorRedFiles": 18,
+      "anchorCssFiles": 2,
+      "anchorYellowFiles": 47,
+      "anchorTotalTrackedLines": 227587,
+      "monthlyRedFileReduction": 1,
+      "quarterlyTotalLinesDecayRate": 0.05
+    }
+  },
+  "ttlPolicy": {
+    "maxExceptionDays": 30,
+    "debtFirstExpiredThreshold": 3,
+    "sources": {
+      "fileSizeExceptions": ".github/file-size-ratchet-exceptions.json",
+      "featureFlagsRegistry": "deploy/v5/feature-flags-registry.json"
+    },
+    "debtExemptions": []
+  },
+  "debtFirstPolicy": {
+    "windowWeeks": 2,
+    "triggerReworkRatio": 0.40,
+    "releaseReworkRatio": 0.30,
+    "reworkPrefixes": ["fix", "bug"],
+    "blockedPrefixesInDebtFirst": ["feat"],
+    "allowedPrefixesInDebtFirst": [
+      "bug",
+      "fix",
+      "refactor",
+      "chore",
+      "ci",
+      "docs",
+      "perf",
+      "test",
+      "revert"
+    ],
+    "defaultModeFile": "/opt/openclaude/harness-gate/control/mode.json"
+  }
+}

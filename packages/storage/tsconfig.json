@@ -4,5 +4,8 @@
     "outDir": "dist-types",
     "tsBuildInfoFile": "dist-types/.tsbuildinfo"
   },
-  "include": ["src"]
+  "include": ["src"],
+  "references": [
+    { "path": "../kernel" }
+  ]
 }
