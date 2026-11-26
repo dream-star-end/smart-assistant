@@ -9,11 +9,11 @@
     "lintSuppress"
   ],
   "totals": {
-    "emptyCatch": 1588,
+    "emptyCatch": 1593,
     "typeEscape": 911,
-    "syncIo": 2252,
+    "syncIo": 2269,
     "lintSuppress": 177,
-    "all": 4928
+    "all": 4950
   },
   "files": {
     "packages/channels/feishu/src/client.ts": {
@@ -391,7 +391,7 @@
     "packages/commercial/src/agent-sandbox/artifactBlobStore.ts": {
       "emptyCatch": 9,
       "typeEscape": 0,
-      "syncIo": 63,
+      "syncIo": 65,
       "lintSuppress": 0
     },
     "packages/commercial/src/agent-sandbox/cc5Runtime.ts": {
@@ -2423,7 +2423,7 @@
       "lintSuppress": 0
     },
     "packages/gateway/src/engine/antigravityPromptState.ts": {
-      "emptyCatch": 5,
+      "emptyCatch": 6,
       "typeEscape": 0,
       "syncIo": 16,
       "lintSuppress": 0
@@ -2623,7 +2623,7 @@
     "packages/gateway/src/engine/resumeArtifacts.ts": {
       "emptyCatch": 0,
       "typeEscape": 0,
-      "syncIo": 13,
+      "syncIo": 17,
       "lintSuppress": 0
     },
     "packages/gateway/src/engine/resumedEnvelopeDedup.ts": {
@@ -3191,9 +3191,9 @@
       "lintSuppress": 0
     },
     "packages/gateway/src/sessionCheckpointStore.ts": {
-      "emptyCatch": 2,
+      "emptyCatch": 4,
       "typeEscape": 0,
-      "syncIo": 20,
+      "syncIo": 29,
       "lintSuppress": 0
     },
     "packages/gateway/src/sessionLifecycle.ts": {
@@ -3268,6 +3268,18 @@
       "syncIo": 55,
       "lintSuppress": 0
     },
+    "packages/gateway/src/storageSeam/remoteArtifactBlobClient.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/storageSeam/remoteSessionAuthorityClient.ts": {
+      "emptyCatch": 1,
+      "typeEscape": 0,
+      "syncIo": 0,
+      "lintSuppress": 0
+    },
     "packages/gateway/src/subprocessRunner.ts": {
       "emptyCatch": 6,
       "typeEscape": 1,
@@ -3326,6 +3338,12 @@
       "emptyCatch": 1,
       "typeEscape": 0,
       "syncIo": 0,
+      "lintSuppress": 0
+    },
+    "packages/gateway/src/turnCapsuleRuntime.ts": {
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 2,
       "lintSuppress": 0
     },
     "packages/gateway/src/turnDispatch.ts": {

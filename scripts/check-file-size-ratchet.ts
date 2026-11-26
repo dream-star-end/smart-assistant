@@ -98,7 +98,7 @@ export interface ApprovedCalibration {
 export const APPROVED_CALIBRATION: ApprovedCalibration = {
   ticket: 'OCV5-904',
   fromBaselineSha256: '458c08ed73c9fc50dacadb732ba581fd81a7a3c8f306cffef0312f13b72d37ba',
-  toBaselineSha256: 'fad80378e3afc652537a8dfddabb1ee6f643d1c8a4fae9b57beb6657c917b976',
+  toBaselineSha256: 'b80389ab2bb12d794f69ec34b383a5d368ca36f88c2d98bea0dd1c8afa983cd4',
 }
 
 export function sha256Hex(text: string): string {

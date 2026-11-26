@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "windowLines": 12,
   "summary": {
-    "scannedFiles": 2625,
-    "totalClusters": 1448,
-    "totalInstances": 5190
+    "scannedFiles": 2634,
+    "totalClusters": 1455,
+    "totalInstances": 5204
   },
   "topHotspots": [
     {
@@ -528,6 +528,10 @@
       "instances": 4
     },
     "0302327e4c2d51d099284163754081fbc49d9a180f596c4c2a744382bdee54aa": {
+      "files": 2,
+      "instances": 2
+    },
+    "03074641cdc8e308dcd8f83a0eec1269a2b8eecb7dac27e1277b5b52edf7b2f5": {
       "files": 2,
       "instances": 2
     },
@@ -1351,6 +1355,10 @@
       "files": 3,
       "instances": 3
     },
+    "253770f450940bf0098e46befd837366ffab858d5a899bd3d6b96f2ec05198b2": {
+      "files": 2,
+      "instances": 2
+    },
     "2538e5a665b49126a296dbeaa26d14699e601cc67740e072590813cbc5c74f3f": {
       "files": 2,
       "instances": 2
@@ -1692,6 +1700,10 @@
       "instances": 2
     },
     "339e4073a457b09df5d23f969fe7d09cb6a120970892946817fcbe914d20defc": {
+      "files": 2,
+      "instances": 2
+    },
+    "33a42d4d71f0922f44e96468cb37d94d36303385e09fc44cd00b9b62dc987cb5": {
       "files": 2,
       "instances": 2
     },
@@ -2783,6 +2795,10 @@
       "files": 2,
       "instances": 2
     },
+    "6203295192fd094c45a9881049e937e76f660900aa300d9760bab55bcd596188": {
+      "files": 2,
+      "instances": 2
+    },
     "62b800080e5cf20ae0a60ac3bb11b52ec3fcc557698a3d9a611fcc8fbc9dba9f": {
       "files": 2,
       "instances": 2
@@ -3754,6 +3770,10 @@
     "892f56c9a426e6b15536feb31e41304763620b74a58e6ba07bcf7f90a4e939e9": {
       "files": 5,
       "instances": 5
+    },
+    "89b9a799c5afc8661e93b0d2500930190e8a5e27f01e97aac785de9d580d7938": {
+      "files": 2,
+      "instances": 2
     },
     "8a0fadbd731aa849f9ce3d98a8df22101f67e343918f2338a36e3ead82de0ca9": {
       "files": 2,
@@ -4943,6 +4963,10 @@
       "files": 2,
       "instances": 2
     },
+    "c3d62a820a885af2e9135a79a4501d9fa7a0dba0cd4454e56bd452d7b552919f": {
+      "files": 2,
+      "instances": 2
+    },
     "c4216c6f881c7355c76a24ecdc98077179ff51430e9b96bd872e370b56f61ad0": {
       "files": 2,
       "instances": 2
@@ -5458,6 +5482,10 @@
     "d6f6f9570c34c8ac8a93167894c55bf74c6dcf0359ec9b65d42621a0c2a03d65": {
       "files": 5,
       "instances": 5
+    },
+    "d706f3aa881d8c39615e1c78f356f66fa4ca92fb51c0cfe0f1acdcfa28ffacf4": {
+      "files": 2,
+      "instances": 2
     },
     "d75ffce1d7daca3fae0f2e9ff88b3eba21e2751f96021bcf0e2fa799260e87cf": {
       "files": 2,

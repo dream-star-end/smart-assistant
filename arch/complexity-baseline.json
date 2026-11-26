@@ -6,10 +6,10 @@
     "maxNesting": 5
   },
   "summary": {
-    "exceedingFunctions": 2048,
-    "overLines": 1325,
-    "overCcDirect": 1386,
-    "overMaxNesting": 66
+    "exceedingFunctions": 2058,
+    "overLines": 1333,
+    "overCcDirect": 1391,
+    "overMaxNesting": 67
   },
   "functions": {
     "packages/channels/feishu/src/cards.ts::parseFeishuApprovalCardCallback": {
@@ -1108,7 +1108,7 @@
       "maxNesting": 3
     },
     "packages/commercial/src/bootstrap/internalProxyBootstrap.ts::bootstrapInternalProxyAndListeners": {
-      "lines": 998,
+      "lines": 1014,
       "ccDirect": 31,
       "maxNesting": 5
     },
@@ -1141,6 +1141,11 @@
       "lines": 228,
       "ccDirect": 32,
       "maxNesting": 3
+    },
+    "packages/commercial/src/bootstrap/runtimeSupervisorBootstrap.ts::bootstrapMailerBridgeAndAuthority": {
+      "lines": 124,
+      "ccDirect": 20,
+      "maxNesting": 2
     },
     "packages/commercial/src/bootstrap/runtimeSupervisorBootstrap.ts::bootstrapPluginsRuntime": {
       "lines": 168,
@@ -1657,6 +1662,16 @@
       "ccDirect": 8,
       "maxNesting": 1
     },
+    "packages/commercial/src/db/threeLayerContainerPatch.ts::patchContainerCapsuleRef": {
+      "lines": 105,
+      "ccDirect": 6,
+      "maxNesting": 0
+    },
+    "packages/commercial/src/db/threeLayerContainerPatch.ts::patchContainerResumePointer": {
+      "lines": 150,
+      "ccDirect": 6,
+      "maxNesting": 1
+    },
     "packages/commercial/src/db/threeLayerPendingInstall.ts::extractPendingInstallMigration": {
       "lines": 39,
       "ccDirect": 21,
@@ -2020,6 +2035,16 @@
     "packages/commercial/src/http/internalAntigravityRelay.ts::makeAntigravityRelayHandler": {
       "lines": 508,
       "ccDirect": 12,
+      "maxNesting": 0
+    },
+    "packages/commercial/src/http/internalArtifactBlobs.ts::makeInternalArtifactBlobsHandler": {
+      "lines": 362,
+      "ccDirect": 1,
+      "maxNesting": 0
+    },
+    "packages/commercial/src/http/internalAuthorityState.ts::makeInternalAuthorityStateHandler": {
+      "lines": 437,
+      "ccDirect": 3,
       "maxNesting": 0
     },
     "packages/commercial/src/http/internalCodexRelay.ts::decodeValidatedImageBase64": {
@@ -2823,7 +2848,7 @@
       "maxNesting": 0
     },
     "packages/commercial/src/index.ts::registerCommercial": {
-      "lines": 2491,
+      "lines": 2495,
       "ccDirect": 196,
       "maxNesting": 4
     },
@@ -5367,6 +5392,11 @@
       "ccDirect": 11,
       "maxNesting": 7
     },
+    "packages/gateway/src/engine/resumeArtifacts.ts::probeResumeArtifactForCapsule": {
+      "lines": 62,
+      "ccDirect": 39,
+      "maxNesting": 3
+    },
     "packages/gateway/src/engine/swarmStallMonitor.ts::SwarmStallMonitor.diagnoseStall": {
       "lines": 164,
       "ccDirect": 30,
@@ -6187,6 +6217,11 @@
       "ccDirect": 15,
       "maxNesting": 2
     },
+    "packages/gateway/src/sessionAuthorityHook.ts::prepareSessionAuthorityBeforeCreate": {
+      "lines": 103,
+      "ccDirect": 35,
+      "maxNesting": 4
+    },
     "packages/gateway/src/sessionAutoCompact.ts::isSafeUniversalOverflowSummary": {
       "lines": 36,
       "ccDirect": 27,
@@ -6238,7 +6273,7 @@
       "maxNesting": 1
     },
     "packages/gateway/src/sessionLifecycle.ts::compactSession": {
-      "lines": 300,
+      "lines": 295,
       "ccDirect": 82,
       "maxNesting": 4
     },
@@ -6298,8 +6333,8 @@
       "maxNesting": 2
     },
     "packages/gateway/src/sessionSubmit.ts::_getOrCreateExclusive": {
-      "lines": 672,
-      "ccDirect": 186,
+      "lines": 673,
+      "ccDirect": 190,
       "maxNesting": 7
     },
     "packages/gateway/src/sessionSubmit.ts::finishIdleUnderLock": {
@@ -6313,13 +6348,13 @@
       "maxNesting": 0
     },
     "packages/gateway/src/sessionSubmit.ts::recordExternalTurn": {
-      "lines": 127,
+      "lines": 122,
       "ccDirect": 11,
       "maxNesting": 2
     },
     "packages/gateway/src/sessionSubmit.ts::submit": {
-      "lines": 1180,
-      "ccDirect": 277,
+      "lines": 1175,
+      "ccDirect": 280,
       "maxNesting": 7
     },
     "packages/gateway/src/sessionTail.ts::_persistTailBatch": {
@@ -6333,12 +6368,12 @@
       "maxNesting": 1
     },
     "packages/gateway/src/sessionTurnRunner.ts::_runOneTurn": {
-      "lines": 2163,
+      "lines": 2158,
       "ccDirect": 1,
       "maxNesting": 1
     },
     "packages/gateway/src/sessionTurnRunner.ts::_runOneTurn.finalizeTurn": {
-      "lines": 1008,
+      "lines": 1003,
       "ccDirect": 259,
       "maxNesting": 4
     },
@@ -6555,6 +6590,21 @@
     "packages/gateway/src/taskboard/stateMachine.ts::canTransition": {
       "lines": 65,
       "ccDirect": 24,
+      "maxNesting": 3
+    },
+    "packages/gateway/src/turnAuthorityRuntime.ts::AuthorityStateRuntime.executeNarrowResumeOp": {
+      "lines": 84,
+      "ccDirect": 42,
+      "maxNesting": 2
+    },
+    "packages/gateway/src/turnAuthorityRuntime.ts::AuthorityStateRuntime.hydrateSessionIfMissing": {
+      "lines": 163,
+      "ccDirect": 49,
+      "maxNesting": 6
+    },
+    "packages/gateway/src/turnCapsuleRuntime.ts::EngineCapsuleRuntime.exportSessionCapsuleToAuthority": {
+      "lines": 101,
+      "ccDirect": 23,
       "maxNesting": 3
     },
     "packages/gateway/src/turnDispatchInbox.ts::queryMasterTapeState": {

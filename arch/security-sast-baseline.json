@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
   "summary": {
-    "totalEntries": 126,
-    "totalCount": 464,
+    "totalEntries": 127,
+    "totalCount": 473,
     "byRule": {
-      "SEC-SAST-SQL-INTERPOLATION": 268,
+      "SEC-SAST-SQL-INTERPOLATION": 277,
       "SEC-SAST-UNBOUNDED-LOOP-AWAIT": 196
     }
   },
@@ -70,6 +70,7 @@
     "packages/commercial/src/db/pgSessionsBackend.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 18,
     "packages/commercial/src/db/serviceRestartLiveFold.ts|SEC-SAST-SQL-INTERPOLATION": 2,
     "packages/commercial/src/db/sessionSnapshot.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 1,
+    "packages/commercial/src/db/threeLayerContainerPatch.ts|SEC-SAST-SQL-INTERPOLATION": 9,
     "packages/commercial/src/db/threeLayerStateStore.ts|SEC-SAST-SQL-INTERPOLATION": 24,
     "packages/commercial/src/deploy/deployState.ts|SEC-SAST-SQL-INTERPOLATION": 3,
     "packages/commercial/src/deploy/deployState.ts|SEC-SAST-UNBOUNDED-LOOP-AWAIT": 1,
