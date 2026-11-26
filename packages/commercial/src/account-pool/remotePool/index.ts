@@ -68,13 +68,57 @@ export type {
 export {
   PRE_DISPATCH_REMOTE_FALLBACK_ERROR_CODES,
   createSelfhostCrossPoolFallbackSelector,
+  createSelfhostForcedLocalMigrationResolver,
   createSelfhostReturnToRemoteGrantResolver,
   isPreDispatchRemotePoolFailure,
 } from './selfhostCrossPoolSelector.js'
 export type {
+  ContinuityAppliedVerifier,
+  ContinuityVerificationInput,
+  ContinuityVerificationResult,
   CrossPoolFallbackMigrationGrant,
   SelfhostCrossPoolFallbackInput,
   SelfhostCrossPoolFallbackResult,
   SelfhostCrossPoolSelectorDeps,
+  SelfhostForcedLocalMigrationInput,
   SelfhostReturnToRemoteInput,
 } from './selfhostCrossPoolSelector.js'
+export {
+  CROSS_POOL_CHECKPOINT_MAX_CHARS,
+  buildCrossPoolAnchoredSummary,
+  ensureCrossPoolRollingCheckpoint,
+} from './crossPoolContinuity.js'
+export type {
+  BuildCrossPoolAnchoredSummaryOptions,
+  CrossPoolAnchoredSummary,
+  EnsureCrossPoolRollingCheckpointInput,
+} from './crossPoolContinuity.js'
+export {
+  DEFAULT_LOCAL_POOL_PRIORITY,
+  DEFAULT_REMOTE_POOL_PRIORITY,
+  ENGINE_FAMILY_BY_AUTHORITY,
+  deriveLogicalModelBindingsFromCatalog,
+  deriveLogicalModelCapabilityFromCatalogEntry,
+  loadCatalogBindingSourceEntriesFromDb,
+  resolveBindingDriverIdForEngine,
+  resolveSelfhostLogicalModelPoolTarget,
+  selectPeekBindingCandidate,
+  syncLogicalModelPoolBindingsFromCatalog,
+  validateExecutableBindingTuple,
+} from './logicalModelBindingsSync.js'
+export type {
+  BindingTupleValidationFailureCode,
+  CatalogBindingSourceEntry,
+  CatalogBindingSourceInput,
+  DeriveLogicalModelBindingsOptions,
+  ExecutableInferencePoolKind,
+  PoolTransitionRequirement,
+  ResolveSelfhostLogicalModelPoolTargetInput,
+  ResolveSelfhostLogicalModelPoolTargetResult,
+  SelectPeekBindingCandidateInput,
+  SelfhostLogicalModelResolutionFailureCode,
+  SyncLogicalModelBindingsOptions,
+  SyncLogicalModelBindingsResult,
+  ValidateExecutableBindingTupleInput,
+  ValidateExecutableBindingTupleResult,
+} from './logicalModelBindingsSync.js'

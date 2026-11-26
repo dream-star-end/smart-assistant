@@ -1,10 +1,407 @@
+import { createHash } from "node:crypto";
 import {
   MODEL_AUTHORITY_FIELD,
+  type AuthoritativeRollingCheckpoint,
   type AuthorityPoolMigrationGrant,
   type ModelAuthorityBundle,
   type RemoteExecutionBackend,
 } from "@openclaude/protocol";
+import type {
+  ContinuityAppliedVerifier,
+  PrepareRollingCheckpointCallback,
+} from "../account-pool/remotePool/selfhostCrossPoolSelector.js";
 import type { Logger } from "../logging/logger.js";
+
+export const CROSS_POOL_CHECKPOINT_FIELD = "_crossPoolCheckpoint" as const;
+export const CROSS_POOL_CHECKPOINT_WIRE_VERSION = 1 as const;
+export const CROSS_POOL_CHECKPOINT_MAX_SUMMARY_CHARS = 16_384;
+export const MIGRATION_INSTALL_RECEIPT_TYPE = "outbound.control.migration_install_receipt" as const;
+const CROSS_POOL_CHECKPOINT_MAX_UTF8_BYTES = 49_152;
+const MIGRATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
+
+export interface PendingMigrationInstallRecord {
+  readonly sessionKey: string;
+  readonly placementEpoch: number;
+  readonly migrationId: string;
+  readonly continuityTier?: string;
+  readonly checkpointGeneration?: string | null;
+}
+
+export interface MigrationInstallDispatchLookupRecord {
+  readonly clientMessageId: string;
+  readonly dispatchId: string;
+  readonly attemptNo: number;
+  readonly sessionId?: string;
+  readonly pendingMigrationInstall?: PendingMigrationInstallRecord;
+}
+
+export interface MigrationInstallReceiptContext {
+  readonly uid: number | bigint;
+  readonly admittedDispatches: ReadonlyMap<string, MigrationInstallDispatchLookupRecord>;
+  readonly pendingMigrationInstalls?: Map<string, MigrationInstallDispatchLookupRecord>;
+  readonly markPlacementMigrationInstalled?: (args: {
+    readonly uid: number;
+    readonly sessionKey: string;
+    readonly placementEpoch: number;
+    readonly migrationId: string;
+    readonly checkpointGeneration: string | null;
+    readonly consumedByTurnKey: string;
+    readonly requireWarmCheckpointMatch: boolean;
+  }) => Promise<unknown>;
+  readonly onInstalled?: (record: MigrationInstallDispatchLookupRecord) => void;
+  readonly warn?: (message: string, meta: Record<string, unknown>) => void;
+}
+
+/**
+ * OCV5-902 B1: Only un-upgraded legacy containers performing a non-warm (`cold_degraded`)
+ * migration may fall back to clearing `pendingInstallMigration` from a generic `running` or
+ * `terminal` dispatch receipt. NEVER on `'queued'`, and NEVER for `tape_rebuilt`!
+ */
+export function shouldMarkInstallFromDispatchReceipt(
+  pending: PendingMigrationInstallRecord | null | undefined,
+  receiptState: unknown,
+): boolean {
+  if (!pending) return false;
+  if (pending.continuityTier === "tape_rebuilt") return false;
+  if (
+    typeof pending.checkpointGeneration === "string" &&
+    pending.checkpointGeneration.trim().length > 0
+  ) {
+    return false;
+  }
+  return receiptState === "running" || receiptState === "terminal";
+}
+
+/**
+ * OCV5-902 B1: Clears legacy `cold_degraded` pending installs on verified `running`/`terminal`
+ * dispatch receipts (including follow-up receipts after `queued` dropped `admittedDispatches`).
+ * Never fires on `queued` or `tape_rebuilt`, and keeps `pendingMigrationInstalls` intact on PG failure.
+ */
+export function tryMarkLegacyColdInstallFromReceipt(
+  receipt: {
+    readonly clientMessageId: string;
+    readonly dispatchId: string;
+    readonly attemptNo: number;
+    readonly sessionId: string;
+    readonly state: unknown;
+  },
+  ctx: {
+    readonly uid: number | bigint;
+    readonly pendingMigrationInstalls: Map<string, MigrationInstallDispatchLookupRecord>;
+    readonly markPlacementMigrationInstalled?: MigrationInstallReceiptContext["markPlacementMigrationInstalled"];
+    readonly warn?: (message: string, meta: Record<string, unknown>) => void;
+  },
+): void {
+  const rec = ctx.pendingMigrationInstalls.get(receipt.clientMessageId);
+  const pending = rec?.pendingMigrationInstall;
+  if (!rec || !pending || !ctx.markPlacementMigrationInstalled) return;
+  if (
+    rec.dispatchId !== receipt.dispatchId ||
+    rec.attemptNo !== receipt.attemptNo ||
+    (typeof rec.sessionId === "string" && rec.sessionId !== receipt.sessionId)
+  ) {
+    return;
+  }
+  if (!shouldMarkInstallFromDispatchReceipt(pending, receipt.state)) return;
+  void ctx
+    .markPlacementMigrationInstalled({
+      uid: Number(ctx.uid),
+      sessionKey: pending.sessionKey,
+      placementEpoch: pending.placementEpoch,
+      migrationId: pending.migrationId,
+      checkpointGeneration: null,
+      consumedByTurnKey: rec.clientMessageId,
+      requireWarmCheckpointMatch: false,
+    })
+    .then((installed) => {
+      if (installed) {
+        ctx.pendingMigrationInstalls.delete(rec.clientMessageId);
+      }
+    })
+    .catch((err) => {
+      ctx.warn?.("user-chat-bridge: legacy cold migration install PG commit failed", {
+        clientMessageId: rec.clientMessageId,
+        dispatchId: rec.dispatchId,
+        migrationId: pending.migrationId,
+        err,
+      });
+    });
+}
+
+/**
+ * OCV5-902 B1: Master-side parser/handler for container `outbound.control.migration_install_receipt`
+ * frames. Always consumes the control frame (returns `true`, never forwarded to browser) and
+ * commits PG `markPlacementMigrationInstalled` ONLY after exact verification of
+ * `(clientMessageId, dispatchId, attemptNo, sessionKey, migrationId, placementEpoch, checkpointGeneration)`.
+ */
+export function parseAndHandleMigrationInstallReceipt(
+  frameText: string | null,
+  ctx: MigrationInstallReceiptContext,
+): boolean {
+  if (frameText === null || !frameText.includes(`"${MIGRATION_INSTALL_RECEIPT_TYPE}"`)) {
+    return false;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(frameText);
+  } catch {
+    return false;
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    (parsed as { type?: unknown }).type !== MIGRATION_INSTALL_RECEIPT_TYPE
+  ) {
+    return false;
+  }
+  const r = parsed as Record<string, unknown>;
+  const cmid = typeof r.clientMessageId === "string" ? r.clientMessageId.trim() : "";
+  const dispatchId = typeof r.dispatchId === "string" ? r.dispatchId.trim() : "";
+  const attemptNo = r.attemptNo;
+  const sessionKey = typeof r.sessionKey === "string" ? r.sessionKey.trim() : "";
+  const migrationId = typeof r.migrationId === "string" ? r.migrationId.trim() : "";
+  const placementEpoch = r.placementEpoch;
+  const continuityTier = typeof r.continuityTier === "string" ? r.continuityTier.trim() : "";
+  const rawGen = r.checkpointGeneration;
+  const checkpointGeneration =
+    rawGen === null
+      ? null
+      : typeof rawGen === "string" && rawGen.trim().length > 0 && rawGen.trim().length <= 128
+        ? rawGen.trim()
+        : undefined;
+
+  if (
+    cmid.length === 0 ||
+    dispatchId.length === 0 ||
+    typeof attemptNo !== "number" ||
+    !Number.isSafeInteger(attemptNo) ||
+    attemptNo < 1 ||
+    sessionKey.length === 0 ||
+    !MIGRATION_ID_RE.test(migrationId) ||
+    typeof placementEpoch !== "number" ||
+    !Number.isSafeInteger(placementEpoch) ||
+    placementEpoch < 1 ||
+    continuityTier.length === 0 ||
+    checkpointGeneration === undefined
+  ) {
+    ctx.warn?.("user-chat-bridge: malformed migration install receipt ignored", {
+      clientMessageId: cmid || undefined,
+      dispatchId: dispatchId || undefined,
+    });
+    return true;
+  }
+
+  const rec = ctx.pendingMigrationInstalls?.get(cmid) ?? ctx.admittedDispatches.get(cmid);
+  const pending = rec?.pendingMigrationInstall;
+  if (!rec || !pending) {
+    return true;
+  }
+
+  const expectedGen =
+    typeof pending.checkpointGeneration === "string" && pending.checkpointGeneration.trim().length > 0
+      ? pending.checkpointGeneration.trim()
+      : null;
+  const isWarm = pending.continuityTier === "tape_rebuilt" || expectedGen !== null;
+
+  if (
+    rec.dispatchId !== dispatchId ||
+    rec.attemptNo !== attemptNo ||
+    pending.sessionKey !== sessionKey ||
+    pending.migrationId !== migrationId ||
+    pending.placementEpoch !== placementEpoch
+  ) {
+    ctx.warn?.("user-chat-bridge: migration install receipt identity mismatch ignored", {
+      clientMessageId: cmid,
+      dispatchId,
+      migrationId,
+    });
+    return true;
+  }
+
+  if (isWarm) {
+    if (
+      expectedGen === null ||
+      continuityTier !== "tape_rebuilt" ||
+      checkpointGeneration !== expectedGen
+    ) {
+      ctx.warn?.("user-chat-bridge: warm migration install receipt generation mismatch ignored", {
+        clientMessageId: cmid,
+        dispatchId,
+        migrationId,
+      });
+      return true;
+    }
+  } else if (checkpointGeneration !== null) {
+    ctx.warn?.("user-chat-bridge: non-warm migration install receipt unexpected generation ignored", {
+      clientMessageId: cmid,
+      dispatchId,
+      migrationId,
+    });
+    return true;
+  }
+
+  if (ctx.markPlacementMigrationInstalled) {
+    void ctx
+      .markPlacementMigrationInstalled({
+        uid: Number(ctx.uid),
+        sessionKey: pending.sessionKey,
+        placementEpoch: pending.placementEpoch,
+        migrationId: pending.migrationId,
+        checkpointGeneration,
+        consumedByTurnKey: rec.clientMessageId,
+        requireWarmCheckpointMatch: isWarm,
+      })
+      .then((installed) => {
+        if (installed) {
+          ctx.pendingMigrationInstalls?.delete(rec.clientMessageId);
+          ctx.onInstalled?.(rec);
+        }
+      })
+      .catch((err) => {
+        ctx.warn?.("user-chat-bridge: migration install receipt PG commit failed", {
+          clientMessageId: cmid,
+          dispatchId,
+          migrationId,
+          err,
+        });
+      });
+  }
+  return true;
+}
+
+export interface CrossPoolCheckpointWirePayload {
+  readonly v: typeof CROSS_POOL_CHECKPOINT_WIRE_VERSION;
+  readonly generation: string;
+  readonly migrationId: string;
+  readonly placementEpoch: number;
+  readonly mode: string;
+  readonly anchorSeq: number;
+  readonly sourceEngine: string;
+  readonly summary: string;
+  readonly sha256: string;
+  readonly instructions?: string;
+}
+
+export interface CrossPoolMigrationCommittedMeta {
+  readonly migrationId: string;
+  readonly placementEpoch: number;
+  readonly continuityTier?: string;
+  readonly checkpointGeneration: string | null;
+}
+
+function toProtocolPoolMigrationGrant(
+  grant: AuthorityPoolMigrationGrant | undefined,
+): AuthorityPoolMigrationGrant | undefined {
+  if (!grant) return undefined;
+  return {
+    migrationId: grant.migrationId,
+    placementEpoch: grant.placementEpoch,
+    allowBackendTransition: true,
+    ...(grant.continuityTier !== undefined ? { continuityTier: grant.continuityTier } : {}),
+  };
+}
+
+/**
+ * OCV5-902 P0-1: Builds a verified wire carrier payload for a `tape_rebuilt` cross-pool
+ * migration grant. Returns `null` if the checkpoint or grant fails integrity/size bounds.
+ */
+export function buildCrossPoolCheckpointWirePayload(
+  cp: AuthoritativeRollingCheckpoint | null | undefined,
+  migrationGrant: AuthorityPoolMigrationGrant | null | undefined,
+): CrossPoolCheckpointWirePayload | null {
+  if (!cp || !migrationGrant) return null;
+  if (
+    migrationGrant.allowBackendTransition !== true ||
+    migrationGrant.continuityTier !== "tape_rebuilt"
+  ) {
+    return null;
+  }
+  const migrationId =
+    typeof migrationGrant.migrationId === "string" ? migrationGrant.migrationId.trim() : "";
+  if (migrationId.length < 8 || migrationId.length > 128) return null;
+  if (
+    typeof migrationGrant.placementEpoch !== "number" ||
+    !Number.isSafeInteger(migrationGrant.placementEpoch) ||
+    migrationGrant.placementEpoch < 1
+  ) {
+    return null;
+  }
+  const generation =
+    typeof cp.checkpointGeneration === "string" ? cp.checkpointGeneration.trim() : "";
+  if (generation.length === 0 || generation.length > 128) return null;
+  const summary = typeof cp.summary === "string" ? cp.summary.trim() : "";
+  if (summary.length === 0 || summary.length > CROSS_POOL_CHECKPOINT_MAX_SUMMARY_CHARS) {
+    return null;
+  }
+  if (Buffer.byteLength(summary, "utf8") > CROSS_POOL_CHECKPOINT_MAX_UTF8_BYTES) {
+    return null;
+  }
+  const instructions =
+    typeof cp.instructions === "string" && cp.instructions.trim().length > 0
+      ? cp.instructions.trim()
+      : undefined;
+  if (instructions !== undefined && instructions.length > 4_096) return null;
+
+  const sha256 = createHash("sha256").update(summary, "utf8").digest("hex");
+  return Object.freeze({
+    v: CROSS_POOL_CHECKPOINT_WIRE_VERSION,
+    generation,
+    migrationId,
+    placementEpoch: migrationGrant.placementEpoch,
+    mode: cp.mode,
+    anchorSeq: cp.anchorSeq,
+    sourceEngine: cp.sourceEngine,
+    summary,
+    sha256,
+    ...(instructions !== undefined ? { instructions } : {}),
+  });
+}
+
+export function extractCrossPoolCheckpointGeneration(
+  sealed: Record<string, unknown> | null | undefined,
+): string | null {
+  if (!sealed || typeof sealed !== "object") return null;
+  const raw = sealed[CROSS_POOL_CHECKPOINT_FIELD];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const gen = (raw as { generation?: unknown }).generation;
+  return typeof gen === "string" && gen.trim().length > 0 ? gen.trim() : null;
+}
+
+/**
+ * Honest seal-side continuity verifier: proves the checkpoint is non-empty, within wire
+ * frame limits, hashes cleanly into a valid wire carrier payload, and binds it to the
+ * outgoing sealed frame before permitting `continuityTier = 'tape_rebuilt'`.
+ */
+export function createSealWireContinuityVerifier(opts?: {
+  readonly maxSummaryChars?: number;
+  readonly onBound?: (cp: AuthoritativeRollingCheckpoint) => void;
+}): ContinuityAppliedVerifier {
+  const maxSummaryChars = Math.min(
+    CROSS_POOL_CHECKPOINT_MAX_SUMMARY_CHARS,
+    typeof opts?.maxSummaryChars === "number" && opts.maxSummaryChars > 0
+      ? Math.floor(opts.maxSummaryChars)
+      : CROSS_POOL_CHECKPOINT_MAX_SUMMARY_CHARS,
+  );
+  return async (ctx) => {
+    const cp = ctx.checkpoint;
+    if (!cp || typeof cp.summary !== "string") return { applied: false };
+    const trimmed = cp.summary.trim();
+    if (trimmed.length === 0 || trimmed.length > maxSummaryChars) {
+      return { applied: false };
+    }
+    const probeGrant: AuthorityPoolMigrationGrant = {
+      migrationId: "mig-probe-wire-verify",
+      placementEpoch: ctx.targetPlacementEpoch,
+      allowBackendTransition: true,
+      continuityTier: "tape_rebuilt",
+    };
+    const wire = buildCrossPoolCheckpointWirePayload(cp, probeGrant);
+    if (!wire) return { applied: false };
+    opts?.onBound?.(cp);
+    return { applied: true, checkpointId: cp.checkpointGeneration };
+  };
+}
 
 export interface SealExecLike {
   readonly canonicalModel: string;
@@ -46,6 +443,14 @@ export interface RemotePoolSealDeps<TExec extends SealExecLike> {
   readonly uid: number;
   readonly containerId: number | undefined;
   readonly sessionKey: string | undefined;
+  readonly sessionId?: string;
+  readonly hasLocalHistory?: boolean;
+  readonly historicalMessages?: readonly unknown[];
+  readonly excludeClientMessageId?: string;
+  readonly prepareRollingCheckpoint?: PrepareRollingCheckpointCallback;
+  readonly enableCrossPoolCheckpoint?: boolean;
+  readonly verifyContinuityApplied?: ContinuityAppliedVerifier;
+  readonly onMigrationCommitted?: (meta: CrossPoolMigrationCommittedMeta) => void;
   readonly exec: TExec;
   readonly billingRequestId?: string;
   readonly authorityTurnId?: string;
@@ -62,10 +467,15 @@ export interface RemotePoolSealDeps<TExec extends SealExecLike> {
     uid: number;
     containerId: number;
     sessionKey: string;
+    sessionId?: string;
     canonicalModel: string;
     engine: string;
     cause: unknown;
     expectedSecurityEpoch?: number;
+    historicalMessages?: readonly unknown[];
+    excludeClientMessageId?: string;
+    prepareRollingCheckpoint?: PrepareRollingCheckpointCallback;
+    verifyContinuityApplied?: ContinuityAppliedVerifier;
     validateTargetSignable?: (target: {
       canonicalModel: string;
       logicalModel: string;
@@ -77,24 +487,67 @@ export interface RemotePoolSealDeps<TExec extends SealExecLike> {
       resolvedCanonicalModel: string;
       logicalModel: string;
       migrationGrant: AuthorityPoolMigrationGrant;
+      deliveredCheckpoint?: AuthoritativeRollingCheckpoint;
     }) => Promise<boolean>;
   }) => Promise<{
     executionBackend?: RemoteExecutionBackend;
     fallbackPool: "local_pool" | "remote_pool";
     resolvedCanonicalModel?: string;
     migrationGrant?: AuthorityPoolMigrationGrant;
+    deliveredCheckpoint?: AuthoritativeRollingCheckpoint;
   } | null>;
   readonly returnToRemoteGrantResolver?: (args: {
     uid: number;
     containerId: number;
     sessionKey: string;
+    sessionId?: string;
     canonicalModel: string;
     engine: string;
     executionBackend: RemoteExecutionBackend;
     expectedSecurityEpoch?: number;
-    beforeCommit?: (prepared: { migrationGrant: AuthorityPoolMigrationGrant }) => Promise<boolean>;
+    hasLocalHistory?: boolean;
+    historicalMessages?: readonly unknown[];
+    excludeClientMessageId?: string;
+    prepareRollingCheckpoint?: PrepareRollingCheckpointCallback;
+    verifyContinuityApplied?: ContinuityAppliedVerifier;
+    onDeliveredCheckpoint?: (checkpoint: AuthoritativeRollingCheckpoint) => void;
+    beforeCommit?: (prepared: {
+      migrationGrant: AuthorityPoolMigrationGrant;
+      deliveredCheckpoint?: AuthoritativeRollingCheckpoint;
+    }) => Promise<boolean>;
     onBlocked?: (code: string) => void;
-  }) => Promise<AuthorityPoolMigrationGrant | null>;
+  }) => Promise<
+    (AuthorityPoolMigrationGrant & { readonly deliveredCheckpoint?: AuthoritativeRollingCheckpoint }) | null
+  >;
+  readonly forcedLocalMigrationResolver?: (args: {
+    uid: number;
+    containerId: number;
+    sessionKey: string;
+    sessionId?: string;
+    canonicalModel: string;
+    engine: string;
+    reason?: string;
+    expectedSecurityEpoch?: number;
+    historicalMessages?: readonly unknown[];
+    excludeClientMessageId?: string;
+    prepareRollingCheckpoint?: PrepareRollingCheckpointCallback;
+    verifyContinuityApplied?: ContinuityAppliedVerifier;
+    onDeliveredCheckpoint?: (checkpoint: AuthoritativeRollingCheckpoint) => void;
+    beforeCommit?: (prepared: {
+      migrationGrant: AuthorityPoolMigrationGrant;
+      deliveredCheckpoint?: AuthoritativeRollingCheckpoint;
+    }) => Promise<boolean>;
+    onBlocked?: (code: string) => void;
+  }) => Promise<
+    (AuthorityPoolMigrationGrant & { readonly deliveredCheckpoint?: AuthoritativeRollingCheckpoint }) | null
+  >;
+  readonly recordRemotePlacement?: (args: {
+    readonly uid: number;
+    readonly sessionKey: string;
+    readonly engine: string;
+    readonly operationId: string;
+    readonly profileId?: string;
+  }) => Promise<void>;
   /**
    * Mints authentic local billing + transport route credentials for non-egress-billed
    * engines (`codex` / `antigravity`) BEFORE PG `placementEpoch` commit.
@@ -137,10 +590,27 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
   let executionBackend: RemoteExecutionBackend | undefined;
   let execToSign = input.exec;
   let poolMigration: AuthorityPoolMigrationGrant | undefined;
+  let deliveredCheckpoint: AuthoritativeRollingCheckpoint | undefined;
   let preSignedBundle: ModelAuthorityBundle | undefined;
   let effectiveBillingRequestId = input.billingRequestId;
   let committedTransport: PreparedLocalFallbackTransport | undefined;
   let committedCompensateOnce: ((reason: string) => Promise<void>) | undefined;
+
+  let wireBoundCheckpoint: AuthoritativeRollingCheckpoint | undefined;
+  const shouldInjectDefaultVerifier =
+    input.enableCrossPoolCheckpoint === true ||
+    input.sessionId !== undefined ||
+    input.historicalMessages !== undefined ||
+    input.prepareRollingCheckpoint !== undefined;
+  const continuityVerifier: ContinuityAppliedVerifier | undefined =
+    input.verifyContinuityApplied ??
+    (shouldInjectDefaultVerifier
+      ? createSealWireContinuityVerifier({
+          onBound: (cp) => {
+            wireBoundCheckpoint = cp;
+          },
+        })
+      : undefined);
 
   try {
     if (input.exec.placement === "remote_pool") {
@@ -159,36 +629,69 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
       if (input.returnToRemoteGrantResolver) {
         let returnEpochDrifted = false;
         let returnBlockedCode: string | undefined;
-        poolMigration =
-          (await input
-            .returnToRemoteGrantResolver({
-              uid: input.uid,
-              containerId: input.containerId,
-              sessionKey: input.sessionKey,
-              canonicalModel: input.exec.canonicalModel,
-              engine: input.exec.engine,
-              executionBackend,
-              expectedSecurityEpoch: input.exec.securityEpoch,
-              onBlocked: (code) => {
-                returnBlockedCode = code;
-              },
-              beforeCommit: async (prepared) => {
-                const latestEpoch = await input.readEpochAtSign().catch(() => null);
-                if (latestEpoch === null || Number(latestEpoch) !== input.exec.securityEpoch) {
-                  returnEpochDrifted = true;
-                  return false;
-                }
-                preSignedBundle = input.signAuthorityBundle(
-                  input.exec,
-                  input.billingRequestId,
-                  input.authorityTurnId,
-                  executionBackend,
-                  prepared.migrationGrant,
-                );
-                return true;
-              },
-            })
-            .catch(() => null)) ?? undefined;
+        let returnDeliveredCheckpoint: AuthoritativeRollingCheckpoint | undefined;
+        const resolvedReturnGrant = await input
+          .returnToRemoteGrantResolver({
+            uid: input.uid,
+            containerId: input.containerId,
+            sessionKey: input.sessionKey,
+            ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+            canonicalModel: input.exec.canonicalModel,
+            engine: input.exec.engine,
+            executionBackend,
+            expectedSecurityEpoch: input.exec.securityEpoch,
+            ...(input.hasLocalHistory !== undefined ? { hasLocalHistory: input.hasLocalHistory } : {}),
+            ...(input.historicalMessages !== undefined
+              ? { historicalMessages: input.historicalMessages }
+              : {}),
+            ...(input.excludeClientMessageId !== undefined
+              ? { excludeClientMessageId: input.excludeClientMessageId }
+              : {}),
+            ...(input.prepareRollingCheckpoint !== undefined
+              ? { prepareRollingCheckpoint: input.prepareRollingCheckpoint }
+              : {}),
+            ...(continuityVerifier !== undefined
+              ? { verifyContinuityApplied: continuityVerifier }
+              : {}),
+            onDeliveredCheckpoint: (cp) => {
+              returnDeliveredCheckpoint = cp;
+            },
+            onBlocked: (code) => {
+              returnBlockedCode = code;
+            },
+            beforeCommit: async (prepared) => {
+              const latestEpoch = await input.readEpochAtSign().catch(() => null);
+              if (latestEpoch === null || Number(latestEpoch) !== input.exec.securityEpoch) {
+                returnEpochDrifted = true;
+                return false;
+              }
+              const candidateCp = prepared.deliveredCheckpoint ?? wireBoundCheckpoint;
+              if (
+                prepared.migrationGrant.continuityTier === "tape_rebuilt" &&
+                buildCrossPoolCheckpointWirePayload(candidateCp, prepared.migrationGrant) === null
+              ) {
+                returnBlockedCode = "CROSS_POOL_CHECKPOINT_UNAVAILABLE";
+                return false;
+              }
+              if (prepared.deliveredCheckpoint) {
+                returnDeliveredCheckpoint = prepared.deliveredCheckpoint;
+              }
+              preSignedBundle = input.signAuthorityBundle(
+                input.exec,
+                input.billingRequestId,
+                input.authorityTurnId,
+                executionBackend,
+                toProtocolPoolMigrationGrant(prepared.migrationGrant),
+              );
+              return true;
+            },
+          })
+          .catch(() => null);
+        poolMigration = toProtocolPoolMigrationGrant(resolvedReturnGrant ?? undefined);
+        deliveredCheckpoint =
+          returnDeliveredCheckpoint ??
+          resolvedReturnGrant?.deliveredCheckpoint ??
+          (poolMigration?.continuityTier === "tape_rebuilt" ? wireBoundCheckpoint : undefined);
         if (returnEpochDrifted) {
           return await input.reject(
             "MODEL_CONFIG_CHANGED_RETRY_TURN",
@@ -204,6 +707,112 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
           );
         }
       }
+      // OCV5-902 B4: Persist initial `remote_pool` placement pointer on first healthy direct remote
+      // turn so a subsequent admin remote-binding disable always finds an authoritative pointer.
+      if (!poolMigration && input.recordRemotePlacement) {
+        const profileId =
+          "profileId" in executionBackend && typeof executionBackend.profileId === "string"
+            ? executionBackend.profileId
+            : undefined;
+        await input
+          .recordRemotePlacement({
+            uid: input.uid,
+            sessionKey: input.sessionKey,
+            engine: input.exec.engine,
+            operationId: executionBackend.operationId,
+            ...(profileId ? { profileId } : {}),
+          })
+          .catch((recErr) => {
+            input.log?.warn("user-chat-bridge: initial remote placement pointer persist failed", {
+              sessionKey: input.sessionKey,
+              err: recErr,
+            });
+          });
+      }
+    } else if (
+      input.exec.placement === "local" &&
+      input.forcedLocalMigrationResolver &&
+      input.sessionKey &&
+      input.containerId !== undefined
+    ) {
+      let forcedEpochDrifted = false;
+      let forcedBlockedCode: string | undefined;
+      let forcedDeliveredCheckpoint: AuthoritativeRollingCheckpoint | undefined;
+      const resolvedForcedGrant = await input
+        .forcedLocalMigrationResolver({
+          uid: input.uid,
+          containerId: input.containerId,
+          sessionKey: input.sessionKey,
+          ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+          canonicalModel: input.exec.canonicalModel,
+          engine: input.exec.engine,
+          reason: "MODEL_POOL_BINDING_FORCED_LOCAL",
+          expectedSecurityEpoch: input.exec.securityEpoch,
+          ...(input.historicalMessages !== undefined
+            ? { historicalMessages: input.historicalMessages }
+            : {}),
+          ...(input.excludeClientMessageId !== undefined
+            ? { excludeClientMessageId: input.excludeClientMessageId }
+            : {}),
+          ...(input.prepareRollingCheckpoint !== undefined
+            ? { prepareRollingCheckpoint: input.prepareRollingCheckpoint }
+            : {}),
+          ...(continuityVerifier !== undefined
+            ? { verifyContinuityApplied: continuityVerifier }
+            : {}),
+          onDeliveredCheckpoint: (cp) => {
+            forcedDeliveredCheckpoint = cp;
+          },
+          onBlocked: (code) => {
+            forcedBlockedCode = code;
+          },
+          beforeCommit: async (prepared) => {
+            const latestEpoch = await input.readEpochAtSign().catch(() => null);
+            if (latestEpoch === null || Number(latestEpoch) !== input.exec.securityEpoch) {
+              forcedEpochDrifted = true;
+              return false;
+            }
+            const candidateCp = prepared.deliveredCheckpoint ?? wireBoundCheckpoint;
+            if (
+              prepared.migrationGrant.continuityTier === "tape_rebuilt" &&
+              buildCrossPoolCheckpointWirePayload(candidateCp, prepared.migrationGrant) === null
+            ) {
+              forcedBlockedCode = "CROSS_POOL_CHECKPOINT_UNAVAILABLE";
+              return false;
+            }
+            if (prepared.deliveredCheckpoint) {
+              forcedDeliveredCheckpoint = prepared.deliveredCheckpoint;
+            }
+            preSignedBundle = input.signAuthorityBundle(
+              input.exec,
+              input.billingRequestId,
+              input.authorityTurnId,
+              undefined,
+              toProtocolPoolMigrationGrant(prepared.migrationGrant),
+            );
+            return true;
+          },
+        })
+        .catch(() => null);
+      poolMigration = toProtocolPoolMigrationGrant(resolvedForcedGrant ?? undefined);
+      deliveredCheckpoint =
+        forcedDeliveredCheckpoint ??
+        resolvedForcedGrant?.deliveredCheckpoint ??
+        (poolMigration?.continuityTier === "tape_rebuilt" ? wireBoundCheckpoint : undefined);
+      if (forcedEpochDrifted) {
+        return await input.reject(
+          "MODEL_CONFIG_CHANGED_RETRY_TURN",
+          "model configuration changed, please resend",
+          "sign_boundary_epoch_changed",
+        );
+      }
+      if (forcedBlockedCode) {
+        return await input.reject(
+          "REMOTE_NATIVE_UNAVAILABLE",
+          "remote node unavailable for this chat, retry shortly",
+          "forced_local_migration_blocked",
+        );
+      }
     }
   } catch (err) {
     let preparedLocalExec: TExec | undefined;
@@ -211,6 +820,7 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
     let transportCompensated = false;
     let fallbackEpochDrifted = false;
     let preSignedMigrationId: string | undefined;
+    let fallbackDeliveredCheckpoint: AuthoritativeRollingCheckpoint | undefined;
 
     const compensateTransportOnce = async (reason: string): Promise<void> => {
       if (!preparedTransport || transportCompensated) return;
@@ -293,7 +903,7 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
           effectiveBillingRequestId,
           input.authorityTurnId,
           undefined,
-          migrationGrant,
+          toProtocolPoolMigrationGrant(migrationGrant),
         );
         preSignedMigrationId = migrationGrant?.migrationId;
       } catch (signErr) {
@@ -315,10 +925,23 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
               uid: input.uid,
               containerId: input.containerId,
               sessionKey: input.sessionKey,
+              ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
               canonicalModel: input.exec.canonicalModel,
               engine: input.exec.engine,
               cause: err,
               expectedSecurityEpoch: input.exec.securityEpoch,
+              ...(input.historicalMessages !== undefined
+                ? { historicalMessages: input.historicalMessages }
+                : {}),
+              ...(input.excludeClientMessageId !== undefined
+                ? { excludeClientMessageId: input.excludeClientMessageId }
+                : {}),
+              ...(input.prepareRollingCheckpoint !== undefined
+                ? { prepareRollingCheckpoint: input.prepareRollingCheckpoint }
+                : {}),
+              ...(continuityVerifier !== undefined
+                ? { verifyContinuityApplied: continuityVerifier }
+                : {}),
               validateTargetSignable: async (target) => {
                 if (
                   engineRequiresLocalFallbackTransport(target.engine) &&
@@ -351,6 +974,16 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
                 return true;
               },
               beforeCommit: async (prepared) => {
+                const candidateCp = prepared.deliveredCheckpoint ?? wireBoundCheckpoint;
+                if (
+                  prepared.migrationGrant.continuityTier === "tape_rebuilt" &&
+                  buildCrossPoolCheckpointWirePayload(candidateCp, prepared.migrationGrant) === null
+                ) {
+                  return false;
+                }
+                if (prepared.deliveredCheckpoint) {
+                  fallbackDeliveredCheckpoint = prepared.deliveredCheckpoint;
+                }
                 const execForSign = preparedLocalExec ?? input.exec;
                 return await prepareAndSignLocalTarget(execForSign, prepared.migrationGrant);
               },
@@ -371,7 +1004,7 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
         if (grantMatches && transportSatisfied) {
           execToSign = preparedLocalExec;
           executionBackend = undefined;
-          poolMigration = fb.migrationGrant;
+          poolMigration = toProtocolPoolMigrationGrant(fb.migrationGrant);
           fallbackAccepted = true;
         }
       } else if (preparedLocalExec) {
@@ -381,7 +1014,7 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
         if (await prepareAndSignLocalTarget(preparedLocalExec, fb.migrationGrant)) {
           execToSign = preparedLocalExec;
           executionBackend = undefined;
-          poolMigration = fb.migrationGrant;
+          poolMigration = toProtocolPoolMigrationGrant(fb.migrationGrant);
           fallbackAccepted = true;
         }
       } else if (fb.resolvedCanonicalModel && input.resolveLocalExec) {
@@ -398,7 +1031,7 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
           if (await prepareAndSignLocalTarget(localExec, fb.migrationGrant)) {
             execToSign = localExec;
             executionBackend = undefined;
-            poolMigration = fb.migrationGrant;
+            poolMigration = toProtocolPoolMigrationGrant(fb.migrationGrant);
             fallbackAccepted = true;
           }
         }
@@ -406,23 +1039,23 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
         if (engineRequiresLocalFallbackTransport(input.exec.engine)) {
           if (preSignedBundle && preparedTransport) {
             executionBackend = undefined;
-            poolMigration = fb.migrationGrant;
+            poolMigration = toProtocolPoolMigrationGrant(fb.migrationGrant);
             fallbackAccepted = true;
           } else if (await prepareAndSignLocalTarget(input.exec, fb.migrationGrant)) {
             executionBackend = undefined;
-            poolMigration = fb.migrationGrant;
+            poolMigration = toProtocolPoolMigrationGrant(fb.migrationGrant);
             fallbackAccepted = true;
           }
         } else {
           executionBackend = undefined;
-          poolMigration = fb.migrationGrant;
+          poolMigration = toProtocolPoolMigrationGrant(fb.migrationGrant);
           fallbackAccepted = true;
         }
       }
     } else if (fb?.executionBackend) {
       await compensateTransportOnce("fallback_switched_to_remote");
       executionBackend = fb.executionBackend;
-      poolMigration = fb.migrationGrant;
+      poolMigration = toProtocolPoolMigrationGrant(fb.migrationGrant);
       fallbackAccepted = true;
     }
 
@@ -464,8 +1097,29 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
         "remote_native_binding_rejected",
       );
     }
+    deliveredCheckpoint =
+      fb?.deliveredCheckpoint ??
+      fallbackDeliveredCheckpoint ??
+      (poolMigration?.continuityTier === "tape_rebuilt" ? wireBoundCheckpoint : undefined);
     committedTransport = preparedTransport;
     committedCompensateOnce = compensateTransportOnce;
+  }
+
+  const wireCheckpoint =
+    poolMigration?.continuityTier === "tape_rebuilt" && deliveredCheckpoint
+      ? buildCrossPoolCheckpointWirePayload(deliveredCheckpoint, poolMigration)
+      : null;
+
+  // OCV5-902 B2 hard invariant: never emit a `tape_rebuilt` bundle without a valid wire carrier!
+  if (poolMigration?.continuityTier === "tape_rebuilt" && wireCheckpoint === null) {
+    if (committedCompensateOnce) {
+      await committedCompensateOnce("missing_warm_checkpoint_carrier");
+    }
+    return await input.reject(
+      "REMOTE_NATIVE_UNAVAILABLE",
+      "cross-pool continuity checkpoint unavailable, retry shortly",
+      "missing_warm_checkpoint_carrier",
+    );
   }
 
   let finalBundle: ModelAuthorityBundle;
@@ -477,7 +1131,7 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
         effectiveBillingRequestId,
         input.authorityTurnId,
         executionBackend,
-        poolMigration,
+        toProtocolPoolMigrationGrant(poolMigration),
       );
   } catch (signErr) {
     if (committedCompensateOnce) {
@@ -495,8 +1149,20 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
     });
   }
 
+  if (poolMigration) {
+    input.onMigrationCommitted?.({
+      migrationId: poolMigration.migrationId,
+      placementEpoch: poolMigration.placementEpoch,
+      ...(poolMigration.continuityTier !== undefined
+        ? { continuityTier: poolMigration.continuityTier }
+        : {}),
+      checkpointGeneration: wireCheckpoint?.generation ?? null,
+    });
+  }
+
   return {
     ...(committedTransport ? committedTransport.extraFrameFields : {}),
+    ...(wireCheckpoint ? { [CROSS_POOL_CHECKPOINT_FIELD]: wireCheckpoint } : {}),
     model: execToSign.canonicalModel,
     [MODEL_AUTHORITY_FIELD]: finalBundle,
   };

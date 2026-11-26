@@ -48,6 +48,7 @@ import {
   assertNoPendingRemoteBillingForSession,
   type ExcludeCurrentPreparedBinding,
 } from './placement.js'
+import { ensureCrossPoolRollingCheckpoint } from './crossPoolContinuity.js'
 import {
   PRE_DISPATCH_RETRYABLE_ERROR_CODES,
   UnifiedPlacementRouter,
@@ -63,6 +64,7 @@ export const PRE_DISPATCH_REMOTE_FALLBACK_ERROR_CODES = [
   'NO_ELIGIBLE_REMOTE_PROFILE',
   'REMOTE_DRIVER_REVERIFY_REQUIRED',
   'REMOTE_POOL_EXECUTION_DISABLED',
+  'MODEL_POOL_BINDING_FORCED_LOCAL',
 ] as const
 
 const PRE_DISPATCH_FALLBACK_CODE_SET: ReadonlySet<string> = new Set<string>(
@@ -130,7 +132,28 @@ export interface CrossPoolFallbackMigrationGrant {
   readonly placementEpoch: number
   readonly allowBackendTransition: true
   readonly continuityTier: ResumeLadderTier
+  /**
+   * OCV5-902 P0-1: Non-enumerable side-channel reference to the authoritative PG rolling
+   * checkpoint paired with a `tape_rebuilt` grant (omitted from JSON/JCS serialization so
+   * `AuthorityPoolMigrationGrant` stays strictly 4 wire fields).
+   */
+  readonly deliveredCheckpoint?: AuthoritativeRollingCheckpoint
 }
+
+export interface PrepareRollingCheckpointInput {
+  readonly uid: number
+  readonly sessionKey: string
+  readonly sessionId?: string
+  readonly sourcePlacementEpoch: number
+  readonly sourceEngine: AuthorityEngineKind
+  readonly authorityStore: PgSessionAuthorityStateStore
+  readonly historicalMessages?: readonly unknown[]
+  readonly excludeClientMessageId?: string
+}
+
+export type PrepareRollingCheckpointCallback = (
+  input: PrepareRollingCheckpointInput,
+) => Promise<AuthoritativeRollingCheckpoint | null>
 
 export interface ContinuityVerificationInput {
   readonly uid: number
@@ -160,12 +183,16 @@ export interface SelfhostCrossPoolFallbackInput {
   readonly uid: number
   readonly containerId: number
   readonly sessionKey: string
+  readonly sessionId?: string
   readonly canonicalModel: string
   readonly engine: string
   readonly cause: unknown
   readonly expectedSecurityEpoch?: number
   readonly requiredCapabilities?: RequiredTurnCapabilities
   readonly dispatched?: boolean
+  readonly historicalMessages?: readonly unknown[]
+  readonly excludeClientMessageId?: string
+  readonly prepareRollingCheckpoint?: PrepareRollingCheckpointCallback
   /**
    * B01 Stage-1 pre-sign validation hook: runs BEFORE `beginPlacementMigration` so any
    * target descriptor rejection leaves PG completely untouched.
@@ -186,6 +213,7 @@ export interface SelfhostCrossPoolFallbackInput {
     readonly resolvedCanonicalModel: string
     readonly logicalModel: string
     readonly migrationGrant: CrossPoolFallbackMigrationGrant
+    readonly deliveredCheckpoint?: AuthoritativeRollingCheckpoint
   }) => Promise<boolean>
   /**
    * B01: Optional continuity proof hook. `tape_rebuilt` is ONLY published when an unacked
@@ -199,16 +227,29 @@ export interface SelfhostReturnToRemoteInput {
   readonly uid: number
   readonly containerId: number
   readonly sessionKey: string
+  readonly sessionId?: string
   readonly canonicalModel: string
   readonly engine: string
   readonly executionBackend: RemoteExecutionBackend
   readonly expectedSecurityEpoch?: number
+  /**
+   * OCV5-902 B4: When true and PG has no `session_engine_pointers` row yet (pre-rollout
+   * local session with verified local turn history), treat the session as originating on
+   * `local_container` at epoch 1 and run the full `1 -> 2` migration flow. Never guessed
+   * when omitted or false.
+   */
+  readonly hasLocalHistory?: boolean
+  readonly historicalMessages?: readonly unknown[]
+  readonly excludeClientMessageId?: string
+  readonly prepareRollingCheckpoint?: PrepareRollingCheckpointCallback
+  readonly onDeliveredCheckpoint?: (checkpoint: AuthoritativeRollingCheckpoint) => void
   /**
    * B01 Stage-2 pre-commit hook: validates epoch/signing BEFORE committing return-to-remote.
    * Returning `false` or throwing aborts the migration and leaves PG on `local_container`.
    */
   readonly beforeCommit?: (prepared: {
     readonly migrationGrant: CrossPoolFallbackMigrationGrant
+    readonly deliveredCheckpoint?: AuthoritativeRollingCheckpoint
   }) => Promise<boolean>
   /** Notifies caller when an active `local_container` return is fail-closed blocked (e.g. B06). */
   readonly onBlocked?: (code: string) => void
@@ -220,12 +261,34 @@ export interface SelfhostReturnToRemoteInput {
   readonly verifyContinuityApplied?: ContinuityAppliedVerifier
 }
 
+export interface SelfhostForcedLocalMigrationInput {
+  readonly uid: number
+  readonly containerId: number
+  readonly sessionKey: string
+  readonly sessionId?: string
+  readonly canonicalModel: string
+  readonly engine: string
+  readonly reason?: string
+  readonly expectedSecurityEpoch?: number
+  readonly historicalMessages?: readonly unknown[]
+  readonly excludeClientMessageId?: string
+  readonly prepareRollingCheckpoint?: PrepareRollingCheckpointCallback
+  readonly onDeliveredCheckpoint?: (checkpoint: AuthoritativeRollingCheckpoint) => void
+  readonly beforeCommit?: (prepared: {
+    readonly migrationGrant: CrossPoolFallbackMigrationGrant
+    readonly deliveredCheckpoint?: AuthoritativeRollingCheckpoint
+  }) => Promise<boolean>
+  readonly onBlocked?: (code: string) => void
+  readonly verifyContinuityApplied?: ContinuityAppliedVerifier
+}
+
 export interface SelfhostCrossPoolFallbackResult {
   readonly fallbackPool: 'local_pool' | 'remote_pool'
   readonly executionBackend: RemoteExecutionBackend | undefined
   readonly resolvedCanonicalModel: string
   readonly logicalModel: string
   readonly migrationGrant?: CrossPoolFallbackMigrationGrant
+  readonly deliveredCheckpoint?: AuthoritativeRollingCheckpoint
   readonly reusedExistingLocalPlacement?: boolean
   readonly placementEpoch?: number
 }
@@ -242,9 +305,189 @@ export interface SelfhostCrossPoolSelectorDeps {
     readonly operationId?: string | null
     readonly excludeCurrentPreparedBinding?: ExcludeCurrentPreparedBinding
   }) => Promise<boolean>
+  readonly prepareRollingCheckpoint?: PrepareRollingCheckpointCallback
   readonly verifyContinuityApplied?: ContinuityAppliedVerifier
   readonly router?: UnifiedPlacementRouter
   readonly now?: () => number
+}
+
+function makeMigrationGrant(
+  base: {
+    readonly migrationId: string
+    readonly placementEpoch: number
+    readonly allowBackendTransition: true
+    readonly continuityTier: ResumeLadderTier
+  },
+  deliveredCheckpoint?: AuthoritativeRollingCheckpoint | null,
+): CrossPoolFallbackMigrationGrant {
+  const grant: Record<string, unknown> = {
+    migrationId: base.migrationId,
+    placementEpoch: base.placementEpoch,
+    allowBackendTransition: true as const,
+    continuityTier: base.continuityTier,
+  }
+  if (deliveredCheckpoint) {
+    Object.defineProperty(grant, 'deliveredCheckpoint', {
+      value: deliveredCheckpoint,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    })
+  }
+  return Object.freeze(grant) as unknown as CrossPoolFallbackMigrationGrant
+}
+
+/**
+ * OCV5-902 B2: Strictly resolves the checkpoint carrier for a pending-install redelivery.
+ * - `tape_rebuilt` with a recorded `checkpointGeneration`: MUST read that exact row cleanly
+ *   from PG; any read error, missing row, or empty summary fails closed (`ok: false`) so the
+ *   caller aborts this forward and retains PG `pendingInstall` for a clean retry.
+ * - Legacy `tape_rebuilt` row missing `checkpointGeneration`: explicitly downgrades to
+ *   `cold_degraded` rather than signing an empty `tape_rebuilt` grant.
+ */
+async function resolveRedeliveredPendingInstall(input: {
+  readonly authorityStore: PgSessionAuthorityStateStore
+  readonly uid: number
+  readonly sessionKey: string
+  readonly pendingInstall: NonNullable<ReturnType<typeof extractPendingInstallMigration>>
+}): Promise<
+  | {
+      readonly ok: true
+      readonly continuityTier: ResumeLadderTier
+      readonly checkpoint?: AuthoritativeRollingCheckpoint
+    }
+  | {
+      readonly ok: false
+      readonly blockedCode: 'CROSS_POOL_CHECKPOINT_UNAVAILABLE'
+    }
+> {
+  if (input.pendingInstall.continuityTier !== 'tape_rebuilt') {
+    return { ok: true, continuityTier: input.pendingInstall.continuityTier }
+  }
+  const gen = input.pendingInstall.checkpointGeneration
+  if (!gen) {
+    return { ok: true, continuityTier: 'cold_degraded' }
+  }
+  let fetched: AuthoritativeRollingCheckpoint | null
+  try {
+    fetched = await input.authorityStore.getRollingCheckpointByGeneration(
+      input.uid,
+      input.sessionKey,
+      gen,
+    )
+  } catch {
+    return { ok: false, blockedCode: 'CROSS_POOL_CHECKPOINT_UNAVAILABLE' }
+  }
+  if (fetched === null || typeof fetched.summary !== 'string' || fetched.summary.trim().length === 0) {
+    return { ok: false, blockedCode: 'CROSS_POOL_CHECKPOINT_UNAVAILABLE' }
+  }
+  return { ok: true, continuityTier: 'tape_rebuilt', checkpoint: fetched }
+}
+
+async function resolveAndVerifyCrossPoolContinuity(input: {
+  readonly authorityStore: PgSessionAuthorityStateStore
+  readonly uid: number
+  readonly containerId: number
+  readonly sessionKey: string
+  readonly sessionId?: string
+  readonly fromPoolKind: 'remote_pool' | 'local_container'
+  readonly toPoolKind: 'remote_pool' | 'local_container'
+  readonly sourcePlacementEpoch: number
+  readonly sourceEngine: AuthorityEngineKind
+  readonly historicalMessages?: readonly unknown[]
+  readonly excludeClientMessageId?: string
+  readonly prepareRollingCheckpoint?: PrepareRollingCheckpointCallback
+  readonly depsVerifier?: ContinuityAppliedVerifier
+  readonly inputVerifier?: ContinuityAppliedVerifier
+}): Promise<{
+  readonly ok: boolean
+  readonly continuityTier: ResumeLadderTier
+  readonly deliveredCheckpoint?: AuthoritativeRollingCheckpoint
+}> {
+  let rollingCheckpoint: AuthoritativeRollingCheckpoint | null
+  try {
+    rollingCheckpoint = await input.authorityStore.peekRollingCheckpoint(
+      input.uid,
+      input.sessionKey,
+      input.sourcePlacementEpoch,
+    )
+  } catch {
+    return { ok: false, continuityTier: 'cold_degraded' }
+  }
+
+  if (rollingCheckpoint === null) {
+    if (input.prepareRollingCheckpoint) {
+      try {
+        rollingCheckpoint = await input.prepareRollingCheckpoint({
+          uid: input.uid,
+          sessionKey: input.sessionKey,
+          sessionId: input.sessionId,
+          sourcePlacementEpoch: input.sourcePlacementEpoch,
+          sourceEngine: input.sourceEngine,
+          authorityStore: input.authorityStore,
+          historicalMessages: input.historicalMessages,
+          excludeClientMessageId: input.excludeClientMessageId,
+        })
+      } catch {
+        rollingCheckpoint = null
+      }
+    } else if (
+      Array.isArray(input.historicalMessages) &&
+      input.historicalMessages.length > 0 &&
+      typeof input.sessionId === 'string' &&
+      input.sessionId.trim().length > 0
+    ) {
+      rollingCheckpoint = await ensureCrossPoolRollingCheckpoint({
+        authorityStore: input.authorityStore,
+        uid: input.uid,
+        sessionKey: input.sessionKey,
+        sessionId: input.sessionId.trim(),
+        sourcePlacementEpoch: input.sourcePlacementEpoch,
+        sourceEngine: input.sourceEngine,
+        rawHistory: input.historicalMessages,
+        excludeClientMessageId: input.excludeClientMessageId,
+      })
+    }
+  }
+
+  const verifiers: ContinuityAppliedVerifier[] = []
+  if (input.depsVerifier) verifiers.push(input.depsVerifier)
+  if (input.inputVerifier && input.inputVerifier !== input.depsVerifier) {
+    verifiers.push(input.inputVerifier)
+  }
+
+  if (rollingCheckpoint === null || verifiers.length === 0) {
+    return { ok: true, continuityTier: 'cold_degraded' }
+  }
+
+  for (const verify of verifiers) {
+    try {
+      const verified = await verify({
+        uid: input.uid,
+        containerId: input.containerId,
+        sessionKey: input.sessionKey,
+        fromPoolKind: input.fromPoolKind,
+        toPoolKind: input.toPoolKind,
+        sourcePlacementEpoch: input.sourcePlacementEpoch,
+        targetPlacementEpoch: input.sourcePlacementEpoch + 1,
+        checkpoint: rollingCheckpoint,
+      })
+      if (
+        verified.applied !== true ||
+        verified.checkpointId !== rollingCheckpoint.checkpointGeneration
+      ) {
+        return { ok: true, continuityTier: 'cold_degraded' }
+      }
+    } catch {
+      return { ok: true, continuityTier: 'cold_degraded' }
+    }
+  }
+
+  return {
+    ok: true,
+    continuityTier: 'tape_rebuilt',
+    deliveredCheckpoint: rollingCheckpoint,
+  }
 }
 
 function extractErrorCandidates(cause: unknown): string[] {
@@ -622,17 +865,33 @@ export function createSelfhostCrossPoolFallbackSelector(
         return null
       }
       const pendingInstall = extractPendingInstallMigration(existingPointer.promptCacheMeta)
-      const redeliveredGrant: CrossPoolFallbackMigrationGrant | undefined =
+      const shouldRedeliver =
         pendingInstall !== null &&
         pendingInstall.targetPoolKind === 'local_container' &&
         pendingInstall.targetEpoch === existingPointer.placementEpoch
-          ? Object.freeze({
-              migrationId: pendingInstall.migrationId,
-              placementEpoch: pendingInstall.targetEpoch,
-              allowBackendTransition: true as const,
-              continuityTier: pendingInstall.continuityTier,
-            })
-          : undefined
+      let redeliveredCheckpoint: AuthoritativeRollingCheckpoint | undefined
+      let redeliveredGrant: CrossPoolFallbackMigrationGrant | undefined
+      if (shouldRedeliver && pendingInstall !== null) {
+        const resolvedPending = await resolveRedeliveredPendingInstall({
+          authorityStore,
+          uid: input.uid,
+          sessionKey: input.sessionKey,
+          pendingInstall,
+        })
+        if (!resolvedPending.ok) {
+          return null
+        }
+        redeliveredCheckpoint = resolvedPending.checkpoint
+        redeliveredGrant = makeMigrationGrant(
+          {
+            migrationId: pendingInstall.migrationId,
+            placementEpoch: pendingInstall.targetEpoch,
+            allowBackendTransition: true as const,
+            continuityTier: resolvedPending.continuityTier,
+          },
+          redeliveredCheckpoint,
+        )
+      }
       return Object.freeze({
         fallbackPool: 'local_pool' as const,
         executionBackend: undefined,
@@ -641,49 +900,32 @@ export function createSelfhostCrossPoolFallbackSelector(
         reusedExistingLocalPlacement: true as const,
         placementEpoch: existingPointer.placementEpoch,
         migrationGrant: redeliveredGrant,
+        ...(redeliveredCheckpoint ? { deliveredCheckpoint: redeliveredCheckpoint } : {}),
       })
     }
 
     const expectedPlacementEpoch = existingPointer?.placementEpoch ?? 1
 
-    // B01: Honest continuityTier — publish `tape_rebuilt` ONLY when an unacked rolling
-    // checkpoint exists for the EXACT current source epoch AND `verifyContinuityApplied`
-    // explicitly confirms `{ applied: true, checkpointId }`. Never fabricate `tape_rebuilt`
-    // solely from peeking a PG checkpoint row.
-    let rollingCheckpoint: Awaited<ReturnType<PgSessionAuthorityStateStore['peekRollingCheckpoint']>>
-    try {
-      rollingCheckpoint = await authorityStore.peekRollingCheckpoint(
-        input.uid,
-        input.sessionKey,
-        expectedPlacementEpoch,
-      )
-    } catch {
-      return null
-    }
-    let continuityTier: ResumeLadderTier = 'cold_degraded'
-    const continuityVerifier = input.verifyContinuityApplied ?? deps.verifyContinuityApplied
-    if (rollingCheckpoint !== null && continuityVerifier) {
-      try {
-        const verified = await continuityVerifier({
-          uid: input.uid,
-          containerId: input.containerId,
-          sessionKey: input.sessionKey,
-          fromPoolKind: existingPointer?.poolKind === 'local_container' ? 'local_container' : 'remote_pool',
-          toPoolKind: 'local_container',
-          sourcePlacementEpoch: expectedPlacementEpoch,
-          targetPlacementEpoch: expectedPlacementEpoch + 1,
-          checkpoint: rollingCheckpoint,
-        })
-        if (
-          verified.applied === true &&
-          verified.checkpointId === rollingCheckpoint.checkpointGeneration
-        ) {
-          continuityTier = 'tape_rebuilt'
-        }
-      } catch {
-        continuityTier = 'cold_degraded'
-      }
-    }
+    const continuity = await resolveAndVerifyCrossPoolContinuity({
+      authorityStore,
+      uid: input.uid,
+      containerId: input.containerId,
+      sessionKey: input.sessionKey,
+      sessionId: input.sessionId,
+      fromPoolKind:
+        existingPointer?.poolKind === 'local_container' ? 'local_container' : 'remote_pool',
+      toPoolKind: 'local_container',
+      sourcePlacementEpoch: expectedPlacementEpoch,
+      sourceEngine: existingPointer?.engine ?? authEngine,
+      historicalMessages: input.historicalMessages,
+      excludeClientMessageId: input.excludeClientMessageId,
+      prepareRollingCheckpoint: input.prepareRollingCheckpoint ?? deps.prepareRollingCheckpoint,
+      depsVerifier: deps.verifyContinuityApplied,
+      inputVerifier: input.verifyContinuityApplied,
+    })
+    if (!continuity.ok) return null
+    const continuityTier: ResumeLadderTier = continuity.continuityTier
+    const deliveredCheckpoint = continuity.deliveredCheckpoint
 
     const fromPlacement: PlacementDescriptor = {
       poolKind: existingPointer?.poolKind ?? 'remote_pool',
@@ -712,12 +954,15 @@ export function createSelfhostCrossPoolFallbackSelector(
     })
     if (!begun.applied) return null
 
-    const preparedGrant: CrossPoolFallbackMigrationGrant = Object.freeze({
-      migrationId: begun.migration.migrationId,
-      placementEpoch: begun.migration.toEpoch,
-      allowBackendTransition: true as const,
-      continuityTier,
-    })
+    const preparedGrant: CrossPoolFallbackMigrationGrant = makeMigrationGrant(
+      {
+        migrationId: begun.migration.migrationId,
+        placementEpoch: begun.migration.toEpoch,
+        allowBackendTransition: true as const,
+        continuityTier,
+      },
+      deliveredCheckpoint,
+    )
 
     if (input.beforeCommit) {
       let commitApproved = false
@@ -727,6 +972,7 @@ export function createSelfhostCrossPoolFallbackSelector(
           resolvedCanonicalModel: resolvedLocalDesc.canonicalModel,
           logicalModel,
           migrationGrant: preparedGrant,
+          ...(deliveredCheckpoint ? { deliveredCheckpoint } : {}),
         })
       } catch {
         commitApproved = false
@@ -770,6 +1016,9 @@ export function createSelfhostCrossPoolFallbackSelector(
         userId: input.uid,
         sessionKey: input.sessionKey,
         continuityTier,
+        ...(continuityTier === 'tape_rebuilt' && deliveredCheckpoint
+          ? { checkpointGeneration: deliveredCheckpoint.checkpointGeneration }
+          : {}),
       })
       .catch(async () => {
         // B01 + OCV5-893 B3: If PG commit landed before the ack was lost, read back the
@@ -804,12 +1053,15 @@ export function createSelfhostCrossPoolFallbackSelector(
       }
     }
 
-    const migrationGrant: CrossPoolFallbackMigrationGrant = Object.freeze({
-      migrationId: committed.migration.migrationId,
-      placementEpoch: committed.pointer.placementEpoch,
-      allowBackendTransition: true as const,
-      continuityTier,
-    })
+    const migrationGrant: CrossPoolFallbackMigrationGrant = makeMigrationGrant(
+      {
+        migrationId: committed.migration.migrationId,
+        placementEpoch: committed.pointer.placementEpoch,
+        allowBackendTransition: true as const,
+        continuityTier,
+      },
+      deliveredCheckpoint,
+    )
 
     return Object.freeze({
       fallbackPool: 'local_pool' as const,
@@ -817,6 +1069,7 @@ export function createSelfhostCrossPoolFallbackSelector(
       resolvedCanonicalModel: resolvedLocalDesc.canonicalModel,
       logicalModel,
       migrationGrant,
+      ...(deliveredCheckpoint ? { deliveredCheckpoint } : {}),
     })
   }
 }
@@ -833,7 +1086,12 @@ export function createSelfhostCrossPoolFallbackSelector(
 export function createSelfhostReturnToRemoteGrantResolver(
   deps: Pick<
     SelfhostCrossPoolSelectorDeps,
-    'pool' | 'selfhost' | 'authorityStore' | 'pendingBillingChecker' | 'verifyContinuityApplied'
+    | 'pool'
+    | 'selfhost'
+    | 'authorityStore'
+    | 'pendingBillingChecker'
+    | 'prepareRollingCheckpoint'
+    | 'verifyContinuityApplied'
   >,
 ): (input: SelfhostReturnToRemoteInput) => Promise<CrossPoolFallbackMigrationGrant | null> {
   const authorityStore =
@@ -862,7 +1120,25 @@ export function createSelfhostReturnToRemoteGrantResolver(
     } catch {
       return null
     }
-    if (!existingPointer) {
+    let isLegacyLocalWithoutPointer = !existingPointer && input.hasLocalHistory === true
+    if (isLegacyLocalWithoutPointer && deps.pool) {
+      // OCV5-902 B4: Do not classify an unpointed session with historical remote_agent_bindings
+      // as pre-existing local history; only pure-local unpointed sessions migrate 1 -> 2.
+      try {
+        const rbRes = await deps.pool.query<{ operation_id?: string | null }>(
+          `SELECT operation_id FROM remote_agent_bindings
+            WHERE user_id = $1 AND session_key = $2
+            LIMIT 1`,
+          [input.uid, input.sessionKey],
+        )
+        if (rbRes.rows.length > 0) {
+          isLegacyLocalWithoutPointer = false
+        }
+      } catch {
+        return null
+      }
+    }
+    if (!existingPointer && !isLegacyLocalWithoutPointer) {
       return null
     }
 
@@ -872,7 +1148,9 @@ export function createSelfhostReturnToRemoteGrantResolver(
       input.executionBackend.operationId.trim().length > 0
         ? input.executionBackend.operationId.trim()
         : null
-    const pendingInstall = extractPendingInstallMigration(existingPointer.promptCacheMeta)
+    const pendingInstall = existingPointer
+      ? extractPendingInstallMigration(existingPointer.promptCacheMeta)
+      : null
     // OCV5-893 B3: Restrict remote re-delivery strictly to the exact committed targetOperationId
     // when one was recorded so a brand-new remote operation can never inherit a stale grant.
     const operationMatchesPendingInstall =
@@ -880,6 +1158,7 @@ export function createSelfhostReturnToRemoteGrantResolver(
       (pendingInstall.targetOperationId === null ||
         (backendOperationId !== null && pendingInstall.targetOperationId === backendOperationId))
     const isPendingRemoteInstallRedelivery =
+      existingPointer !== null &&
       existingPointer.poolKind === 'remote_pool' &&
       existingPointer.migrationState === 'active' &&
       existingPointer.engine === authEngine &&
@@ -888,7 +1167,11 @@ export function createSelfhostReturnToRemoteGrantResolver(
       pendingInstall.targetEpoch === existingPointer.placementEpoch &&
       operationMatchesPendingInstall
 
-    if (existingPointer.poolKind !== 'local_container' && !isPendingRemoteInstallRedelivery) {
+    if (
+      !isLegacyLocalWithoutPointer &&
+      existingPointer?.poolKind !== 'local_container' &&
+      !isPendingRemoteInstallRedelivery
+    ) {
       return null
     }
 
@@ -927,7 +1210,7 @@ export function createSelfhostReturnToRemoteGrantResolver(
         const hasPending = await deps.pendingBillingChecker({
           uid: input.uid,
           sessionKey: input.sessionKey,
-          operationId: existingPointer.operationId ?? null,
+          operationId: existingPointer?.operationId ?? null,
           ...(excludeCurrentPreparedBinding ? { excludeCurrentPreparedBinding } : {}),
         })
         if (hasPending) {
@@ -939,7 +1222,7 @@ export function createSelfhostReturnToRemoteGrantResolver(
           deps.pool,
           input.uid,
           input.sessionKey,
-          existingPointer.operationId ?? null,
+          existingPointer?.operationId ?? null,
           excludeCurrentPreparedBinding ? { excludeCurrentPreparedBinding } : undefined,
         )
       }
@@ -948,21 +1231,37 @@ export function createSelfhostReturnToRemoteGrantResolver(
       return null
     }
 
-    // OCV5-893 B3: PG already committed `local_container -> remote_pool` at this epoch,
-    // but the first frame was lost before container installation (`pendingInstallMigration`
-    // is still present). Re-deliver the exact committed grant after running `beforeCommit`
-    // sign/epoch validation — without starting a redundant migration or bumping epoch!
+    // OCV5-893 B3 + OCV5-902 B2: PG already committed `local_container -> remote_pool` at this
+    // epoch, but the first frame was lost before container installation. Re-deliver the exact
+    // committed grant ONLY after verifying checkpoint availability and `beforeCommit` sign check.
     if (isPendingRemoteInstallRedelivery && pendingInstall !== null) {
-      const redeliveredGrant: CrossPoolFallbackMigrationGrant = Object.freeze({
-        migrationId: pendingInstall.migrationId,
-        placementEpoch: pendingInstall.targetEpoch,
-        allowBackendTransition: true as const,
-        continuityTier: pendingInstall.continuityTier,
+      const resolvedPending = await resolveRedeliveredPendingInstall({
+        authorityStore,
+        uid: input.uid,
+        sessionKey: input.sessionKey,
+        pendingInstall,
       })
+      if (!resolvedPending.ok) {
+        input.onBlocked?.(resolvedPending.blockedCode)
+        return null
+      }
+      const redeliveredCheckpoint = resolvedPending.checkpoint
+      const redeliveredGrant: CrossPoolFallbackMigrationGrant = makeMigrationGrant(
+        {
+          migrationId: pendingInstall.migrationId,
+          placementEpoch: pendingInstall.targetEpoch,
+          allowBackendTransition: true as const,
+          continuityTier: resolvedPending.continuityTier,
+        },
+        redeliveredCheckpoint,
+      )
       if (input.beforeCommit) {
         let approved = false
         try {
-          approved = await input.beforeCommit({ migrationGrant: redeliveredGrant })
+          approved = await input.beforeCommit({
+            migrationGrant: redeliveredGrant,
+            ...(redeliveredCheckpoint ? { deliveredCheckpoint: redeliveredCheckpoint } : {}),
+          })
         } catch {
           approved = false
         }
@@ -971,57 +1270,50 @@ export function createSelfhostReturnToRemoteGrantResolver(
           return null
         }
       }
+      if (redeliveredCheckpoint) {
+        input.onDeliveredCheckpoint?.(redeliveredCheckpoint)
+      }
       return redeliveredGrant
     }
 
-    let rollingCheckpoint: Awaited<ReturnType<PgSessionAuthorityStateStore['peekRollingCheckpoint']>>
-    try {
-      rollingCheckpoint = await authorityStore.peekRollingCheckpoint(
-        input.uid,
-        input.sessionKey,
-        existingPointer.placementEpoch,
-      )
-    } catch {
+    const sourcePlacementEpoch = existingPointer?.placementEpoch ?? 1
+    const sourceEngine = existingPointer?.engine ?? authEngine
+
+    const continuity = await resolveAndVerifyCrossPoolContinuity({
+      authorityStore,
+      uid: input.uid,
+      containerId: input.containerId,
+      sessionKey: input.sessionKey,
+      sessionId: input.sessionId,
+      fromPoolKind: 'local_container',
+      toPoolKind: 'remote_pool',
+      sourcePlacementEpoch,
+      sourceEngine,
+      historicalMessages: input.historicalMessages,
+      excludeClientMessageId: input.excludeClientMessageId,
+      prepareRollingCheckpoint: input.prepareRollingCheckpoint ?? deps.prepareRollingCheckpoint,
+      depsVerifier: deps.verifyContinuityApplied,
+      inputVerifier: input.verifyContinuityApplied,
+    })
+    if (!continuity.ok) {
       input.onBlocked?.('AUTHORITY_CHECKPOINT_READ_FAILED')
       return null
     }
-    let continuityTier: ResumeLadderTier = 'cold_degraded'
-    const continuityVerifier = input.verifyContinuityApplied ?? deps.verifyContinuityApplied
-    if (rollingCheckpoint !== null && continuityVerifier) {
-      try {
-        const verified = await continuityVerifier({
-          uid: input.uid,
-          containerId: input.containerId,
-          sessionKey: input.sessionKey,
-          fromPoolKind: 'local_container',
-          toPoolKind: 'remote_pool',
-          sourcePlacementEpoch: existingPointer.placementEpoch,
-          targetPlacementEpoch: existingPointer.placementEpoch + 1,
-          checkpoint: rollingCheckpoint,
-        })
-        if (
-          verified.applied === true &&
-          verified.checkpointId === rollingCheckpoint.checkpointGeneration
-        ) {
-          continuityTier = 'tape_rebuilt'
-        }
-      } catch {
-        continuityTier = 'cold_degraded'
-      }
-    }
+    const continuityTier: ResumeLadderTier = continuity.continuityTier
+    const deliveredCheckpoint = continuity.deliveredCheckpoint
 
     const fromPlacement: PlacementDescriptor = {
       poolKind: 'local_container',
-      engine: existingPointer.engine,
+      engine: sourceEngine,
       driverId: `local-${engineFamily}`,
-      placementEpoch: existingPointer.placementEpoch,
+      placementEpoch: sourcePlacementEpoch,
       containerId: String(input.containerId),
     }
     const toPlacement: PlacementDescriptor = {
       poolKind: 'remote_pool',
       engine: authEngine,
       driverId: backendDriverId,
-      placementEpoch: existingPointer.placementEpoch + 1,
+      placementEpoch: sourcePlacementEpoch + 1,
       operationId: input.executionBackend.operationId,
       ...(backendProfileId ? { profileId: backendProfileId } : {}),
     }
@@ -1029,27 +1321,35 @@ export function createSelfhostReturnToRemoteGrantResolver(
     const begun = await authorityStore.beginPlacementMigration({
       userId: input.uid,
       sessionKey: input.sessionKey,
-      expectedPlacementEpoch: existingPointer.placementEpoch,
+      expectedPlacementEpoch: sourcePlacementEpoch,
       fromPlacement,
       toPlacement,
-      reason: 'remote_pool_recovered_return_from_local',
+      reason: isLegacyLocalWithoutPointer
+        ? 'legacy_local_session_migrated_to_remote'
+        : 'remote_pool_recovered_return_from_local',
     })
     if (!begun.applied) {
       input.onBlocked?.('RETURN_TO_REMOTE_MIGRATION_CONFLICT')
       return null
     }
 
-    const preparedGrant: CrossPoolFallbackMigrationGrant = Object.freeze({
-      migrationId: begun.migration.migrationId,
-      placementEpoch: begun.migration.toEpoch,
-      allowBackendTransition: true as const,
-      continuityTier,
-    })
+    const preparedGrant: CrossPoolFallbackMigrationGrant = makeMigrationGrant(
+      {
+        migrationId: begun.migration.migrationId,
+        placementEpoch: begun.migration.toEpoch,
+        allowBackendTransition: true as const,
+        continuityTier,
+      },
+      deliveredCheckpoint,
+    )
 
     if (input.beforeCommit) {
       let commitApproved = false
       try {
-        commitApproved = await input.beforeCommit({ migrationGrant: preparedGrant })
+        commitApproved = await input.beforeCommit({
+          migrationGrant: preparedGrant,
+          ...(deliveredCheckpoint ? { deliveredCheckpoint } : {}),
+        })
       } catch {
         commitApproved = false
       }
@@ -1093,6 +1393,9 @@ export function createSelfhostReturnToRemoteGrantResolver(
         userId: input.uid,
         sessionKey: input.sessionKey,
         continuityTier,
+        ...(continuityTier === 'tape_rebuilt' && deliveredCheckpoint
+          ? { checkpointGeneration: deliveredCheckpoint.checkpointGeneration }
+          : {}),
         operationId: input.executionBackend.operationId,
         ...(backendProfileId ? { profileId: backendProfileId } : {}),
       })
@@ -1130,11 +1433,364 @@ export function createSelfhostReturnToRemoteGrantResolver(
       }
     }
 
-    return Object.freeze({
-      migrationId: committed.migration.migrationId,
-      placementEpoch: committed.pointer.placementEpoch,
-      allowBackendTransition: true as const,
-      continuityTier: committed.migration.continuityTier ?? continuityTier,
+    if (deliveredCheckpoint) {
+      input.onDeliveredCheckpoint?.(deliveredCheckpoint)
+    }
+
+    return makeMigrationGrant(
+      {
+        migrationId: committed.migration.migrationId,
+        placementEpoch: committed.pointer.placementEpoch,
+        allowBackendTransition: true as const,
+        continuityTier: committed.migration.continuityTier ?? continuityTier,
+      },
+      deliveredCheckpoint,
+    )
+  }
+}
+
+/**
+ * OCV5-902 B4: Forced-local migration grant resolver for selfhost V5.
+ * When an active `remote_pool` session is redirected to local execution by an admin binding
+ * priority/disable change (`MODEL_POOL_BINDING_FORCED_LOCAL`), runs the exact same B06
+ * unsettled-billing fence, `tape_rebuilt` checkpoint continuity proof, and CAS epoch migration
+ * (`remote_pool` -> `local_container`, epoch N -> N+1) so the container transitions cleanly
+ * without hitting `CC5_BACKEND_SCOPE_CHANGED`.
+ */
+export function createSelfhostForcedLocalMigrationResolver(
+  deps: Pick<
+    SelfhostCrossPoolSelectorDeps,
+    | 'pool'
+    | 'selfhost'
+    | 'authorityStore'
+    | 'pendingBillingChecker'
+    | 'prepareRollingCheckpoint'
+    | 'verifyContinuityApplied'
+  >,
+): (input: SelfhostForcedLocalMigrationInput) => Promise<CrossPoolFallbackMigrationGrant | null> {
+  const authorityStore =
+    deps.authorityStore ?? (deps.pool ? new PgSessionAuthorityStateStore(deps.pool) : undefined)
+
+  return async (
+    input: SelfhostForcedLocalMigrationInput,
+  ): Promise<CrossPoolFallbackMigrationGrant | null> => {
+    if (deps.selfhost !== true || !authorityStore) return null
+    if (!deps.pendingBillingChecker && !deps.pool) return null
+    if (
+      !Number.isSafeInteger(input.uid) ||
+      input.uid <= 0 ||
+      typeof input.sessionKey !== 'string' ||
+      input.sessionKey.trim().length === 0
+    ) {
+      return null
+    }
+    if (!AUTHORITY_ENGINE_SET.has(input.engine)) return null
+    const authEngine = input.engine as AuthorityEngineKind
+    if (LOCAL_CROSS_POOL_FALLBACK_SUPPORTED_ENGINES[authEngine] !== true) return null
+    const engineFamily = ENGINE_FAMILY_BY_AUTHORITY[authEngine]
+
+    let existingPointer: Awaited<ReturnType<PgSessionAuthorityStateStore['getEnginePointer']>>
+    try {
+      existingPointer = await authorityStore.getEnginePointer(input.uid, input.sessionKey)
+    } catch {
+      return null
+    }
+    // OCV5-902 B4: Reconstruct unpointed legacy remote sessions from authoritative remote_agent_bindings
+    // so disabling a remote binding mid-session still performs a verified 1 -> 2 migration (with B06).
+    let inferredRemoteBinding: { operationId: string | null; profileId: string | null } | null = null
+    if (!existingPointer && deps.pool) {
+      try {
+        const rbRes = await deps.pool.query<{
+          operation_id?: string | null
+          profile_id?: string | null
+        }>(
+          `SELECT operation_id, profile_id
+             FROM remote_agent_bindings
+            WHERE user_id = $1 AND session_key = $2
+            ORDER BY updated_at DESC
+            LIMIT 1`,
+          [input.uid, input.sessionKey],
+        )
+        const rbRow = rbRes.rows[0]
+        if (rbRow) {
+          inferredRemoteBinding = {
+            operationId:
+              typeof rbRow.operation_id === 'string' && rbRow.operation_id.trim().length > 0
+                ? rbRow.operation_id.trim()
+                : null,
+            profileId:
+              typeof rbRow.profile_id === 'string' && rbRow.profile_id.trim().length > 0
+                ? rbRow.profile_id.trim()
+                : null,
+          }
+        }
+      } catch {
+        input.onBlocked?.('REMOTE_PLACEMENT_LOOKUP_FAILED')
+        return null
+      }
+    }
+    if (!existingPointer && !inferredRemoteBinding) return null
+
+    const pendingInstall = existingPointer
+      ? extractPendingInstallMigration(existingPointer.promptCacheMeta)
+      : null
+    const isPendingLocalInstallRedelivery =
+      existingPointer !== null &&
+      existingPointer.poolKind === 'local_container' &&
+      existingPointer.migrationState === 'active' &&
+      existingPointer.engine === authEngine &&
+      pendingInstall !== null &&
+      pendingInstall.targetPoolKind === 'local_container' &&
+      pendingInstall.targetEpoch === existingPointer.placementEpoch
+
+    if (
+      existingPointer !== null &&
+      existingPointer.poolKind !== 'remote_pool' &&
+      !isPendingLocalInstallRedelivery
+    ) {
+      return null
+    }
+
+    const sourcePlacementEpoch = existingPointer?.placementEpoch ?? 1
+    const sourceEngine = existingPointer?.engine ?? authEngine
+    const sourceOperationId = existingPointer?.operationId ?? inferredRemoteBinding?.operationId ?? null
+    const sourceProfileId = existingPointer?.profileId ?? inferredRemoteBinding?.profileId ?? null
+
+    // B06: Strictly enforce unsettled remote billing fence before migrating away from remote_pool.
+    try {
+      if (deps.pendingBillingChecker) {
+        const hasPending = await deps.pendingBillingChecker({
+          uid: input.uid,
+          sessionKey: input.sessionKey,
+          operationId: sourceOperationId,
+        })
+        if (hasPending) {
+          input.onBlocked?.('REMOTE_OPERATION_BILLING_PENDING')
+          return null
+        }
+      } else if (deps.pool) {
+        await assertNoPendingRemoteBillingForSession(
+          deps.pool,
+          input.uid,
+          input.sessionKey,
+          sourceOperationId,
+        )
+      }
+    } catch {
+      input.onBlocked?.('REMOTE_OPERATION_BILLING_PENDING')
+      return null
+    }
+
+    if (isPendingLocalInstallRedelivery && pendingInstall !== null) {
+      const resolvedPending = await resolveRedeliveredPendingInstall({
+        authorityStore,
+        uid: input.uid,
+        sessionKey: input.sessionKey,
+        pendingInstall,
+      })
+      if (!resolvedPending.ok) {
+        input.onBlocked?.(resolvedPending.blockedCode)
+        return null
+      }
+      const redeliveredCheckpoint = resolvedPending.checkpoint
+      const redeliveredGrant = makeMigrationGrant(
+        {
+          migrationId: pendingInstall.migrationId,
+          placementEpoch: pendingInstall.targetEpoch,
+          allowBackendTransition: true as const,
+          continuityTier: resolvedPending.continuityTier,
+        },
+        redeliveredCheckpoint,
+      )
+      if (input.beforeCommit) {
+        let approved = false
+        try {
+          approved = await input.beforeCommit({
+            migrationGrant: redeliveredGrant,
+            ...(redeliveredCheckpoint ? { deliveredCheckpoint: redeliveredCheckpoint } : {}),
+          })
+        } catch {
+          approved = false
+        }
+        if (!approved) {
+          input.onBlocked?.('FORCED_LOCAL_SIGN_REJECTED')
+          return null
+        }
+      }
+      if (redeliveredCheckpoint) {
+        input.onDeliveredCheckpoint?.(redeliveredCheckpoint)
+      }
+      return redeliveredGrant
+    }
+
+    if (existingPointer && existingPointer.migrationState !== 'active') {
+      input.onBlocked?.('FORCED_LOCAL_MIGRATION_CONFLICT')
+      return null
+    }
+
+    const continuity = await resolveAndVerifyCrossPoolContinuity({
+      authorityStore,
+      uid: input.uid,
+      containerId: input.containerId,
+      sessionKey: input.sessionKey,
+      sessionId: input.sessionId,
+      fromPoolKind: 'remote_pool',
+      toPoolKind: 'local_container',
+      sourcePlacementEpoch,
+      sourceEngine,
+      historicalMessages: input.historicalMessages,
+      excludeClientMessageId: input.excludeClientMessageId,
+      prepareRollingCheckpoint: input.prepareRollingCheckpoint ?? deps.prepareRollingCheckpoint,
+      depsVerifier: deps.verifyContinuityApplied,
+      inputVerifier: input.verifyContinuityApplied,
     })
+    if (!continuity.ok) {
+      input.onBlocked?.('AUTHORITY_CHECKPOINT_READ_FAILED')
+      return null
+    }
+    const continuityTier: ResumeLadderTier = continuity.continuityTier
+    const deliveredCheckpoint = continuity.deliveredCheckpoint
+
+    const fromPlacement: PlacementDescriptor = {
+      poolKind: 'remote_pool',
+      engine: sourceEngine,
+      driverId: engineFamily,
+      placementEpoch: sourcePlacementEpoch,
+      ...(sourceProfileId ? { profileId: sourceProfileId } : {}),
+      ...(sourceOperationId ? { operationId: sourceOperationId } : {}),
+    }
+    const toPlacement: PlacementDescriptor = {
+      poolKind: 'local_container',
+      engine: authEngine,
+      driverId: `local-${engineFamily}`,
+      placementEpoch: sourcePlacementEpoch + 1,
+      containerId: String(input.containerId),
+    }
+
+    const begun = await authorityStore.beginPlacementMigration({
+      userId: input.uid,
+      sessionKey: input.sessionKey,
+      expectedPlacementEpoch: sourcePlacementEpoch,
+      fromPlacement,
+      toPlacement,
+      reason:
+        typeof input.reason === 'string' && input.reason.trim().length > 0
+          ? input.reason.trim()
+          : 'MODEL_POOL_BINDING_FORCED_LOCAL',
+    })
+    if (!begun.applied) {
+      input.onBlocked?.('FORCED_LOCAL_MIGRATION_CONFLICT')
+      return null
+    }
+
+    const preparedGrant = makeMigrationGrant(
+      {
+        migrationId: begun.migration.migrationId,
+        placementEpoch: begun.migration.toEpoch,
+        allowBackendTransition: true as const,
+        continuityTier,
+      },
+      deliveredCheckpoint,
+    )
+
+    if (input.beforeCommit) {
+      let commitApproved = false
+      try {
+        commitApproved = await input.beforeCommit({
+          migrationGrant: preparedGrant,
+          ...(deliveredCheckpoint ? { deliveredCheckpoint } : {}),
+        })
+      } catch {
+        commitApproved = false
+      }
+      if (!commitApproved) {
+        await authorityStore
+          .abortPlacementMigration({
+            migrationId: begun.migration.migrationId,
+            reason: 'forced_local_sign_validation_rejected',
+            userId: input.uid,
+            sessionKey: input.sessionKey,
+          })
+          .catch(() => {})
+        input.onBlocked?.('FORCED_LOCAL_SIGN_REJECTED')
+        return null
+      }
+    }
+
+    const readBackCommittedLocal = async () => {
+      const readBack = await authorityStore
+        .getPlacementMigration(begun.migration.migrationId)
+        .catch(() => null)
+      if (readBack && readBack.state === 'committed') {
+        const ptr = await authorityStore
+          .getEnginePointer(input.uid, input.sessionKey)
+          .catch(() => null)
+        if (
+          ptr &&
+          ptr.poolKind === 'local_container' &&
+          ptr.migrationState === 'active' &&
+          ptr.placementEpoch === readBack.toEpoch
+        ) {
+          return { applied: true as const, migration: readBack, pointer: ptr }
+        }
+      }
+      return null
+    }
+
+    let committed = await authorityStore
+      .commitPlacementMigration({
+        migrationId: begun.migration.migrationId,
+        userId: input.uid,
+        sessionKey: input.sessionKey,
+        continuityTier,
+        ...(continuityTier === 'tape_rebuilt' && deliveredCheckpoint
+          ? { checkpointGeneration: deliveredCheckpoint.checkpointGeneration }
+          : {}),
+      })
+      .catch(async () => {
+        const recovered = await readBackCommittedLocal()
+        if (recovered) return recovered
+        await authorityStore
+          .abortPlacementMigration({
+            migrationId: begun.migration.migrationId,
+            reason: 'forced_local_commit_failed',
+            userId: input.uid,
+            sessionKey: input.sessionKey,
+          })
+          .catch(() => {})
+        return null
+      })
+
+    if (!committed || !committed.applied) {
+      const recovered = await readBackCommittedLocal()
+      if (recovered) {
+        committed = recovered
+      } else {
+        await authorityStore
+          .abortPlacementMigration({
+            migrationId: begun.migration.migrationId,
+            reason: 'forced_local_commit_not_applied',
+            userId: input.uid,
+            sessionKey: input.sessionKey,
+          })
+          .catch(() => {})
+        input.onBlocked?.('FORCED_LOCAL_COMMIT_FAILED')
+        return null
+      }
+    }
+
+    if (deliveredCheckpoint) {
+      input.onDeliveredCheckpoint?.(deliveredCheckpoint)
+    }
+
+    return makeMigrationGrant(
+      {
+        migrationId: committed.migration.migrationId,
+        placementEpoch: committed.pointer.placementEpoch,
+        allowBackendTransition: true as const,
+        continuityTier: committed.migration.continuityTier ?? continuityTier,
+      },
+      deliveredCheckpoint,
+    )
   }
 }
