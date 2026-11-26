@@ -45,6 +45,8 @@ import {
 import {
   buildPendingInstallPromptCacheMetaJson,
   extractPendingInstallMigration,
+  normalizeCheckpointGeneration,
+  resolvePendingInstallAckTarget,
   stripPendingInstallPromptCacheMetaJson,
   type PendingInstallMigration,
 } from './threeLayerPendingInstall.js'
@@ -145,6 +147,7 @@ export interface CommitPlacementMigrationCas {
   readonly userId?: number | bigint
   readonly sessionKey?: string
   readonly continuityTier: ResumeLadderTier
+  readonly checkpointGeneration?: string | null
   readonly capsuleRef?: EngineStateCapsuleRef | null
   readonly nativeSessionId?: string | null
   readonly operationId?: string | null
@@ -152,6 +155,18 @@ export interface CommitPlacementMigrationCas {
   readonly capsuleId?: string | null
   readonly promptCacheMeta?: Readonly<Record<string, unknown>> | null
   readonly usageBaseline?: Readonly<Record<string, number>> | null
+}
+
+export interface MarkPlacementMigrationInstalledOptions {
+  readonly consumedByTurnKey?: string
+  readonly checkpointGeneration?: string | null
+  readonly requireWarmCheckpointMatch?: boolean
+}
+
+export interface MarkPlacementMigrationInstalledResult {
+  readonly installed: boolean
+  readonly checkpointAcked: boolean
+  readonly checkpointGeneration: string | null
 }
 
 export type CommitPlacementMigrationResult =
@@ -534,13 +549,9 @@ function mapMigrationRow(row: MigrationRow): PlacementMigrationRecord {
   })
 }
 
-const POINTER_SELECT_COLUMNS = `
-  user_id, session_key, placement_epoch, pool_kind, engine,
-  native_session_id, operation_id, profile_id, capsule_id,
-  history_json, rejected_ids_json, prompt_cache_meta_json, usage_baseline_json,
-  history_context_version, promoted_from_history,
-  migration_state, active_migration_id, updated_at, created_at
-`
+const POINTER_SELECT_COLUMNS = `user_id, session_key, placement_epoch, pool_kind, engine, native_session_id, operation_id, profile_id, capsule_id, history_json, rejected_ids_json, prompt_cache_meta_json, usage_baseline_json, history_context_version, promoted_from_history, migration_state, active_migration_id, updated_at, created_at`
+const CHECKPOINT_SELECT_COLUMNS = `session_key, session_id, checkpoint_generation, placement_epoch, mode, anchor_seq, source_engine, summary, instructions, acked_by_turn_key, acked_at, created_at`
+const MIGRATION_SELECT_COLUMNS = `migration_id, user_id, session_key, from_epoch, to_epoch, state, from_placement_json, to_placement_json, capsule_ref_json, continuity_tier, reason, created_at, completed_at`
 
 export class PgSessionAuthorityStateStore {
   private readonly pool: PgTransactionPool
@@ -893,9 +904,7 @@ export class PgSessionAuthorityStateStore {
     const res =
       expectedEpoch !== undefined
         ? await this.pool.query<CheckpointRow>(
-            `SELECT session_key, session_id, checkpoint_generation, placement_epoch, mode,
-                    anchor_seq, source_engine, summary, instructions,
-                    acked_by_turn_key, acked_at, created_at
+            `SELECT ${CHECKPOINT_SELECT_COLUMNS}
                FROM session_rolling_checkpoints
               WHERE user_id = $1 AND session_key = $2 AND placement_epoch = $3 AND acked_at IS NULL
               ORDER BY created_at DESC, checkpoint_generation DESC
@@ -903,15 +912,39 @@ export class PgSessionAuthorityStateStore {
             [uid, key, expectedEpoch],
           )
         : await this.pool.query<CheckpointRow>(
-            `SELECT session_key, session_id, checkpoint_generation, placement_epoch, mode,
-                    anchor_seq, source_engine, summary, instructions,
-                    acked_by_turn_key, acked_at, created_at
+            `SELECT ${CHECKPOINT_SELECT_COLUMNS}
                FROM session_rolling_checkpoints
               WHERE user_id = $1 AND session_key = $2 AND acked_at IS NULL
               ORDER BY created_at DESC, checkpoint_generation DESC
               LIMIT 1`,
             [uid, key],
           )
+    const row = res.rows[0]
+    return row ? mapCheckpointRow(row) : null
+  }
+
+  /** OCV5-902 P0-1: Read a rolling checkpoint by exact generation (survives epoch N -> N+1 bump on first-frame retry). */
+  async getRollingCheckpointByGeneration(
+    userId: number | bigint,
+    sessionKey: string,
+    checkpointGeneration: string,
+    opts?: { readonly includeAcked?: boolean },
+  ): Promise<AuthoritativeRollingCheckpoint | null> {
+    const uid = normalizeUserId(userId)
+    const key = assertNonEmptyString(sessionKey, 'STATE_STORE_SESSION_KEY_INVALID')
+    const generation = assertNonEmptyString(
+      checkpointGeneration,
+      'CHECKPOINT_GENERATION_INVALID',
+      128,
+    )
+    const ackClause = opts?.includeAcked === true ? '' : ' AND acked_at IS NULL'
+    const res = await this.pool.query<CheckpointRow>(
+      `SELECT ${CHECKPOINT_SELECT_COLUMNS}
+         FROM session_rolling_checkpoints
+        WHERE user_id = $1 AND session_key = $2 AND checkpoint_generation = $3${ackClause}
+        LIMIT 1`,
+      [uid, key, generation],
+    )
     const row = res.rows[0]
     return row ? mapCheckpointRow(row) : null
   }
@@ -1041,9 +1074,7 @@ export class PgSessionAuthorityStateStore {
            migration_id, user_id, session_key, from_epoch, to_epoch, state,
            from_placement_json, to_placement_json, reason
          ) VALUES ($1, $2, $3, $4, $5, 'migrating', $6::jsonb, $7::jsonb, $8)
-         RETURNING migration_id, user_id, session_key, from_epoch, to_epoch, state,
-                   from_placement_json, to_placement_json, capsule_ref_json,
-                   continuity_tier, reason, created_at, completed_at`,
+         RETURNING ${MIGRATION_SELECT_COLUMNS}`,
         [
           migrationId,
           uid,
@@ -1070,15 +1101,11 @@ export class PgSessionAuthorityStateStore {
     assertCondition(IDENT_8_128_RE.test(cas.migrationId), 'MIGRATION_ID_INVALID')
     assertCondition(RESUME_TIER_SET.has(cas.continuityTier), 'MIGRATION_CONTINUITY_TIER_INVALID')
     const expectedUid = cas.userId !== undefined ? normalizeUserId(cas.userId) : null
+    const checkpointGeneration = normalizeCheckpointGeneration(cas.checkpointGeneration)
 
     return withTransaction<CommitPlacementMigrationResult>(this.pool, async (client) => {
       const migRes = await client.query<MigrationRow>(
-        `SELECT migration_id, user_id, session_key, from_epoch, to_epoch, state,
-                from_placement_json, to_placement_json, capsule_ref_json,
-                continuity_tier, reason, created_at, completed_at
-           FROM session_placement_migrations
-          WHERE migration_id = $1
-          FOR UPDATE`,
+        `SELECT ${MIGRATION_SELECT_COLUMNS} FROM session_placement_migrations WHERE migration_id = $1 FOR UPDATE`,
         [cas.migrationId],
       )
       const migRow = migRes.rows[0]
@@ -1106,9 +1133,7 @@ export class PgSessionAuthorityStateStore {
                 completed_at = NOW()
           WHERE migration_id = $1
             AND state = 'migrating'
-          RETURNING migration_id, user_id, session_key, from_epoch, to_epoch, state,
-                    from_placement_json, to_placement_json, capsule_ref_json,
-                    continuity_tier, reason, created_at, completed_at`,
+          RETURNING ${MIGRATION_SELECT_COLUMNS}`,
         [
           cas.migrationId,
           cas.continuityTier,
@@ -1134,14 +1159,8 @@ export class PgSessionAuthorityStateStore {
         cas.capsuleId !== undefined ? cas.capsuleId : (cas.capsuleRef?.capsuleId ?? null)
       const hasUsageBaseline = cas.usageBaseline !== undefined
 
-      // OCV5-893 B3: Preserve existing prompt_cache_meta_json fields and atomically record
-      // `pendingInstallMigration` so retries after a dropped first frame can re-deliver the
-      // exact committed grant in either direction without relying on `nativeSessionId`.
       const existingPtrRes = await client.query<{ prompt_cache_meta_json: unknown }>(
-        `SELECT prompt_cache_meta_json
-           FROM session_engine_pointers
-          WHERE user_id = $1 AND session_key = $2
-          FOR UPDATE`,
+        `SELECT prompt_cache_meta_json FROM session_engine_pointers WHERE user_id = $1 AND session_key = $2 FOR UPDATE`,
         [uid, key],
       )
       const basePromptCacheMeta =
@@ -1155,6 +1174,7 @@ export class PgSessionAuthorityStateStore {
         targetOperationId,
         continuityTier: cas.continuityTier,
         committedAtMs: Date.now(),
+        ...(checkpointGeneration !== null ? { checkpointGeneration } : {}),
       }
       const nextPromptCacheMetaJson = buildPendingInstallPromptCacheMetaJson(
         basePromptCacheMeta,
@@ -1222,12 +1242,7 @@ export class PgSessionAuthorityStateStore {
 
     return withTransaction<AbortPlacementMigrationResult>(this.pool, async (client) => {
       const migRes = await client.query<MigrationRow>(
-        `SELECT migration_id, user_id, session_key, from_epoch, to_epoch, state,
-                from_placement_json, to_placement_json, capsule_ref_json,
-                continuity_tier, reason, created_at, completed_at
-           FROM session_placement_migrations
-          WHERE migration_id = $1
-          FOR UPDATE`,
+        `SELECT ${MIGRATION_SELECT_COLUMNS} FROM session_placement_migrations WHERE migration_id = $1 FOR UPDATE`,
         [cas.migrationId],
       )
       const migRow = migRes.rows[0]
@@ -1254,9 +1269,7 @@ export class PgSessionAuthorityStateStore {
                 completed_at = NOW()
           WHERE migration_id = $1
             AND state = 'migrating'
-          RETURNING migration_id, user_id, session_key, from_epoch, to_epoch, state,
-                    from_placement_json, to_placement_json, capsule_ref_json,
-                    continuity_tier, reason, created_at, completed_at`,
+          RETURNING ${MIGRATION_SELECT_COLUMNS}`,
         [cas.migrationId, reason],
       )
       if (abortedRes.rows.length === 0) {
@@ -1287,69 +1300,97 @@ export class PgSessionAuthorityStateStore {
   async getPlacementMigration(migrationId: string): Promise<PlacementMigrationRecord | null> {
     assertCondition(IDENT_8_128_RE.test(migrationId), 'MIGRATION_ID_INVALID')
     const res = await this.pool.query<MigrationRow>(
-      `SELECT migration_id, user_id, session_key, from_epoch, to_epoch, state,
-              from_placement_json, to_placement_json, capsule_ref_json,
-              continuity_tier, reason, created_at, completed_at
-         FROM session_placement_migrations
-        WHERE migration_id = $1`,
+      `SELECT ${MIGRATION_SELECT_COLUMNS} FROM session_placement_migrations WHERE migration_id = $1`,
       [migrationId],
     )
     return res.rows[0] ? mapMigrationRow(res.rows[0]) : null
   }
 
   /**
-   * OCV5-893 B3: Idempotently clears `pendingInstallMigration` from
-   * `session_engine_pointers.prompt_cache_meta_json` once the migrated placement
-   * has been confirmed installed on the container for `(expectedEpoch, expectedMigrationId)`.
-   * Preserves all other keys inside `prompt_cache_meta_json`.
+   * OCV5-893 B3 + OCV5-902 B1: Atomically clears `pendingInstallMigration` and acks the matched
+   * `session_rolling_checkpoints` row inside a single PG transaction.
    */
-  async markPlacementMigrationInstalled(
+  async markPlacementMigrationInstalledAndAckCheckpoint(
     userId: number | bigint,
     sessionKey: string,
     expectedEpoch: number,
     expectedMigrationId: string,
-  ): Promise<boolean> {
+    opts?: MarkPlacementMigrationInstalledOptions,
+  ): Promise<MarkPlacementMigrationInstalledResult> {
     const uid = normalizeUserId(userId)
     const key = assertNonEmptyString(sessionKey, 'STATE_STORE_SESSION_KEY_INVALID')
     const epoch = assertPositiveEpoch(expectedEpoch, 'STATE_STORE_PLACEMENT_EPOCH_INVALID')
     assertCondition(IDENT_8_128_RE.test(expectedMigrationId), 'MIGRATION_ID_INVALID')
+    const turnKey =
+      typeof opts?.consumedByTurnKey === 'string' && opts.consumedByTurnKey.trim().length > 0
+        ? assertNonEmptyString(opts.consumedByTurnKey.trim(), 'CHECKPOINT_TURN_KEY_INVALID', 256)
+        : `migration-install:${expectedMigrationId}`
+    const noop = Object.freeze({ installed: false, checkpointAcked: false, checkpointGeneration: null })
 
-    return withTransaction<boolean>(this.pool, async (client) => {
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
-        `session-migrate:${uid}:${key}`,
-      ])
+    return withTransaction<MarkPlacementMigrationInstalledResult>(this.pool, async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`session-migrate:${uid}:${key}`])
       const ptrRes = await client.query<PointerRow>(
-        `SELECT ${POINTER_SELECT_COLUMNS}
-           FROM session_engine_pointers
-          WHERE user_id = $1 AND session_key = $2
-          FOR UPDATE`,
+        `SELECT ${POINTER_SELECT_COLUMNS} FROM session_engine_pointers WHERE user_id = $1 AND session_key = $2 FOR UPDATE`,
         [uid, key],
       )
       const row = ptrRes.rows[0]
-      if (!row) return false
+      if (!row) return noop
       const pointer = mapPointerRow(row)
-      if (pointer.placementEpoch !== epoch) return false
+      if (pointer.placementEpoch !== epoch) return noop
       const pending = extractPendingInstallMigration(pointer.promptCacheMeta)
-      if (
-        !pending ||
-        pending.migrationId !== expectedMigrationId ||
-        pending.targetEpoch !== epoch
-      ) {
-        return false
+      if (!pending || pending.migrationId !== expectedMigrationId || pending.targetEpoch !== epoch) {
+        return noop
       }
+      const ackTarget = resolvePendingInstallAckTarget(pending, opts)
+      if (!ackTarget.allowed) return noop
+
       const nextJson = stripPendingInstallPromptCacheMetaJson(pointer.promptCacheMeta)
       const upd = await client.query<{ placement_epoch: string | number }>(
         `UPDATE session_engine_pointers
             SET prompt_cache_meta_json = $3::jsonb,
                 updated_at = NOW()
-          WHERE user_id = $1
-            AND session_key = $2
-            AND placement_epoch = $4
+          WHERE user_id = $1 AND session_key = $2 AND placement_epoch = $4
           RETURNING placement_epoch`,
         [uid, key, nextJson, epoch],
       )
-      return upd.rows.length > 0
+      if (upd.rows.length === 0) return noop
+      if (ackTarget.checkpointGeneration === null) {
+        return Object.freeze({ installed: true, checkpointAcked: false, checkpointGeneration: null })
+      }
+      const ackRes = await client.query<{ checkpoint_generation: string }>(
+        `UPDATE session_rolling_checkpoints
+            SET acked_by_turn_key = $4,
+                acked_at = NOW()
+          WHERE user_id = $1
+            AND session_key = $2
+            AND checkpoint_generation = $3
+            AND acked_at IS NULL
+          RETURNING checkpoint_generation`,
+        [uid, key, ackTarget.checkpointGeneration, turnKey],
+      )
+      return Object.freeze({
+        installed: true,
+        checkpointAcked: ackRes.rows.length > 0,
+        checkpointGeneration: ackTarget.checkpointGeneration,
+      })
     })
+  }
+
+  async markPlacementMigrationInstalled(
+    userId: number | bigint,
+    sessionKey: string,
+    expectedEpoch: number,
+    expectedMigrationId: string,
+    opts?: MarkPlacementMigrationInstalledOptions,
+  ): Promise<boolean> {
+    const res = await this.markPlacementMigrationInstalledAndAckCheckpoint(
+      userId,
+      sessionKey,
+      expectedEpoch,
+      expectedMigrationId,
+      opts,
+    )
+    return res.installed
   }
 }
 
@@ -1392,6 +1433,8 @@ function mapBindingRow(row: BindingRow): LogicalModelPoolBinding {
   })
 }
 
+const BINDING_SELECT_COLUMNS = `logical_model_id, pool_kind, driver_id, canonical_model_id, priority, capabilities_json, enabled`
+
 export class PgLogicalModelBindingStore {
   private readonly pool: PgQueryable
 
@@ -1401,21 +1444,8 @@ export class PgLogicalModelBindingStore {
 
   async resolveBindingsForModel(rawModelId: string): Promise<ResolvedModelPoolBindings> {
     const resolved = resolveLogicalModelId(rawModelId)
-    const sql = resolved.isLegacyRemoteAlias
-      ? `SELECT logical_model_id, pool_kind, driver_id, canonical_model_id,
-                priority, capabilities_json, enabled
-           FROM model_logical_pool_bindings
-          WHERE logical_model_id = $1
-            AND enabled = TRUE
-            AND pool_kind = 'remote_pool'
-          ORDER BY priority ASC, driver_id ASC`
-      : `SELECT logical_model_id, pool_kind, driver_id, canonical_model_id,
-                priority, capabilities_json, enabled
-           FROM model_logical_pool_bindings
-          WHERE logical_model_id = $1
-            AND enabled = TRUE
-          ORDER BY priority ASC, driver_id ASC`
-
+    const poolClause = resolved.isLegacyRemoteAlias ? ` AND pool_kind = 'remote_pool'` : ''
+    const sql = `SELECT ${BINDING_SELECT_COLUMNS} FROM model_logical_pool_bindings WHERE logical_model_id = $1 AND enabled = TRUE${poolClause} ORDER BY priority ASC, driver_id ASC`
     const res = await this.pool.query<BindingRow>(sql, [resolved.logicalModel])
     return Object.freeze({
       resolved,
@@ -1424,26 +1454,12 @@ export class PgLogicalModelBindingStore {
   }
 
   /**
-   * N01: Authoritative binding inspection distinguishing:
-   * - `status: 'unconfigured'` (`totalCount === 0`)
-   * - `status: 'configured'` with all bindings disabled (`totalCount > 0 && enabledBindings.length === 0`)
-   * - read failure (propagates thrown error; never swallowed).
+   * N01: Authoritative binding inspection distinguishing unconfigured, all-disabled, and read error.
    */
   async inspectLogicalModelBindings(rawModelId: string): Promise<InspectedModelPoolBindings> {
     const resolved = resolveLogicalModelId(rawModelId)
-    const sql = resolved.isLegacyRemoteAlias
-      ? `SELECT logical_model_id, pool_kind, driver_id, canonical_model_id,
-                priority, capabilities_json, enabled
-           FROM model_logical_pool_bindings
-          WHERE logical_model_id = $1
-            AND pool_kind = 'remote_pool'
-          ORDER BY priority ASC, driver_id ASC`
-      : `SELECT logical_model_id, pool_kind, driver_id, canonical_model_id,
-                priority, capabilities_json, enabled
-           FROM model_logical_pool_bindings
-          WHERE logical_model_id = $1
-          ORDER BY priority ASC, driver_id ASC`
-
+    const poolClause = resolved.isLegacyRemoteAlias ? ` AND pool_kind = 'remote_pool'` : ''
+    const sql = `SELECT ${BINDING_SELECT_COLUMNS} FROM model_logical_pool_bindings WHERE logical_model_id = $1${poolClause} ORDER BY priority ASC, driver_id ASC`
     const res = await this.pool.query<BindingRow>(sql, [resolved.logicalModel])
     const allConfiguredBindings = Object.freeze(res.rows.map(mapBindingRow))
     const enabledBindings = Object.freeze(allConfiguredBindings.filter((b) => b.enabled))
@@ -1627,10 +1643,8 @@ function mapBlobUploadRow(row: BlobUploadRow): ArtifactBlobUploadRecord {
   })
 }
 
-const BLOB_SELECT_COLUMNS = `
-  blob_id, tenant_id, sha256, size_bytes, mime_type, kind,
-  logical_name, container_relative_path, storage_backend, storage_uri, created_at
-`
+const BLOB_SELECT_COLUMNS = `blob_id, tenant_id, sha256, size_bytes, mime_type, kind, logical_name, container_relative_path, storage_backend, storage_uri, created_at`
+const BLOB_UPLOAD_SELECT_COLUMNS = `upload_id, tenant_id, kind, filename, mime_type, expected_size_bytes, chunk_bytes, chunk_count, received_parts_json, status, completed_blob_id, created_at, updated_at`
 
 export class PgArtifactBlobMetaStore {
   private readonly pool: PgTransactionPool
@@ -1673,9 +1687,7 @@ export class PgArtifactBlobMetaStore {
          upload_id, tenant_id, kind, filename, mime_type,
          expected_size_bytes, chunk_bytes, chunk_count
        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING upload_id, tenant_id, kind, filename, mime_type,
-                 expected_size_bytes, chunk_bytes, chunk_count,
-                 received_parts_json, status, completed_blob_id, created_at, updated_at`,
+       RETURNING ${BLOB_UPLOAD_SELECT_COLUMNS}`,
       [
         uploadId,
         meta.tenantId,
@@ -1693,11 +1705,7 @@ export class PgArtifactBlobMetaStore {
   async getUpload(uploadId: string): Promise<ArtifactBlobUploadRecord | null> {
     assertCondition(IDENT_8_128_RE.test(uploadId), 'BLOB_UPLOAD_ID_INVALID')
     const res = await this.pool.query<BlobUploadRow>(
-      `SELECT upload_id, tenant_id, kind, filename, mime_type,
-              expected_size_bytes, chunk_bytes, chunk_count,
-              received_parts_json, status, completed_blob_id, created_at, updated_at
-         FROM artifact_blob_uploads
-        WHERE upload_id = $1`,
+      `SELECT ${BLOB_UPLOAD_SELECT_COLUMNS} FROM artifact_blob_uploads WHERE upload_id = $1`,
       [uploadId],
     )
     return res.rows[0] ? mapBlobUploadRow(res.rows[0]) : null

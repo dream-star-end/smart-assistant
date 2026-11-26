@@ -122,6 +122,9 @@ export const ADMIN_AUDIT_ACTIONS = {
   // OCV5-424 服务池:API key 成员的添加 / 管理员启停。
   "pool_key.create": { kind: "write", mode: "best-effort" },
   "pool_key.patch": { kind: "write", mode: "best-effort" },
+  // OCV5-902 P0-2 逻辑模型与执行池绑定:目录同步 / 管理员手工覆写。
+  "model_pool_bindings.sync": { kind: "write", mode: "best-effort" },
+  "model_pool_bindings.put": { kind: "write", mode: "best-effort" },
   // OCV5-721 远端服务池(节点、Profile、模型勾选上架、绑定吊销)。
   "remote_pool.node.create": { kind: "write", mode: "best-effort" },
   "remote_pool.node.probe": { kind: "write", mode: "best-effort" },

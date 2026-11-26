@@ -143,7 +143,7 @@ import {
   activeGoalAttribution,
   RuntimeRecycleDrainingError,
 } from './sessionManager.js'
-import { ackPendingCheckpointIfTurnSucceeded, applyPendingCheckpointToSession, beginCheckpointTurnOutcome, isSessionCompacting, peekPendingCheckpoint, resetUnackedCheckpointSessionFlags, type PersistedCheckpointRecord } from './sessionCheckpointStore.js'
+import { ackPendingCheckpointIfTurnSucceeded, applyPendingCheckpointToSession, beginCheckpointTurnOutcome, isSessionCompacting, peekPendingCheckpoint, resetUnackedCheckpointSessionFlags, resolveMigrationAwareStoredResume, type PersistedCheckpointRecord } from './sessionCheckpointStore.js'
 import { beginTurnOverflowContext, clearTurnOverflowContext, getTurnActiveCheckpointGeneration, maybeAutoCompactBeforeTurn } from './sessionAutoCompact.js'
 import type {
   SessionManager,
@@ -1906,23 +1906,12 @@ export async function _getOrCreateExclusive(
     //     teardown 判定与构造用同一份解析结果,不会出现"比较用 A、spawn 用 B"。
     //   - createEngine 对未注册 engine fail-closed 抛错(原 v5 channel 硬闸的
     //     语义升级形态:任何 channel 都不会把未注册 engine 静默落到 CCB)。
-    const storedResumeForCreate = this._resumeMap.get(opts.sessionKey)
+    const { effectiveStoredResumeId: storedResumeForCreate, clearStaleResume } = resolveMigrationAwareStoredResume({
+      storedResumeId: this._resumeMap.get(opts.sessionKey), executionBackend, hasAuthorizedMigration,
+    })
+    if (clearStaleResume) { this._resumeMap.delete(opts.sessionKey); this._resumeMapProvider.delete(opts.sessionKey); this._saveResumeMap() }
     const cc5Backend = executionBackend?.kind === 'cc5-interactive-v1' ? executionBackend : undefined
     const v4Backend = executionBackend?.kind === 'remote-driver-v4' ? executionBackend : undefined
-    if (
-      cc5Backend &&
-      storedResumeForCreate &&
-      parseCc5ResumeId(storedResumeForCreate)?.bindingId !== cc5Backend.operationId
-    ) {
-      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
-    }
-    if (
-      v4Backend &&
-      storedResumeForCreate &&
-      parseRemoteV4ResumeId(storedResumeForCreate)?.bindingId !== v4Backend.operationId
-    ) {
-      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
-    }
     const hadSameProviderResume =
       Boolean(storedResumeForCreate) &&
       normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === engineId

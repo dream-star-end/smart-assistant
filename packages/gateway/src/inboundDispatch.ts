@@ -1,5 +1,6 @@
-import { freezeGrokExecutionDescriptor } from '@openclaude/protocol'
-import { takeSystemHelpBootstrap } from '@openclaude/protocol'
+import { freezeGrokExecutionDescriptor, takeSystemHelpBootstrap } from '@openclaude/protocol'
+import { finalizeInboundCrossPoolMigration } from './crossPoolCheckpoint.js'
+import { savePendingCheckpointWithGeneration } from './sessionCheckpointStore.js'
 import { getSystemHelpBootstrap } from './systemHelpFrames.js'
 /**
  * Gateway inbound dispatch: the per-frame chat dispatch path (dispatchInbound)
@@ -828,10 +829,9 @@ export async function dispatchInbound(
       ...(promptQueueExecutionFence ? { promptQueueExecutionFence } : {}),
     }).catch(rejectSessionStart)
     if (!session) return
-    admitCmid =
-      typeof safeClientMessageId === 'string' && safeClientMessageId !== ''
-        ? safeClientMessageId
-        : undefined
+    const migRes = finalizeInboundCrossPoolMigration(frame, turnAuthority, sessionKey, (f) => this.deliver(f as never), { dispatchContext: getDispatchContext(frame as object), clientMessageId: safeClientMessageId, userId: activeUserId, saveCheckpoint: savePendingCheckpointWithGeneration })
+    if (migRes.fatalError) { rejectSessionStart(new Error(migRes.fatalError)); return }
+    admitCmid = typeof safeClientMessageId === 'string' && safeClientMessageId !== '' ? safeClientMessageId : undefined
     admitSession = session
     if (admitCmid) session._admittingClientMessageId = admitCmid
     const wechatDispatchStarted = (frame as any)._wechatDispatchStarted

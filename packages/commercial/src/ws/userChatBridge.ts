@@ -26,7 +26,7 @@ import { SYSTEM_HELP_CAPABILITY, SYSTEM_HELP_BOOTSTRAP_FIELD, takeSystemHelpBoot
 import type { SystemHelpIdentityScope } from '../system-assistant/helpGrant.js'
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
 import { applyTeamLeaderForwarding, resolveBridgeTeamLeaderModel } from "./teamModeForwarding.js";
-import { resolveRemotePoolBackendAndSeal, type LocalFallbackCommittedHandle, type PreparedLocalFallbackTransport } from "./userChatBridgeRemotePoolSeal.js";
+import { CROSS_POOL_CHECKPOINT_FIELD, extractCrossPoolCheckpointGeneration, parseAndHandleMigrationInstallReceipt, resolveRemotePoolBackendAndSeal, tryMarkLegacyColdInstallFromReceipt, type LocalFallbackCommittedHandle, type PendingMigrationInstallRecord, type PreparedLocalFallbackTransport, type RemotePoolSealDeps, type SealExecLike } from "./userChatBridgeRemotePoolSeal.js";
 import { createLocalFallbackWireTracker, prepareBridgeLocalFallbackTransport, type FallbackWireOutcomeHandler } from "./userChatBridgeLocalFallbackTransport.js";
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
@@ -826,17 +826,13 @@ export interface UserChatBridgeDeps {
   cc5BackendSelector?: (input: { uid: number; containerId: number; sessionKey: string;
     canonicalModel: string; engine: string; placement: "local" | "remote_pool" }) =>
     Promise<RemoteExecutionBackend | undefined>;
-  crossPoolFallbackSelector?: (args: {
-    uid: number; containerId: number; sessionKey: string; canonicalModel: string; engine: string; cause: unknown; expectedSecurityEpoch?: number;
-    validateTargetSignable?: (target: { canonicalModel: string; logicalModel: string; engine: string; fallbackPool: "local_pool" }) => Promise<boolean>;
-    beforeCommit?: (prepared: { fallbackPool: "local_pool"; resolvedCanonicalModel: string; logicalModel: string; migrationGrant: AuthorityPoolMigrationGrant }) => Promise<boolean>;
-  }) => Promise<{ executionBackend?: RemoteExecutionBackend; fallbackPool: "local_pool" | "remote_pool"; resolvedCanonicalModel?: string; migrationGrant?: AuthorityPoolMigrationGrant } | null>;
-  returnToRemoteGrantResolver?: (args: {
-    uid: number; containerId: number; sessionKey: string; canonicalModel: string; engine: string; executionBackend: RemoteExecutionBackend; expectedSecurityEpoch?: number;
-    beforeCommit?: (prepared: { migrationGrant: AuthorityPoolMigrationGrant }) => Promise<boolean>;
-    onBlocked?: (code: string) => void;
-  }) => Promise<AuthorityPoolMigrationGrant | null>;
-  markPlacementMigrationInstalled?: (args: { uid: number; sessionKey: string; placementEpoch: number; migrationId: string }) => Promise<boolean>;
+  crossPoolFallbackSelector?: RemotePoolSealDeps<SealExecLike>["crossPoolFallbackSelector"];
+  returnToRemoteGrantResolver?: RemotePoolSealDeps<SealExecLike>["returnToRemoteGrantResolver"];
+  forcedLocalMigrationResolver?: RemotePoolSealDeps<SealExecLike>["forcedLocalMigrationResolver"];
+  recordRemotePlacement?: RemotePoolSealDeps<SealExecLike>["recordRemotePlacement"];
+  markPlacementMigrationInstalled?: (args: { uid: number; sessionKey: string; placementEpoch: number; migrationId: string; checkpointGeneration?: string | null; consumedByTurnKey?: string; requireWarmCheckpointMatch?: boolean }) => Promise<boolean>;
+  peekLogicalModelPoolTarget?: (rawModelId: string, catalogSnapshot?: Pick<ModelCatalogSnapshot, "resolve"> | null, isModelAllowed?: (canonicalModel: string) => boolean, uid?: number, sessionKey?: string | null) => string | null;
+  resolveLogicalModelPoolTarget?: (args: { rawModelId: string; catalogSnapshot: Pick<ModelCatalogSnapshot, "resolve">; isModelAllowed?: (canonicalModel: string) => boolean; uid?: number; sessionKey?: string | null }) => Promise<{ ok: true; canonicalModelId: string } | { ok: false; code: string }>;
   /** Composition supplies the verified selfhost default; explicit env 0 rolls back. */
   containerLinkEnabled?: boolean;
   containerLinkHeartbeatMs?: number;
@@ -3050,6 +3046,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       turn?: InboundTurnIdentity;
       /** 拒帧时的补偿(abort journal / release preCheck / 还槽);无预扣的路径不传。 */
       compensate?: (reason: string) => Promise<void> | void;
+      sessionId?: string; historicalMessages?: readonly unknown[]; excludeClientMessageId?: string; enableCrossPoolCheckpoint?: boolean;
       prepareLocalFallbackTransport?: (p: { readonly localExec: ResolvedTurnExecution; readonly billingRequestId?: string; readonly authorityTurnId?: string }) => Promise<PreparedLocalFallbackTransport | null>;
       onLocalFallbackCommitted?: (h: LocalFallbackCommittedHandle) => void;
     }): Promise<Record<string, unknown> | null> => {
@@ -3100,6 +3097,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         uid: Number(uid),
         containerId,
         sessionKey: args.turn?.sessionKey,
+        sessionId: args.sessionId, historicalMessages: args.historicalMessages, hasLocalHistory: Array.isArray(args.historicalMessages) && args.historicalMessages.length > 0, excludeClientMessageId: args.excludeClientMessageId, enableCrossPoolCheckpoint: args.enableCrossPoolCheckpoint,
         exec: args.exec,
         billingRequestId: args.billingRequestId,
         authorityTurnId: args.authorityTurnId,
@@ -3107,6 +3105,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         cc5BackendSelector: deps.cc5BackendSelector,
         crossPoolFallbackSelector: deps.crossPoolFallbackSelector,
         returnToRemoteGrantResolver: deps.returnToRemoteGrantResolver,
+        forcedLocalMigrationResolver: deps.forcedLocalMigrationResolver, recordRemotePlacement: deps.recordRemotePlacement,
         prepareLocalFallbackTransport: args.prepareLocalFallbackTransport,
         onLocalFallbackCommitted: args.onLocalFallbackCommitted,
         resolveLocalExec: authorityDeps
@@ -3137,6 +3136,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       log: Logger | null;
       onReject?: (code: string) => void;
       turn?: InboundTurnIdentity;
+      allowRemotePlacement?: boolean; classifiedRemoteNative?: boolean;
       /** Cursor Opus/Fable turn-level context tier(见 frames.ts InboundMessage.contextTier)。
        * 只在 cursor 路径传入;非 tier 模型忽略。 */
       contextTier?: CursorContextTier | null;
@@ -3158,7 +3158,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       let exec: ResolvedTurnExecution;
       try {
-        exec = await resolveTurnExecution(authorityDeps.catalog, args.model);
+        let modelToResolve = args.model;
+        if (deps.resolveLogicalModelPoolTarget) {
+          const snap = await authorityDeps.catalog.assertFresh();
+          if (modelCheckerHandle !== null && modelCheckerHandle.epoch() < snap.securityEpoch) await modelCheckerHandle.reloadAtLeast(snap.securityEpoch);
+          const poolRes = await deps.resolveLogicalModelPoolTarget({ rawModelId: args.model, catalogSnapshot: snap, isModelAllowed: modelCheckerHandle ? (m) => modelCheckerHandle.isAllowed(m) : undefined, uid: Number(uid), sessionKey: args.turn?.sessionKey ?? null });
+          if (!poolRes.ok) return reject(poolRes.code === "MODEL_POOL_BINDING_READ_FAILED" ? "MODEL_AUTHORITY_UNAVAILABLE" : "MODEL_NOT_AVAILABLE", poolRes.code === "MODEL_POOL_BINDING_READ_FAILED" ? "model routing unavailable, retry shortly" : `model not available: ${args.model}`);
+          modelToResolve = poolRes.canonicalModelId;
+        }
+        exec = await resolveTurnExecution(authorityDeps.catalog, modelToResolve);
       } catch (err) {
         if (err instanceof ModelNotAvailableError) {
           args.log?.info("user-chat-bridge: model not available", { model: args.model });
@@ -3178,7 +3186,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         args.log?.info("user-chat-bridge: desktop rejects non-ccb engine", { engine: exec.engine });
         return reject("ENGINE_NOT_ENABLED", "desktop runtime only supports the CCB engine");
       }
-      if (execIsCodex !== args.classifiedCodex) {
+      if (execIsCodex !== args.classifiedCodex || (exec.placement === "remote_pool" && !args.allowRemotePlacement) || (exec.placement !== "remote_pool" && args.classifiedRemoteNative === true)) {
         args.log?.warn("user-chat-bridge: engine reclassified mid-turn", {
           model: args.model,
           canonicalModel: exec.canonicalModel,
@@ -3216,16 +3224,18 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             );
           }
           if (cleaned) return null;
-          if (!modelCheckerHandle.isAllowed(exec.canonicalModel)) {
-            args.log?.info("user-chat-bridge: model authorization revoked mid-connection", {
-              model: exec.canonicalModel,
-              epoch: wantEpoch.toString(),
-            });
-            return reject(
-              "UNAUTHORIZED_MODEL",
-              `model not authorized for current user: ${exec.canonicalModel}`,
-            );
-          }
+        }
+        // OCV5-902 B5: Always verify the final resolved canonical model against the fresh checker
+        // regardless of whether the reload happened above or earlier inside logical binding resolution.
+        if (!modelCheckerHandle.isAllowed(exec.canonicalModel)) {
+          args.log?.info("user-chat-bridge: model authorization revoked mid-connection", {
+            model: exec.canonicalModel,
+            epoch: wantEpoch.toString(),
+          });
+          return reject(
+            "UNAUTHORIZED_MODEL",
+            `model not authorized for current user: ${exec.canonicalModel}`,
+          );
         }
       }
       // ── 角色分档窗口投影(modelRolePolicy · 执行轴)──────────────────────────
@@ -3570,9 +3580,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
        *  heartbeats share the same admitted grace window and unsent gate as ContainerLink. */
       admittedAtMs?: number;
       wireSent?: boolean;
-      pendingMigrationInstall?: { sessionKey: string; placementEpoch: number; migrationId: string };
+      pendingMigrationInstall?: PendingMigrationInstallRecord;
     }
     const admittedDispatches = new Map<string, AdmittedDispatch>();
+    const pendingMigrationInstalls = new Map<string, AdmittedDispatch>();
+    const trackSealedMigration = (rec: AdmittedDispatch | undefined, sk: string | null | undefined, sealed: Record<string, unknown>) => { const pm = (sealed[MODEL_AUTHORITY_FIELD] as { payload?: { poolMigration?: { migrationId?: string; placementEpoch?: number; continuityTier?: string } } } | undefined)?.payload?.poolMigration; if (rec && pm?.migrationId && typeof pm.placementEpoch === "number" && typeof sk === "string" && sk) { const cpGen = extractCrossPoolCheckpointGeneration(sealed); rec.pendingMigrationInstall = { sessionKey: sk, placementEpoch: pm.placementEpoch, migrationId: pm.migrationId, ...(pm.continuityTier ? { continuityTier: pm.continuityTier } : {}), ...(cpGen ? { checkpointGeneration: cpGen } : {}) }; pendingMigrationInstalls.set(rec.clientMessageId, rec); } };
     type EnrichmentDispatchPhase = "enriching" | "transferring" | "terminalizing" | "transferred";
     interface EnrichmentDispatchState {
       record: AdmittedDispatch;
@@ -4374,7 +4386,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           let engine = historyModel && isCodexEngineModel(historyModel) ? "codex" : "ccb";
           if (authorityDeps !== undefined) {
             if (historyModel === null) return false;
-            const execution = await resolveTurnExecution(authorityDeps.catalog, historyModel);
+            let historyTarget = historyModel;
+            if (deps.resolveLogicalModelPoolTarget) { const snap = await authorityDeps.catalog.assertFresh(); const hAgentId = typeof frameObj.agentId === "string" && frameObj.agentId.trim() ? frameObj.agentId.trim() : "main"; const pr = await deps.resolveLogicalModelPoolTarget({ rawModelId: historyModel, catalogSnapshot: snap, isModelAllowed: modelCheckerHandle ? (m) => modelCheckerHandle.isAllowed(m) : undefined, uid: Number(uid), sessionKey: `agent:${hAgentId}:webchat:dm:${peerId.replace(/[^a-zA-Z0-9_-]/g, "_")}` }); if (pr.ok) historyTarget = pr.canonicalModelId; }
+            const execution = await resolveTurnExecution(authorityDeps.catalog, historyTarget);
             contextWindow = projectContextWindowForCursorTier(
               execution.canonicalModel,
               projectContextWindowForRole(
@@ -4899,7 +4913,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // 内 tryDedupCompleted 已消费;此处仅对 legacy 生效,避免二次 dedup 同一轮)。
         if (!useDispatchAdmission && await tryDedupCompleted()) return null;
         let enriched: Record<string, unknown> = { ...frameObj, _workspaceMode: sessionWorkspaceMode };
-        delete enriched._masterHistoricalMessages;
+        delete enriched._masterHistoricalMessages; delete enriched[CROSS_POOL_CHECKPOINT_FIELD];
         if (rawHistory !== null) {
           const historical = _sanitizeMasterHistoricalMessagesForFrame(rawHistory, {
             ...(clientMessageId ? { excludeClientMessageId: clientMessageId } : {}),
@@ -5217,8 +5231,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
             const p = parsed as Record<string, unknown>;
             const sH = Object.prototype.hasOwnProperty.call(p, SYSTEM_HELP_BOOTSTRAP_FIELD);
-            const sM = Object.prototype.hasOwnProperty.call(p, '_masterHistoricalMessages');
-            if (sH || sM) { if (sH) takeSystemHelpBootstrap(p); if (sM) Reflect.deleteProperty(p, '_masterHistoricalMessages'); passthroughData = Buffer.from(JSON.stringify(p), 'utf8'); passthroughLen = passthroughData.byteLength; }
+            const sM = Object.prototype.hasOwnProperty.call(p, '_masterHistoricalMessages'); const sC = Object.prototype.hasOwnProperty.call(p, CROSS_POOL_CHECKPOINT_FIELD);
+            if (sH || sM || sC) { if (sH) takeSystemHelpBootstrap(p); if (sM) Reflect.deleteProperty(p, '_masterHistoricalMessages'); if (sC) Reflect.deleteProperty(p, CROSS_POOL_CHECKPOINT_FIELD); passthroughData = Buffer.from(JSON.stringify(p), 'utf8'); passthroughLen = passthroughData.byteLength; }
           }
         } catch { /* ordinary binary payloads retain their original transport */ }
       }
@@ -5243,9 +5257,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // Browser never authors platform GoalState or the master-only sync
             // control frame. Strip the former and drop the latter before any
             // async enrichment/forwarding.
-            if (Object.prototype.hasOwnProperty.call(parsedObj, "_goalState") || Object.prototype.hasOwnProperty.call(parsedObj, "_masterHistoricalMessages")) {
-              delete parsedObj._goalState;
-              delete parsedObj._masterHistoricalMessages;
+            if (Object.prototype.hasOwnProperty.call(parsedObj, "_goalState") || Object.prototype.hasOwnProperty.call(parsedObj, "_masterHistoricalMessages") || Object.prototype.hasOwnProperty.call(parsedObj, CROSS_POOL_CHECKPOINT_FIELD)) {
+              delete parsedObj._goalState; delete parsedObj._masterHistoricalMessages; delete parsedObj[CROSS_POOL_CHECKPOINT_FIELD];
               const strippedStr = JSON.stringify(parsedObj);
               passthroughData = Buffer.from(strippedStr, "utf8");
               passthroughLen = Buffer.byteLength(strippedStr);
@@ -5888,10 +5901,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (source === "frame.model" || source === "agentId.implied") {
               lastSeenModelId = effectiveModel;
             }
+            const peekedEffectiveModel = effectiveModel !== null && deps.peekLogicalModelPoolTarget ? (deps.peekLogicalModelPoolTarget(effectiveModel, authorityDeps?.catalog.peek() ?? null, modelCheckerHandle ? (m) => modelCheckerHandle.isAllowed(m) : undefined, Number(uid), inboundTurnIdentityForFrame?.sessionKey ?? null) ?? effectiveModel) : effectiveModel;
             if (
-              effectiveModel !== null &&
-              (isCc5TestModel(effectiveModel) ||
-               (modelCheckerHandle !== null && !modelCheckerHandle.isAllowed(effectiveModel)))
+              effectiveModel !== null && peekedEffectiveModel !== null &&
+              (isCc5TestModel(peekedEffectiveModel) ||
+               (modelCheckerHandle !== null && !modelCheckerHandle.isAllowed(peekedEffectiveModel) && (!deps.resolveLogicalModelPoolTarget || authorityDeps?.catalog.peek()?.resolve(effectiveModel) !== null)))
             ) {
               const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
               const peerId = peerObj && typeof peerObj === "object" && typeof peerObj.id === "string"
@@ -5915,44 +5929,32 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               );
               return;
             }
-            effectiveModelForFrame = effectiveModel;
-            // ── 模型执行权威:待签发的 model(方案 §2 步 ②)────────────────────
-            // 复用上面既有的 effectiveModel 推导链。它为 null 的唯一场景 = 帧既无
-            // model 也无 agentId 且本桥从没见过 model —— 此时容器会落到默认 agent
-            // (通常 'main'),故用 master agent 权威解析 'main' 补齐,推不出则由
-            // resolveAuthorityExecOrReject fail-closed 拒帧(不猜、不放行)。
-            authorityModelForFrame =
-              effectiveModel ?? agentModelResolverHandle?.resolve("main") ?? null;
-            // codex 判定的**单一权威**:
-            //   - flag 开 → catalog 快照的 engine(与签发同源;alias 归一后查 active 行)。
-            //     baked 的 gpt-* 前缀集合从此不参与判定 —— 它与 catalog 必然漂移
-            //     (catalog 里 engine 迁移 / 新增 codex 系模型,旧镜像的前缀表不认识)。
-            //   - flag 关 → 旧的 isCodexEngineModel(零行为变化)。
-            // peek() 为 null(快照 unknown)时回落 baked **仅用于选路**:真正的判定发生在
-            // IIFE 里的 epoch fence,fence 不过一律拒帧,故错选路不会造成错计费。
+            effectiveModelForFrame = peekedEffectiveModel;
+            authorityModelForFrame = effectiveModel ?? agentModelResolverHandle?.resolve("main") ?? null;
+            const peekedAuthorityModel = authorityModelForFrame !== null && deps.peekLogicalModelPoolTarget ? (deps.peekLogicalModelPoolTarget(authorityModelForFrame, authorityDeps?.catalog.peek() ?? null, modelCheckerHandle ? (m) => modelCheckerHandle.isAllowed(m) : undefined, Number(uid), inboundTurnIdentityForFrame?.sessionKey ?? null) ?? authorityModelForFrame) : authorityModelForFrame;
             isCodexInboundFrame =
-              authorityOn && authorityModelForFrame !== null
-                ? (authorityDeps?.catalog.peek()?.isEngineReportedModel(authorityModelForFrame) ??
+              authorityOn && peekedAuthorityModel !== null
+                ? (authorityDeps?.catalog.peek()?.isEngineReportedModel(peekedAuthorityModel) ??
                    (isCodexEngineModel(effectiveModel) || isGrokEngineModel(effectiveModel)))
                 : (isCodexEngineModel(effectiveModel) || isGrokEngineModel(effectiveModel));
             // Remote native billing belongs to the master relay, never the local Codex route/tape.
-            if (authorityOn && authorityModelForFrame !== null &&
-                authorityDeps?.catalog.peek()?.resolve(authorityModelForFrame)?.placement === "remote_pool") {
+            if (authorityOn && peekedAuthorityModel !== null &&
+                authorityDeps?.catalog.peek()?.resolve(peekedAuthorityModel)?.placement === "remote_pool") {
               isRemoteNativeInboundFrame = true;
             }
             isCursorInboundFrame =
-              authorityOn && authorityModelForFrame !== null
-                ? (authorityDeps?.catalog.peek()?.isCursorModel(authorityModelForFrame) ??
+              authorityOn && peekedAuthorityModel !== null
+                ? (authorityDeps?.catalog.peek()?.isCursorModel(peekedAuthorityModel) ??
                    isCursorEngineModel(effectiveModel))
                 : isCursorEngineModel(effectiveModel);
             isZcodeInboundFrame =
-              authorityOn && authorityModelForFrame !== null
-                ? (authorityDeps?.catalog.peek()?.isZcodeModel(authorityModelForFrame) ??
+              authorityOn && peekedAuthorityModel !== null
+                ? (authorityDeps?.catalog.peek()?.isZcodeModel(peekedAuthorityModel) ??
                    isZcodeEngineModel(effectiveModel))
                 : isZcodeEngineModel(effectiveModel);
             isAntigravityInboundFrame =
-              authorityOn && authorityModelForFrame !== null
-                ? (authorityDeps?.catalog.peek()?.isAntigravityModel(authorityModelForFrame) ??
+              authorityOn && peekedAuthorityModel !== null
+                ? (authorityDeps?.catalog.peek()?.isAntigravityModel(peekedAuthorityModel) ??
                    isAntigravityEngineModel(effectiveModel))
                 : isAntigravityEngineModel(effectiveModel);
             // peer.id was frozen at inbound.message entry for every turn-level
@@ -6194,12 +6196,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const busyPre = await deps.pgPool.query<{ dispatch_id: string }>(
                 `SELECT dispatch_id
                    FROM turn_dispatches
-                  WHERE model = $1
+                  WHERE (model = $1 OR ($3::text IS NOT NULL AND model = $3))
                     AND status IN ('admitted', 'accepted')
                     AND (lease_until IS NULL OR lease_until > NOW())
                     AND ($2::text IS NULL OR client_message_id <> $2)
                   LIMIT 1`,
-                [modelCapture, cursorTurnIdentity.clientMessageId],
+                [modelCapture, cursorTurnIdentity.clientMessageId, authorityModelCapture],
               );
               if (busyPre.rows.length > 0) {
                 rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
@@ -6214,12 +6216,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const busyPost = await deps.pgPool.query<{ dispatch_id: string }>(
                 `SELECT dispatch_id
                    FROM turn_dispatches
-                  WHERE model = $1
+                  WHERE (model = $1 OR ($3::text IS NOT NULL AND model = $3))
                     AND status IN ('admitted', 'accepted')
                     AND (lease_until IS NULL OR lease_until > NOW())
                     AND dispatch_id <> $2
                   LIMIT 1`,
-                [modelCapture, dispatchRecord.dispatchId],
+                [modelCapture, dispatchRecord.dispatchId, authorityModelCapture],
               );
               if (busyPost.rows.length > 0) {
                 rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
@@ -6245,12 +6247,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (
                 authorityExec === null
                 || authorityExec.engine !== 'cursor'
-                || authorityExec.canonicalModel !== modelCapture
+                || (authorityExec.canonicalModel !== modelCapture && (!deps.resolveLogicalModelPoolTarget || isBoxGptWebModel(authorityExec.canonicalModel) !== isBoxGptWebModel(modelCapture)))
               ) {
                 failDispatchPreForward(dispatchRecord, 'cursor_authority_rejected');
                 return;
               }
             }
+            const activeCursorModel = authorityExec?.canonicalModel ?? modelCapture;
             // Cursor Sand main-model traffic never reaches the anthropic egress
             // proxy, so no request_finalize_journal evidence is ever written for
             // this turn. Bind the minted authorityTurnId to the durable dispatch
@@ -6288,7 +6291,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
             // box-gpt-6-astra-pro is never billed (no audit row, so no settle; OCV5-575): an allowed
             // account with a zero balance may still use it.
-            const cursorBilled = !isBoxGptWebModel(modelCapture);
+            const cursorBilled = !isBoxGptWebModel(activeCursorModel);
             let cursorSpendable: bigint | null = null;
             try {
               if (cursorBilled) cursorSpendable = await readTotalSpendableBalance(uid);
@@ -6315,11 +6318,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               return;
             }
-            if (!isBoxGptWebModel(modelCapture)) {
+            if (!isBoxGptWebModel(activeCursorModel)) {
               await deps.pgPool.query(
                 `INSERT INTO cursor_external_usage_audit(request_id,user_id,container_id,session_id,model_id,status)
                  VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT (request_id) DO NOTHING`,
-                [requestId, uid, cid, peerCapture, modelCapture],
+                [requestId, uid, cid, peerCapture, activeCursorModel],
               );
             }
             let authorityFields: Record<string, unknown> = {};
@@ -6433,12 +6436,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (
                 authorityExec === null
                 || authorityExec.engine !== 'antigravity'
-                || authorityExec.canonicalModel !== antigravityModelId
+                || (!deps.resolveLogicalModelPoolTarget && authorityExec.canonicalModel !== antigravityModelId)
               ) {
                 failDispatchPreForward(dispatchRecord, 'antigravity_authority_rejected');
                 return;
               }
             }
+            const activeAgyModel = authorityExec?.canonicalModel ?? antigravityModelId;
             const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
             let spendable: bigint;
             try {
@@ -6491,7 +6495,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const catalogSnapshot = authorityDeps?.catalog.peek() ?? null;
             const swarmAllowedModelIds = allowSwarmMemberModels
               ? resolveLocalSwarmAllowedAntigravityModels({
-                  primaryModelId: antigravityModelId,
+                  primaryModelId: activeAgyModel,
                   isAllowedForUser: modelCheckerHandle ? (id) => modelCheckerHandle.isAllowed(id) : null,
                   isCatalogRoutableLocal: catalogSnapshot
                     ? (id) => {
@@ -6515,7 +6519,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 containerId: cid,
                 userId: uid,
                 requestId,
-                modelId: antigravityModelId,
+                modelId: activeAgyModel,
                 budgetCredits: spendable,
                 ...(swarmAllowedModelIds ? { allowedModelIds: swarmAllowedModelIds } : {}),
               });
@@ -6538,25 +6542,22 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             await recordAntigravityTurn(deps.pgPool, {
               requestId,
               userId: uid,
-              modelId: antigravityModelId,
+              modelId: activeAgyModel,
               sessionId: peerCapture,
               traceId: traceCapture,
             });
             pendingAntigravityRelays.set(requestId, {
               token: minted.token,
-              modelId: antigravityModelId,
+              modelId: activeAgyModel,
               sessionId: peerCapture,
               traceId: traceCapture,
             });
             let authorityFields: Record<string, unknown> = {};
             if (authorityExec !== null) {
-              const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch, turn: antigravityTurnIdentity });
-              if (sealed === null) {
-                failDispatchPreForward(dispatchRecord, 'antigravity_authority_seal_rejected');
-                dropMinted();
-                return;
-              }
+              const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch, turn: antigravityTurnIdentity, ...(peerCapture ? { sessionId: peerCapture } : {}), historicalMessages: Array.isArray((enriched as Record<string, unknown>)._masterHistoricalMessages) ? ((enriched as Record<string, unknown>)._masterHistoricalMessages as readonly unknown[]) : undefined, ...(antigravityTurnIdentity.clientMessageId ? { excludeClientMessageId: antigravityTurnIdentity.clientMessageId } : {}), enableCrossPoolCheckpoint: true });
+              if (sealed === null) { failDispatchPreForward(dispatchRecord, 'antigravity_authority_seal_rejected'); dropMinted(); return; }
               authorityFields = sealed;
+              trackSealedMigration(dispatchRecord, antigravityTurnIdentity.sessionKey, sealed);
             }
             const { swarmMode: _droppedSwarmMode, ...enrichedForAntigravity } =
               enriched as Record<string, unknown>;
@@ -6654,12 +6655,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (
                 authorityExec === null
                 || authorityExec.engine !== 'zcode'
-                || authorityExec.canonicalModel !== zcodeModelId
+                || (!deps.resolveLogicalModelPoolTarget && authorityExec.canonicalModel !== zcodeModelId)
               ) {
                 failDispatchPreForward(dispatchRecord, 'zcode_authority_rejected');
                 return;
               }
             }
+            const activeZcodeModel = authorityExec?.canonicalModel ?? zcodeModelId;
             const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
             if (!deps.mintZcodeRoute) {
               rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
@@ -6701,7 +6703,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 containerId: cid,
                 userId: uid,
                 requestId,
-                modelId: zcodeModelId,
+                modelId: activeZcodeModel,
               });
             } catch (err) {
               logCapture?.error('user-chat-bridge: ZCode relay mint failed', { err });
@@ -6711,7 +6713,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             pendingZcodeRelays.set(requestId, {
               token: minted.token,
-              modelId: zcodeModelId,
+              modelId: activeZcodeModel,
               sessionId: peerCapture,
               traceId: traceCapture,
             });
@@ -6722,7 +6724,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 userId: uid,
                 containerId: cid,
                 sessionId: peerCapture,
-                modelId: zcodeModelId,
+                modelId: activeZcodeModel,
               });
               rememberZcodePending(pendingZcodeRequestIds, requestId);
               ensureZcodeStaleReconcile();
@@ -7524,13 +7526,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   log: turnLogCapture,
                   onReject: rejectPromptQueueDispatch,
                   turn: turnIdentity,
-                  // seal 只报告拒因；真正的资源补偿统一由下方 finally 状态机执行。
+                  ...(turnIdentity.peerId ? { sessionId: turnIdentity.peerId } : {}), historicalMessages: Array.isArray((enrichedParsed as Record<string, unknown>)._masterHistoricalMessages) ? ((enrichedParsed as Record<string, unknown>)._masterHistoricalMessages as readonly unknown[]) : undefined, ...(turnIdentity.clientMessageId ? { excludeClientMessageId: turnIdentity.clientMessageId } : {}), enableCrossPoolCheckpoint: true,
                   compensate: (reason) => { abandonReason = reason; },
                 });
-                if (sealed === null) {
-                  return;
-                }
+                if (sealed === null) return;
                 authorityFields = sealed;
+                trackSealedMigration(dispatchRecordB, turnIdentity.sessionKey, sealed);
               }
               if (!isCurrentCodexTurnState(codexTurnState)) {
                 abandonReason = "bridge_disconnect_before_forward";
@@ -7616,10 +7617,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   log: turnLogCapture,
                   onReject: rejectPromptQueueDispatch,
                   turn: turnIdentity,
+                  ...(turnIdentity.peerId ? { sessionId: turnIdentity.peerId } : {}), historicalMessages: Array.isArray((enrichedParsed as Record<string, unknown>)._masterHistoricalMessages) ? ((enrichedParsed as Record<string, unknown>)._masterHistoricalMessages as readonly unknown[]) : undefined, ...(turnIdentity.clientMessageId ? { excludeClientMessageId: turnIdentity.clientMessageId } : {}), enableCrossPoolCheckpoint: true,
                   compensate: () => releaseAcquiredSlotForFailure(),
                 });
                 if (sealed === null) return;
                 authorityFields = sealed;
+                trackSealedMigration(dispatchRecordB, turnIdentity.sessionKey, sealed);
               }
               if (!isCurrentCodexTurnState(codexTurnState)) {
                 releaseAcquiredSlotForFailure();
@@ -7749,7 +7752,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const turnTraceIdCapture = turnTraceIdForFrame;
         const turnLogCapture = turnLogForFrame;
         const authorityModelCapture = authorityModelForFrame;
-        const classifiedCodexCapture = isCodexInboundFrame || isAntigravityInboundFrame;
+        const classifiedCodexCapture = isCodexInboundFrame || isAntigravityInboundFrame; const classifiedRemoteNativeCapture = isRemoteNativeInboundFrame;
         const ccbTurnIdentity = inboundTurnIdentityForFrame;
         const agentIdCapture = inboundAgentIdForFrame;
         trackPreparation(async () => {
@@ -7769,6 +7772,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               authorityExec = await resolveAuthorityExecOrReject({
                 model: authorityModelCapture,
                 classifiedCodex: classifiedCodexCapture,
+                allowRemotePlacement: true, classifiedRemoteNative: classifiedRemoteNativeCapture,
                 log: turnLogCapture,
                 onReject: rejectPromptQueueDispatch,
                 turn: ccbTurnIdentity,
@@ -7829,6 +7833,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 log: turnLogCapture,
                 onReject: rejectPromptQueueDispatch,
                 turn: ccbTurnIdentity,
+                ...(ccbTurnIdentity.peerId ? { sessionId: ccbTurnIdentity.peerId } : {}), historicalMessages: Array.isArray(enrichedParsed._masterHistoricalMessages) ? enrichedParsed._masterHistoricalMessages : undefined, ...(ccbTurnIdentity.clientMessageId ? { excludeClientMessageId: ccbTurnIdentity.clientMessageId } : {}), enableCrossPoolCheckpoint: true,
                 ...(authorityExec.placement === "remote_pool" && containerId !== undefined ? {
                   prepareLocalFallbackTransport: (p) => prepareBridgeLocalFallbackTransport({ ...p, uid, containerId, peerId: ccbTurnIdentity.peerId, clientMessageId: ccbTurnIdentity.clientMessageId, promptQueueGrantId: dispatchRequest?.grantId ?? null, agentId: agentIdCapture, traceId: turnTraceIdCapture, parsedCapture: inboundParsedCapture, enrichedParsed, dispatchRecord: dispatchRecordC, recoveryJob, containerHasCodexSpeedTiers, codexBillingEnabled, sessionMaxMs: readCodexSessionMaxMs(), pgPool: deps.pgPool, preCheckRedis: deps.preCheckRedis, pricing: deps.pricing, codexBinding: deps.codexBinding, createCodexRoute: deps.createCodexRoute, admitAntigravityTurn: deps.admitAntigravityTurn, expireAntigravityRoute: deps.expireAntigravityRoute, activeCodexTurnsByPeer, inflightCodexTurns, pendingAntigravityRelays, codexPeerKey, isCurrentCodexTurnState, releaseCodexTurnState, expireCodexRouteToken, retryPendingGrokLeaseRelease, modelCheckerHandle, catalogSnapshot: authorityDeps?.catalog.peek() ?? null, isCleaned: () => cleaned, log: turnLogCapture }),
                   onLocalFallbackCommitted: (h) => { fallbackBox.current = h; if (dispatchRecordC) dispatchRecordC.remoteLane = false; },
@@ -7836,10 +7841,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               });
               if (sealed === null) { failDispatchPreForward(dispatchRecordC, "authority_seal_rejected"); return; }
               authorityFields = sealed;
-              const pm = (sealed[MODEL_AUTHORITY_FIELD] as { payload?: { poolMigration?: { migrationId?: string; placementEpoch?: number } } } | undefined)?.payload?.poolMigration;
-              if (dispatchRecordC && pm?.migrationId && typeof pm.placementEpoch === "number" && typeof ccbTurnIdentity.sessionKey === "string" && ccbTurnIdentity.sessionKey) {
-                dispatchRecordC.pendingMigrationInstall = { sessionKey: ccbTurnIdentity.sessionKey, placementEpoch: pm.placementEpoch, migrationId: pm.migrationId };
-              }
+              trackSealedMigration(dispatchRecordC, ccbTurnIdentity.sessionKey, sealed);
             }
             if (authorityTurnId !== undefined && dispatchRecordC !== undefined) {
               try {
@@ -8393,6 +8395,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
         const attestPeek = frameText;
+        if (parseAndHandleMigrationInstallReceipt(attestPeek, { uid, admittedDispatches, pendingMigrationInstalls, markPlacementMigrationInstalled: deps.markPlacementMigrationInstalled, warn: (message, meta) => bridgeLog?.warn(message, meta) })) return;
         if (handleTurnDispatchReceipt(attestPeek, {
           pool: deps.pgPool, uid, admittedDispatches, enrichmentDispatches,
           ...(containerId !== undefined ? {
@@ -8401,7 +8404,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           } : {}),
           claimEnrichmentTerminalization, acceptEnrichmentReceipt, dropAdmittedDispatch,
           settleCronOriginClaim, noteDispatchStreamFrame,
-          onDispatchAccepted: (rec) => { if (rec.pendingMigrationInstall && deps.markPlacementMigrationInstalled) void deps.markPlacementMigrationInstalled({ uid: Number(uid), ...rec.pendingMigrationInstall }).catch(() => {}); },
+          onDispatchAccepted: (rec, state) => tryMarkLegacyColdInstallFromReceipt({ ...rec, state }, { uid, pendingMigrationInstalls, markPlacementMigrationInstalled: deps.markPlacementMigrationInstalled, warn: (m, meta) => bridgeLog?.warn(m, meta) }), onFollowupActiveReceipt: (r) => tryMarkLegacyColdInstallFromReceipt(r, { uid, pendingMigrationInstalls, markPlacementMigrationInstalled: deps.markPlacementMigrationInstalled, warn: (m, meta) => bridgeLog?.warn(m, meta) }),
           hasCronOriginClaim: (dispatchId) => cronOriginClaimWaiters.has(dispatchId),
           broadcast: (frame) => { broadcastToUser(uid, frame); },
           warn: (message, meta) => bridgeLog?.warn(message, meta),
@@ -10382,7 +10385,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       // Transport-death/drain-timeout paths terminalize enrichment before
       // final cleanup. Receipt-owning turns remain under durable recovery.
-      admittedDispatches.clear();
+      admittedDispatches.clear(); pendingMigrationInstalls.clear();
 
       // Release every session-scoped admission state. Awaiting acquire/route
       // continuations carry the state identity fence and release any resource

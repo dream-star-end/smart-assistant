@@ -37,7 +37,14 @@ type ReceiptContext<R extends ReceiptRecord, E extends { record: R }> = {
   settleCronOriginClaim(dispatchId: string, result: ClaimResult): void
   hasCronOriginClaim(dispatchId: string): boolean
   noteDispatchStreamFrame(sessionId: string, clientMessageId: string, final: boolean): void
-  onDispatchAccepted?(record: R): void
+  onDispatchAccepted?(record: R, receiptState?: unknown): void
+  onFollowupActiveReceipt?(receipt: {
+    clientMessageId: string
+    dispatchId: string
+    attemptNo: number
+    sessionId: string
+    state: 'running' | 'terminal'
+  }): void
   broadcast(frame: unknown): void
   warn(message: string, meta: Record<string, unknown>): void
 }
@@ -134,6 +141,29 @@ export function handleTurnDispatchReceipt<R extends ReceiptRecord, E extends { r
         receiptTurnKey,
       )
     }
+    if (
+      context.onFollowupActiveReceipt &&
+      isClientMessageId(receipt.clientMessageId) &&
+      typeof receipt.dispatchId === 'string' &&
+      typeof receipt.sessionId === 'string' &&
+      receipt.sessionId.length > 0 &&
+      typeof receipt.attemptNo === 'number' &&
+      Number.isInteger(receipt.attemptNo) &&
+      receipt.attemptNo > 0 &&
+      ((receipt.state === 'running' && receipt.outcome === null) ||
+        (receipt.state === 'terminal' &&
+          (receipt.outcome === 'completed' ||
+            receipt.outcome === 'interrupted' ||
+            receipt.outcome === 'crashed')))
+    ) {
+      context.onFollowupActiveReceipt({
+        clientMessageId: receipt.clientMessageId,
+        dispatchId: receipt.dispatchId,
+        attemptNo: receipt.attemptNo,
+        sessionId: receipt.sessionId,
+        state: receipt.state,
+      })
+    }
     return true
   }
   const disposition = classifyTurnDispatchReceipt(receipt, rec)
@@ -196,7 +226,7 @@ export function handleTurnDispatchReceipt<R extends ReceiptRecord, E extends { r
       // The atomic recovery statement verifies this exact attempt/epoch is
       // accepted before it commits forwarded; duplicate receipts cannot win it.
       if (accepted) {
-        context.onDispatchAccepted?.(rec)
+        context.onDispatchAccepted?.(rec, receipt.state)
         context.broadcast(acceptedFrame())
         context.broadcast(recoveryRunningFrame(rec.recoveryJob!))
       }
@@ -217,14 +247,14 @@ export function handleTurnDispatchReceipt<R extends ReceiptRecord, E extends { r
         })
         if (accepted !== null) {
           claimed = true
-          context.onDispatchAccepted?.(rec)
+          context.onDispatchAccepted?.(rec, receipt.state)
           context.broadcast(acceptedFrame())
         } else if (mustConfirmCronClaim) {
           const durable = await getDispatchByLogicalKey(pool, {
             userId: context.uid, sessionId: rec.sessionId, clientMessageId: rec.clientMessageId,
           })
           claimed = durable?.dispatchId === rec.dispatchId && durable.attemptNo === rec.attemptNo && durable.status === 'accepted'
-          if (claimed) context.onDispatchAccepted?.(rec)
+          if (claimed) context.onDispatchAccepted?.(rec, receipt.state)
         }
         if (receiptTurnKey) {
           await bindReceiptTurnKey(pool, rec, receiptTurnKey)

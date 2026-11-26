@@ -27,6 +27,7 @@ import {
   AccountPoolUnavailableError,
   type AccountScheduler,
 } from "../account-pool/scheduler.js";
+import { syncLogicalModelPoolBindingsFromCatalog } from "../account-pool/remotePool/logicalModelBindingsSync.js";
 import { createMasterCc5Runtime } from "../agent-sandbox/cc5Runtime.js";
 import {
   makeDraftPreparation,
@@ -479,11 +480,36 @@ export function assembleV3SupervisorCore(deps: {
     runtimeTuple = t;
   }
 
+  const isSelfhostV5 =
+    getRuntimeChannel() === "v5" &&
+    deps.flavorIdentity.status === "ok" &&
+    deps.flavorIdentity.flavor === "selfhost";
+
+  if (isSelfhostV5 && deps.modelCatalogCache) {
+    const catalogCache = deps.modelCatalogCache;
+    void syncLogicalModelPoolBindingsFromCatalog(
+      getPool(),
+      async () => (await catalogCache.assertFresh()).entries,
+      { overwriteAdminOverrides: false },
+    )
+      .then((stats) => {
+        rootLogger.info("[commercial] selfhost logical model pool bindings synced", {
+          synced: stats.synced,
+          enabled: stats.enabled,
+          disabled: stats.disabled,
+          skipped: stats.skipped,
+        });
+      })
+      .catch((err: unknown) => {
+        rootLogger.warn(
+          "[commercial] selfhost logical model pool bindings startup sync failed (fail-open)",
+          { error: err instanceof Error ? err.message : String(err) },
+        );
+      });
+  }
+
   const cc5Runtime = createMasterCc5Runtime({
-    selfhost:
-      getRuntimeChannel() === "v5" &&
-      deps.flavorIdentity.status === "ok" &&
-      deps.flavorIdentity.flavor === "selfhost",
+    selfhost: isSelfhostV5,
     authorityReady:
       deps.modelAuthoritySigner !== null &&
       deps.modelAuthoritySigner !== undefined &&

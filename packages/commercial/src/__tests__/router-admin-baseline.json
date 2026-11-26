@@ -535,6 +535,24 @@
   },
   {
     "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/pools/model-bindings",
+    "handler": "handleAdminModelPoolBindingsList"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/pools/model-bindings/sync",
+    "handler": "handleAdminModelPoolBindingsSync"
+  },
+  {
+    "method": "PUT",
+    "pathKind": "path",
+    "pathValue": "/api/admin/pools/model-bindings",
+    "handler": "handleAdminModelPoolBindingPut"
+  },
+  {
+    "method": "GET",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/remote-pool/codex-commissioning",
     "handler": "handleCodexCommissioning"
