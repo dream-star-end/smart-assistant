@@ -29,6 +29,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { errMsg } from "@openclaude/kernel";
 
 import {
   ContainerIdentityError,
@@ -373,8 +374,4 @@ export function assertSeedModelsActive(snapshot: ModelCatalogSnapshot): void {
         "平台预设 agent 会在第一条消息就被拒。修 catalog(staged→active)后再启动。",
     );
   }
-}
-
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }

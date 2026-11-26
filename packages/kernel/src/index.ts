@@ -21,3 +21,19 @@ export {
 export type { Fields, LevelRef, LogLevel, LogRecord, Logger, LoggerOptions } from './log.js'
 export { traceFields } from './trace.js'
 export type { TraceContext } from './trace.js'
+export {
+  asRecord,
+  atomicWriteJson,
+  errMsg,
+  isRecord,
+  readBoundedJson,
+  sendJson,
+  sha256Hex,
+  sleep,
+} from './sharedUtils.js'
+export type {
+  AtomicWriteFileHandle,
+  AtomicWriteFsDeps,
+  AtomicWriteJsonOptions,
+  JsonResponseLike,
+} from './sharedUtils.js'
