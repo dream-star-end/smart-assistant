@@ -181,7 +181,8 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
         `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${ghLog}"\n`,
         { mode: 0o755 },
       )
-      const approveRes = runBash(
+      // 1a. B2: Long allowedPaths that cannot fit in GitHub 140-char description with --publish-github-status MUST FAIL-CLOSED!
+      const overflowRes = runBash(
         GOVERNOR_SH,
         [
           'approve-a0',
@@ -203,6 +204,111 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
           PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
         },
       )
+      assert.equal(
+        overflowRes.status,
+        1,
+        'overflowing allowedPaths with --publish-github-status MUST fail closed (never drop scope!)',
+      )
+      assert.match(overflowRes.stderr, /cannot publish oc-v5\/a0-approval.*refusing to silently drop allowedPaths/)
+      assert.equal(existsSync(ghLog), false, 'failed overflow publish must NOT call gh api')
+
+      // 1b. Compact allowedPaths + --publish-github-status succeeds & explicitly includes paths=
+      const ghShortSha = 'f'.repeat(40)
+      const ghApprove = runBash(
+        GOVERNOR_SH,
+        [
+          'approve-a0',
+          '--sha',
+          ghShortSha,
+          '--reason',
+          'Compact scope publish ok',
+          '--allowed-path',
+          'arch/a0-protected-paths.json',
+          '--publish-github-status',
+          '--github-repo',
+          'dream-star-end/openclaude',
+        ],
+        {
+          OC_GOVERNOR_ROOT: tmp,
+          OC_GOVERNOR_NOW_ISO: issuedAt,
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        },
+      )
+      assert.equal(ghApprove.status, 0, ghApprove.stderr)
+      const ghLine = readFileSync(ghLog, 'utf8')
+      assert.match(ghLine, /context=oc-v5\/a0-approval/)
+      assert.match(ghLine, /state=success/)
+      assert.match(ghLine, /paths=arch\/a0-protected-paths\.json/)
+      assert.match(ghLine, new RegExp(`sha=${ghShortSha.slice(0, 12)}`))
+
+      // 1c. B2: revoke-a0 automatically publishes state=failure revocation status on GitHub for published SHA!
+      writeFileSync(ghLog, '')
+      const revokeRes = runBash(
+        GOVERNOR_SH,
+        ['revoke-a0', '--sha', ghShortSha, '--reason', 'Compromised candidate SHA'],
+        {
+          OC_GOVERNOR_ROOT: tmp,
+          OC_GOVERNOR_NOW_ISO: nowIso,
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        },
+      )
+      assert.equal(revokeRes.status, 0, revokeRes.stderr)
+      assert.equal(JSON.parse(revokeRes.stdout).publishedGithubRevocation, true)
+      const revokeGhLine = readFileSync(ghLog, 'utf8')
+      assert.match(revokeGhLine, /state=failure/)
+      assert.match(revokeGhLine, /context=oc-v5\/a0-approval/)
+      assert.match(revokeGhLine, /revoked/)
+
+      // 1d. B7 Unicode UTF-8 byte-order parity (U+E000 vs U+20000: UTF-8 puts U+E000 before U+20000 on BOTH ends!)
+      const uniSha = 'd'.repeat(40)
+      const uniApprove = runBash(
+        GOVERNOR_SH,
+        [
+          'approve-a0',
+          '--sha',
+          uniSha,
+          '--reason',
+          'Unicode UTF-8 byte-order parity check',
+          '--allowed-path',
+          'dir/\u{20000}.ts',
+          '--allowed-path',
+          'dir/\uE000.ts',
+        ],
+        { OC_GOVERNOR_ROOT: tmp, OC_GOVERNOR_NOW_ISO: issuedAt },
+      )
+      assert.equal(uniApprove.status, 0, uniApprove.stderr)
+      const uniDoc = JSON.parse(uniApprove.stdout)
+      assert.deepEqual(uniDoc.allowedPaths, ['dir/\uE000.ts', 'dir/\u{20000}.ts'])
+      assert.equal(
+        uniDoc.sha256,
+        computeA0ReceiptDigest({
+          sha: uniSha,
+          issuedAt,
+          expiresAt,
+          reason: uniDoc.reason,
+          allowedPaths: ['dir/\u{20000}.ts', 'dir/\uE000.ts'],
+        }),
+      )
+
+      // 1e. Host-only approval with multi-path allowedPaths for parity matrix
+      const approveRes = runBash(
+        GOVERNOR_SH,
+        [
+          'approve-a0',
+          '--sha',
+          sha,
+          '--reason',
+          '   Trimmed valid A0 governance reason   ',
+          '--allowed-path',
+          'scripts/check-a0-monotonic.ts',
+          '--allowed-path',
+          'arch/a0-protected-paths.json',
+        ],
+        {
+          OC_GOVERNOR_ROOT: tmp,
+          OC_GOVERNOR_NOW_ISO: issuedAt,
+        },
+      )
       assert.equal(approveRes.status, 0, approveRes.stderr)
       const issuedDoc = JSON.parse(approveRes.stdout)
       assert.equal(issuedDoc.reason, 'Trimmed valid A0 governance reason')
@@ -220,9 +326,6 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
           allowedPaths: issuedDoc.allowedPaths,
         }),
       )
-      const ghLine = readFileSync(ghLog, 'utf8')
-      assert.match(ghLine, /context=oc-v5\/a0-approval/)
-      assert.match(ghLine, new RegExp(`sha=${sha.slice(0, 12)}`))
 
       // 2. Parity matrix helper: asserts oc-governor verify-a0 and verifyA0ApprovalFile agree 100%!
       const assertParity = (
@@ -689,24 +792,45 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
     }
   })
 
-  test('B1/B4 sync-referee.sh --stage-audited verifies A0 approval bound to exact targetSha and writes TRANSITION_APPROVAL.json + MANIFEST.json', () => {
+  test('B1/B4 sync-referee.sh --stage-audited exports strictly from git archive targetSha, rejects dirty worktree/narrow scope, and writes TRANSITION_APPROVAL.json + MANIFEST.json', () => {
     const tmp = mkdtempSync(path.join(os.tmpdir(), 'oc-sync-transition-'))
     try {
       const govRoot = path.join(tmp, 'harness-gate')
       const candidateSrc = path.join(tmp, 'audited-candidate')
       const liveRel = path.join(tmp, 'live-rel')
       const liveLink = path.join(tmp, 'openclaude-v5-selfhost-live')
-      const targetSha = '9'.repeat(40)
-      const wrongSha = '8'.repeat(40)
 
+      // Build a REAL Git repo so --stage-audited exports strictly via `git archive $targetSha`
       mkdirSync(path.join(candidateSrc, 'scripts/lib'), { recursive: true })
       mkdirSync(path.join(candidateSrc, 'packages/commercial/scripts'), { recursive: true })
       mkdirSync(path.join(candidateSrc, 'packages/protocol/src'), { recursive: true })
       mkdirSync(path.join(candidateSrc, '.github/scripts'), { recursive: true })
-      writeFileSync(path.join(candidateSrc, 'scripts/check-a0-monotonic.ts'), '// audited gate\n')
+      writeFileSync(path.join(candidateSrc, 'scripts/check-a0-monotonic.ts'), '// audited gate v1\n')
       writeFileSync(path.join(candidateSrc, 'packages/commercial/scripts/lint-demo.ts'), '// lint\n')
       writeFileSync(path.join(candidateSrc, 'packages/protocol/src/httpContracts.ts'), '// contracts\n')
       writeFileSync(path.join(candidateSrc, '.github/scripts/integ-shard-budget.ts'), '// budget\n')
+
+      const gitEnv = {
+        ...process.env,
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_AUTHOR_NAME: 'test',
+        GIT_AUTHOR_EMAIL: 'test@example.invalid',
+        GIT_COMMITTER_NAME: 'test',
+        GIT_COMMITTER_EMAIL: 'test@example.invalid',
+      }
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-C', candidateSrc, ...args], { env: gitEnv, encoding: 'utf8' }).trim()
+      git('init', '-q')
+      git('add', '.')
+      git('commit', '-qm', 'feat(v5): audited transition referee commit A')
+      const targetSha = git('rev-parse', 'HEAD')
+
+      // Commit B on top + DIRTY uncommitted tamper in worktree — --stage-audited for commit A MUST ignore BOTH!
+      writeFileSync(path.join(candidateSrc, 'scripts/check-a0-monotonic.ts'), '// COMMIT B DIFFERENT CODE\n')
+      git('commit', '-qam', 'feat(v5): unrelated commit B')
+      const wrongSha = git('rev-parse', 'HEAD')
+      writeFileSync(path.join(candidateSrc, 'scripts/check-a0-monotonic.ts'), '// DIRTY WORKTREE TAMPERED GATE!\n')
 
       // Verified live release with node_modules to be linked into transition referee
       mkdirSync(path.join(liveRel, 'node_modules/tsx'), { recursive: true })
@@ -717,15 +841,47 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       )
       symlinkSync(liveRel, liveLink)
 
-      // Issue valid A0 approval for targetSha
+      // Issue narrow-scope A0 approval (changelog.json only) -> MUST be rejected for staging full referee!
       const env = { OC_GOVERNOR_ROOT: govRoot, OC_GOVERNOR_NOW_ISO: '2026-11-26T12:00:00Z' }
+      const narrowApprove = runBash(
+        GOVERNOR_SH,
+        [
+          'approve-a0',
+          '--sha',
+          targetSha,
+          '--reason',
+          'Narrow approval only for changelog',
+          '--allowed-path',
+          'changelog.json',
+        ],
+        env,
+      )
+      assert.equal(narrowApprove.status, 0, narrowApprove.stderr)
+      const approvalFile = path.join(govRoot, `control/a0-approvals/${targetSha}.json`)
+      const rNarrow = runBash(
+        SYNC_REFEREE_SH,
+        [
+          '--stage-audited',
+          candidateSrc,
+          '--target-sha',
+          targetSha,
+          '--approval-file',
+          approvalFile,
+          '--live-link',
+          liveLink,
+        ],
+        env,
+      )
+      assert.equal(rNarrow.status, 1, 'narrow allowedPaths approval MUST NOT authorize staging full transition referee')
+      assert.match(rNarrow.stderr, /narrow allowedPaths approval/)
+
+      // Issue unrestricted A0 approval for targetSha
       const approve = runBash(
         GOVERNOR_SH,
         ['approve-a0', '--sha', targetSha, '--reason', 'B1 audited schema transition rollout'],
         env,
       )
       assert.equal(approve.status, 0, approve.stderr)
-      const approvalFile = path.join(govRoot, `control/a0-approvals/${targetSha}.json`)
 
       // 1. Mismatched --target-sha MUST fail closed
       const rWrongSha = runBash(
@@ -761,7 +917,7 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       )
       assert.equal(rExpired.status, 1)
 
-      // 3. Valid --stage-audited succeeds and writes read-only referee + TRANSITION_APPROVAL.json + MANIFEST.json + .github/scripts + node_modules
+      // 3. Valid --stage-audited exports strictly from git archive targetSha (ignoring commit B & dirty worktree!)
       const rOk = runBash(
         SYNC_REFEREE_SH,
         [
@@ -778,14 +934,24 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       )
       assert.equal(rOk.status, 0, rOk.stderr)
       const refereeDir = path.join(govRoot, 'referee')
+      // Verify bytes match EXACT committed object A, NOT commit B or dirty worktree!
+      assert.equal(
+        readFileSync(path.join(refereeDir, 'scripts/check-a0-monotonic.ts'), 'utf8'),
+        '// audited gate v1\n',
+        'staged transition referee MUST contain exact git object bytes of targetSha, NEVER dirty worktree or HEAD!',
+      )
       const transition = JSON.parse(readFileSync(path.join(refereeDir, 'TRANSITION_APPROVAL.json'), 'utf8'))
       assert.equal(transition.mode, 'transition-audited')
+      assert.equal(transition.exportMethod, 'git-archive')
       assert.equal(transition.targetSha, targetSha)
+      assert.match(transition.treeSha, /^[0-9a-f]{40}$/)
       assert.equal(transition.approval.sha, targetSha)
 
       const manifest = JSON.parse(readFileSync(path.join(refereeDir, 'MANIFEST.json'), 'utf8'))
       assert.equal(manifest.mode, 'transition-audited')
+      assert.equal(manifest.exportMethod, 'git-archive')
       assert.equal(manifest.targetSha, targetSha)
+      assert.equal(manifest.treeSha, transition.treeSha)
       assert.ok(manifest.files['TRANSITION_APPROVAL.json'])
       assert.ok(manifest.files['.github/scripts/integ-shard-budget.ts'])
       assert.ok(manifest.files['packages/protocol/src/httpContracts.ts'])

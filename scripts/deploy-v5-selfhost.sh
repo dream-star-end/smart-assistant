@@ -1458,8 +1458,8 @@ $(lease_event_sql "$LEASE_TRAIN_ID" executor-begin "deploy:$$" "head=$head")
 COMMIT;
 SQL
     log "  🎫 lease train $LEASE_TRAIN_ID building(pid $$,target ${LEASE_TARGET_SHA:0:12})"
-  else
-    # 人工直跑:登记 manual train。已有 open train(worker 列车在跑)→ 拒,避免双发布线。
+  elif [[ "${CUTOVER_ROLLBACK:-0}" == 1 && "${OC_V5_RETENTION_INTERNAL_ROLLBACK:-0}" == 1 && -n "${OC_V5_COMPENSATE_TRAIN_ID:-}" ]] && declare -F v5_selfhost_lease_begin_compensation >/dev/null 2>&1; then v5_selfhost_lease_begin_compensation "$head"; return 0
+  else # 人工直跑:登记 manual train。已有 open train(worker 列车在跑)→ 拒,避免双发布线。
     local open
     open="$(lease_sql "SELECT id||'('||status||')' FROM train WHERE resource='deploy:selfhost' AND status NOT IN ('committed','failed') LIMIT 1;")"
     [[ -z "$open" ]] || die "Lease Center 有 open train $open,拒绝并行人工发布。查看:scripts/oc-lease.sh status"

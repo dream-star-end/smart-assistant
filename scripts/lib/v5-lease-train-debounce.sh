@@ -350,15 +350,43 @@ worker_pre_dispatch_ci_gate() { # <40-hex-tip-sha>
   esac
 }
 
-# B5 安全 FF CAS（planned 阶段启动 deploy-v5-selfhost.sh 前）：
-# - 严禁在远端 tip 已经推进到 C4 时反选旧绿 C3（因为 prepare 要求目标严格等于远端当前 tip）；
-# - 仅当远端最新实际 tip 本身是 cur_tip 的快进后代且 CI 三态严格为 success 时，才快进到 latest_tip；
-# - 在 UPDATE train ... WHERE id=... AND status='planned' AND target_sha=... 后硬校验 SQLite changes() == 1，
-#   CAS 失败原子回滚、绝不写假事件、绝不修改内存 tip 变量！
+# 原子撤销/延期尚未 spawn 的 planned train（不触碰已注册 rides 与精确 policy 请求，仅解除该未派班 train 的 binding 占位）
+_worker_defer_unspawned_planned_train() { # <train_id> <cur_tip> <latest_tip> <reason>
+  local train_id="$1" cur_tip="$2" latest_tip="$3" reason="$4" now=""
+  now="$(lease_now)"
+  lease_tx <<SQL
+.bail on
+CREATE TEMP TABLE IF NOT EXISTS _defer_cas_guard(ok INTEGER NOT NULL CHECK(ok = 1));
+DELETE FROM _defer_cas_guard;
+BEGIN IMMEDIATE;
+UPDATE lease
+   SET result_json=json_remove(result_json,'$.releasePolicyBinding'),
+       updated_at='$now'
+ WHERE resource='$RESOURCE'
+   AND status='registered'
+   AND json_extract(COALESCE(result_json,'{}'),'$.releasePolicyBinding.trainId')='$(lease_q "$train_id")';
+DELETE FROM train
+ WHERE id='$(lease_q "$train_id")'
+   AND status='planned'
+   AND target_sha='$(lease_q "$cur_tip")'
+   AND (executor_pid IS NULL OR executor_pid=0);
+INSERT INTO _defer_cas_guard(ok) VALUES(changes());
+$(lease_event_sql "$train_id" train-deferred "$ACTOR" "from=$cur_tip latest_tip=$latest_tip reason=$reason")
+COMMIT;
+SQL
+}
+
+# B5 安全 FF CAS 与三态返回（planned 阶段启动 deploy-v5-selfhost.sh 前）：
+# - 设置 PLANNED_FF_OUTCOME 并返回对应退出码：
+#     * unchanged (rc=0) : 远端 tip 未前进，按原 target 正常 spawn
+#     * advanced  (rc=0) : 远端最新 tip 是快进后代且 CI=success，已完成工作树快进与 SQLite CAS (changes()==1)
+#     * defer     (rc=10): 远端已前进到新 tip 但新 tip 非绿/不可快进/原班绑定精确源不再为 tip → 绝不 spawn 必死旧班！
+#                          原子撤回未 spawn 的 planned train，完整保留 registered rides 与精确策略请求，待新 tip 绿后再排！
 worker_planned_fast_forward_green_tip() { # <train_id> <tip_var_name>
   local train_id="$1" tip_var="$2" cur_tip="" latest_tip="" ev_doc=""
   local ci_out="" ci_st="" ci_detail="" head="" now="" rid rsha covered_count=0
   local -a covered_ids=()
+  PLANNED_FF_OUTCOME="unchanged"
   cur_tip="${!tip_var}"
   [[ "$cur_tip" =~ ^[0-9a-f]{40}$ ]] || return 0
 
@@ -367,32 +395,40 @@ worker_planned_fast_forward_green_tip() { # <train_id> <tip_var_name>
   [[ -n "$latest_tip" && "$latest_tip" != "$cur_tip" ]] || return 0
 
   if ! git -C "$LEASE_REPO_ROOT" merge-base --is-ancestor "$cur_tip" "$latest_tip" 2>/dev/null; then
-    wlog "train $train_id planned 检测到 origin tip ${latest_tip:0:12} 与 ${cur_tip:0:12} 非快进血缘，保持原 target"
-    return 0
+    wlog "train $train_id planned 检测到 origin tip ${latest_tip:0:12} 与 ${cur_tip:0:12} 非快进血缘，原子延期不派必死旧班"
+    _worker_defer_unspawned_planned_train "$train_id" "$cur_tip" "$latest_tip" "non-ff-tip-advanced" || true
+    PLANNED_FF_OUTCOME="defer"
+    return 10
   fi
 
-  # 若已绑定精确源 releasePolicy 或 allow-inflight，禁止漂移 target_sha(遵守精确源授权契约)
+  # 若已绑定精确源 releasePolicy 或 allow-inflight，绝不漂移 target_sha；且远端已推进导致旧 tip 不可 prepare，原子延期保留精确请求！
   ev_doc="$(train_field "$train_id" evidence_json 2>/dev/null || true)"
   [[ -n "$ev_doc" ]] || ev_doc='{}'
   if jq -e 'type=="object" and (has("releasePolicy") or has("cutover"))' <<<"$ev_doc" >/dev/null 2>&1; then
-    wlog "train $train_id 已绑定精确源 policy/inflight(${cur_tip:0:12})，不快进 target_sha"
-    return 0
+    wlog "train $train_id 已绑定精确源 policy/inflight(${cur_tip:0:12})，但远端已前进至 ${latest_tip:0:12}，禁止漂移且原子延期保留精确策略绑定"
+    _worker_defer_unspawned_planned_train "$train_id" "$cur_tip" "$latest_tip" "exact-source-policy-superseded-by-new-tip" || true
+    PLANNED_FF_OUTCOME="defer"
+    return 10
   fi
 
-  # 仅评估远端最新实际 tip，绝不回溯挑选已非 tip 的旧绿提交 C3！
+  # 仅评估远端最新实际 tip，绝不派发已非 tip 的旧班 C3！
   ci_out="$(worker_sha_ci_status "$latest_tip")"
   IFS=$'\t' read -r ci_st ci_detail <<<"$ci_out"
   if [[ "$ci_st" != "success" ]]; then
-    wlog "train $train_id planned 检测到远端新 tip ${latest_tip:0:12} CI=${ci_st} (${ci_detail})，禁止反选非 tip 旧绿提交，保持原 target ${cur_tip:0:12}"
-    return 0
+    wlog "train $train_id planned 检测到远端新 tip ${latest_tip:0:12} CI=${ci_st} (${ci_detail})，不派必死旧班 ${cur_tip:0:12}，原子延期保留 rides 待新 tip 绿后再排"
+    _worker_defer_unspawned_planned_train "$train_id" "$cur_tip" "$latest_tip" "new-tip-ci-${ci_st:-unknown}" || true
+    PLANNED_FF_OUTCOME="defer"
+    return 10
   fi
 
   # 在持 deploy.lock(fd 8) 内将发版工作树快进到最新绿灯 tip
   head="$(git -C "$LEASE_REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
   if [[ "$head" != "$latest_tip" ]]; then
     if ! canonical_fast_forward "$head" "$latest_tip"; then
-      wlog "train $train_id planned 快进工作树到 ${latest_tip:0:12} 失败，保持原 target ${cur_tip:0:12}"
-      return 0
+      wlog "train $train_id planned 快进工作树到 ${latest_tip:0:12} 失败，原子延期不派必死旧班 ${cur_tip:0:12}"
+      _worker_defer_unspawned_planned_train "$train_id" "$cur_tip" "$latest_tip" "worktree-ff-failed" || true
+      PLANNED_FF_OUTCOME="defer"
+      return 10
     fi
   fi
 
@@ -413,10 +449,18 @@ worker_planned_fast_forward_green_tip() { # <train_id> <tip_var_name>
   fi
   now="$(lease_now)"
   ev_patch="$(jq -cn --arg from "$cur_tip" --arg to "$latest_tip" --arg at "$now" --argjson rides "$ids_json" \
-    '{plannedFastForward:{from:$from,to:$to,at:$at,coveredLeaseIds:$rides}}')" || return 0
-  ev_merge="$(lease_json_object_merge_sql evidence_json "$ev_patch")" || return 0
+    '{plannedFastForward:{from:$from,to:$to,at:$at,coveredLeaseIds:$rides}}')" || {
+    _worker_defer_unspawned_planned_train "$train_id" "$cur_tip" "$latest_tip" "ev-patch-failed" || true
+    PLANNED_FF_OUTCOME="defer"
+    return 10
+  }
+  ev_merge="$(lease_json_object_merge_sql evidence_json "$ev_patch")" || {
+    _worker_defer_unspawned_planned_train "$train_id" "$cur_tip" "$latest_tip" "ev-merge-failed" || true
+    PLANNED_FF_OUTCOME="defer"
+    return 10
+  }
 
-  # 硬 CAS 校验：UPDATE train 必须严格命中 1 行 (changes() == 1)，否则事务回滚、不写事件、不改内存 tip_var！
+  # 硬 CAS 校验：UPDATE train 必须严格命中 1 行 (changes() == 1)，否则事务回滚、不写事件、不改内存 tip_var 并 defer！
   if lease_tx <<SQL
 .bail on
 CREATE TEMP TABLE IF NOT EXISTS _ff_cas_guard(ok INTEGER NOT NULL CHECK(ok = 1));
@@ -433,9 +477,12 @@ COMMIT;
 SQL
   then
     printf -v "$tip_var" '%s' "$latest_tip"
+    PLANNED_FF_OUTCOME="advanced"
     wlog "train $train_id planned 自动快进: ${cur_tip:0:12} → ${latest_tip:0:12} (远端最新 tip CI 绿灯, CAS=1, 合并覆盖祖先 rides=$covered_count)"
+    return 0
   else
-    wlog "train $train_id planned 快进 CAS 失败(changes()!=1 或写库失败)，回滚并保持内存 target ${cur_tip:0:12}"
+    wlog "train $train_id planned 快进 CAS 失败(changes()!=1 或写库失败)，回滚并原子延期不派旧班 ${cur_tip:0:12}"
+    PLANNED_FF_OUTCOME="defer"
+    return 10
   fi
-  return 0
 }

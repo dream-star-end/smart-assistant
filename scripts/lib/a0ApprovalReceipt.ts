@@ -80,10 +80,12 @@ export function matchesAnyGlob(filePath: string, globs: readonly string[]): bool
   return globs.some((g) => globToRegExp(g).test(filePath))
 }
 
-/** Normalize and sort allowedPaths for canonical payload binding (undefined -> '*'). */
+/** Normalize and sort allowedPaths by UTF-8 byte order for canonical payload binding (undefined -> '*'). */
 export function canonicalizeA0AllowedPaths(allowedPaths?: readonly string[]): string {
   if (allowedPaths === undefined) return '*'
-  const normalized = [...new Set(allowedPaths.map((p) => p.trim()))].sort()
+  const normalized = [...new Set(allowedPaths.map((p) => p.trim()))].sort((a, b) =>
+    Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')),
+  )
   return JSON.stringify(normalized)
 }
 

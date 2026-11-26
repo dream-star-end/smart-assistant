@@ -857,6 +857,17 @@ release_policy_recover_forward() {
     release_policy_keep_failed "$rel" recovery-gates "$rc"
     return $?
   fi
+  # B6: policy 恢复路径必须持有本版本的 retention PASS 证明，缺失时必须实跑 retention 门通过才允许 finalize committed！
+  if [[ "${OC_V5_RETENTION_ENABLED:-1}" != 0 ]]; then
+    if ! lease_train_has_retention_pass "$rel" "$LEASE_TARGET_SHA"; then
+      if declare -F v5_selfhost_post_cutover_retention_gate >/dev/null 2>&1; then
+        v5_selfhost_post_cutover_retention_gate "$rel" "$LEASE_TARGET_SHA" || return $?
+      else
+        cutover_clog "✗ [release-policy-recover] 缺少本版本 retention PASS 证明且无保留集门函数，拒绝 finalize committed"
+        return 79
+      fi
+    fi
+  fi
   CUTOVER_SURVIVOR_ARMED=1
   release_policy_finalize_forward "$rel" || return $?
   return 0
@@ -900,6 +911,33 @@ UPDATE train SET status='cutover', evidence_json=$ev_merge, updated_at='$now'
 $(lease_event_sql "$LEASE_TRAIN_ID" train-verifying "deploy:$$" "post-cutover retention verifying rel=$rel")
 COMMIT;
 SQL
+}
+
+# 持久化本版本 retention PASS 证明到 train.evidence_json，供 policy 恢复路径校验（B6）。
+lease_train_mark_retention_passed() { # <candidate-rel> <40-hex-sha>
+  [[ "${LEASE_TRAIN_ACTIVE:-0}" == 1 && -n "${LEASE_TRAIN_ID:-}" ]] || return 0
+  release_policy_guard_owner || return 86
+  local rel="${1:-}" sha="${2:-}" now="" ev="" ev_merge=""
+  now="$(lease_now)"
+  ev="$(jq -cn --arg rel "$rel" --arg sha "$sha" --arg at "$now" \
+    '{retentionPhase:"passed",retentionProof:{schema:1,rel:$rel,sha:$sha,passedAt:$at}}')" || return 1
+  ev_merge="$(lease_json_object_merge_sql evidence_json "$ev")" || return 1
+  lease_tx <<SQL || return 1
+.bail on
+BEGIN IMMEDIATE;
+UPDATE train SET evidence_json=$ev_merge, updated_at='$now'
+ WHERE id='$(lease_q "$LEASE_TRAIN_ID")' AND status NOT IN ('committed','failed','recovery_required');
+$(lease_event_sql "$LEASE_TRAIN_ID" train-retention-passed "deploy:$$" "post-cutover retention passed rel=$rel sha=$sha")
+COMMIT;
+SQL
+}
+
+# 核验当前 train 是否已持匹配 <rel> 与 <sha> 的持久化 retention PASS 证明。
+lease_train_has_retention_pass() { # <candidate-rel> <40-hex-sha>
+  [[ -n "${LEASE_TRAIN_ID:-}" ]] || return 1
+  local rel="${1:-}" sha="${2:-}" got=""
+  got="$(lease_sql "SELECT COALESCE(json_extract(evidence_json,'$.retentionPhase'),'')||'|'||COALESCE(json_extract(evidence_json,'$.retentionProof.rel'),'')||'|'||COALESCE(json_extract(evidence_json,'$.retentionProof.sha'),'') FROM train WHERE id='$(lease_q "$LEASE_TRAIN_ID")';")" || return 1
+  [[ "$got" == "passed|$rel|$sha" ]]
 }
 
 # 终态:成功由 cmd_deploy 末尾调 committed;失败由 EXIT trap 调(未 committed 即 failed/recovery_required)。

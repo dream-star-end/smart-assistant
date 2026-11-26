@@ -117,10 +117,26 @@ else:
             errors.append(f"updatedAt 必须为有效 ISO 日期/时间戳 (got={uval!r})")
     if "capabilities" in doc and doc["capabilities"] is not None:
         caps = doc["capabilities"]
-        if not isinstance(caps, list) or any(not isinstance(c, str) or not c.strip() for c in caps):
-            errors.append("capabilities 必须为非空字符串数组")
-    if "note" in doc and doc["note"] is not None and not isinstance(doc["note"], str):
-        errors.append("note 必须是字符串")
+        if not isinstance(caps, dict):
+            errors.append("capabilities 必须为 JSON 对象")
+        else:
+            for ck, cv in caps.items():
+                if not isinstance(ck, str) or not CLI_KEY_RE.fullmatch(ck):
+                    errors.append(f"capabilities 键名非法: {ck!r}")
+                if isinstance(cv, str):
+                    if not cv.strip() or SHELL_META_RE.search(cv):
+                        errors.append(f"capabilities[{ck!r}] 必须为非空安全字符串")
+                elif isinstance(cv, list):
+                    if len(cv) == 0 or any(
+                        not isinstance(item, str) or not item.strip() or SHELL_META_RE.search(item)
+                        for item in cv
+                    ):
+                        errors.append(f"capabilities[{ck!r}] 必须为非空安全字符串数组")
+                else:
+                    errors.append(f"capabilities[{ck!r}] 必须为字符串或字符串数组")
+    if "note" in doc and doc["note"] is not None:
+        if not isinstance(doc["note"], str) or not doc["note"].strip():
+            errors.append("note 必须是非空字符串")
     clis = doc.get("cliVersions")
     if not isinstance(clis, dict) or len(clis) == 0:
         errors.append("cliVersions 必须是非空 JSON 对象")
@@ -344,11 +360,11 @@ v5_selfhost_check_blast_radius() { # <target-sha> [base-ref] [target-branch]
     return 0
   fi
   if [[ ! -x "$gov_bin" ]]; then
-    if [[ "${OC_V5_BLAST_RADIUS_REQUIRED:-0}" == 1 ]]; then
-      _v5_tg_die "[blast-radius] OC_V5_BLAST_RADIUS_REQUIRED=1 但缺少可执行 $gov_bin (fail-closed)"
+    if [[ "${OC_V5_TEST_ALLOW_MISSING_GOVERNOR:-0}" == 1 ]]; then
+      _v5_tg_log "  · [blast-radius] OC_V5_TEST_ALLOW_MISSING_GOVERNOR=1，测试模式跳过缺失的 $gov_bin"
+      return 0
     fi
-    _v5_tg_log "  · [blast-radius] 未安装可执行 $gov_bin，跳过物理爆破半径校验"
-    return 0
+    _v5_tg_die "[blast-radius] 正向切流缺少可执行宿主裁判 $gov_bin（默认 fail-closed，请先安装 /opt/openclaude/harness-gate/bin/oc-governor）"
   fi
   if [[ -z "$branch" ]]; then
     branch="${OC_V5_TARGET_BRANCH:-}"
@@ -360,16 +376,19 @@ v5_selfhost_check_blast_radius() { # <target-sha> [base-ref] [target-branch]
 
   base_ref="$(_v5_selfhost_resolve_diff_base "$sha" "$base_ref")"
   local -a changed_files=()
-  local f=""
+  local diff_out="" f=""
   if [[ -n "$base_ref" ]]; then
-    while IFS= read -r f; do
-      [[ -n "$f" ]] && changed_files+=("$f")
-    done < <("${g[@]}" diff --name-only "${base_ref}...${sha}" 2>/dev/null || true)
+    if ! diff_out="$("${g[@]}" diff --name-only "${base_ref}...${sha}" 2>&1)"; then
+      _v5_tg_die "[blast-radius] git diff ${base_ref}...${sha} 失败，拒绝以空清单跳过爆破半径校验 (fail-closed): ${diff_out:0:300}"
+    fi
   else
-    while IFS= read -r f; do
-      [[ -n "$f" ]] && changed_files+=("$f")
-    done < <("${g[@]}" show --pretty="" --name-only "$sha" 2>/dev/null || true)
+    if ! diff_out="$("${g[@]}" show --pretty="" --name-only "$sha" 2>&1)"; then
+      _v5_tg_die "[blast-radius] git show --name-only ${sha} 失败，拒绝以空清单跳过爆破半径校验 (fail-closed): ${diff_out:0:300}"
+    fi
   fi
+  while IFS= read -r f; do
+    [[ -n "$f" ]] && changed_files+=("$f")
+  done <<<"$diff_out"
 
   # 若存在 pinned candidate release 目录，用其作为 --repo-root 确保 SQL 扫描读的是精确候选提交内容而非脏工作树
   local scan_root="${CUTOVER_REL:-}"
@@ -643,13 +662,80 @@ v5_selfhost_notify_governor_breaker() { # <train-id> <reason>
   fi
 }
 
+# B6 同操作内补偿回滚准入校验（由 lease_train_begin 在 CUTOVER_ROLLBACK=1 + OC_V5_RETENTION_INTERNAL_ROLLBACK=1 时调用）：
+# - 仅允许原 open train 的持锁父进程发起的同操作补偿回滚，严禁外部无关并行人工发布绕过；
+# - 不新建第二条 train、不在子进程设置 LEASE_TRAIN_ACTIVE=1（防止子 rollback 把原失败 train 误标 committed），
+#   交由父进程在核验旧 live 健康后把原 train 原子落定为 failed（或 recovery_required）。
+v5_selfhost_lease_begin_compensation() { # <rollback-target-sha>
+  local rb_sha="$1" cid="${OC_V5_COMPENSATE_TRAIN_ID:-}" csha="${OC_V5_COMPENSATE_TARGET_SHA:-}"
+  local cpid="${OC_V5_COMPENSATE_PARENT_PID:-}" cnonce="${OC_V5_COMPENSATE_POLICY_NONCE:-}"
+  local row="" st="" tgt="" epid="" ev_nonce="" other_open=""
+  [[ "${CUTOVER_ROLLBACK:-0}" == 1 && "${OC_V5_RETENTION_INTERNAL_ROLLBACK:-0}" == 1 ]] \
+    || _v5_tg_die "补偿回滚准入失败: 缺少 CUTOVER_ROLLBACK=1 / OC_V5_RETENTION_INTERNAL_ROLLBACK=1"
+  [[ "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-0}" == 1 ]] \
+    || _v5_tg_die "补偿回滚准入失败: 父操作未持有部署锁 (OC_V5_SELFHOST_DEPLOY_LOCK_HELD!=1)"
+  lease_valid_train_id "$cid" \
+    || _v5_tg_die "补偿回滚准入失败: 非法 OC_V5_COMPENSATE_TRAIN_ID=$cid"
+  [[ "$csha" =~ ^[0-9a-f]{40}$ ]] \
+    || _v5_tg_die "补偿回滚准入失败: 非法 OC_V5_COMPENSATE_TARGET_SHA=${csha:-<empty>}"
+  [[ "$cpid" =~ ^[1-9][0-9]*$ ]] \
+    || _v5_tg_die "补偿回滚准入失败: 缺少有效父执行器 PID (OC_V5_COMPENSATE_PARENT_PID=${cpid:-<empty>})"
+  row="$(lease_sql "SELECT status||'|'||target_sha||'|'||COALESCE(executor_pid,0)||'|'||COALESCE(json_extract(evidence_json,'$.releasePolicyOwner.nonce'),'') FROM train WHERE id='$(lease_q "$cid")' AND resource='deploy:selfhost';")"
+  [[ -n "$row" ]] || _v5_tg_die "补偿回滚准入失败: 原 train 不存在 ($cid)"
+  IFS='|' read -r st tgt epid ev_nonce <<<"$row"
+  [[ "$st" == cutover || "$st" == building ]] \
+    || _v5_tg_die "补偿回滚准入失败: 原 train $cid status=$st 非活跃 cutover/building 态"
+  [[ "$tgt" == "$csha" ]] \
+    || _v5_tg_die "补偿回滚准入失败: 原 train $cid target_sha=$tgt ≠ $csha"
+  [[ "$epid" == "$cpid" ]] \
+    || _v5_tg_die "补偿回滚准入失败: 原 train $cid executor_pid=$epid ≠ parent_pid=$cpid"
+  kill -0 "$epid" 2>/dev/null \
+    || _v5_tg_die "补偿回滚准入失败: 原 train $cid 父执行器 pid=$epid 已退出"
+  if [[ -n "$ev_nonce" && "$ev_nonce" != "$cnonce" ]]; then
+    _v5_tg_die "补偿回滚准入失败: 原 train $cid releasePolicyOwner.nonce 不匹配"
+  fi
+  other_open="$(lease_sql "SELECT id||'('||status||')' FROM train WHERE resource='deploy:selfhost' AND id<>'$(lease_q "$cid")' AND status NOT IN ('committed','failed') LIMIT 1;")"
+  [[ -z "$other_open" ]] \
+    || _v5_tg_die "补偿回滚准入失败: 存在其他冲突 open train $other_open"
+  lease_tx <<SQL || _v5_tg_die "补偿回滚准入写事件失败(sqlite),fail-closed"
+BEGIN IMMEDIATE;
+$(lease_event_sql "$cid" train-compensate-rollback-begin "rollback:$$" "parent_pid=$cpid target_sha=$csha rollback_sha=$rb_sha")
+COMMIT;
+SQL
+  LEASE_COMPENSATE_PARENT_TRAIN_ID="$cid"
+  LEASE_TRAIN_ID=""
+  LEASE_TRAIN_ACTIVE=0
+  _v5_tg_log "  🎫 同操作补偿回滚已获准入 (parent_train=$cid, parent_pid=$cpid, rollback_sha=${rb_sha:0:12})"
+}
+
+v5_selfhost_lease_record_compensation_ok() { # <rollback-master> <from-live>
+  local rb_master="${1:-}" from_live="${2:-}" cid="${LEASE_COMPENSATE_PARENT_TRAIN_ID:-}"
+  [[ -n "$cid" ]] || return 0
+  lease_tx <<SQL || true
+BEGIN IMMEDIATE;
+$(lease_event_sql "$cid" train-compensate-rollback-ok "rollback:$$" "live=$rb_master from=$from_live")
+COMMIT;
+SQL
+  _v5_tg_log "  🎫 同操作补偿回滚已切换至 $rb_master（原列车 $cid 交由父操作核验后标 failed）"
+}
+
 v5_selfhost_trigger_official_rollback() { # <failed-rel> <sha> <retention-rc>
   local rel="$1" sha="$2" ret_rc="$3"
   if [[ -n "${OC_V5_RETENTION_ROLLBACK_CMD:-}" ]]; then
-    bash -c "$OC_V5_RETENTION_ROLLBACK_CMD" -- "$rel" "$sha" "$ret_rc"
+    OC_V5_COMPENSATE_TRAIN_ID="${LEASE_TRAIN_ID:-}" \
+    OC_V5_COMPENSATE_TARGET_SHA="${LEASE_TARGET_SHA:-$sha}" \
+    OC_V5_COMPENSATE_PARENT_PID="$$" \
+    OC_V5_COMPENSATE_POLICY_NONCE="${RELEASE_POLICY_NONCE:-}" \
+    OC_V5_RETENTION_INTERNAL_ROLLBACK=1 \
+    OC_V5_SELFHOST_DEPLOY_LOCK_HELD="${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-1}" \
+      bash -c "$OC_V5_RETENTION_ROLLBACK_CMD" -- "$rel" "$sha" "$ret_rc"
     return $?
   fi
   env -u LEASE_TRAIN_ID -u OC_V5_LEASE_TRAIN_ID \
+    OC_V5_COMPENSATE_TRAIN_ID="${LEASE_TRAIN_ID:-}" \
+    OC_V5_COMPENSATE_TARGET_SHA="${LEASE_TARGET_SHA:-$sha}" \
+    OC_V5_COMPENSATE_PARENT_PID="$$" \
+    OC_V5_COMPENSATE_POLICY_NONCE="${RELEASE_POLICY_NONCE:-}" \
     OC_V5_RETENTION_INTERNAL_ROLLBACK=1 \
     OC_V5_SELFHOST_DEPLOY_LOCK_HELD="${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-1}" \
     "$SCRIPT_DIR/deploy-v5-selfhost.sh" --rollback
@@ -758,6 +844,10 @@ v5_selfhost_post_cutover_retention_gate() { # <release-path> <40-hex-sha>
   fi
 
   if [[ "$rc" == 0 ]]; then
+    if declare -F lease_train_mark_retention_passed >/dev/null 2>&1; then
+      lease_train_mark_retention_passed "$rel" "$sha" \
+        || { _v5_tg_log "✗ [post-cutover-retention] 无法持久化 retention PASS 证明"; return 79; }
+    fi
     tsum_note retentionGate passed 2>/dev/null || :
     _v5_tg_log "  ✓ [post-cutover-retention] 行为保留集全部 PASS，放行 finalize committed"
     return 0

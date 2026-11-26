@@ -110,6 +110,10 @@ export interface VerifyArchStewardReceiptOptions {
   baseSha?: string
   requiredTriggers?: readonly StructuralRiskTriggerCode[]
   hmacKey?: string
+  /** When true (or OC_STEWARD_REQUIRE_HMAC=1), fail-closed unless hmacKey is present and hmac-sha256 verifies. */
+  requireHmac?: boolean
+  /** True ONLY when caller verified receipt file is root-owned regular file (distinct from cryptographic HMAC). */
+  rootFileIntegrity?: boolean
 }
 
 function verifyShaAndModels(
@@ -259,9 +263,8 @@ function verifyDimensionsAndVeto(
   }
 }
 
-function verifyEvidenceAndDigest(
+function verifyUsageEvidence(
   obj: Record<string, unknown>,
-  hmacKey: string | undefined,
   violations: StewardReceiptViolation[],
 ): void {
   if (!obj.usageEvidence || typeof obj.usageEvidence !== 'object' || Array.isArray(obj.usageEvidence)) {
@@ -313,7 +316,14 @@ function verifyEvidenceAndDigest(
       })
     }
   }
+}
 
+function verifyReceiptDigest(
+  obj: Record<string, unknown>,
+  hmacKey: string | undefined,
+  requireHmac: boolean,
+  violations: StewardReceiptViolation[],
+): boolean {
   const receiptDigest = typeof obj.receiptDigest === 'string' ? obj.receiptDigest.trim() : ''
   const digestMatch = DIGEST_RE.exec(receiptDigest)
   if (!digestMatch) {
@@ -321,28 +331,39 @@ function verifyEvidenceAndDigest(
       code: 'STEWARD-RECEIPT-DIGEST-MISMATCH',
       message: `receipt.receiptDigest must match 'sha256:<64hex>' or 'hmac-sha256:<64hex>' (got ${JSON.stringify(obj.receiptDigest)})`,
     })
-    return
+    return false
   }
   const algo = digestMatch[1]!
+  if (requireHmac && !hmacKey) {
+    violations.push({
+      code: 'STEWARD-RECEIPT-DIGEST-MISMATCH',
+      message: `HMAC signature required (OC_STEWARD_REQUIRE_HMAC=1) but no HMAC key configured (${DEFAULT_STEWARD_HMAC_KEY_ENV})`,
+    })
+    return false
+  }
   if (hmacKey && algo !== 'hmac-sha256') {
     violations.push({
       code: 'STEWARD-RECEIPT-DIGEST-MISMATCH',
       message: 'HMAC key is configured; plain sha256 digest downgrade is rejected (hmac-sha256 required)',
     })
-  } else if (!hmacKey && algo === 'hmac-sha256') {
+    return false
+  }
+  if (!hmacKey && algo === 'hmac-sha256') {
     violations.push({
       code: 'STEWARD-RECEIPT-DIGEST-MISMATCH',
       message: `receipt uses hmac-sha256 digest but verifier has no HMAC key configured (${DEFAULT_STEWARD_HMAC_KEY_ENV})`,
     })
-  } else {
-    const expectedDigest = computeArchStewardReceiptDigest(obj, hmacKey)
-    if (!safeEqualStrings(receiptDigest, expectedDigest)) {
-      violations.push({
-        code: 'STEWARD-RECEIPT-DIGEST-MISMATCH',
-        message: 'receiptDigest mismatch — receipt content was tampered with or forged',
-      })
-    }
+    return false
   }
+  const expectedDigest = computeArchStewardReceiptDigest(obj, hmacKey)
+  if (!safeEqualStrings(receiptDigest, expectedDigest)) {
+    violations.push({
+      code: 'STEWARD-RECEIPT-DIGEST-MISMATCH',
+      message: 'receiptDigest mismatch — receipt content was tampered with or forged',
+    })
+    return false
+  }
+  return Boolean(hmacKey && algo === 'hmac-sha256')
 }
 
 /**
@@ -410,13 +431,24 @@ export function verifyArchStewardReceipt(
   }
 
   verifyDimensionsAndVeto(obj, violations)
-  verifyEvidenceAndDigest(obj, expected.hmacKey, violations)
+  verifyUsageEvidence(obj, violations)
+  const requireHmac = expected.requireHmac ?? process.env.OC_STEWARD_REQUIRE_HMAC === '1'
+  const hmacVerified = verifyReceiptDigest(obj, expected.hmacKey, requireHmac, violations)
+  const rootFileIntegrity = Boolean(expected.rootFileIntegrity)
+  const integrityMode: StewardReceiptVerificationResult['integrityMode'] = hmacVerified
+    ? 'hmac-sha256'
+    : violations.length === 0 && rootFileIntegrity
+      ? 'root-file-sha256'
+      : 'unverified'
 
   return {
     ok: violations.length === 0,
     receipt: violations.length === 0 ? (obj as unknown as ArchStewardReceipt) : undefined,
     violations,
     recommendedStewardModel: recommendedStewardModel ?? recommendAuditModelFor(null),
+    hmacVerified,
+    rootFileIntegrity,
+    integrityMode,
   }
 }
 
@@ -518,7 +550,14 @@ export function findStewardReceiptForCommit(opts: {
 
     try {
       const raw: unknown = JSON.parse(readFileSync(filePath, 'utf8'))
-      return { found: true, channel, source: filePath, raw, searchedLocations }
+      return {
+        found: true,
+        channel,
+        source: filePath,
+        raw,
+        rootOwnerVerified: st.uid === 0,
+        searchedLocations,
+      }
     } catch (err) {
       return {
         found: true,

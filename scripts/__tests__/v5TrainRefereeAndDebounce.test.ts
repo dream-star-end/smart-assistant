@@ -400,11 +400,24 @@ process.exit(0)
     seedGovStubs(refDir)
     writeFileSync(join(refDir, 'scripts/check-monotonic-baselines.ts'), v2CheckerSrc)
     const approvalFile = join(approvalsDir, `${upgradeSha}.json`)
+    // ②-0: Narrow allowedPaths approval MUST NOT authorize staging full transition referee (B1!)
+    const narrowApprovalSha = writeA0ApprovalReceipt({
+      approvalFile,
+      sha: upgradeSha,
+      reason: 'OCV5-903 narrow path approval must be rejected for referee swap',
+      allowedPaths: ['arch/schema-budget.json', 'scripts/check-monotonic-baselines.ts'],
+      hmacKey,
+    })
+    stageAuditedTransitionReferee({ refDir, targetSha: upgradeSha, approvalFile, approvalSha256: narrowApprovalSha })
+    r = runGates(upgradeSha)
+    assert.notEqual(r.status, 0, 'Step 2-0: narrow allowedPaths MUST NOT authorize full transition referee')
+    assert.match(r.stderr, /禁止窄审批替换裁判/)
+
+    // Now issue unrestricted A0 approval (allowedPaths omitted -> '*')
     const approvalSha256 = writeA0ApprovalReceipt({
       approvalFile,
       sha: upgradeSha,
       reason: 'OCV5-903 audited schema v1->v2 transition rollout',
-      allowedPaths: ['arch/schema-budget.json', 'scripts/check-monotonic-baselines.ts'],
       hmacKey,
     })
     stageAuditedTransitionReferee({ refDir, targetSha: upgradeSha, approvalFile, approvalSha256 })
@@ -571,6 +584,30 @@ process.exit(0)
     cpSync(join(REPO_ROOT, 'scripts/check-security-sast.ts'), join(refDir, 'scripts/check-security-sast.ts'))
     mkdirSync(join(refDir, 'scripts/lib'), { recursive: true })
     cpSync(join(REPO_ROOT, 'scripts/lib/prodFileDiscovery.ts'), join(refDir, 'scripts/lib/prodFileDiscovery.ts'))
+    // B4 behavioral eval isolation probe in check-context-static.ts: verify env -i stripped host secrets + unprivileged nobody (65534) when root!
+    const ctxProbeOut = join(f.dir, 'ctx-isolation-probe.json')
+    writeFileSync(ctxProbeOut, '', { mode: 0o666 })
+    chmodSync(ctxProbeOut, 0o666)
+    chmodSync(f.dir, 0o755)
+    writeFileSync(
+      join(refDir, 'scripts/check-context-static.ts'),
+      `import { writeFileSync } from 'node:fs'
+let writeRefBlocked = false
+try {
+  writeFileSync(${JSON.stringify(join(refDir, 'escape-attempt.txt'))}, 'pwn')
+} catch {
+  writeRefBlocked = true
+}
+writeFileSync(${JSON.stringify(ctxProbeOut)}, JSON.stringify({
+  uid: typeof process.getuid === 'function' ? process.getuid() : -1,
+  ghToken: process.env.GH_TOKEN ?? null,
+  githubToken: process.env.GITHUB_TOKEN ?? null,
+  secretProbe: process.env.OC_SECRET_PROBE ?? null,
+  writeRefBlocked,
+}))
+process.exit(0)
+`,
+    )
     writeFileSync(
       join(refDir, 'scripts/check-debt-ttl.ts'),
       `// supports --base --head
@@ -619,10 +656,23 @@ process.exit(0)
         NODE_OPTIONS: '--require=/nonexistent/poison-preload.cjs',
         NODE_PATH: '/nonexistent/poison-node-path',
         TSX_TSCONFIG_PATH: '/nonexistent/poison-tsconfig.json',
+        GH_TOKEN: 'ghp_must_be_stripped_in_context_eval',
+        GITHUB_TOKEN: 'ghs_must_be_stripped_in_context_eval',
+        OC_SECRET_PROBE: 'host_secret_must_never_leak',
       },
     )
     assert.equal(res.status, 0, res.stderr + res.stdout)
     assert.equal(existsSync(poisonMarker), false, 'MUST NEVER execute poisoned staging tsx, script, or protocol!')
+
+    // Verify B4 behavioral eval ran with env -i (zero leaked secrets) and unprivileged nobody (65534) when root!
+    const ctxProbe = JSON.parse(readFileSync(ctxProbeOut, 'utf8'))
+    assert.equal(ctxProbe.ghToken, null, 'GH_TOKEN must be stripped by env -i in check-context-static.ts')
+    assert.equal(ctxProbe.githubToken, null, 'GITHUB_TOKEN must be stripped by env -i in check-context-static.ts')
+    assert.equal(ctxProbe.secretProbe, null, 'host env vars must be stripped by env -i in check-context-static.ts')
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      assert.equal(ctxProbe.uid, 65534, 'check-context-static.ts MUST drop privileges to nobody (65534) when running as root')
+      assert.equal(ctxProbe.writeRefBlocked, true, 'unprivileged context eval MUST be blocked from writing to referee dir')
+    }
 
     // Verify env vars stripped & trusted protocol loaded & --root "$staging" passed
     const probe = JSON.parse(readFileSync(envProbeLog, 'utf8').trim())
@@ -951,39 +1001,107 @@ describe('B5. 45s debounce, 3-state CI classification, trusted events & safe FF 
           'wlog() { echo "$*"; }',
           extractBashFn(readFileSync(LEASE_WORKER, 'utf8'), 'canonical_fast_forward'),
           `tip=${q(c2)}`,
-          `worker_planned_fast_forward_green_tip ${q(trainId)} tip`,
-          'echo "FINAL_TIP=$tip"',
+          'rc=0',
+          `worker_planned_fast_forward_green_tip ${q(trainId)} tip || rc=$?`,
+          'echo "FINAL_TIP=$tip OUTCOME=${PLANNED_FF_OUTCOME:-} RC=$rc"',
+          'exit "$rc"',
         ].join('\n'),
         { ...workerEnv, OC_V5_WORKER_CI_STATUS_CMD: ciStatusCmd },
       )
 
-    // FF-1: Remote tip is c4 (pending) while older c3 is green -> MUST NOT pick non-tip c3!
+    // Register a ride for c3 (NOT yet on live c2!) that must survive defer intact (never marked failed!)
+    execFileSync('sqlite3', [
+      db,
+      `INSERT INTO lease(id,resource,mode,status,owner,owner_uid,want_sha,created_at,updated_at)
+         VALUES('ls-b5-defer-keep','deploy:selfhost','ride','registered','dev',1000,'${c3}','2026-11-26T12:00:00Z','2026-11-26T12:00:00Z');`,
+    ])
+
+    // FF-1 (B5 defer): Remote tip is c4 (pending) while older c3 is green -> MUST NOT pick c3 AND MUST return defer (rc=10),
+    // atomically withdrawing unspawned planned train while preserving registered ride!
     r = runFf(`if [[ "$1" == "${c3}" ]]; then echo "success"; else echo "pending"; fi`)
-    assert.equal(r.status, 0, r.stderr)
+    assert.equal(r.status, 10, `expected rc=10 (defer) when remote tip c4 is pending, got ${r.status}: ${r.stdout} ${r.stderr}`)
+    assert.match(r.stdout, /OUTCOME=defer/)
     assert.match(r.stdout, new RegExp(`FINAL_TIP=${c2}`), 'must NOT select older green c3 when remote tip is c4')
-    assert.match(r.stdout, /禁止反选非 tip 旧绿提交/)
-    assert.equal(sqlVal(`SELECT target_sha FROM train WHERE id='${trainId}';`), c2)
+    assert.equal(sqlVal(`SELECT COUNT(*) FROM train WHERE id='${trainId}';`), '0', 'unspawned planned train MUST be atomically withdrawn on defer')
+    assert.equal(sqlVal(`SELECT COUNT(*) FROM event WHERE event='train-deferred';`), '1')
+    assert.equal(sqlVal(`SELECT status FROM lease WHERE id='ls-b5-defer-keep';`), 'registered', 'ride MUST stay registered across defer!')
     assert.equal(sqlVal(`SELECT COUNT(*) FROM event WHERE event='train-fast-forward';`), '0')
 
-    // FF-2: Concurrent CAS conflict (status changed to 'building' before UPDATE) -> changes()==0 aborts, NO event, NO memory mutation!
-    execFileSync('sqlite3', [db, `UPDATE train SET status='building' WHERE id='${trainId}';`])
+    // FF-2: Concurrent CAS conflict (status changed to 'building' before UPDATE) -> changes()==0 aborts, returns defer (rc=10), NO event, NO memory mutation!
+    execFileSync('sqlite3', [
+      db,
+      `INSERT INTO train(id,resource,target_sha,status,owner,created_at,updated_at)
+         VALUES('${trainId}','deploy:selfhost','${c2}','building','worker:test','2026-11-26T12:00:00Z','2026-11-26T12:00:00Z');`,
+    ])
     r = runFf(`echo "success"`)
-    assert.equal(r.status, 0, r.stderr)
+    assert.equal(r.status, 10, `CAS conflict must return defer (10), got ${r.status}`)
     assert.match(r.stdout, /快进 CAS 失败/)
     assert.match(r.stdout, new RegExp(`FINAL_TIP=${c2}`), 'CAS failure MUST NOT mutate in-memory tip')
     assert.equal(sqlVal(`SELECT target_sha FROM train WHERE id='${trainId}';`), c2)
     assert.equal(sqlVal(`SELECT COUNT(*) FROM event WHERE event='train-fast-forward';`), '0')
 
-    // FF-3: Train back to planned & remote tip c4 is green -> FFs cleanly to c4 with changes()==1!
+    // FF-3: Train back to planned & remote tip c4 is green -> FFs cleanly to c4 with changes()==1 & OUTCOME=advanced!
     execFileSync('sqlite3', [db, `UPDATE train SET status='planned' WHERE id='${trainId}';`])
     g(wt, 'reset', '--hard', '-q', c2)
     r = runFf(`[[ "$1" == "${c4}" ]] && echo "success" || echo "pending"`)
     assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stdout, /OUTCOME=advanced/)
     assert.match(r.stdout, new RegExp(`FINAL_TIP=${c4}`), 'must FF to latest green remote tip c4')
     assert.match(r.stdout, /CAS=1/)
     assert.equal(g(wt, 'rev-parse', 'HEAD'), c4)
     assert.equal(sqlVal(`SELECT target_sha FROM train WHERE id='${trainId}';`), c4)
     assert.equal(sqlVal(`SELECT COUNT(*) FROM event WHERE event='train-fast-forward';`), '1')
+
+    // FF-4: Full worker dispatch_train E2E: c3 green -> planned inserted -> remote advances to c4 (pending) before spawn ->
+    // worker does NOT spawn doomed c3, defers & preserves ride -> c4 turns green -> next tick spawns c4!
+    execFileSync('sqlite3', [db, 'DELETE FROM train; DELETE FROM event;'])
+    g(pushWt, 'reset', '--hard', '-q', c3)
+    g(pushWt, 'push', '--force', '-q', 'origin', 'feat/v5-selfhost')
+    g(wt, 'fetch', '-q', 'origin', 'feat/v5-selfhost')
+    g(wt, 'reset', '--hard', '-q', c3)
+    const spawnLog = join(sb.dir, 'b5-ff4-spawn.log')
+    const fakeDeployFf4 = join(sb.dir, 'fake-deploy-ff4.sh')
+    writeFileSync(fakeDeployFf4, `#!/usr/bin/env bash\necho "$*" >> ${q(spawnLog)}\nexit 0\n`)
+    chmodSync(fakeDeployFf4, 0o755)
+    // Hook worker_planned_fast_forward_green_tip wrapper to push c4 right AFTER planned insert and BEFORE second fetch!
+    const rDeferTick = runBash(
+      [
+        `source ${q(LEASE_WORKER)}`,
+        'lease_deploy_process_running() { return 1; }',
+        'orig_ff="$(declare -f worker_planned_fast_forward_green_tip)"',
+        'eval "${orig_ff/worker_planned_fast_forward_green_tip/_orig_worker_planned_ff}"',
+        `worker_planned_fast_forward_green_tip() { git -C ${q(pushWt)} push -q origin ${q(c4)}:refs/heads/feat/v5-selfhost; _orig_worker_planned_ff "$@"; }`,
+        'dispatch_train',
+      ].join('\n'),
+      {
+        ...workerEnv,
+        OC_V5_LEASE_DEPLOY_BIN: fakeDeployFf4,
+        OC_V5_TRAIN_DEBOUNCE_SEC: '0',
+        OC_V5_WORKER_CI_STATUS_CMD: `if [[ "$1" == "${c3}" ]]; then echo "success"; else echo "pending"; fi`,
+      },
+    )
+    assert.equal(rDeferTick.status, 0, rDeferTick.stderr)
+    assert.match(rDeferTick.stdout, /已原子延期\(outcome=defer\)/, `expected defer log: ${rDeferTick.stdout}`)
+    assert.equal(existsSync(spawnLog), false, 'worker MUST NOT spawn doomed old target c3 when c4 arrived pending!')
+    assert.equal(sqlVal('SELECT COUNT(*) FROM train;'), '0', 'deferred planned train must be cleanly withdrawn')
+    assert.equal(sqlVal(`SELECT status FROM lease WHERE id='ls-b5-defer-keep';`), 'registered', 'ride remains registered')
+
+    // Now c4 turns green -> next tick dispatches c4!
+    const rGreenTick = runBash(
+      `source ${q(LEASE_WORKER)}; lease_deploy_process_running() { return 1; }; dispatch_train`,
+      {
+        ...workerEnv,
+        OC_V5_LEASE_DEPLOY_BIN: fakeDeployFf4,
+        OC_V5_TRAIN_DEBOUNCE_SEC: '0',
+        OC_V5_WORKER_CI_STATUS_CMD: `if [[ "$1" == "${c4}" ]]; then echo "success"; else echo "pending"; fi`,
+      },
+    )
+    assert.equal(rGreenTick.status, 0, rGreenTick.stderr)
+    assert.equal(
+      sqlVal('SELECT target_sha FROM train ORDER BY created_at DESC LIMIT 1;'),
+      c4,
+      `next green tick must dispatch c4; stdout=${rGreenTick.stdout}\nstderr=${rGreenTick.stderr}`,
+    )
   })
 })
 
@@ -1391,6 +1509,165 @@ print(d)
       assert.equal(sc.sql(`SELECT status FROM train WHERE id='${sc.trainId}';`), 'recovery_required')
     }
   })
+
+  test('B6 real lease_train_begin admission (NO rollback stub) & policy recovery retention PASS proof', async (t) => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end('{"ok":true}')
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    t.after(() => server.close())
+    const addr = server.address() as { port: number }
+    const healthzUrl = `http://127.0.0.1:${addr.port}/healthz`
+
+    const sb = makeSandbox(t, 'ocv5-903-b6-real-admit-')
+    const db = join(sb.dir, 'lease.db')
+    const releases = join(sb.dir, 'releases')
+    const prevRel = join(releases, 'rel-prev')
+    const candRel = join(releases, 'rel-cand')
+    const liveLink = join(sb.dir, 'live')
+    const survState = join(sb.dir, 'survivor.state')
+    const failRunner = join(sb.dir, 'fail-retention.sh')
+    const prevSha = '1'.repeat(40)
+    const candSha = '2'.repeat(40)
+    const trainId = 'tr-20261126T180000Z-abcdef000001'
+    const nonce = 'nonce-real-comp-001'
+    mkdirSync(prevRel, { recursive: true })
+    mkdirSync(candRel, { recursive: true })
+    symlinkSync(candRel, liveLink)
+    writeFileSync(failRunner, '#!/usr/bin/env bash\nexit 1\n')
+    chmodSync(failRunner, 0o755)
+
+    const env = {
+      ...sb.env,
+      LEASE_DB: db,
+      OC_V5_LEASE_DB: db,
+      LEASE_LIB,
+      MASTER_RELEASES_ROOT: releases,
+      MASTER_LIVE_LINK: liveLink,
+      SURVIVOR_STATE: survState,
+      OC_V5_RETENTION_SETTLE_SEC: '0',
+      OC_V5_RETENTION_HEALTHZ_URL: healthzUrl,
+      OC_V5_RETENTION_HEALTHZ_ATTEMPTS: '2',
+      OC_V5_RETENTION_HEALTHZ_INTERVAL_SEC: '1',
+    }
+    const fnBegin = extractBashFn(readFileSync(DEPLOY_SCRIPT, 'utf8'), 'lease_train_begin')
+    const fnLoad = extractBashFn(readFileSync(DEPLOY_SCRIPT, 'utf8'), 'lease_train_load_lib')
+
+    // Seed real SQLite open cutover train with releasePolicyOwner.nonce
+    const initR = runBash(
+      [
+        `source ${q(LEASE_LIB)}`,
+        'lease_init_db',
+        `sqlite3 ${q(db)} "INSERT INTO train(id,resource,target_sha,status,owner,executor_pid,evidence_json,created_at,updated_at) VALUES('${trainId}','deploy:selfhost','${candSha}','cutover','worker:test',$$,'{\\"releasePolicyOwner\\":{\\"nonce\\":\\"${nonce}\\"}}','2026-11-26T18:00:00Z','2026-11-26T18:00:00Z');"`,
+      ].join('\n'),
+      env,
+    )
+    assert.equal(initR.status, 0, initR.stderr)
+
+    // 1. Unrelated concurrent manual deploy/rollback while cutover train is open -> MUST BE REJECTED by real lease_train_begin!
+    const rManual = runBash(
+      [
+        'DRY=0; LEASE_TRAIN_ID=""; LEASE_TARGET_SHA=""; CUTOVER_ROLLBACK=1',
+        'log() { echo "$*"; }; die() { echo "✗ $*" >&2; exit 1; }',
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        fnLoad,
+        fnBegin,
+        `lease_train_begin ${q(prevSha)}`,
+      ].join('\n'),
+      env,
+    )
+    assert.notEqual(rManual.status, 0, 'unrelated manual rollback MUST still be rejected when open cutover train exists')
+    assert.match(rManual.stderr, /Lease Center 有 open train .*拒绝并行人工发布/)
+
+    // 2. Forged compensation with WRONG nonce -> MUST BE REJECTED!
+    const rWrongNonce = runBash(
+      [
+        `sqlite3 ${q(db)} "UPDATE train SET executor_pid=$$ WHERE id='${trainId}';"`,
+        'DRY=0; LEASE_TRAIN_ID=""; LEASE_TARGET_SHA=""; CUTOVER_ROLLBACK=1',
+        'log() { echo "$*"; }; die() { echo "✗ $*" >&2; exit 1; }',
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        fnLoad,
+        fnBegin,
+        `OC_V5_RETENTION_INTERNAL_ROLLBACK=1 OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 OC_V5_COMPENSATE_TRAIN_ID=${q(trainId)} OC_V5_COMPENSATE_TARGET_SHA=${q(candSha)} OC_V5_COMPENSATE_PARENT_PID=$$ OC_V5_COMPENSATE_POLICY_NONCE=wrong-nonce lease_train_begin ${q(prevSha)}`,
+      ].join('\n'),
+      env,
+    )
+    assert.notEqual(rWrongNonce.status, 0, 'forged compensation with wrong nonce MUST be rejected')
+    assert.match(rWrongNonce.stderr, /nonce 不匹配/)
+
+    // 3. REAL same-operation compensation inside v5_selfhost_post_cutover_retention_gate calling REAL lease_train_begin!
+    const realCompRollback = join(sb.dir, 'real-comp-rollback.sh')
+    writeFileSync(
+      realCompRollback,
+      [
+        '#!/usr/bin/env bash',
+        'set -Eeuo pipefail',
+        'DRY=0; LEASE_TRAIN_ID=""; LEASE_TARGET_SHA=""; CUTOVER_ROLLBACK=1',
+        'log() { echo "$*"; }; die() { echo "✗ $*" >&2; exit 1; }',
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        fnLoad,
+        fnBegin,
+        `lease_train_begin ${q(prevSha)}`,
+        `ln -sfn ${q(prevRel)} ${q(liveLink)}`,
+        `v5_selfhost_lease_record_compensation_ok ${q(prevRel)} ${q(candRel)}`,
+      ].join('\n'),
+    )
+    chmodSync(realCompRollback, 0o755)
+
+    const rRealComp = await runBashAsync(
+      [
+        `SCRIPT_DIR=${q(join(REPO_ROOT, 'scripts'))}`,
+        `source ${q(LEASE_LIB)}`,
+        `source ${q(RELEASE_POLICY_LIB)}`,
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        'log() { echo "$*"; }; cutover_clog() { echo "$*"; }; die() { echo "✗ $*" >&2; exit 1; }',
+        'tsum_note() { :; }; deploy_alert() { :; }',
+        'cutover_persist_phase() { printf "phase=%s\\nexecutor_pid=%s\\n" "$1" "$$" >"$SURVIVOR_STATE"; }',
+        'cutover_disarm_survivor() { :; }',
+        `sqlite3 ${q(db)} "UPDATE train SET executor_pid=$$ WHERE id='${trainId}';"`,
+        'RELEASE_POLICY_MODE=""',
+        `LEASE_TRAIN_ID=${q(trainId)}; LEASE_TARGET_SHA=${q(candSha)}; RELEASE_POLICY_NONCE=${q(nonce)}; LEASE_TRAIN_ACTIVE=1; CUTOVER_MUTATED=1`,
+        `CUTOVER_PREV_LIVE=${q(prevRel)}; CUTOVER_REL=${q(candRel)}; OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1`,
+        `OC_V5_RETENTION_RUNNER=${q(failRunner)}`,
+        `OC_V5_RETENTION_ROLLBACK_CMD=${q(realCompRollback)}`,
+        `v5_selfhost_post_cutover_retention_gate ${q(candRel)} ${q(candSha)}`,
+      ].join('\n'),
+      env,
+    )
+    assert.equal(rRealComp.status, 1, `same-operation compensation should succeed rollback & exit 1 (failed, NOT 79 recovery_required!): stdout=${rRealComp.stdout}\nstderr=${rRealComp.stderr}`)
+    const sqlVal = (qStr: string) => execFileSync('sqlite3', [db, qStr], { encoding: 'utf8' }).trim()
+    assert.equal(
+      sqlVal(`SELECT status FROM train WHERE id='${trainId}';`),
+      'failed',
+      `original train MUST end as failed (NOT committed, NOT recovery_required!): stdout=${rRealComp.stdout}\nstderr=${rRealComp.stderr}`,
+    )
+    assert.equal(sqlVal(`SELECT COUNT(*) FROM event WHERE subject_id='${trainId}' AND event='train-compensate-rollback-begin';`), '1')
+    assert.equal(sqlVal(`SELECT COUNT(*) FROM event WHERE subject_id='${trainId}' AND event='train-compensate-rollback-ok';`), '1')
+    assert.equal(realpathSync(liveLink), realpathSync(prevRel))
+
+    // 4. B6 policy recovery retention PASS proof check: false before retention PASS, true only after lease_train_mark_retention_passed!
+    const proofTrain = 'tr-20261126T180500Z-abcdef000002'
+    const rProof = runBash(
+      [
+        `SCRIPT_DIR=${q(join(REPO_ROOT, 'scripts'))}`,
+        `source ${q(LEASE_LIB)}`,
+        `source ${q(RELEASE_POLICY_LIB)}`,
+        'RELEASE_POLICY_MODE=""',
+        `sqlite3 ${q(db)} "INSERT INTO train(id,resource,target_sha,status,owner,created_at,updated_at) VALUES('${proofTrain}','deploy:selfhost','${candSha}','cutover','worker:test','2026-11-26T18:05:00Z','2026-11-26T18:05:00Z');"`,
+        `LEASE_TRAIN_ID=${q(proofTrain)}; LEASE_TARGET_SHA=${q(candSha)}; LEASE_TRAIN_ACTIVE=1`,
+        `if lease_train_has_retention_pass ${q(candRel)} ${q(candSha)}; then echo "BEFORE=PASS"; else echo "BEFORE=MISSING"; fi`,
+        `lease_train_mark_retention_passed ${q(candRel)} ${q(candSha)}`,
+        `if lease_train_has_retention_pass ${q(candRel)} ${q(candSha)}; then echo "AFTER=PASS"; else echo "AFTER=MISSING"; fi`,
+        `if lease_train_has_retention_pass ${q(prevRel)} ${q(candSha)}; then echo "WRONG_REL=PASS"; else echo "WRONG_REL=REJECTED"; fi`,
+      ].join('\n'),
+      env,
+    )
+    assert.equal(rProof.status, 0, rProof.stderr)
+    assert.match(rProof.stdout, /BEFORE=MISSING/)
+    assert.match(rProof.stdout, /AFTER=PASS/)
+    assert.match(rProof.stdout, /WRONG_REL=REJECTED/)
+  })
 })
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1577,6 +1854,26 @@ describe('B7. Shared forward cutover guard boundary, physical blast-radius & tru
     assert.notEqual(r.status, 0, 'unvouchered destructive DDL MUST be blocked')
     assert.match(r.stderr, /DESTRUCTIVE_DDL_LOCKED/)
 
+    // 7e (B7 fail-closed): Missing/non-executable oc-governor MUST fail closed by default!
+    setAllGreen(cleanSha, 'push')
+    r = runGuards(cleanSha, `OC_V5_GOVERNOR_BIN=${q(join(f.dir, 'nonexistent-oc-governor'))}`)
+    assert.notEqual(r.status, 0, 'missing oc-governor MUST fail closed by default in forward mode')
+    assert.match(r.stderr, /缺少可执行宿主裁判.*fail-closed/)
+
+    // 7f (B7 fail-closed): Failed git diff (bad base ref) MUST fail closed instead of passing empty file list!
+    const rBadDiff = runBash(
+      [
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        `REPO_ROOT=${q(f.repo)}`,
+        `OC_GOVERNOR_ROOT=${q(govRoot)}`,
+        `OC_V5_GOVERNOR_BIN=${q(OC_GOVERNOR)}`,
+        `v5_selfhost_check_blast_radius ${q(cleanSha)} nonexistent-base-ref-xyz feat/v5-selfhost`,
+      ].join('\n'),
+      f.env,
+    )
+    assert.notEqual(rBadDiff.status, 0, 'failed git diff MUST fail closed instead of treating changed_files as empty')
+    assert.match(rBadDiff.stderr, /git diff .*失败.*fail-closed/)
+
     // 8. Verified rollback (CUTOVER_ROLLBACK=1) takes emergency exemption even under emergency_stop + red CI!
     writeFileSync(modeFile, JSON.stringify({ mode: 'emergency_stop', reason: 'incident' }))
     r = runGuards(ddlSha, 'CUTOVER_ROLLBACK=1')
@@ -1643,12 +1940,21 @@ describe('B8. Commit-bound runtime image pin & rollback isolation from broken wo
       runtimeImage: 'openclaude/openclaude-runtime:v5-commit-pinned-20261126',
       previousRuntimeImage: 'openclaude/openclaude-runtime:v5-prev-pinned-20261120',
       cliVersions: { claudeCode: '2.1.332', codex: '0.172.0' },
+      capabilities: { chrome: '158', sciVerify: ['pint', 'z3-solver'] },
       ticket: 'OCV5-903',
     }
     writeFileSync(join(f.repo, 'deploy/v5/runtime-image-pin.json'), `${JSON.stringify(validPin, null, 2)}\n`)
     f.git('add', '.')
     f.git('commit', '-qm', 'chore(v5): add valid commit pin')
     const validSha = f.git('rev-parse', 'HEAD')
+
+    // Bad commit with array capabilities (conflicts with TS runtimeImagePin.ts object schema) -> MUST fail closed!
+    writeFileSync(
+      join(f.repo, 'deploy/v5/runtime-image-pin.json'),
+      JSON.stringify({ ...validPin, capabilities: ['chrome'] }),
+    )
+    f.git('commit', '-qam', 'chore(v5): bad array capabilities')
+    const badCapsSha = f.git('rev-parse', 'HEAD')
 
     // Bad commit with floating :latest tag -> MUST fail closed!
     writeFileSync(
@@ -1699,7 +2005,29 @@ describe('B8. Commit-bound runtime image pin & rollback isolation from broken wo
     assert.equal(r.status, 0, r.stderr)
     assert.match(r.stdout, new RegExp(`fallback-default:${legacySha}`))
 
-    // 3. :latest and non-allowlisted repo prefix fail closed
+    // 3. :latest, array capabilities, and non-allowlisted repo prefix fail closed
+    r = runBash(
+      `source ${q(TRAIN_GUARDS_LIB)}; REPO_ROOT=${q(f.repo)}; v5_selfhost_load_runtime_image_pin_for_commit ${q(badCapsSha)}`,
+      f.env,
+    )
+    assert.notEqual(r.status, 0, 'array capabilities must fail closed to match TS runtimeImagePin.ts object schema')
+    assert.match(r.stderr, /capabilities 必须为 JSON 对象/)
+
+    // 4. REAL repository HEAD pin loads cleanly via production v5_selfhost_load_runtime_image_pin_for_commit!
+    const repoHead = execFileSync('git', ['-C', REPO_ROOT, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const livePinDoc = JSON.parse(readFileSync(join(REPO_ROOT, 'deploy/v5/runtime-image-pin.json'), 'utf8'))
+    r = runBash(
+      [
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        `REPO_ROOT=${q(REPO_ROOT)}`,
+        `v5_selfhost_load_runtime_image_pin_for_commit ${q(repoHead)}`,
+        'printf "%s|%s\\n" "$RUNTIME_IMAGE" "$RUNTIME_IMAGE_PIN_SOURCE"',
+      ].join('\n'),
+      f.env,
+    )
+    assert.equal(r.status, 0, `real repo HEAD pin MUST pass shell loader: ${r.stderr}`)
+    assert.equal(r.stdout.trim(), `${livePinDoc.runtimeImage}|commit:${repoHead}:deploy/v5/runtime-image-pin.json`)
+
     r = runBash(
       `source ${q(TRAIN_GUARDS_LIB)}; REPO_ROOT=${q(f.repo)}; v5_selfhost_load_runtime_image_pin_for_commit ${q(latestSha)}`,
       f.env,

@@ -67,6 +67,7 @@ now_iso() {
 MODE="live-sync"
 SOURCE_DIR=""
 SOURCE_COMMIT=""
+TREE_SHA=""
 APPROVAL_META_JSON=""
 
 if [[ -n "$STAGE_AUDITED_SRC" ]]; then
@@ -79,7 +80,11 @@ if [[ -n "$STAGE_AUDITED_SRC" ]]; then
   [[ -n "$APPROVAL_FILE" ]] || die "--stage-audited requires --approval-file <a0_approval_json>"
 
   SOURCE_DIR="$(readlink -f -- "$STAGE_AUDITED_SRC" 2>/dev/null || true)"
-  [[ -n "$SOURCE_DIR" && -d "$SOURCE_DIR/scripts" ]] || die "--stage-audited source missing scripts/: $STAGE_AUDITED_SRC"
+  [[ -n "$SOURCE_DIR" ]] || die "--stage-audited source directory does not exist: $STAGE_AUDITED_SRC"
+  git -C "$SOURCE_DIR" cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null \
+    || die "--stage-audited requires a Git repo containing exact commit object --target-sha $TARGET_SHA (never copies unverified dirty worktree!)"
+  TREE_SHA="$(git -C "$SOURCE_DIR" rev-parse "${TARGET_SHA}^{tree}" 2>/dev/null || true)"
+  [[ "$TREE_SHA" =~ ^[0-9a-f]{40}$ ]] || die "failed to resolve tree SHA for $TARGET_SHA"
   SOURCE_COMMIT="$TARGET_SHA"
 
   if [[ -z "$HMAC_KEY_FILE" ]]; then
@@ -147,7 +152,7 @@ if "allowedPaths" in doc and doc["allowedPaths"] is not None:
     rp = doc["allowedPaths"]
     if not isinstance(rp, list) or len(rp) == 0 or any(not isinstance(x, str) or "\r" in x or "\n" in x or not x.strip() for x in rp):
         fail("approval allowedPaths must be a non-empty array of single-line strings")
-    allowed_paths = sorted(set(x.strip() for x in rp))
+    allowed_paths = sorted(set(x.strip() for x in rp), key=lambda s: s.encode("utf-8"))
 
 paths_canonical = "*" if allowed_paths is None else json.dumps(allowed_paths, separators=(",", ":"), ensure_ascii=False)
 canonical = (
@@ -240,41 +245,138 @@ copy_rel_path() {
   cp -a "$src" "$dst"
 }
 
-# 1. Gate scripts & shared shell/TS libraries
-if [[ -d "$SOURCE_DIR/scripts" ]]; then
-  mkdir -p "$STAGING_DIR/scripts"
-  for f in "$SOURCE_DIR"/scripts/check-*.ts "$SOURCE_DIR"/scripts/check-*.sh; do
-    [[ -f "$f" ]] || continue
-    cp -a "$f" "$STAGING_DIR/scripts/"
+# 1-3. Populate referee files:
+# - transition-audited (B1): STRICTLY export whitelisted paths from Git object $TARGET_SHA via `git archive`
+#   (ZERO bytes copied from potentially dirty worktree or mismatched HEAD!), and verify approval.allowedPaths
+#   covers EVERY staged referee path (refusing narrow-path approvals from swapping the full referee!).
+# - live-sync: copy whitelisted paths from verified $MASTER_LIVE_LINK immutable release directory.
+if [[ "$MODE" == "transition-audited" ]]; then
+  EXPORT_PATHS_FILE="${STAGING_DIR}.export-paths.txt"
+  python3 - "$SOURCE_DIR" "$TARGET_SHA" "$APPROVAL_META_JSON" "$EXPORT_PATHS_FILE" <<'PY'
+import json, re, subprocess, sys
+
+src_dir, target_sha, meta_raw, out_list = sys.argv[1:]
+meta = json.loads(meta_raw)
+allowed_paths = meta.get("approval", {}).get("allowedPaths")
+
+def glob_to_regex(glob: str) -> re.Pattern:
+    out = []
+    i = 0
+    n = len(glob)
+    while i < n:
+        ch = glob[i]
+        if ch == "*":
+            if i + 1 < n and glob[i + 1] == "*":
+                if i + 2 < n and glob[i + 2] == "/":
+                    out.append("(?:.+/)?")
+                    i += 3
+                    continue
+                out.append(".*")
+                i += 2
+                continue
+            out.append("[^/]*")
+        elif ch in "+?^${}()|[]\\.":
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+        i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+WHITELIST_EXACT = {
+    "packages/protocol/package.json",
+    "biome.json",
+    "package.json",
+    "tsconfig.json",
+    ".github/CODEOWNERS",
+    ".github/file-size-baseline.json",
+    ".github/file-size-ratchet-exceptions.json",
+    ".github/context-eval-baseline.json",
+    "e2e/session-display/incidents.json",
+    "e2e/session-display/incident-waivers.json",
+    "e2e/session-display/incident-trailer-enforced-from",
+}
+WHITELIST_PREFIXES = (
+    "scripts/lib/",
+    "packages/commercial/scripts/",
+    "packages/protocol/src/",
+    ".github/scripts/",
+    ".github/integ-tiers/",
+    ".github/known-failures/",
+    "arch/",
+    "deploy/v5/",
+)
+SCRIPT_CHECK_RE = re.compile(r"^scripts/check-[^/]+\.(?:ts|sh)$")
+
+def is_whitelisted(rel: str) -> bool:
+    if rel in WHITELIST_EXACT or SCRIPT_CHECK_RE.fullmatch(rel):
+        return True
+    return any(rel.startswith(p) for p in WHITELIST_PREFIXES)
+
+raw = subprocess.check_output(
+    ["git", "-c", "safe.directory=*", "-C", src_dir, "ls-tree", "-r", "--name-only", target_sha],
+    text=True,
+)
+selected = [line.strip() for line in raw.splitlines() if line.strip() and is_whitelisted(line.strip())]
+if not selected or not any(p.startswith("scripts/") for p in selected):
+    raise SystemExit(f"target commit {target_sha} contains no whitelisted referee scripts/")
+
+if allowed_paths is not None:
+    matchers = [glob_to_regex(g) for g in allowed_paths]
+    uncovered = [p for p in selected if not any(m.match(p) for m in matchers)]
+    if uncovered:
+        sample = ", ".join(uncovered[:5])
+        raise SystemExit(
+            f"narrow allowedPaths approval cannot authorize staging full transition referee: "
+            f"{len(uncovered)} staged path(s) uncovered (e.g. {sample}); approval must use unrestricted '*' or explicitly cover all referee paths"
+        )
+
+with open(out_list, "w", encoding="utf-8") as f:
+    for p in selected:
+        f.write(p + "\n")
+PY
+  [[ -s "$EXPORT_PATHS_FILE" ]] || { rm -f "$EXPORT_PATHS_FILE"; die "failed to select whitelisted paths from git object $TARGET_SHA"; }
+  mapfile -t EXPORT_PATHS < "$EXPORT_PATHS_FILE"
+  rm -f "$EXPORT_PATHS_FILE"
+  git -c safe.directory='*' -C "$SOURCE_DIR" archive --format=tar "$TARGET_SHA" -- "${EXPORT_PATHS[@]}" \
+    | tar -x -C "$STAGING_DIR" \
+    || die "git archive export from $TARGET_SHA failed"
+else
+  # 1. Gate scripts & shared shell/TS libraries
+  if [[ -d "$SOURCE_DIR/scripts" ]]; then
+    mkdir -p "$STAGING_DIR/scripts"
+    for f in "$SOURCE_DIR"/scripts/check-*.ts "$SOURCE_DIR"/scripts/check-*.sh; do
+      [[ -f "$f" ]] || continue
+      cp -a "$f" "$STAGING_DIR/scripts/"
+    done
+    copy_rel_path "scripts/lib"
+  fi
+
+  # 2. Package-level lint/gate scripts, .github/scripts helpers, & protocol definitions imported by gates
+  copy_rel_path "packages/commercial/scripts"
+  copy_rel_path "packages/protocol/src"
+  copy_rel_path "packages/protocol/package.json"
+  copy_rel_path ".github/scripts"
+
+  # 3. Architecture map, monotonic baselines, CODEOWNERS, and incident ledgers
+  copy_rel_path "arch"
+  copy_rel_path "deploy/v5"
+  copy_rel_path "biome.json"
+  copy_rel_path "package.json"
+  copy_rel_path "tsconfig.json"
+
+  for gh_rel in \
+    ".github/CODEOWNERS" \
+    ".github/file-size-baseline.json" \
+    ".github/file-size-ratchet-exceptions.json" \
+    ".github/context-eval-baseline.json" \
+    ".github/integ-tiers" \
+    ".github/known-failures" \
+    "e2e/session-display/incidents.json" \
+    "e2e/session-display/incident-waivers.json" \
+    "e2e/session-display/incident-trailer-enforced-from"; do
+    copy_rel_path "$gh_rel"
   done
-  copy_rel_path "scripts/lib"
 fi
-
-# 2. Package-level lint/gate scripts, .github/scripts helpers, & protocol definitions imported by gates
-copy_rel_path "packages/commercial/scripts"
-copy_rel_path "packages/protocol/src"
-copy_rel_path "packages/protocol/package.json"
-copy_rel_path ".github/scripts"
-
-# 3. Architecture map, monotonic baselines, CODEOWNERS, and incident ledgers
-copy_rel_path "arch"
-copy_rel_path "deploy/v5"
-copy_rel_path "biome.json"
-copy_rel_path "package.json"
-copy_rel_path "tsconfig.json"
-
-for gh_rel in \
-  ".github/CODEOWNERS" \
-  ".github/file-size-baseline.json" \
-  ".github/file-size-ratchet-exceptions.json" \
-  ".github/context-eval-baseline.json" \
-  ".github/integ-tiers" \
-  ".github/known-failures" \
-  "e2e/session-display/incidents.json" \
-  "e2e/session-display/incident-waivers.json" \
-  "e2e/session-display/incident-trailer-enforced-from"; do
-  copy_rel_path "$gh_rel"
-done
 
 # 4. Wire trusted node_modules so external referee executes with pinned runtime dependencies (B4)
 RESOLVED_NM=""
@@ -305,17 +407,19 @@ if [[ -n "$RESOLVED_NM" && -d "$RESOLVED_NM" ]]; then
   fi
 fi
 
-# 5. In transition-audited mode, write TRANSITION_APPROVAL.json bound to exact targetSha
+# 5. In transition-audited mode, write TRANSITION_APPROVAL.json bound to exact targetSha & git-archive treeSha
 if [[ "$MODE" == "transition-audited" ]]; then
   ACTOR="$(id -un 2>/dev/null || echo unknown)"
-  python3 - "$STAGING_DIR/TRANSITION_APPROVAL.json" "$TARGET_SHA" "$SOURCE_DIR" "$ACTOR" "$(now_iso)" "$APPROVAL_META_JSON" <<'PY'
+  python3 - "$STAGING_DIR/TRANSITION_APPROVAL.json" "$TARGET_SHA" "$TREE_SHA" "$SOURCE_DIR" "$ACTOR" "$(now_iso)" "$APPROVAL_META_JSON" <<'PY'
 import json, pathlib, sys
-out_path, target_sha, source_dir, actor, staged_at, meta_raw = sys.argv[1:]
+out_path, target_sha, tree_sha, source_dir, actor, staged_at, meta_raw = sys.argv[1:]
 meta = json.loads(meta_raw)
 doc = {
     "schemaVersion": 1,
     "mode": "transition-audited",
+    "exportMethod": "git-archive",
     "targetSha": target_sha,
+    "treeSha": tree_sha,
     "stagedAt": staged_at,
     "stagedBy": actor,
     "sourceDir": source_dir,
@@ -328,7 +432,7 @@ PY
 fi
 
 # 6. Generate deterministic MANIFEST.json with SHA-256 of every synced file (skipping node_modules/)
-MANIFEST_SUMMARY="$(python3 - "$STAGING_DIR" "$SOURCE_COMMIT" "$SOURCE_DIR" "$MODE" "$TARGET_SHA" <<'PY'
+MANIFEST_SUMMARY="$(python3 - "$STAGING_DIR" "$SOURCE_COMMIT" "$SOURCE_DIR" "$MODE" "$TARGET_SHA" "$TREE_SHA" <<'PY'
 import datetime as dt, hashlib, json, os, pathlib, sys
 
 staging = pathlib.Path(sys.argv[1])
@@ -336,6 +440,7 @@ source_commit = sys.argv[2]
 source_dir = sys.argv[3]
 mode = sys.argv[4]
 target_sha = sys.argv[5]
+tree_sha = sys.argv[6]
 
 files_map: dict[str, str] = {}
 for root_str, dirs, files in os.walk(staging, followlinks=False):
@@ -357,7 +462,7 @@ manifest = {
     "mode": mode,
     "sourceCommit": source_commit,
     "sourceRelease": source_dir,
-    **({"targetSha": target_sha} if mode == "transition-audited" else {}),
+    **({"exportMethod": "git-archive", "targetSha": target_sha, "treeSha": tree_sha} if mode == "transition-audited" else {}),
     "syncedAt": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "fileCount": len(files_map),
     "files": files_map,

@@ -157,7 +157,30 @@ def parse_iso_utc(raw: str, label: str) -> dt.datetime:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed.astimezone(dt.timezone.utc)
 
-def verify_a0_approval_file(approval_path: pathlib.Path, expected_sha: str, req_root: bool) -> None:
+def glob_to_regex(glob: str) -> re.Pattern:
+    out = []
+    i = 0
+    n = len(glob)
+    while i < n:
+        ch = glob[i]
+        if ch == "*":
+            if i + 1 < n and glob[i + 1] == "*":
+                if i + 2 < n and glob[i + 2] == "/":
+                    out.append("(?:.+/)?")
+                    i += 3
+                    continue
+                out.append(".*")
+                i += 2
+                continue
+            out.append("[^/]*")
+        elif ch in "+?^${}()|[]\\.":
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+        i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+def verify_a0_approval_file(approval_path: pathlib.Path, expected_sha: str, req_root: bool, staged_files: list[str] | None = None) -> None:
     if not approval_path.is_absolute():
         fail(f"TRANSITION_APPROVAL.approvalFile 必须是绝对路径: {approval_path}")
     check_trusted_file(approval_path, "A0 approvalFile", req_root)
@@ -186,6 +209,7 @@ def verify_a0_approval_file(approval_path: pathlib.Path, expected_sha: str, req_
         fail(f"A0 approvalFile 已过期 (expiresAt={expires_at})")
 
     allowed_paths = doc.get("allowedPaths")
+    norm_paths: list[str] | None = None
     if allowed_paths is not None:
         if (
             not isinstance(allowed_paths, list)
@@ -193,10 +217,16 @@ def verify_a0_approval_file(approval_path: pathlib.Path, expected_sha: str, req_
             or any(not isinstance(x, str) or not x.strip() for x in allowed_paths)
         ):
             fail("A0 approvalFile allowedPaths 必须是非空字符串数组")
-        norm_paths = sorted(set(x.strip() for x in allowed_paths))
+        norm_paths = sorted(set(x.strip() for x in allowed_paths), key=lambda s: s.encode("utf-8"))
         ap_str = json.dumps(norm_paths, separators=(",", ":"), ensure_ascii=False)
     else:
         ap_str = "*"
+
+    if norm_paths is not None and staged_files is not None:
+        matchers = [glob_to_regex(g) for g in norm_paths]
+        uncovered = [p for p in staged_files if p != "TRANSITION_APPROVAL.json" and not any(m.match(p) for m in matchers)]
+        if uncovered:
+            fail(f"A0 approvalFile allowedPaths 未覆盖整套过渡裁判路径(禁止窄审批替换裁判): {', '.join(uncovered[:5])}")
 
     canonical = (
         f"a0-approval-v1\n"
@@ -328,7 +358,7 @@ if has_transition:
     if not isinstance(approval_file_raw, str) or not approval_file_raw.strip():
         fail("TRANSITION_APPROVAL.json 缺少 approvalFile")
     approval_path = pathlib.Path(approval_file_raw)
-    verify_a0_approval_file(approval_path, full_sha, require_root)
+    verify_a0_approval_file(approval_path, full_sha, require_root, sorted(manifest_doc.get("files", {}).keys()))
     expected_app_sha = tdoc.get("approvalSha256")
     if expected_app_sha is not None:
         if not isinstance(expected_app_sha, str) or not SHA64_RE.fullmatch(expected_app_sha):
@@ -559,38 +589,175 @@ os.symlink(ref_nm, view / "node_modules")
 PY
 }
 
-# 专为行为上下文评测(check-context-static.ts)构造隔离视图：
-# 仅在其真实动态 import 候选 promptSlots / intelligentUi 时使用；
-# scripts/、packages/protocol/、node_modules 仍 100% 来自可信裁判，严禁链接 $staging/scripts 或 $staging/node_modules。
+# B4 专为行为上下文评测(check-context-static.ts)构造低权限、无凭据、只读隔离视图：
+# - 绝不链接宿主可写路径或把宿主敏感凭据暴露给候选导入的 promptSlots/intelligentUi；
+# - scripts/、packages/protocol/、node_modules 100% 源自可信裁判，候选所需文件以只读副本 (0444/0555, dirs 0755)
+#   落入独立只读目录；运行进程使用 `env -i` 剥离全部宿主凭据/GH/PG/SSH env，
+#   并在 root 身份下经 `setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs`（回落 su nobody）降权执行！
 _master_referee_build_context_eval_view() { # <ref-root> <staging> <view-dir> <ref-nm>
   local ref_root="$1" staging="$2" view_dir="$3" ref_nm="$4"
-  master_referee_build_exec_view "$ref_root" "$view_dir" "$ref_nm" || return 1
+  local nm_eff="$ref_nm"
+  # 若以 root 降权至 nobody(65534)，先解析对 nobody 可读的可信裁判 node_modules（避免 /var/lib/docker 0710 不可穿越）
+  if [[ "$(id -u)" == 0 ]] && command -v setpriv >/dev/null 2>&1; then
+    if ! setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs test -r "$nm_eff/tsx/dist/cli.mjs" 2>/dev/null; then
+      local tsx_real="" nm_real=""
+      tsx_real="$(readlink -f -- "$nm_eff/tsx" 2>/dev/null || true)"
+      nm_real="$(dirname -- "$tsx_real" 2>/dev/null || true)"
+      if [[ -n "$nm_real" ]] && setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs test -r "$nm_real/tsx/dist/cli.mjs" 2>/dev/null; then
+        nm_eff="$nm_real"
+      fi
+    fi
+  fi
+  master_referee_build_exec_view "$ref_root" "$view_dir" "$nm_eff" || return 1
+  chmod 0755 "$view_dir" 2>/dev/null || true
   python3 - "$staging" "$view_dir" <<'PY'
 import os
 from pathlib import Path
+import shutil
 import sys
 
 staging = Path(sys.argv[1]).resolve()
 view = Path(sys.argv[2])
 
-def link_if_exists(rel: str) -> None:
+def copy_ro_item(rel: str) -> None:
     src = staging / rel
     dst = view / rel
     if not src.exists() or dst.exists() or dst.is_symlink():
         return
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(src, dst)
+    if src.is_file():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        os.chmod(dst, 0o444)
+        return
+    if src.is_dir():
+        for root_str, dirs, files in os.walk(src, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", "dist", "dist-types", "__tests__", "browser-tests")]
+            rel_dir = Path(root_str).relative_to(src)
+            tdir = dst / rel_dir
+            tdir.mkdir(parents=True, exist_ok=True)
+            os.chmod(tdir, 0o755)
+            for fname in files:
+                sf = Path(root_str) / fname
+                if sf.is_symlink() or not sf.is_file():
+                    continue
+                df = tdir / fname
+                shutil.copy2(sf, df)
+                os.chmod(df, 0o444)
 
 for rel in (
     ".github/context-eval-baseline.json",
-    "packages/gateway",
-    "packages/storage",
+    "packages/gateway/package.json",
+    "packages/gateway/src",
+    "packages/storage/package.json",
+    "packages/storage/src",
     "packages/commercial/src",
     "packages/commercial/package.json",
     "docs",
 ):
-    link_if_exists(rel)
+    copy_ro_item(rel)
+
+# Ensure all directories under view (except node_modules symlink) are traversable read-only (0755/0555) for nobody
+for root_str, dirs, files in os.walk(view, followlinks=False):
+    dirs[:] = [d for d in dirs if d != "node_modules"]
+    os.chmod(root_str, 0o755)
 PY
+}
+
+# B4 在最小无凭据环境 (env -i) + 非特权 nobody (65534:65534) 下隔离执行行为评测 check-context-static.ts！
+_master_governance_run_context_eval_isolated() { # <ref-root> <ctx-view> <staging> <ref-nm> [rel-script]
+  local ref_root="$1" ctx_view="$2" staging="$3" ref_nm="$4" rel="${5:-scripts/check-context-static.ts}"
+  local resolved="" rc=0 mode="" script_exec="" ctx_tmp="" nm_exec="" node_bin="" node_dir="" safe_path=""
+  resolved="$(master_referee_resolve_script "$ref_root" "$staging" "$rel")" || rc=$?
+  if (( rc != 0 )); then
+    mlog "✗ governance fast gate: ${ref_root:+外置裁判($ref_root)}${ref_root:-候选}缺必需门禁 $rel"
+    return 1
+  fi
+  mode="${resolved%%$'\t'*}"
+  if [[ "$mode" == referee ]]; then
+    script_exec="$ctx_view/$rel"
+    mlog "  [referee-unprivileged] $rel ($ref_root, env=-i, uid=$( [[ "$(id -u)" == 0 ]] && echo 65534 || id -u ))"
+  else
+    script_exec="$ctx_view/$rel"
+    mlog "  [referee-bootstrap-unprivileged] $rel (env=-i, uid=$( [[ "$(id -u)" == 0 ]] && echo 65534 || id -u ))"
+  fi
+
+  nm_exec="$(readlink -f -- "$ctx_view/node_modules" 2>/dev/null || printf '%s' "$ref_nm")"
+  node_bin="$(command -v node || printf '/usr/bin/node')"
+  node_dir="$(dirname -- "$node_bin")"
+  safe_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  if [[ ":$safe_path:" != *":$node_dir:"* ]]; then
+    safe_path="$node_dir:$safe_path"
+  fi
+
+  ctx_tmp="$(mktemp -d /tmp/oc-ref-ctx-tmp.XXXXXX)"
+  local -a tsx_cmd=()
+  if [[ -f "$nm_exec/tsx/dist/cli.mjs" ]]; then
+    tsx_cmd=("$node_bin" "$nm_exec/tsx/dist/cli.mjs")
+  elif [[ -x "$nm_exec/.bin/tsx" ]]; then
+    tsx_cmd=("$nm_exec/.bin/tsx")
+  else
+    rm -rf -- "$ctx_tmp"
+    mlog "✗ [referee-unprivileged] 隔离视图 node_modules 缺少 tsx: $nm_exec"
+    return 1
+  fi
+
+  local run_rc=0
+  if [[ "$(id -u)" == 0 ]]; then
+    chown 65534:65534 "$ctx_tmp" 2>/dev/null || true
+    chmod 0700 "$ctx_tmp" 2>/dev/null || true
+    if command -v setpriv >/dev/null 2>&1; then
+      (
+        cd "$ctx_view"
+        exec env -i \
+          PATH="$safe_path" \
+          HOME="$ctx_tmp" \
+          TMPDIR="$ctx_tmp" \
+          LC_ALL="C.UTF-8" \
+          LANG="C.UTF-8" \
+          NODE_ENV="test" \
+          TSX_DISABLE_CACHE="1" \
+          setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs \
+          "${tsx_cmd[@]}" "$script_exec" --skip-sub-evals
+      ) || run_rc=$?
+    elif command -v su >/dev/null 2>&1; then
+      (
+        cd "$ctx_view"
+        exec env -i \
+          PATH="$safe_path" \
+          HOME="$ctx_tmp" \
+          TMPDIR="$ctx_tmp" \
+          LC_ALL="C.UTF-8" \
+          LANG="C.UTF-8" \
+          NODE_ENV="test" \
+          TSX_DISABLE_CACHE="1" \
+          su -s /bin/sh nobody -c 'exec "$@"' -- _ "${tsx_cmd[@]}" "$script_exec" --skip-sub-evals
+      ) || run_rc=$?
+    else
+      rm -rf -- "$ctx_tmp"
+      mlog "✗ [referee-unprivileged] root 身份缺少 setpriv/su，拒绝以特权执行候选行为评测(fail-closed)"
+      return 1
+    fi
+  else
+    chmod 0700 "$ctx_tmp" 2>/dev/null || true
+    (
+      cd "$ctx_view"
+      exec env -i \
+        PATH="$safe_path" \
+        HOME="$ctx_tmp" \
+        TMPDIR="$ctx_tmp" \
+        LC_ALL="C.UTF-8" \
+        LANG="C.UTF-8" \
+        NODE_ENV="test" \
+        TSX_DISABLE_CACHE="1" \
+        "${tsx_cmd[@]}" "$script_exec" --skip-sub-evals
+    ) || run_rc=$?
+  fi
+  rm -rf -- "$ctx_tmp"
+  if (( run_rc != 0 )); then
+    mlog "✗ pinned governance gate 失败 (${mode}-unprivileged): scripts/check-context-static.ts"
+    return 1
+  fi
+  return 0
 }
 
 # 供 build_master_release 内独立 job(如 master_job_architecture)获取隔离裁判执行根目录。
@@ -644,11 +811,15 @@ _master_governance_prepare_pinned_git() { # <git-dir> <staging> <full-sha> <out-
 # - 解释器来自已验证可信裁判 node_modules (MASTER_GOV_TSX_CMD)，绝不借用 $staging/node_modules；
 # - 外置裁判模式下绝不因失败或缺失而回落到候选 $staging！
 _master_governance_run_gate() {
-  # <ref_root> <ref_view> <staging> <rel> <runner:tsx|bash> <cwd> <git_dir_env> <work_tree_env> <req_pat> <optional:0|1> -- <args...>
+  # <ref_root> <ref_view> <staging> <rel> <runner:tsx|tsx-isolated|bash> <cwd> <git_dir_env> <work_tree_env> <req_pat> <optional:0|1> -- <args...>
   local ref_root="$1" ref_view="$2" staging="$3" rel="$4" runner="$5" run_cwd="$6"
   local env_git_dir="$7" env_work_tree="$8" req_pat="$9" optional="${10}"
   shift 10
   [[ "${1:-}" == "--" ]] && shift
+  if [[ "$runner" == "tsx-isolated" ]]; then
+    _master_governance_run_context_eval_isolated "$ref_root" "$ref_view" "$staging" "${MASTER_GOV_REF_NM:-}" "$rel" "$@"
+    return $?
+  fi
   local resolved="" rc=0 mode="" script_exec=""
   resolved="$(master_referee_resolve_script "$ref_root" "$staging" "$rel" "$req_pat")" || rc=$?
   if (( rc == 3 )); then
@@ -722,6 +893,7 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
     mlog "✗ governance fast gate: 无法解析可信裁判 node_modules(fail-closed)"
     return 1
   }
+  local MASTER_GOV_REF_NM="$ref_nm"
   if [[ -f "$ref_nm/tsx/dist/cli.mjs" ]]; then
     MASTER_GOV_TSX_CMD=(node "$ref_nm/tsx/dist/cli.mjs")
   elif [[ -x "$ref_nm/.bin/tsx" ]]; then
@@ -759,14 +931,23 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-integ-tiers.ts tsx "$ref_view" "" "" "" 0 -- --root "$staging" || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-v5-e2e-selectors.ts tsx "$ref_view" "" "" "" 0 -- --root "$staging" || return 1
 
-  # check-context-static.ts 为行为评测(动态 import 候选 promptSlots/intelligentUi)，单独构造最小行为视图，绝不污染静态 $ref_view
-  ctx_view="$ref_view"
-  if [[ -n "$ref_root" && -f "$ref_view/scripts/check-context-static.ts" ]] \
-    && grep -qF 'packages/commercial/src/intelligentUi' "$ref_view/scripts/check-context-static.ts" 2>/dev/null; then
-    ctx_view="$MASTER_GATE_TMPDIR/referee-ctx-view-$$"
-    _master_referee_build_context_eval_view "$ref_root" "$staging" "$ctx_view" "$ref_nm" || return 1
+  # B4 check-context-static.ts 为行为评测(import 候选 promptSlots/intelligentUi)：
+  # 单独构造只读拷贝视图(放 /tmp/oc-ref-ctx.* 0755)，用 env -i 剥离全部宿主凭据并在 root 下以 nobody(65534) 降权执行！
+  local ctx_base="" ctx_rc=0
+  ctx_base="$(mktemp -d /tmp/oc-ref-ctx.XXXXXX)"
+  chmod 0755 "$ctx_base"
+  ctx_view="$ctx_base/view"
+  if [[ -n "$ref_root" ]]; then
+    _master_referee_build_context_eval_view "$ref_root" "$staging" "$ctx_view" "$ref_nm" || ctx_rc=$?
+  else
+    _master_referee_build_context_eval_view "$staging" "$staging" "$ctx_view" "$ref_nm" || ctx_rc=$?
   fi
-  _master_governance_run_gate "$ref_root" "$ctx_view" "$staging" scripts/check-context-static.ts tsx "$ctx_view" "" "" "" 0 -- --skip-sub-evals || return 1
+  if (( ctx_rc == 0 )); then
+    _master_governance_run_gate "$ref_root" "$ctx_view" "$staging" scripts/check-context-static.ts tsx-isolated "$ctx_view" "" "" "" 0 -- --skip-sub-evals || ctx_rc=$?
+  fi
+  chmod -R u+w "$ctx_base" 2>/dev/null || true
+  rm -rf -- "$ctx_base"
+  if (( ctx_rc != 0 )); then return 1; fi
 
   # ── Phase 2: 解析非自身基线 + 只读 pinned gitdir ──
   base_ref="$(master_resolve_governance_base_ref "$full_sha")" || return 1

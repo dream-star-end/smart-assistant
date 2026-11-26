@@ -383,7 +383,13 @@ COMMIT;
 SQL
   wlog "train $id planned target=${tip:0:12} rides=$pending → spawn deploy"
   if declare -F worker_planned_fast_forward_green_tip >/dev/null 2>&1; then
-    worker_planned_fast_forward_green_tip "$id" tip || { exec 8>&-; return 0; }
+    local ff_rc=0
+    worker_planned_fast_forward_green_tip "$id" tip || ff_rc=$?
+    if (( ff_rc == 10 )) || [[ "${PLANNED_FF_OUTCOME:-}" == "defer" ]]; then
+      wlog "train $id planned 已原子延期(outcome=defer)，不派旧班 ${tip:0:12}，registered rides 保持待新 tip 绿后再排"
+      exec 8>&-; return 0
+    fi
+    if (( ff_rc != 0 )); then exec 8>&-; return 0; fi
   fi
   if [[ "$DRY" == 1 ]]; then
     wlog "[dry] 不 spawn"; exec 8>&-; return 0

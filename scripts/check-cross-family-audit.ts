@@ -108,6 +108,7 @@ export interface StewardGateRunOptions {
   explicitReceiptPath?: string
   gitDir?: string
   hmacKey?: string
+  requireHmac?: boolean
   requireRootOwner?: boolean
   allowUntrustedRepoReceipt?: boolean
   env?: Readonly<Record<string, string | undefined>>
@@ -174,11 +175,14 @@ function runLocalStewardCheck(opts: StewardGateRunOptions): {
 
   let receiptVerification: StewardReceiptVerificationResult | undefined
   if (receiptLookup.found && !receiptLookup.error) {
+    const requireHmac = opts.requireHmac ?? env.OC_STEWARD_REQUIRE_HMAC === '1'
     receiptVerification = verifyArchStewardReceipt(receiptLookup.raw, {
       headSha,
       baseSha,
       requiredTriggers: risk.triggers,
       hmacKey: opts.hmacKey,
+      requireHmac,
+      rootFileIntegrity: Boolean(receiptLookup.rootOwnerVerified),
     })
   }
 
@@ -215,73 +219,60 @@ export function runStewardGate(opts: StewardGateRunOptions): StewardGateRunResul
   }
 }
 
-/**
- * Asynchronous Architecture Steward check supporting both host root-only receipts
- * and out-of-commit GitHub Commit Status `oc-v5/arch-steward`.
- */
-export async function runStewardGateAsync(
+function mergeGithubStewardOutcome(
   opts: StewardGateRunOptions,
-): Promise<StewardGateRunResult> {
-  const local = runLocalStewardCheck(opts)
-  if (!local.risk.requiresSteward) {
+  local: ReturnType<typeof runLocalStewardCheck>,
+  githubStatus: GithubStewardStatusResult,
+): StewardGateRunResult {
+  const searched = [...(local.receiptLookup?.searchedLocations ?? []), githubStatus.source]
+  const failExit: 0 | 1 = opts.mode === 'check-only' ? 0 : 1
+  const base = { mode: opts.mode, headSha: local.headSha, baseSha: local.baseSha, risk: local.risk }
+  // B3: Cross-channel VETO/failure precedence — even if local receipt passed, GitHub veto blocks!
+  if (githubStatus.verdict === 'veto') {
     return {
+      ...base,
+      ok: false,
+      exitCode: failExit,
+      receiptLookup: {
+        found: true,
+        channel: 'github-status',
+        source: githubStatus.source,
+        error: githubStatus.reason,
+        searchedLocations: searched,
+      },
+      receiptVerification: local.receiptVerification,
+      githubStatus,
+    }
+  }
+  if (local.passed) {
+    return {
+      ...base,
       ok: true,
       exitCode: 0,
-      mode: opts.mode,
-      headSha: local.headSha,
-      baseSha: local.baseSha,
-      risk: local.risk,
-    }
-  }
-
-  if (local.passed || local.hasHardVeto) {
-    const exitCode: 0 | 1 = local.passed || opts.mode === 'check-only' ? 0 : 1
-    return {
-      ok: local.passed,
-      exitCode,
-      mode: opts.mode,
-      headSha: local.headSha,
-      baseSha: local.baseSha,
-      risk: local.risk,
       receiptLookup: local.receiptLookup,
       receiptVerification: local.receiptVerification,
+      githubStatus,
     }
   }
-
-  const ghRepo = opts.github?.repo?.trim()
-  const ghToken = opts.github?.token?.trim()
-  let githubStatus: GithubStewardStatusResult | undefined
-  if (ghRepo && ghToken && !opts.explicitReceiptPath) {
-    githubStatus = await verifyGithubStewardStatus({
-      repo: ghRepo,
-      token: ghToken,
-      headSha: local.headSha,
-      trustedPublishers: opts.github?.trustedPublishers,
-      apiBaseUrl: opts.github?.apiBaseUrl,
-      fetchImpl: opts.github?.fetchImpl,
-    })
-    const searched = [
-      ...(local.receiptLookup?.searchedLocations ?? []),
-      githubStatus.source,
-    ]
-    if (githubStatus.valid) {
-      return {
-        ok: true,
-        exitCode: 0,
-        mode: opts.mode,
-        headSha: local.headSha,
-        baseSha: local.baseSha,
-        risk: local.risk,
-        receiptLookup: {
-          found: true,
-          channel: 'github-status',
-          source: githubStatus.source,
-          searchedLocations: searched,
-        },
-        githubStatus,
-      }
+  if (githubStatus.valid) {
+    return {
+      ...base,
+      ok: true,
+      exitCode: 0,
+      receiptLookup: {
+        found: true,
+        channel: 'github-status',
+        source: githubStatus.source,
+        searchedLocations: searched,
+      },
+      githubStatus,
     }
-    const mergedLookup: ReceiptLookupResult = {
+  }
+  return {
+    ...base,
+    ok: false,
+    exitCode: failExit,
+    receiptLookup: {
       found: local.receiptLookup?.found ?? false,
       channel: local.receiptLookup?.channel,
       source: local.receiptLookup?.source ?? githubStatus.source,
@@ -290,29 +281,50 @@ export async function runStewardGateAsync(
         ? `${local.receiptLookup.error}; github: ${githubStatus.reason}`
         : githubStatus.reason,
       searchedLocations: searched,
-    }
-    const exitCode: 0 | 1 = opts.mode === 'check-only' ? 0 : 1
+    },
+    receiptVerification: local.receiptVerification,
+    githubStatus,
+  }
+}
+
+/**
+ * Asynchronous Architecture Steward check supporting both host root-only receipts
+ * and out-of-commit GitHub Commit Status `oc-v5/arch-steward`.
+ */
+export async function runStewardGateAsync(
+  opts: StewardGateRunOptions,
+): Promise<StewardGateRunResult> {
+  const local = runLocalStewardCheck(opts)
+  const base = { mode: opts.mode, headSha: local.headSha, baseSha: local.baseSha, risk: local.risk }
+  if (!local.risk.requiresSteward) {
+    return { ...base, ok: true, exitCode: 0 }
+  }
+  if (local.hasHardVeto) {
     return {
+      ...base,
       ok: false,
-      exitCode,
-      mode: opts.mode,
-      headSha: local.headSha,
-      baseSha: local.baseSha,
-      risk: local.risk,
-      receiptLookup: mergedLookup,
+      exitCode: opts.mode === 'check-only' ? 0 : 1,
+      receiptLookup: local.receiptLookup,
       receiptVerification: local.receiptVerification,
-      githubStatus,
     }
   }
-
-  const exitCode: 0 | 1 = opts.mode === 'check-only' ? 0 : 1
+  const ghRepo = opts.github?.repo?.trim()
+  const ghToken = opts.github?.token?.trim()
+  if (ghRepo && ghToken && !opts.explicitReceiptPath) {
+    const githubStatus = await verifyGithubStewardStatus({
+      repo: ghRepo,
+      token: ghToken,
+      headSha: local.headSha,
+      trustedPublishers: opts.github?.trustedPublishers,
+      apiBaseUrl: opts.github?.apiBaseUrl,
+      fetchImpl: opts.github?.fetchImpl,
+    })
+    return mergeGithubStewardOutcome(opts, local, githubStatus)
+  }
   return {
-    ok: false,
-    exitCode,
-    mode: opts.mode,
-    headSha: local.headSha,
-    baseSha: local.baseSha,
-    risk: local.risk,
+    ...base,
+    ok: local.passed,
+    exitCode: local.passed || opts.mode === 'check-only' ? 0 : 1,
     receiptLookup: local.receiptLookup,
     receiptVerification: local.receiptVerification,
   }

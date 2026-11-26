@@ -1152,7 +1152,40 @@ describe('Gate engine & CLI end-to-end: check-cross-family-audit.ts --enforce-co
     )
     assert.equal(rRealVeto.status, 1, 'real VETO MUST exit 1')
     assert.match(rRealVeto.stderr, /STEWARD-HARD-VETO/)
-    assert.equal(existsSync(ghLog), false, 'real VETO must NEVER publish GitHub status')
+    assert.equal(existsSync(ghLog), true, 'real VETO with --publish-github-status MUST publish failure/veto status to supersede any prior approve')
+    const vetoGhLog = readFileSync(ghLog, 'utf8')
+    assert.match(vetoGhLog, /state=failure/)
+    assert.match(vetoGhLog, /context=oc-v5\/arch-steward/)
+    assert.match(vetoGhLog, /verdict=veto/)
+
+    // 7. B3: verifyArchStewardReceipt distinguishes hmacVerified vs rootFileIntegrity & fails closed when requireHmac=true without key
+    const plainReceipt = signArchStewardReceipt(
+      makeUnsignedReceipt({
+        headSha,
+        baseSha,
+        triggers: ['CLONE_OR_T2_CORE_PATH'],
+      }),
+    )
+    const plainRes = verifyArchStewardReceipt(plainReceipt, {
+      headSha,
+      baseSha,
+      requiredTriggers: ['CLONE_OR_T2_CORE_PATH'],
+      rootFileIntegrity: true,
+    })
+    assert.equal(plainRes.ok, true)
+    assert.equal(plainRes.hmacVerified, false, 'plain sha256 receipt must report hmacVerified=false')
+    assert.equal(plainRes.rootFileIntegrity, true)
+    assert.equal(plainRes.integrityMode, 'root-file-sha256')
+
+    const requireHmacNoKey = verifyArchStewardReceipt(plainReceipt, {
+      headSha,
+      baseSha,
+      requiredTriggers: ['CLONE_OR_T2_CORE_PATH'],
+      requireHmac: true,
+      rootFileIntegrity: true,
+    })
+    assert.equal(requireHmacNoKey.ok, false, 'requireHmac=true without key MUST fail closed')
+    assert.ok(requireHmacNoKey.violations.some((v) => v.code === 'STEWARD-RECEIPT-DIGEST-MISMATCH'))
   })
 
   test('B2: out-of-commit GitHub Commit Status oc-v5/arch-steward passes on valid cross-family status and rejects same-family/dry-run/veto/untrusted', async (t) => {
@@ -1257,6 +1290,53 @@ describe('Gate engine & CLI end-to-end: check-cross-family-audit.ts --enforce-co
       assert.equal(gBad.ok, false)
       assert.equal(gBad.exitCode, 1)
     }
+
+    // 3b. B3: GitHub VETO / failure status takes precedence over ANY approve status on the same SHA — AND overrides local approve cross-channel!
+    const localReceiptDir = path.join(repo.dir, '.local-receipts-veto-test')
+    mkdirSync(localReceiptDir, { recursive: true })
+    const localApprove = signArchStewardReceipt(
+      makeUnsignedReceipt({
+        headSha,
+        baseSha,
+        triggers: ['CLONE_OR_T2_CORE_PATH'],
+      }),
+    )
+    writeFileSync(path.join(localReceiptDir, `${headSha}.json`), JSON.stringify(localApprove, null, 2))
+
+    const gVetoSupersedes = await runStewardGateAsync({
+      root: repo.dir,
+      mode: 'enforce-commit',
+      baseRef: baseSha,
+      headRef: headSha,
+      receiptDirs: [localReceiptDir],
+      requireRootOwner: false,
+      allowUntrustedRepoReceipt: true,
+      github: {
+        repo: 'dream-star-end/openclaude',
+        token: 'ghs_mock_token',
+        fetchImpl: makeMockFetch([
+          {
+            id: 60,
+            context: 'oc-v5/arch-steward',
+            state: 'success',
+            description: `verdict=approve sha=${shortSha} author=openai-gpt steward=google-gemini digest=hmac-sha256:0123456789abcdef`,
+            creator: { login: 'dream-star-end' },
+            created_at: '2026-11-26T15:05:00Z',
+          },
+          {
+            id: 59,
+            context: 'oc-v5/arch-steward',
+            state: 'failure',
+            description: `verdict=veto sha=${shortSha} author=openai-gpt steward=google-gemini digest=hmac-sha256:deadbeef01234567`,
+            creator: { login: 'dream-star-end' },
+            created_at: '2026-11-26T15:02:00Z',
+          },
+        ]),
+      },
+    })
+    assert.equal(gVetoSupersedes.ok, false, 'GitHub failure/veto MUST supersede both approve status and local approve receipt')
+    assert.equal(gVetoSupersedes.exitCode, 1)
+    assert.equal(gVetoSupersedes.githubStatus?.verdict, 'veto')
 
     // 4. Real CLI subprocess against local HTTP mock GitHub API (hosted runner without host receipt dir)
     const server = http.createServer((req, res) => {

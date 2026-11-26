@@ -162,7 +162,11 @@ cmd_rollback() {
   CUTOVER_JOINT=1
   log "── 进入 --cutover 翻转窗口(同一套状态机) release=$ROLLBACK_MASTER ──"
   cmd_cutover
-  lease_train_finish committed "rollback committed live=$ROLLBACK_MASTER from=$live"
+  if [[ -n "${LEASE_COMPENSATE_PARENT_TRAIN_ID:-}" ]] && declare -F v5_selfhost_lease_record_compensation_ok >/dev/null 2>&1; then
+    v5_selfhost_lease_record_compensation_ok "$ROLLBACK_MASTER" "$live"
+  else
+    lease_train_finish committed "rollback committed live=$ROLLBACK_MASTER from=$live"
+  fi
   if [[ "$DRY" == 1 ]]; then   # OCV5-541: a dry run changed nothing; say what a real run would do
     log "✓ --rollback --dry-run 计划结束,未改任何东西:实际执行会把 live → $ROLLBACK_MASTER,.prev-release → $live"
     return 0

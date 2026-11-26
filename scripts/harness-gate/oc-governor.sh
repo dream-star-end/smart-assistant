@@ -188,7 +188,7 @@ if raw_lines:
         if "\r" in p or "\n" in p or not p.strip():
             raise SystemExit("--allowed-path entries must be non-empty single-line strings")
         paths.append(p.strip())
-    paths = sorted(set(paths))
+    paths = sorted(set(paths), key=lambda s: s.encode("utf-8"))
 
 paths_canonical = "*" if not paths else json.dumps(paths, separators=(",", ":"), ensure_ascii=False)
 canonical = (
@@ -231,37 +231,55 @@ if hmac_hex is not None:
 if paths:
     doc["allowedPaths"] = paths
 
-# Build GitHub commit status description (<= 140 chars) binding sha, expiry, digest, paths & reason
+# Build GitHub commit status description (<= 140 chars) ALWAYS binding sha, expiry, digest, explicit paths= & >=8-char reason.
+# B2: NEVER omit allowedPaths on overflow — fail-closed if scope cannot be represented within 140 chars!
 paths_tag = "*" if not paths else ",".join(paths)
-meta_prefix = f"sha={sha[:12]} exp={expires_iso} digest={digest[:16]}"
-if len(meta_prefix) + len(paths_tag) + 12 < 110:
-    meta_prefix = f"{meta_prefix} paths={paths_tag}"
-avail = max(8, 140 - len(meta_prefix) - 3)
+meta_prefix = f"sha={sha[:12]} exp={expires_iso} digest={digest[:16]} paths={paths_tag}"
 reason_clean = " ".join(reason.split())
-if len(reason_clean) > avail:
-    reason_clean = reason_clean[: max(8, avail - 3)] + "..."
-gh_desc = f"{meta_prefix} | {reason_clean}"[:140]
+max_reason_len = 140 - len(meta_prefix) - 3
+gh_desc_overflow = max_reason_len < 8
+gh_desc = ""
+if not gh_desc_overflow:
+    r_trimmed = reason_clean if len(reason_clean) <= max_reason_len else (reason_clean[: max(8, max_reason_len - 3)] + "...")
+    gh_desc = f"{meta_prefix} | {r_trimmed}"[:140]
 
-print(json.dumps({"doc": doc, "riskCard": risk_card, "ghDesc": gh_desc, "reason": reason}, ensure_ascii=False))
+print(json.dumps({
+    "doc": doc,
+    "riskCard": risk_card,
+    "ghDesc": gh_desc,
+    "ghDescOverflow": gh_desc_overflow,
+    "ghMetaLen": len(meta_prefix),
+    "reason": reason,
+}, ensure_ascii=False))
 PY
 )" || die_usage "failed to build A0 approval seal"
 
+  local gh_desc_overflow="" gh_meta_len=""
   doc_json="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["doc"], ensure_ascii=False, indent=2))' "$out_payload")"
   risk_card="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["riskCard"])' "$out_payload")"
   gh_desc="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ghDesc"])' "$out_payload")"
+  gh_desc_overflow="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1])["ghDescOverflow"] else "0")' "$out_payload")"
+  gh_meta_len="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ghMetaLen"])' "$out_payload")"
   reason="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["reason"])' "$out_payload")"
-  atomic_write_file "$APPROVALS_DIR/${sha}.json" "$doc_json" 0644
-  atomic_write_file "$APPROVALS_DIR/${sha}.card.txt" "$risk_card" 0644
 
   if [[ "$publish_gh" == "1" ]]; then
+    if [[ "$gh_desc_overflow" == "1" ]]; then
+      die_gate "cannot publish oc-v5/a0-approval: explicit paths= scope + metadata (${gh_meta_len} chars) cannot fit in GitHub 140-char description with >=8-char reason (refusing to silently drop allowedPaths scope!)"
+    fi
     local resolved_repo=""
     resolved_repo="$(resolve_github_repo_slug "$gh_repo")"
     [[ -n "$resolved_repo" ]] || die_usage "--publish-github-status requires --github-repo <owner/repo> (or GITHUB_REPOSITORY / GH_REPO)"
     command -v gh >/dev/null 2>&1 || die_usage "--publish-github-status requires gh CLI in PATH"
+    atomic_write_file "$APPROVALS_DIR/${sha}.json" "$doc_json" 0644
+    atomic_write_file "$APPROVALS_DIR/${sha}.card.txt" "$risk_card" 0644
     gh api -X POST "repos/${resolved_repo}/statuses/${sha}" \
       -f state=success \
       -f context="oc-v5/a0-approval" \
       -f description="$gh_desc" >/dev/null || die_gate "failed to publish GitHub status oc-v5/a0-approval on ${resolved_repo}@${sha}"
+    atomic_write_file "$APPROVALS_DIR/${sha}.gh.json" "$(python3 -c 'import json,sys; print(json.dumps({"publishedGithubStatus":True,"githubRepo":sys.argv[1],"sha":sys.argv[2],"publishedAt":sys.argv[3]}, ensure_ascii=False))' "$resolved_repo" "$sha" "$ts")" 0644
+  else
+    atomic_write_file "$APPROVALS_DIR/${sha}.json" "$doc_json" 0644
+    atomic_write_file "$APPROVALS_DIR/${sha}.card.txt" "$risk_card" 0644
   fi
 
   append_audit_safe "$(python3 -c 'import json,sys; t,a,s,r,ttl,pgh=sys.argv[1:]; print(json.dumps({"ts":t,"action":"approve_a0","actor":a,"sha":s,"ttlHours":float(ttl),"reason":r,"publishedGithubStatus":pgh=="1","outcome":"ok"}, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$sha" "$reason" "$ttl_hours" "$publish_gh")"
@@ -269,19 +287,46 @@ PY
 }
 
 cmd_revoke_a0() {
-  local sha="" reason="manual revoke"
+  local sha="" reason="manual revoke" publish_gh=0 local_only=0 gh_repo=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --sha) sha="${2:-}"; shift 2 ;;
       --reason) reason="${2:-}"; shift 2 ;;
+      --publish-github-status) publish_gh=1; shift ;;
+      --github-repo) gh_repo="${2:-}"; shift 2 ;;
+      --local-only) local_only=1; shift ;;
       *) die_usage "unknown revoke-a0 argument: $1" ;;
     esac
   done
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die_usage "--sha must be a 40-char lowercase hex commit SHA"
   ensure_dirs
-  rm -f "$APPROVALS_DIR/${sha}.json" "$APPROVALS_DIR/${sha}.card.txt"
-  append_audit_safe "$(python3 -c 'import json,sys; t,a,s,r=sys.argv[1:]; print(json.dumps({"ts":t,"action":"revoke_a0","actor":a,"sha":s,"reason":r,"outcome":"ok"}, ensure_ascii=False, separators=(",",":")))' "$(now_iso)" "$(actor_name)" "$sha" "$reason")"
-  printf '{"ok":true,"revokedSha":"%s"}\n' "$sha"
+
+  local recorded_repo=""
+  if [[ -f "$APPROVALS_DIR/${sha}.gh.json" && ! -L "$APPROVALS_DIR/${sha}.gh.json" ]]; then
+    recorded_repo="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); print(d.get("githubRepo") or "")' "$APPROVALS_DIR/${sha}.gh.json" 2>/dev/null || true)"
+  fi
+  if [[ "$local_only" != "1" && -n "$recorded_repo" ]]; then
+    publish_gh=1
+    [[ -n "$gh_repo" ]] || gh_repo="$recorded_repo"
+  fi
+
+  local published_revoke=0
+  if [[ "$publish_gh" == "1" ]]; then
+    local resolved_repo="" revoke_desc=""
+    resolved_repo="$(resolve_github_repo_slug "$gh_repo")"
+    [[ -n "$resolved_repo" ]] || die_usage "revoke-a0 --publish-github-status requires --github-repo <owner/repo> (or GITHUB_REPOSITORY / GH_REPO)"
+    command -v gh >/dev/null 2>&1 || die_usage "revoke-a0 --publish-github-status requires gh CLI in PATH"
+    revoke_desc="$(python3 -c 'import sys; s,r=sys.argv[1], " ".join(sys.argv[2].split()); p=f"revoked sha={s[:12]} paths=* | "; print((p + (r or "manual revoke"))[:140])' "$sha" "$reason")"
+    gh api -X POST "repos/${resolved_repo}/statuses/${sha}" \
+      -f state=failure \
+      -f context="oc-v5/a0-approval" \
+      -f description="$revoke_desc" >/dev/null || die_gate "failed to publish revocation GitHub status oc-v5/a0-approval on ${resolved_repo}@${sha}"
+    published_revoke=1
+  fi
+
+  rm -f "$APPROVALS_DIR/${sha}.json" "$APPROVALS_DIR/${sha}.card.txt" "$APPROVALS_DIR/${sha}.gh.json"
+  append_audit_safe "$(python3 -c 'import json,sys; t,a,s,r,pr=sys.argv[1:]; print(json.dumps({"ts":t,"action":"revoke_a0","actor":a,"sha":s,"reason":r,"publishedGithubRevocation":pr=="1","outcome":"ok"}, ensure_ascii=False, separators=(",",":")))' "$(now_iso)" "$(actor_name)" "$sha" "$reason" "$published_revoke")"
+  printf '{"ok":true,"revokedSha":"%s","publishedGithubRevocation":%s}\n' "$sha" "$( [[ "$published_revoke" == "1" ]] && echo true || echo false )"
 }
 
 cmd_verify_a0() {
@@ -408,7 +453,7 @@ if "allowedPaths" in doc and doc["allowedPaths"] is not None:
         if not isinstance(item, str) or "\r" in item or "\n" in item or not item.strip():
             fail("invalid_allowed_paths", 11)
         cleaned.append(item.strip())
-    allowed_paths = sorted(set(cleaned))
+    allowed_paths = sorted(set(cleaned), key=lambda s: s.encode("utf-8"))
 
 paths_canonical = "*" if allowed_paths is None else json.dumps(allowed_paths, separators=(",", ":"), ensure_ascii=False)
 canonical = (

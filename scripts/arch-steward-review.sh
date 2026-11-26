@@ -359,24 +359,35 @@ run_tsx "$AUDIT_SCRIPT" --sign-receipt "$tmp_unsigned" --out "$out_path"
 chmod 0644 "$out_path" 2>/dev/null || true
 echo "[arch-steward-review] Production receipt written: $out_path"
 
-# 7. Mechanically enforce the produced receipt (exits 1 on veto / invalid receipt!)
+# 7. Mechanically enforce the produced receipt and (if --publish-github-status) publish atomic approve/veto status!
+# B3: On VETO or enforcement failure, publish `state=failure` (`verdict=veto`) to `oc-v5/arch-steward` BEFORE exiting 1
+# so any earlier approve status on the same SHA is immediately superseded across CI and host channels.
 enforce_args=(--enforce-commit --root "$root" --base "$base_sha" --head "$head_sha" --receipt "$out_path")
 if [[ "$unsafe_test_skip_owner" == 1 || "${OC_STEWARD_UNSAFE_TEST_SKIP_OWNER:-0}" == 1 ]]; then
   enforce_args+=(--unsafe-test-skip-owner)
 fi
-run_tsx "$AUDIT_SCRIPT" "${enforce_args[@]}"
+enforce_rc=0
+run_tsx "$AUDIT_SCRIPT" "${enforce_args[@]}" || enforce_rc=$?
 
-# 8. Optionally publish out-of-commit GitHub Commit Status `oc-v5/arch-steward` (ONLY after enforce passed!)
 if [[ "$publish_gh" == 1 ]]; then
   resolved_repo="$(resolve_github_repo_slug "$gh_repo")"
   [[ -n "$resolved_repo" ]] || die "--publish-github-status 需要 --github-repo <owner/repo>（或 GITHUB_REPOSITORY / GH_REPO）"
   command -v gh >/dev/null 2>&1 || die "--publish-github-status 需要 PATH 中可用的 gh CLI"
-  receipt_digest="$(node -e 'const d = JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).receiptDigest || ""; console.log(d);' "$out_path")"
-  digest_short="$(node -e 'const d = process.argv[1]; const [a, h] = d.split(":"); console.log(`${a}:${(h || "").slice(0, 16)}`);' "$receipt_digest")"
-  gh_desc="verdict=approve sha=${head_sha:0:12} author=${author_family} steward=${steward_family} digest=${digest_short}"
+  receipt_meta="$(node -e 'const d = JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")); const dg = String(d.receiptDigest || ""); const [a, h] = dg.split(":"); console.log([String(d.verdict || "veto"), `${a}:${(h || "").slice(0, 16)}`].join("\t"));' "$out_path")"
+  IFS=$'\t' read -r receipt_verdict digest_short <<<"$receipt_meta"
+  if [[ "$enforce_rc" == 0 && "$receipt_verdict" == "approve" ]]; then
+    gh_state="success"
+    gh_verdict="approve"
+  else
+    gh_state="failure"
+    gh_verdict="veto"
+  fi
+  gh_desc="verdict=${gh_verdict} sha=${head_sha:0:12} author=${author_family} steward=${steward_family} digest=${digest_short}"
   gh api -X POST "repos/${resolved_repo}/statuses/${head_sha}" \
-    -f state=success \
+    -f state="$gh_state" \
     -f context="oc-v5/arch-steward" \
     -f description="${gh_desc:0:140}" >/dev/null || die "发布 GitHub status oc-v5/arch-steward 失败 (${resolved_repo}@${head_sha})"
-  echo "[arch-steward-review] Published GitHub status oc-v5/arch-steward on ${resolved_repo}@${head_sha:0:12}"
+  echo "[arch-steward-review] Published GitHub status oc-v5/arch-steward (${gh_state}/${gh_verdict}) on ${resolved_repo}@${head_sha:0:12}"
 fi
+
+exit "$enforce_rc"

@@ -82,6 +82,7 @@ export interface GithubA0ApprovalOptions {
 
 export interface GithubA0ApprovalResult {
   valid: boolean
+  revoked?: boolean
   channel?: 'github-status' | 'github-pr-review'
   source: string
   approvedBy?: string
@@ -243,6 +244,50 @@ function extractA0StatusReason(description: string): string {
   return stripped
 }
 
+const REVOKED_MARKER_RE = /\brevok(?:e|ed|ing)\b/i
+
+function findRevokedA0Status(
+  matching: readonly GithubStatusEntry[],
+  source: string,
+): GithubA0ApprovalResult | null {
+  for (const st of matching) {
+    const desc = (st.description ?? '').trim()
+    if (st.state === 'failure' || st.state === 'error' || REVOKED_MARKER_RE.test(desc)) {
+      const creator = st.creator?.login?.trim() ?? 'unknown'
+      return {
+        valid: false,
+        revoked: true,
+        source,
+        approvedBy: creator,
+        reason: `trusted ${A0_GITHUB_STATUS_CONTEXT} revocation/failure status takes precedence (state=${JSON.stringify(st.state)}, by=@${creator})`,
+      }
+    }
+  }
+  return null
+}
+
+function findStewardVetoStatus(
+  matching: readonly GithubStatusEntry[],
+  source: string,
+): GithubStewardStatusResult | null {
+  for (const st of matching) {
+    const desc = (st.description ?? '').trim()
+    const kv = parseKvTokens(desc)
+    const verdict = (kv.get('verdict') ?? '').toLowerCase()
+    if (st.state === 'failure' || st.state === 'error' || verdict === 'veto') {
+      const publishedBy = st.creator?.login?.trim() ?? 'unknown'
+      return {
+        valid: false,
+        source,
+        publishedBy,
+        verdict: 'veto',
+        reason: `trusted ${STEWARD_GITHUB_STATUS_CONTEXT} failure/veto status takes precedence over any approve status (state=${JSON.stringify(st.state)}, verdict=${JSON.stringify(verdict || 'veto')}, by=@${publishedBy})`,
+      }
+    }
+  }
+  return null
+}
+
 function evaluateA0CommitStatus(
   statuses: readonly GithubStatusEntry[],
   headSha: string,
@@ -260,10 +305,12 @@ function evaluateA0CommitStatus(
   )
   if (matching.length === 0) return null
 
+  const source = `${sourceBase}:status:${A0_GITHUB_STATUS_CONTEXT}@${headSha.slice(0, 12)}`
+  const revokedHit = findRevokedA0Status(matching, source)
+  if (revokedHit) return revokedHit
+
   const latest = matching[0]!
   const creator = latest.creator?.login?.trim() ?? 'unknown'
-  const source = `${sourceBase}:status:${A0_GITHUB_STATUS_CONTEXT}@${headSha.slice(0, 12)}`
-
   if (latest.state !== 'success') {
     return {
       valid: false,
@@ -327,8 +374,16 @@ function evaluateA0CommitStatus(
     }
   }
 
-  const pathsRaw = kv.get('paths')
-  if (pathsRaw && pathsRaw !== '*') {
+  const pathsRaw = kv.get('paths')?.trim() ?? ''
+  if (!pathsRaw) {
+    return {
+      valid: false,
+      source,
+      approvedBy: creator,
+      reason: `${A0_GITHUB_STATUS_CONTEXT} missing required explicit paths= scope token (refusing to treat omitted paths as unrestricted)`,
+    }
+  }
+  if (pathsRaw !== '*') {
     const globs = pathsRaw
       .split(',')
       .map((p) => p.trim())
@@ -474,6 +529,7 @@ export async function verifyGithubA0Approval(
       sourceBase,
     )
     if (statusEval?.valid) return statusEval
+    if (statusEval?.revoked) return statusEval
     if (statusEval) failureNotes.push(statusEval.reason)
     else failureNotes.push(`no trusted ${A0_GITHUB_STATUS_CONTEXT} status on ${headSha.slice(0, 12)}`)
   }
@@ -563,6 +619,9 @@ export async function verifyGithubStewardStatus(
       reason: `no trusted ${STEWARD_GITHUB_STATUS_CONTEXT} commit status found for ${headSha.slice(0, 12)}`,
     }
   }
+
+  const vetoHit = findStewardVetoStatus(matching, source)
+  if (vetoHit) return vetoHit
 
   const latest = matching[0]!
   const publishedBy = latest.creator?.login?.trim() ?? 'unknown'

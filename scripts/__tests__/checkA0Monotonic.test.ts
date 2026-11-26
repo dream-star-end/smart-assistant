@@ -905,7 +905,7 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
               id: 20,
               context: 'oc-v5/a0-approval',
               state: 'success',
-              description: `sha=${shortSha} exp=${futureExp} | Approved billing ledger migration`,
+              description: `sha=${shortSha} exp=${futureExp} paths=* | Approved billing ledger migration`,
               creator: { login: 'dream-star-end' },
               created_at: '2026-11-26T12:00:00Z',
             },
@@ -917,6 +917,60 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
     assert.equal(rStatusOk.ok, true)
     assert.equal(rStatusOk.approval?.valid, true)
     assert.equal(rStatusOk.approval?.valid ? rStatusOk.approval.source : '', 'github-status')
+
+    // 1b. B2: Missing explicit paths= scope token MUST FAIL-CLOSED (never treated as unrestricted!)
+    const rMissingPaths = await runCheckA0MonotonicAsync({
+      root: repo,
+      base: 'base',
+      head: headSha,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: 'dream-star-end/openclaude',
+        token: 'ghs_test_token',
+        fetchImpl: makeMockFetch({
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/statuses`]: [
+            {
+              id: 201,
+              context: 'oc-v5/a0-approval',
+              state: 'success',
+              description: `sha=${shortSha} exp=${futureExp} | Omitted paths scope must be rejected`,
+              creator: { login: 'dream-star-end' },
+              created_at: '2026-11-26T12:00:00Z',
+            },
+          ],
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/pulls`]: [],
+        }),
+      },
+    })
+    assert.equal(rMissingPaths.ok, false, 'oc-v5/a0-approval missing explicit paths= MUST fail closed')
+
+    // 1c. B2: Narrow paths= scope not covering A0 diff MUST FAIL-CLOSED
+    const rNarrowPaths = await runCheckA0MonotonicAsync({
+      root: repo,
+      base: 'base',
+      head: headSha,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: 'dream-star-end/openclaude',
+        token: 'ghs_test_token',
+        fetchImpl: makeMockFetch({
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/statuses`]: [
+            {
+              id: 202,
+              context: 'oc-v5/a0-approval',
+              state: 'success',
+              description: `sha=${shortSha} exp=${futureExp} paths=changelog.json | Narrow scope approval`,
+              creator: { login: 'dream-star-end' },
+              created_at: '2026-11-26T12:00:00Z',
+            },
+          ],
+          [`/repos/dream-star-end/openclaude/commits/${headSha}/pulls`]: [],
+        }),
+      },
+    })
+    assert.equal(rNarrowPaths.ok, false, 'narrow paths= scope not covering changed A0 file MUST fail closed')
 
     // 2. Untrusted publisher -> REJECT
     const rUntrusted = await runCheckA0MonotonicAsync({
@@ -981,13 +1035,14 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       github: {
         repo: 'dream-star-end/openclaude',
         token: 'ghs_test_token',
+        prNumber: 1450,
         fetchImpl: makeMockFetch({
           [`/repos/dream-star-end/openclaude/commits/${headSha}/statuses`]: [
             {
               id: 30,
               context: 'oc-v5/a0-approval',
               state: 'failure',
-              description: `sha=${shortSha} | Revoked approval`,
+              description: `revoked sha=${shortSha} paths=* | Revoked approval`,
               creator: { login: 'dream-star-end' },
               created_at: '2026-11-26T13:00:00Z',
             },
@@ -995,16 +1050,25 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
               id: 29,
               context: 'oc-v5/a0-approval',
               state: 'success',
-              description: `sha=${shortSha} exp=${futureExp} | Earlier approval`,
+              description: `sha=${shortSha} exp=${futureExp} paths=* | Earlier approval`,
               creator: { login: 'dream-star-end' },
               created_at: '2026-11-26T12:00:00Z',
             },
           ],
-          [`/repos/dream-star-end/openclaude/commits/${headSha}/pulls`]: [],
+          // Even with a PR CODEOWNER APPROVED review, explicit revocation status MUST take precedence!
+          '/repos/dream-star-end/openclaude/pulls/1450/reviews': [
+            {
+              id: 99,
+              state: 'APPROVED',
+              commit_id: headSha,
+              submitted_at: '2026-11-26T12:30:00Z',
+              user: { login: 'dream-star-end' },
+            },
+          ],
         }),
       },
     })
-    assert.equal(rRevokedStatus.ok, false)
+    assert.equal(rRevokedStatus.ok, false, 'revoked oc-v5/a0-approval status MUST override both success status and PR review')
 
     // 4. PR CODEOWNER APPROVED review bound to exact headSha -> PASS; stale commit_id or CHANGES_REQUESTED -> REJECT
     const rPrOk = await runCheckA0MonotonicAsync({
@@ -1078,7 +1142,7 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
               id: 100,
               context: 'oc-v5/a0-approval',
               state: 'success',
-              description: `sha=${shortSha} exp=${futureExp} | Approved via hosted runner status`,
+              description: `sha=${shortSha} exp=${futureExp} paths=* | Approved via hosted runner status`,
               creator: { login: 'dream-star-end' },
               created_at: '2026-11-26T12:00:00Z',
             },

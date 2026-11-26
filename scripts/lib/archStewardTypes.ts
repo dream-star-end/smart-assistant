@@ -202,6 +202,11 @@ export interface StewardReceiptVerificationResult {
   receipt?: ArchStewardReceipt
   violations: StewardReceiptViolation[]
   recommendedStewardModel?: string
+  /** True ONLY when cryptographic HMAC-SHA256 was verified with an active key. */
+  hmacVerified?: boolean
+  /** True ONLY when OS root-owned non-symlink non-writable host file integrity was verified. */
+  rootFileIntegrity?: boolean
+  integrityMode?: 'hmac-sha256' | 'root-file-sha256' | 'unverified'
 }
 
 export interface ReceiptLookupResult {
@@ -210,6 +215,8 @@ export interface ReceiptLookupResult {
   source?: string
   raw?: unknown
   error?: string
+  /** True when receipt file was verified root-owned (uid=0), regular file, non-symlink, non-group/world writable. */
+  rootOwnerVerified?: boolean
   searchedLocations: string[]
 }
 
