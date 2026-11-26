@@ -1372,7 +1372,7 @@ export function Composer({
                 />
               )}
             </span>
-            <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-1 sm:flex-initial sm:gap-1.5">
+            <div className={cn("ml-auto flex items-center gap-1 sm:gap-1.5", modelSlot ? "min-w-0" : "shrink-0")}>
               {modelSlot && (
                 <div
                   data-testid="composer-model-slot"

@@ -25,6 +25,7 @@ import { flushSync } from "react-dom";
 import { ChatHeader } from "../src/components/ChatHeader";
 import { Composer } from "../src/components/Composer";
 import { MessageList } from "../src/components/MessageRenderer";
+import { ModelSelector } from "../src/components/ModelSelector";
 import { createStickToBottomController } from "../src/components/chat/stickToBottom";
 import { attachWheelFence } from "../src/components/chat/wheelFence";
 import type { Agent } from "../src/lib/agents";
@@ -36,6 +37,7 @@ declare global {
     /** T25 移动整页:上层真实收到的交互结果(run.mjs 读回)。 */
     __mobilePage: {
       navOpens: number;
+      findOpens: number;
       /** Independent input/expected-output fixtures for real clipboard proof (T68). */
       copyFixture: { raw: string; plain: string };
       sends: Array<{ text: string; mediaCount: number }>;
@@ -59,6 +61,7 @@ declare global {
 
 window.__mobilePage = {
   navOpens: 0,
+  findOpens: 0,
   copyFixture: {
     raw: "**MOBILE-ASSISTANT-COPY-FIXTURE**\n\n复制必须保留 **原文** 和 `工具结果`。",
     plain: "MOBILE-ASSISTANT-COPY-FIXTURE\n\n复制必须保留 原文 和 工具结果。",
@@ -272,7 +275,9 @@ function MobileChatPage() {
           onOpenMobileNav={() => {
             window.__mobilePage.navOpens += 1;
           }}
-          onOpenFind={() => {}}
+          onOpenFind={() => {
+            window.__mobilePage.findOpens += 1;
+          }}
           sessionUnreadCount={22}
           onOpenInbox={() => {}}
           unreadCount={3}
@@ -324,6 +329,17 @@ function MobileChatPage() {
               url: "https://stub.invalid/mobile",
               filename: file.name,
             })}
+            modelSlot={
+              <ModelSelector
+                placement="composer"
+                models={MOBILE_MODELS}
+                selectedId={modelId}
+                onSelect={setModelId}
+                effortSupported={["low", "medium", "high"]}
+                effortActive="high"
+                onSelectEffort={() => {}}
+              />
+            }
           />
         </div>
       </main>

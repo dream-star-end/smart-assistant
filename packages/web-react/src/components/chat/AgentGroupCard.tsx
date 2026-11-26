@@ -114,14 +114,18 @@ export const ChildBlockView = memo(
       );
     }
     if (child.kind === "plan" && Array.isArray(child.steps) && child.steps.length > 0) {
+      const steps = child.steps.filter(
+        (s): s is NonNullable<typeof s> => Boolean(s) && typeof s === "object",
+      );
+      if (steps.length === 0) return null;
       return (
         <ul className="oc-surface-recessed space-y-1 rounded-lg border border-border/60 px-3 py-2 text-meta text-muted">
-          {child.steps.map((s, idx) => (
-            <li key={`${idx}-${s.step}`} className="flex items-start gap-2">
+          {steps.map((s, idx) => (
+            <li key={`${idx}-${s.step ?? ""}`} className="flex items-start gap-2">
               <span className="mt-0.5 shrink-0 text-caption text-faint">
                 {s.status === "completed" ? "✓" : s.status === "in_progress" ? "●" : "○"}
               </span>
-              <span className="min-w-0 break-words">{s.step}</span>
+              <span className="min-w-0 break-words">{s.step ?? ""}</span>
             </li>
           ))}
         </ul>

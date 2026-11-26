@@ -138,7 +138,7 @@ for (const kind of ['version mismatch', 'damaged JSON']) {
   });
 }
 
-test('a source symlink is copied as private buildinfo content, and a missing donor needs no cache', (t) => {
+test('a source symlink is refused by O_NOFOLLOW hardening, and a missing donor needs no cache', (t) => {
   const f = fixture(t);
   const donor = project(f, 'donor');
   const staging = project(f, 'staging');
@@ -147,8 +147,9 @@ test('a source symlink is copied as private buildinfo content, and a missing don
   const before = statSync(cache).mtimeMs;
   symlinkSync(cache, donor.info);
   seedInto(f, donor, staging);
-  assert.equal(readFileSync(staging.info, 'utf8'), 'cache bytes\n');
-  assert.notEqual(realpathSync(staging.info), cache);
+  // OCV5-775: master_seed_frontend_buildinfo opens donor buildinfo with O_NOFOLLOW /
+  // follow_symlinks=False and requires S_ISREG, so symlinked buildinfo files are refused.
+  assert.equal(existsSync(staging.info), false);
   assert.equal(statSync(cache).mtimeMs, before);
   const noCache = project(f, 'no-cache');
   const emptyStaging = project(f, 'empty-staging');
