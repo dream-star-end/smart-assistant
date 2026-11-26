@@ -169,13 +169,14 @@ export const MAX_HIDDEN_DELEGATIONS_PER_TURN = 3
 /** P2 批次4 — 普通成员(队长直接委派的已安装 agent,非 hidden 非 review)每 turn
  *  委派次数上限。消"串行无上限"债:队长可以持续 fan-out,但单 turn 不该无界地把
  *  同一批成员反复委派(失控的串行重试/发散拆分会烧钱且拖长 turn)。超限返回结构化
- *  错误引导队长收敛(见 _runDelegateTask member guard 分支),不是静默失败。默认 8,
- *  env 可配(下限 1);比 hidden 熔断默认值宽,因为正常复杂任务的合理 fan-out 会多于审查。 */
-export const MEMBER_DELEGATIONS_PER_TURN_DEFAULT = 8
+ *  错误引导队长收敛(见 _runDelegateTask member guard 分支),不是静默失败。默认 16
+ *  (OCV5-895: 覆盖 R1+R2 双轮跨家族复审),env 可配(下限 1);比 hidden 熔断默认值宽,
+ *  因为正常复杂任务的合理 fan-out 会多于审查。 */
+export const MEMBER_DELEGATIONS_PER_TURN_DEFAULT = 16
 
 /** 「每 turn、按父会话」的委派计数器 —— 一套通用机制,当前服务两条策略:
  *   1. hidden 审查员串行熔断(_hiddenDelegateGuard,上限 env 可配默认 MAX_HIDDEN_DELEGATIONS_PER_TURN);
- *   2. P2 批次4 普通成员每 turn 委派上限(_memberDelegateGuard,env 可配默认 8)。
+ *   2. P2 批次4 普通成员每 turn 委派上限(_memberDelegateGuard,env 可配默认 16)。
  *  两者机制完全一致(仅上限值与计数范围不同),故复用同一个类而非另起并行实现。
  *
  *  计数键 = **父会话 sessionKey**,依据:delegate 请求(mcp-memory
@@ -185,8 +186,18 @@ export const MEMBER_DELEGATIONS_PER_TURN_DEFAULT = 8
  *  划定。子 delegate 会话的 sessionKey 自带时间戳(一次性,不能当计数键),但它作为"父"
  *  再委派时天然就是 turn 粒度,其计数在该 delegate 请求收尾时清理。TTL 惰性清扫兜底
  *  cron/task 等永远等不到下一条用户消息的父会话 —— 既防 Map 泄漏,也防"额度永久锁死"。 */
+/** 单次委派配额的代次凭证(OCV5-895 B5):跨轮迟到退款必须匹配同一 generation,防错扣新轮占用。 */
+export interface DelegationQuotaToken {
+  readonly parentKey: string
+  readonly generation: number
+}
+
 export class PerTurnDelegationGuard {
-  private counts = new Map<string, { count: number; touchedAt: number }>()
+  private counts = new Map<
+    string,
+    { count: number; rawAttempts: number; touchedAt: number; generation: number }
+  >()
+  private nextGeneration = 1
 
   constructor(
     private readonly limit = MAX_HIDDEN_DELEGATIONS_PER_TURN,
@@ -194,19 +205,54 @@ export class PerTurnDelegationGuard {
     private readonly staleMs = 12 * 60 * 60_000,
   ) {}
 
-  /** 为一次 hidden 委派占额度:未达上限 → 计数 +1 放行;已达上限 → 拒绝。
-   *  `limit` 缺省用构造时上限;生产 hidden 路径传入 call-time env 解析值。 */
-  tryAcquire(parentKey: string, now = Date.now(), limit = this.limit): boolean {
+  /** 获取带代次凭证的额度:未达上限且原始尝试未达上限 → 计数与原始尝试各 +1 并返回代次凭证;
+   *  已达上限 → `{ ok: false }`。新建、过期重建或 `resetForParent` 后必分配全新单调递增 generation。 */
+  acquireToken(
+    parentKey: string,
+    now = Date.now(),
+    limit = this.limit,
+    rawLimit = Math.max(limit * 2, limit + 4),
+  ): { ok: true; token: DelegationQuotaToken } | { ok: false } {
     this.prune(now)
     const entry = this.counts.get(parentKey)
     if (!entry) {
-      this.counts.set(parentKey, { count: 1, touchedAt: now })
-      return true
+      if (limit <= 0 || rawLimit <= 0) return { ok: false }
+      const generation = this.nextGeneration++
+      this.counts.set(parentKey, { count: 1, rawAttempts: 1, touchedAt: now, generation })
+      return { ok: true, token: { parentKey, generation } }
     }
-    if (entry.count >= limit) return false
+    if (entry.count >= limit || entry.rawAttempts >= rawLimit) return { ok: false }
     entry.count++
+    entry.rawAttempts++
     entry.touchedAt = now
+    return { ok: true, token: { parentKey, generation: entry.generation } }
+  }
+
+  /** 为一次委派占额度:未达上限且原始尝试未达上限 → 计数与原始尝试各 +1 放行;已达上限 → 拒绝。
+   *  `limit` 缺省用构造时上限;生产 hidden 路径传入 call-time env 解析值。
+   *  `rawLimit` 缺省 `Math.max(limit * 2, limit + 4)`,与 `refund`/`refundToken` 配合防止无限重试风暴(OCV5-895)。 */
+  tryAcquire(
+    parentKey: string,
+    now = Date.now(),
+    limit = this.limit,
+    rawLimit = Math.max(limit * 2, limit + 4),
+  ): boolean {
+    return this.acquireToken(parentKey, now, limit, rawLimit).ok
+  }
+
+  /** 按代次凭证退还一次有效占用额度(保留 `rawAttempts`):旧轮或已过期凭证返回 `false` 零副作用。 */
+  refundToken(token: DelegationQuotaToken): boolean {
+    const entry = this.counts.get(token.parentKey)
+    if (!entry || entry.generation !== token.generation) return false
+    entry.count = Math.max(0, entry.count - 1)
     return true
+  }
+
+  /** 退还一次有效占用额度(用于未执行早退或零输出上游失败),保留 `rawAttempts` 不退还以防无限重试风暴。 */
+  refund(parentKey: string): void {
+    const entry = this.counts.get(parentKey)
+    if (!entry) return
+    entry.count = Math.max(0, entry.count - 1)
   }
 
   /** 父会话开启新用户 turn / 父 delegate 会话收尾时清零。 */
@@ -217,6 +263,11 @@ export class PerTurnDelegationGuard {
   /** 只读:该父键本 turn 已占用的额度(团队模式「组队却未送审」可观测用)。 */
   countFor(parentKey: string): number {
     return this.counts.get(parentKey)?.count ?? 0
+  }
+
+  /** 只读:该父键本 turn 累计的原始尝试次数(不随 `refund` 回退)。 */
+  rawAttemptsFor(parentKey: string): number {
+    return this.counts.get(parentKey)?.rawAttempts ?? 0
   }
 
   private prune(now: number): void {

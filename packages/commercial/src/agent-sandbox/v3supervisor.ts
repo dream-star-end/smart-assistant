@@ -716,6 +716,8 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "blog-writer",
   // OCV5-791：持久化静态站点发布（oc-site）与外部 Supabase 全栈开发规范。
   "site-publishing",
+  // OCV5-895：零硬伤四层科研深审（净室校验 + 正交切片 + 跨家族盲审 + 反例仲裁）。
+  "scientific-deep-audit",
 ] as const;
 
 /**

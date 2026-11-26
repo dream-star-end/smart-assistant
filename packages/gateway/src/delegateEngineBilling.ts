@@ -60,6 +60,8 @@ export interface DelegateEngineBillingAdmission {
   grokExecutionDescriptor?: GrokExecutionDescriptor
   /** Master-issued provider route for any codex admit (advisor or delegate). */
   route?: unknown
+  /** Remaining spendable credits (fen) captured at master admission (OCV5-895 B1). */
+  creditBudgetFen?: bigint
 }
 
 export type DelegateEngineBillingSettlePayload = Omit<DurableCodexBilling, 'terminalCode'> & {
@@ -359,11 +361,16 @@ export function createDelegateEngineBillingClient(args?: {
             routeTokenHash: createHash('sha256').update(input.grokRouteToken ?? '').digest('hex'),
           })
         : undefined
+      const creditBudgetFen =
+        typeof result.creditBudgetFen === 'string' && /^\d{1,32}$/.test(result.creditBudgetFen)
+          ? BigInt(result.creditBudgetFen)
+          : undefined
       return {
         requestId: result.requestId,
         engineSessionId: result.engineSessionId,
         ...(grokExecutionDescriptor ? { grokExecutionDescriptor } : {}),
         ...(result.route !== undefined ? { route: result.route } : {}),
+        ...(creditBudgetFen !== undefined ? { creditBudgetFen } : {}),
       }
     },
     async settle(billing) {

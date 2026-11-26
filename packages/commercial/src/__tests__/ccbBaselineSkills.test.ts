@@ -275,4 +275,73 @@ describe('ccb-baseline skills ↔ manifest', () => {
       /oc-stylecheck .*--style-file \/home\/agent\/\.openclaude\/research\/style\/profile\.md/,
     )
   })
+
+  it('ships scientific-deep-audit, updated multi-model-review court gates, and pinned Python scientific deps (OCV5-895)', () => {
+    assert.ok(
+      (V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('scientific-deep-audit'),
+      'V3_CCB_BASELINE_SKILL_NAMES must include scientific-deep-audit',
+    )
+
+    const sciAuditSkill = readFileSync(join(skillsDir, 'scientific-deep-audit', 'SKILL.md'), 'utf8')
+    assert.match(sciAuditSkill, /name:\s*scientific-deep-audit/)
+    assert.match(sciAuditSkill, /scripts\/cleanroom_verify_template\.py/)
+    assert.match(sciAuditSkill, /repro_script/)
+    assert.match(sciAuditSkill, /oc-review verify --unsafe-local-exec/)
+    assert.doesNotMatch(sciAuditSkill, /oc-review verify --exec\b/)
+    assert.match(sciAuditSkill, /sandbox_unavailable_collect_only/)
+    assert.match(sciAuditSkill, /oc-review ledger init/)
+    assert.match(sciAuditSkill, /OC_WITNESS_VERDICT/)
+    assert.match(sciAuditSkill, /emit_witness_verdict/)
+    assert.match(sciAuditSkill, /verified_by_machine/)
+    assert.match(sciAuditSkill, /findingDigest/)
+    assert.match(sciAuditSkill, /scriptSha256/)
+    assert.match(sciAuditSkill, /--scientific-gate/)
+    assert.match(sciAuditSkill, /chao1Residual<0\.5/)
+    assert.match(sciAuditSkill, /PASS_READY/)
+    assert.match(sciAuditSkill, /box-api-claude-sonnet-5-5/)
+
+    const verifyTemplatePath = join(
+      skillsDir,
+      'scientific-deep-audit',
+      'scripts',
+      'cleanroom_verify_template.py',
+    )
+    assert.ok(existsSync(verifyTemplatePath), 'cleanroom_verify_template.py must exist')
+    const verifyTemplate = readFileSync(verifyTemplatePath, 'utf8')
+    for (const fn of [
+      'check_jacobian_parity',
+      'check_so3_invariants',
+      'check_nonzero_roundtrip',
+      'check_dimensions',
+      'check_ssot_numbers',
+      'check_callsite_impact',
+      'emit_witness_verdict',
+    ]) {
+      assert.match(verifyTemplate, new RegExp(`def ${fn}\\(`))
+    }
+    assert.match(verifyTemplate, /OC_WITNESS_VERDICT_FILE/)
+    assert.match(verifyTemplate, /missing_keys/)
+    assert.match(verifyTemplate, /NO_COVERAGE/)
+
+    const reviewSkill = readFileSync(join(skillsDir, 'multi-model-review', 'SKILL.md'), 'utf8')
+    assert.match(reviewSkill, /scientific-deep-audit/)
+    assert.match(reviewSkill, /repro_script/)
+    assert.match(reviewSkill, /oc-review verify/)
+    assert.match(reviewSkill, /--unsafe-local-exec/)
+    assert.doesNotMatch(reviewSkill, /oc-review verify --exec\b/)
+    assert.match(reviewSkill, /OC_WITNESS_VERDICT/)
+    assert.match(reviewSkill, /findingDigest/)
+    assert.match(reviewSkill, /scriptSha256/)
+    assert.match(reviewSkill, /--verification/)
+    assert.match(reviewSkill, /--scientific-gate/)
+    assert.match(reviewSkill, /500\/429/)
+
+    const dockerfile = readFileSync(
+      join(here, '..', '..', 'agent-sandbox', 'Dockerfile.openclaude-runtime'),
+      'utf8',
+    )
+    assert.match(dockerfile, /pint==0\.25\.3/)
+    assert.match(dockerfile, /uncertainties==3\.2\.3/)
+    assert.match(dockerfile, /hypothesis==6\.170\.17/)
+  })
 })

@@ -20,9 +20,42 @@
  * 粗聚合;宁可漏聚(分别列出)不误聚(把不同问题合并)——分歧呈现是本功能的价值核心。
  * 无网络、无 DB;schema 为 CLI 本地定义,不进 protocol 包。
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  DEFAULT_BATCH_TIMEOUT_MS,
+  DEFAULT_VERIFY_TIMEOUT_MS,
+  VERIFICATION_STATUSES,
+  VerificationFormatError,
+  computeDefectIdentityKey,
+  computeFindingDigest,
+  computeSafeFileSha256,
+  computeSafeScriptSha256,
+  computeScientificMetrics,
+  formatScientificGateMessage,
+  formatVerifySummaryLine,
+  isMachineVerificationStatus,
+  normalizeDefectIssue,
+  normalizeDefectText,
+  parseVerificationReport,
+  resolveModelFamily,
+  verifyWitnessesInDir,
+  type MachineVerificationStatus,
+  type ScientificGateStatus,
+  type ScientificMetrics,
+  type ScientificMetricsActiveFinding,
+  type VerificationEntry,
+  type VerificationReport,
+} from './ocReviewVerify.js'
+
+export type {
+  MachineVerificationStatus,
+  ScientificGateStatus,
+  ScientificMetrics,
+  VerificationEntry,
+  VerificationReport,
+}
 
 const TOOL = 'oc-review'
 
@@ -63,10 +96,14 @@ export type ReviewFinding = {
   new_evidence?: boolean
   evidence?: string
   topic?: string
+  model_family?: string
+  repro_script?: string
+  verified_by_machine?: MachineVerificationStatus
+  verification_output?: string
 }
 
 export type ReviewFile = {
-  reviewer: { model: string; role?: string }
+  reviewer: { model: string; role?: string; model_family?: string }
   verdict: ReviewVerdict
   findings: ReviewFinding[]
 }
@@ -105,7 +142,8 @@ export const REVIEW_JSON_SCHEMA = `{
       "required": ["model"],
       "properties": {
         "model": { "type": "string", "minLength": 1, "description": "评审员模型 slug,如 kimi-k3" },
-        "role": { "type": "string", "description": "评审员角色,如 方法学审查" }
+        "role": { "type": "string", "description": "评审员角色,如 方法学审查" },
+        "model_family": { "type": "string", "description": "展示用模型家族标注(可选;科学深审独立家族严格按权威 reviewer.model 归类,自填标签不提升覆盖率)" }
       }
     },
     "verdict": { "enum": ["accept", "minor", "major", "reject"] },
@@ -129,7 +167,11 @@ export const REVIEW_JSON_SCHEMA = `{
           "issue": { "type": "string", "minLength": 1 },
           "suggestion": { "type": "string" },
           "evidence": { "type": "string", "description": "定位依据或可复核反证(可选)" },
-          "new_evidence": { "type": "boolean", "description": "是否基于全新反证重开账本中已裁决条目(可选,默认 false)" }
+          "new_evidence": { "type": "boolean", "description": "是否基于全新反证重开账本中已裁决条目(可选,默认 false)" },
+          "model_family": { "type": "string", "description": "展示用模型家族标注(可选;科学深审独立家族仅按每份评审文件的 reviewer 字段计 1 票)" },
+          "repro_script": { "type": "string", "description": "最小反例复现脚本相对路径(可选,仅允许 .py/.m;须 exit 0 并经 OC_WITNESS_VERDICT_FILE 或 stdout OC_WITNESS_VERDICT JSON 输出含匹配 finding_digest 的 confirmed/refuted)" },
+          "verified_by_machine": { "enum": ["confirmed", "refuted", "unverified"], "description": "展示参考字段(可选;绝不能自报降级 P0,权威状态仅来自绑定 findingDigest+scriptSha256 的 --verification 报告)" },
+          "verification_output": { "type": "string", "description": "机器反例核验输出摘要(可选)" }
         }
       }
     }
@@ -202,6 +244,9 @@ export function parseReviewFile(text: string, label: string): ReviewFile {
   if (rec.role !== undefined && typeof rec.role !== 'string') {
     bad('reviewer.role must be a string when present')
   }
+  if (rec.model_family !== undefined && typeof rec.model_family !== 'string') {
+    bad('reviewer.model_family must be a string when present')
+  }
   if (!isVerdict(obj.verdict)) {
     bad(`verdict must be one of ${VERDICTS.join('|')}`)
   }
@@ -241,6 +286,18 @@ export function parseReviewFile(text: string, label: string): ReviewFile {
     if (f.topic !== undefined && typeof f.topic !== 'string') {
       bad(`${where}.topic must be a string when present`)
     }
+    if (f.model_family !== undefined && typeof f.model_family !== 'string') {
+      bad(`${where}.model_family must be a string when present`)
+    }
+    if (f.repro_script !== undefined && typeof f.repro_script !== 'string') {
+      bad(`${where}.repro_script must be a string when present`)
+    }
+    if (f.verified_by_machine !== undefined && !isMachineVerificationStatus(f.verified_by_machine)) {
+      bad(`${where}.verified_by_machine must be one of ${VERIFICATION_STATUSES.join('|')}`)
+    }
+    if (f.verification_output !== undefined && typeof f.verification_output !== 'string') {
+      bad(`${where}.verification_output must be a string when present`)
+    }
     const finding: ReviewFinding = { location: f.location, severity: f.severity, issue: f.issue }
     if (f.suggestion !== undefined) finding.suggestion = f.suggestion
     if (f.priority !== undefined) finding.priority = f.priority
@@ -248,10 +305,15 @@ export function parseReviewFile(text: string, label: string): ReviewFile {
     if (f.new_evidence !== undefined) finding.new_evidence = f.new_evidence
     if (f.evidence !== undefined) finding.evidence = f.evidence
     if (f.topic !== undefined) finding.topic = f.topic
+    if (f.model_family !== undefined) finding.model_family = f.model_family
+    if (f.repro_script !== undefined) finding.repro_script = f.repro_script
+    if (f.verified_by_machine !== undefined) finding.verified_by_machine = f.verified_by_machine
+    if (f.verification_output !== undefined) finding.verification_output = f.verification_output
     return finding
   })
   const file: ReviewFile = { reviewer: { model: rec.model.trim() }, verdict: obj.verdict, findings }
   if (rec.role !== undefined) file.reviewer.role = rec.role
+  if (rec.model_family !== undefined) file.reviewer.model_family = rec.model_family
   return file
 }
 
@@ -297,6 +359,8 @@ export type TaggedFinding = ReviewFinding & {
   resolvedPriority: ReviewPriority
   reopenedWithNewEvidence?: boolean
   matchedLedgerId?: string
+  /** 仅来自加密绑定 `--verification` 报告的权威机器核验状态(绝不采信作者自填字段)。 */
+  authoritativeVerification?: MachineVerificationStatus
 }
 
 export type SuppressedFlipFlop = {
@@ -314,10 +378,19 @@ export type SuppressedFlipFlop = {
   }
 }
 
+export type MachineRefutedFinding = {
+  reviewer: string
+  modelFamily: string
+  finding: ReviewFinding
+  priority: ReviewPriority
+  reproScript?: string
+  verificationOutput?: string
+}
+
 export type PriorityCounts = Record<ReviewPriority, number>
 
 export type ConvergenceGate = {
-  status: 'PASS_READY' | 'FIX_REQUIRED'
+  status: ScientificGateStatus
   activeP0: number
   suppressedFlipFlops: number
   round?: number
@@ -372,11 +445,23 @@ export type CollateResult = {
   sole: SoleEntry[]
   /** 缺席评审员(默认宽松模式下跳过的坏文件);--strict 时任何坏文件直接 exit 1,此处恒为空。 */
   skipped: SkippedReview[]
+  /** 经机器反例证伪的发现(已自动排除,不计入活跃 P0 与共识区);仅启用科学验证上下文时附带。 */
+  machineRefuted?: MachineRefutedFinding[]
+  /** 科学深审指标(跨家族覆盖、机器核验 P0 与 Chao1 残余估算);仅启用科学验证上下文时附带。 */
+  scientificMetrics?: ScientificMetrics
 }
 
 export type CollateOptions = {
   ledger?: DecisionLedger
   round?: number
+  verificationReport?: VerificationReport
+  scriptRoot?: string
+  /** 可选冻结稿件/数据输入版本摘要(SHA-256 或版本标签);提供时校验与 verificationReport 及 findingDigest 一致。 */
+  inputDigest?: string
+  scientificGate?: boolean
+  minFamilies?: number
+  maxResidual?: number
+  sourceFiles?: ReadonlyMap<ReviewFile, string>
 }
 
 const CANONICAL_ANCHOR_RE = /^(sec|fig|tab|line|raw):(.+)$/i
@@ -613,31 +698,183 @@ function soleSeverity(entry: SoleEntry): ReviewSeverity {
  * 当提供 ledger 时,命中 accepted / rejected_with_evidence 且未声明 new_evidence: true 的
  * finding 自动折叠进 suppressedFlipFlops,不计入 activePriorityTotals 与活跃 P0 闸门。
  */
+type AuthoritativeVerificationResolution = {
+  status?: MachineVerificationStatus
+  output?: string
+  reproScript?: string
+}
+
+/**
+ * 严格按 `(file, findingDigest)` 加密绑定解析权威机器核验状态(B4):
+ *   - 无 `--verification` 或缺失 `sourceFile` 时 fail-closed 返回空(绝不按索引或跨文件回退);
+ *   - 冻结输入版本 `inputDigest` 不匹配时 fail-closed 返回 `unverified`;
+ *   - 同一 `(file, findingDigest)` 在报告中存在冲突条目时 fail-closed 返回 `unverified`;
+ *   - 对 `confirmed`/`refuted` 且提供可信 `checkScriptRoot` 时,既核对 `report.scriptRoot` 与
+ *     可信目录一致,又按可信目录校核实时磁盘脚本 SHA-256,不一致视为陈旧退回 `unverified`。
+ */
+function resolveAuthoritativeVerification(
+  report: VerificationReport | undefined,
+  sourceFile: string | undefined,
+  reviewerModel: string,
+  finding: ReviewFinding,
+  checkScriptRoot: string | undefined,
+  inputDigest: string | undefined,
+): AuthoritativeVerificationResolution {
+  if (!report || sourceFile === undefined) return {}
+  const expectedInputDigest = inputDigest?.trim() || undefined
+  const reportInputDigest = report.inputDigest?.trim() || undefined
+  if (expectedInputDigest !== undefined && reportInputDigest !== expectedInputDigest) {
+    return {
+      status: 'unverified',
+      output: 'stale verification: input/manuscript version mismatch',
+      ...(finding.repro_script !== undefined ? { reproScript: finding.repro_script } : {}),
+    }
+  }
+  const effectiveInputDigest = expectedInputDigest ?? reportInputDigest
+  const digest = computeFindingDigest(sourceFile, reviewerModel, finding, effectiveInputDigest)
+  const matches = report.entries.filter(
+    (e) => e.file === sourceFile && e.findingDigest === digest,
+  )
+  if (matches.length === 0) return {}
+  if (matches.length > 1) {
+    const distinctStates = new Set(matches.map((m) => `${m.status}|${m.scriptSha256 ?? ''}`))
+    if (distinctStates.size > 1) {
+      return {
+        status: 'unverified',
+        output: 'conflicting duplicate verification entries for finding digest',
+        reproScript: matches[0]!.reproScript,
+      }
+    }
+  }
+  const entry = matches[0]!
+  if (
+    (entry.status === 'confirmed' || entry.status === 'refuted') &&
+    finding.repro_script !== undefined &&
+    checkScriptRoot !== undefined &&
+    checkScriptRoot.trim() !== ''
+  ) {
+    let realTrustedRoot: string
+    let realReportRoot: string
+    try {
+      realTrustedRoot = realpathSync(resolve(checkScriptRoot))
+      realReportRoot = realpathSync(resolve(report.scriptRoot))
+    } catch {
+      return {
+        status: 'unverified',
+        output: 'stale verification: scriptRoot cannot be resolved',
+        reproScript: entry.reproScript,
+      }
+    }
+    if (realTrustedRoot !== realReportRoot) {
+      return {
+        status: 'unverified',
+        output: 'stale verification: verification report scriptRoot does not match trusted scriptRoot',
+        reproScript: entry.reproScript,
+      }
+    }
+    if (!entry.scriptSha256) {
+      return {
+        status: 'unverified',
+        output: 'stale verification: missing scriptSha256',
+        reproScript: entry.reproScript,
+      }
+    }
+    const liveSha = computeSafeScriptSha256(realTrustedRoot, finding.repro_script)
+    if (liveSha === null || liveSha !== entry.scriptSha256) {
+      return {
+        status: 'unverified',
+        output: 'stale verification: repro_script changed or missing on disk',
+        reproScript: entry.reproScript,
+      }
+    }
+  }
+  const output = entry.summary || entry.outputPreview || entry.reason || undefined
+  return {
+    status: entry.status,
+    ...(output !== undefined ? { output } : {}),
+    reproScript: entry.reproScript,
+  }
+}
+
 export function collateReviews(
   files: ReviewFile[],
   skipped: SkippedReview[] = [],
   options: CollateOptions = {},
 ): CollateResult {
-  const sorted = [...files].sort((a, b) => a.reviewer.model.localeCompare(b.reviewer.model))
+  const sorted = [...files].sort(
+    (a, b) =>
+      a.reviewer.model.localeCompare(b.reviewer.model) ||
+      (options.sourceFiles?.get(a) ?? '').localeCompare(options.sourceFiles?.get(b) ?? ''),
+  )
   const totals = emptySeverityCounts()
   const priorityTotals = emptyPriorityCounts()
   const activePriorityTotals = emptyPriorityCounts()
   const verdictCounts = emptyVerdictCounts()
   const reviewers: ReviewerSummary[] = []
   const suppressedFlipFlops: SuppressedFlipFlop[] = []
+  const machineRefuted: MachineRefutedFinding[] = []
+  const activeFindingsForMetrics: ScientificMetricsActiveFinding[] = []
   const buckets = new Map<string, TaggedFinding[]>()
+  let hasScientificContext = Boolean(options.verificationReport || options.scientificGate)
+  const checkScriptRoot = options.scriptRoot
+  const inputDigest = options.inputDigest?.trim() || undefined
+
   for (const file of sorted) {
     const counts = emptySeverityCounts()
     verdictCounts[file.verdict] += 1
-    for (const finding of file.findings) {
+    const sourceFile = options.sourceFiles?.get(file)
+    // B6: 独立家族严格按可核实的实际来源 `reviewer.model` 归类(绝不采纳自报 model_family 字符串)
+    const fileFamily = resolveModelFamily(file.reviewer.model)
+
+    for (let findingIdx = 0; findingIdx < file.findings.length; findingIdx++) {
+      const finding = file.findings[findingIdx]!
       counts[finding.severity] += 1
       totals[finding.severity] += 1
       const resolvedPriority = resolveFindingPriority(finding)
       priorityTotals[resolvedPriority] += 1
 
+      if (
+        finding.repro_script !== undefined ||
+        finding.verified_by_machine !== undefined ||
+        finding.verification_output !== undefined
+      ) {
+        hasScientificContext = true
+      }
+
+      // B4: 权威机器核验仅来自加密绑定 `--verification` 报告,评审 JSON 自填字段仅作展示
+      const auth = resolveAuthoritativeVerification(
+        options.verificationReport,
+        sourceFile,
+        file.reviewer.model,
+        finding,
+        checkScriptRoot,
+        inputDigest,
+      )
+      const authoritativeStatus = auth.status
+
+      if (authoritativeStatus === 'refuted') {
+        hasScientificContext = true
+        const refutedItem: MachineRefutedFinding = {
+          reviewer: file.reviewer.model,
+          modelFamily: fileFamily,
+          finding: { ...finding, verified_by_machine: 'refuted' },
+          priority: resolvedPriority,
+        }
+        const scriptRef = auth.reproScript ?? finding.repro_script
+        if (scriptRef !== undefined) refutedItem.reproScript = scriptRef
+        if (auth.output !== undefined) {
+          refutedItem.verificationOutput = auth.output
+          refutedItem.finding.verification_output = auth.output
+        }
+        machineRefuted.push(refutedItem)
+        continue
+      }
+
       const matchedEntry =
         options.ledger !== undefined ? matchSuppressedLedgerEntry(finding, options.ledger) : undefined
-      if (matchedEntry !== undefined && finding.new_evidence !== true) {
+      // B4: 新机器 confirmed 与旧账本冲突时严禁静默折叠,强制以新反证重开进入活跃 P0
+      const forcedReopenByMachine = matchedEntry !== undefined && authoritativeStatus === 'confirmed'
+      if (matchedEntry !== undefined && finding.new_evidence !== true && !forcedReopenByMachine) {
         const ledgerSnapshot: SuppressedFlipFlop['ledgerEntry'] = {
           id: matchedEntry.id,
           anchor: matchedEntry.anchor,
@@ -662,11 +899,31 @@ export function collateReviews(
         reviewer: file.reviewer.model,
         resolvedPriority,
       }
-      if (matchedEntry !== undefined && finding.new_evidence === true) {
+      if (authoritativeStatus !== undefined) {
+        tagged.authoritativeVerification = authoritativeStatus
+        tagged.verified_by_machine = authoritativeStatus
+      }
+      if (auth.output !== undefined) tagged.verification_output = auth.output
+      if (matchedEntry !== undefined && (finding.new_evidence === true || forcedReopenByMachine)) {
         tagged.reopenedWithNewEvidence = true
         tagged.matchedLedgerId = matchedEntry.id
       }
-      for (const anchor of locationAnchors(finding.location)) {
+      const anchors = locationAnchors(finding.location)
+      const defectKey = computeDefectIdentityKey(anchors, finding.location, finding.topic, finding.issue)
+      const normalizedTopic = normalizeDefectText(finding.topic)
+      const normalizedIssue = normalizeDefectIssue(finding.issue)
+      activeFindingsForMetrics.push({
+        reviewer: file.reviewer.model,
+        modelFamily: fileFamily,
+        defectKey,
+        anchors,
+        ...(normalizedTopic !== '' ? { normalizedTopic } : {}),
+        ...(normalizedIssue !== '' ? { normalizedIssue } : {}),
+        resolvedPriority,
+        ...(finding.category !== undefined ? { category: finding.category } : {}),
+        ...(authoritativeStatus !== undefined ? { verifiedByMachine: authoritativeStatus } : {}),
+      })
+      for (const anchor of anchors) {
         const bucket = buckets.get(anchor)
         if (bucket) bucket.push(tagged)
         else buckets.set(anchor, [tagged])
@@ -729,6 +986,12 @@ export function collateReviews(
       a.finding.location.localeCompare(b.finding.location) ||
       a.finding.issue.localeCompare(b.finding.issue),
   )
+  machineRefuted.sort(
+    (a, b) =>
+      a.reviewer.localeCompare(b.reviewer) ||
+      a.finding.location.localeCompare(b.finding.location) ||
+      a.finding.issue.localeCompare(b.finding.issue),
+  )
 
   const activeP0 = activePriorityTotals.P0
   const gate: ConvergenceGate = {
@@ -743,7 +1006,7 @@ export function collateReviews(
   if (options.round !== undefined) gate.round = options.round
 
   const skippedSorted = [...skipped].sort((a, b) => a.file.localeCompare(b.file))
-  return {
+  const result: CollateResult = {
     reviewers,
     verdictCounts,
     totals,
@@ -756,6 +1019,22 @@ export function collateReviews(
     sole,
     skipped: skippedSorted,
   }
+  if (hasScientificContext) {
+    const scientificMetrics = computeScientificMetrics({
+      files: sorted,
+      activeFindings: activeFindingsForMetrics,
+      machineRefuted: machineRefuted.map((m) => ({ resolvedPriority: m.priority })),
+      ...(options.minFamilies !== undefined ? { minFamilies: options.minFamilies } : {}),
+      ...(options.maxResidual !== undefined ? { maxResidual: options.maxResidual } : {}),
+    })
+    if (options.scientificGate === true) {
+      gate.status = scientificMetrics.scientificGateStatus
+      gate.message = formatScientificGateMessage(scientificMetrics)
+    }
+    result.machineRefuted = machineRefuted
+    result.scientificMetrics = scientificMetrics
+  }
+  return result
 }
 
 /** 末行 `COLLATE: b/m/mi/s`;有缺席评审员时追加 ` skipped=<n>`,程序判读能一眼看出汇总不完整。 */
@@ -770,7 +1049,10 @@ function oneLine(text: string): string {
 }
 
 function findingIssueSuffix(f: TaggedFinding): string {
-  return f.reopenedWithNewEvidence === true ? ' [reopened_with_new_evidence]' : ''
+  const tags: string[] = []
+  if (f.reopenedWithNewEvidence === true) tags.push('[reopened_with_new_evidence]')
+  if (f.authoritativeVerification === 'confirmed') tags.push('[machine_confirmed]')
+  return tags.length > 0 ? ` ${tags.join(' ')}` : ''
 }
 
 /** 渲染 Markdown 汇总卡(确定性:同一输入字节级相同输出)。 */
@@ -858,6 +1140,36 @@ export function renderSummaryMd(result: CollateResult): string {
     }
     lines.push('')
   }
+  if (result.machineRefuted !== undefined && result.machineRefuted.length > 0) {
+    lines.push('## 机器反例证伪（已自动排除，防多模型集体误判）', '')
+    for (const item of result.machineRefuted) {
+      lines.push(
+        `- [${item.priority}] **${item.reviewer}** (\`${item.modelFamily}\`) ${oneLine(item.finding.location)}: ${oneLine(item.finding.issue)}`,
+      )
+      const detailParts: string[] = []
+      if (item.reproScript !== undefined) detailParts.push(`脚本: \`${oneLine(item.reproScript)}\``)
+      if (item.verificationOutput !== undefined && item.verificationOutput.trim() !== '') {
+        detailParts.push(`输出: ${oneLine(item.verificationOutput)}`)
+      }
+      if (detailParts.length > 0) lines.push(`  - 机器证伪: ${detailParts.join(' | ')}`)
+    }
+    lines.push('')
+  }
+  if (result.scientificMetrics !== undefined) {
+    const m = result.scientificMetrics
+    lines.push('## 科学深审门禁（反例仲裁 + Chao1 残余估算）', '')
+    lines.push(`- 科学闸门: \`${m.scientificGateStatus}\``)
+    lines.push(
+      `- 独立模型家族 (${m.familyCount}/${m.minFamilies}): ${m.distinctFamilies.join(', ') || '(无)'}`,
+    )
+    lines.push(
+      `- 机器核验 P0: confirmed=${m.confirmedP0} / refuted=${m.refutedP0} / unverified=${m.unverifiedP0}（机器总证伪 ${m.totalMachineRefuted} 条）`,
+    )
+    lines.push(
+      `- Chao1 残余估算: ${m.chao1Residual} (阈值 < ${m.maxResidual}; 独立高危桶=${m.observedDefectBuckets}, f1=${m.f1}, f2=${m.f2})`,
+    )
+    lines.push('')
+  }
   const t = result.totals
   const totalFindings = t.blocker + t.major + t.minor + t.suggestion
   lines.push('## 统计', '')
@@ -876,11 +1188,16 @@ export type OcReviewCliResult = { exitCode: number; stdout: string; stderr: stri
 
 const USAGE = [
   'usage: oc-review schema',
-  '       oc-review collate --dir <dir> [--out <summary.md>] [--ledger <decision-ledger.json>] [--round <n>] [--strict]',
+  '       oc-review verify --dir <dir> [--exec|--unsafe-local-exec] [--script-root <root>] [--manuscript <file>|--input-sha <id>] [--timeout <sec>] [--batch-timeout <sec>] [--out <verification-report.json>]',
+  '       oc-review collate --dir <dir> [--out <summary.md>] [--ledger <decision-ledger.json>] [--round <n>] [--verification <verification-report.json>] [--script-root <root>] [--manuscript <file>|--input-sha <id>] [--scientific-gate] [--min-families <n>] [--max-residual <num>] [--strict]',
   '       oc-review ledger <init|record|show> --file <path> [...]',
   '  schema   打印评审员 JSON schema(贴进委派 prompt)',
+  '  verify   默认只采集 reviews-*.json 中的 repro_script 哈希与 findingDigest(不执行);',
+  '           --exec 仅在具备内核强制只读/断网沙箱时执行,无沙箱环境自动退回只采集;',
+  '           --unsafe-local-exec 仅限运行经人工/净室审计的本地脚本(当前容器无 OS 隔离),末行 VERIFY',
   '  collate  读 <dir>/reviews-*.json → 写 review-summary.md/.json,stdout 末行 COLLATE',
   '           可选 --ledger 挂载跨轮裁决账本防 Flip-Flop,输出 P0 收敛闸门(PASS_READY/FIX_REQUIRED)',
+  '           可选 --verification 接入加密绑定机器核验报告自动排除 refuted 误判;--scientific-gate 启用 Chao1 科学深审门禁',
   '           坏格式文件默认跳过并标注缺席(COLLATE 行追加 skipped=<n>);--strict 任一坏文件即 exit 1',
   '  ledger   管理跨轮裁决账本(init / record / show),幂等记录 accepted|rejected_with_evidence|deferred',
 ].join('\n')
@@ -930,6 +1247,160 @@ function parsePositiveInt(raw: string): number | null {
   if (!/^\d+$/.test(raw.trim())) return null
   const n = Number(raw.trim())
   return Number.isSafeInteger(n) && n >= 1 ? n : null
+}
+
+function parseNonNegativeNumber(raw: string): number | null {
+  const trimmed = raw.trim()
+  if (trimmed === '') return null
+  const n = Number(trimmed)
+  return Number.isFinite(n) && n >= 0 ? n : null
+}
+
+function resolveInputDigestFlag(
+  cmdName: string,
+  flags: Record<string, string>,
+  callerCwd?: string,
+): { ok: true; inputDigest?: string } | { ok: false; result: OcReviewCliResult } {
+  const hasManuscript = flags.manuscript !== undefined
+  const hasInputSha = flags['input-sha'] !== undefined
+  if (hasManuscript && hasInputSha) {
+    return {
+      ok: false,
+      result: err(`${cmdName}: specify at most one of --manuscript or --input-sha`, 2),
+    }
+  }
+  if (hasManuscript) {
+    if (flags.manuscript === 'true' || flags.manuscript.trim() === '') {
+      return { ok: false, result: err(`${cmdName} --manuscript <file>`, 2) }
+    }
+    const target = resolveCallerPath(flags.manuscript, callerCwd)
+    try {
+      return { ok: true, inputDigest: `sha256:${computeSafeFileSha256(target)}` }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      return { ok: false, result: err(`cannot hash --manuscript ${target}: ${msg}`) }
+    }
+  }
+  if (hasInputSha) {
+    if (flags['input-sha'] === 'true' || flags['input-sha'].trim() === '') {
+      return { ok: false, result: err(`${cmdName} --input-sha <id>`, 2) }
+    }
+    return { ok: true, inputDigest: flags['input-sha'].trim() }
+  }
+  return { ok: true }
+}
+
+function runVerify(rest: string[], callerCwd?: string): OcReviewCliResult {
+  const flags = parseSimpleFlags(rest)
+  const rawDir = flags.dir
+  if (rawDir === undefined || rawDir === 'true' || rawDir.trim() === '') {
+    return err(
+      'verify --dir <dir> [--exec|--unsafe-local-exec] [--script-root <root>] [--manuscript <file>|--input-sha <id>] [--timeout <sec>] [--batch-timeout <sec>] [--out <verification-report.json>]',
+      2,
+    )
+  }
+  const dir = resolveCallerPath(rawDir, callerCwd)
+  const execEnabled = flags.exec !== undefined && flags.exec !== 'false'
+  const unsafeLocalExec =
+    flags['unsafe-local-exec'] !== undefined && flags['unsafe-local-exec'] !== 'false'
+  let scriptRoot = dir
+  if (flags['script-root'] !== undefined) {
+    if (flags['script-root'] === 'true' || flags['script-root'].trim() === '') {
+      return err('verify --script-root <root>', 2)
+    }
+    scriptRoot = resolveCallerPath(flags['script-root'], callerCwd)
+  }
+  const inputRes = resolveInputDigestFlag('verify', flags, callerCwd)
+  if (!inputRes.ok) return inputRes.result
+  const inputDigest = inputRes.inputDigest
+  let timeoutMs = DEFAULT_VERIFY_TIMEOUT_MS
+  if (flags.timeout !== undefined) {
+    if (flags.timeout === 'true') {
+      return err('verify --timeout must be a positive number (seconds)', 2)
+    }
+    const sec = Number(flags.timeout.trim())
+    if (!Number.isFinite(sec) || sec <= 0) {
+      return err('verify --timeout must be a positive number (seconds)', 2)
+    }
+    timeoutMs = sec * 1000
+  }
+  let batchTimeoutMs = DEFAULT_BATCH_TIMEOUT_MS
+  if (flags['batch-timeout'] !== undefined) {
+    if (flags['batch-timeout'] === 'true') {
+      return err('verify --batch-timeout must be a positive number (seconds)', 2)
+    }
+    const sec = Number(flags['batch-timeout'].trim())
+    if (!Number.isFinite(sec) || sec <= 0) {
+      return err('verify --batch-timeout must be a positive number (seconds)', 2)
+    }
+    batchTimeoutMs = sec * 1000
+  }
+  let outPath = join(dir, 'verification-report.json')
+  if (flags.out !== undefined) {
+    if (flags.out === 'true' || flags.out.trim() === '') {
+      return err('verify --out <path>', 2)
+    }
+    outPath = resolveCallerPath(flags.out, callerCwd)
+  }
+
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+      .filter((n) => /^reviews-.*\.json$/.test(n))
+      .sort()
+  } catch {
+    return err(`cannot read dir: ${dir}`)
+  }
+  if (names.length === 0) return err(`no reviews-*.json in ${dir}`)
+
+  try {
+    if (!statSync(scriptRoot).isDirectory()) {
+      return err(`scriptRoot is not a directory: ${scriptRoot}`)
+    }
+  } catch {
+    return err(`cannot read scriptRoot: ${scriptRoot}`)
+  }
+
+  let validCount = 0
+  const badReasons: string[] = []
+  for (const name of names) {
+    try {
+      parseReviewFile(readFileSync(join(dir, name), 'utf8'), name)
+      validCount += 1
+    } catch (e) {
+      badReasons.push(e instanceof ReviewFormatError ? e.message : `${name}: cannot read file`)
+    }
+  }
+  if (validCount === 0) {
+    return err(`no valid reviews-*.json in ${dir} (${badReasons.join('; ')})`)
+  }
+
+  let report: VerificationReport
+  try {
+    report = verifyWitnessesInDir({
+      dir,
+      scriptRoot,
+      exec: execEnabled,
+      unsafeLocalExec,
+      ...(inputDigest !== undefined ? { inputDigest } : {}),
+      timeoutMs,
+      batchTimeoutMs,
+      parseReview: parseReviewFile,
+    })
+  } catch (e) {
+    return err(e instanceof Error ? e.message : String(e))
+  }
+
+  try {
+    mkdirSync(dirname(resolve(outPath)), { recursive: true })
+    writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    return err(`cannot write ${outPath}: ${msg}`)
+  }
+
+  const stdout = `${JSON.stringify({ ...report, reportPath: outPath }, null, 2)}\n${formatVerifySummaryLine(report)}\n`
+  return { exitCode: 0, stdout, stderr: '' }
 }
 
 function runLedger(rest: string[], callerCwd?: string): OcReviewCliResult {
@@ -1095,6 +1566,51 @@ function runCollate(rest: string[], callerCwd?: string): OcReviewCliResult {
     if (parsed === null) return err('collate --round must be a positive integer', 2)
     round = parsed
   }
+  let verificationReport: VerificationReport | undefined
+  if (flags.verification !== undefined) {
+    if (flags.verification === 'true' || flags.verification.trim() === '') {
+      return err('collate --verification <path>', 2)
+    }
+    const verPath = resolveCallerPath(flags.verification, callerCwd)
+    try {
+      verificationReport = parseVerificationReport(readFileSync(verPath, 'utf8'), verPath)
+    } catch (e) {
+      const msg =
+        e instanceof VerificationFormatError ? e.message : `cannot read verification report ${verPath}`
+      return err(msg)
+    }
+  }
+  // B4: 默认以调用方指定的 --script-root 或 --dir 作为可信脚本根,绝不盲信验证报告自报的 scriptRoot
+  let trustedScriptRoot = dir
+  if (flags['script-root'] !== undefined) {
+    if (flags['script-root'] === 'true' || flags['script-root'].trim() === '') {
+      return err('collate --script-root <root>', 2)
+    }
+    trustedScriptRoot = resolveCallerPath(flags['script-root'], callerCwd)
+  }
+  const inputRes = resolveInputDigestFlag('collate', flags, callerCwd)
+  if (!inputRes.ok) return inputRes.result
+  const inputDigest = inputRes.inputDigest
+  const scientificGate =
+    flags['scientific-gate'] !== undefined && flags['scientific-gate'] !== 'false'
+  let minFamilies: number | undefined
+  if (flags['min-families'] !== undefined) {
+    if (flags['min-families'] === 'true') {
+      return err('collate --min-families must be a positive integer', 2)
+    }
+    const parsed = parsePositiveInt(flags['min-families'])
+    if (parsed === null) return err('collate --min-families must be a positive integer', 2)
+    minFamilies = parsed
+  }
+  let maxResidual: number | undefined
+  if (flags['max-residual'] !== undefined) {
+    if (flags['max-residual'] === 'true') {
+      return err('collate --max-residual must be a non-negative number', 2)
+    }
+    const parsed = parseNonNegativeNumber(flags['max-residual'])
+    if (parsed === null) return err('collate --max-residual must be a non-negative number', 2)
+    maxResidual = parsed
+  }
   let names: string[]
   try {
     names = readdirSync(dir).filter((n) => /^reviews-.*\.json$/.test(n)).sort()
@@ -1106,6 +1622,7 @@ function runCollate(rest: string[], callerCwd?: string): OcReviewCliResult {
   // 不该让其余评审员的结果全部作废);--strict 恢复任一坏文件即 exit 1 的旧行为。
   const strict = flags.strict !== undefined
   const files: ReviewFile[] = []
+  const sourceFiles = new Map<ReviewFile, string>()
   const skipped: SkippedReview[] = []
   for (const name of names) {
     let text: string
@@ -1117,7 +1634,9 @@ function runCollate(rest: string[], callerCwd?: string): OcReviewCliResult {
       continue
     }
     try {
-      files.push(parseReviewFile(text, name))
+      const parsedFile = parseReviewFile(text, name)
+      files.push(parsedFile)
+      sourceFiles.set(parsedFile, name)
     } catch (e) {
       const msg = e instanceof ReviewFormatError ? e.message : String(e)
       if (strict) return err(msg)
@@ -1129,9 +1648,14 @@ function runCollate(rest: string[], callerCwd?: string): OcReviewCliResult {
     const detail = skipped.map((s) => `${s.file}: ${s.reason}`).join('; ')
     return err(`no valid reviews-*.json in ${dir} (${detail})`)
   }
-  const collateOpts: CollateOptions = {}
+  const collateOpts: CollateOptions = { sourceFiles, scriptRoot: trustedScriptRoot }
   if (ledger !== undefined) collateOpts.ledger = ledger
   if (round !== undefined) collateOpts.round = round
+  if (verificationReport !== undefined) collateOpts.verificationReport = verificationReport
+  if (inputDigest !== undefined) collateOpts.inputDigest = inputDigest
+  if (scientificGate) collateOpts.scientificGate = true
+  if (minFamilies !== undefined) collateOpts.minFamilies = minFamilies
+  if (maxResidual !== undefined) collateOpts.maxResidual = maxResidual
   const result = collateReviews(files, skipped, collateOpts)
   const md = renderSummaryMd(result)
   const mdPath =
@@ -1160,6 +1684,8 @@ export function runOcReviewCli(argv: string[], opts?: OcReviewCliOptions): OcRev
   switch (cmd) {
     case 'schema':
       return { exitCode: 0, stdout: `${REVIEW_JSON_SCHEMA}\n`, stderr: '' }
+    case 'verify':
+      return runVerify(rest, parsed.callerCwd)
     case 'collate':
       return runCollate(rest, parsed.callerCwd)
     case 'ledger':

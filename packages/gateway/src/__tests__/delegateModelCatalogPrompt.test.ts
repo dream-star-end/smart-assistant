@@ -138,20 +138,31 @@ describe('suggestDelegateModels(DELEGATE_MODEL_UNKNOWN 自愈候选)', () => {
 
 describe('buildAgentsSlot 注入「委派可用型号」', () => {
   it('ctx 注入投影 → 段出现在 slot 里', async () => {
-    const slot = await buildAgentsSlot({
-      agentId: 'main',
-      model: 'glm-5.3-zai',
-      delegateModelCatalog: {
-        models: [...mk(['deepseek-v4-flash'], 'ccb'), ...mk(['gpt-6-astra'], 'codex')],
-        projectionRevision: 'p1',
-        verifiedAt: 5,
-      },
-    })
-    assert.match(slot.content, /## 委派可用型号/)
-    assert.match(slot.content, /- CCB: `deepseek-v4-flash`/)
-    const section = slot.content.slice(slot.content.indexOf(DELEGATE_MODEL_SECTION_HEADING))
-      .split(/\n## /)[0]
-    assert.doesNotMatch(section, /- Codex:/)
+    const savedExempt = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+    Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+    try {
+      const slot = await buildAgentsSlot({
+        agentId: 'main',
+        model: 'glm-5.3-zai',
+        delegateModelCatalog: {
+          models: [
+            ...mk(['deepseek-v4-flash'], 'ccb'),
+            ...mk(['gpt-6-astra'], 'codex'),
+            ...mk(['cursor-grok-4.6-high'], 'cursor'),
+          ],
+          projectionRevision: 'p1',
+          verifiedAt: 5,
+        },
+      })
+      assert.match(slot.content, /## 委派可用型号/)
+      assert.match(slot.content, /- CCB: `deepseek-v4-flash`/)
+      const section = slot.content.slice(slot.content.indexOf(DELEGATE_MODEL_SECTION_HEADING))
+        .split(/\n## /)[0]
+      assert.match(section, /- Codex: `gpt-6-astra`/)
+      assert.doesNotMatch(section, /- Cursor:/)
+    } finally {
+      if (savedExempt !== undefined) process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = savedExempt
+    }
   })
   it('无投影(null)→ 提示行而非静默消失', async () => {
     const slot = await buildAgentsSlot({ agentId: 'main', model: 'glm-5.3-zai', delegateModelCatalog: null })
@@ -207,12 +218,19 @@ describe('commercial delegation catalog matches billed execution', () => {
         supported_efforts: [], supports_vision: false, capability_zero: false, supports_thinking: false })) })
     const advertised = [...text.matchAll(/^- [^:]+: (.+)$/gm)]
       .flatMap(line => [...line[1].matchAll(/`([^`]+)`/g)].map(match => match[1]))
-    assert.deepEqual(advertised, ['deepseek-v4-flash', 'grok-build'])
+    assert.deepEqual(advertised, ['deepseek-v4-flash', 'gpt-6-astra', 'grok-build'])
     for (const model of advertised) {
       assert.doesNotThrow(() => decideLocalExecution({ view: catalog, agent: { id: 'member' },
         model, kind: 'billed_delegate', env: {} }))
     }
-    for (const m of models.slice(2)) assert.ok(!text.includes(m.modelId), m.modelId)
+    for (const m of models.slice(3)) {
+      assert.ok(!text.includes(m.modelId), m.modelId)
+      assert.throws(
+        () => decideLocalExecution({ view: catalog, agent: { id: 'member' },
+          model: m.modelId, kind: 'billed_delegate', env: {} }),
+        (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_CODEX_UNSUPPORTED',
+      )
+    }
     assert.match(text, /DELEGATE_CODEX_UNSUPPORTED/)
   })
   it('selfhost exemption retains every available engine', () => {

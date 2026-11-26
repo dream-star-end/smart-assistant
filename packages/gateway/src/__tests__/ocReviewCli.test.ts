@@ -8,7 +8,7 @@
  *     help/schema/未知命令、同一输入字节级确定性。
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
@@ -27,6 +27,15 @@ import {
   upsertLedgerEntry,
   type ReviewFile,
 } from '../ocReviewCli.js'
+import {
+  computeDefectIdentityKey,
+  computeFindingDigest,
+  computeScientificMetrics,
+  formatVerifySummaryLine,
+  inferModelFamily,
+  parseVerificationReport,
+  verifyWitnessesInDir,
+} from '../ocReviewVerify.js'
 
 function review(model: string, verdict: ReviewFile['verdict'], findings: ReviewFile['findings'], role?: string): ReviewFile {
   const file: ReviewFile = { reviewer: { model }, verdict, findings }
@@ -1128,5 +1137,839 @@ describe('T2 审计阻断修复回归 (#4/#5/#6, OCV5-878)', () => {
     assert.equal(res.suppressedFlipFlops.length, 0)
     assert.equal(res.activePriorityTotals.P0, 1)
     assert.equal(res.gate.status, 'FIX_REQUIRED')
+  })
+})
+
+describe('科学深审反例法庭、安全边界与 Chao1 门禁 (OCV5-895)', () => {
+  it('inferModelFamily 确定性归类 11 类独立家族(含简写/大小写)并保留未知 slug 回退', () => {
+    assert.equal(inferModelFamily('gemini-4-pro'), 'google')
+    assert.equal(inferModelFamily('Gemini'), 'google')
+    assert.equal(inferModelFamily('box-api-claude-opus-5-5'), 'anthropic')
+    assert.equal(inferModelFamily('Claude'), 'anthropic')
+    assert.equal(inferModelFamily('gpt-6.2-astra'), 'openai')
+    assert.equal(inferModelFamily('GPT'), 'openai')
+    assert.equal(inferModelFamily('o3-mini'), 'openai')
+    assert.equal(inferModelFamily('grok-build'), 'xai')
+    assert.equal(inferModelFamily('Grok'), 'xai')
+    assert.equal(inferModelFamily('deepseek-v4-flash'), 'deepseek')
+    assert.equal(inferModelFamily('kimi-k3'), 'moonshot')
+    assert.equal(inferModelFamily('k3.1-pro'), 'moonshot')
+    assert.equal(inferModelFamily('qwen3.7-plus-go'), 'qwen')
+    assert.equal(inferModelFamily('glm-5.3'), 'zhipu')
+    assert.equal(inferModelFamily('minimax-m3-go'), 'minimax')
+    assert.equal(inferModelFamily('step-3'), 'step')
+    assert.equal(inferModelFamily('cleanroom-sympy'), 'cleanroom')
+    assert.equal(inferModelFamily('Custom-Lab-Model-v2'), 'custom-lab-model-v2')
+  })
+
+  it('parseReviewFile 与 schema 支持科学验证字段且严格校验坏枚举', () => {
+    const schemaRes = runOcReviewCli(['schema'])
+    assert.equal(schemaRes.exitCode, 0)
+    const schema = JSON.parse(schemaRes.stdout)
+    assert.equal(schema.properties.reviewer.properties.model_family.type, 'string')
+    const fProps = schema.properties.findings.items.properties
+    assert.equal(fProps.repro_script.type, 'string')
+    assert.deepEqual(fProps.verified_by_machine.enum, ['confirmed', 'refuted', 'unverified'])
+    assert.equal(fProps.verification_output.type, 'string')
+
+    const parsed = parseReviewFile(
+      JSON.stringify({
+        reviewer: { model: 'gpt-6.2-astra', model_family: 'openai' },
+        verdict: 'major',
+        findings: [
+          {
+            location: '§3.2',
+            severity: 'blocker',
+            category: 'math_physics',
+            model_family: 'openai',
+            repro_script: 'repro_sign.py',
+            verified_by_machine: 'confirmed',
+            verification_output: 'diff=6.56mm',
+            issue: '四级旋转链双重扣除拉普拉斯项',
+          },
+        ],
+      }),
+      'reviews-codex.json',
+    )
+    assert.equal(parsed.reviewer.model_family, 'openai')
+    assert.equal(parsed.findings[0].repro_script, 'repro_sign.py')
+    assert.equal(parsed.findings[0].verified_by_machine, 'confirmed')
+    assert.equal(parsed.findings[0].verification_output, 'diff=6.56mm')
+
+    assert.throws(
+      () =>
+        parseReviewFile(
+          JSON.stringify({
+            reviewer: { model: 'm' },
+            verdict: 'major',
+            findings: [{ location: '§1', severity: 'major', verified_by_machine: 'maybe', issue: 'x' }],
+          }),
+          'bad.json',
+        ),
+      /findings\[0\]\.verified_by_machine/,
+    )
+  })
+
+  it('B2-①: oc-review verify 默认与无内核沙箱时的 --exec 均只采集 findingDigest+scriptSha256,绝不执行脚本', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-verify-noexec-'))
+    try {
+      const marker = join(dir, 'should_not_exist.txt')
+      writeFileSync(
+        join(dir, 'side_effect.py'),
+        `import os\nopen(${JSON.stringify(marker)}, "w").write("RAN")\nprint('OC_WITNESS_VERDICT: {"status":"confirmed","summary":"ran","finding_digest":"' + os.environ.get("OC_WITNESS_FINDING_DIGEST","") + '"}')\n`,
+      )
+      writeFileSync(
+        join(dir, 'reviews-a.json'),
+        JSON.stringify({
+          reviewer: { model: 'gpt-6.2-astra' },
+          verdict: 'reject',
+          findings: [
+            { location: '§2.1', severity: 'blocker', issue: '默认不应执行', repro_script: 'side_effect.py' },
+          ],
+        }),
+      )
+
+      const res = runOcReviewCli(['verify', '--dir', dir])
+      assert.equal(res.exitCode, 0, res.stderr)
+      assert.match(res.stdout, /VERIFY: confirmed=0 refuted=0 unverified=1\n$/)
+      assert.equal(existsSync(marker), false, 'default verify must never execute witness scripts')
+
+      const report = parseVerificationReport(
+        readFileSync(join(dir, 'verification-report.json'), 'utf8'),
+        'verification-report.json',
+      )
+      assert.equal(report.executionMode, 'collect_only')
+      assert.equal(report.entries.length, 1)
+      assert.equal(report.entries[0].status, 'unverified')
+      assert.equal(report.entries[0].reason, 'exec_disabled_by_default')
+      assert.match(report.entries[0].findingDigest, /^[0-9a-f]{64}$/)
+      assert.match(report.entries[0].scriptSha256 ?? '', /^[0-9a-f]{64}$/)
+
+      // B2-①b: 无内核强制只读/断网沙箱时,传 --exec 必须 fail-closed 退回只采集,绝不把普通执行伪装成隔离!
+      const execFallback = runOcReviewCli(['verify', '--dir', dir, '--exec'])
+      assert.equal(execFallback.exitCode, 0, execFallback.stderr)
+      assert.match(execFallback.stdout, /VERIFY: confirmed=0 refuted=0 unverified=1\n$/)
+      assert.equal(existsSync(marker), false, '--exec without OS sandbox must fall back to collect-only')
+      const fallbackReport = parseVerificationReport(
+        readFileSync(join(dir, 'verification-report.json'), 'utf8'),
+        'verification-report.json',
+      )
+      assert.equal(fallbackReport.executionMode, 'collect_only')
+      assert.equal(fallbackReport.entries[0].status, 'unverified')
+      assert.equal(fallbackReport.entries[0].reason, 'sandbox_unavailable_collect_only')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('B2-② + B3: --unsafe-local-exec 临时 cwd 不污染原目录、强制显式含 finding_digest 的 OC_WITNESS_VERDICT 协议、崩溃/截断/非零退出/缺失裁决一律 unverified、路径逃逸全部拒绝', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-verify-exec-'))
+    const outside = mkdtempSync(join(tmpdir(), 'oc-verify-out-'))
+    try {
+      // 1. 合法 confirmed (通过 OC_WITNESS_VERDICT_FILE + 尝试向 cwd 写垃圾文件验证临时目录隔离)
+      writeFileSync(
+        join(dir, 'repro_confirmed_file.py'),
+        [
+          'import json, os',
+          'open("cwd_pollution.txt", "w").write("dirty")',
+          'assert "OC_WITNESS_VERDICT_FILE" in os.environ',
+          'with open(os.environ["OC_WITNESS_VERDICT_FILE"], "w") as f:',
+          '    json.dump({"status": "confirmed", "summary": "diff=6.56mm confirmed", "finding_digest": os.environ["OC_WITNESS_FINDING_DIGEST"]}, f)',
+          'print("CONFIRMED:" + "A" * 600)',
+        ].join('\n') + '\n',
+      )
+      // 2. 合法 refuted (通过 stdout OC_WITNESS_VERDICT 哨兵行 + 必填 finding_digest, exit 0)
+      writeFileSync(
+        join(dir, 'repro_refuted_stdout.py'),
+        [
+          'import json, os',
+          'print("checking Frisch-Waugh-Lovell identity...")',
+          'print("OC_WITNESS_VERDICT: " + json.dumps({"status": "refuted", "summary": "FWL identity diff=7.55e-15; claim refuted", "finding_digest": os.environ["OC_WITNESS_FINDING_DIGEST"]}))',
+        ].join('\n') + '\n',
+      )
+      // 3. 非零退出 exit 1 → 必须 unverified (绝不判 refuted!)
+      writeFileSync(join(dir, 'crash_exit1.py'), 'import sys\nprint("oops")\nsys.exit(1)\n')
+      // 4. ImportError 崩溃 → 必须 unverified (绝不判 refuted!)
+      writeFileSync(join(dir, 'crash_import.py'), 'import nonexistent_physics_pkg_xyz_999\n')
+      // 5. SyntaxError 崩溃 → 必须 unverified (绝不判 refuted!)
+      writeFileSync(join(dir, 'crash_syntax.py'), 'def broken(:\n  pass\n')
+      // 6. exit 0 但缺失 OC_WITNESS_VERDICT → 必须 unverified
+      writeFileSync(join(dir, 'exit0_no_verdict.py'), 'print("just plain stdout without verdict")\n')
+      // 7. exit 0 但 status 为 skip / 缺失 finding_digest / digest 不匹配 / stdout 截断 → 必须 unverified
+      writeFileSync(
+        join(dir, 'exit0_skip.py'),
+        'print(\'OC_WITNESS_VERDICT: {"status":"skip","summary":"skipped"}\')\n',
+      )
+      writeFileSync(
+        join(dir, 'exit0_missing_digest.py'),
+        'print(\'OC_WITNESS_VERDICT: {"status":"refuted","summary":"no digest"}\')\n',
+      )
+      writeFileSync(
+        join(dir, 'exit0_bad_digest.py'),
+        'print(\'OC_WITNESS_VERDICT: {"status":"refuted","summary":"forged","finding_digest":"0000"}\')\n',
+      )
+      writeFileSync(
+        join(dir, 'exit0_truncated_stdout.py'),
+        [
+          'import json, os',
+          'print("OC_WITNESS_VERDICT: " + json.dumps({"status": "refuted", "summary": "early fake", "finding_digest": os.environ["OC_WITNESS_FINDING_DIGEST"]}))',
+          'print("X" * (300 * 1024))',
+        ].join('\n') + '\n',
+      )
+      // 8. 非法扩展名 + 外部脚本 + 符号链接出逃
+      writeFileSync(join(dir, 'evil.sh'), '#!/bin/sh\nexit 0\n')
+      const outsidePy = join(outside, 'outside.py')
+      writeFileSync(outsidePy, 'print("SHOULD NOT RUN")\n')
+      symlinkSync(outsidePy, join(dir, 'escape_link.py'))
+
+      writeFileSync(
+        join(dir, 'reviews-a.json'),
+        JSON.stringify({
+          reviewer: { model: 'gpt-6.2-astra' },
+          verdict: 'reject',
+          findings: [
+            { location: '§2.1', severity: 'blocker', issue: '真实反例(文件裁决)', repro_script: 'repro_confirmed_file.py' },
+            { location: '§3.2', severity: 'blocker', issue: '恒等式证伪(stdout裁决)', repro_script: 'repro_refuted_stdout.py' },
+            { location: '§3.3', severity: 'blocker', issue: '普通exit1崩溃', repro_script: 'crash_exit1.py' },
+            { location: '§3.4', severity: 'blocker', issue: '缺依赖ImportError', repro_script: 'crash_import.py' },
+            { location: '§3.5', severity: 'blocker', issue: '语法错SyntaxError', repro_script: 'crash_syntax.py' },
+            { location: '§3.6', severity: 'blocker', issue: 'exit0缺裁决', repro_script: 'exit0_no_verdict.py' },
+            { location: '§3.7', severity: 'blocker', issue: 'exit0状态skip', repro_script: 'exit0_skip.py' },
+            { location: '§3.7b', severity: 'blocker', issue: '缺失finding_digest', repro_script: 'exit0_missing_digest.py' },
+            { location: '§3.8', severity: 'blocker', issue: 'digest不匹配', repro_script: 'exit0_bad_digest.py' },
+            { location: '§3.9', severity: 'blocker', issue: 'stdout超限截断', repro_script: 'exit0_truncated_stdout.py' },
+            { location: '§4.1', severity: 'blocker', issue: '相对路径穿越', repro_script: '../outside.py' },
+            { location: '§4.2', severity: 'blocker', issue: '绝对路径逃逸', repro_script: outsidePy },
+            { location: '§4.3', severity: 'blocker', issue: '符号链接出逃', repro_script: 'escape_link.py' },
+            { location: '§4.4', severity: 'blocker', issue: '非法扩展名', repro_script: 'evil.sh' },
+            { location: '§4.5', severity: 'blocker', issue: '文件缺失', repro_script: 'missing.py' },
+          ],
+        }),
+      )
+
+      const missingDir = runOcReviewCli(['verify'])
+      assert.equal(missingDir.exitCode, 2)
+      assert.match(missingDir.stderr, /verify --dir/)
+
+      const res = runOcReviewCli([
+        'verify',
+        '--dir',
+        dir,
+        '--script-root',
+        dir,
+        '--unsafe-local-exec',
+        '--timeout',
+        '15',
+      ])
+      assert.equal(res.exitCode, 0, res.stderr)
+      const lines = res.stdout.trimEnd().split('\n')
+      assert.equal(lines[lines.length - 1], 'VERIFY: confirmed=1 refuted=1 unverified=13')
+
+      // 原工作目录绝不能被见证脚本的 cwd 写入污染!
+      assert.equal(existsSync(join(dir, 'cwd_pollution.txt')), false)
+
+      const reportPath = join(dir, 'verification-report.json')
+      const report = parseVerificationReport(readFileSync(reportPath, 'utf8'), reportPath)
+      assert.equal(report.executionMode, 'unsafe_local_exec')
+      assert.equal(report.entries.length, 15)
+      assert.equal(formatVerifySummaryLine(report), 'VERIFY: confirmed=1 refuted=1 unverified=13')
+
+      assert.equal(report.entries[0].status, 'confirmed')
+      assert.equal(report.entries[0].summary, 'diff=6.56mm confirmed')
+      assert.ok(report.entries[0].outputPreview.length <= 500)
+
+      assert.equal(report.entries[1].status, 'refuted')
+      assert.match(report.entries[1].summary ?? '', /FWL identity diff=7\.55e-15/)
+
+      // 任何脚本崩溃/非零退出/缺裁决/坏状态/缺失或错配 digest/stdout 截断均保持 unverified
+      assert.equal(report.entries[2].status, 'unverified')
+      assert.equal(report.entries[2].reason, 'script_error_exit_1')
+      assert.equal(report.entries[3].status, 'unverified')
+      assert.match(report.entries[3].reason ?? '', /^script_error_exit_/)
+      assert.equal(report.entries[4].status, 'unverified')
+      assert.match(report.entries[4].reason ?? '', /^script_error_exit_/)
+      assert.equal(report.entries[5].status, 'unverified')
+      assert.equal(report.entries[5].reason, 'missing_witness_verdict')
+      assert.equal(report.entries[6].status, 'unverified')
+      assert.match(report.entries[6].reason ?? '', /invalid_witness_verdict_status/)
+      assert.equal(report.entries[7].status, 'unverified')
+      assert.equal(report.entries[7].reason, 'missing_witness_verdict_digest')
+      assert.equal(report.entries[8].status, 'unverified')
+      assert.equal(report.entries[8].reason, 'witness_verdict_digest_mismatch')
+      assert.equal(report.entries[9].status, 'unverified')
+      assert.equal(report.entries[9].reason, 'stdout_truncated_untrusted_verdict')
+
+      assert.equal(report.entries[10].status, 'unverified')
+      assert.match(report.entries[10].reason ?? '', /escapes scriptRoot/)
+      assert.equal(report.entries[11].status, 'unverified')
+      assert.match(report.entries[11].reason ?? '', /escapes scriptRoot/)
+      assert.equal(report.entries[12].status, 'unverified')
+      assert.match(report.entries[12].reason ?? '', /symlink escapes scriptRoot/)
+      assert.equal(report.entries[13].status, 'unverified')
+      assert.match(report.entries[13].reason ?? '', /only \.py and \.m allowed/)
+      assert.equal(report.entries[14].status, 'unverified')
+      assert.match(report.entries[14].reason ?? '', /not found/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('B2-②b: --unsafe-local-exec 全路径回收整组子进程(含正常退出与超时无孤儿残留)且 --batch-timeout 超限后停止启动剩余见证', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-verify-timeout-'))
+    try {
+      // 0. 正常退出但后台派生孙进程:验证 finally 仍 SIGKILL 整个进程组无孤儿残留!
+      writeFileSync(
+        join(dir, 'spawn_and_exit0.py'),
+        [
+          'import json, os, subprocess',
+          'child = subprocess.Popen(["python3", "-c", "import time; time.sleep(60)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)',
+          'print(f"BG_PID={child.pid}", flush=True)',
+          'print("OC_WITNESS_VERDICT: " + json.dumps({"status": "confirmed", "summary": "bg_spawned", "finding_digest": os.environ["OC_WITNESS_FINDING_DIGEST"]}), flush=True)',
+        ].join('\n') + '\n',
+      )
+      // 1. 派生孙进程并打印其 PID 后长时间挂起,验证超时 SIGKILL 整个进程组
+      writeFileSync(
+        join(dir, 'spawn_and_hang.py'),
+        [
+          'import subprocess, sys, time',
+          'child = subprocess.Popen(["python3", "-c", "import time; time.sleep(60)"])',
+          'print(f"CHILD_PID={child.pid}", flush=True)',
+          'time.sleep(60)',
+        ].join('\n') + '\n',
+      )
+      writeFileSync(
+        join(dir, 'slow_witness.py'),
+        'import json, os, time\ntime.sleep(3)\nprint("OC_WITNESS_VERDICT: " + json.dumps({"status":"confirmed","summary":"slow","finding_digest":os.environ["OC_WITNESS_FINDING_DIGEST"]}))\n',
+      )
+      writeFileSync(
+        join(dir, 'reviews-timeout.json'),
+        JSON.stringify({
+          reviewer: { model: 'gpt-6.2-astra' },
+          verdict: 'reject',
+          findings: [
+            { location: '§1.0', severity: 'blocker', issue: 'bg-exit0', repro_script: 'spawn_and_exit0.py' },
+            { location: '§1.1', severity: 'blocker', issue: 'hang-1', repro_script: 'spawn_and_hang.py' },
+            { location: '§1.2', severity: 'blocker', issue: 'slow-2', repro_script: 'slow_witness.py' },
+            { location: '§1.3', severity: 'blocker', issue: 'slow-3', repro_script: 'slow_witness.py' },
+            { location: '§1.4', severity: 'blocker', issue: 'slow-4', repro_script: 'slow_witness.py' },
+          ],
+        }),
+      )
+
+      const res = runOcReviewCli([
+        'verify',
+        '--dir',
+        dir,
+        '--unsafe-local-exec',
+        '--timeout',
+        '2',
+        '--batch-timeout',
+        '5',
+      ])
+      assert.equal(res.exitCode, 0, res.stderr)
+      assert.match(res.stdout, /VERIFY: confirmed=1 refuted=0 unverified=4\n$/)
+
+      const report = parseVerificationReport(
+        readFileSync(join(dir, 'verification-report.json'), 'utf8'),
+        'verification-report.json',
+      )
+      // 第 0 条正常 exit 0 但派生的后台孙进程也必须已被 SIGKILL 回收 (ESRCH)!
+      assert.equal(report.entries[0].status, 'confirmed')
+      const bgMatch = /BG_PID=(\d+)/.exec(report.entries[0].outputPreview)
+      assert.ok(bgMatch, `expected BG_PID in outputPreview: ${report.entries[0].outputPreview}`)
+      assert.throws(() => process.kill(Number(bgMatch[1]), 0), /ESRCH/)
+
+      // 第 1 条超时并回收整个进程组:检查孙进程 PID 已死亡 (ESRCH)
+      assert.equal(report.entries[1].status, 'unverified')
+      assert.match(report.entries[1].reason ?? '', /timed out/)
+      const pidMatch = /CHILD_PID=(\d+)/.exec(report.entries[1].outputPreview)
+      assert.ok(pidMatch, `expected CHILD_PID in outputPreview: ${report.entries[1].outputPreview}`)
+      const childPid = Number(pidMatch[1])
+      assert.throws(() => process.kill(childPid, 0), /ESRCH/)
+
+      // 批预算 5s 耗尽后,末条不再启动直接记 batch_timeout_exceeded
+      assert.equal(report.entries[4].status, 'unverified')
+      assert.equal(report.entries[4].reason, 'batch_timeout_exceeded')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('B4: 禁作者自报降级 P0、改证据/升 P0/标 new_evidence/改稿件/改脚本均使旧报告失效、新机器 confirmed 与旧账本冲突强制重开', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-sci-b4-'))
+    const otherRoot = mkdtempSync(join(tmpdir(), 'oc-sci-b4-other-'))
+    try {
+      // 场景 A: 作者在评审 JSON 自填 verified_by_machine="refuted" 但无权威 --verification 报告 → 绝不能消除 P0!
+      const selfClaim = collateReviews(
+        [
+          review('grok-build', 'reject', [
+            {
+              location: '§3.2',
+              severity: 'blocker',
+              category: 'math_physics',
+              verified_by_machine: 'refuted',
+              verification_output: 'self-claimed refuted',
+              issue: '声称 Beutler 放大应为 1.66x',
+            },
+          ]),
+          review('gemini-4-pro', 'accept', []),
+        ],
+        [],
+        { scientificGate: true },
+      )
+      assert.equal(selfClaim.activePriorityTotals.P0, 1)
+      assert.equal(selfClaim.machineRefuted?.length, 0)
+      assert.equal(selfClaim.scientificMetrics?.unverifiedP0, 1)
+      assert.equal(selfClaim.scientificMetrics?.refutedP0, 0)
+      assert.equal(selfClaim.gate.status, 'FIX_REQUIRED')
+
+      // 场景 B: 真实 verify --unsafe-local-exec --manuscript 证伪两家多模型误判 → 通过;
+      // 一旦改证据/升 P2→P0/标 new_evidence/改稿件/改脚本/换 scriptRoot,旧报告立刻失效恢复活跃 P0!
+      const manuscriptPath = join(dir, 'paper-v1.md')
+      writeFileSync(manuscriptPath, '# Manuscript v1\nEquation (1): factor = 2.86x\n')
+      const scriptPath = join(dir, 'check_fwl_identity.py')
+      writeFileSync(
+        scriptPath,
+        'import json, os\nprint("OC_WITNESS_VERDICT: " + json.dumps({"status": "refuted", "summary": "FWL exact identity diff=7.55e-15; 2.86x holds", "finding_digest": os.environ["OC_WITNESS_FINDING_DIGEST"]}))\n',
+      )
+      writeFileSync(
+        join(dir, 'reviews-grok.json'),
+        JSON.stringify({
+          reviewer: { model: 'grok-build', role: '红队盲审' },
+          verdict: 'minor',
+          findings: [
+            {
+              location: '§3.2',
+              severity: 'minor',
+              priority: 'P2',
+              category: 'math_physics',
+              evidence: 'old weak heuristic estimate',
+              repro_script: 'check_fwl_identity.py',
+              issue: '声称双差消钟后 Beutler 放大从 2.86x 降到 1.66x',
+            },
+          ],
+        }),
+      )
+      writeFileSync(
+        join(dir, 'reviews-gemini.json'),
+        JSON.stringify({
+          reviewer: { model: 'gemini-4-pro', role: '切片2审查' },
+          verdict: 'reject',
+          findings: [
+            {
+              location: 'section 3.2',
+              severity: 'blocker',
+              category: 'math_physics',
+              repro_script: 'check_fwl_identity.py',
+              issue: '独立声称 Beutler 放大应为 1.66x',
+            },
+          ],
+        }),
+      )
+
+      const verifyRes = runOcReviewCli([
+        'verify',
+        '--dir',
+        dir,
+        '--manuscript',
+        manuscriptPath,
+        '--unsafe-local-exec',
+      ])
+      assert.equal(verifyRes.exitCode, 0, verifyRes.stderr)
+      assert.match(verifyRes.stdout, /VERIFY: confirmed=0 refuted=2 unverified=0\n$/)
+
+      const verPath = join(dir, 'verification-report.json')
+      const colPass = runOcReviewCli([
+        'collate',
+        '--dir',
+        dir,
+        '--manuscript',
+        manuscriptPath,
+        '--verification',
+        verPath,
+        '--scientific-gate',
+      ])
+      assert.equal(colPass.exitCode, 0, colPass.stderr)
+      const passJson = JSON.parse(readFileSync(join(dir, 'review-summary.json'), 'utf8'))
+      assert.equal(passJson.consensus.length, 0)
+      assert.equal(passJson.activePriorityTotals.P0, 0)
+      assert.equal(passJson.machineRefuted.length, 2)
+      assert.equal(passJson.scientificMetrics.refutedP0, 1)
+      assert.equal(passJson.gate.status, 'PASS_READY')
+      const md = readFileSync(join(dir, 'review-summary.md'), 'utf8')
+      assert.match(md, /## 机器反例证伪（已自动排除，防多模型集体误判）/)
+      assert.match(md, /## 科学深审门禁（反例仲裁 \+ Chao1 残余估算）/)
+
+      // B4-2a (R2 审计反例): 只改 evidence + 升 P2→P0 + 标 new_evidence=true,不改 issue/location/脚本!
+      // 旧 refuted 绝不得静默折叠新 P0!
+      writeFileSync(
+        join(dir, 'reviews-grok.json'),
+        JSON.stringify({
+          reviewer: { model: 'grok-build', role: '红队盲审' },
+          verdict: 'minor',
+          findings: [
+            {
+              location: '§3.2',
+              severity: 'minor',
+              priority: 'P0',
+              category: 'math_physics',
+              evidence: 'new exact counterexample derivation in eq (12)',
+              new_evidence: true,
+              repro_script: 'check_fwl_identity.py',
+              issue: '声称双差消钟后 Beutler 放大从 2.86x 降到 1.66x',
+            },
+          ],
+        }),
+      )
+      const colNewEvidence = runOcReviewCli([
+        'collate',
+        '--dir',
+        dir,
+        '--manuscript',
+        manuscriptPath,
+        '--verification',
+        verPath,
+        '--scientific-gate',
+      ])
+      assert.equal(colNewEvidence.exitCode, 0, colNewEvidence.stderr)
+      const newEvJson = JSON.parse(readFileSync(join(dir, 'review-summary.json'), 'utf8'))
+      assert.equal(newEvJson.activePriorityTotals.P0, 1)
+      assert.equal(newEvJson.machineRefuted.length, 1)
+      assert.equal(newEvJson.gate.status, 'FIX_REQUIRED')
+
+      // B4-2b: 只修改稿件内容(reviews-gemini.json 与脚本均未动) → inputDigest 失配,连未改的 gemini 也恢复活跃 P0!
+      writeFileSync(manuscriptPath, '# Manuscript v2\nEquation (1): factor = 1.66x (edited)\n')
+      const colEditedManuscript = runOcReviewCli([
+        'collate',
+        '--dir',
+        dir,
+        '--manuscript',
+        manuscriptPath,
+        '--verification',
+        verPath,
+        '--scientific-gate',
+      ])
+      assert.equal(colEditedManuscript.exitCode, 0, colEditedManuscript.stderr)
+      const msJson = JSON.parse(readFileSync(join(dir, 'review-summary.json'), 'utf8'))
+      assert.equal(msJson.activePriorityTotals.P0, 2)
+      assert.equal(msJson.machineRefuted.length, 0)
+      assert.equal(msJson.gate.status, 'FIX_REQUIRED')
+
+      // 恢复 v1 稿件后校验 --script-root 不一致也必须 fail-closed(绝不盲信报告自带 scriptRoot)
+      writeFileSync(manuscriptPath, '# Manuscript v1\nEquation (1): factor = 2.86x\n')
+      const colWrongRoot = runOcReviewCli([
+        'collate',
+        '--dir',
+        dir,
+        '--script-root',
+        otherRoot,
+        '--manuscript',
+        manuscriptPath,
+        '--verification',
+        verPath,
+        '--scientific-gate',
+      ])
+      assert.equal(colWrongRoot.exitCode, 0, colWrongRoot.stderr)
+      const wrongRootJson = JSON.parse(readFileSync(join(dir, 'review-summary.json'), 'utf8'))
+      assert.equal(wrongRootJson.activePriorityTotals.P0, 2)
+      assert.equal(wrongRootJson.machineRefuted.length, 0)
+
+      // B4-2c: 磁盘脚本被修改 → scriptSha256 失配,全部退回 unverified!
+      writeFileSync(scriptPath, 'print("tampered")\n')
+      const colStaleScript = runOcReviewCli([
+        'collate',
+        '--dir',
+        dir,
+        '--manuscript',
+        manuscriptPath,
+        '--verification',
+        verPath,
+        '--scientific-gate',
+      ])
+      assert.equal(colStaleScript.exitCode, 0, colStaleScript.stderr)
+      const staleJson = JSON.parse(readFileSync(join(dir, 'review-summary.json'), 'utf8'))
+      assert.equal(staleJson.activePriorityTotals.P0, 2)
+      assert.equal(staleJson.machineRefuted.length, 0)
+      assert.equal(staleJson.gate.status, 'FIX_REQUIRED')
+
+      // B4-3: 新机器 confirmed 与旧账本 accepted/rejected_with_evidence 冲突 → 严禁静默折叠,强制重开!
+      const ledgerPath = join(dir, 'decision-ledger.json')
+      assert.equal(
+        runOcReviewCli([
+          'ledger',
+          'record',
+          '--file',
+          ledgerPath,
+          '--anchor',
+          '§5.1',
+          '--topic',
+          '倾转底座门控',
+          '--decision',
+          'rejected_with_evidence',
+          '--reason',
+          '首轮误判以为已修复',
+          '--round',
+          '1',
+        ]).exitCode,
+        0,
+      )
+      writeFileSync(
+        join(dir, 'repro_confirmed_opt.py'),
+        'import json, os\nprint("OC_WITNESS_VERDICT: " + json.dumps({"status": "confirmed", "summary": "7 production callsites missing opt", "finding_digest": os.environ["OC_WITNESS_FINDING_DIGEST"]}))\n',
+      )
+      writeFileSync(
+        join(dir, 'reviews-grok.json'),
+        JSON.stringify({
+          reviewer: { model: 'grok-build' },
+          verdict: 'reject',
+          findings: [
+            {
+              location: '§5.1',
+              severity: 'blocker',
+              category: 'code_data_mismatch',
+              topic: '倾转底座门控',
+              repro_script: 'repro_confirmed_opt.py',
+              issue: '7 处生产调用链未传 opt 静默回退旧模型',
+            },
+          ],
+        }),
+      )
+      writeFileSync(
+        join(dir, 'reviews-gemini.json'),
+        JSON.stringify({ reviewer: { model: 'gemini-4-pro' }, verdict: 'accept', findings: [] }),
+      )
+      assert.equal(runOcReviewCli(['verify', '--dir', dir, '--unsafe-local-exec']).exitCode, 0)
+      const conflictRun = runOcReviewCli([
+        'collate',
+        '--dir',
+        dir,
+        '--ledger',
+        ledgerPath,
+        '--verification',
+        verPath,
+        '--scientific-gate',
+        '--round',
+        '2',
+      ])
+      assert.equal(conflictRun.exitCode, 0, conflictRun.stderr)
+      const conflictJson = JSON.parse(readFileSync(join(dir, 'review-summary.json'), 'utf8'))
+      assert.equal(conflictJson.suppressedFlipFlops.length, 0)
+      assert.equal(conflictJson.activePriorityTotals.P0, 1)
+      assert.equal(conflictJson.scientificMetrics.confirmedP0, 1)
+      assert.equal(conflictJson.gate.status, 'FIX_REQUIRED')
+      const reopened = conflictJson.sole.find((s: any) => s.anchor === 'sec:5.1')
+      assert.ok(reopened)
+      assert.equal(reopened.findings[0].reopenedWithNewEvidence, true)
+      assert.equal(reopened.findings[0].authoritativeVerification, 'confirmed')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+      rmSync(otherRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('B6 精确不变量回归: 同模型自定义标签不造第二家族、跨评审补写章节号(Fig.4 vs Fig.4/§2)不拆桶、同节异 topic 独立分桶与 4 态科学闸门', () => {
+    // B6-1a: 1 份 GPT 评审文件里 finding 写了 model_family:"GPT" → 严格只计 1 个家族 openai → INSUFFICIENT_COVERAGE
+    const singleGpt = collateReviews(
+      [
+        {
+          reviewer: { model: 'gpt-6.2-astra' },
+          verdict: 'minor',
+          findings: [
+            {
+              location: '§2',
+              severity: 'minor',
+              category: 'style',
+              model_family: 'GPT',
+              issue: '措辞微调',
+            },
+          ],
+        },
+      ],
+      [],
+      { scientificGate: true },
+    )
+    assert.deepEqual(singleGpt.scientificMetrics?.distinctFamilies, ['openai'])
+    assert.equal(singleGpt.scientificMetrics?.familyCount, 1)
+    assert.equal(singleGpt.gate.status, 'INSUFFICIENT_COVERAGE')
+
+    // B6-1b (R2 审计反例 2): 两份评审的 reviewer.model 都是 gpt-6.2-astra;
+    // 第二份把 reviewer.model_family 改成未知角色标签 "review-team-B"(或冲突家族 "Anthropic") → 仍严格只计 1 个家族!
+    const spoofedSameModel = collateReviews(
+      [
+        {
+          reviewer: { model: 'gpt-6.2-astra', model_family: 'OpenAI' },
+          verdict: 'accept',
+          findings: [],
+        },
+        {
+          reviewer: { model: 'gpt-6.2-astra', model_family: 'review-team-B' },
+          verdict: 'accept',
+          findings: [],
+        },
+        {
+          reviewer: { model: 'gpt-6.2-astra', model_family: 'Anthropic' },
+          verdict: 'accept',
+          findings: [],
+        },
+      ],
+      [],
+      { scientificGate: true },
+    )
+    assert.deepEqual(spoofedSameModel.scientificMetrics?.distinctFamilies, ['openai'])
+    assert.equal(spoofedSameModel.scientificMetrics?.familyCount, 1)
+    assert.equal(spoofedSameModel.gate.status, 'INSUFFICIENT_COVERAGE')
+
+    // B6-2a: 同一个问题 location 从 "§2" 改为 "§2 Fig. 4" → f1 仍为 1, chao1Residual 仍为 0, PASS_READY 不变!
+    const singleAnchor = collateReviews(
+      [
+        review('gpt-6.2-astra', 'minor', [
+          { location: '§2', severity: 'minor', category: 'math_physics', topic: '量纲说明', issue: '量纲推导边界需补注' },
+        ]),
+        review('box-api-claude-opus-5-5', 'accept', []),
+      ],
+      [],
+      { scientificGate: true },
+    )
+    const multiAnchor = collateReviews(
+      [
+        review('gpt-6.2-astra', 'minor', [
+          { location: '§2 Fig. 4', severity: 'minor', category: 'math_physics', topic: '量纲说明', issue: '量纲推导边界需补注' },
+        ]),
+        review('box-api-claude-opus-5-5', 'accept', []),
+      ],
+      [],
+      { scientificGate: true },
+    )
+    assert.equal(singleAnchor.scientificMetrics?.f1, 1)
+    assert.equal(singleAnchor.scientificMetrics?.chao1Residual, 0)
+    assert.equal(singleAnchor.gate.status, 'PASS_READY')
+    assert.equal(multiAnchor.scientificMetrics?.observedDefectBuckets, 1)
+    assert.equal(multiAnchor.scientificMetrics?.f1, 1)
+    assert.equal(multiAnchor.scientificMetrics?.chao1Residual, 0)
+    assert.equal(multiAnchor.gate.status, 'PASS_READY')
+
+    // B6-2b (R2 审计反例 1): 两个独立家族报告相同 topic、issue 和 Fig. 4;
+    // 一方把位置从 "Fig. 4" 补全为 "Fig. 4 / §2" → 相交锚点 fig:4 + 同 topic 仍归为 1 桶(f1=0, f2=1, PASS_READY)!
+    const bothFig4 = collateReviews(
+      [
+        review('gpt-6.2-astra', 'minor', [
+          { location: 'Fig. 4', severity: 'minor', category: 'math_physics', topic: '误差棒尺度', issue: 'Fig. 4 纵轴误差棒未注明 1-sigma' },
+        ]),
+        review('box-api-claude-opus-5-5', 'minor', [
+          { location: 'Fig. 4', severity: 'minor', category: 'math_physics', topic: '误差棒尺度', issue: 'Fig. 4 纵轴误差棒未注明 1-sigma' },
+        ]),
+      ],
+      [],
+      { scientificGate: true },
+    )
+    const expandedWithSec = collateReviews(
+      [
+        review('gpt-6.2-astra', 'minor', [
+          { location: 'Fig. 4', severity: 'minor', category: 'math_physics', topic: '误差棒尺度', issue: 'Fig. 4 纵轴误差棒未注明 1-sigma' },
+        ]),
+        review('box-api-claude-opus-5-5', 'minor', [
+          { location: 'Fig. 4 / §2', severity: 'minor', category: 'math_physics', topic: '误差棒尺度', issue: 'Fig. 4 纵轴误差棒未注明 1-sigma' },
+        ]),
+      ],
+      [],
+      { scientificGate: true },
+    )
+    assert.equal(bothFig4.scientificMetrics?.f1, 0)
+    assert.equal(bothFig4.scientificMetrics?.f2, 1)
+    assert.equal(bothFig4.scientificMetrics?.chao1Residual, 0)
+    assert.equal(bothFig4.gate.status, 'PASS_READY')
+    assert.equal(expandedWithSec.scientificMetrics?.observedDefectBuckets, 1)
+    assert.equal(expandedWithSec.scientificMetrics?.f1, 0)
+    assert.equal(expandedWithSec.scientificMetrics?.f2, 1)
+    assert.equal(expandedWithSec.scientificMetrics?.chao1Residual, 0)
+    assert.equal(expandedWithSec.gate.status, 'PASS_READY')
+
+    // B6-3: 同节 §2 不同 topic 的两个独立高危问题 → 分桶独立计数(f1=2, f2=0, chao1Residual=1 → RESIDUAL_RISK_HIGH)
+    const sameSecDiffTopics = collateReviews(
+      [
+        review('gpt-6.2-astra', 'minor', [
+          { location: '§2', severity: 'minor', category: 'math_physics', topic: '量纲说明', issue: '量纲推导边界需补注' },
+        ]),
+        review('box-api-claude-opus-5-5', 'minor', [
+          { location: '§2', severity: 'minor', category: 'consistency', topic: '有效位数', issue: '表2与正文有效位数存在舍入差异' },
+        ]),
+      ],
+      [],
+      { scientificGate: true },
+    )
+    assert.equal(sameSecDiffTopics.scientificMetrics?.observedDefectBuckets, 2)
+    assert.equal(sameSecDiffTopics.scientificMetrics?.f1, 2)
+    assert.equal(sameSecDiffTopics.scientificMetrics?.f2, 0)
+    assert.equal(sameSecDiffTopics.scientificMetrics?.chao1Residual, 1)
+    assert.equal(sameSecDiffTopics.gate.status, 'RESIDUAL_RISK_HIGH')
+
+    // PASS_READY Chao1 精确算术: f1=2, f2=2 → 2*1/(2*3) = 0.333 < 0.5
+    const passMetrics = computeScientificMetrics({
+      files: [
+        { reviewer: { model: 'gpt-6.2-astra' } },
+        { reviewer: { model: 'box-api-claude-opus-5-5' } },
+      ],
+      activeFindings: [
+        { reviewer: 'gpt-6.2-astra', modelFamily: 'openai', defectKey: computeDefectIdentityKey(['sec:1'], '§1', 't1'), resolvedPriority: 'P2', category: 'consistency' },
+        { reviewer: 'box-api-claude-opus-5-5', modelFamily: 'anthropic', defectKey: computeDefectIdentityKey(['sec:2'], '§2', 't2'), resolvedPriority: 'P2', category: 'math_physics' },
+        { reviewer: 'gpt-6.2-astra', modelFamily: 'openai', defectKey: computeDefectIdentityKey(['sec:3'], '§3', 't3'), resolvedPriority: 'P2', category: 'consistency' },
+        { reviewer: 'box-api-claude-opus-5-5', modelFamily: 'anthropic', defectKey: computeDefectIdentityKey(['sec:3'], '§3', 't3'), resolvedPriority: 'P2', category: 'consistency' },
+        { reviewer: 'gpt-6.2-astra', modelFamily: 'openai', defectKey: computeDefectIdentityKey(['sec:4'], '§4', 't4'), resolvedPriority: 'P2', category: 'code_data_mismatch' },
+        { reviewer: 'box-api-claude-opus-5-5', modelFamily: 'anthropic', defectKey: computeDefectIdentityKey(['sec:4'], '§4', 't4'), resolvedPriority: 'P2', category: 'code_data_mismatch' },
+      ],
+      machineRefuted: [],
+    })
+    assert.equal(passMetrics.f1, 2)
+    assert.equal(passMetrics.f2, 2)
+    assert.equal(passMetrics.chao1Residual, 0.333)
+    assert.equal(passMetrics.scientificGateStatus, 'PASS_READY')
+
+    // computeFindingDigest 确定性与完整证据敏感性验证(含 evidence/priority/new_evidence/inputDigest)
+    const d1 = computeFindingDigest('reviews-a.json', 'gpt-6.2-astra', {
+      location: '§2',
+      severity: 'minor',
+      priority: 'P2',
+      category: 'math_physics',
+      issue: 'foo',
+      topic: 't',
+      evidence: 'old',
+      new_evidence: false,
+      repro_script: 'a.py',
+    }, 'sha256:v1')
+    const d2 = computeFindingDigest('reviews-a.json', 'gpt-6.2-astra', {
+      location: '§2',
+      severity: 'minor',
+      priority: 'P0',
+      category: 'math_physics',
+      issue: 'foo',
+      topic: 't',
+      evidence: 'new',
+      new_evidence: true,
+      repro_script: 'a.py',
+    }, 'sha256:v1')
+    const d3 = computeFindingDigest('reviews-a.json', 'gpt-6.2-astra', {
+      location: '§2',
+      severity: 'minor',
+      priority: 'P2',
+      category: 'math_physics',
+      issue: 'foo',
+      topic: 't',
+      evidence: 'old',
+      new_evidence: false,
+      repro_script: 'a.py',
+    }, 'sha256:v2')
+    assert.match(d1, /^[0-9a-f]{64}$/)
+    assert.notEqual(d1, d2)
+    assert.notEqual(d1, d3)
+
+    // verifyWitnessesInDir 空目录正常返回空报告
+    const emptyDir = mkdtempSync(join(tmpdir(), 'oc-verify-empty-'))
+    try {
+      const emptyReport = verifyWitnessesInDir({ dir: emptyDir })
+      assert.deepEqual(emptyReport.entries, [])
+    } finally {
+      rmSync(emptyDir, { recursive: true, force: true })
+    }
   })
 })

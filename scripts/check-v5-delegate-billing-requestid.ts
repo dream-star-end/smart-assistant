@@ -82,11 +82,13 @@ function makeBillingClient(): BillingStub {
     abandons,
     async admit(input) {
       admits.push(input as unknown as Record<string, unknown>);
-      // Master admits every codex delegate with a provider route (OCV5-729);
-      // without it the gateway fail-closes and never submits.
+      // Master admits every codex delegate with a provider route (OCV5-729)
+      // and remaining credit budget (OCV5-895 B1); without them the gateway
+      // fail-closes and never submits.
       return {
         requestId: REQUEST_ID,
         engineSessionId: `oceng-${"b".repeat(48)}`,
+        creditBudgetFen: 1000n,
         ...(input.engine === "codex"
           ? { route: { kind: "official_oauth", groupId: "3" } }
           : {}),
@@ -179,8 +181,12 @@ function makeGateway(opts: {
       _effort?: string | null,
       _model?: string,
       requestId?: string,
+      _traceId?: string,
+      _conversationMode?: unknown,
+      submitOpts?: { creditBudgetFen?: bigint },
     ) => {
       gw._lastSubmitRequestId = requestId;
+      gw._lastSubmitOpts = submitOpts;
       gw._submitOnEvent = onEvent;
       if (opts.submitError) throw opts.submitError;
       if (opts.emitBilling) {
@@ -260,6 +266,11 @@ function memberBody(extra: Record<string, unknown>): Record<string, unknown> {
     "sessions.submit requestId must be the master-minted 32-hex id",
   );
   assert.equal(gw._lastSubmitRequestId, REQUEST_ID, "submit requestId must equal the admitted requestId");
+  assert.equal(
+    gw._lastSubmitOpts?.creditBudgetFen,
+    1000n,
+    "handleDelegateTask must forward admitted creditBudgetFen to sessions.submit",
+  );
   assert.equal(billing.settles.length, 1, "codex_billing frame must be live-settled exactly once");
   assert.equal(billing.abandons.length, 0, "successful delegate must not abandon");
   const settled = billing.settles[0]!;
@@ -521,7 +532,7 @@ async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000,
   const text = renderDelegateModelSection(input, {});
   const advertised = [...text.matchAll(/^- [^:]+: (.+)$/gm)]
     .flatMap(line => [...line[1]!.matchAll(/`([^`]+)`/g)].map(match => match[1]!));
-  assert.deepEqual(advertised, ["deepseek-v4-flash", "grok-build"]);
+  assert.deepEqual(advertised, ["deepseek-v4-flash", "gpt-6-astra", "grok-build"]);
   for (const model of advertised) {
     assert.doesNotThrow(() => decideLocalExecution({ view, agent: { id: "member" },
       model, kind: "billed_delegate", env: {} }));

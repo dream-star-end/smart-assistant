@@ -461,6 +461,12 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
       /OPENCLAUDE_DELEGATE_CONTEXT_FILE/,
     ),
     'memory.retired': memoryProbe(['memory'], /子命令已退役/),
+    'skill-list': async () => {
+      const result = await run(TSX, ['packages/mcp-memory/src/ocMemoryCli.ts', 'skill-list'])
+      assert.equal(result.code, 0, result.stderr)
+    },
+    'skill-search': memoryProbe(['skill-search'], /skill-search requires/),
+    'skill-view': memoryProbe(['skill-view'], /skill-view requires/),
   },
   'oc-minimax': {
     image: scriptProbe('oc-minimax.py', ['image', '--help'], { code: 0, stdout: /image generate/ }),
@@ -570,6 +576,7 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     schema: reviewProbe(['schema'], 0, /ReviewFile/),
     collate: reviewProbe(['collate'], 2, /collate --dir/),
     ledger: reviewProbe(['ledger'], 2, /ledger <init\|record\|show>/),
+    verify: reviewProbe(['verify'], 2, /verify --dir/),
   },
   'oc-system': {
     skill: scriptProbe('oc-system.py', ['skill', 'preferences'], { code: 0, stdout: /用户偏好设置/ }),

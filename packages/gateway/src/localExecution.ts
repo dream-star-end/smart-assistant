@@ -21,6 +21,7 @@ import {
   type LocalCatalogView,
 } from './modelCatalogClient.js'
 import { suggestDelegateModels } from './delegateModelCatalogPrompt.js'
+import { isBilledDelegateMasterAdmittedEngine } from './engine/engineDelegateCapabilities.js'
 import { ALLOWED_INBOUND_MODELS, assertKnownExplicitDelegateModel } from './delegatePolicy.js'
 import type { LiveRunnerSessionView } from './server.js'
 
@@ -164,9 +165,12 @@ export function decideLocalExecution(args: {
     if (kind === 'prewarm' || kind === 'auto_dream') {
       return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
     }
-    // These callers admit master billing before executing locally.
-    if ((kind === 'billed_delegate' && engine === 'grok') ||
-      (kind === 'billed_advisor' && engine === 'codex')) {
+    // These callers admit master billing before executing locally (OCV5-895: codex delegates
+    // also admit master billing + provider route via OCV5-729).
+    if (
+      (kind === 'billed_delegate' && isBilledDelegateMasterAdmittedEngine(engine)) ||
+      (kind === 'billed_advisor' && engine === 'codex')
+    ) {
       return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
     }
     if (kind === 'turn' || kind === 'billed_delegate' || kind === 'billed_advisor') {

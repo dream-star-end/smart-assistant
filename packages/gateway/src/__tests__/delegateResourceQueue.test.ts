@@ -18,7 +18,10 @@
 import assert from 'node:assert/strict'
 import { afterEach, describe, it } from 'node:test'
 
-import { DELEGATE_MAX_CONCURRENT_DELEGATIONS } from '../delegateCapacity.js'
+import {
+  DELEGATE_MAX_CONCURRENT_DELEGATIONS,
+  delegateConcurrencyCap,
+} from '../delegateCapacity.js'
 import { DELEGATE_QUEUE_MAX_WAITERS, Gateway, PerTurnDelegationGuard } from '../server.js'
 import { OutboundRingBuffer } from '../outboundRing.js'
 
@@ -217,7 +220,10 @@ describe('资源闸有界排队 — 等待封顶', () => {
     gw._activeDelegations = DELEGATE_MAX_CONCURRENT_DELEGATIONS
     const r = await delegate(gw, 'coding-assistant', taskBody())
     assert.equal(r.status, 429, '并发闸超时必须保持 429 形状')
-    assert.match(r.body.error, /too many concurrent delegations \(max 4 non-review/)
+    assert.match(
+      r.body.error,
+      new RegExp(`too many concurrent delegations \\(max ${delegateConcurrencyCap(false)} non-review`),
+    )
     assert.match(r.body.error, /已等待 \d+s 资源仍紧张/)
     assert.equal(gw._activeDelegations, DELEGATE_MAX_CONCURRENT_DELEGATIONS, '等待失败不得改变并发计数')
   })
@@ -255,7 +261,10 @@ describe('资源闸有界排队 — 等待者上限', () => {
     const t0 = Date.now()
     const r = await delegate(gw, 'coding-assistant', taskBody())
     assert.equal(r.status, 429)
-    assert.match(r.body.error, /too many concurrent delegations \(max 4 non-review/)
+    assert.match(
+      r.body.error,
+      new RegExp(`too many concurrent delegations \\(max ${delegateConcurrencyCap(false)} non-review`),
+    )
     assert.match(r.body.error, /排队等待者已满/)
     assert.ok(Date.now() - t0 < 1_000)
   })

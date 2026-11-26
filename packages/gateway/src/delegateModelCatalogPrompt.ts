@@ -14,6 +14,7 @@
  */
 import type { LocalCatalogModel } from './modelCatalogClient.js'
 import { isEngineLocalTurnExempt } from './modelAuthority.js'
+import { isCommercialBilledDelegateEngine } from './engine/engineDelegateCapabilities.js'
 
 export const DELEGATE_MODEL_SECTION_HEADING = '## 委派可用型号'
 
@@ -150,7 +151,11 @@ export function renderDelegateModelSection(
   const localExempt = isEngineLocalTurnExempt(env)
   const byEngine = new Map<LocalCatalogModel['engine'], string[]>()
   for (const m of input.models) {
-    if (m.available !== true || (!localExempt && m.engine !== 'ccb' && m.engine !== 'grok')) continue
+    if (
+      m.available !== true ||
+      (!localExempt && !isCommercialBilledDelegateEngine(m.engine))
+    )
+      continue
     const list = byEngine.get(m.engine) ?? []
     list.push(m.modelId)
     byEngine.set(m.engine, list)

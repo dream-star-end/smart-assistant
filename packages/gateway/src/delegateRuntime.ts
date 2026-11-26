@@ -1357,16 +1357,17 @@ export async function _runDelegateTaskCore(
 
   // Per-turn 委派熔断(两条策略共用 PerTurnDelegationGuard,互斥分派):
   //   - hidden 系统 agent(隐藏审查员)→ 串行硬上限(env OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN,默认 3);
-  //   - 普通成员(非 hidden 非 review)→ 每 turn 委派上限(env 默认 8),消"串行无上限"债。
+  //   - 普通成员(非 hidden 非 review)→ 每 turn 委派上限(env 默认 16),消"串行无上限"债。
   // 计数键优先取 parentSessionKey(delegate 请求里唯一的父上下文,turn 级标识拿不到 ——
   // 依据见 PerTurnDelegationGuard 注释);极端情况下 body 缺 parentSessionKey 时退化为按
-  // sourceAgent 计数,由 TTL 清扫兜底回收(无绕过口)。本地预检拒绝不占额度;预检通过后
-  // 已启动的失败/超时仍占额度。本闸先于资源闸排队:per-turn 额度等不出来 fail
-  // fast、不占等待名额(保守偏置)。
+  // sourceAgent 计数,由 TTL 清扫兜底回收(无绕过口)。本地预检拒绝不占额度;未进入执行或
+  // 零输出上游失败退还有效额度(保留 rawAttempts 防风暴),有输出/超时/用户取消仍占额度。
+  // 本闸先于资源闸排队:per-turn 额度等不出来 fail fast、不占等待名额(保守偏置)。
   const delegateGuardKey = input.delegationGuardOwnerKey || (
     typeof parentSessionKey === 'string' && parentSessionKey
       ? parentSessionKey
       : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`)
+  let refundMemberQuota = (): void => {}
   if (isTeamReviewExecution(targetAgentId)) {
     const hiddenLimit = resolveHiddenDelegationsPerTurn()
     if (!this._hiddenDelegateGuard.tryAcquire(delegateGuardKey, Date.now(), hiddenLimit)) {
@@ -1385,7 +1386,8 @@ export async function _runDelegateTaskCore(
     // 普通成员委派(队长直接派给已安装成员)。isReview 豁免(那是内部硬编排,走 hidden 分支)。
     const memberLimit = resolveMemberDelegationsPerTurn()
     const memberGuard = (this._memberDelegateGuard ??= new PerTurnDelegationGuard(memberLimit))
-    if (!memberGuard.tryAcquire(delegateGuardKey)) {
+    const acquired = memberGuard.acquireToken(delegateGuardKey, Date.now(), memberLimit)
+    if (!acquired.ok) {
       this.log.warn('delegate_member_limit', {
         targetAgentId,
         guardKey: delegateGuardKey,
@@ -1397,9 +1399,17 @@ export async function _runDelegateTaskCore(
         message: `本轮委派已达上限(${memberLimit} 次/turn)。请先整合已经收到的成员结果,基于现有产出继续推进;若确实还需要更多子任务,合并为更少的委派或分两轮进行,不要在同一轮内持续拆分委派。`,
       }
     }
+    const memberQuotaToken = acquired.token
+    let memberQuotaRefunded = false
+    refundMemberQuota = () => {
+      if (!memberQuotaRefunded) {
+        memberQuotaRefunded = true
+        memberGuard.refundToken(memberQuotaToken)
+      }
+    }
   }
 
-  input.taskboardControl?.assertOpen()
+  try { input.taskboardControl?.assertOpen() } catch (err) { refundMemberQuota(); throw err }
   const sessionKey =
     input.sessionKey ?? `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
   this.log.info('delegate', {
@@ -1628,6 +1638,7 @@ export async function _runDelegateTaskCore(
     sessionKey,
   )
   if (input.taskboardControl?.signal.aborted) {
+    refundMemberQuota()
     unregisterDelegation?.()
     this._delegateOwnerByRunId?.delete(progressRunId)
     await input.taskboardControl.waitForDescendants(sessionKey)
@@ -1727,6 +1738,7 @@ export async function _runDelegateTaskCore(
     else if (gate.status === 'queue_full') failureClass = 'capacity_queue_full'
     else if (gate.status === 'aborted') failureClass = 'cancelled'
     else failureClass = 'capacity_timeout'
+    refundMemberQuota()
     return this._applyDelegateCapacityReject(input, {
       httpStatus,
       message,
@@ -1740,6 +1752,7 @@ export async function _runDelegateTaskCore(
     antigravity?: DelegateAntigravityRouteLease | null,
     remoteLane?: DelegateRemoteLaneLease | null,
   ): Promise<DelegateTaskResult> => {
+    refundMemberQuota()
     try {
       await input.taskboardControl?.waitForDescendants(sessionKey)
       if (admission) await (this._delegateEngineBilling ?? defaultDelegateEngineBilling).abandon(admission.requestId).catch(() => {})
@@ -1759,6 +1772,7 @@ export async function _runDelegateTaskCore(
   if (isDelegateSmEnabled() && input.backgroundJobId) {
     const claimed = this._delegateJobs?.claimQueued(input.backgroundJobId)
     if (!claimed?.ok) {
+      refundMemberQuota()
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
       if (claimed && claimed.reason === 'cutover_frozen') {
@@ -1860,6 +1874,7 @@ export async function _runDelegateTaskCore(
     if (input.backgroundJobId && (!current || current.state !== 'running' || !fence ||
         current.claimToken !== fence.claimToken || current.fencingEpoch !== fence.fencingEpoch)) traceAborted = true
     if (traceAborted || traceWait.isAborted() || this._shuttingDown || input.taskboardControl?.signal.aborted) {
+      refundMemberQuota()
       if (input._leaseTimer) clearInterval(input._leaseTimer)
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
@@ -1891,6 +1906,7 @@ export async function _runDelegateTaskCore(
       return cancelPreparation(null, null, null, acquiredRemote.ok ? acquiredRemote.lease : null)
     }
     if (!acquiredRemote.ok) {
+      refundMemberQuota()
       if (input._leaseTimer) clearInterval(input._leaseTimer)
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
@@ -1920,11 +1936,12 @@ export async function _runDelegateTaskCore(
       requestedModel,
       agentModel: execAgent.model,
     })
-  if (input.taskboardControl?.signal.aborted) return cancelPreparation()
+  if (input.taskboardControl?.signal.aborted) return cancelPreparation(null, null, null, remoteLaneLease)
   let grokRoute: { baseUrl: string; routeToken: string } | null = null
   let grokRouteLease: DelegateGrokRouteLease | null = null
   if (grokDelegate) {
     if (!grokMintModelId) {
+      refundMemberQuota()
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
       return {
@@ -1938,7 +1955,9 @@ export async function _runDelegateTaskCore(
       sessionId: sessionKey,
       log: this.log,
     })
-    if (input.taskboardControl?.signal.aborted) return cancelPreparation(acquired.ok ? acquired.lease : null)
+    if (input.taskboardControl?.signal.aborted) {
+      return cancelPreparation(acquired.ok ? acquired.lease : null, null, null, remoteLaneLease)
+    }
     if (!acquired.ok && !requestedModel) {
       // 默认路径(用户没显式要 grok):mint 失败(订阅并发满 / 容器租约上限 / 无账号 /
       // master 通道缺失)不拒,同一请求内回落到 ccb 的 DELEGATE_GROK_FALLBACK_MODEL,
@@ -1958,6 +1977,7 @@ export async function _runDelegateTaskCore(
           defaultModel: this.deps.config.defaults.model,
         })
       } catch (err) {
+        refundMemberQuota()
         const mapped = this._mapLocalExecutionError(err)
         if (!mapped) {
           this._releaseDelegateSlot(slotOpts)
@@ -1977,6 +1997,7 @@ export async function _runDelegateTaskCore(
       execAgent = { ...delegatedAgent, model: DELEGATE_GROK_FALLBACK_MODEL }
     } else if (!acquired.ok) {
       // 显式 model 指定 grok:与排队被拒同形,已过闸的并发名额必须在此释放(下方 finally 不会执行)。
+      refundMemberQuota()
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
       this.log.warn('delegate_grok_route_denied', {
@@ -2020,6 +2041,7 @@ export async function _runDelegateTaskCore(
   if (engineReported) {
     billingModel = delegateExec?.canonicalModel || requestedModel || execAgent.model
     if (!billingModel) {
+      refundMemberQuota()
       if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
@@ -2047,6 +2069,7 @@ export async function _runDelegateTaskCore(
           : {}),
       })
     } catch (err) {
+      refundMemberQuota()
       if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
@@ -2063,7 +2086,9 @@ export async function _runDelegateTaskCore(
       }
     }
   }
-  if (input.taskboardControl?.signal.aborted) return cancelPreparation(grokRouteLease, engineBillingAdmission)
+  if (input.taskboardControl?.signal.aborted) {
+    return cancelPreparation(grokRouteLease, engineBillingAdmission, null, remoteLaneLease)
+  }
   // codex 委派必须有 master 签发的 provider route(OCV5-729):容器里的 codex
   // CLI 没有任何 baked `model_providers.*`,裸起会退回内建 `openai` provider
   // 的 workspace routing discovery,被 relay allowlist 404 → 整轮失败。route
@@ -2088,6 +2113,7 @@ export async function _runDelegateTaskCore(
         })
       : null
     if (!codexRoute) {
+      refundMemberQuota()
       this.log.warn('delegate_codex_route_unavailable', {
         targetAgentId,
         model: billingModel,
@@ -2108,6 +2134,30 @@ export async function _runDelegateTaskCore(
         message: 'Codex 委派路由不可用（master 未签发 provider route），未启动',
       }
     }
+    if (
+      !isEngineLocalTurnExempt() &&
+      (engineBillingAdmission.creditBudgetFen === undefined ||
+        engineBillingAdmission.creditBudgetFen <= 0n)
+    ) {
+      refundMemberQuota()
+      this.log.warn('delegate_codex_credit_budget_unavailable', {
+        targetAgentId,
+        model: billingModel,
+      })
+      await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
+      if (input._leaseTimer) clearInterval(input._leaseTimer)
+      if (grokRouteLease) grokRouteLease.release().catch(() => {})
+      if (remoteLaneLease) {
+        await remoteLaneLease.release({ outcome: 'interrupted', releaseLane: true }).catch(() => {})
+      }
+      this._releaseDelegateSlot(slotOpts)
+      unregisterDelegation?.()
+      return {
+        kind: 'rejected',
+        httpStatus: 503,
+        message: 'Codex 委派计费预算不可用（master 未下发有效 creditBudgetFen），未启动',
+      }
+    }
   }
   // antigravity 委派同样必须有 master 签发的 relay route(OCV5-738):容器本地
   // turn 没有 bridge 注入 __oc_antigravity_route,adapter 在 spawn 前就
@@ -2124,7 +2174,7 @@ export async function _runDelegateTaskCore(
     })
     if (input.taskboardControl?.signal.aborted) {
       if (acquired.ok) await acquired.lease.release().catch(() => {})
-      return cancelPreparation(grokRouteLease, engineBillingAdmission)
+      return cancelPreparation(grokRouteLease, engineBillingAdmission, null, remoteLaneLease)
     }
     if (acquired.ok) {
       // Mirror chat's inbound projection: the agent/model pair already resolves
@@ -2147,6 +2197,7 @@ export async function _runDelegateTaskCore(
       })
     }
     if (!acquired.ok || !antigravityRoute) {
+      refundMemberQuota()
       const reason = acquired.ok ? 'projection_failed' : acquired.reason
       const httpStatus = acquired.ok ? 503 : acquired.httpStatus
       this.log.warn('delegate_antigravity_route_unavailable', {
@@ -2275,6 +2326,7 @@ export async function _runDelegateTaskCore(
       )
     }
   } catch (err) {
+    refundMemberQuota()
     if (engineBillingAdmission) {
       await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
     }
@@ -2363,7 +2415,7 @@ export async function _runDelegateTaskCore(
     clearTimeoutTimer()
     detachAncestorActivity?.()
     await this.sessions.destroySession(sessionKey)
-    return cancelPreparation(grokRouteLease, engineBillingAdmission, antigravityRouteLease)
+    return cancelPreparation(grokRouteLease, engineBillingAdmission, antigravityRouteLease, remoteLaneLease)
   }
   const turnStartedAt = Date.now()
   const submitPromise = this.sessions.submit(
@@ -2460,6 +2512,8 @@ export async function _runDelegateTaskCore(
       ...(remoteLaneLease ? { modelAuthority: remoteLaneLease.turnModelAuthority } : {}),
       ...(engineBillingAdmission?.grokExecutionDescriptor
         ? { grokExecutionDescriptor: engineBillingAdmission.grokExecutionDescriptor } : {}),
+      ...(engineBillingAdmission?.creditBudgetFen !== undefined
+        ? { creditBudgetFen: engineBillingAdmission.creditBudgetFen } : {}),
       ...(grokRoute ? { grokRoute } : {}),
       ...(codexRoute ? { codexRoute } : {}),
       ...(antigravityRoute ? { antigravityRoute } : {}),
@@ -2608,6 +2662,9 @@ export async function _runDelegateTaskCore(
     }
     this._runLog.complete(_dlgRun, { status: 'failed', error })
   } finally {
+    if (error && output.trim().length === 0 && !timedOut && !cancelled) {
+      refundMemberQuota()
+    }
     await input.taskboardControl?.waitForDescendants(sessionKey)
     clearTimeoutTimer()
     detachAncestorActivity?.()

@@ -639,3 +639,53 @@ describe('Grok authenticated admission response bindings', () => {
     assert.equal(Object.isFrozen(admitted.grokExecutionDescriptor), true)
   })
 })
+
+describe('OCV5-895 B1: admit creditBudgetFen parsing', () => {
+  it('parses decimal string creditBudgetFen into bigint', async () => {
+    for (const [raw, expected] of [['2500', 2500n], ['0', 0n]] as const) {
+      const client = createDelegateEngineBillingClient({
+        env: ENV,
+        startupRecovery: false,
+        fetcher: (async () =>
+          response(200, {
+            requestId: 'a'.repeat(32),
+            engineSessionId: `oceng-${'b'.repeat(48)}`,
+            route: { kind: 'official_oauth', groupId: '3' },
+            creditBudgetFen: raw,
+          })) as any,
+      })
+      const admission = await client.admit({
+        model: 'gpt-6-astra',
+        engine: 'codex',
+        agentId: 'coding-assistant',
+        delegateAgentId: 'coding-assistant',
+        sessionKey: 'agent:coding-assistant:delegate:main:1',
+      })
+      assert.equal(admission.creditBudgetFen, expected)
+    }
+  })
+
+  it('omits creditBudgetFen when missing or malformed so gateway can fail closed', async () => {
+    for (const raw of [undefined, null, '', '-5', '12.3', 'abc', 100, '1'.repeat(33)]) {
+      const client = createDelegateEngineBillingClient({
+        env: ENV,
+        startupRecovery: false,
+        fetcher: (async () =>
+          response(200, {
+            requestId: 'a'.repeat(32),
+            engineSessionId: `oceng-${'b'.repeat(48)}`,
+            route: { kind: 'official_oauth', groupId: '3' },
+            ...(raw !== undefined ? { creditBudgetFen: raw } : {}),
+          })) as any,
+      })
+      const admission = await client.admit({
+        model: 'gpt-6-astra',
+        engine: 'codex',
+        agentId: 'coding-assistant',
+        delegateAgentId: 'coding-assistant',
+        sessionKey: 'agent:coding-assistant:delegate:main:1',
+      })
+      assert.equal('creditBudgetFen' in admission, false, `raw=${String(raw)} must be ignored`)
+    }
+  })
+})

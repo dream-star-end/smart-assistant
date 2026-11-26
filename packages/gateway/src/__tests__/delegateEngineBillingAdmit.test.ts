@@ -56,6 +56,7 @@ function makeBillingClient(
         requestId: REQUEST_ID,
         engineSessionId: `oceng-${'b'.repeat(48)}`,
         ...(includeRoute ? { route: admitRoute } : {}),
+        creditBudgetFen: 1000n,
       }
     },
     async settle(billing) {

@@ -406,10 +406,24 @@ export function createDelegateEngineBillingRuntime(
           }
           throw err
         }
+        const creditBudgetFen =
+          typeof precheck.balance === 'bigint' && precheck.balance > 0n
+            ? precheck.balance.toString()
+            : undefined
         if (codexRouteRequired) {
-          return { requestId, engineSessionId, route: codexRoute }
+          return {
+            requestId,
+            engineSessionId,
+            route: codexRoute,
+            ...(creditBudgetFen !== undefined ? { creditBudgetFen } : {}),
+          }
         }
-        return { requestId, engineSessionId, ...(grokExecutionDescriptor ? { grokExecutionDescriptor } : {}) }
+        return {
+          requestId,
+          engineSessionId,
+          ...(grokExecutionDescriptor ? { grokExecutionDescriptor } : {}),
+          ...(creditBudgetFen !== undefined ? { creditBudgetFen } : {}),
+        }
       }
 
       const requestId = requireString(body, 'requestId', REQUEST_ID_RE)

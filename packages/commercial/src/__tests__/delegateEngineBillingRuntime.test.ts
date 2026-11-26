@@ -1684,3 +1684,65 @@ describe('delegate engine-billing antigravity reconciliation (OCV5-738)', () => 
     )
   })
 })
+
+describe('OCV5-895 B1: admit returns positive precheck creditBudgetFen for mid-turn protection', () => {
+  it('returns creditBudgetFen string for codex, grok, and antigravity when balance > 0n', async () => {
+    const codex = makeRuntime({ advisorRoute: { kind: 'official_oauth', groupId: '9' } })
+    const codexRes = await codex.runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: admitBody({ model: 'gpt-5.6-sol', engine: 'codex' }),
+    })
+    assert.equal(codexRes.creditBudgetFen, '100')
+
+    const grok = makeRuntime()
+    const grokRes = await grok.runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: admitBody({ model: 'grok-build', engine: 'grok' }),
+    })
+    assert.equal(grokRes.creditBudgetFen, '100')
+
+    const ag = makeRuntime()
+    const agRes = await ag.runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: {
+        model: AG_MODEL,
+        engine: 'antigravity',
+        agentId: 'auditor',
+        delegateAgentId: 'auditor',
+        sessionKey: 'agent:auditor:delegate:main:1',
+      },
+    })
+    assert.equal(agRes.creditBudgetFen, '100')
+  })
+
+  it('omits creditBudgetFen when precheck balance is non-positive', async () => {
+    const zeroBalance = createDelegateEngineBillingRuntime({
+      getPool: () => ({ query: async () => ({ rows: [] }) }) as never,
+      preCheckRedis: {} as never,
+      pricing: { get: () => undefined } as never,
+      catalog: { assertFresh: async () => defaultSnapshot() },
+      loadUserModelAuthz: async () => PUBLIC_AUTHZ,
+      newRequestId: () => REQUEST_ID,
+      getAgentCostMultiplierFn: async () => '1.000',
+      preCheckWithCostFn: async () => ({
+        maxCost: 10n,
+        balance: 0n,
+        capped: true,
+        originalMaxCost: 10n,
+        reservation: { userId: '42', requestId: REQUEST_ID },
+      }),
+      startInflightJournalFn: async () => true,
+      createCodexDelegateRoute: async () => ({ kind: 'official_oauth', groupId: '9' }),
+      attributeOpenTurnFn: async () => null,
+    })
+    const res = await zeroBalance.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: admitBody({ model: 'gpt-5.6-sol', engine: 'codex' }),
+    })
+    assert.equal('creditBudgetFen' in res, false)
+  })
+})
