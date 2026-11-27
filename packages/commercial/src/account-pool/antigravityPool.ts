@@ -25,11 +25,13 @@ import type { PoolOutcome } from './policy/outcome.js'
 import { GEMINI_OAUTH_MEMBERS, applyTableMemberOutcome } from './policy/tableMembers.js'
 import {
   affinitySettings,
+  antigravityAdmissionLimits,
   inflightCount,
   reserveInflight,
   resolveAffinity,
   underRateCap,
   type AffinityAction,
+  type AffinitySettings,
 } from './policy/affinity.js'
 import { healthWeight, rankWRH } from './policy/select.js'
 
@@ -108,6 +110,17 @@ export interface AntigravityAccountPick {
 /** Affinity key of the Antigravity subscription pool (one binding per user). */
 export const ANTIGRAVITY_AFFINITY_SERVICE = 'antigravity'
 
+/** Keep the preferred pool under both thresholds. In selfhost, a full account is
+ * still eligible for a delegate if the rolling minute budget has room. */
+function preferredCapacity<T extends { id: string }>(
+  rows: T[], caps: AffinitySettings, limits: ReturnType<typeof antigravityAdmissionLimits>,
+): T[] {
+  const rated = (r: T) => underRateCap(ANTIGRAVITY_AFFINITY_SERVICE, r.id, caps.antigravityRatePerMin)
+  const open = rows.filter((r) => inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, r.id) < caps.antigravityInflight && rated(r))
+  if (open.length || limits === 'strict') return open
+  return limits === 'rate-only' ? rows.filter(rated) : rows
+}
+
 /**
  * Account for this turn. Selectable = active, or an expired rate-limit/quota/
  * upstream cooldown (half-open); an auth/credential cooldown waits for the
@@ -133,8 +146,8 @@ export async function pickAntigravityAccount(
      */
     reserveToken?: string
     /**
-     * When true (delegate turns, OCV5-897 B3), return null when all accounts are
-     * at their in-flight or per-minute capacity instead of soft-spilling onto order[0].
+     * Delegate turns enforce the rolling minute budget; commercial also enforces
+     * the per-account in-flight ceiling. Neither mode bypasses model/account eligibility.
      */
     strictCapacity?: boolean
   } = {},
@@ -172,16 +185,10 @@ export async function pickAntigravityAccount(
       availableModels: usable[0].available_models,
     }
   }
-  // Per-account caps (docs §6): an account at its in-flight or per-minute cap is
-  // left out for this turn only (spill); when every account is capped, use them anyway.
   const caps = await affinitySettings()
-  const open = usable.filter(
-    (r) =>
-      inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, r.id) < caps.antigravityInflight &&
-      underRateCap(ANTIGRAVITY_AFFINITY_SERVICE, r.id, caps.antigravityRatePerMin),
-  )
-  if (deps.strictCapacity && open.length === 0) return null
-  const uncapped = open.length > 0 ? open : usable
+  const limits = antigravityAdmissionLimits(deps.strictCapacity)
+  const uncapped = preferredCapacity(usable, caps, limits)
+  if (uncapped.length === 0) return null
   const bestTier = Math.min(...uncapped.map(tier))
   const candidates = uncapped.filter((r) => tier(r) === bestTier)
   let resolved: Awaited<ReturnType<typeof resolveAffinity>> = null
@@ -242,7 +249,7 @@ export async function pickAntigravityAccount(
       caps.antigravityInflight,
       Date.now(),
       caps.antigravityRatePerMin,
-      deps.strictCapacity === true,
+      limits,
     )
     if (id === null) return null
     row = usable.find((r) => r.id === id) ?? preferred

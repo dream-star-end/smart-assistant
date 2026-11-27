@@ -323,10 +323,19 @@ export const DEFAULT_AFFINITY_SETTINGS: AffinitySettings = {
 let settingsCache: { at: number; value: AffinitySettings } | null = null
 let settingsLoader: (() => Promise<AffinitySettings>) | null = null
 
-/** Wire the admin system-settings reader (index.ts); tests can inject. */
-export function configureAffinitySettings(loader: (() => Promise<AffinitySettings>) | null): void {
+type AdmissionLimits = 'soft' | 'strict' | 'rate-only'
+let selfhostDelegateOverflow = false
+
+/** The master supplies its verified deployment flavor, never a caller-controlled hint. */
+export function configureAffinitySettings(loader: (() => Promise<AffinitySettings>) | null, selfhost = false): void {
+  selfhostDelegateOverflow = selfhost
   settingsLoader = loader
   settingsCache = null
+}
+
+export function antigravityAdmissionLimits(strictCapacity = false): AdmissionLimits {
+  if (!strictCapacity) return 'soft'
+  return selfhostDelegateOverflow ? 'rate-only' : 'strict'
 }
 
 /** Cached 60s; a failed read keeps the defaults (selection must never block on settings). */
@@ -386,13 +395,8 @@ export function acquireInflight(service: string, id: string, token: string, now 
   inflightOwner.set(token, k)
 }
 
-/**
- * Check-and-reserve with no await in between (atomic in this process): reserve a
- * unit on the first member in `order` with room under `cap` and (when given)
- * under the per-minute cap; then the first with room; when every member is at
- * the cap, the first anyway (never refuse service). Also counts the
- * admission for the per-minute window. Returns the member id reserved.
- */
+/** Atomically choose and reserve under the active limits, and count the admission
+ * towards the minute window. A released in-flight unit never refunds a minute admission. */
 export function reserveInflight(
   service: string,
   order: ReadonlyArray<string>,
@@ -400,16 +404,16 @@ export function reserveInflight(
   cap: number,
   now = Date.now(),
   ratePerMin: number | null = null,
-  strictCapacity = false,
+  limits: AdmissionLimits = 'soft',
 ): string | null {
   if (order.length === 0) return null
   const roomy = (m: string) => inflightCount(service, m, now) < cap
   const rated = (m: string) => ratePerMin === null || underRateCap(service, m, ratePerMin, now)
-  // Strict mode (delegation, OCV5-897 B3) refuses when no account has capacity;
-  // default foreground mode preserves soft-spillover to order[0].
-  const id = strictCapacity
-    ? (order.find((m) => roomy(m) && rated(m)) ?? null)
-    : (order.find((m) => roomy(m) && rated(m)) ?? order.find(roomy) ?? order[0])
+  // Prefer spare capacity in every mode. Only foreground may exceed the rate limit;
+  // selfhost delegation can overflow a full account but never its rolling minute budget.
+  let id = order.find((m) => roomy(m) && rated(m))
+  if (!id && limits === 'rate-only') id = order.find(rated)
+  if (!id && limits === 'soft') id = order.find(roomy) ?? order[0]
   if (!id) return null
   acquireInflight(service, id, token, now)
   noteAdmission(service, id, now)
@@ -455,6 +459,5 @@ export function _resetAffinityCapsForTest(): void {
   rateWindows.clear()
   inflight.clear()
   inflightOwner.clear()
-  settingsCache = null
-  settingsLoader = null
+  configureAffinitySettings(null)
 }
