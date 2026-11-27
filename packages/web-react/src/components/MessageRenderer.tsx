@@ -799,6 +799,16 @@ type RenderItem =
       items: SingleRenderItem[];
       ticketIds: string[];
     };
+function withActiveSwarm(out: RenderItem[], messages: ChatMessage[], activeStart: number, sending: boolean): RenderItem[] {
+  if (!sending) return out;
+  for (let i = out.length - 1; i >= 0; i -= 1) {
+    const item = out[i];
+    if (item.kind !== "process" || !item.active) continue;
+    item.swarm = processSwarmSnapshot(messages, activeStart, item.members.at(-1));
+    break;
+  }
+  return out;
+}
 function itemMessages(item: LeafRenderItem): ChatMessage[] {
   return item.kind === "single" ? [item.m] : item.members;
 }
@@ -1117,13 +1127,7 @@ function discloseProcess(
   if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
   flushInteractive();
   flushTerminal();
-  for (let i = out.length - 1; sending && i >= 0; i -= 1) {
-    const item = out[i];
-    if (item.kind !== "process" || !item.active) continue;
-    item.swarm = processSwarmSnapshot(messages, activeStart, item.members.at(-1));
-    break;
-  }
-  return out;
+  return withActiveSwarm(out, messages, activeStart, sending);
 }
 
 /**
@@ -2713,8 +2717,7 @@ export function MessageList({
       const olderSteps = olderLiveStepsKey === it.key ? olderLiveStepsControl : null;
       const live = it.active || olderSteps !== null;
       return (
-        <ProcessGroupMemo
-          live={live}
+        <ProcessGroupMemo live={live}
           sig={live ? "" : [
             open ? 1 : 0,
             needle,

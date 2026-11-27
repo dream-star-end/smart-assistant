@@ -23,7 +23,6 @@ import { cn, groupDigits } from "../../lib/utils";
 import { toolChangedFileCount } from "./workPane";
 import { ProcessStages } from "./lazyProcessStages";
 import { QUIET_TAIL_MS, RUNNING_META_MS, formatElapsed, swarmGapStatus, isSwarmWaitTool, type ProcessLiveStatus } from "./processWaitStatus";
-export type { ProcessLiveStatus } from "./processWaitStatus";
 import type { PhaseKind } from "./phaseTimeline";
 
 // 展开时间轴与阶段时间线懒块只从外壳拿这些符号。懒块若直接 import cards / meta / status,
@@ -1153,23 +1152,7 @@ export function processRoundCredits(input: {
   return sumAssistantCostCredits(input.following) ?? sumAssistantCostCredits(assistants);
 }
 
-export function ProcessDisclosure<T>({
-  sections,
-  onFirstTextPaint,
-  active,
-  open,
-  setOpen,
-  detailOpen,
-  setDetailOpen,
-  renderItem,
-  keyOf,
-  messagesOf,
-  olderSteps,
-  activity,
-  bounds,
-  swarm,
-  tokenUsageOf,
-}: {
+type DisclosureProps<T> = {
   sections: ProcessSection<T>[];
   onFirstTextPaint?: CardCallbacks["onFirstTextPaint"];
   active: boolean;
@@ -1198,7 +1181,25 @@ export function ProcessDisclosure<T>({
   swarm?: SwarmSnapshot | null;
   /** 一步所在模型调用的 token 用量,只进耗时的悬停说明。 */
   tokenUsageOf?: (item: T) => DisplayTokenUsage | undefined;
-}) {
+};
+
+export function ProcessDisclosure<T>({
+  sections,
+  onFirstTextPaint,
+  active,
+  open,
+  setOpen,
+  detailOpen,
+  setDetailOpen,
+  renderItem,
+  keyOf,
+  messagesOf,
+  olderSteps,
+  activity,
+  bounds,
+  swarm,
+  tokenUsageOf,
+}: DisclosureProps<T>) {
   const startedAt = activity?.startedAt ?? null;
   const lastFrameAt = activity?.lastFrameAt ?? null;
   const turnStartedAt = startedAt ?? bounds?.startedAt ?? null;

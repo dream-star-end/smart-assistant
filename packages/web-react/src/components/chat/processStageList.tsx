@@ -1,3 +1,4 @@
+import type { ProcessLiveStatus } from "./processWaitStatus";
 import { mcpOpName, normalizeSingleUnderscoreMcp } from "./processToolName";
 /**
  * 展开后的过程时间轴(人话步骤、技术详情、组摘要)。
@@ -54,7 +55,6 @@ import {
   workKind,
   workSummary,
   type PhaseKind,
-  type ProcessLiveStatus,
   type ProcessSection,
   type ToolInput,
 } from "./ProcessDisclosure";
@@ -442,6 +442,20 @@ function StageText({ message, live = false, onFirstTextPaint }: {
   );
 }
 
+function ProcessWaitTail({ live, waitingMs }: { live: ProcessLiveStatus; waitingMs: number }) {
+  return (
+  <div data-testid="process-live-tail" className="oc-step-enter flex min-h-8 items-center gap-2 py-1 [@media(hover:none)]:min-h-10">
+    <StepIcon Icon={live.kind === "swarm" ? Users : Brain} tone="live" />
+    <span data-testid="process-step-live" data-live-pending="true" className="oc-live-status-shine min-w-0 truncate text-body text-muted">{live.text}</span>
+    {live.kind !== "swarm" ? (
+      <span aria-hidden className="shrink-0 whitespace-nowrap text-caption tabular-nums text-faint">
+        {formatElapsed(waitingMs)}
+      </span>
+    ) : null}
+  </div>
+  );
+}
+
 export type ProcessStageListProps<T> = {
   sections: ProcessSection<T>[];
   active: boolean;
@@ -798,15 +812,7 @@ export function ProcessStageList<T>({
               );
             })}
             {waiting && live ? (
-              <div key="__live-tail" data-testid="process-live-tail" className="oc-step-enter flex min-h-8 items-center gap-2 py-1 [@media(hover:none)]:min-h-10">
-                <StepIcon Icon={live.kind === "swarm" ? Users : Brain} tone="live" />
-                <span data-testid="process-step-live" data-live-pending="true" className="oc-live-status-shine min-w-0 truncate text-body text-muted">{live.text}</span>
-                {live.kind !== "swarm" ? (
-                  <span aria-hidden className="shrink-0 whitespace-nowrap text-caption tabular-nums text-faint">
-                    {formatElapsed(waitingMs)}
-                  </span>
-                ) : null}
-              </div>
+              <ProcessWaitTail key="__live-tail" live={live} waitingMs={waitingMs} />
             ) : null}
             </div>
             )}

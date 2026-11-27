@@ -26,7 +26,7 @@ import type {
   SwarmSnapshot,
 } from '@openclaude/protocol'
 
-import { findPeerHandoffs, mentionMatchesWorker } from './swarmStallBoard.js'
+import { classifyWork, findPeerHandoffs, isMemberEffectivelyWaiting, mentionMatchesWorker } from './swarmStallBoard.js'
 
 export const GATEWAY_STALL_MONITOR_AGENT = 'gateway-monitor'
 export const DEFAULT_SWARM_STALL_THRESHOLD_MS = 180_000
@@ -106,7 +106,8 @@ export interface SwarmStallMonitorOptions {
 
 const MONITOR_NAME_RE = /^monitor(?:-\d+)?$/i
 const DONE_PREFIX_RE = /^\s*(?:@all\s+)?(?:\*{1,2}|_{1,2})?\[done\](?::|：)?(?:\*{1,2}|_{1,2})?(?:\s|$|:|：|-|—)/i
-const PARKED_WAIT_ACTIVITIES = new Set(['等待讨论板消息', '已完成本轮思考'])
+
+export { isMemberEffectivelyWaiting } from './swarmStallBoard.js'
 
 export function isSwarmMonitorAgentName(name: string): boolean {
   const lower = name.trim().toLowerCase()
@@ -115,26 +116,6 @@ export function isSwarmMonitorAgentName(name: string): boolean {
 
 export function isSwarmAuxiliaryRole(role: SwarmMemberRole): boolean {
   return role === 'monitor' || role === 'narrator'
-}
-
-/**
- * True when a live member is parked waiting for board activity rather than
- * actively executing tools or thinking.
- *
- * Note: in native Antigravity transcripts, a member currently blocked inside
- * `swarm_wait` shows `status: 'working'` with `activity: '等待讨论板消息'`.
- * Treating that state as effectively waiting prevents deadlocked `swarm_wait`
- * pairs from looking permanently busy.
- */
-export function isMemberEffectivelyWaiting(member: SwarmMemberSnapshot): boolean {
-  if (member.status === 'killed') return false
-  if (member.status === 'waiting' || member.status === 'stopped') return true
-  if (typeof member.waitingOnBoard === 'boolean') return member.waitingOnBoard
-  return (
-    member.status === 'working' &&
-    typeof member.activity === 'string' &&
-    PARKED_WAIT_ACTIVITIES.has(member.activity)
-  )
 }
 
 function isMonitorPost(post: SwarmBoardPost): boolean {
@@ -368,12 +349,7 @@ export class SwarmStallMonitor {
       return null
     }
 
-    const workingMembers: string[] = []
-    const waitingMembers: string[] = []
-    for (const m of liveCoreMembers) {
-      if (isMemberEffectivelyWaiting(m)) waitingMembers.push(m.name)
-      else workingMembers.push(m.name)
-    }
+    const { workingMembers, waitingMembers } = classifyWork(liveCoreMembers)
 
     let newestDoneSeq = this.lastDoneSeq
     for (const post of nonMonitorPosts) {

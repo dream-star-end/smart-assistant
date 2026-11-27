@@ -57,3 +57,35 @@ export function findPeerHandoffs(
   }
   return { coveredSeqs, receiptSeq }
 }
+
+const PARKED_WAIT_ACTIVITIES = new Set(['等待讨论板消息', '已完成本轮思考'])
+
+/**
+ * True when a live member is parked waiting for board activity rather than
+ * actively executing tools or thinking.
+ *
+ * Note: in native Antigravity transcripts, a member currently blocked inside
+ * `swarm_wait` shows `status: 'working'` with `activity: '等待讨论板消息'`.
+ * Treating that state as effectively waiting prevents deadlocked `swarm_wait`
+ * pairs from looking permanently busy.
+ */
+export function isMemberEffectivelyWaiting(member: SwarmMemberSnapshot): boolean {
+  if (member.status === 'killed') return false
+  if (member.status === 'waiting' || member.status === 'stopped') return true
+  if (typeof member.waitingOnBoard === 'boolean') return member.waitingOnBoard
+  return (
+    member.status === 'working' &&
+    typeof member.activity === 'string' &&
+    PARKED_WAIT_ACTIVITIES.has(member.activity)
+  )
+}
+
+export function classifyWork(liveCoreMembers: readonly SwarmMemberSnapshot[]) {
+  const workingMembers: string[] = []
+  const waitingMembers: string[] = []
+  for (const m of liveCoreMembers) {
+    if (isMemberEffectivelyWaiting(m)) waitingMembers.push(m.name)
+    else workingMembers.push(m.name)
+  }
+  return { workingMembers, waitingMembers }
+}
