@@ -68,4 +68,43 @@ describe('oc-* --help fast path', () => {
     assert.equal(result.status, 0, result.stderr)
     assert.match(result.stdout, /oc-xlsx/)
   })
+
+  test('oc-cite.sh --help/-h/help stays synced with ocCiteCli USAGE', () => {
+    const cliSource = readFileSync(join(REPO_ROOT, 'packages/gateway/src/ocCiteCli.ts'), 'utf8')
+    const usageMatch = /const USAGE = `([\s\S]*?)`;/.exec(cliSource)
+    assert.ok(usageMatch, 'ocCiteCli.ts USAGE constant not found')
+    const expectedStdout = `${usageMatch[1]}\n`
+
+    for (const flag of ['--help', '-h', 'help']) {
+      const result = spawnSync(join(BIN_DIR, 'oc-cite.sh'), [flag], {
+        encoding: 'utf8',
+        timeout: 2000,
+        env: { ...process.env, PATH: '/usr/bin:/bin' },
+      })
+      assert.equal(result.status, 0, `oc-cite.sh ${flag}: exit ${result.status}\n${result.stderr}`)
+      assert.equal(result.stderr ?? '', '', `oc-cite.sh ${flag}: stderr must be empty`)
+      for (const token of [
+        'oc-cite verify <id...>',
+        'oc-cite format <id>',
+        'oc-cite check --manifest <file>',
+        'oc-cite fix --manifest <file> --docs <docId,...>',
+        'doi:/arxiv:/openalex:/pmid:/ads:<bibcode>',
+        'gb-t-7714-2015',
+        'ieee',
+        'nature',
+        'apa',
+        'bibtex',
+        '--doc-id',
+        '--span-id',
+        '--evidence-grade',
+      ]) {
+        assert.ok(result.stdout.includes(token), `oc-cite.sh ${flag} missing ${token}`)
+      }
+      assert.equal(
+        result.stdout,
+        expectedStdout,
+        `oc-cite.sh ${flag} drifted from ocCiteCli.ts USAGE`,
+      )
+    }
+  })
 })
