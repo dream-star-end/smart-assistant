@@ -1,4 +1,4 @@
-import { renewAntigravityRouteLease, renewAntigravityRouteLeaseDetailed } from '../delegateAntigravityRoute.js'
+import type { AntigravityRouteRenewResult } from '../delegateAntigravityRoute.js'
 import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { PassiveStageTiming } from '../passiveStageTiming.js'
 import { identityCompatEnvironment } from '@openclaude/storage'
@@ -32,10 +32,9 @@ import { dirname, join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable, Writable } from 'node:stream'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import {
   ANTIGRAVITY_RELAY_PREFIX,
-  SWARM_BOARD_TOOL_NAME,
   antigravityCliModelId,
   mergeSwarmSnapshots,
   TOOL_FAILED_EMPTY_SENTINEL,
@@ -47,14 +46,14 @@ import {
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { EngineAdapter, EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
-import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
+import type { PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
 import { SubprocessRunner, recordContextEvalEvent } from '../subprocessRunner.js'
 import { type EngineCreateOpts, registerEngine, registerEngineRemoteContext } from './registry.js'
 import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { buildCodexEnv } from './codexShared.js'
 import { createLogger } from '../logger.js'
 import { probeEnvFacts } from '../envProbe.js'
-import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
+import { detachChildStdio, killProcessGroup, killProcessTree, shutdownTimeoutMs, waitForCloseWithin, type ProcessTreeSnapshot } from '../processGroupShutdown.js'
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext, memoryInstructionsFingerprint } from '../promptSlots.js'
@@ -79,22 +78,18 @@ import {
 } from './antigravityPromptState.js'
 import { antigravityProductToolInput, antigravityProductToolName, antigravityToolOutput } from './antigravityToolNormalize.js'
 import { AntigravityToolBackfiller, isBackfillableAntigravityFileTool } from './antigravityToolBackfill.js'
+import { AntigravitySwarmWatcher, formatSwarmWorkingDetail, settleSwarmSnapshotTerminal } from './antigravitySwarmWatcher.js'
+import type { SwarmStallMonitorOptions } from './swarmStallMonitor.js'
 import {
-  AntigravitySwarmWatcher,
-  buildDurableSwarmBoardInput,
-  formatSwarmWorkingDetail,
-  settleSwarmSnapshotTerminal,
-} from './antigravitySwarmWatcher.js'
-import { GATEWAY_STALL_MONITOR_AGENT } from './swarmStallMonitor.js'
-import {
-  awaitLocalAntigravitySwarmSlotIfActive,
-  buildAntigravityDurableBillingEvent,
-  cleanupKilledNativeSwarmWorktrees,
-  reapLingeringCliProcessGroup,
-  releaseSwarmSlotAfterBoundedReap,
+  awaitLocalAntigravitySwarmSlotIfActive, cleanupKilledNativeSwarmWorktrees,
+  reapLingeringCliProcessGroup, releaseSwarmSlotAfterBoundedReap,
 } from './antigravitySwarmConcurrency.js'
-import { injectSwarmDirective } from '../swarmCommand.js'
-import { lookupRemoteSwarmMcpContext } from '../remoteSwarmRuntime.js'
+import {
+  ANTIGRAVITY_SWARM_DEADLOCKED_DETAIL, advanceAntigravityRouteHeartbeatCounters, applyRemoteSwarmMcpEnvToProfile,
+  buildAntigravitySwarmTerminalToolEntry, buildAntigravityTurnBillingPair, captureProcessTreeSnapshot,
+  dispatchAntigravitySwarmStallAlert, probeAntigravityRouteHeartbeat, reapClosedTurnLingeringProcessGroup,
+  reapDeadlockedSwarmProcess, scheduleAbnormalExitProcessTreeReap,
+} from './antigravityDeadlockGuard.js'
 import {
   prepareAntigravityNativeTrajectory,
   recoverAntigravityNativeTrajectory,
@@ -144,7 +139,14 @@ function antigravitySpawnPath(hostPathDir: string | null): string {
   return hostPathDir ? `${hostPathDir}:${ANTIGRAVITY_SPAWN_PATH}` : ANTIGRAVITY_SPAWN_PATH
 }
 
-let timingTestHooks: { keepaliveMs?: number; routeRenewMs?: number; renewRoute?: typeof renewAntigravityRouteLease; resultSettleMs?: number; staleErrorExitWaitMs?: number } | null = null
+type AntigravityTimingTestHooks = {
+  keepaliveMs?: number; routeRenewMs?: number
+  renewRoute?: (routeToken: string) => Promise<boolean | AntigravityRouteRenewResult>
+  resultSettleMs?: number; staleErrorExitWaitMs?: number
+  deadlockTermGraceMs?: number; deadlockKillGraceMs?: number
+  swarmWatcher?: { pollMs?: number; now?: () => number; stallMonitor?: SwarmStallMonitorOptions }
+}
+let timingTestHooks: AntigravityTimingTestHooks | null = null
 const STDERR_MAX_CHARS = 64 * 1024
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 /** 1.3.4 without usable credentials prints an OAuth URL and blocks for 60 s. */
@@ -233,6 +235,11 @@ interface TurnContext {
   routeToken: string | null
   routeRenewAt: number
   routeRenewBusy: boolean
+  routeRenewRevokedCount: number
+  routeRenewFailureCount: number
+  deadlockTerminating: boolean
+  deadlockReapDone: Promise<void> | null
+  processTreeSnapshot: ProcessTreeSnapshot | null
   /** Ends this turn's route-token trace binding for the container relay (OCV5-595). */
   releaseRelayTrace: (() => void) | null
   sawOutput: boolean
@@ -466,6 +473,11 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       routeToken: null,
       routeRenewAt: 0,
       routeRenewBusy: false,
+      routeRenewRevokedCount: 0,
+      routeRenewFailureCount: 0,
+      deadlockTerminating: false,
+      deadlockReapDone: null,
+      processTreeSnapshot: null,
       releaseRelayTrace: null,
       sawOutput: false,
       terminal: false,
@@ -766,11 +778,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       onHeartbeat: () => { this.lastActivityAt = Date.now(); this.emit('activity') },
       onRenewRoute: async () => {
         ctx.routeRenewAt = Date.now()
-        if (timingTestHooks?.renewRoute) {
-          const res = await timingTestHooks.renewRoute(route.routeToken)
-          return res === false ? 'revoked' : 'ok'
-        }
-        return renewAntigravityRouteLeaseDetailed(route.routeToken)
+        return probeAntigravityRouteHeartbeat(route.routeToken, timingTestHooks?.renewRoute)
       },
       onRenewWarn: (outcome) => {
         log.warn('antigravity queued route renewal transient failure; proceeding', {
@@ -797,73 +805,45 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.params.readOnly === true || ctx.swarmWatcher || ctx.terminal || ctx.abandoned || !ctx.projection) return
     if (!CONVERSATION_ID_RE.test(conversationId)) return
     const brainDir = ctx.projection.sessionBrainDir
+    const watcherHooks = timingTestHooks?.swarmWatcher
     const watcher = new AntigravitySwarmWatcher({
       brainDir,
       conversationId,
+      ...(watcherHooks?.pollMs !== undefined ? { pollMs: watcherHooks.pollMs } : {}),
+      ...(watcherHooks?.now ? { now: watcherHooks.now } : {}),
       // Resumed conversations may carry a historical swarm directory from an earlier
       // turn. Treat it as a silent baseline until this turn actually mutates the
       // board or runs an own native swarm tool (`activateTurnSwarm()`).
       seedBaselineOnStart: Boolean(ctx.requestedConversationId || ctx.resumedLaunch),
       onSnapshot: (snapshot) => this.emitSwarmSnapshot(ctx, snapshot),
       stallMonitor: {
+        ...watcherHooks?.stallMonitor,
         onDiagnostic: (diag) => {
+          watcherHooks?.stallMonitor?.onDiagnostic?.(diag)
           log.info('antigravity_swarm_stall_diagnostic', {
-            sessionKey: this.opts.sessionKey,
-            conversationId,
-            kind: diag.kind,
-            phase: diag.phase,
-            headSeq: diag.headSeq,
-            idleMs: diag.idleMs,
-            alertCount: diag.alertCount,
-            workingMembers: diag.workingMembers,
-            waitingMembers: diag.waitingMembers,
+            sessionKey: this.opts.sessionKey, conversationId, kind: diag.kind, phase: diag.phase,
+            headSeq: diag.headSeq, idleMs: diag.idleMs, alertCount: diag.alertCount,
+            workingMembers: diag.workingMembers, waitingMembers: diag.waitingMembers,
             ...(diag.reason ? { reason: diag.reason } : {}),
             ...(diag.target ? { target: diag.target } : {}),
             ...(diag.detail ? { detail: diag.detail } : {}),
           })
         },
       },
-      onStallDetected: (alert) => {
+      onStallExhausted: (ev) => {
         if (ctx.terminal || ctx.abandoned || ctx.interrupted) return
-        void injectSwarmDirective({
-          brainDir,
-          conversationId,
-          target: alert.target,
-          message: alert.message,
-          channel: alert.channel,
-          sender: GATEWAY_STALL_MONITOR_AGENT,
-          controlKind: 'stall',
-          shouldAbort: () => ctx.terminal || ctx.abandoned || ctx.interrupted,
+        void this.terminateDeadlockedSwarm(ctx, {
+          reason: ev.reason, swarmId: ev.swarmId, idleMs: ev.idleMs,
+          alertCount: ev.alertCount, headSeq: ev.headSeq, waitingMembers: ev.waitingMembers,
         })
-          .then((res) => {
-            if (ctx.terminal || ctx.abandoned || ctx.interrupted) return
-            if (res.ok) {
-              log.info('antigravity_swarm_stall_alert', {
-                sessionKey: this.opts.sessionKey,
-                conversationId,
-                target: alert.target,
-                reason: alert.reason,
-                attempt: alert.attempt,
-                idleMs: alert.idleMs,
-                seq: res.seq,
-              })
-              ctx.swarmWatcher?.kick()
-            } else if (res.code !== 'ABORTED') {
-              ctx.swarmWatcher?.rollbackStallAlert(alert)
-              log.warn('antigravity_swarm_stall_alert_failed', {
-                sessionKey: this.opts.sessionKey, conversationId, target: alert.target,
-                reason: alert.reason, code: res.code, error: res.error,
-              })
-            }
-          })
-          .catch((err) => {
-            if (ctx.terminal || ctx.abandoned || ctx.interrupted) return
-            ctx.swarmWatcher?.rollbackStallAlert(alert)
-            log.warn('antigravity_swarm_stall_alert_failed', {
-              sessionKey: this.opts.sessionKey, conversationId, target: alert.target,
-              reason: alert.reason, error: String((err as Error)?.message ?? err),
-            })
-          })
+      },
+      onStallDetected: (alert) => {
+        dispatchAntigravitySwarmStallAlert({
+          brainDir, conversationId, sessionKey: this.opts.sessionKey, alert,
+          isAborted: () => ctx.terminal || ctx.abandoned || ctx.interrupted,
+          getWatcher: () => ctx.swarmWatcher,
+          log,
+        })
       },
     })
     ctx.swarmWatcher = watcher
@@ -958,23 +938,16 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         },
       })
     }
-    const durableInput = buildDurableSwarmBoardInput(finalSwarm)
-    const swarmSummary = formatSwarmWorkingDetail(finalSwarm)
-    const swarmStartedAt = finalSwarm.startedAt ?? ctx.startedAt
-    ctx.tools.set(swarmBlockId, {
-      toolUseId: swarmBlockId,
-      blockId: swarmBlockId,
-      toolName: SWARM_BOARD_TOOL_NAME,
-      inputJson: durableInput,
-      inputPreview: durableInput.title.slice(0, 500),
-      output: swarmSummary,
-      completed: true,
-      isError: phase === 'error',
-      durationMs: Math.max(0, Date.now() - swarmStartedAt),
-      ts: Date.now(),
-      arrivedAt: swarmStartedAt,
-      eventOrdinal: ctx.swarmEventOrdinal ?? ctx.params.nextDurableEventOrdinal?.(),
-    })
+    ctx.tools.set(
+      swarmBlockId,
+      buildAntigravitySwarmTerminalToolEntry({
+        swarmBlockId,
+        finalSwarm,
+        phase,
+        turnStartedAt: ctx.startedAt,
+        eventOrdinal: ctx.swarmEventOrdinal ?? ctx.params.nextDurableEventOrdinal?.(),
+      }),
+    )
   }
 
   private spawnChild(
@@ -1020,7 +993,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       // Fail fast instead of waiting out the CLI's 60 s OAuth prompt.
       if (!ctx.terminal && AUTH_PROMPT_RE.test(ctx.stderr)) {
         ctx.errorDetail = 'ANTIGRAVITY_AUTH_REQUIRED: CLI fell back to interactive Google sign-in'
-        killProcessGroup(proc, 'SIGKILL')
+        ctx.processTreeSnapshot = killProcessTree(proc, 'SIGKILL', { snapshot: ctx.processTreeSnapshot })
       }
     })
     proc.once('error', (err) => {
@@ -1030,9 +1003,16 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       if (!ctx.terminal) this.finishError(ctx, String(err))
       this.emit('error', err)
     })
-    proc.once('close', (code, signal) => {
-      void this.closeTurn(ctx, code, signal, stdoutBuffer)
+    proc.once('exit', (code, signal) => {
+      if (code === 0 && signal === null && !ctx.interrupted && !ctx.deadlockTerminating) return
+      scheduleAbnormalExitProcessTreeReap({
+        proc, isClosed: () => ctx.procClosed, getSnapshot: () => ctx.processTreeSnapshot,
+        setSnapshot: (s) => { ctx.processTreeSnapshot = s }, getReapPromise: () => ctx.deadlockReapDone,
+        setReapPromise: (p) => { ctx.deadlockReapDone = p },
+        termGraceMs: timingTestHooks?.deadlockTermGraceMs, killGraceMs: timingTestHooks?.deadlockKillGraceMs,
+      })
     })
+    proc.once('close', (code, signal) => { void this.closeTurn(ctx, code, signal, stdoutBuffer) })
   }
 
   private async closeTurn(ctx: TurnContext, code: number | null, signal: string | null, tail: string): Promise<void> {
@@ -1046,6 +1026,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       // B1: Wait for an in-flight settleResult (e.g. swarm process-group grace/reap) to finish
       // reading final SwarmBoard + worker token deltas and setting `deliveredSuccess` BEFORE cleanupLaunch!
       if (ctx.settling && ctx.settlingDone) await ctx.settlingDone
+      if (ctx.deadlockReapDone) await ctx.deadlockReapDone
       if (!ctx.terminal && !ctx.settling) {
         const detail = ctx.errorDetail || ctx.stderr.trim() || `antigravity exited with code ${String(code)}`
         this.finishError(ctx, detail)
@@ -1704,38 +1685,21 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   /** Status-only live sideband + durable turn-tape billing locator (OCV5-887). */
-  private emitExternalBilling(
-    ctx: TurnContext,
-    isError: boolean,
-    usage: ReturnType<AntigravityAdapter['usageSnapshot']>,
-  ): void {
+  private emitExternalBilling(ctx: TurnContext, isError: boolean, usage: ReturnType<AntigravityAdapter['usageSnapshot']>): void {
     const requestId = ctx.params.requestId
     if (!requestId || !REQUEST_ID_RE.test(requestId)) return
     const detail = ctx.errorDetail ?? ''
-    const budgetStop = isError && !ctx.interrupted && BUDGET_EXHAUSTED_RE.test(detail)
-    const cls = !isError || ctx.interrupted || budgetStop ? null
-      : authError(detail) ? 'auth' as const
-      : QUOTA_RE.test(detail) ? 'quota' as const
-      : null
-    const status: EngineExternalBillingEvent['status'] = budgetStop || !isError ? 'success'
-      : cls ? 'unavailable' : 'error'
-    const terminalCode: EngineExternalBillingEvent['terminalCode'] = budgetStop || !isError ? undefined
-      : ctx.interruptReason === 'user' ? 'USER_CANCELLED'
-      : cls === 'auth' ? 'AUTH_UNAVAILABLE'
-      : cls === 'quota' ? 'QUOTA_UNAVAILABLE'
-      : 'ENGINE_ERROR'
-    const durationMs = Date.now() - ctx.startedAt
-    this.emit('external_billing', {
-      requestId, engine: 'antigravity', status, durationMs,
-      ...(terminalCode ? { terminalCode } : {}),
-    } satisfies EngineExternalBillingEvent)
-    this.emit('billing', buildAntigravityDurableBillingEvent({
+    const { external, durable } = buildAntigravityTurnBillingPair({
       requestId, sessionKey: this.opts.sessionKey, turnKey: ctx.params.turnKey,
       parentTurnKey: ctx.params.usageAttribution?.parentTurnKey,
       parentSessionId: ctx.params.usageAttribution?.parentSessionId,
       delegateAgentId: ctx.params.usageAttribution?.delegateAgentId,
-      status, terminalCode, interrupted: ctx.interrupted, budgetStop, durationMs, usage,
-    }))
+      isError, interrupted: ctx.interrupted, interruptReason: ctx.interruptReason, errorDetail: ctx.errorDetail,
+      isAuthError: authError(detail), isBudgetExhausted: BUDGET_EXHAUSTED_RE.test(detail), isQuotaError: QUOTA_RE.test(detail),
+      durationMs: Date.now() - ctx.startedAt, usage,
+    })
+    this.emit('external_billing', external)
+    this.emit('billing', durable)
   }
 
   private finishError(ctx: TurnContext, detail: string): void {
@@ -1748,20 +1712,19 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     this.stopKeepalive(ctx)
     // Preserve any already-displayed swarm board in `ctx.tools` BEFORE terminal
     // teardown so `getPartialSnapshot()` persists one settled terminal card.
-    this.commitTerminalSwarmBoard(ctx, ctx.interrupted ? 'interrupted' : 'error', {
-      emitEvent: false,
-      readDisk: false,
-    })
+    this.commitTerminalSwarmBoard(ctx, ctx.interrupted ? 'interrupted' : 'error', { emitEvent: false, readDisk: false })
     const release = ctx.releaseSwarmSlot
     ctx.releaseSwarmSlot = null
     if (ctx.terminal) {
-      releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 150 })
+      releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 150, snapshot: ctx.processTreeSnapshot })
       return
     }
     ctx.deliveredSuccess = false
     ctx.terminal = true
-    if (ctx.proc && !ctx.procClosed) killProcessGroup(ctx.proc, 'SIGTERM')
-    releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 0 })
+    if (ctx.proc && !ctx.procClosed) {
+      ctx.processTreeSnapshot = killProcessTree(ctx.proc, 'SIGTERM', { snapshot: ctx.processTreeSnapshot })
+    }
+    releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 0, snapshot: ctx.processTreeSnapshot })
     ctx.resolveSummary(null)
   }
 
@@ -1769,7 +1732,11 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     this.stopSwarmWatcher(ctx)
     const release = ctx.releaseSwarmSlot
     ctx.releaseSwarmSlot = null
-    releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 0 })
+    if (release) {
+      releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 0, snapshot: ctx.processTreeSnapshot })
+    } else if (ctx.procClosed) {
+      reapClosedTurnLingeringProcessGroup(ctx.proc, ctx.processTreeSnapshot)
+    }
     ctx.toolBackfiller?.dispose()
     ctx.toolBackfiller = null
     // Every caller is the end of the turn's process, so its relay requests stop naming this turn too.
@@ -1793,28 +1760,70 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   private ensureKeepalive(ctx: TurnContext): void {
     if (ctx.keepalive) return
     // The CLI can think for minutes with no stdout; a live process keeps the
-    // session's idle watchdog from killing it.
+    // session's idle watchdog from killing it (unless its swarm is stuck parked in max_alerts).
     ctx.keepalive = setInterval(() => {
       if (this.active !== ctx || ctx.terminal || ctx.abandoned || !ctx.proc || ctx.proc.exitCode !== null) {
         this.stopKeepalive(ctx)
         return
       }
-      this.lastActivityAt = Date.now()
-      this.emit('activity')
+      if (!ctx.swarmWatcher?.isStallSuppressedAllParked()) {
+        this.lastActivityAt = Date.now()
+        this.emit('activity')
+      }
       // CLI stdout and browser WS may both be idle during a long native tool.
       // Renew only this live execution; metadata is not our liveness proof.
       if (!ctx.interrupted && !ctx.procClosed && ctx.routeToken && !ctx.routeRenewBusy &&
           Date.now() - ctx.routeRenewAt >= (timingTestHooks?.routeRenewMs ?? 60_000)) {
         ctx.routeRenewAt = Date.now()
         ctx.routeRenewBusy = true
-        void (timingTestHooks?.renewRoute ?? renewAntigravityRouteLease)(ctx.routeToken)
-          .catch(() => log.warn('antigravity route heartbeat unavailable', {
-            sessionKey: this.opts.sessionKey, traceId: ctx.params.traceId,
-          }))
+        void probeAntigravityRouteHeartbeat(ctx.routeToken, timingTestHooks?.renewRoute)
+          .then((outcome) => {
+            if (this.active !== ctx || ctx.terminal || ctx.abandoned || ctx.interrupted) return
+            const { degraded, fastKillReason } = advanceAntigravityRouteHeartbeatCounters(
+              ctx, outcome, Boolean(ctx.swarmWatcher?.isStallSuppressedAllParked()),
+            )
+            if (degraded) {
+              log.warn('antigravity route heartbeat unavailable', {
+                sessionKey: this.opts.sessionKey, traceId: ctx.params.traceId, outcome,
+                revokedCount: ctx.routeRenewRevokedCount, failureCount: ctx.routeRenewFailureCount,
+              })
+            }
+            if (fastKillReason) {
+              void this.terminateDeadlockedSwarm(ctx, {
+                reason: fastKillReason,
+                swarmId: ctx.conversationId ?? ctx.requestedConversationId ?? undefined,
+                revokedCount: ctx.routeRenewRevokedCount, failureCount: ctx.routeRenewFailureCount,
+              })
+            }
+          })
           .finally(() => { ctx.routeRenewBusy = false })
       }
     }, timingTestHooks?.keepaliveMs ?? KEEPALIVE_INTERVAL_MS)
     ctx.keepalive.unref()
+  }
+
+  private async terminateDeadlockedSwarm(ctx: TurnContext, meta: Record<string, unknown>): Promise<void> {
+    if (ctx.deadlockTerminating || ctx.terminal || ctx.abandoned || ctx.interrupted) return
+    ctx.deadlockTerminating = true
+    log.warn('antigravity_swarm_deadlock_terminate', {
+      sessionKey: this.opts.sessionKey, traceId: ctx.params.traceId,
+      conversationId: ctx.conversationId ?? ctx.requestedConversationId, ...meta,
+    })
+    this.stopKeepalive(ctx)
+    if (ctx.resultTimer) { clearTimeout(ctx.resultTimer); ctx.resultTimer = null }
+    ctx.pendingResult = null
+    ctx.deliveredSuccess = false
+    ctx.errorDetail = ANTIGRAVITY_SWARM_DEADLOCKED_DETAIL
+    this.commitTerminalSwarmBoard(ctx, 'error', { emitEvent: true, readDisk: true })
+    let resolveReap!: () => void
+    ctx.deadlockReapDone = new Promise<void>((r) => { resolveReap = r })
+    try {
+      await reapDeadlockedSwarmProcess(
+        ctx.proc, () => ctx.procClosed, ctx.processTreeSnapshot, (s) => { ctx.processTreeSnapshot = s },
+        { termGraceMs: timingTestHooks?.deadlockTermGraceMs, killGraceMs: timingTestHooks?.deadlockKillGraceMs },
+      )
+    } finally { resolveReap() }
+    if (!ctx.terminal && !ctx.abandoned) this.abandonTurn(ctx, ctx.proc, ctx.errorDetail)
   }
 
   private stopKeepalive(ctx: TurnContext): void {
@@ -1839,7 +1848,10 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.proc.killed && !ctx.procClosed) return false
     ctx.interruptReason ??= reason
     ctx.interrupted = true
-    if (!ctx.procClosed) killProcessGroup(ctx.proc, 'SIGINT')
+    if (!ctx.procClosed) {
+      ctx.processTreeSnapshot = captureProcessTreeSnapshot(ctx.proc, ctx.processTreeSnapshot)
+      killProcessGroup(ctx.proc, 'SIGINT')
+    }
     return true
   }
 
@@ -1862,14 +1874,14 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       }
     }
     ctx.deliveredSuccess = false
-    killProcessGroup(proc, 'SIGTERM')
+    const snapBeforeTerm = killProcessTree(proc, 'SIGTERM', { snapshot: ctx.processTreeSnapshot })
+    ctx.processTreeSnapshot = snapBeforeTerm
     let closed = await waitForCloseWithin(barrier, grace)
     if (!closed) {
-      killProcessGroup(proc, 'SIGKILL')
-      closed = await waitForCloseWithin(
-        barrier,
-        shutdownTimeoutMs('OPENCLAUDE_ANTIGRAVITY_SHUTDOWN_FINAL_DRAIN_MS', SHUTDOWN_FINAL_DRAIN_DEFAULT_MS),
-      )
+      const merged = captureProcessTreeSnapshot(proc, snapBeforeTerm)
+      ctx.processTreeSnapshot = merged
+      killProcessTree(proc, 'SIGKILL', { snapshot: merged })
+      closed = await waitForCloseWithin(barrier, shutdownTimeoutMs('OPENCLAUDE_ANTIGRAVITY_SHUTDOWN_FINAL_DRAIN_MS', SHUTDOWN_FINAL_DRAIN_DEFAULT_MS))
     }
     if (closed) return
     log.error('antigravity stdout never closed after process-group SIGKILL', { sessionKey: this.opts.sessionKey, pid: proc.pid })
@@ -1947,7 +1959,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 export const _internals = {
   promptText,
   assemblePrompt,
-  setTimingTestHooks(hooks: { keepaliveMs?: number; routeRenewMs?: number; renewRoute?: typeof renewAntigravityRouteLease; resultSettleMs?: number; staleErrorExitWaitMs?: number } | null): void {
+  setTimingTestHooks(hooks: AntigravityTimingTestHooks | null): void {
     timingTestHooks = hooks
   },
 }
@@ -1958,27 +1970,12 @@ registerEngineRemoteContext('antigravity', async ({ opts, supportsVision, prompt
   const runner = new SubprocessRunner({ ...opts, harness: 'official-cc', boxResidentCc: true })
   if (promptPolicy !== undefined) runner.setPromptPrivacy(promptPolicy)
   const { learning, profile, env, cleanup } = await runner.prepareRemoteToolContext({ supportsVision })
-  const swarmCtx = lookupRemoteSwarmMcpContext(opts.sessionKey)
-  const swarmEnv: Record<string, string> = swarmCtx
-    ? {
-        OPENCLAUDE_REMOTE_SWARM_ENABLED: '1',
-        OPENCLAUDE_REMOTE_SWARM_SESSION_KEY: swarmCtx.coordinatorSessionKey,
-        OPENCLAUDE_REMOTE_SWARM_MEMBER: swarmCtx.memberName,
-        OPENCLAUDE_REMOTE_SWARM_TOKEN: swarmCtx.callerToken,
-      }
-    : {}
-  const mergedEnv: NodeJS.ProcessEnv = { ...env, ...swarmEnv }
-  if (!promptOnly && swarmCtx && profile.mcpConfigPath && existsSync(profile.mcpConfigPath)) {
-    try {
-      const rawCfg = JSON.parse(readFileSync(profile.mcpConfigPath, 'utf8')) as {
-        mcpServers?: Record<string, { env?: Record<string, string> }>
-      }
-      if (rawCfg?.mcpServers?.['openclaude-memory']) {
-        rawCfg.mcpServers['openclaude-memory'].env = { ...(rawCfg.mcpServers['openclaude-memory'].env ?? {}), ...swarmEnv }
-        writeFileSync(profile.mcpConfigPath, JSON.stringify(rawCfg, null, 2), { mode: 0o600 })
-      }
-    } catch { /* keep original mcp config if unreadable */ }
-  }
+  const mergedEnv = applyRemoteSwarmMcpEnvToProfile({
+    sessionKey: opts.sessionKey,
+    env,
+    mcpConfigPath: profile.mcpConfigPath,
+    promptOnly,
+  })
   const platformPrompt = learning.extraPromptFile ? readFileSync(learning.extraPromptFile, 'utf8') : ''
   if (promptOnly) cleanup()
   return {

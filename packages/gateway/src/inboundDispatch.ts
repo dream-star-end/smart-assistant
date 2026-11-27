@@ -58,12 +58,8 @@ import { messageAttachmentTotal, noteAttachmentTotalRejection } from './uploadTo
 import { parseCreditBudgetFen } from './creditExhaustion.js'
 import { resolveChatRunWorkspace } from './projectWorkspace.js'
 import { createRunContextDescriptor, webchatRunId } from './runContextPersist.js'
-import {
-  type AgentDef,
-  paths,
-  syncMarketplaceHub,
-  recordAutoDreamSuccessfulSession,
-} from '@openclaude/storage'
+import { type AgentDef, paths, syncMarketplaceHub, recordAutoDreamSuccessfulSession } from '@openclaude/storage'
+import { bindAdmittedClientTurnSessionKey } from './turnDispatch.js'
 import { isHiddenSystemAgentId } from './agentVisibility.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
 import {
@@ -137,6 +133,7 @@ export interface InboundDispatchHost {
   _markIdempotencyKey: Gateway['_markIdempotencyKey']
   _memberDelegateGuard: Gateway['_memberDelegateGuard']
   _outboundRing: Gateway['_outboundRing']
+  _admittedClientTurnMeta?: Gateway['_admittedClientTurnMeta']
   _pendingPermissions: Gateway['_pendingPermissions']
   _promptQueueExecutionFenceByFrame: Gateway['_promptQueueExecutionFenceByFrame']
   _promptQueueLifecycleByFrame: Gateway['_promptQueueLifecycleByFrame']
@@ -387,13 +384,13 @@ export async function dispatchInbound(
         cfg.agents.find((a) => a.id === cfg.default) ??
         cfg.agents.find((a) => a.id === 'main') ?? { id: 'main' }
       agent = ag
-      // Include agentId in sessionKey so different agents get isolated subprocesses
       sessionKey = `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
     } else {
       const routed = this.router.route(frame)
       sessionKey = routed.sessionKey
       agent = routed.agent
     }
+    bindAdmittedClientTurnSessionKey(this, frame, sessionKey)
     agent = (await resolveRuntimeExecutionAgent(agent, cfg, executionIdentityProjection)).agent
     if (isHiddenSystemAgentId(agent.id)) {
       const hiddenAgentUserId: string =

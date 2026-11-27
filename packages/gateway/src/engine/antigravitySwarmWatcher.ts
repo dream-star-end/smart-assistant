@@ -13,13 +13,11 @@
  *   - Timer is `.unref()`'d and unconditionally cleared on `stop()`.
  */
 import { createHash } from 'node:crypto'
-import { basename } from 'node:path'
 import {
   SWARM_MAX_CHANNELS,
   SWARM_MAX_MEMBERS,
   SWARM_MAX_POSTS,
   SWARM_MAX_POST_CHARS,
-  compactSwarmSnapshotToByteBudget,
   extractSwarmMentions,
   type SwarmBoardPost,
   type SwarmChannelSnapshot,
@@ -29,6 +27,16 @@ import {
   type SwarmPhase,
   type SwarmSnapshot,
 } from '@openclaude/protocol'
+import {
+  buildDurableSwarmBoardInput,
+  compactSwarmSnapshotForPersistence,
+  describeToolActivity,
+  findActiveNonBoardToolInTurn,
+  formatSwarmWorkingDetail,
+  normalizeSwarmToolName,
+  settleSwarmSnapshotTerminal,
+  type DurableSwarmBoardInput,
+} from './antigravitySwarmFormat.js'
 import {
   CONVERSATION_ID_RE,
   IncrementalTranscriptTelemetryCache,
@@ -45,6 +53,7 @@ import {
 import {
   SwarmStallMonitor,
   type SwarmStallAlert,
+  type SwarmStallExhaustion,
   type SwarmStallMonitorOptions,
 } from './swarmStallMonitor.js'
 
@@ -103,6 +112,7 @@ interface TranscriptSummary {
   status: SwarmMemberStatus | null
   activity?: string
   waitingOnBoard?: boolean
+  hasActiveNonWaitTool?: boolean
   failed?: boolean
   lastError?: string
   firstStepAt?: number
@@ -137,79 +147,7 @@ function inferRole(name: string, rawRole: unknown): SwarmMemberRole {
   return 'worker'
 }
 
-function shortFileTarget(args: Record<string, unknown> | null): string {
-  if (!args) return ''
-  const raw =
-    asStr(args.Path) ||
-    asStr(args.AbsolutePath) ||
-    asStr(args.TargetFile) ||
-    asStr(args.file_path) ||
-    asStr(args.path)
-  if (!raw) return ''
-  return basename(raw) || raw
-}
-
-const SWARM_MCP_TOOL_PREFIX = 'mcp_openclaude-memory_'
-
-/** Strip the container MCP prefix (`mcp_openclaude-memory_`) so remote swarm tools
- *  (`mcp_openclaude-memory_swarm_wait` / `_post_message` / `_read_board` / `_swarm`)
- *  normalize to the same canonical names as native Antigravity CLI tools. */
-export function normalizeSwarmToolName(raw: string): string {
-  const trimmed = raw.trim()
-  if (trimmed.toLowerCase().startsWith(SWARM_MCP_TOOL_PREFIX)) {
-    return trimmed.slice(SWARM_MCP_TOOL_PREFIX.length)
-  }
-  return trimmed
-}
-
-function describeToolActivity(toolName: string, args: Record<string, unknown> | null): string {
-  const rawName = toolName.trim()
-  const name = normalizeSwarmToolName(rawName)
-  const target = shortFileTarget(args)
-  switch (name) {
-    case 'read_file':
-    case 'view_file':
-      return target ? `阅读 ${target}` : '阅读文件'
-    case 'write_file':
-    case 'write_to_file':
-      return target ? `写入 ${target}` : '写入文件'
-    case 'edit_file':
-    case 'replace_file_content':
-    case 'multi_replace_file_content':
-    case 'sed_file':
-      return target ? `编辑 ${target}` : '编辑文件'
-    case 'run_command':
-    case 'oc_bash':
-      return '运行命令'
-    case 'grep_search':
-    case 'oc_grep':
-      return '检索代码'
-    case 'find_by_name':
-    case 'list_dir':
-    case 'oc_glob':
-      return '浏览目录'
-    case 'search_web':
-      return '联网检索'
-    case 'read_url_content':
-      return '抓取网页'
-    case 'post_message':
-      return '发送讨论消息'
-    case 'read_board':
-      return '查看讨论板'
-    case 'swarm_wait':
-      return '等待讨论板消息'
-    case 'swarm': {
-      const action = args ? asStr(args.action) : ''
-      if (action === 'add') return '招募蜂群成员'
-      if (action === 'status') return '检查蜂群状态'
-      if (action === 'kill') return '回收蜂群成员'
-      return '调度蜂群'
-    }
-    default:
-      if (rawName.startsWith('mcp_')) return `调用 ${rawName.split('_').slice(-1)[0] || rawName}`
-      return name ? `执行 ${name}` : '处理中…'
-  }
-}
+export { normalizeSwarmToolName }
 
 function hasSwarmWaitCall(calls: readonly unknown[]): boolean {
   return calls.some((c) => normalizeSwarmToolName(asStr(recordOf(c)?.name)).toLowerCase() === 'swarm_wait')
@@ -294,7 +232,7 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
   const lastType = asStr(last.type).toUpperCase()
   const lastStatus = asStr(last.status).toUpperCase()
 
-  if (lastStatus === 'ERROR' || lastType === 'ERROR_MESSAGE') {
+  if (lastType === 'ERROR_MESSAGE') {
     const errText = clampText(asStr(last.content) || asStr(last.error) || '执行出错', 160)
     return {
       ...telBase,
@@ -306,13 +244,41 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
     }
   }
 
-  // Find the most recent planner step in the current turn.
+  // Find the most recent planner step in the current turn before treating a single
+  // tool step `ERROR` (e.g. `swarm_wait` erroring while a sibling `run_command` in the
+  // same batch is still running) as whole-turn failure/parking (OCV5-923 B5).
   let lastPlanner: Record<string, unknown> | null = null
+  let lastPlannerIdx = -1
   for (let i = turnSteps.length - 1; i >= 0; i -= 1) {
-    const t = asStr(turnSteps[i]?.type).toUpperCase()
-    if (t === 'PLANNER_RESPONSE') {
+    if (asStr(turnSteps[i]?.type).toUpperCase() === 'PLANNER_RESPONSE') {
       lastPlanner = turnSteps[i]!
+      lastPlannerIdx = i
       break
+    }
+  }
+  const lastPlannerCalls =
+    lastPlanner && Array.isArray(lastPlanner.tool_calls) ? lastPlanner.tool_calls : []
+  const activeNonBoardTool = findActiveNonBoardToolInTurn(turnSteps, lastPlannerIdx, lastPlannerCalls)
+  if (activeNonBoardTool) {
+    return {
+      ...telBase,
+      stepCount: maxStepIndex,
+      status: 'working',
+      activity: describeToolActivity(activeNonBoardTool.name, activeNonBoardTool.args),
+      waitingOnBoard: false,
+      hasActiveNonWaitTool: true,
+    }
+  }
+
+  if (lastStatus === 'ERROR') {
+    const errText = clampText(asStr(last.content) || asStr(last.error) || '执行出错', 160)
+    return {
+      ...telBase,
+      stepCount: maxStepIndex,
+      status: 'waiting',
+      activity: '步骤异常',
+      failed: true,
+      lastError: errText,
     }
   }
 
@@ -358,8 +324,6 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
   // Check if a tool batch ended with `swarm_wait` DONE (member parked itself).
   // Handles both explicit tool steps (`tool_name`/`name`) and native CLI 1.5.8 `GENERIC`
   // tool results whose planner batch included `swarm_wait` in any position (e.g. `[swarm_wait, post_message]`).
-  const lastPlannerCalls =
-    lastPlanner && Array.isArray(lastPlanner.tool_calls) ? lastPlanner.tool_calls : []
   const isSwarmWaitDone =
     turnSteps.slice(-6).some((step) => {
       const name = normalizeSwarmToolName(asStr(step.tool_name || step.name)).toLowerCase()
@@ -659,6 +623,8 @@ function buildSwarmSnapshotFromLoadedData(
       status = 'killed'
     } else if (opts.phase === 'completed' || opts.phase === 'interrupted' || opts.phase === 'error') {
       status = transcript.status === 'killed' ? 'killed' : 'waiting'
+    } else if (transcript.hasActiveNonWaitTool) {
+      status = 'working'
     } else if (rawPhase === 'WAITING') {
       status = 'waiting'
     } else if (rawPhase === 'STOPPED') {
@@ -725,6 +691,7 @@ function buildSwarmSnapshotFromLoadedData(
         ? '已回收'
         : transcript.activity || (wakeModeLower === 'mentions' ? '等待 @提及' : status === 'waiting' ? '待命中' : '工作中…')
     const waitingOnBoard =
+      !transcript.hasActiveNonWaitTool &&
       status !== 'killed' &&
       (status === 'waiting' || status === 'stopped' || transcript.waitingOnBoard === true)
 
@@ -738,7 +705,7 @@ function buildSwarmSnapshotFromLoadedData(
       ...(wakeMode ? { wakeMode } : {}),
       stepCount: transcript.stepCount,
       activity,
-      ...(waitingOnBoard ? { waitingOnBoard: true } : {}),
+      ...(waitingOnBoard ? { waitingOnBoard: true } : transcript.hasActiveNonWaitTool ? { waitingOnBoard: false } : {}),
       ...(transcript.failed ? { failed: true } : {}),
       ...(transcript.lastError ? { lastError: transcript.lastError } : {}),
       unreadCount,
@@ -1059,24 +1026,20 @@ export interface AntigravitySwarmWatcherOptions {
    */
   seedBaselineOnStart?: boolean
   onSnapshot: (snapshot: SwarmSnapshot) => void
-  /** Optional zero-token deterministic stall monitor configuration (enabled when `onStallDetected` is provided). */
+  /** Optional zero-token deterministic stall monitor configuration (enabled when `onStallDetected` or `onStallExhausted` is provided). */
   stallMonitor?: SwarmStallMonitorOptions
   /** Invoked when every live core member stays parked past the stall threshold without `[done]`. */
   onStallDetected?: (alert: SwarmStallAlert) => void
+  /** Invoked at most once per generation when all core members remain parked past `exhaustedGraceMs` after the final stall alert. */
+  onStallExhausted?: (event: SwarmStallExhaustion) => void
 }
 
-export function settleSwarmSnapshotTerminal(snap: SwarmSnapshot, phase: SwarmPhase): SwarmSnapshot {
-  const { postsMode: _pm, deltaBaseSeq: _dbs, ...clean } = structuredClone(snap)
-  return {
-    ...clean,
-    phase,
-    revision: snap.revision + 1,
-    updatedAt: Date.now(),
-    members: snap.members.map((m) => ({
-      ...m,
-      status: m.status === 'killed' ? 'killed' : 'waiting',
-    })),
-  }
+export {
+  buildDurableSwarmBoardInput,
+  compactSwarmSnapshotForPersistence,
+  formatSwarmWorkingDetail,
+  settleSwarmSnapshotTerminal,
+  type DurableSwarmBoardInput,
 }
 
 /**
@@ -1133,7 +1096,33 @@ export class AntigravitySwarmWatcher {
     this.seedBaselineOnStart = opts.seedBaselineOnStart === true
     this.onSnapshot = opts.onSnapshot
     this.onStallDetected = opts.onStallDetected
-    this.stallMonitor = opts.onStallDetected ? new SwarmStallMonitor(opts.stallMonitor) : null
+    const watcherExhausted = opts.onStallExhausted
+    const monitorExhausted = opts.stallMonitor?.onStallExhausted
+    const combinedExhausted =
+      watcherExhausted || monitorExhausted
+        ? (ev: SwarmStallExhaustion) => {
+            if (this.stopped || !this.turnActive) return
+            try {
+              monitorExhausted?.(ev)
+            } catch {
+              // Observer errors must never crash the adapter timer loop.
+            }
+            if (watcherExhausted && watcherExhausted !== monitorExhausted) {
+              try {
+                watcherExhausted(ev)
+              } catch {
+                // Observer errors must never crash the adapter timer loop.
+              }
+            }
+          }
+        : undefined
+    this.stallMonitor =
+      opts.onStallDetected || combinedExhausted
+        ? new SwarmStallMonitor({
+            ...opts.stallMonitor,
+            ...(combinedExhausted ? { onStallExhausted: combinedExhausted } : {}),
+          })
+        : null
     // When resuming an existing swarm (`seedBaselineOnStart`), anchor window token
     // deltas at turn start (minus 1s clock skew margin) so historical worker steps
     // are not re-counted in `turnWorkerUsageDelta()`.
@@ -1206,6 +1195,12 @@ export class AntigravitySwarmWatcher {
   /** Roll back a stall alert's quota consumption when lock contention prevented board delivery. */
   rollbackStallAlert(alert: SwarmStallAlert): void {
     this.stallMonitor?.rollbackAlert(alert)
+  }
+
+  /** True iff this active swarm is stuck in `suppressed_max_alerts` with zero working core members. */
+  isStallSuppressedAllParked(): boolean {
+    if (this.stopped || !this.turnActive || !this.stallMonitor) return false
+    return this.stallMonitor.isStallSuppressedAllParked()
   }
 
   /** Non-coordinator worker token delta observed during this turn (for tape display accuracy). */
@@ -1427,9 +1422,9 @@ export class AntigravitySwarmWatcher {
   }
 
   private evaluateStall(snap: SwarmSnapshot, now: number): void {
-    if (this.stopped || !this.turnActive || !this.stallMonitor || !this.onStallDetected) return
+    if (this.stopped || !this.turnActive || !this.stallMonitor) return
     const alert = this.stallMonitor.evaluate(snap, now)
-    if (!alert) return
+    if (!alert || !this.onStallDetected) return
     try {
       this.onStallDetected(alert)
     } catch {
@@ -1738,50 +1733,4 @@ export class AntigravitySwarmWatcher {
       this.timer = null
     }
   }
-}
-
-/** Concise one-line status text for the live turn_status working bar. */
-export function formatSwarmWorkingDetail(snap: SwarmSnapshot): string {
-  const working = snap.members.filter((m) => m.status === 'working' && m.role !== 'monitor' && m.role !== 'narrator').length
-  const live = snap.members.filter((m) => m.status !== 'killed').length
-  const parts: string[] = [`蜂群「${snap.title}」`]
-  if (working > 0) parts.push(`${working} 成员运行中`)
-  else parts.push(`${live} 成员协作中`)
-  if (snap.totalPosts > 0) parts.push(`${snap.totalPosts} 条讨论`)
-  return parts.join(' · ')
-}
-
-export interface DurableSwarmBoardInput {
-  swarmId: string
-  title: string
-  phase: SwarmPhase
-  snapshot: SwarmSnapshot
-}
-
-function durableEnvelopeFor(snapshot: SwarmSnapshot): DurableSwarmBoardInput {
-  return {
-    swarmId: snapshot.swarmId,
-    title: snapshot.title,
-    phase: snapshot.phase,
-    snapshot,
-  }
-}
-
-/**
- * Produce a UTF-8 byte-bounded copy of a SwarmSnapshot whose COMPLETE
- * `{ swarmId, title, phase, snapshot }` envelope fits safely inside
- * `ToolEntrySchema.inputJson` (16 KB server-authored durability cap).
- */
-export function compactSwarmSnapshotForPersistence(
-  snap: SwarmSnapshot,
-  maxBytes: number = 13_000,
-): SwarmSnapshot {
-  return structuredClone(compactSwarmSnapshotToByteBudget(snap, maxBytes))
-}
-
-export function buildDurableSwarmBoardInput(
-  snap: SwarmSnapshot,
-  maxBytes: number = 13_000,
-): DurableSwarmBoardInput {
-  return durableEnvelopeFor(compactSwarmSnapshotForPersistence(snap, maxBytes))
 }

@@ -14,18 +14,70 @@ import type { DelegateJobSnapshot } from './delegateJobs.js'
 import { parseParentEngine } from './jobTerminal.js'
 import type { SessionRepoStatusOut } from './sessionRepoWorkspace.js'
 import { messageSendAttempt, preStartStopKey } from './sessionManager.js'
+import { isHiddenSystemAgentId } from './agentVisibility.js'
 import { getTurnAuthority } from './modelAuthority.js'
 import { DISPATCH_AUTHORITY_FIELD, DispatchRejected, type DispatchTurnContext, type admitTurnDispatch, attachDispatchContext, buildTurnDispatchReceiptFrame } from './turnDispatchInbox.js'
 import type { Gateway } from './server.js'
+import type { HandleStopFrame, WsConnectionHost } from './wsConnection.js'
 import { userSentTurnFrames } from './turnFrames.js'
 
 /** Bounds of Gateway._recentSettlements (FIFO evict + TTL); formerly Gateway statics. */
 const RECENT_SETTLEMENT_MAX = 1000
 const RECENT_SETTLEMENT_TTL_MS = 5 * 60_000
 
+/** OCV5-923 — metadata for admitted webchat turns awaiting or running dispatch. */
+export interface AdmittedClientTurnMeta {
+  peerId: string
+  clientMessageId: string
+  targetSessionKey?: string
+  /** Running turn already occupying targetSessionKey at admission/route-binding time (proves happens-before for non-admitted old turns). */
+  runningCmidAtAdmission?: string
+  hadActivePersistAtAdmission?: boolean
+  /** Monotonic admission order sequence on this gateway instance. */
+  seq: number
+}
+
+function captureBlockingTurnAtAdmission(
+  sessions: { getByKey?: (key: string) => unknown },
+  targetSessionKey: string,
+  meta: AdmittedClientTurnMeta,
+): void {
+  if (meta.runningCmidAtAdmission !== undefined || meta.hadActivePersistAtAdmission !== undefined) return
+  const live = typeof sessions.getByKey === 'function' ? sessions.getByKey(targetSessionKey) : undefined
+  if (!live || typeof live !== 'object') return
+  const runningCmid = (live as { _runningClientMessageId?: unknown })._runningClientMessageId
+  if (typeof runningCmid === 'string' && runningCmid.length > 0 && runningCmid !== meta.clientMessageId) {
+    meta.runningCmidAtAdmission = runningCmid
+  }
+  if ((live as { _persistActiveTurn?: unknown })._persistActiveTurn) {
+    meta.hadActivePersistAtAdmission = true
+  }
+}
+
+/**
+ * OCV5-923 (B2): Bind the single authoritative execution sessionKey resolved by
+ * `inboundDispatch` onto the admitted turn's metadata so pre-start Stop and
+ * execution always share the exact same routing decision (even across router hot-reloads).
+ */
+export function bindAdmittedClientTurnSessionKey(
+  host: { _admittedClientTurnMeta?: Map<string, AdmittedClientTurnMeta>; sessions: { getByKey?: (key: string) => unknown } },
+  frame: InboundFrame,
+  sessionKey: string,
+): void {
+  const clientMessageId = (frame as { clientMessageId?: unknown }).clientMessageId
+  if (frame.type !== 'inbound.message' || frame.channel !== 'webchat' || !isClientMessageId(clientMessageId)) return
+  const meta = host._admittedClientTurnMeta?.get(preStartStopKey(frame.peer.id, clientMessageId))
+  if (!meta || !sessionKey) return
+  meta.targetSessionKey = sessionKey
+  captureBlockingTurnAtAdmission(host.sessions, sessionKey, meta)
+}
+
+let nextAdmittedTurnSeq = 1
+
 export interface TurnDispatchHost {
   _activeSendToAgentCallbacks: Gateway['_activeSendToAgentCallbacks']
   _admittedClientTurns: Gateway['_admittedClientTurns']
+  _admittedClientTurnMeta?: Gateway['_admittedClientTurnMeta']
   _authorityConns: Gateway['_authorityConns']
   _delegateInflightSurface: Gateway['_delegateInflightSurface']
   _dispatchAuthority: Gateway['_dispatchAuthority']
@@ -36,6 +88,7 @@ export interface TurnDispatchHost {
   _syntheticTurnBarriers: Gateway['_syntheticTurnBarriers']
   dispatchInbound: Gateway['dispatchInbound']
   log: Gateway['log']
+  router?: Gateway['router']
   sessions: Gateway['sessions']
 }
 
@@ -213,6 +266,28 @@ export async function _dispatchAdmittedClientTurn(this: TurnDispatchHost, frame:
   const key = preStartStopKey(frame.peer.id, clientMessageId)
   const admitted = (this._admittedClientTurns ??= new Map())
   admitted.set(key, (admitted.get(key) ?? 0) + 1)
+  const metaMap = (this._admittedClientTurnMeta ??= new Map())
+  if (!metaMap.has(key)) {
+    // Match inboundDispatch.ts execution routing deterministically:
+    // - Explicit frame.agentId builds a deterministic sessionKey independent of router hot-reloads.
+    // - Without frame.agentId, leave targetSessionKey undefined until inboundDispatch resolves the
+    //   single authoritative route and calls bindAdmittedClientTurnSessionKey() (OCV5-923 B2).
+    let targetSessionKey: string | undefined
+    if (typeof frame.agentId === 'string' && frame.agentId.trim()) {
+      const safePeerId = frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')
+      targetSessionKey = `agent:${frame.agentId.trim()}:${frame.channel}:${frame.peer.kind}:${safePeerId}`
+    }
+    const entry: AdmittedClientTurnMeta = {
+      peerId: frame.peer.id,
+      clientMessageId,
+      ...(targetSessionKey ? { targetSessionKey } : {}),
+      seq: nextAdmittedTurnSeq++,
+    }
+    if (targetSessionKey) {
+      captureBlockingTurnAtAdmission(this.sessions, targetSessionKey, entry)
+    }
+    metaMap.set(key, entry)
+  }
   this.sessions.adoptPreStartStopOnAdmission(
     frame.peer.id,
     clientMessageId,
@@ -226,6 +301,7 @@ export async function _dispatchAdmittedClientTurn(this: TurnDispatchHost, frame:
       admitted.set(key, left)
     } else {
       admitted.delete(key)
+      metaMap.delete(key)
       this.sessions.clearPreStartStop(frame.peer.id, clientMessageId)
     }
   }
@@ -278,4 +354,115 @@ export function _lookupSettlement(this: TurnDispatchHost, requestId: string): Lo
     userId: e.userId,
     answers: e.answers,
   }
+}
+
+/**
+ * OCV5-435 / OCV5-923 — handle Stop for an admitted pre-start webchat turn:
+ * fences the target turn (and any earlier queued turns on the exact same
+ * sessionKey) and interrupts an older in-flight blocking turn on that exact
+ * sessionKey without violating B5 cross-agent isolation or interrupting a newer
+ * overtaking turn.
+ */
+export async function handlePreStartStop(
+  host: WsConnectionHost,
+  frame: HandleStopFrame,
+  clientMessageId: string,
+  admittedKey: string,
+  safePeerId: string,
+  suffix: string,
+  interruptRemoteSwarm: (
+    host: WsConnectionHost,
+    sessionKey: string,
+    reason: string,
+  ) => Promise<boolean>,
+): Promise<boolean> {
+  host.sessions.fencePreStartStop(frame.peer.id, clientMessageId)
+  const meta = host._admittedClientTurnMeta?.get(admittedKey)
+  // Prefer admission-time targetSessionKey; if meta exists without one, never
+  // guess from frame.sessionKey. Only fall back to frame.agentId when meta is
+  // absent (legacy Set mocks).
+  let targetSessionKey: string | undefined
+  if (meta) {
+    targetSessionKey = meta.targetSessionKey
+  } else {
+    const explicitFrameAgentId =
+      typeof frame.agentId === 'string' && frame.agentId.trim()
+        ? frame.agentId.trim()
+        : undefined
+    if (explicitFrameAgentId) {
+      targetSessionKey = `agent:${explicitFrameAgentId}:${frame.channel}:${frame.peer.kind}:${safePeerId}`
+    }
+  }
+
+  let interruptedBlockingTurn = false
+  let blockingClientMessageId: string | undefined
+
+  if (targetSessionKey) {
+    const targetAgentId = targetSessionKey.split(':')[1]
+    if (!targetAgentId || !isHiddenSystemAgentId(targetAgentId)) {
+      if (meta && host._admittedClientTurnMeta) {
+        for (const [otherKey, otherMeta] of host._admittedClientTurnMeta.entries()) {
+          if (otherKey === admittedKey) continue
+          if (otherMeta.targetSessionKey !== targetSessionKey) continue
+          if (otherMeta.seq < meta.seq) {
+            host.sessions.fencePreStartStop(otherMeta.peerId, otherMeta.clientMessageId)
+          }
+        }
+      }
+
+      // Production sessions.list() returns summaries without internal turn fields;
+      // use getByKey() for the real AgentSession (falling back to list() only on mocks without getByKey).
+      const blockingLive =
+        typeof host.sessions.getByKey === 'function'
+          ? host.sessions.getByKey(targetSessionKey)
+          : host.sessions.list().find((live) => live.sessionKey === targetSessionKey)
+      if (blockingLive) {
+        const runningCmid = (blockingLive as { _runningClientMessageId?: string })._runningClientMessageId
+        const hasActivePersist = Boolean((blockingLive as { _persistActiveTurn?: unknown })._persistActiveTurn)
+        const hasBlockingTurn =
+          (typeof runningCmid === 'string' && runningCmid.length > 0 && runningCmid !== clientMessageId) ||
+          (hasActivePersist && runningCmid !== clientMessageId)
+        if (hasBlockingTurn && meta) {
+          const runningMeta =
+            typeof runningCmid === 'string' && runningCmid.length > 0
+              ? host._admittedClientTurnMeta?.get(preStartStopKey(frame.peer.id, runningCmid))
+              : undefined
+          // Only interrupt & cascade when we can PROVE the blocking turn predates this admitted turn:
+          //   1. Both turns were admitted and runningMeta.seq < meta.seq, OR
+          //   2. This exact runningCmid was already running on targetSessionKey when meta was admitted/bound, OR
+          //   3. A _persistActiveTurn-only turn (no runningCmid) was already active at admission/bind time.
+          // Unsequenced newer callbacks (e.g. delegateCallbacks sneaking in after admission) are NEVER killed.
+          const provenOlderRunningCmid =
+            typeof runningCmid === 'string' &&
+            runningCmid.length > 0 &&
+            ((runningMeta !== undefined && runningMeta.seq < meta.seq) ||
+              (runningMeta === undefined && meta.runningCmidAtAdmission === runningCmid))
+          const provenOlderPersistOnly =
+            !runningCmid && hasActivePersist && meta.hadActivePersistAtAdmission === true
+          if (provenOlderRunningCmid || provenOlderPersistOnly) {
+            const blockingSelf = provenOlderRunningCmid
+              ? host.sessions.interruptClientTurn(blockingLive.sessionKey, runningCmid)
+              : host.sessions.interrupt(blockingLive.sessionKey, 'user')
+            if (blockingSelf) {
+              const blockingDelegates = host._interruptDelegationsForParent(blockingLive.sessionKey)
+              const blockingSwarm = await interruptRemoteSwarm(host, blockingLive.sessionKey, 'user_stop')
+              host._settlePendingPermissionsForStop(blockingLive.sessionKey, runningCmid)
+              interruptedBlockingTurn = blockingSelf || blockingDelegates || blockingSwarm
+              blockingClientMessageId = runningCmid
+            }
+          }
+        }
+      }
+    }
+  }
+
+  host.log.info('interrupt', {
+    sessionKey: targetSessionKey ?? `*${suffix}`,
+    clientMessageId,
+    ok: true,
+    preStart: true,
+    interruptedBlockingTurn,
+    ...(blockingClientMessageId ? { blockingClientMessageId } : {}),
+  })
+  return true
 }

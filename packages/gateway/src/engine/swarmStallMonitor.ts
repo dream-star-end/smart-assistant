@@ -21,196 +21,61 @@
  */
 import type {
   SwarmBoardPost,
-  SwarmMemberRole,
   SwarmMemberSnapshot,
   SwarmSnapshot,
 } from '@openclaude/protocol'
+import {
+  DEFAULT_SWARM_STALL_DIAGNOSTIC_THROTTLE_MS,
+  DEFAULT_SWARM_STALL_EXHAUSTED_GRACE_MS,
+  DEFAULT_SWARM_STALL_MAX_ALERTS,
+  DEFAULT_SWARM_STALL_RETRY_COOLDOWN_MS,
+  DEFAULT_SWARM_STALL_THRESHOLD_MS,
+  DEFAULT_SWARM_WORKING_STALL_THRESHOLD_MS,
+  GATEWAY_STALL_MONITOR_AGENT,
+  formatIdleMinutes,
+  isCoordinatorDonePost,
+  isMemberEffectivelyWaiting,
+  isMonitorPost,
+  isSwarmAuxiliaryRole,
+  isSwarmMonitorAgentName,
+  mentionMatchesWorker,
+  postHasLiveCoreRecipient,
+  sanitizeQuotedText,
+  type SwarmStallAlert,
+  type SwarmStallDiagnosticEvent,
+  type SwarmStallDiagnosticKind,
+  type SwarmStallExhaustion,
+  type SwarmStallMonitorOptions,
+  type SwarmStallReason,
+} from './swarmStallTypes.js'
 
-export const GATEWAY_STALL_MONITOR_AGENT = 'gateway-monitor'
-export const DEFAULT_SWARM_STALL_THRESHOLD_MS = 180_000
-export const DEFAULT_SWARM_WORKING_STALL_THRESHOLD_MS = 2_400_000
-export const DEFAULT_SWARM_STALL_RETRY_COOLDOWN_MS = 540_000
-export const DEFAULT_SWARM_STALL_MAX_ALERTS = 3
-export const DEFAULT_SWARM_STALL_DIAGNOSTIC_THROTTLE_MS = 30_000
-
-export type SwarmStallReason =
-  | 'member_failed'
-  | 'working_member_stalled'
-  | 'unanswered_mention'
-  | 'unanswered_mention_escalated'
-  | 'unclaimed_result'
-  | 'channel_stalled'
-  | 'idle_waiting'
-
-export type SwarmStallDiagnosticKind =
-  | 'skipped_phase'
-  | 'skipped_no_workers'
-  | 'stage_done_entered'
-  | 'stage_done_suppressed'
-  | 'stage_rearmed'
-  | 'progress_reset'
-  | 'skipped_working'
-  | 'activity_postponed'
-  | 'quiet_waiting'
-  | 'suppressed_max_alerts'
-  | 'suppressed_cooldown'
-  | 'alert_emitted'
-
-export interface SwarmStallDiagnosticEvent {
-  readonly kind: SwarmStallDiagnosticKind
-  readonly swarmId: string
-  readonly phase: SwarmSnapshot['phase']
-  readonly headSeq: number
-  readonly idleMs: number
-  readonly alertCount: number
-  readonly workingMembers: readonly string[]
-  readonly waitingMembers: readonly string[]
-  readonly reason?: SwarmStallReason
-  readonly target?: string
-  readonly detail?: string
-}
-
-export interface SwarmStallAlert {
-  /** Single target member name (without leading `@`, never `all`). */
-  readonly target: string
-  /** Target board channel (typically `main`). */
-  readonly channel: string
-  readonly reason: SwarmStallReason
-  /** Formatted board post beginning with `@<target> [stall] ...`. */
-  readonly message: string
-  readonly attempt: number
-  /** Monotonic stage/budget generation (OCV5-887 P2-09) preventing stale rollbacks across progress resets. */
-  readonly generation: number
-  readonly idleMs: number
-  /** Highest sequence number of non-monitor posts observed. */
-  readonly headSeq: number
-  readonly citedSeqs: readonly number[]
-}
-
-export interface SwarmStallMonitorOptions {
-  /** Quiet duration before emitting the first stall alert when all core members are parked (default 3 min). */
-  stallThresholdMs?: number
-  /** Quiet duration with zero step/tool/board progress before alerting on a stuck `working` member (default `max(2 * stallThresholdMs, 6 min)`). */
-  workingStallThresholdMs?: number
-  /** Cooldown between repeated alerts for the same stall (default 9 min). */
-  retryCooldownMs?: number
-  /** Max consecutive alerts for the same stall before going silent (default 3). */
-  maxAlerts?: number
-  /** Optional structured diagnostic observer (throttled on repetitive checks, immediate on transitions/alerts). */
-  onDiagnostic?: (event: SwarmStallDiagnosticEvent) => void
-  /** Minimum interval between repetitive diagnostic logs of the same kind (default 30s). */
-  diagnosticThrottleMs?: number
-}
-
-const MONITOR_NAME_RE = /^monitor(?:-\d+)?$/i
-const DONE_PREFIX_RE = /^\s*(?:@all\s+)?(?:\*{1,2}|_{1,2})?\[done\](?::|：)?(?:\*{1,2}|_{1,2})?(?:\s|$|:|：|-|—)/i
-const PARKED_WAIT_ACTIVITIES = new Set(['等待讨论板消息', '已完成本轮思考'])
-
-export function isSwarmMonitorAgentName(name: string): boolean {
-  const lower = name.trim().toLowerCase()
-  return lower === GATEWAY_STALL_MONITOR_AGENT || MONITOR_NAME_RE.test(lower)
-}
-
-export function isSwarmAuxiliaryRole(role: SwarmMemberRole): boolean {
-  return role === 'monitor' || role === 'narrator'
-}
-
-/**
- * True when a live member is parked waiting for board activity rather than
- * actively executing tools or thinking.
- *
- * Note: in native Antigravity transcripts, a member currently blocked inside
- * `swarm_wait` shows `status: 'working'` with `activity: '等待讨论板消息'`.
- * Treating that state as effectively waiting prevents deadlocked `swarm_wait`
- * pairs from looking permanently busy.
- */
-export function isMemberEffectivelyWaiting(member: SwarmMemberSnapshot): boolean {
-  if (member.status === 'killed') return false
-  if (member.status === 'waiting' || member.status === 'stopped') return true
-  if (typeof member.waitingOnBoard === 'boolean') return member.waitingOnBoard
-  return (
-    member.status === 'working' &&
-    typeof member.activity === 'string' &&
-    PARKED_WAIT_ACTIVITIES.has(member.activity)
-  )
-}
-
-function isMonitorPost(post: SwarmBoardPost): boolean {
-  return isSwarmMonitorAgentName(post.agent)
-}
-
-function isCoordinatorDonePost(post: SwarmBoardPost): boolean {
-  return post.agent.trim().toLowerCase() === 'coordinator' && DONE_PREFIX_RE.test(post.text)
-}
-
-function mentionMatchesWorker(mention: string, workerName: string): boolean {
-  const m = mention.toLowerCase()
-  const w = workerName.toLowerCase()
-  if (!m || m === 'all' || m.startsWith('#')) return false
-  if (m === w) return true
-  return w.startsWith(`${m}-`) && /^\d+$/.test(w.slice(m.length + 1))
-}
-
-function postHasLiveCoreRecipient(
-  post: SwarmBoardPost,
-  liveCoreMembers: readonly SwarmMemberSnapshot[],
-): boolean {
-  if (post.mentions.length === 0) return false
-  const senderLower = post.agent.trim().toLowerCase()
-  for (const rawMention of post.mentions) {
-    const m = rawMention.toLowerCase()
-    if (m === 'all') return true
-    if (m === 'coordinator') return senderLower !== 'coordinator'
-    if (m.startsWith('#')) {
-      const ch = m.slice(1)
-      if (
-        ch &&
-        liveCoreMembers.some(
-          (member) =>
-            member.name.toLowerCase() !== senderLower &&
-            (member.channels ?? ['main']).includes(ch),
-        )
-      ) {
-        return true
-      }
-      continue
-    }
-    if (
-      liveCoreMembers.some(
-        (member) =>
-          member.name.toLowerCase() !== senderLower && mentionMatchesWorker(m, member.name),
-      )
-    ) {
-      return true
-    }
-  }
-  return false
-}
-
-function formatIdleMinutes(idleMs: number): number {
-  return Math.max(1, Math.round(idleMs / 60_000))
-}
-
-/**
- * Neutralize `@mention` tokens in quoted error/member strings so a single-target
- * stall alert can NEVER accidentally wake `@all`, `@#channel`, or other workers.
- */
-function sanitizeQuotedText(text: string | undefined, maxChars: number, fallback: string): string {
-  const clean = (text ?? '')
-    .replace(/\s+/g, ' ')
-    .replace(/@/g, '＠')
-    .replace(/`/g, "'")
-    .trim()
-  if (!clean) return fallback
-  return clean.length <= maxChars ? clean : `${clean.slice(0, Math.max(1, maxChars - 1))}…`
+export {
+  DEFAULT_SWARM_STALL_DIAGNOSTIC_THROTTLE_MS,
+  DEFAULT_SWARM_STALL_EXHAUSTED_GRACE_MS,
+  DEFAULT_SWARM_STALL_MAX_ALERTS,
+  DEFAULT_SWARM_STALL_RETRY_COOLDOWN_MS,
+  DEFAULT_SWARM_STALL_THRESHOLD_MS,
+  DEFAULT_SWARM_WORKING_STALL_THRESHOLD_MS,
+  GATEWAY_STALL_MONITOR_AGENT,
+  isMemberEffectivelyWaiting,
+  isSwarmAuxiliaryRole,
+  isSwarmMonitorAgentName,
+  type SwarmStallAlert,
+  type SwarmStallDiagnosticEvent,
+  type SwarmStallDiagnosticKind,
+  type SwarmStallExhaustion,
+  type SwarmStallMonitorOptions,
+  type SwarmStallReason,
 }
 
 export class SwarmStallMonitor {
   private readonly stallThresholdMs: number
   private readonly workingStallThresholdMs: number
   private readonly retryCooldownMs: number
+  private readonly exhaustedGraceMs: number
   private readonly maxAlerts: number
   private readonly onDiagnostic?: (event: SwarmStallDiagnosticEvent) => void
+  private readonly onStallExhausted?: (event: SwarmStallExhaustion) => void
   private readonly diagnosticThrottleMs: number
 
   /** Highest coordinator `[done]` post seq observed. */
@@ -236,6 +101,8 @@ export class SwarmStallMonitor {
   private alertCount = 0
   private lastAlertAt = 0
   private prevAlertAt = 0
+  private exhaustedEmitted = false
+  private lastWorkingMembers: readonly string[] = []
   private readonly repingedMentions = new Map<string, number>()
   private lastDiagnosticKind: SwarmStallDiagnosticKind | null = null
   private lastDiagnosticAt = 0
@@ -248,12 +115,19 @@ export class SwarmStallMonitor {
         Math.max(this.stallThresholdMs * 2, DEFAULT_SWARM_WORKING_STALL_THRESHOLD_MS),
     )
     this.retryCooldownMs = Math.max(1_000, opts?.retryCooldownMs ?? DEFAULT_SWARM_STALL_RETRY_COOLDOWN_MS)
+    this.exhaustedGraceMs = Math.max(0, opts?.exhaustedGraceMs ?? this.retryCooldownMs)
     this.maxAlerts = Math.max(1, Math.floor(opts?.maxAlerts ?? DEFAULT_SWARM_STALL_MAX_ALERTS))
     this.onDiagnostic = opts?.onDiagnostic
+    this.onStallExhausted = opts?.onStallExhausted
     this.diagnosticThrottleMs = Math.max(
       0,
       opts?.diagnosticThrottleMs ?? DEFAULT_SWARM_STALL_DIAGNOSTIC_THROTTLE_MS,
     )
+  }
+
+  /** True iff the active stage has exhausted all stall alerts and zero core members are working. */
+  isStallSuppressedAllParked(): boolean {
+    return !this.stageDone && this.alertCount >= this.maxAlerts && this.lastWorkingMembers.length === 0
   }
 
   /** Clear all state on turn end, user stop, or swarm teardown. */
@@ -264,6 +138,7 @@ export class SwarmStallMonitor {
     this.lastBusinessKey = null
     this.lastActivityKey = null
     this.lastQuietSince = 0
+    this.lastWorkingMembers = []
     this.lastDiagnosticKind = null
     this.lastDiagnosticAt = 0
     this.clearAlertState()
@@ -274,6 +149,7 @@ export class SwarmStallMonitor {
     this.alertCount = 0
     this.lastAlertAt = 0
     this.prevAlertAt = 0
+    this.exhaustedEmitted = false
     this.repingedMentions.clear()
   }
 
@@ -288,6 +164,7 @@ export class SwarmStallMonitor {
     if (this.alertCount !== alert.attempt || this.alertCount <= 0) return
     this.alertCount -= 1
     this.lastAlertAt = this.prevAlertAt
+    if (this.alertCount < this.maxAlerts) this.exhaustedEmitted = false
     if (alert.reason === 'unanswered_mention') {
       const targetLower = alert.target.trim().toLowerCase()
       const cited = alert.citedSeqs[0]
@@ -350,6 +227,7 @@ export class SwarmStallMonitor {
       this.lastBusinessKey = null
       this.lastActivityKey = null
       this.lastQuietSince = now
+      this.lastWorkingMembers = []
       this.clearAlertState()
       this.emitDiagnostic(now, {
         kind: 'skipped_no_workers',
@@ -374,6 +252,7 @@ export class SwarmStallMonitor {
       if (isMemberEffectivelyWaiting(m)) waitingMembers.push(m.name)
       else workingMembers.push(m.name)
     }
+    this.lastWorkingMembers = workingMembers
 
     let newestDoneSeq = this.lastDoneSeq
     for (const post of nonMonitorPosts) {
@@ -572,6 +451,40 @@ export class SwarmStallMonitor {
       return null
     }
     if (this.alertCount >= this.maxAlerts) {
+      if (!anyWorking && now - this.lastAlertAt >= this.exhaustedGraceMs && !this.exhaustedEmitted) {
+        this.exhaustedEmitted = true
+        this.emitDiagnostic(
+          now,
+          {
+            kind: 'stall_exhausted',
+            swarmId: snap.swarmId,
+            phase: snap.phase,
+            headSeq: effectiveHeadSeq,
+            idleMs,
+            alertCount: this.alertCount,
+            workingMembers,
+            waitingMembers,
+            detail: 'max_alerts_exhausted',
+          },
+          { immediate: true },
+        )
+        if (this.onStallExhausted) {
+          try {
+            this.onStallExhausted({
+              swarmId: snap.swarmId,
+              generation: this.stageGeneration,
+              idleMs,
+              alertCount: this.alertCount,
+              headSeq: effectiveHeadSeq,
+              waitingMembers: [...waitingMembers],
+              reason: 'max_alerts_exhausted',
+            })
+          } catch {
+            // Observer errors must never break stall monitoring.
+          }
+        }
+        return null
+      }
       this.emitDiagnostic(now, {
         kind: 'suppressed_max_alerts',
         swarmId: snap.swarmId,
