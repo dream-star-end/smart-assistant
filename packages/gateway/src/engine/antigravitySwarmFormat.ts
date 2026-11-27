@@ -230,6 +230,8 @@ function extractPlannerCallSpecs(lastPlannerCalls: readonly unknown[]): PlannerC
 
 function collectAfterPlannerTerminals(afterPlanner: readonly Record<string, unknown>[]): TerminalToolStep[] {
   const seenIds = new Set<string>()
+  const seenStepIndices = new Set<number>()
+  const seenUnindexedPayloads = new Set<string>()
   const terminals: TerminalToolStep[] = []
   for (const s of afterPlanner) {
     const st = strOf(s.status).toUpperCase()
@@ -238,6 +240,15 @@ function collectAfterPlannerTerminals(afterPlanner: readonly Record<string, unkn
     if (cid) {
       if (seenIds.has(cid)) continue
       seenIds.add(cid)
+    }
+    const rawStepIdx = s.step_index
+    if (typeof rawStepIdx === 'number' && Number.isFinite(rawStepIdx)) {
+      if (seenStepIndices.has(rawStepIdx)) continue
+      seenStepIndices.add(rawStepIdx)
+    } else if (!cid) {
+      const fingerprint = JSON.stringify(s)
+      if (seenUnindexedPayloads.has(fingerprint)) continue
+      seenUnindexedPayloads.add(fingerprint)
     }
     const tname = stepToolName(s)
     if (!cid && !tname) continue
@@ -252,18 +263,19 @@ function findUnambiguousNameFallbackIndex(
   idMatchedNorms: ReadonlySet<string>,
   term: TerminalToolStep,
 ): number {
+  if (idMatchedNorms.has(term.norm)) return -1
+  let sameNormTotal = 0
   const candidates: number[] = []
   for (let i = 0; i < calls.length; i += 1) {
     const c = calls[i]!
-    if (accounted.has(i) || c.norm !== term.norm) continue
+    if (c.norm !== term.norm) continue
+    sameNormTotal += 1
+    if (accounted.has(i)) continue
     if (term.id && c.id) continue
     candidates.push(i)
   }
-  if (candidates.length === 0) return -1
-  const firstIdx = candidates[0]!
-  if (calls[firstIdx]!.id === '') return firstIdx
-  if (candidates.length === 1 && !idMatchedNorms.has(term.norm)) return firstIdx
-  return -1
+  if (sameNormTotal !== 1 || candidates.length !== 1) return -1
+  return candidates[0]!
 }
 
 function matchAccountedPlannerCalls(

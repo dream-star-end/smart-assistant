@@ -1057,6 +1057,89 @@ process.stdin.on('data', (c) => {
       assert.equal(monP11.evaluate(snapP11, 1_800_000), null)
       assert.equal(monP11.isStallSuppressedAllParked(), false)
       assert.equal(exhaustedP11.length, 0, 'P1-1: swarm must NOT be reaped while run_command(A) is still unfinished')
+
+      // R2-final P1-1 control matrix:
+      // (a) un-ID'd [run_command(A), run_command(B), swarm_wait] + single named DONE -> working, 0 exhaustion
+      // (b) same un-ID'd batch with B's exact DONE replayed (same step_index OR unindexed) -> STILL working, 0 exhaustion
+      // (c) attributable completions for BOTH A (tc-a) and B (tc-b) -> waiting, normal stall_exhausted convergence
+      const unIdBatchStep = JSON.stringify({
+        step_index: 0,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          { name: 'run_command', args: { CommandLine: 'python3 job_a.py' } },
+          { name: 'run_command', args: { CommandLine: 'python3 job_b.py' } },
+          { name: 'swarm_wait', args: { since: 1 } },
+        ],
+      })
+      const unIdDoneStep = JSON.stringify({
+        step_index: 1,
+        type: 'TOOL_RESULT',
+        tool_name: 'run_command',
+        status: 'DONE',
+        content: 'job_b finished',
+      })
+      for (const [label, lines] of [
+        ['single un-ID DONE', [unIdBatchStep, unIdDoneStep]],
+        ['replayed un-ID DONE (same step_index)', [unIdBatchStep, unIdDoneStep, unIdDoneStep]],
+      ] as const) {
+        await writeFile(path.join(workerLogs, 'transcript.jsonl'), `${lines.join('\n')}\n`)
+        const snapUnId = readAntigravitySwarmSnapshot({
+          brainDir,
+          conversationId: convId,
+          phase: 'running',
+          revision: 5,
+          now: 1_000,
+        })
+        assert.ok(snapUnId)
+        const wUnId = snapUnId.members.find((m) => m.name === 'worker-a')
+        assert.equal(wUnId?.status, 'working', `${label}: must stay working while A is unfinished`)
+        assert.equal(wUnId?.waitingOnBoard, false, `${label}: waitingOnBoard must stay false`)
+        const exhUnId: SwarmStallExhaustion[] = []
+        const monUnId = new SwarmStallMonitor({ onStallExhausted: (e) => exhUnId.push(e) })
+        assert.equal(monUnId.evaluate(snapUnId, 0), null)
+        assert.equal(monUnId.evaluate(snapUnId, 180_000), null)
+        assert.equal(monUnId.evaluate(snapUnId, 720_000), null)
+        assert.equal(monUnId.evaluate(snapUnId, 1_260_000), null)
+        assert.equal(monUnId.evaluate(snapUnId, 1_800_000), null)
+        assert.equal(exhUnId.length, 0, `${label}: must NOT fire max_alerts_exhausted`)
+      }
+
+      // Positive control (c): both A (tc-a) and B (tc-b) have attributable completions -> normal waiting convergence
+      const bothDoneTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            { id: 'tc-a', name: 'run_command', args: { CommandLine: 'python3 job_a.py' } },
+            { id: 'tc-b', name: 'run_command', args: { CommandLine: 'python3 job_b.py' } },
+            { id: 'tc-c', name: 'swarm_wait', args: { since: 1 } },
+          ],
+        }),
+        JSON.stringify({ step_index: 1, type: 'TOOL_RESULT', tool_call_id: 'tc-b', tool_name: 'run_command', status: 'DONE', content: 'b ok' }),
+        JSON.stringify({ step_index: 2, type: 'TOOL_RESULT', tool_call_id: 'tc-a', tool_name: 'run_command', status: 'DONE', content: 'a ok' }),
+      ].join('\n') + '\n'
+      await writeFile(path.join(workerLogs, 'transcript.jsonl'), bothDoneTranscript)
+      const snapBothDone = readAntigravitySwarmSnapshot({
+        brainDir,
+        conversationId: convId,
+        phase: 'running',
+        revision: 6,
+        now: 1_000,
+      })
+      assert.ok(snapBothDone)
+      const wBothDone = snapBothDone.members.find((m) => m.name === 'worker-a')
+      assert.equal(wBothDone?.status, 'waiting', 'once both A and B have attributable DONEs, worker parks normally')
+      assert.equal(wBothDone?.waitingOnBoard, true)
+      const exhBoth: SwarmStallExhaustion[] = []
+      const monBoth = new SwarmStallMonitor({ onStallExhausted: (e) => exhBoth.push(e) })
+      assert.equal(monBoth.evaluate(snapBothDone, 0), null)
+      assert.ok(monBoth.evaluate(snapBothDone, 180_000))
+      assert.ok(monBoth.evaluate(snapBothDone, 720_000))
+      assert.ok(monBoth.evaluate(snapBothDone, 1_260_000))
+      assert.equal(monBoth.evaluate(snapBothDone, 1_800_000), null)
+      assert.equal(exhBoth.length, 1, 'parked swarm converges normally once both A and B completed')
     } finally {
       await rm(brainDir, { recursive: true, force: true })
     }
