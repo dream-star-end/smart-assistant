@@ -19,6 +19,8 @@ test("附件合计超过 2048MB 时不上传并提示分条发送", { timeout: 9
     loader: { ".css": "empty" },
     alias: {
       "node:crypto": fileURLToPath(new URL("./stubs/node-crypto.js", import.meta.url)),
+      "@openclaude/protocol/containerPreview": fileURLToPath(new URL("../../protocol/src/containerPreview.ts", import.meta.url)),
+      "@openclaude/protocol/teamCards": fileURLToPath(new URL("../../protocol/src/teamCards.ts", import.meta.url)),
       "@openclaude/protocol/browser": fileURLToPath(new URL("../../protocol/src/browser.ts", import.meta.url)),
       "@openclaude/protocol": fileURLToPath(new URL("../../protocol/src/index.ts", import.meta.url)),
     },
@@ -92,6 +94,8 @@ test("单个文件超过 1024MB 时不上传", { timeout: 90_000 }, async () => 
     loader: { ".css": "empty" },
     alias: {
       "node:crypto": fileURLToPath(new URL("./stubs/node-crypto.js", import.meta.url)),
+      "@openclaude/protocol/containerPreview": fileURLToPath(new URL("../../protocol/src/containerPreview.ts", import.meta.url)),
+      "@openclaude/protocol/teamCards": fileURLToPath(new URL("../../protocol/src/teamCards.ts", import.meta.url)),
       "@openclaude/protocol/browser": fileURLToPath(new URL("../../protocol/src/browser.ts", import.meta.url)),
       "@openclaude/protocol": fileURLToPath(new URL("../../protocol/src/index.ts", import.meta.url)),
     },

@@ -73,12 +73,14 @@ import { readUploadUserFailureCode } from './uploadTotalRejection.js'
 import { _pendingPermissionCatchupFrames } from './pendingPermissionSnapshot.js'
 import { resolveLocalExecutionIfEnforced, localExecutionOverride, makePeerKey, _parseConnectionTraceIdFromUpgrade, _stripPrivateRoutingFields, _turnStatusWireFields, _helloTurnStatusResendPhase, preparedModelSwitchCatchupFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldPushTurnInterruptedFinal, _shouldInterruptUnknownInFlight } from './server.js'
 import type { Gateway } from './server.js'
+import { handlePreStartStop } from './wsStopHandlers.js'
 
 const MODEL_SWITCH_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,127}$/
 
 export interface WsConnectionHost {
   _activeTurnReplaysServed: Gateway['_activeTurnReplaysServed']
   _admittedClientTurns: Gateway['_admittedClientTurns']
+  _admittedClientTurnMeta?: Gateway['_admittedClientTurnMeta']
   _authorityConns: Gateway['_authorityConns']
   _bridgeConnections: Gateway['_bridgeConnections']
   _consumeDispatchAuthority: Gateway['_consumeDispatchAuthority']
@@ -1344,20 +1346,14 @@ export async function handleStop(
       this.log.info('interrupt', { sessionKey: live.sessionKey, clientMessageId, ok })
       return ok
     }
-    // OCV5-435: accepted but its engine run does not exist yet (cold start,
-    // lock wait). Bind the Stop to that exact turn instead of answering
-    // TURN_NOT_ACTIVE and letting it run unseen.
-    // B5: Do NOT cascade-interrupt other live sessions sharing the peer suffix;
-    // pre-start turns have not spawned workers and have no ownership over other agents' swarms.
-    if (this._admittedClientTurns?.has(preStartStopKey(frame.peer.id, clientMessageId))) {
-      this.sessions.fencePreStartStop(frame.peer.id, clientMessageId)
-      this.log.info('interrupt', {
-        sessionKey: `*${suffix}`,
-        clientMessageId,
-        ok: true,
-        preStart: true,
+    // OCV5-435 / OCV5-923: admitted pre-start turn stop (fences queued turn(s) & interrupts older blocking turn on same session).
+    const admittedKey = preStartStopKey(frame.peer.id, clientMessageId)
+    if (this._admittedClientTurns?.has(admittedKey)) {
+      return handlePreStartStop(this, frame, clientMessageId, admittedKey, safePeerId, suffix, {
+        preStartStopKey,
+        isHiddenSystemAgentId,
+        interruptRemoteSwarm: interruptRemoteSwarmForSession,
       })
-      return true
     }
     // Not admitted here yet: the Stop may have overtaken its own message
     // (Master acks admission before forwarding it). Arm a short fence for

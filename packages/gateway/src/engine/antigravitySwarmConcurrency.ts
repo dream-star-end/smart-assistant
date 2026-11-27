@@ -10,7 +10,14 @@ import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, 
 import { dirname, join, resolve, sep } from 'node:path'
 import type { EngineBillingEvent, EngineExternalBillingEvent } from './engineEvents.js'
 import { engineSessionId } from './engineSessionId.js'
-import { detachChildStdio, killProcessGroup } from '../processGroupShutdown.js'
+import {
+  detachChildStdio,
+  killProcessTree,
+  mergeProcessTreeSnapshots,
+  snapshotDescendantProcessGroupsAsync,
+  type KillProcessTreeOpts,
+  type ProcessTreeSnapshot,
+} from '../processGroupShutdown.js'
 import type { AntigravityRouteRenewResult } from '../delegateAntigravityRoute.js'
 
 /**
@@ -114,7 +121,7 @@ function sleepShort(ms: number): Promise<void> {
   })
 }
 
-async function probeRouteLease(
+export async function probeRouteLease(
   onRenewRoute: () => Promise<boolean | AntigravityRouteRenewResult>,
 ): Promise<AntigravityRouteRenewResult> {
   try {
@@ -260,23 +267,80 @@ export function acquireLocalAntigravitySwarmSlot(opts?: {
   }
 }
 
-function isProcessGroupAlive(pid: number | undefined): boolean {
-  if (typeof pid !== 'number' || pid <= 0 || process.platform === 'win32') return false
+export function isProcessGroupAlive(
+  pid: number | undefined,
+  killFn: (pid: number, signal?: NodeJS.Signals | number) => boolean = process.kill.bind(process),
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (typeof pid !== 'number' || pid <= 1 || platform === 'win32') return false
   try {
-    process.kill(-pid, 0)
+    killFn(-pid, 0)
     return true
   } catch (err) {
     return (err as NodeJS.ErrnoException | null)?.code === 'EPERM'
   }
 }
 
+export function hasAnyTrackedProcessGroupAlive(
+  pid: number | undefined,
+  snapshot: ProcessTreeSnapshot | null | undefined,
+  killFn: (pid: number, signal?: NodeJS.Signals | number) => boolean = process.kill.bind(process),
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (isProcessGroupAlive(pid, killFn, platform)) return true
+  if (!snapshot) return false
+  for (const pgid of snapshot.descendantPgids) {
+    if (isProcessGroupAlive(pgid, killFn, platform)) return true
+  }
+  return false
+}
+
 /**
- * Reap a lingering CLI process group on active swarm turns where background
- * worker subprocesses keep stdio/sockets open or outlive a leader exit 0.
- * Gives the coordinator `naturalExitGraceMs` to exit cleanly first, then sends
- * bounded SIGTERM -> SIGKILL while polling until `close` AND process-group ESRCH.
- * Always terminates in bounded time (detaching stdio if descendants keep pipes open).
+ * Reap a lingering CLI process group AND any escaped descendant process groups
+ * on active swarm turns where background worker subprocesses keep stdio/sockets
+ * open, escape into their own PGID, or outlive a leader exit.
+ * Captures descendant PGIDs BEFORE sending SIGTERM -> SIGKILL so reparenting
+ * to PID 1 never loses them, while preserving detached `oc-memory-mcp` children.
  */
+function waitUntilProcessTreeReaped(
+  proc: ChildProcess,
+  isClosed: () => boolean,
+  isReaped: () => boolean,
+  ms: number,
+  pollIntervalMs: number,
+): Promise<boolean> {
+  if (isReaped()) return Promise.resolve(true)
+  if (ms <= 0) return Promise.resolve(false)
+  return new Promise<boolean>((resolveWait) => {
+    let settled = false
+    const finish = (ok: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      clearInterval(poller)
+      proc.removeListener('close', check)
+      resolveWait(ok)
+    }
+    const check = () => {
+      if (isReaped()) finish(true)
+    }
+    const timer = setTimeout(() => finish(isReaped()), ms)
+    const poller = setInterval(check, Math.min(pollIntervalMs, ms))
+    poller.unref()
+    if (!isClosed()) proc.once('close', check)
+  })
+}
+
+async function refreshSnapshotIfPidValid(
+  pid: number | undefined,
+  prev: ProcessTreeSnapshot | null,
+  treeOpts: KillProcessTreeOpts | undefined,
+): Promise<ProcessTreeSnapshot | null> {
+  if (typeof pid !== 'number' || pid <= 1) return prev
+  const fresh = await snapshotDescendantProcessGroupsAsync(pid, treeOpts)
+  return mergeProcessTreeSnapshots(prev, fresh)
+}
+
 export async function reapLingeringCliProcessGroup(
   proc: ChildProcess | null,
   isClosed: () => boolean,
@@ -285,12 +349,23 @@ export async function reapLingeringCliProcessGroup(
     termGraceMs?: number
     killGraceMs?: number
     pollIntervalMs?: number
+    snapshot?: ProcessTreeSnapshot | null
+    treeOpts?: KillProcessTreeOpts
     onTimeout?: () => void
   },
 ): Promise<void> {
   if (!proc) return
   const pid = proc.pid
-  const isReaped = (): boolean => isClosed() && !isProcessGroupAlive(pid)
+  const killFn = opts?.treeOpts?.kill ?? process.kill.bind(process)
+  const platform = opts?.treeOpts?.platform ?? process.platform
+
+  let snapshot: ProcessTreeSnapshot | null = opts?.snapshot ?? null
+  if (!isClosed() || hasAnyTrackedProcessGroupAlive(pid, snapshot, killFn, platform)) {
+    snapshot = await refreshSnapshotIfPidValid(pid, snapshot, opts?.treeOpts)
+  }
+
+  const isReaped = (): boolean =>
+    isClosed() && !hasAnyTrackedProcessGroupAlive(pid, snapshot, killFn, platform)
   if (isReaped()) return
 
   const naturalExitGraceMs = Math.max(0, opts?.naturalExitGraceMs ?? 150)
@@ -298,51 +373,36 @@ export async function reapLingeringCliProcessGroup(
   const killGraceMs = Math.max(20, opts?.killGraceMs ?? 400)
   const pollIntervalMs = Math.max(10, opts?.pollIntervalMs ?? 25)
 
-  const waitReaped = (ms: number): Promise<boolean> => {
-    if (isReaped()) return Promise.resolve(true)
-    if (ms <= 0) return Promise.resolve(false)
-    return new Promise<boolean>((resolveWait) => {
-      let settled = false
-      const finish = (ok: boolean) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        clearInterval(poller)
-        proc.removeListener('close', check)
-        resolveWait(ok)
-      }
-      const check = () => {
-        if (isReaped()) finish(true)
-      }
-      const timer = setTimeout(() => finish(isReaped()), ms)
-      const poller = setInterval(check, Math.min(pollIntervalMs, ms))
-      poller.unref()
-      if (!isClosed()) proc.once('close', check)
-    })
+  if (naturalExitGraceMs > 0 && (await waitUntilProcessTreeReaped(proc, isClosed, isReaped, naturalExitGraceMs, pollIntervalMs))) {
+    return
   }
-
-  if (naturalExitGraceMs > 0 && (await waitReaped(naturalExitGraceMs))) return
-  killProcessGroup(proc, 'SIGTERM')
-  if (await waitReaped(termGraceMs)) return
-  killProcessGroup(proc, 'SIGKILL')
-  if (await waitReaped(killGraceMs)) return
+  snapshot = await refreshSnapshotIfPidValid(pid, snapshot, opts?.treeOpts)
+  killProcessTree(proc, 'SIGTERM', { ...opts?.treeOpts, snapshot })
+  if (await waitUntilProcessTreeReaped(proc, isClosed, isReaped, termGraceMs, pollIntervalMs)) return
+  snapshot = await refreshSnapshotIfPidValid(pid, snapshot, opts?.treeOpts)
+  killProcessTree(proc, 'SIGKILL', { ...opts?.treeOpts, snapshot })
+  if (await waitUntilProcessTreeReaped(proc, isClosed, isReaped, killGraceMs, pollIntervalMs)) return
   if (!isClosed()) detachChildStdio(proc)
   opts?.onTimeout?.()
 }
 
 /**
- * Release a local swarm FIFO slot only after the CLI process group is confirmed
- * reaped (synchronously when no process exists or already reaped; otherwise via
- * bounded async `reapLingeringCliProcessGroup` so a slot never deadlocks forever).
+ * Release a local swarm FIFO slot only after the CLI process group (and any
+ * captured escaped descendant PGIDs) is confirmed reaped.
  */
 export function releaseSwarmSlotAfterBoundedReap(
   proc: ChildProcess | null,
   isClosed: () => boolean,
   release: (() => void) | null,
-  opts?: { naturalExitGraceMs?: number; termGraceMs?: number; killGraceMs?: number },
+  opts?: {
+    naturalExitGraceMs?: number
+    termGraceMs?: number
+    killGraceMs?: number
+    snapshot?: ProcessTreeSnapshot | null
+  },
 ): void {
   if (!release) return
-  if (!proc || (isClosed() && !isProcessGroupAlive(proc.pid))) {
+  if (!proc || (isClosed() && !hasAnyTrackedProcessGroupAlive(proc.pid, opts?.snapshot))) {
     release()
     return
   }
@@ -350,6 +410,7 @@ export function releaseSwarmSlotAfterBoundedReap(
     naturalExitGraceMs: opts?.naturalExitGraceMs ?? 0,
     termGraceMs: opts?.termGraceMs ?? 800,
     killGraceMs: opts?.killGraceMs ?? 400,
+    snapshot: opts?.snapshot,
   }).finally(() => {
     release()
   })

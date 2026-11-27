@@ -23,9 +23,59 @@ import { userSentTurnFrames } from './turnFrames.js'
 const RECENT_SETTLEMENT_MAX = 1000
 const RECENT_SETTLEMENT_TTL_MS = 5 * 60_000
 
+/** OCV5-923 — metadata for admitted webchat turns awaiting or running dispatch. */
+export interface AdmittedClientTurnMeta {
+  peerId: string
+  clientMessageId: string
+  targetSessionKey?: string
+  /** Running turn already occupying targetSessionKey at admission/route-binding time (proves happens-before for non-admitted old turns). */
+  runningCmidAtAdmission?: string
+  hadActivePersistAtAdmission?: boolean
+  /** Monotonic admission order sequence on this gateway instance. */
+  seq: number
+}
+
+function captureBlockingTurnAtAdmission(
+  sessions: { getByKey?: (key: string) => unknown },
+  targetSessionKey: string,
+  meta: AdmittedClientTurnMeta,
+): void {
+  if (meta.runningCmidAtAdmission !== undefined || meta.hadActivePersistAtAdmission !== undefined) return
+  const live = typeof sessions.getByKey === 'function' ? sessions.getByKey(targetSessionKey) : undefined
+  if (!live || typeof live !== 'object') return
+  const runningCmid = (live as { _runningClientMessageId?: unknown })._runningClientMessageId
+  if (typeof runningCmid === 'string' && runningCmid.length > 0 && runningCmid !== meta.clientMessageId) {
+    meta.runningCmidAtAdmission = runningCmid
+  }
+  if ((live as { _persistActiveTurn?: unknown })._persistActiveTurn) {
+    meta.hadActivePersistAtAdmission = true
+  }
+}
+
+/**
+ * OCV5-923 (B2): Bind the single authoritative execution sessionKey resolved by
+ * `inboundDispatch` onto the admitted turn's metadata so pre-start Stop and
+ * execution always share the exact same routing decision (even across router hot-reloads).
+ */
+export function bindAdmittedClientTurnSessionKey(
+  host: { _admittedClientTurnMeta?: Map<string, AdmittedClientTurnMeta>; sessions: { getByKey?: (key: string) => unknown } },
+  frame: InboundFrame,
+  sessionKey: string,
+): void {
+  const clientMessageId = (frame as { clientMessageId?: unknown }).clientMessageId
+  if (frame.type !== 'inbound.message' || frame.channel !== 'webchat' || !isClientMessageId(clientMessageId)) return
+  const meta = host._admittedClientTurnMeta?.get(preStartStopKey(frame.peer.id, clientMessageId))
+  if (!meta || !sessionKey) return
+  meta.targetSessionKey = sessionKey
+  captureBlockingTurnAtAdmission(host.sessions, sessionKey, meta)
+}
+
+let nextAdmittedTurnSeq = 1
+
 export interface TurnDispatchHost {
   _activeSendToAgentCallbacks: Gateway['_activeSendToAgentCallbacks']
   _admittedClientTurns: Gateway['_admittedClientTurns']
+  _admittedClientTurnMeta?: Gateway['_admittedClientTurnMeta']
   _authorityConns: Gateway['_authorityConns']
   _delegateInflightSurface: Gateway['_delegateInflightSurface']
   _dispatchAuthority: Gateway['_dispatchAuthority']
@@ -36,6 +86,7 @@ export interface TurnDispatchHost {
   _syntheticTurnBarriers: Gateway['_syntheticTurnBarriers']
   dispatchInbound: Gateway['dispatchInbound']
   log: Gateway['log']
+  router?: Gateway['router']
   sessions: Gateway['sessions']
 }
 
@@ -213,6 +264,28 @@ export async function _dispatchAdmittedClientTurn(this: TurnDispatchHost, frame:
   const key = preStartStopKey(frame.peer.id, clientMessageId)
   const admitted = (this._admittedClientTurns ??= new Map())
   admitted.set(key, (admitted.get(key) ?? 0) + 1)
+  const metaMap = (this._admittedClientTurnMeta ??= new Map())
+  if (!metaMap.has(key)) {
+    // Match inboundDispatch.ts execution routing deterministically:
+    // - Explicit frame.agentId builds a deterministic sessionKey independent of router hot-reloads.
+    // - Without frame.agentId, leave targetSessionKey undefined until inboundDispatch resolves the
+    //   single authoritative route and calls bindAdmittedClientTurnSessionKey() (OCV5-923 B2).
+    let targetSessionKey: string | undefined
+    if (typeof frame.agentId === 'string' && frame.agentId.trim()) {
+      const safePeerId = frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')
+      targetSessionKey = `agent:${frame.agentId.trim()}:${frame.channel}:${frame.peer.kind}:${safePeerId}`
+    }
+    const entry: AdmittedClientTurnMeta = {
+      peerId: frame.peer.id,
+      clientMessageId,
+      ...(targetSessionKey ? { targetSessionKey } : {}),
+      seq: nextAdmittedTurnSeq++,
+    }
+    if (targetSessionKey) {
+      captureBlockingTurnAtAdmission(this.sessions, targetSessionKey, entry)
+    }
+    metaMap.set(key, entry)
+  }
   this.sessions.adoptPreStartStopOnAdmission(
     frame.peer.id,
     clientMessageId,
@@ -226,6 +299,7 @@ export async function _dispatchAdmittedClientTurn(this: TurnDispatchHost, frame:
       admitted.set(key, left)
     } else {
       admitted.delete(key)
+      metaMap.delete(key)
       this.sessions.clearPreStartStop(frame.peer.id, clientMessageId)
     }
   }
