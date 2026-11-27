@@ -6,9 +6,9 @@ import { sha256HexUtf8, timingSafeHexEqual } from "../crypto/digest.js";
 import {
   isValidGovernanceApprovalId, isValidGovernanceMode,
   type GovernanceApprovalClassification, type GovernanceApprovalDecision, type GovernanceApprovalKind,
-  type GovernanceApprovalStatus, type GovernanceAuditItem, type GovernanceBreakerState,
-  type GovernanceCockpitGauge, type GovernanceCockpitSummary, type GovernanceMode,
-  type GovernanceModeState, type GovernanceResumeStatus, type GovernanceSafetyLight,
+  type GovernanceApprovalRecommendation, type GovernanceApprovalStatus, type GovernanceAuditItem,
+  type GovernanceBreakerState, type GovernanceCockpitGauge, type GovernanceCockpitSummary, type GovernanceMode,
+  type GovernanceModeState, type GovernanceResumeStatus, type GovernanceRiskCategory, type GovernanceSafetyLight,
   type GovernanceSafetyLightKey, type GovernanceStewardVerdict, type PendingGovernanceApproval,
   type SafetyLightLevel,
 } from "./selfhostGovernanceTypes.js";
@@ -32,6 +32,10 @@ const APPROVAL_STATUSES: ReadonlySet<string> = new Set<GovernanceApprovalStatus>
 ]);
 const APPROVAL_CLASSES: ReadonlySet<string> = new Set<GovernanceApprovalClassification>([
   "absolute_reject", "human_review_required", "auto_pass",
+]);
+const RISK_CATEGORIES: ReadonlySet<string> = new Set<GovernanceRiskCategory>(["ux_degradation", "billing_change"]);
+const RECOMMENDATION_ACTIONS: ReadonlySet<string> = new Set<GovernanceApprovalRecommendation["action"]>([
+  "approve", "reject", "caution",
 ]);
 const RESUME_STATUSES: ReadonlySet<string> = new Set<GovernanceResumeStatus>([
   "not_started", "starting", "started", "running", "not_started_busy", "head_moved", "completed", "failed", "skipped", "not_applicable",
@@ -196,6 +200,130 @@ function normalizeDecision(raw: unknown): GovernanceApprovalDecision | undefined
   return out;
 }
 
+function normalizeRecommendation(raw: unknown): GovernanceApprovalRecommendation | undefined {
+  const obj = asRec(raw);
+  const action = asStr(obj?.action);
+  const label = asStr(obj?.label);
+  const reason = asStr(obj?.reason);
+  if (!obj || !action || !RECOMMENDATION_ACTIONS.has(action) || !label || !reason) return undefined;
+  return { action: action as GovernanceApprovalRecommendation["action"], label, reason };
+}
+
+export function inferRiskCategory(code: string, scope?: string): GovernanceRiskCategory {
+  const upperCode = code.toUpperCase();
+  const lowerScope = (scope ?? "").toLowerCase();
+  if (
+    upperCode === "BILLING_CORE_LOCKED" ||
+    upperCode.includes("BILLING") ||
+    upperCode.includes("COST") ||
+    lowerScope.includes("billing") ||
+    lowerScope.includes("cost") ||
+    lowerScope.includes("payment")
+  ) {
+    return "billing_change";
+  }
+  return "ux_degradation";
+}
+
+function summarizeFilesPlain(files: readonly string[]): string {
+  if (files.length === 0) return "";
+  const shortNames = files.slice(0, 2).map((f) => {
+    const parts = f.split("/").filter(Boolean);
+    return parts.length > 0 ? parts[parts.length - 1]! : f;
+  });
+  return files.length > 2 ? `${shortNames.join("、")} 等 ${files.length} 个文件` : shortNames.join("、");
+}
+
+function sanitizeLegacySummary(text: string): string {
+  return text
+    .replace(/(?:refs\/heads\/|origin\/)?feat\/[a-z0-9._/-]+/gi, "")
+    .replace(/\b[0-9a-f]{40}\b/gi, "")
+    .replace(/\b(?:HMAC|AST|SHA256|SHA-256|SHA)\b/gi, "")
+    .replace(/[（(]\s*[)）]/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+export function synthesizeWhatChanged(input: {
+  riskCategory: GovernanceRiskCategory;
+  kind: GovernanceApprovalKind;
+  code: string;
+  files: readonly string[];
+  plainSummary?: string;
+}): string {
+  const fileText = summarizeFilesPlain(input.files);
+  const upperCode = input.code.toUpperCase();
+  if (input.riskCategory === "billing_change") {
+    if (input.kind === "breaker_unlock" || upperCode.includes("COST")) {
+      return "单日算力开销达到预算上限触发保护熔断，当前申请恢复自动运行。";
+    }
+    return fileText
+      ? `调整了计费相关代码（${fileText}），可能影响计费规则或扣费逻辑。`
+      : "本次改动涉及计费或预算控制相关逻辑。";
+  }
+  if (/DDL|SQL|MIGRATION/.test(upperCode)) {
+    return fileText
+      ? `包含数据库结构变更（${fileText}），可能影响线上数据结构或服务稳定性。`
+      : "本次改动包含高风险数据库结构变更。";
+  }
+  if (input.kind === "breaker_unlock" || /BREAKER|ROLLBACK/.test(upperCode)) {
+    return "近期发版触发了自动保护熔断，当前申请恢复自动更新。";
+  }
+  if (input.kind === "a0_approval" || upperCode.startsWith("A0_")) {
+    return fileText
+      ? `调整了核心发布安全护栏规则（${fileText}）。`
+      : "本次改动调整了核心发布安全护栏规则。";
+  }
+  if (fileText) {
+    return `修改了线上核心功能代码（${fileText}），可能影响用户体验或稳定性。`;
+  }
+  const cleaned = input.plainSummary ? sanitizeLegacySummary(input.plainSummary) : "";
+  return cleaned || "本次改动触发了稳定性保护检查，需要人工确认。";
+}
+
+export function synthesizeWhyNeedYou(input: {
+  riskCategory: GovernanceRiskCategory;
+  kind: GovernanceApprovalKind;
+  code: string;
+}): string {
+  const upperCode = input.code.toUpperCase();
+  if (input.riskCategory === "billing_change") {
+    if (input.kind === "breaker_unlock" || upperCode.includes("COST")) {
+      return "命中「计费方式可能变化」保护：算力成本已触及预算阈值，需你确认开销可控后再恢复自动运行。";
+    }
+    return "命中「计费方式可能变化」保护：改动涉及计费核心逻辑，可能影响扣费或账单计算，需你确认无误后放行。";
+  }
+  if (/DDL|SQL|MIGRATION/.test(upperCode)) {
+    return "命中「用户体验可能下降」保护：该数据库变更可能影响已有数据或导致服务中断，需你确认安全后放行。";
+  }
+  if (input.kind === "breaker_unlock" || /BREAKER|ROLLBACK/.test(upperCode)) {
+    return "命中「用户体验可能下降」保护：近期发版出现异常已暂停自动更新，需你确认问题排查完毕后再恢复。";
+  }
+  if (input.kind === "a0_approval" || upperCode.startsWith("A0_")) {
+    return "命中「用户体验可能下降」保护：调整发布安全护栏可能影响线上质量防线，需你确认后生效。";
+  }
+  return "命中「用户体验可能下降」保护：该改动可能影响线上功能稳定性或使用体验，需你确认风险可控后放行。";
+}
+
+export function synthesizeRecommendation(
+  stewardVerdict: GovernanceStewardVerdict,
+  safetyLights: readonly GovernanceSafetyLight[],
+): GovernanceApprovalRecommendation {
+  if (stewardVerdict.verdict === "veto") {
+    return { action: "reject", label: "建议驳回", reason: "独立复核给出否决意见，建议先驳回并修改后再提交。" };
+  }
+  if (safetyLights.some((l) => l.level === "red")) {
+    return { action: "reject", label: "建议驳回", reason: "安全核验存在高危红灯项，风险较高，建议先驳回排查。" };
+  }
+  if (stewardVerdict.verdict === "approve" && stewardVerdict.hmacVerified !== false) {
+    if (safetyLights.some((l) => l.level === "yellow")) {
+      return { action: "caution", label: "确认后可批准", reason: "独立复核已通过，但涉及敏感变更范围，确认符合预期后可批准放行。" };
+    }
+    return { action: "approve", label: "建议批准", reason: "独立复核已通过且安全核验无异常，确认符合预期后可直接批准。" };
+  }
+  return { action: "caution", label: "请谨慎核对", reason: "暂缺完整的独立复核结论，请确认改动内容与预期一致后再决定。" };
+}
+
 function extractApprovalOptionals(raw: JsonRecord): Partial<PendingGovernanceApproval> {
   const opt: Partial<PendingGovernanceApproval> = {};
   const scope = asStr(raw.scope); if (scope) opt.scope = scope;
@@ -233,19 +361,41 @@ function validateApprovalCore(
 export function normalizePendingApproval(raw: JsonRecord, nowMs: number): PendingGovernanceApproval | null {
   const core = validateApprovalCore(raw, nowMs);
   if (!core) return null;
+  const code = asStr(raw.code) ?? "GOVERNANCE_LOCKED";
+  const scope = asStr(raw.scope);
   const files = Array.isArray(raw.files) ? raw.files.filter((x): x is string => typeof x === "string" && x.trim().length > 0) : [];
   const safetyLights = Array.isArray(raw.safetyLights)
     ? raw.safetyLights.map(normalizeSafetyLight).filter((x): x is GovernanceSafetyLight => x !== null)
     : [];
+  const stewardVerdict = normalizeStewardVerdict(raw.stewardVerdict);
+  const rawPlainSummary = asStr(raw.plainSummary) ?? asStr(raw.summary);
+  const rawRiskCategory = asStr(raw.riskCategory);
+  const riskCategory: GovernanceRiskCategory =
+    rawRiskCategory && RISK_CATEGORIES.has(rawRiskCategory)
+      ? (rawRiskCategory as GovernanceRiskCategory)
+      : inferRiskCategory(code, scope);
+  const whatChanged =
+    asStr(raw.whatChanged) ??
+    synthesizeWhatChanged({ riskCategory, kind: core.kind, code, files, plainSummary: rawPlainSummary });
+  const whyNeedYou =
+    asStr(raw.whyNeedYou) ??
+    synthesizeWhyNeedYou({ riskCategory, kind: core.kind, code });
+  const recommendation =
+    normalizeRecommendation(raw.recommendation) ??
+    synthesizeRecommendation(stewardVerdict, safetyLights);
   return {
     ...core,
-    code: asStr(raw.code) ?? "GOVERNANCE_LOCKED",
+    code,
     branch: asStr(raw.branch) ?? "",
     title: asStr(raw.title) ?? `治理审批单 ${core.id}`,
-    plainSummary: asStr(raw.plainSummary) ?? asStr(raw.summary) ?? "需要管理员确认放行该治理拦截项。",
-    approveEffect: asStr(raw.approveEffect) ?? "批准后将签发绑定本次提交的受控凭证。",
-    rejectEffect: asStr(raw.rejectEffect) ?? "驳回后不会签发任何凭证，当前变更将继续保持拦截状态。",
-    files, safetyLights, stewardVerdict: normalizeStewardVerdict(raw.stewardVerdict),
+    plainSummary: rawPlainSummary ?? whatChanged,
+    riskCategory,
+    whatChanged,
+    whyNeedYou,
+    recommendation,
+    approveEffect: asStr(raw.approveEffect) ?? "批准后将放行本次变更并继续自动发版。",
+    rejectEffect: asStr(raw.rejectEffect) ?? "驳回后不会放行本次变更，线上版本保持不变。",
+    files, safetyLights, stewardVerdict,
     createdAt: asStr(raw.createdAt) ?? "",
     ...extractApprovalOptionals(raw),
   };
@@ -259,6 +409,8 @@ const AUDIT_FORMATTERS: Readonly<Record<string, AuditFormatter>> = {
   mode_set: (r) => ({ label: "切换总闸模式", detail: `由「${modeLabelOf(asStr(r.prevMode))}」切至「${modeLabelOf(asStr(r.mode))}」${suffixReason(r)}` }),
   check_blast_radius: (r, o) => {
     const br = asStr(r.branch) ?? "未知分支";
+    if (o === "ok_auto_noncore_billing") return { label: "非核心计费辅助自动放行", detail: "仅涉及非核心计费辅助模块，未改动计费规则，已自动放行" };
+    if (o === "ok_semantic_no_runtime_billing" || o === "ok_auto_no_runtime_billing") return { label: "纯注释/类型声明自动放行", detail: "仅改动注释或类型声明，未影响计费运行逻辑，已自动放行" };
     if (o === "ok_semantic_noncore") return { label: "爆破半径语义降噪放行", detail: `纯注释/类型变更且已过严格 HMAC 跨家族审计，自动放行（${br}）` };
     if (o === "blocked") return { label: "爆破半径拦截", detail: `已拦截高敏变更（${asStr(r.code) ?? "受保护路径"}，分支 ${br}）` };
     return { label: "爆破半径校验通过", detail: `分支 ${br} 爆破半径检查通过` };

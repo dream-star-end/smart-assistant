@@ -117,7 +117,12 @@ export function useToolCardActions(): ToolCardActions {
  * 为纯展示。busy = 正在流式/发送中,交互块应禁用点击。
  */
 export type ChatInteraction = {
-  sendUserText?: (text: string) => void;
+  /**
+   * 替用户发送一条文本消息。
+   * 兼容返回 `void` 的测试桩、返回 `boolean` 的同步实现以及真实异步发送器
+   * （`useChatCardActions` 返回 `Promise<boolean>` / `Promise<unknown>`，未受理时返回 `false`）。
+   */
+  sendUserText?: (text: string) => unknown;
   busy?: boolean;
   sessionId?: string | null;
   /**

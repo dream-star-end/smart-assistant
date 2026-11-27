@@ -553,10 +553,18 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
 const LazyGovernanceApprovalBlock = lazy(() => import("./GovernanceApprovalBlock"));
 
 export function GovernanceApprovalSlot({ spec, notes, streaming, readOnly, nested }: BlockProps<GovernanceApprovalSpec>) {
-  const { sendUserText } = useChatInteraction();
+  const { sendUserText, busy } = useChatInteraction();
   return (
     <Suspense fallback={<Skeleton kind="governance_approval" />}>
-      <LazyGovernanceApprovalBlock spec={spec} notes={notes} streaming={streaming} readOnly={readOnly} nested={nested} sendUserText={sendUserText} />
+      <LazyGovernanceApprovalBlock
+        spec={spec}
+        notes={notes}
+        streaming={streaming}
+        readOnly={readOnly}
+        nested={nested}
+        sendUserText={sendUserText}
+        chatBusy={busy}
+      />
     </Suspense>
   );
 }

@@ -4,18 +4,22 @@
  */
 import {
   GOVERNANCE_APPROVAL_ID_RE, type DecideGovernanceApprovalRequest, type GovernanceApprovalClassification,
-  type GovernanceApprovalDecision, type GovernanceApprovalKind, type GovernanceApprovalStatus, type GovernanceAuditItem,
-  type GovernanceBreakerState, type GovernanceCockpitGauge, type GovernanceCockpitSummary, type GovernanceEffectiveMode,
+  type GovernanceApprovalDecision, type GovernanceApprovalKind, type GovernanceApprovalRecommendation,
+  type GovernanceApprovalStatus, type GovernanceAuditItem, type GovernanceBreakerState,
+  type GovernanceCockpitGauge, type GovernanceCockpitSummary, type GovernanceEffectiveMode,
   type GovernanceMode, type GovernanceModeState, type GovernanceOverviewResponse, type GovernanceResumeStatus,
-  type GovernanceSafetyLight, type GovernanceSafetyLightKey, type GovernanceStewardVerdict, type PendingGovernanceApproval, type SafetyLightLevel,
+  type GovernanceRiskCategory, type GovernanceSafetyLight, type GovernanceSafetyLightKey,
+  type GovernanceStewardVerdict, type PendingGovernanceApproval, type SafetyLightLevel,
 } from "@openclaude/protocol/selfhostGovernance";
 
 export {
   GOVERNANCE_APPROVAL_ID_RE, type DecideGovernanceApprovalRequest, type GovernanceApprovalClassification,
-  type GovernanceApprovalDecision, type GovernanceApprovalKind, type GovernanceApprovalStatus, type GovernanceAuditItem,
-  type GovernanceBreakerState, type GovernanceCockpitGauge, type GovernanceCockpitSummary, type GovernanceEffectiveMode,
+  type GovernanceApprovalDecision, type GovernanceApprovalKind, type GovernanceApprovalRecommendation,
+  type GovernanceApprovalStatus, type GovernanceAuditItem, type GovernanceBreakerState,
+  type GovernanceCockpitGauge, type GovernanceCockpitSummary, type GovernanceEffectiveMode,
   type GovernanceMode, type GovernanceModeState, type GovernanceOverviewResponse, type GovernanceResumeStatus,
-  type GovernanceSafetyLight, type GovernanceSafetyLightKey, type GovernanceStewardVerdict, type PendingGovernanceApproval, type SafetyLightLevel,
+  type GovernanceRiskCategory, type GovernanceSafetyLight, type GovernanceSafetyLightKey,
+  type GovernanceStewardVerdict, type PendingGovernanceApproval, type SafetyLightLevel,
 };
 
 export type DecideGovernanceApprovalInput = DecideGovernanceApprovalRequest;

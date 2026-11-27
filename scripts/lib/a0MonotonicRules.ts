@@ -1,6 +1,8 @@
 /**
  * Semantic JSON AST comparison evaluators for `scripts/check-a0-monotonic.ts` (OCV5-904).
  */
+import path from 'node:path'
+import ts from 'typescript'
 import { isPlainObject } from './a0ApprovalReceipt.js'
 import { validateRuntimeImagePin } from './runtimeImagePin.js'
 
@@ -20,28 +22,20 @@ export {
   verifyA0ApprovalUnified,
 } from './a0ApprovalReceipt.js'
 
+export type RiskCategory = 'ux_degradation' | 'billing_change'
+
 export interface A0Finding {
   path: string
   tier: 'A0' | 'A1'
   rule: string
   detail: string
   category?: string
+  riskCategory?: RiskCategory
 }
 
 const LAYER_RANK: Record<string, number> = {
-  L0: 0,
-  L1: 1,
-  L2: 2,
-  L3: 3,
-  L4: 4,
-  L5: 5,
-  L6: 6,
-  F0: 0,
-  F1: 1,
-  F2: 2,
-  F3: 3,
-  F4: 4,
-  F5: 5,
+  L0: 0, L1: 1, L2: 2, L3: 3, L4: 4, L5: 5, L6: 6,
+  F0: 0, F1: 1, F2: 2, F3: 3, F4: 4, F5: 5,
 }
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/
@@ -59,7 +53,7 @@ export function evaluateRuntimeImagePinChange(
   headText: string | null,
 ): A0Finding[] {
   if (headText === null) {
-    return [{ path: filePath, tier: 'A0', rule: 'A0-PIN-DELETED', detail: `${filePath} deleted` }]
+    return [{ path: filePath, tier: 'A0', rule: 'A0-PIN-DELETED', detail: `${filePath} deleted`, riskCategory: 'ux_degradation' }]
   }
   let parsed: unknown
   try {
@@ -71,6 +65,7 @@ export function evaluateRuntimeImagePinChange(
         tier: 'A0',
         rule: 'A0-PIN-INVALID-JSON',
         detail: `${filePath} invalid JSON: ${(err as Error).message}`,
+        riskCategory: 'ux_degradation',
       },
     ]
   }
@@ -82,6 +77,7 @@ export function evaluateRuntimeImagePinChange(
         tier: 'A0',
         rule: 'A0-PIN-SCHEMA-INVALID',
         detail: `${filePath} failed schema/supply-chain validation: ${res.errors.join('; ')}`,
+        riskCategory: 'ux_degradation',
       },
     ]
   }
@@ -418,18 +414,19 @@ export function evaluateShrinkOnlyJsonChange(
   filePath: string,
   baseText: string | null,
   headText: string | null,
-  opts?: { allowDelete?: boolean; mode?: 'budgets' | 'counts' | 'exemptList' | 'contextEval' | 'featureFlags' },
+  opts?: { allowDelete?: boolean; mode?: 'budgets' | 'counts' | 'exemptList' | 'contextEval' | 'featureFlags'; riskCategory?: RiskCategory },
 ): A0Finding[] {
+  const rc = opts?.riskCategory ? { riskCategory: opts.riskCategory } : {}
   if (headText === null) {
     return opts?.allowDelete
       ? [{ path: filePath, tier: 'A1', rule: 'A1-EXEMPT-REMOVED', detail: `${filePath} deleted` }]
-      : [{ path: filePath, tier: 'A0', rule: 'A0-BASELINE-DELETED', detail: `protected baseline ${filePath} deleted` }]
+      : [{ path: filePath, tier: 'A0', rule: 'A0-BASELINE-DELETED', detail: `protected baseline ${filePath} deleted`, ...rc }]
   }
   let headRaw: unknown
   try {
     headRaw = JSON.parse(headText)
   } catch (err) {
-    return [{ path: filePath, tier: 'A0', rule: 'A0-BASELINE-INVALID', detail: `${filePath}: ${(err as Error).message}` }]
+    return [{ path: filePath, tier: 'A0', rule: 'A0-BASELINE-INVALID', detail: `${filePath}: ${(err as Error).message}`, ...rc }]
   }
   if (baseText === null) {
     return [{ path: filePath, tier: 'A1', rule: 'A1-BASELINE-INTRODUCED', detail: `introduced baseline ${filePath}` }]
@@ -438,7 +435,7 @@ export function evaluateShrinkOnlyJsonChange(
   try {
     baseRaw = JSON.parse(baseText)
   } catch {
-    return [{ path: filePath, tier: 'A0', rule: 'A0-BASELINE-BASE-INVALID', detail: `base ${filePath} invalid` }]
+    return [{ path: filePath, tier: 'A0', rule: 'A0-BASELINE-BASE-INVALID', detail: `base ${filePath} invalid`, ...rc }]
   }
 
   const violations: A0Finding[] = []
@@ -488,7 +485,7 @@ export function evaluateShrinkOnlyJsonChange(
         if (typeof bv === 'number') {
           if (typeof hv !== 'number') {
             violations.push({ path: filePath, tier: 'A0', rule: 'A0-THRESHOLD-REMOVED', detail: `${full} removed` })
-          } else if (/^min[A-Z]/.test(k) ? hv < bv : hv > bv) {
+          } else if (isContextEvalHigherStricter(full, k) ? hv < bv : hv > bv) {
             violations.push({ path: filePath, tier: 'A0', rule: 'A0-THRESHOLD-LOOSENED', detail: `${full} loosened ${bv} -> ${hv}` })
           }
         } else if (isPlainObject(bv)) {
@@ -575,26 +572,88 @@ export function evaluateShrinkOnlyJsonChange(
   }
 
   return violations.length > 0
-    ? violations
+    ? violations.map((v) => (opts?.riskCategory && v.tier === 'A0' ? { ...v, riskCategory: opts.riskCategory } : v))
     : [{ path: filePath, tier: 'A1', rule: 'A1-BASELINE-SHRUNK', detail: `${filePath} monotonically tightened` }]
 }
 
 export const POLICY_PATH = 'arch/a0-protected-paths.json'
 
+const CONTEXT_EVAL_HIGHER_KEYS = new Set([
+  'minPrecisionAt3', 'minMrr', 'minNoMatchAccuracy', 'minCases', 'minRecallAt3', 'minRecallAt5',
+])
+const CONTEXT_EVAL_LOWER_PATHS = new Set([
+  'thresholds.maxTotalBytes', 'thresholds.maxTotalGrowthRatio', 'thresholds.maxSlotGrowthRatio',
+  'thresholds.minSlotGrowthBytes', 'subEvals.coreMemory.maxAvgHitsRatio',
+])
+
+function isContextEvalHigherStricter(fullPath: string, key: string): boolean {
+  if (CONTEXT_EVAL_LOWER_PATHS.has(fullPath)) return false
+  if (fullPath.startsWith('thresholds.') || fullPath.startsWith('fixtures.')) return false
+  return fullPath.startsWith('subEvals.') && (CONTEXT_EVAL_HIGHER_KEYS.has(key) || /^min[A-Z]/.test(key))
+}
+
+const BILLING_PAYMENT_TEST_RE =
+  /^packages\/commercial\/src\/(?:billing|payment)\/(?:.*\/)?__tests__\/.*\.(?:test|spec)\.[cm]?[jt]sx?$|^packages\/commercial\/src\/(?:billing|payment)\/.*\.(?:test|spec)\.[cm]?[jt]sx?$/
+const TS_EXT_RE = /\.(?:ts|tsx|mts|cts)$/i
+
+export function isBillingOrPaymentTestPath(filePath: string): boolean {
+  return BILLING_PAYMENT_TEST_RE.test(filePath.replace(/\\/g, '/').replace(/^(?:\.\/)+/, ''))
+}
+
+export function isBillingNonCoreAllowlisted(filePath: string, policy: A0Policy): boolean {
+  const norm = filePath.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '')
+  return (policy.billingNonCoreAllowlist ?? []).includes(norm)
+}
+
+function canonicalRuntimeJs(src: string, fileName: string): string {
+  if (!src || !src.trim()) return ''
+  const isTsx = fileName.toLowerCase().endsWith('.tsx')
+  const res = ts.transpileModule(src, {
+    fileName,
+    reportDiagnostics: true,
+    compilerOptions: {
+      target: ts.ScriptTarget.ESNext,
+      module: ts.ModuleKind.ESNext,
+      verbatimModuleSyntax: true,
+      preserveConstEnums: true,
+      removeComments: true,
+      ...(isTsx ? { jsx: ts.JsxEmit.Preserve } : {}),
+    },
+  })
+  if (res.diagnostics?.some((d) => d.category === ts.DiagnosticCategory.Error)) throw new Error('TS syntax error')
+  const sf = ts.createSourceFile('canonical.js', res.outputText, ts.ScriptTarget.ESNext, false, isTsx ? ts.ScriptKind.JSX : ts.ScriptKind.JS)
+  const printed = ts.createPrinter({ removeComments: true }).printFile(sf).trim()
+  return printed === 'export {};' ? '' : printed
+}
+
+export function hasZeroRuntimeTsDiff(filePath: string, baseText: string | null, headText: string | null): boolean {
+  const norm = filePath.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '')
+  if (!TS_EXT_RE.test(norm) || baseText === null || headText === null) return false
+  try {
+    const baseName = path.basename(norm)
+    return canonicalRuntimeJs(baseText, baseName) === canonicalRuntimeJs(headText, baseName)
+  } catch {
+    return false
+  }
+}
+
 export interface A0Category {
   id: string
   description: string
+  riskCategory?: RiskCategory
   paths?: string[]
   gateGlobs?: string[]
 }
 
 export interface A0Policy {
   schemaVersion: 1
+  approvalPolicy?: string
   approvalDefaults?: {
     hostApprovalDir?: string
     envApprovalDir?: string
     receiptSchemaVersion?: number
   }
+  billingNonCoreAllowlist?: string[]
   a0Categories: A0Category[]
   a1MonotonicSurfaces: {
     declarativePins: string[]
@@ -624,10 +683,19 @@ export interface DiffEntry {
 const REQUIRED_BOOTSTRAP_CATEGORIES = [
   'a0-meta-referee',
   'monotonic-baseline-checkers',
+  'incident-ledger-freeze-anchors',
   'ci-workflows-and-gate-manifests',
   'host-control-plane-and-deploy',
   'billing-accounting-core',
   'permission-and-contract-core',
+] as const
+
+const REQUIRED_META_REFEREE_PATHS = [
+  POLICY_PATH,
+  'scripts/check-a0-monotonic.ts',
+  'scripts/lib/a0MonotonicRules.ts',
+  'scripts/lib/a0ApprovalReceipt.ts',
+  '.github/CODEOWNERS',
 ] as const
 
 const DISALLOWED_BOOTSTRAP_RULES = new Set([
@@ -641,8 +709,14 @@ const DISALLOWED_BOOTSTRAP_RULES = new Set([
   'A0-PIN-SCHEMA-INVALID',
   'A0-MODULES-DELETED',
   'A0-BASELINE-DELETED',
+  'A0-BASELINE-RAISED',
+  'A0-BASELINE-ENTRY-ADDED',
   'A0-BUDGET-RAISED',
   'A0-BUDGET-REMOVED',
+  'A0-THRESHOLD-LOOSENED',
+  'A0-THRESHOLD-REMOVED',
+  'A0-WAIVER-ADDED',
+  'A0-EXEMPTION-ADDED',
   'A0-FLAG-TTL-EXTENDED',
   'A0-FLAG-MADE-PERMANENT',
   'A0-EXCEPTION-ADDED',
@@ -663,7 +737,7 @@ export function validateBootstrapNonWeakening(
     }
   }
   const metaPaths = new Set(byId.get('a0-meta-referee')?.paths ?? [])
-  for (const reqPath of [POLICY_PATH, 'scripts/check-a0-monotonic.ts', '.github/CODEOWNERS']) {
+  for (const reqPath of REQUIRED_META_REFEREE_PATHS) {
     if (!metaPaths.has(reqPath)) {
       errors.push(`bootstrap policy a0-meta-referee must protect "${reqPath}"`)
     }
@@ -684,6 +758,13 @@ export function parsePolicy(raw: unknown): A0Policy {
     !isPlainObject(raw.a1MonotonicSurfaces)
   ) {
     throw new Error(`${POLICY_PATH} must have schemaVersion=1, a0Categories[], and a1MonotonicSurfaces`)
+  }
+  if (
+    raw.billingNonCoreAllowlist !== undefined &&
+    (!Array.isArray(raw.billingNonCoreAllowlist) ||
+      !raw.billingNonCoreAllowlist.every((x) => typeof x === 'string' && x.length > 0))
+  ) {
+    throw new Error(`${POLICY_PATH} billingNonCoreAllowlist must be a string[]`)
   }
   return raw as unknown as A0Policy
 }

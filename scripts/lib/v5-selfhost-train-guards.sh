@@ -495,12 +495,17 @@ PY
       local sha_short="${sha:0:12}"
       [[ "$sha_short" =~ ^[0-9a-f]{4,12}$ ]] || sha_short="unknown"
       approval_id="gov-${scope_tag:-blast}-${sha_short}"
+      local risk_category="ux_degradation"
+      if [[ "$block_code" == "BILLING_CORE_LOCKED" ]]; then
+        risk_category="billing_change"
+      fi
       local -a rec_args=(
         record-pending-approval
         --id "$approval_id"
         --kind blast_voucher
         --code "$block_code"
         --classification human_review_required
+        --risk-category "$risk_category"
         --branch "$branch"
         --scope "${scope_arg:-billing}"
         --repo-root "$REPO_ROOT"

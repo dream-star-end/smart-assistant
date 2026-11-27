@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -240,8 +241,8 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       JSON.stringify(
         {
           schemaVersion: 1,
-          thresholds: { maxTotalBytes: 44000, maxTotalGrowthRatio: 0.05 },
-          subEvals: { coreMemory: { minPrecisionAt3: 0.9 } },
+          thresholds: { maxTotalBytes: 44000, maxTotalGrowthRatio: 0.05, maxSlotGrowthRatio: 0.15, minSlotGrowthBytes: 256 },
+          subEvals: { coreMemory: { minPrecisionAt3: 1, maxAvgHitsRatio: 0.4 } },
           waivers: [],
         },
         null,
@@ -379,8 +380,8 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       JSON.stringify(
         {
           schemaVersion: 1,
-          thresholds: { maxTotalBytes: 40000, maxTotalGrowthRatio: 0.04 },
-          subEvals: { coreMemory: { minPrecisionAt3: 0.95 } },
+          thresholds: { maxTotalBytes: 40000, maxTotalGrowthRatio: 0.04, maxSlotGrowthRatio: 0.12, minSlotGrowthBytes: 128 },
+          subEvals: { coreMemory: { minPrecisionAt3: 1, maxAvgHitsRatio: 0.35 } },
           waivers: [],
         },
         null,
@@ -497,8 +498,72 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
     assert.equal(rAdd.a0Blocks[0]?.rule, 'A0-EXCEPTION-ADDED')
   })
 
-  test('A0 hard-block: raising budgets, slack, ai-smells baseline, or flag TTL fails', () => {
+  test('A0 hard-block (steward boundaryIntegrity): neutering UX guard executors, steward verifier, workflows, or authzModels.ts MUST hard-block A0', () => {
+    const guardedExecutors = [
+      { path: 'scripts/check-ui-hard-gates.ts', expectedCat: 'incident-ledger-freeze-anchors', content: 'process.exit(0)\n' },
+      { path: 'scripts/check-monotonic-baselines.ts', expectedCat: 'monotonic-baseline-checkers', content: 'process.exit(0)\n' },
+      { path: 'scripts/check-incident-ledger-superset.ts', expectedCat: 'incident-ledger-freeze-anchors', content: 'process.exit(0)\n' },
+      { path: 'scripts/check-context-static.ts', expectedCat: 'incident-ledger-freeze-anchors', content: 'process.exit(0)\n' },
+      { path: 'scripts/check-cross-family-audit.ts', expectedCat: 'monotonic-baseline-checkers', content: 'process.exit(0)\n' },
+      { path: 'scripts/lib/archStewardReceipt.ts', expectedCat: 'monotonic-baseline-checkers', content: 'export const verifyArchStewardReceipt = () => ({ ok: true })\n' },
+      { path: '.github/workflows/v5-selfhost-gates.yml', expectedCat: 'ci-workflows-and-gate-manifests', content: 'name: bypassed\n' },
+      { path: '.github/workflows/v5-selfhost-release-gates.yml', expectedCat: 'ci-workflows-and-gate-manifests', content: 'name: bypassed\n' },
+      { path: '.github/workflows/v5-selfhost-web-react.yml', expectedCat: 'ci-workflows-and-gate-manifests', content: 'name: bypassed\n' },
+    ]
+    for (const item of guardedExecutors) {
+      git('reset', '--hard', 'base')
+      write(item.path, item.content)
+      commit(`bad: neuter ${item.path}`)
+      const r = checkInProcess()
+      assert.equal(r.ok, false, `neutering ${item.path} MUST hard-block A0`)
+      assert.ok(
+        r.a0Blocks.some((b) => b.path === item.path && b.category === item.expectedCat),
+        `expected ${item.path} under ${item.expectedCat}, got ${JSON.stringify(r.a0Blocks)}`,
+      )
+    }
+
+    // Bypassing model authorization in authzModels.ts (canUseModel -> return true) or editing modelPublicProjection.ts MUST hard-block A0 (billing_change)
+    git('reset', '--hard', 'base')
+    write('packages/commercial/src/billing/authzModels.ts', 'export async function canUseModel(): Promise<boolean> { return false }\n')
+    write('packages/commercial/src/billing/modelPublicProjection.ts', 'export function projectPublicModels(): string[] { return [] }\n')
+    const seededAuthzBase = commit('chore: seed authzModels & modelPublicProjection')
+
+    write('packages/commercial/src/billing/authzModels.ts', 'export async function canUseModel(): Promise<boolean> { return true }\n')
+    const bypassSha = commit('bad: bypass canUseModel plan/grant check')
+    const rBypass = runCheckA0Monotonic({ root: repo, base: seededAuthzBase, head: bypassSha, approvalDir, requireRootOwner: false })
+    assert.equal(rBypass.ok, false, 'runtime bypass in authzModels.ts MUST hard-block A0')
+    assert.equal(rBypass.a0Blocks[0]?.category, 'billing-accounting-core')
+    assert.equal(rBypass.a0Blocks[0]?.riskCategory, 'billing_change')
+
+    git('reset', '--hard', seededAuthzBase)
+    write('packages/commercial/src/billing/modelPublicProjection.ts', 'export function projectPublicModels(): string[] { return ["free"] }\n')
+    const projSha = commit('bad: alter modelPublicProjection pricing/auth semantics')
+    const rProj = runCheckA0Monotonic({ root: repo, base: seededAuthzBase, head: projSha, approvalDir, requireRootOwner: false })
+    assert.equal(rProj.ok, false, 'runtime edit in modelPublicProjection.ts MUST hard-block A0')
+    assert.equal(rProj.a0Blocks[0]?.riskCategory, 'billing_change')
+
+    // Pure comment/type edit in authzModels.ts and read-only report helper usageReport.ts still auto-pass A1
+    git('reset', '--hard', seededAuthzBase)
+    write('packages/commercial/src/billing/authzModels.ts', '// doc comment\nexport type CanUseNote = string\nexport async function canUseModel(): Promise<boolean> { return false }\n')
+    write('packages/commercial/src/billing/usageReport.ts', 'export const REPORT_TITLE = "usage"\n')
+    const cleanSha = commit('refactor: zero-runtime authz comment + read-only usage report')
+    const rClean = runCheckA0Monotonic({ root: repo, base: seededAuthzBase, head: cleanSha, approvalDir, requireRootOwner: false })
+    assert.equal(rClean.ok, true, `expected auto-pass, got ${JSON.stringify(rClean.a0Blocks)}`)
+    assert.ok(rClean.a1Passes.some((p) => p.path === 'packages/commercial/src/billing/authzModels.ts' && p.rule === 'A1-BILLING-NO-RUNTIME-DIFF'))
+    assert.ok(rClean.a1Passes.some((p) => p.path === 'packages/commercial/src/billing/usageReport.ts' && p.rule === 'A1-BILLING-NONCORE-HELPER'))
+  })
+
+  test('A0 hard-block: raising budgets, slack, ai-smells baseline, context-eval, or flag TTL fails with riskCategory', () => {
     write('packages/web-react/budgets.json', JSON.stringify({ firstScreenGzipBytes: 500000, cssTotalRawBytes: 380000 }))
+    write(
+      '.github/context-eval-baseline.json',
+      JSON.stringify({
+        schemaVersion: 1,
+        thresholds: { maxTotalBytes: 99000, maxTotalGrowthRatio: 0.05 },
+        subEvals: { coreMemory: { minPrecisionAt3: 0.7 } },
+        waivers: [],
+      }),
+    )
     write(
       'arch/ai-smells-baseline.json',
       JSON.stringify({
@@ -527,14 +592,55 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
         orangeZoneFiles: { 'src/mid.ts': 1000 },
       }),
     )
+    write('packages/web-react/ui-static-baseline.json', JSON.stringify({ counts: { cardOverflow: 1 } }))
+    write('packages/web-react/design-tokens-exempt.json', JSON.stringify({ exempt: ['src/Foo.tsx'] }))
     commit('bad: loosen everything')
     const res = checkInProcess()
     assert.equal(res.ok, false)
     const rules = res.a0Blocks.map((b) => b.rule)
     assert.ok(rules.includes('A0-BUDGET-RAISED'))
+    assert.ok(rules.includes('A0-THRESHOLD-LOOSENED'))
     assert.ok(rules.includes('A0-BASELINE-RAISED'))
     assert.ok(rules.includes('A0-FLAG-TTL-EXTENDED'))
     assert.ok(rules.includes('A0-FILESIZE-SLACK-NONZERO'))
+  })
+
+  test('A0 riskCategory classification separates UI taxonomy (billing_change vs ux_degradation) while preserving full A0 protection categories', () => {
+    const policy = JSON.parse(readFileSync(path.join(root, 'arch/a0-protected-paths.json'), 'utf8')) as {
+      a0Categories: Array<{ id: string; riskCategory?: string; paths?: string[] }>
+    }
+    const ids = policy.a0Categories.map((c) => c.id)
+    for (const required of [
+      'a0-meta-referee',
+      'monotonic-baseline-checkers',
+      'incident-ledger-freeze-anchors',
+      'ci-workflows-and-gate-manifests',
+      'host-control-plane-and-deploy',
+      'billing-accounting-core',
+      'permission-and-contract-core',
+      'exemptions-and-known-failures',
+      'release-announcements',
+      'existing-gate-deletion-or-modification',
+    ]) {
+      assert.ok(ids.includes(required), `missing required A0 category ${required}`)
+    }
+
+    // payment/** -> billing_change A0 block
+    write('packages/commercial/src/payment/orders.ts', 'export const orderV = 2\n')
+    commit('feat: edit payment orders')
+    const rPay = checkInProcess()
+    assert.equal(rPay.ok, false)
+    assert.equal(rPay.a0Blocks[0]?.category, 'billing-accounting-core')
+    assert.equal(rPay.a0Blocks[0]?.riskCategory, 'billing_change')
+
+    // incident-ledger-freeze-anchors -> ux_degradation A0 block
+    git('reset', '--hard', 'base')
+    write('e2e/session-display/incident-ledger-baseline.json', '{"incidents":[]}\n')
+    commit('feat: edit incident ledger')
+    const rUx = checkInProcess()
+    assert.equal(rUx.ok, false)
+    assert.equal(rUx.a0Blocks[0]?.category, 'incident-ledger-freeze-anchors')
+    assert.equal(rUx.a0Blocks[0]?.riskCategory, 'ux_degradation')
   })
 
   test('A0 hard-block: self-tampering check-a0-monotonic.ts or arch/a0-protected-paths.json fails', () => {
@@ -740,16 +846,24 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
     }
   })
 
-  test('A0 rename regression: renaming deploy/v5/runtime-image-pin.json or baselines is hard-blocked as A0', () => {
+  test('A0 rename regression: renaming deploy/v5/runtime-image-pin.json, UX budgets, or arch/modules.json is hard-blocked as A0', () => {
     // Rename A1 declarative runtime pin -> MUST trigger A0-PIN-DELETED on oldPath!
     git('mv', 'deploy/v5/runtime-image-pin.json', 'deploy/v5/runtime-image-pin-moved.json')
     commit('bad: rename runtime image pin')
     const rPinRename = checkInProcess()
     assert.equal(rPinRename.ok, false)
     assert.ok(
-      rPinRename.a0Blocks.some((b) => b.rule === 'A0-PIN-DELETED' && b.path === 'deploy/v5/runtime-image-pin.json'),
+      rPinRename.a0Blocks.some((b) => b.rule === 'A0-PIN-DELETED' && b.path === 'deploy/v5/runtime-image-pin.json' && b.riskCategory === 'ux_degradation'),
       `expected A0-PIN-DELETED for renamed pin, got ${JSON.stringify(rPinRename.a0Blocks)}`,
     )
+
+    // Rename UX budgets.json -> MUST trigger A0-BASELINE-DELETED (ux_degradation)!
+    git('reset', '--hard', 'base')
+    git('mv', 'packages/web-react/budgets.json', 'packages/web-react/budgets-renamed.json')
+    commit('bad: rename UX budgets.json')
+    const rBudgetRename = checkInProcess()
+    assert.equal(rBudgetRename.ok, false)
+    assert.ok(rBudgetRename.a0Blocks.some((b) => b.rule === 'A0-BASELINE-DELETED' && b.riskCategory === 'ux_degradation'))
 
     // Rename arch/modules.json -> MUST trigger A0-MODULES-DELETED!
     git('reset', '--hard', 'base')
@@ -758,15 +872,27 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
     const rModRename = checkInProcess()
     assert.equal(rModRename.ok, false)
     assert.ok(rModRename.a0Blocks.some((b) => b.rule === 'A0-MODULES-DELETED'))
+
+    // Rename existing gate -> MUST trigger A0-GATE-RENAMED!
+    git('reset', '--hard', 'base')
+    git('mv', 'scripts/check-existing-gate.ts', 'scripts/check-existing-gate-moved.ts')
+    commit('bad: rename existing gate')
+    const rGateRename = checkInProcess()
+    assert.equal(rGateRename.ok, false)
+    assert.ok(rGateRename.a0Blocks.some((b) => b.rule === 'A0-GATE-RENAMED'))
   })
 
-  test('B7 A0 protection list covers lease worker, debounce, train guards, governance gates, and release policy', () => {
+  test('B7 + OCV5-919: host control plane, deploy, permission core, contextEval threshold direction, and billing/payment exemptions are enforced', () => {
+    // 1. Host control plane & deploy orchestrator paths MUST hard-block A0
     for (const rel of [
+      'scripts/deploy-v5-selfhost.sh',
       'scripts/v5-lease-worker.sh',
       'scripts/lib/v5-lease-train-debounce.sh',
       'scripts/lib/v5-selfhost-train-guards.sh',
       'scripts/lib/v5-selfhost-governance-gates.sh',
       'scripts/lib/v5-selfhost-release-policy.sh',
+      'scripts/harness-gate/oc-governor.sh',
+      'scripts/harness-gate/sync-referee.sh',
     ]) {
       git('reset', '--hard', 'base')
       write(rel, '#!/usr/bin/env bash\necho tampered\n')
@@ -776,6 +902,102 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       assert.ok(
         res.a0Blocks.some((b) => b.path === rel && b.category === 'host-control-plane-and-deploy'),
         `expected host-control-plane-and-deploy block for ${rel}, got ${JSON.stringify(res.a0Blocks)}`,
+      )
+    }
+
+    // 2. Permission core & architecture/meta checkers MUST hard-block A0 on solo edits
+    for (const item of [
+      { rel: 'packages/protocol/src/advisorNoWrite.ts', cat: 'permission-and-contract-core' },
+      { rel: 'packages/gateway/src/actionPolicyEngine.ts', cat: 'permission-and-contract-core' },
+      { rel: 'scripts/check-architecture.ts', cat: 'monotonic-baseline-checkers' },
+      { rel: 'scripts/lib/a0MonotonicRules.ts', cat: 'a0-meta-referee' },
+    ]) {
+      git('reset', '--hard', 'base')
+      write(item.rel, '// tampered core\n')
+      commit(`bad: tamper ${item.rel}`)
+      const res = checkInProcess()
+      assert.equal(res.ok, false, `modifying ${item.rel} MUST hard-block A0`)
+      assert.ok(res.a0Blocks.some((b) => b.path === item.rel && b.category === item.cat))
+    }
+
+    // 3. BLOCKER 4: contextEval thresholds.minSlotGrowthBytes bidirectional check (256->128 A1 pass, 256->512 A0 block; subEvals.coreMemory.minPrecisionAt3 1->0.9 A0 block)
+    git('reset', '--hard', 'base')
+    write(
+      '.github/context-eval-baseline.json',
+      JSON.stringify({
+        schemaVersion: 1,
+        thresholds: { maxTotalBytes: 44000, maxTotalGrowthRatio: 0.05, maxSlotGrowthRatio: 0.15, minSlotGrowthBytes: 128 },
+        subEvals: { coreMemory: { minPrecisionAt3: 1, maxAvgHitsRatio: 0.4 } },
+        waivers: [],
+      }),
+    )
+    commit('refactor: tighten minSlotGrowthBytes 256 -> 128')
+    const rTighten = checkInProcess()
+    assert.equal(rTighten.ok, true, `256->128 MUST tighten and auto-pass A1: ${JSON.stringify(rTighten.a0Blocks)}`)
+
+    git('reset', '--hard', 'base')
+    write(
+      '.github/context-eval-baseline.json',
+      JSON.stringify({
+        schemaVersion: 1,
+        thresholds: { maxTotalBytes: 44000, maxTotalGrowthRatio: 0.05, maxSlotGrowthRatio: 0.15, minSlotGrowthBytes: 512 },
+        subEvals: { coreMemory: { minPrecisionAt3: 1, maxAvgHitsRatio: 0.4 } },
+        waivers: [],
+      }),
+    )
+    commit('bad: loosen minSlotGrowthBytes 256 -> 512')
+    const rLoosen = checkInProcess()
+    assert.equal(rLoosen.ok, false, '256->512 MUST be blocked as A0-THRESHOLD-LOOSENED')
+    assert.ok(
+      rLoosen.a0Blocks.some((b) => b.rule === 'A0-THRESHOLD-LOOSENED' && b.riskCategory === 'ux_degradation' && b.detail.includes('minSlotGrowthBytes')),
+      `expected minSlotGrowthBytes loosened block, got ${JSON.stringify(rLoosen.a0Blocks)}`,
+    )
+
+    git('reset', '--hard', 'base')
+    write(
+      '.github/context-eval-baseline.json',
+      JSON.stringify({
+        schemaVersion: 1,
+        thresholds: { maxTotalBytes: 44000, maxTotalGrowthRatio: 0.05, maxSlotGrowthRatio: 0.15, minSlotGrowthBytes: 256 },
+        subEvals: { coreMemory: { minPrecisionAt3: 0.9, maxAvgHitsRatio: 0.4 } },
+        waivers: [],
+      }),
+    )
+    commit('bad: loosen minPrecisionAt3 1 -> 0.9')
+    const rPrec = checkInProcess()
+    assert.equal(rPrec.ok, false, 'minPrecisionAt3 1->0.9 MUST be blocked as A0-THRESHOLD-LOOSENED')
+    assert.ok(rPrec.a0Blocks.some((b) => b.rule === 'A0-THRESHOLD-LOOSENED' && b.riskCategory === 'ux_degradation'))
+
+    // 4. BLOCKER 6 + R2 #1/#6: CI check-a0-monotonic aligns with oc-governor on billing/payment pure tests, allowlisted pure helpers, and zero-runtime-diff TS edits (M/A/D)
+    git('reset', '--hard', 'base')
+    write('packages/commercial/src/billing/ledger.ts', '// pure comment\nexport type LedgerHint = { v: number }\nexport const ledgerVersion = 1\n')
+    write('packages/commercial/src/billing/pureTypesNew.ts', 'export interface BillingHintOnly { readonly ok: boolean }\n')
+    write('packages/commercial/src/payment/orders.test.ts', 'export const testOk = true\n')
+    write('packages/commercial/src/billing/usageReport.ts', 'export const reportFormat = 2\n')
+    commit('chore: billing pure comment/type, pure-type new file, payment test, and allowlisted pure helper')
+    const rBillingExempt = checkInProcess()
+    assert.equal(rBillingExempt.ok, true, `expected A1 auto-pass for aligned billing exemptions: ${JSON.stringify(rBillingExempt.a0Blocks)}`)
+    assert.ok(rBillingExempt.a1Passes.some((p) => p.rule === 'A1-BILLING-NO-RUNTIME-DIFF' && p.path === 'packages/commercial/src/billing/ledger.ts'))
+    assert.ok(rBillingExempt.a1Passes.some((p) => p.rule === 'A1-BILLING-NO-RUNTIME-DIFF' && p.path === 'packages/commercial/src/billing/pureTypesNew.ts'))
+    assert.ok(rBillingExempt.a1Passes.some((p) => p.rule === 'A1-BILLING-TEST-ONLY' && p.path === 'packages/commercial/src/payment/orders.test.ts'))
+    assert.ok(rBillingExempt.a1Passes.some((p) => p.rule === 'A1-BILLING-NONCORE-HELPER' && p.path === 'packages/commercial/src/billing/usageReport.ts'))
+
+    for (const prodBillingPath of [
+      'packages/commercial/src/billing/ledger.ts',
+      'packages/commercial/src/billing/remoteDriverTurnBilling.ts',
+      'packages/commercial/src/billing/remoteDriverReceiptV5.ts',
+      'packages/commercial/src/billing/codexServiceTierPricing.ts',
+      'packages/protocol/src/serviceTiers.ts',
+      'packages/commercial/src/payment/stripe.ts',
+    ]) {
+      git('reset', '--hard', 'base')
+      write(prodBillingPath, 'export const runtimeBehaviorChanged = 999\n')
+      commit(`feat: runtime billing change in ${prodBillingPath}`)
+      const rProd = checkInProcess()
+      assert.equal(rProd.ok, false, `runtime edit in ${prodBillingPath} MUST A0-block`)
+      assert.ok(
+        rProd.a0Blocks.some((b) => b.path === prodBillingPath && b.category === 'billing-accounting-core' && b.riskCategory === 'billing_change'),
+        `expected billing_change A0 block for ${prodBillingPath}, got ${JSON.stringify(rProd.a0Blocks)}`,
       )
     }
   })
