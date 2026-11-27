@@ -162,7 +162,12 @@ function runLocalStewardCheck(opts: StewardGateRunOptions): {
     headRef: headSha,
     gitDir,
   })
-  const baseSha = diffSummary.baseSha ?? resolveGitSha(opts.root, baseRef, gitDir)
+  // F1: In enforce-commit mode, preserve the caller's requested baseSha for ancestry/range
+  // classification and receipt baseSha verification (never silently replace a diverged baseRef
+  // with its merge-base). Keep merge-base diff semantics for enforce-pr / check-only.
+  const requestedBaseSha = resolveGitSha(opts.root, baseRef, gitDir)
+  const baseSha =
+    opts.mode === 'enforce-commit' ? requestedBaseSha : (diffSummary.baseSha ?? requestedBaseSha)
   const risk = evaluateStructuralRisk(diffSummary, { root: opts.root })
 
   if (!risk.requiresSteward) {

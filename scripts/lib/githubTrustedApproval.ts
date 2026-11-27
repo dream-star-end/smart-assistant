@@ -372,12 +372,38 @@ export async function verifyGithubA0Approval(
   }
   if (prDenied) return prDenied
   if (prIncomplete) return prIncomplete
-  if (directStatus.state === 'approved' && directStatus.result) return directStatus.result
-  if (prApproved) return prApproved
 
-  // Channel 3: Merged-PR carry-over (B5: prNumber HARD-disables carry-over; B4: invalid direct status blocks carry-over)
+  const directApprove =
+    directStatus.state === 'approved' && directStatus.result ? directStatus.result : prApproved
+
+  // Channel 3: Merged-PR carry-over & negative-vote discovery (F3: even when S has a direct
+  // approve in post-merge mode with expectedBaseRef, still scan equivalent PR head(s) H for
+  // revocation/denial/incomplete/invalid before accepting!)
   const allowCarryOver =
     opts.prNumber === undefined && opts.allowMergedPrCarryOver !== false && !directStatusInvalid
+  if (directApprove) {
+    if (allowCarryOver && opts.expectedBaseRef?.trim()) {
+      const carryNeg = await tryA0MergedPrCarryOver(
+        ctx,
+        opts,
+        headSha,
+        nowMs,
+        sourceBase,
+        failureNotes,
+      )
+      if (
+        carryNeg.result &&
+        (carryNeg.result.revoked ||
+          carryNeg.result.denied ||
+          carryNeg.result.incomplete ||
+          carryNeg.result.invalid)
+      ) {
+        return carryNeg.result
+      }
+    }
+    return directApprove
+  }
+
   let equivalenceCandidates: MergedPrEquivalenceCandidate[] | undefined
   if (allowCarryOver) {
     const carry = await tryA0MergedPrCarryOver(ctx, opts, headSha, nowMs, sourceBase, failureNotes)
@@ -484,7 +510,17 @@ export async function verifyGithubStewardStatus(
   }
 
   const direct = await verifyGithubStewardStatusExactSha(ctx, headSha)
-  if (direct.state !== 'absent' || opts.allowMergedPrCarryOver === false) {
+  if (
+    direct.state === 'veto' ||
+    direct.state === 'incomplete' ||
+    direct.state === 'invalid' ||
+    opts.allowMergedPrCarryOver === false
+  ) {
+    return direct.result
+  }
+  // F3: When S has a direct approve in post-merge mode AND expectedBaseRef is bound, STILL discover
+  // equivalent merged-PR head(s) H to enforce negative-vote supremacy (GitHub & host HARD VETO).
+  if (direct.state === 'approved' && !opts.expectedBaseRef?.trim()) {
     return direct.result
   }
 
@@ -517,7 +553,7 @@ export async function verifyGithubStewardStatus(
     if (candCheck.state === 'veto') vetoHit = vetoHit ?? candCheck.result
     else if (candCheck.state === 'incomplete') incompleteHit = incompleteHit ?? candCheck.result
     else if (candCheck.state === 'invalid') invalidHit = invalidHit ?? candCheck.result
-    else if (candCheck.state === 'approved' && !firstApproved) {
+    else if (candCheck.state === 'approved' && !firstApproved && direct.state === 'absent') {
       const tag = `PR#${cand.prNumber}@${cand.prHeadSha.slice(0, 12)} via ${cand.equivalenceProof}`
       firstApproved = {
         ...candCheck.result,
@@ -537,6 +573,12 @@ export async function verifyGithubStewardStatus(
   if (vetoHit) return vetoHit
   if (incompleteHit) return incompleteHit
   if (invalidHit) return invalidHit
+  if (direct.state === 'approved') {
+    return {
+      ...direct.result,
+      ...(eqRes.candidates.length > 0 ? { equivalenceCandidates: eqRes.candidates } : {}),
+    }
+  }
   if (firstApproved) return firstApproved
 
   const extra = carryNotes.length > 0 ? carryNotes.join('; ') : eqRes.notes.join('; ')

@@ -2,19 +2,26 @@
  * Bounded Git First-Parent Range Inspection (OCV5-912).
  *
  * Shared, zero-policy primitive used by both A0 (`a0RangeCarryOver.ts`) and Architecture
- * Steward (`commitRangeCarryOver.ts`) to distinguish single-commit (`N === 1`), coalesced
- * multi-commit (`2 <= N <= 20`), and diverged/oversized (`> 20` / non-ancestor) ranges
- * BEFORE any tip-only approval or carry-over decision.
+ * Steward (`commitRangeCarryOver.ts`) to separate:
+ *   - `single` (N === 1): normal single-commit / merged-PR carry-over path.
+ *   - `multi` (2 <= N <= 20): allows per-commit positive decomposition OR aggregate approval
+ *     with full negative-vote scan across all N commits.
+ *   - `oversized` (21 <= N <= 100): forbids per-commit positive decomposition (requires explicit
+ *     aggregate approval bound to base..head) while still delivering all N commits for full
+ *     intermediate negative-vote scanning (F2).
+ *   - `invalid` (N > 100, non-ancestor/diverged, or unanchored): fails closed.
  */
 import { spawnSync } from 'node:child_process'
 import { SHA40_RE } from './archStewardContract.js'
 
 export const MAX_COALESCED_COMMITS = 20
+export const MAX_NEGATIVE_SCAN_COMMITS = 100
 
 export type FirstParentRangeInfo =
   | { kind: 'single'; commit: string }
   | { kind: 'multi'; commits: string[] }
-  | { kind: 'invalid'; reason: string }
+  | { kind: 'oversized'; commits: string[]; reason: string }
+  | { kind: 'invalid'; reason: string; tooManyForNegativeScan?: boolean }
 
 function runGitChecked(
   root: string,
@@ -42,6 +49,7 @@ export function inspectFirstParentRange(
   headSha: string,
   gitDir?: string,
   maxCommits = MAX_COALESCED_COMMITS,
+  maxNegativeScanCommits = MAX_NEGATIVE_SCAN_COMMITS,
 ): FirstParentRangeInfo {
   const normBase = baseSha.trim().toLowerCase()
   const normHead = headSha.trim().toLowerCase()
@@ -51,9 +59,10 @@ export function inspectFirstParentRange(
   const anc = runGitChecked(root, ['merge-base', '--is-ancestor', normBase, normHead], gitDir)
   if (!anc.ok) return { kind: 'invalid', reason: 'base is not an ancestor of head' }
 
+  const scanCap = Math.max(maxCommits, maxNegativeScanCommits)
   const listRes = runGitChecked(
     root,
-    ['rev-list', '--first-parent', `--max-count=${maxCommits + 1}`, `${normBase}..${normHead}`],
+    ['rev-list', '--first-parent', `--max-count=${scanCap + 1}`, `${normBase}..${normHead}`],
     gitDir,
   )
   if (!listRes.ok || !listRes.stdout) {
@@ -65,10 +74,11 @@ export function inspectFirstParentRange(
     .filter((s) => SHA40_RE.test(s))
     .reverse()
   if (commits.length === 0) return { kind: 'invalid', reason: 'empty commit range' }
-  if (commits.length > maxCommits) {
+  if (commits.length > scanCap) {
     return {
       kind: 'invalid',
-      reason: `first-parent range exceeds max ${maxCommits} commits (require aggregate approval)`,
+      tooManyForNegativeScan: true,
+      reason: `first-parent range exceeds max ${scanCap}-commit negative-vote scan limit (incomplete coverage)`,
     }
   }
   if (commits[commits.length - 1] !== normHead) {
@@ -79,5 +89,10 @@ export function inspectFirstParentRange(
     return { kind: 'invalid', reason: 'first-parent chain does not anchor cleanly at baseSha' }
   }
   if (commits.length === 1) return { kind: 'single', commit: commits[0]! }
-  return { kind: 'multi', commits }
+  if (commits.length <= maxCommits) return { kind: 'multi', commits }
+  return {
+    kind: 'oversized',
+    commits,
+    reason: `first-parent range (${commits.length} commits) exceeds max ${maxCommits}-commit decomposition limit (require aggregate approval)`,
+  }
 }

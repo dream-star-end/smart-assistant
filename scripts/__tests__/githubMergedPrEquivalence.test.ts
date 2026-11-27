@@ -30,6 +30,7 @@ import {
   verifyA0ApprovalFile,
   verifyA0ApprovalUnified,
 } from '../lib/a0ApprovalReceipt.js'
+import { hasExplicitA0RangeBinding } from '../lib/a0RangeCarryOver.js'
 import {
   ARCH_STEWARD_RECEIPT_SCHEMA_VERSION,
   type ArchStewardReceipt,
@@ -1606,7 +1607,13 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
       'R2-B2: tip-only GitHub Steward approve MUST NOT authorize >20-commit range',
     )
 
-    // 2. Steward GREEN on 21-commit range: explicit aggregate host receipt bound to BOTH baseSha & tipSha passes!
+    // 2. Steward GREEN on 21-commit range: explicit aggregate host receipt bound to BOTH baseSha & tipSha passes when ALL 21 commits are clean online!
+    const emptyAllFetch: FetchLike = async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => [],
+    })
     const aggSteward = signArchStewardReceipt(
       makeStewardReceipt({
         headSha: tipSha,
@@ -1629,13 +1636,56 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
         repo: TEST_REPO,
         token: 'ghs_tok',
         expectedBaseRef: BASE_BRANCH,
-        fetchImpl: makeMockFetch({ [`/repos/${TEST_REPO}/commits/${tipSha}/statuses`]: [] }),
+        fetchImpl: emptyAllFetch,
       },
     })
     assert.equal(
       rSteward21HostAgg.ok,
       true,
-      'R2-B2: explicit aggregate Steward host receipt bound to base+head passes >20-commit range',
+      'R2-B2: explicit aggregate Steward host receipt bound to base+head passes >20-commit range when all 21 commits are veto-free',
+    )
+
+    // F2 RED on 21-commit range: if intermediate commit #10 has a GitHub Steward VETO, aggregate host receipt MUST FAIL!
+    const midSha = repo.git(['rev-parse', `${tipSha}~10`])
+    const rSteward21MidVeto = await runStewardGateAsync({
+      root: repo.dir,
+      mode: 'enforce-commit',
+      baseRef: repo.baseSha,
+      headRef: tipSha,
+      receiptDirs: [receiptDir],
+      requireRootOwner: false,
+      hmacKey,
+      requireHmac: true,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: async (url) => {
+          const p = new URL(url).pathname
+          if (p === `/repos/${TEST_REPO}/commits/${midSha}/statuses`) {
+            return {
+              ok: true,
+              status: 200,
+              headers: { get: () => null },
+              json: async () => [
+                {
+                  id: 999,
+                  context: 'oc-v5/arch-steward',
+                  state: 'failure',
+                  description: `verdict=veto sha=${midSha.slice(0, 12)} author=google-gemini steward=openai-gpt`,
+                  creator: { login: 'dream-star-end' },
+                },
+              ],
+            }
+          }
+          return { ok: true, status: 200, headers: { get: () => null }, json: async () => [] }
+        },
+      },
+    })
+    assert.equal(
+      rSteward21MidVeto.ok,
+      false,
+      'F2: intermediate commit VETO in 21-commit range MUST block aggregate Steward receipt',
     )
 
     // 3. A0 RED on 21-commit range: plain direct GitHub status AND plain offline host receipt (without range=base..head) MUST FAIL
@@ -1655,18 +1705,26 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
         repo: TEST_REPO,
         token: 'ghs_tok',
         expectedBaseRef: BASE_BRANCH,
-        fetchImpl: makeMockFetch({
-          [`/repos/${TEST_REPO}/commits/${tipSha}/statuses`]: [
-            {
-              id: 2,
-              context: 'oc-v5/a0-approval',
-              state: 'success',
-              description: `sha=${tipSha.slice(0, 12)} exp=${futureExp} paths=* | Plain tip-only approve`,
-              creator: { login: 'dream-star-end' },
-            },
-          ],
-          [`/repos/${TEST_REPO}/commits/${tipSha}/pulls`]: [],
-        }),
+        fetchImpl: async (url) => {
+          const p = new URL(url).pathname
+          if (p === `/repos/${TEST_REPO}/commits/${tipSha}/statuses`) {
+            return {
+              ok: true,
+              status: 200,
+              headers: { get: () => null },
+              json: async () => [
+                {
+                  id: 2,
+                  context: 'oc-v5/a0-approval',
+                  state: 'success',
+                  description: `sha=${tipSha.slice(0, 12)} exp=${futureExp} paths=* | Plain tip-only approve`,
+                  creator: { login: 'dream-star-end' },
+                },
+              ],
+            }
+          }
+          return { ok: true, status: 200, headers: { get: () => null }, json: async () => [] }
+        },
       },
     })
     assert.equal(
@@ -1675,7 +1733,7 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
       'R2-B2: plain tip-only A0 approval MUST NOT authorize >20-commit range',
     )
 
-    // 4. A0 GREEN on 21-commit range: explicit aggregate host receipt binding range=<base12>..<head12> passes!
+    // 4. A0 GREEN on 21-commit range: explicit aggregate host receipt binding range=<base12>..<head12> passes (and F2 RED if midSha revoked online!)
     writeA0HostReceipt(
       approvalDir,
       tipSha,
@@ -1688,11 +1746,55 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
       head: tipSha,
       approvalDir,
       requireRootOwner: false,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: emptyAllFetch,
+      },
     })
     assert.equal(
       rA021Agg.ok,
       true,
-      'R2-B2: aggregate A0 receipt binding range=<base12>..<head12> passes >20-commit range',
+      'R2-B2: aggregate A0 receipt binding range=<base12>..<head12> passes >20-commit range when all 21 commits are clean',
+    )
+
+    const rA021MidRev = await runCheckA0MonotonicAsync({
+      root: repo.dir,
+      base: repo.baseSha,
+      head: tipSha,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: async (url) => {
+          const p = new URL(url).pathname
+          if (p === `/repos/${TEST_REPO}/commits/${midSha}/statuses`) {
+            return {
+              ok: true,
+              status: 200,
+              headers: { get: () => null },
+              json: async () => [
+                {
+                  id: 998,
+                  context: 'oc-v5/a0-approval',
+                  state: 'failure',
+                  description: `revoked sha=${midSha.slice(0, 12)} paths=* | Mid-train revoked`,
+                  creator: { login: 'dream-star-end' },
+                },
+              ],
+            }
+          }
+          return { ok: true, status: 200, headers: { get: () => null }, json: async () => [] }
+        },
+      },
+    })
+    assert.equal(
+      rA021MidRev.ok,
+      false,
+      'F2: intermediate commit A0 revocation in 21-commit range MUST block aggregate A0 receipt',
     )
 
     // 5. Offline 2-commit A0 range where S1 is unapproved and ONLY plain tip S2 receipt exists -> MUST FAIL!
@@ -2056,5 +2158,268 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
       'R2-B4: malformed online Steward status MUST block even with valid host HMAC receipt',
     )
     assert.equal(stInvalid.githubStatus?.invalid, true)
+  })
+
+  test('F1/F3/F4/W1/W2: diverged base fails enforce-commit; direct S approve still blocked by H veto/revocation; explicitReceiptPath enforces online VETO; strict range token & non-A0 narrow status parity', async (t) => {
+    const hmacKey = 'ocv5-912-f1-f4-hmac-secret-0123456789'
+    const futureExp = new Date(Date.now() + 3_600_000).toISOString()
+
+    // F1: Diverged baseRef vs headRef MUST NOT silently collapse to single commit via merge-base!
+    const repoDiv = initTempRepo(t)
+    repoDiv.git(['checkout', '-qb', 'other-branch'])
+    repoDiv.write('packages/web-react/src/components/Btn.tsx', 'export const Btn = () => "other"\n')
+    const divergedBase = repoDiv.commit('ui(v5): diverged base commit')
+    repoDiv.git(['checkout', '-q', BASE_BRANCH])
+    repoDiv.write('packages/gateway/src/div.ts', 'export const div = 1\n')
+    const divHead = repoDiv.commit('feat(v5): head on selfhost')
+    const rDiv = await runStewardGateAsync({
+      root: repoDiv.dir,
+      mode: 'enforce-commit',
+      baseRef: divergedBase,
+      headRef: divHead,
+      requireRootOwner: false,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch({
+          [`/repos/${TEST_REPO}/commits/${divHead}/statuses`]: [
+            {
+              id: 801,
+              context: 'oc-v5/arch-steward',
+              state: 'success',
+              description: `verdict=approve sha=${divHead.slice(0, 12)} author=google-gemini steward=openai-gpt digest=hmac-sha256:0123456789abcdef`,
+              creator: { login: 'dream-star-end' },
+            },
+          ],
+          [`/repos/${TEST_REPO}/commits/${divHead}/pulls`]: [],
+        }),
+      },
+    })
+    assert.equal(
+      rDiv.ok,
+      false,
+      'F1: diverged base MUST fail closed in enforce-commit even with direct GitHub approve',
+    )
+
+    // F3: Direct approve on S STILL discovers equivalent PR head H and blocks on H VETO / local HARD VETO / A0 revocation!
+    const repoF3 = initTempRepo(t)
+    const vetoDir = mkdtempSync(path.join(tmpdir(), 'ocv5-912-f3-veto-'))
+    t.after(() => rmSync(vetoDir, { recursive: true, force: true }))
+    repoF3.write('packages/gateway/src/f3.ts', 'export const f3 = 1\n')
+    repoF3.write('packages/commercial/src/billing/ledger.ts', 'export const ledgerV = 333\n')
+    const sF3 = repoF3.commit('feat(v5): squash commit S with direct approve but vetoed H')
+    const sF3Tree = repoF3.git(['rev-parse', `${sF3}^{tree}`])
+
+    const hostVetoH = signArchStewardReceipt(
+      makeStewardReceipt({
+        headSha: SHA_H,
+        baseSha: repoF3.baseSha,
+        verdict: 'veto',
+        blockers: [
+          {
+            dimension: 'boundaryIntegrity',
+            severity: 'P1',
+            location: 'packages/gateway/src/f3.ts',
+            reason: 'veto on H',
+          },
+        ],
+        dimensions: {
+          godClassAppend: { status: 'pass', notes: 'ok' },
+          wheelReinvention: { status: 'pass', notes: 'ok' },
+          boundaryIntegrity: { status: 'veto', notes: 'veto' },
+          complexityDrift: { status: 'pass', notes: 'ok' },
+        },
+      }),
+      hmacKey,
+    )
+    writeFileSync(path.join(vetoDir, `${SHA_H}.json`), JSON.stringify(hostVetoH, null, 2))
+    const f3Routes: Record<string, MockRouteSpec> = {
+      [`/repos/${TEST_REPO}/commits/${sF3}/statuses`]: [
+        {
+          id: 810,
+          context: 'oc-v5/arch-steward',
+          state: 'success',
+          description: `verdict=approve sha=${sF3.slice(0, 12)} author=google-gemini steward=openai-gpt digest=hmac-sha256:0123456789abcdef`,
+          creator: { login: 'dream-star-end' },
+        },
+        {
+          id: 811,
+          context: 'oc-v5/a0-approval',
+          state: 'success',
+          description: `sha=${sF3.slice(0, 12)} exp=${futureExp} paths=packages/commercial/src/billing/ledger.ts | Direct S A0 approve`,
+          creator: { login: 'dream-star-end' },
+        },
+      ],
+      [`/repos/${TEST_REPO}/commits/${sF3}/pulls`]: [
+        {
+          number: 1700,
+          merged_at: '2026-11-27T04:00:00Z',
+          merge_commit_sha: sF3,
+          base: { ref: BASE_BRANCH, sha: repoF3.baseSha, repo: { full_name: TEST_REPO } },
+          head: { sha: SHA_H },
+        },
+      ],
+      [`/repos/${TEST_REPO}/commits/${sF3}`]: {
+        sha: sF3,
+        commit: { tree: { sha: sF3Tree } },
+        parents: [{ sha: repoF3.baseSha }],
+      },
+      [`/repos/${TEST_REPO}/commits/${SHA_H}`]: { sha: SHA_H, commit: { tree: { sha: sF3Tree } } },
+      [`/repos/${TEST_REPO}/commits/${SHA_H}/statuses`]: [
+        {
+          id: 812,
+          context: 'oc-v5/a0-approval',
+          state: 'failure',
+          description: `revoked sha=${SHA_H.slice(0, 12)} paths=* | Revoked on H`,
+          creator: { login: 'dream-star-end' },
+        },
+      ],
+      [`/repos/${TEST_REPO}/pulls/1700/reviews`]: [],
+    }
+    const rF3St = await runStewardGateAsync({
+      root: repoF3.dir,
+      mode: 'enforce-commit',
+      baseRef: repoF3.baseSha,
+      headRef: sF3,
+      receiptDirs: [vetoDir],
+      requireRootOwner: false,
+      hmacKey,
+      requireHmac: true,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch(f3Routes),
+      },
+    })
+    assert.equal(
+      rF3St.ok,
+      false,
+      'F3: direct GitHub Steward approve on S MUST STILL block on local host HARD VETO on equivalent H',
+    )
+
+    const rF3A0 = await runCheckA0MonotonicAsync({
+      root: repoF3.dir,
+      base: repoF3.baseSha,
+      head: sF3,
+      approvalDir: vetoDir,
+      requireRootOwner: false,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch(f3Routes),
+      },
+    })
+    assert.equal(
+      rF3A0.ok,
+      false,
+      'F3: direct GitHub A0 approve on S MUST STILL block on revocation on equivalent H',
+    )
+
+    // F4: explicitReceiptPath MUST NOT bypass online GitHub VETO!
+    const expFile = path.join(vetoDir, 'explicit-approve.json')
+    writeFileSync(
+      expFile,
+      JSON.stringify(
+        signArchStewardReceipt(
+          makeStewardReceipt({
+            headSha: sF3,
+            baseSha: repoF3.baseSha,
+            triggers: ['CLONE_OR_T2_CORE_PATH'],
+          }),
+          hmacKey,
+        ),
+        null,
+        2,
+      ),
+    )
+    const rF4 = await runStewardGateAsync({
+      root: repoF3.dir,
+      mode: 'enforce-commit',
+      baseRef: repoF3.baseSha,
+      headRef: sF3,
+      explicitReceiptPath: expFile,
+      requireRootOwner: false,
+      hmacKey,
+      requireHmac: true,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch({
+          [`/repos/${TEST_REPO}/commits/${sF3}/statuses`]: [
+            {
+              id: 820,
+              context: 'oc-v5/arch-steward',
+              state: 'failure',
+              description: `verdict=veto sha=${sF3.slice(0, 12)} author=google-gemini steward=openai-gpt`,
+              creator: { login: 'dream-star-end' },
+            },
+          ],
+        }),
+      },
+    })
+    assert.equal(rF4.ok, false, 'F4: explicitReceiptPath MUST NOT bypass online GitHub VETO')
+
+    // W1: Strict standalone range= token parsing rejects embedded/duplicate tokens
+    const b12 = SHA_P1.slice(0, 12)
+    const h12 = SHA_S.slice(0, 12)
+    assert.equal(hasExplicitA0RangeBinding(`range=${b12}..${h12} approved`, SHA_P1, SHA_S), true)
+    assert.equal(hasExplicitA0RangeBinding(`xrange=${b12}..${h12} approved`, SHA_P1, SHA_S), false)
+    assert.equal(
+      hasExplicitA0RangeBinding(`range=${b12}..${h12}extra approved`, SHA_P1, SHA_S),
+      false,
+    )
+    assert.equal(
+      hasExplicitA0RangeBinding(
+        `range=${b12}..${h12} range=000000000000..111111111111`,
+        SHA_P1,
+        SHA_S,
+      ),
+      false,
+    )
+
+    // W2: Non-A0 tip with valid narrow-scope A0 status MUST NOT falsely reject approved S1!
+    const repoW2 = initTempRepo(t)
+    const w2Dir = mkdtempSync(path.join(tmpdir(), 'ocv5-912-w2-'))
+    t.after(() => rmSync(w2Dir, { recursive: true, force: true }))
+    repoW2.write('packages/commercial/src/billing/ledger.ts', 'export const ledgerV = 500\n')
+    const w2s1 = repoW2.commit('feat(v5): approved A0 S1')
+    writeA0HostReceipt(w2Dir, w2s1)
+    repoW2.write('packages/web-react/src/components/Btn.tsx', 'export const Btn = () => "w2"\n')
+    const w2s2 = repoW2.commit('ui(v5): non-A0 S2')
+    const rW2 = await runCheckA0MonotonicAsync({
+      root: repoW2.dir,
+      base: repoW2.baseSha,
+      head: w2s2,
+      approvalDir: w2Dir,
+      requireRootOwner: false,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch({
+          [`/repos/${TEST_REPO}/commits/${w2s1}/statuses`]: [],
+          [`/repos/${TEST_REPO}/commits/${w2s1}/pulls`]: [],
+          [`/repos/${TEST_REPO}/commits/${w2s2}/statuses`]: [
+            {
+              id: 830,
+              context: 'oc-v5/a0-approval',
+              state: 'success',
+              description: `sha=${w2s2.slice(0, 12)} exp=${futureExp} paths=docs/unrelated.md | Valid narrow status on non-A0 tip`,
+              creator: { login: 'dream-star-end' },
+            },
+          ],
+          [`/repos/${TEST_REPO}/commits/${w2s2}/pulls`]: [],
+        }),
+      },
+    })
+    assert.equal(
+      rW2.ok,
+      true,
+      'W2: valid narrow-scope A0 status on non-A0 commit MUST NOT falsely reject earlier approved A0 commit',
+    )
   })
 })

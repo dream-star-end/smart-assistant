@@ -51,6 +51,7 @@ export interface LocalStewardCarryOverResult {
 
 export interface StewardHostReceiptConfig {
   root: string
+  gitDir?: string
   receiptDirs?: readonly string[]
   requireRootOwner: boolean
   hmacKey?: string
@@ -77,10 +78,14 @@ export function checkLocalHostStewardVeto(opts: StewardHostReceiptConfig & { tar
   receiptLookup?: ReceiptLookupResult
   receiptVerification?: StewardReceiptVerificationResult
 } {
+  // F4: Pass commitMessage so trusted external Steward-Receipt trailers are discovered identically
+  // across single-commit, per-commit range, and aggregate negative-vote paths.
+  const commitMessage = readCommitMessage(opts.root, opts.targetSha, opts.gitDir)
   const lookup = findStewardReceiptForCommit({
     root: opts.root,
     headSha: opts.targetSha,
     receiptDirs: opts.receiptDirs,
+    commitMessage,
     requireRootOwner: opts.requireRootOwner,
     hmacKey: opts.hmacKey,
     allowUntrustedRepoReceipt: opts.allowUntrustedRepoReceipt,
@@ -625,22 +630,48 @@ async function checkStewardRangeNegativeVotes(
 
 /**
  * Resolve online GitHub status, multi-commit first-parent range decomposition, and local host
- * carry-over for Architecture Steward (B2/B3/B4/B5).
+ * carry-over for Architecture Steward (B2/B3/B4/B5/F1/F2/F3/F4).
  */
 export async function resolveStewardGateOnlineAsync(
   opts: StewardOnlineGateInput,
 ): Promise<StewardOnlineGateOutput> {
   const base = { mode: opts.mode, headSha: opts.headSha, baseSha: opts.baseSha, risk: opts.risk }
   const failExit: 0 | 1 = opts.mode === 'check-only' ? 0 : 1
+  // F4: Explicit receipt file selects the positive local receipt source ONLY; it MUST NOT bypass
+  // range classification or negative-vote checks (and a failing explicit file never falls back to GitHub approve).
+  if (opts.explicitReceiptPath && !opts.passed) {
+    return {
+      ...base,
+      ok: false,
+      exitCode: failExit,
+      receiptLookup: opts.receiptLookup,
+      receiptVerification: opts.receiptVerification,
+    }
+  }
   const rangeInfo =
-    opts.mode === 'enforce-commit' && !opts.explicitReceiptPath
+    opts.mode === 'enforce-commit'
       ? inspectFirstParentRange(opts.root, opts.baseSha, opts.headSha, opts.gitDir)
       : { kind: 'single' as const, commit: opts.headSha }
 
-  // B2/B3/B4: Multi-commit (`2..20`) OR un-decomposable (`>20` / non-linear) ranges NEVER allow
-  // tip-only GitHub status (which lacks baseSha). Only an explicit aggregate host receipt bound
-  // to BOTH baseSha & headSha (with zero negative/incomplete/invalid votes) or C1..CN decomposition passes!
   if (rangeInfo.kind === 'invalid') {
+    return {
+      ...base,
+      ok: false,
+      exitCode: failExit,
+      receiptLookup: {
+        found: opts.receiptLookup?.found ?? false,
+        channel: opts.receiptLookup?.channel,
+        source: `range:${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)}`,
+        error: `cannot verify range (${rangeInfo.reason})`,
+        searchedLocations: opts.receiptLookup?.searchedLocations ?? [],
+      },
+      receiptVerification: opts.receiptVerification,
+    }
+  }
+
+  // F2: 21..100 linear commits (`oversized`) require an explicit aggregate host receipt bound to
+  // BOTH baseSha & headSha AND a complete negative-vote scan across ALL N commits!
+  if (rangeInfo.kind === 'oversized') {
     if (!opts.passed) {
       return {
         ...base,
@@ -650,27 +681,21 @@ export async function resolveStewardGateOnlineAsync(
           found: opts.receiptLookup?.found ?? false,
           channel: opts.receiptLookup?.channel,
           source: `range:${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)}`,
-          error: `cannot decompose range (${rangeInfo.reason}); require aggregate host Steward receipt bound to both baseSha and headSha`,
+          error: `${rangeInfo.reason}; require aggregate host Steward receipt bound to both baseSha and headSha`,
           searchedLocations: opts.receiptLookup?.searchedLocations ?? [],
         },
         receiptVerification: opts.receiptVerification,
       }
     }
-    if (!opts.github) {
-      return {
-        ...base,
-        ok: true,
-        exitCode: 0,
-        receiptLookup: opts.receiptLookup,
-        receiptVerification: opts.receiptVerification,
-      }
+    const negHit = await checkStewardRangeNegativeVotes(rangeInfo.commits, opts)
+    if (negHit) return negHit
+    return {
+      ...base,
+      ok: true,
+      exitCode: 0,
+      receiptLookup: opts.receiptLookup,
+      receiptVerification: opts.receiptVerification,
     }
-    const ghDirect = await verifyGithubStewardStatus({
-      ...opts.github,
-      headSha: opts.headSha,
-      allowMergedPrCarryOver: false,
-    })
-    return mergeGithubStewardOutcome(opts, ghDirect)
   }
 
   if (rangeInfo.kind === 'multi') {
@@ -705,13 +730,13 @@ export async function resolveStewardGateOnlineAsync(
   }
 
   const allowSingleCarry = opts.mode === 'enforce-commit'
-  if (opts.github && !opts.explicitReceiptPath) {
+  if (opts.github) {
     const githubStatus = await verifyGithubStewardStatus({
       ...opts.github,
       headSha: opts.headSha,
       allowMergedPrCarryOver: allowSingleCarry,
     })
-    // B3: Check carried-over candidate host HARD VETO unconditionally BEFORE accepting local.passed or githubStatus.valid!
+    // B3/F3: Check carried-over candidate host HARD VETO unconditionally BEFORE accepting local.passed or githubStatus.valid!
     const hostVeto = findLocalHostVetoAcrossCandidates(githubStatus, opts)
     if (hostVeto.vetoed) {
       return {

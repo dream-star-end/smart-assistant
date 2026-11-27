@@ -1,18 +1,19 @@
 /**
  * Multi-Commit A0 Release-Train Range Verification (OCV5-912).
  *
- * Security invariants (B2 / B3 / B4 / B5):
- *   - On multi-commit first-parent ranges (`2 <= N <= 20`), scans EVERY commit `C1..CN`:
- *       * Commits touching A0 paths require valid, non-revoked, non-incomplete, non-invalid A0 approval.
- *       * Non-A0 commits (including a non-A0 release tip `headSha`) are STILL checked online for
- *         explicit A0 revocation / `CHANGES_REQUESTED` / `incomplete` / `invalid` statuses (B3).
- *       * Negative/incomplete/invalid votes are aggregated across the ENTIRE range before any
- *         approval or fallback decision (never short-circuited by an earlier unapproved commit).
- *   - For un-decomposable (`> 20` commits / non-linear) OR partially unapproved ranges (with zero
- *     negative/incomplete/invalid votes), a tip-only single-commit approval NEVER authorizes the
- *     range (online OR offline): ONLY an explicit aggregate approval whose signed `reason` binds
- *     `range=<base12>..<head12>` (and has no online revocation/incomplete/invalid) may pass (B2).
- *   - Preserves actual earliest `expiresAt` across constituent approvals instead of extending TTL.
+ * Security invariants (B2 / B3 / B4 / B5 / F2 / W1 / W2):
+ *   - `single` (`N === 1`): direct + merged-PR carry-over (including F3 negative-vote scan on H).
+ *   - `multi` (`2 <= N <= 20`): scans EVERY commit `C1..CN`:
+ *       * A0-touching commits require valid, non-revoked, non-incomplete, non-invalid A0 approval.
+ *       * Non-A0 commits (including a non-A0 release tip `headSha`) are checked online with empty
+ *         path set (`[]`, avoiding narrow-path false rejections — W2) for revocation/denial/incomplete/invalid.
+ *       * Aggregates all negative/incomplete/invalid votes before any approval or aggregate fallback.
+ *   - `oversized` (`21 <= N <= 100`): forbids per-commit positive decomposition; requires explicit
+ *     aggregate approval binding exact token `range=<base12>..<head12>` (W1: strict token boundary,
+ *     rejects duplicate/conflicting `range=` tokens) AND scans ALL N commits online for any
+ *     revocation/denial/incomplete/invalid (F2).
+ *   - `invalid` (`> 100` commits or non-ancestor/diverged): fails closed (F2: returns `incomplete: true`
+ *     when online negative-vote scan limit is exceeded; rejects diverged ranges both online & offline).
  */
 import {
   type ApprovalVerification,
@@ -48,27 +49,38 @@ export interface A0CommitRangeOptions {
   github?: A0RangeGithubConfig
 }
 
+const RANGE_TOKEN_RE = /(?:^|[\s|;])range=([^\s|;]+)(?=$|[\s|;])/gi
+
+/** W1: Strict standalone token check — requires exact `range=<base12>..<head12>` with no conflicting duplicates. */
 export function hasExplicitA0RangeBinding(
   reason: string,
   baseSha: string,
   headSha: string,
 ): boolean {
-  const token = `range=${baseSha.slice(0, 12).toLowerCase()}..${headSha.slice(0, 12).toLowerCase()}`
-  return reason.toLowerCase().includes(token)
+  const expected = `${baseSha.slice(0, 12).toLowerCase()}..${headSha.slice(0, 12).toLowerCase()}`
+  const found: string[] = []
+  let m: RegExpExecArray | null
+  RANGE_TOKEN_RE.lastIndex = 0
+  while ((m = RANGE_TOKEN_RE.exec(reason)) !== null) {
+    found.push(m[1]!.toLowerCase())
+  }
+  return found.length === 1 && found[0] === expected
 }
 
 async function checkNonA0CommitOnlineNegativeVote(
   commitSha: string,
-  opts: A0CommitRangeOptions,
-): Promise<ApprovalVerification | null> {
+  opts: Omit<A0CommitRangeOptions, 'commits' | 'classifyCommitA0Paths'>,
+): Promise<Extract<ApprovalVerification, { valid: false }> | null> {
   const ghRepo = opts.github?.repo?.trim()
   const ghToken = opts.github?.token?.trim()
   if (!ghRepo || !ghToken) return null
+  // W2: Pass empty a0Paths (`[]`) so a valid narrow-scope status on a non-A0 commit is not falsely
+  // marked invalid for failing to cover another commit's A0 path, while revocation/malformed/incomplete still block.
   const ghRes = await verifyGithubA0Approval({
     repo: ghRepo,
     token: ghToken,
     headSha: commitSha,
-    a0Paths: opts.aggregateA0Paths,
+    a0Paths: [],
     trustedApprovers: opts.github?.trustedApprovers,
     apiBaseUrl: opts.github?.apiBaseUrl,
     allowMergedPrCarryOver: true,
@@ -87,6 +99,23 @@ async function checkNonA0CommitOnlineNegativeVote(
     }
   }
   return null
+}
+
+async function scanCommitsForOnlineA0NegativeVotes(
+  commits: readonly string[],
+  opts: Omit<A0CommitRangeOptions, 'commits' | 'classifyCommitA0Paths'>,
+): Promise<Extract<ApprovalVerification, { valid: false }> | null> {
+  let revokedHit: Extract<ApprovalVerification, { valid: false }> | undefined
+  let incompleteHit: Extract<ApprovalVerification, { valid: false }> | undefined
+  let invalidHit: Extract<ApprovalVerification, { valid: false }> | undefined
+  for (const commitSha of commits) {
+    const neg = await checkNonA0CommitOnlineNegativeVote(commitSha, opts)
+    if (!neg) continue
+    if (neg.revoked) revokedHit = revokedHit ?? neg
+    else if (neg.incomplete) incompleteHit = incompleteHit ?? neg
+    else if (neg.invalid) invalidHit = invalidHit ?? neg
+  }
+  return revokedHit ?? incompleteHit ?? invalidHit ?? null
 }
 
 export async function verifyA0CommitRangeFallback(
@@ -108,7 +137,7 @@ export async function verifyA0CommitRangeFallback(
     parent = commitSha
     if (commitA0Paths.length === 0) {
       const neg = await checkNonA0CommitOnlineNegativeVote(commitSha, opts)
-      if (neg && !neg.valid) {
+      if (neg) {
         if (neg.revoked) revokedHit = revokedHit ?? neg
         else if (neg.incomplete) incompleteHit = incompleteHit ?? neg
         else if (neg.invalid) invalidHit = invalidHit ?? neg
@@ -209,19 +238,10 @@ async function verifyExplicitAggregateRangeA0Approval(
   return {
     valid: false,
     receiptPath: fallbackFailure.receiptPath,
-    reason: `${fallbackFailure.reason} (tip approval on ${opts.headSha.slice(0, 12)} lacks required aggregate binding range=${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)})`,
+    reason: `${fallbackFailure.reason} (tip approval on ${opts.headSha.slice(0, 12)} lacks standalone aggregate binding range=${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)})`,
   }
 }
 
-/**
- * Resolve A0 approval for a non-PR base..head range:
- *   - `single`: standard direct + merged-PR carry-over verification.
- *   - `multi` (`2..20`): full commit-by-commit decomposition (with negative-vote scan across ALL
- *     commits including non-A0 tip), falling back ONLY to an explicit `range=<base12>..<head12>`
- *     aggregate approval if zero negative/incomplete/invalid votes exist.
- *   - `invalid` (`>20` or non-linear): fails closed unless an explicit `range=<base12>..<head12>`
- *     aggregate approval exists on `headSha` (plain tip-only approval NEVER passes!).
- */
 export async function resolveA0ApprovalForBaseRange(
   opts: Omit<A0CommitRangeOptions, 'commits'> & { rangeInfo?: FirstParentRangeInfo },
 ): Promise<ApprovalVerification> {
@@ -245,10 +265,22 @@ export async function resolveA0ApprovalForBaseRange(
     }
     return verifyExplicitAggregateRangeA0Approval(opts, rangeRes)
   }
-  const invalidFail: ApprovalVerification = {
+  if (rangeInfo.kind === 'oversized') {
+    // F2: Even on 21..100 commits with an explicit aggregate approval, scan ALL commits online
+    // for any revocation / CHANGES_REQUESTED / incomplete / invalid before allowing pass!
+    const negHit = await scanCommitsForOnlineA0NegativeVotes(rangeInfo.commits, opts)
+    if (negHit) return negHit
+    const overFail: Extract<ApprovalVerification, { valid: false }> = {
+      valid: false,
+      receiptPath: `range:${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)}`,
+      reason: `${rangeInfo.reason}; require aggregate approval binding range=${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)}`,
+    }
+    return verifyExplicitAggregateRangeA0Approval(opts, overFail)
+  }
+  return {
     valid: false,
     receiptPath: `range:${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)}`,
-    reason: `cannot decompose A0 range (${rangeInfo.reason}); require aggregate approval binding range=${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)}`,
+    reason: `cannot verify A0 range (${rangeInfo.reason})`,
+    ...(rangeInfo.tooManyForNegativeScan ? { incomplete: true } : {}),
   }
-  return verifyExplicitAggregateRangeA0Approval(opts, invalidFail)
 }
