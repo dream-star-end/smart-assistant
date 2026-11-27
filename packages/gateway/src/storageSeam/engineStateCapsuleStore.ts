@@ -69,6 +69,10 @@ import {
   persistNativeTranscriptArchive,
   rebuildNativeTranscriptArchive,
 } from './tapeWarmRebuilder.js'
+import {
+  checkImportNativeSessionOwnership,
+  requireSessionOwnedPaths,
+} from './capsuleSessionOwnership.js'
 
 const DEFAULT_CHUNK_SIZE_BYTES = 4 * 1024 * 1024
 const SQLITE_MAGIC = 'SQLite format 3\0'
@@ -1281,13 +1285,7 @@ export class UniversalEngineStateCapsuleStore implements EngineStateCapsuleStore
       ENGINE_STATE_CAPSULE_MAX_FILES,
     )
     const chunkSizeBytes = Math.max(1024, req.chunkSizeBytes ?? this.defaultChunkSizeBytes)
-
-    const logicalPaths = this.collectAllowedFiles(req.sourceRoot, req.engine, maxFiles)
-
-    // SQLite WAL checkpoint truncation before staging copy to guarantee zero WAL tear.
-    // On busy WAL (busy !== 0 || checkpointed < log):
-    // - 'fail_closed': immediately throws CAPSULE_SQLITE_WAL_CHECKPOINT_BUSY
-    // - 'vacuum_into': stages via transactional `VACUUM INTO` snapshot (never raw-copies .db)
+    const logicalPaths = requireSessionOwnedPaths(this.collectAllowedFiles(req.sourceRoot, req.engine, maxFiles), req.nativeSessionId)
     const busyPolicy: SqliteBusyPolicy = req.sqliteBusyPolicy ?? this.defaultSqliteBusyPolicy
     const checkpointedSqlitePaths: string[] = []
     const sqliteSnapshotStrategies: Record<string, 'wal_checkpoint' | 'vacuum_into'> = {}
@@ -1607,12 +1605,10 @@ export class UniversalEngineStateCapsuleStore implements EngineStateCapsuleStore
     ) {
       return { status: 'incompatible', reason: 'principal_mismatch' }
     }
-    if (
-      req.expectedNativeSessionId &&
-      manifest.nativeSessionId &&
-      manifest.nativeSessionId !== req.expectedNativeSessionId
-    ) {
-      return { status: 'incompatible', reason: 'native_session_mismatch' }
+    const adapter = ENGINE_CAPSULE_ADAPTERS[manifest.engine]
+    const ownershipErr = checkImportNativeSessionOwnership(manifest, req.expectedNativeSessionId, (p) => adapter.relocatePath(p, req))
+    if (ownershipErr) {
+      return { status: 'incompatible', reason: ownershipErr }
     }
     if (manifest.portability === 'non_portable') {
       return { status: 'incompatible', reason: 'capsule_non_portable' }
@@ -1674,7 +1670,6 @@ export class UniversalEngineStateCapsuleStore implements EngineStateCapsuleStore
       verifiedPayloads.push({ entry, bytes })
     }
 
-    const adapter = ENGINE_CAPSULE_ADAPTERS[manifest.engine]
     const relocated: RelocatedCapsulePath[] = []
 
     for (const { entry, bytes } of verifiedPayloads) {

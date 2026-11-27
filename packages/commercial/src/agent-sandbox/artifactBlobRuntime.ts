@@ -11,6 +11,8 @@
  */
 import { createHash } from 'node:crypto'
 import * as path from 'node:path'
+import type { FlavorIdentity } from '../flavor/assertFlavor.js'
+import { isMasterArtifactCasEnabled } from './artifactCasEnv.js'
 import {
   LocalCasArtifactBlobStore,
   resolveMediaOrBlobBridge,
@@ -74,6 +76,52 @@ export function createMasterArtifactBlobStore(
     ...(opts.defaultChunkBytes !== undefined ? { defaultChunkBytes: opts.defaultChunkBytes } : {}),
   })
   return { store, metaStore, rootDir }
+}
+
+export interface ConditionalMasterArtifactBlobStoreOptions extends MasterArtifactBlobStoreOptions {
+  readonly env: NodeJS.ProcessEnv
+  readonly identity?: () => FlavorIdentity
+}
+
+/**
+ * Flavor-aware bootstrap helper (OCV5-913 T2 B2): returns `undefined` on
+ * commercial flavor / `FlavorIdentityError` unless explicitly opted in via
+ * `OC_ARTIFACT_CAS_ENABLED=1`, leaving `/internal/v3/artifact-blobs/*`
+ * fail-closed with 503 and 0 disk writes.
+ */
+export function maybeCreateMasterArtifactBlobStore(
+  opts: ConditionalMasterArtifactBlobStoreOptions,
+): {
+  readonly store: LocalCasArtifactBlobStore
+  readonly metaStore: PgArtifactBlobMetaStore
+  readonly rootDir: string
+} | undefined {
+  if (!isMasterArtifactCasEnabled({ env: opts.env, identity: opts.identity })) {
+    return undefined
+  }
+  return createMasterArtifactBlobStore(opts)
+}
+
+export function initMasterArtifactBlobStoreForBootstrap(
+  opts: ConditionalMasterArtifactBlobStoreOptions,
+): LocalCasArtifactBlobStore | undefined {
+  try {
+    const created = maybeCreateMasterArtifactBlobStore(opts)
+    if (!created) {
+      console.log('[commercial] artifact CAS blob store DISABLED by flavor gate (set OC_ARTIFACT_CAS_ENABLED=1 to opt in)')
+      return undefined
+    }
+    console.log('[commercial] artifact CAS blob store ready', {
+      rootDir: created.rootDir,
+      ticketSigning: Boolean(opts.bridgeSecret),
+    })
+    return created.store
+  } catch (err) {
+    console.error('[commercial] artifact CAS blob store init failed; blob RPC DISABLED', {
+      error: (err as Error)?.message ?? String(err),
+    })
+    return undefined
+  }
 }
 
 /**

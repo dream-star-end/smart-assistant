@@ -260,7 +260,7 @@ describe('OCV5-890 Layer 1: UniversalEngineStateCapsuleStore', () => {
     const sourceRoot = makeTempDir('tear-src')
     const dir = join(sourceRoot, 'sessions', '2026', '11', '25')
     mkdirSync(dir, { recursive: true })
-    const rolloutPath = join(dir, 'rollout-20261125-aaa.jsonl')
+    const rolloutPath = join(dir, 'rollout-20261125-22222222-2222-4222-8222-222222222222.jsonl')
     writeFileSync(rolloutPath, '{"type":"session_meta"}\n', 'utf8')
 
     const store = new UniversalEngineStateCapsuleStore({
@@ -508,7 +508,7 @@ describe('OCV5-890 Layer 1: UniversalEngineStateCapsuleStore', () => {
     const sourceRoot = makeTempDir('compat-src')
     const targetRoot = makeTempDir('compat-dst')
     mkdirSync(join(sourceRoot, 'sessions'), { recursive: true })
-    writeFileSync(join(sourceRoot, 'sessions', 'a.jsonl'), '{}\n', 'utf8')
+    writeFileSync(join(sourceRoot, 'sessions', '66666666-6666-4666-8666-666666666666.jsonl'), '{}\n', 'utf8')
 
     const store = new UniversalEngineStateCapsuleStore({
       blobStore: new InMemoryArtifactBlobStore(),

@@ -82,10 +82,10 @@ beforeEach(async () => {
   await writeFile(paths.agentClaudeMd(profile.legacyAgentId), 'LOCAL MANUAL v1')
   await writeFile(paths.agentClaudeMd(profile.canonicalAgentId), 'MARKET PERSONA')
   await writeFile(join(paths.home, 'openclaude.json'), JSON.stringify(config))
-  await writeAgentsConfig({ agents: [...agents, {id: 'pair-child', model: 'glm-5.2'}], default: profile.legacyAgentId, routes: [] })
+  await writeAgentsConfig({ agents: [...agents, {id: 'pair-child', model: 'deepseek-v4-flash'}], default: profile.legacyAgentId, routes: [] })
   setV3MasterSinkSingleton({ persistOrQueue: async () => ({ ok: true }), attemptOnce: async () => {} } as any)
 })
-after(async () => { for (const sm of managers) await sm.shutdownAll(); setV3MasterSinkSingleton(null); await new Promise<void>(resolve => server.close(() => resolve())); await rm(home, { recursive: true, force: true }) })
+after(async () => { for (const sm of managers) await sm.shutdownAll(); setV3MasterSinkSingleton(null); server.closeAllConnections?.(); await new Promise<void>(resolve => server.close(() => resolve())); await rm(home, { recursive: true, force: true }) })
 
 
 function latch() {
@@ -100,13 +100,13 @@ function gateway(sm: InstanceType<typeof SessionManager>) {
     _hiddenDelegateGuard: new PerTurnDelegationGuard(), _memberDelegateGuard: new PerTurnDelegationGuard(8),
     _delegateQueuePollMs: 10, _readDelegateMemoryPressure: () => null,
     log: {debug() {}, info() {}, warn() {}, error() {}}, deps: {config}, sessions: sm,
-    _getAgentsConfig: async () => ({default: profile.legacyAgentId, agents: [...agents, {id: 'pair-child', model: 'glm-5.2'}]}),
+    _getAgentsConfig: async () => ({default: profile.legacyAgentId, agents: [...agents, {id: 'pair-child', model: 'deepseek-v4-flash'}]}),
     _runLog: {start: () => ({}), complete() {}}, deliver() {}, getUserId: () => '3',
   })
   return gw
 }
 async function delegate(gw: any, parentKey: string) {
-  gw.readBody = async () => JSON.stringify({goal: 'pair child result', model: 'glm-5.2', sourceAgent: profile.legacyAgentId, parentSessionKey: parentKey})
+  gw.readBody = async () => JSON.stringify({goal: 'pair child result', model: 'deepseek-v4-flash', sourceAgent: profile.legacyAgentId, parentSessionKey: parentKey})
   let status = 0, body = ''
   const res = {writeHead: (n: number) => { status = n }, end: (s: unknown) => {body = String(s ?? '')}}
   await gw.handleDelegateTask({method: 'POST', headers: {}}, res, 'pair-child')
