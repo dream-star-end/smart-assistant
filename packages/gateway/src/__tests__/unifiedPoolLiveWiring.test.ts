@@ -36,6 +36,7 @@ import {
   type CatalogPricingReader,
 } from '../inferencePool/index.js'
 import { syncSelfhostUnifiedPoolAdapterWrapper } from '../remotePool/registerRemoteDriver.js'
+import { restartRunnerForConfigChange } from '../runnerConfigRestart.js'
 
 const SAVED_WRAPPER = getUnifiedPoolAdapterWrapper()
 const SAVED_SELFHOST_ENV = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
@@ -1382,5 +1383,214 @@ describe('OCV5-915 P3-1: Dual-Pool Live Wiring, ES Proxy Facade & CreditBudgetGu
     const okSummary = await okRun.summary
     assert.equal(okSummary?.assistantText, 'hermetic-ok')
     assert.equal(hermeticCapable.submitCount, 1)
+  })
+
+  it('OCV5-921: local_pool wrapper remains reusable after restartRunnerForConfigChange/shutdown across subsequent turns', async () => {
+    const abandonedReasons: string[] = []
+    let turnNo = 0
+    const base = new DuckTypedLiveAdapter(
+      { engineId: 'codex', model: 'gpt-6-luna' },
+      async (params) => {
+        turnNo += 1
+        params.onEvent({
+          kind: 'block',
+          block: { kind: 'text', text: `reply-${turnNo}` },
+        })
+        return {
+          usage: {
+            cost: 0,
+            inputTokens: 20 * turnNo,
+            outputTokens: 10 * turnNo,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            totalTokens: 30 * turnNo,
+          },
+          assistantText: `reply-${turnNo}`,
+          thinkingText: '',
+          assistantSegments: [],
+          thinkingSegments: [],
+          tools: [],
+          runtimeEvents: [],
+          stopReason: 'end_turn',
+          numTurns: 1,
+          isError: false,
+          staleResumeId: false,
+          phantomSignals: { apiState: 'called', skipReason: null },
+        }
+      },
+    )
+    const wrapped = wrapEngineWithUnifiedPoolDriver(
+      base,
+      { engineId: 'codex', poolKind: 'local_pool', opts: makeCreateOpts({ model: 'gpt-6-luna' }) },
+      {
+        onAbandonJournal: (_admissionId, reason) => {
+          abandonedReasons.push(reason)
+        },
+      },
+    )
+
+    // Real local engines (CodexAdapter/CcbAdapter/AntigravityAdapter) do not define
+    // restartForConfigChange(), so restartRunnerForConfigChange() invokes runner.shutdown()
+    // and reuses the same runner instance for subsequent turns.
+    Object.defineProperty(base, 'restartForConfigChange', { value: undefined, configurable: true })
+    await restartRunnerForConfigChange(wrapped)
+    assert.equal(base.shutdownCount, 1)
+
+    const run1 = wrapped.submitTurn({
+      input: 'first turn after config restart',
+      requestId: 'req_ocv5_921_turn1',
+      turnKey: FIXED_TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run1.submitted
+    const summary1 = await run1.summary
+    assert.equal(summary1?.assistantText, 'reply-1')
+    assert.equal(base.submitCount, 1)
+    assert.equal(abandonedReasons.length, 0)
+    assert.equal(wrapped.getLastTurnReceiptV5()?.status, 'success')
+
+    // Second config restart (e.g. model switch) must also keep the wrapped runner reusable.
+    wrapped.setModel('gpt-6.2-astra')
+    await restartRunnerForConfigChange(wrapped)
+    assert.equal(base.shutdownCount, 2)
+
+    const run2 = wrapped.submitTurn({
+      input: 'second turn after model restart',
+      requestId: 'req_ocv5_921_turn2',
+      turnKey: FIXED_TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 1 },
+      toolUseIdToName: new Map(),
+    })
+    await run2.submitted
+    const summary2 = await run2.summary
+    assert.equal(summary2?.assistantText, 'reply-2')
+    assert.equal(base.submitCount, 2)
+    assert.equal(abandonedReasons.length, 0)
+  })
+
+  it('OCV5-921: concurrent submitTurn during in-flight shutdown is abandoned, and failed shutdown still releases the fence', async () => {
+    const abandonedReasons: string[] = []
+    let releaseShutdown!: () => void
+    let failNextShutdown = false
+    const base = new DuckTypedLiveAdapter(
+      { engineId: 'codex', model: 'gpt-6-luna' },
+      async () => ({
+        usage: { cost: 0, inputTokens: 12, outputTokens: 6, cacheReadTokens: 0, cacheCreationTokens: 0, totalTokens: 18 },
+        assistantText: 'recovered-after-shutdown',
+        thinkingText: '',
+        assistantSegments: [],
+        thinkingSegments: [],
+        tools: [],
+        runtimeEvents: [],
+        stopReason: 'end_turn',
+        numTurns: 1,
+        isError: false,
+        staleResumeId: false,
+        phantomSignals: { apiState: 'called', skipReason: null },
+      }),
+    )
+    const origShutdown = base.shutdown.bind(base)
+    let blockShutdownOnce = true
+    base.shutdown = async () => {
+      if (blockShutdownOnce) {
+        blockShutdownOnce = false
+        await new Promise<void>((r) => {
+          releaseShutdown = r
+        })
+      }
+      if (failNextShutdown) {
+        failNextShutdown = false
+        throw new Error('simulated shutdown failure')
+      }
+      await origShutdown()
+    }
+
+    const wrapped = wrapEngineWithUnifiedPoolDriver(
+      base,
+      { engineId: 'codex', poolKind: 'local_pool', opts: makeCreateOpts({ model: 'gpt-6-luna' }) },
+      {
+        onAbandonJournal: (_admissionId, reason) => {
+          abandonedReasons.push(reason)
+        },
+      },
+    )
+
+    // 1. While shutdown is in flight, a concurrent submitTurn must be cancelled via abandon('shutdown').
+    const shutdownPromise = wrapped.shutdown()
+    const concurrentRun = wrapped.submitTurn({
+      input: 'arrived during shutdown',
+      requestId: 'req_ocv5_921_during_shutdown',
+      turnKey: FIXED_TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    releaseShutdown()
+    await shutdownPromise
+    await concurrentRun.submitted
+    assert.equal(await concurrentRun.summary, null)
+    assert.equal(base.submitCount, 0)
+    assert.deepEqual(abandonedReasons, ['shutdown'])
+
+    // 2. If shutdown throws, the fence must still be released in finally so subsequent turns succeed.
+    failNextShutdown = true
+    await assert.rejects(wrapped.shutdown(), /simulated shutdown failure/)
+
+    const postRun = wrapped.submitTurn({
+      input: 'after failed shutdown',
+      requestId: 'req_ocv5_921_after_failed_shutdown',
+      turnKey: FIXED_TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await postRun.submitted
+    const postSummary = await postRun.summary
+    assert.equal(postSummary?.assistantText, 'recovered-after-shutdown')
+    assert.equal(base.submitCount, 1)
+  })
+
+  it('OCV5-921: remote_pool wrapper releases shutdownInFlight fence after shutdown completes (does not permanently latch wrapper)', async () => {
+    const base = new DuckTypedLiveAdapter(
+      { engineId: 'codex', model: 'gpt-6-luna' },
+      async () => ({
+        usage: { cost: 0, inputTokens: 15, outputTokens: 8, cacheReadTokens: 0, cacheCreationTokens: 0, totalTokens: 23 },
+        assistantText: 'remote-after-shutdown',
+        thinkingText: '',
+        assistantSegments: [],
+        thinkingSegments: [],
+        tools: [],
+        runtimeEvents: [],
+        stopReason: 'end_turn',
+        numTurns: 1,
+        isError: false,
+        staleResumeId: false,
+        phantomSignals: { apiState: 'called', skipReason: null },
+      }),
+    )
+    const wrapped = wrapEngineWithUnifiedPoolDriver(base, {
+      engineId: 'codex',
+      poolKind: 'remote_pool',
+      opts: makeCreateOpts({ model: 'gpt-6-luna' }),
+    })
+
+    await wrapped.shutdown()
+    assert.equal(base.shutdownCount, 1)
+
+    const run = wrapped.submitTurn({
+      input: 'remote turn after shutdown',
+      requestId: 'req_ocv5_921_remote_post_shutdown',
+      turnKey: FIXED_TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run.submitted
+    const summary = await run.summary
+    assert.equal(summary?.assistantText, 'remote-after-shutdown')
+    assert.equal(base.submitCount, 1)
   })
 })
