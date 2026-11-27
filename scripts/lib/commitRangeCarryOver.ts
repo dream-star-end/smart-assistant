@@ -1,19 +1,9 @@
 /**
- * Multi-Commit First-Parent Range, Cross-Channel Veto & Local Host Carry-Over Verification (OCV5-912).
- *
- * Security invariants (B2 / B3 / B4 / B5):
- *   1. `inspectFirstParentRange` uses bounded `git rev-list --max-count` to distinguish single-commit
- *      (`N === 1`), coalesced multi-commit (`2 <= N <= 20`), and diverged/oversized ranges BEFORE any
- *      tip-only carry-over can shortcut earlier commits.
- *   2. Cross-channel VETO precedence is symmetric and order-independent:
- *      - Online `veto` or `incomplete` overrides local host approve.
- *      - Local host HARD VETO on `S` or carried-over `H` overrides GitHub approve (and low-risk pass).
- *      - Multiple carry-over candidates are all scanned for VETO before returning any approval.
- *   3. Multi-commit range decomposition checks EVERY commit `Ci` in `C1..CN`: low-risk commits must
- *      prove they landed on `expectedBaseRef` via a merged PR (`merge_commit_sha === Ci`) with zero
- *      vetoes and zero incomplete online checks.
+ * Architecture Steward Multi-Commit Range, Cross-Channel Veto & Host Carry-Over Verification (OCV5-912).
+ * Enforces bounded range checks, symmetric cross-channel VETO/unverifiable precedence, and merged-PR provenance.
  */
 import {
+  DEFAULT_STEWARD_HMAC_KEY_ENV,
   type ReceiptLookupResult,
   SHA40_RE,
   type StewardReceiptVerificationResult,
@@ -23,6 +13,7 @@ import {
   evaluateStructuralRisk,
   findStewardReceiptForCommit,
   readCommitMessage,
+  resolveStewardHmacKeyState,
   verifyArchStewardReceipt,
 } from './archStewardContract.js'
 import {
@@ -69,17 +60,23 @@ export interface StewardGithubApiConfig {
   fetchImpl?: FetchLike
 }
 
-/**
- * Check whether a local host Steward receipt exists for `targetSha` and carries a HARD VETO
- * (used to enforce symmetric cross-channel VETO precedence even when GitHub approved `targetSha`).
- */
-export function checkLocalHostStewardVeto(opts: StewardHostReceiptConfig & { targetSha: string }): {
+export interface LocalHostVetoCheckResult {
+  blocked: boolean
   vetoed: boolean
+  unverifiable?: boolean
+  vetoSha?: string
   receiptLookup?: ReceiptLookupResult
   receiptVerification?: StewardReceiptVerificationResult
-} {
-  // F4: Pass commitMessage so trusted external Steward-Receipt trailers are discovered identically
-  // across single-commit, per-commit range, and aggregate negative-vote paths.
+}
+
+/**
+ * Check whether an authoritative local host Steward receipt exists for `targetSha` and carries a
+ * HARD VETO OR cannot be verified (F4: distinguishes truly absent vs authentic HARD VETO vs
+ * unverifiable authoritative host receipt, resolving host HMAC independently when needed).
+ */
+export function checkLocalHostStewardVeto(
+  opts: StewardHostReceiptConfig & { targetSha: string },
+): LocalHostVetoCheckResult {
   const commitMessage = readCommitMessage(opts.root, opts.targetSha, opts.gitDir)
   const lookup = findStewardReceiptForCommit({
     root: opts.root,
@@ -91,11 +88,41 @@ export function checkLocalHostStewardVeto(opts: StewardHostReceiptConfig & { tar
     allowUntrustedRepoReceipt: opts.allowUntrustedRepoReceipt,
     env: opts.env,
   })
-  if (!lookup.found || lookup.error) return { vetoed: false }
+  if (lookup.error) {
+    return { blocked: true, vetoed: false, unverifiable: true, receiptLookup: lookup }
+  }
+  if (!lookup.found) return { blocked: false, vetoed: false }
+
+  let effectiveHmacKey = opts.hmacKey
+  let effectiveRequireHmac = opts.requireHmac
+  if (!effectiveHmacKey && lookup.channel === 'host-file') {
+    try {
+      const hostKeyState = resolveStewardHmacKeyState({
+        hmacKeyEnv: DEFAULT_STEWARD_HMAC_KEY_ENV,
+        requireRootOwner: opts.requireRootOwner,
+        allowHostDefault: true,
+        root: opts.root,
+        receiptDirs: opts.receiptDirs,
+        env: opts.env,
+      })
+      effectiveHmacKey = hostKeyState.hmacKey
+      effectiveRequireHmac = effectiveRequireHmac || hostKeyState.requireHmac
+    } catch (err) {
+      return {
+        blocked: true,
+        vetoed: false,
+        unverifiable: true,
+        receiptLookup: {
+          ...lookup,
+          error: `authoritative host receipt exists but host .hmac-key could not be loaded: ${(err as Error).message}`,
+        },
+      }
+    }
+  }
   const ver = verifyArchStewardReceipt(lookup.raw, {
     headSha: opts.targetSha,
-    hmacKey: opts.hmacKey,
-    requireHmac: opts.requireHmac,
+    hmacKey: effectiveHmacKey,
+    requireHmac: effectiveRequireHmac,
     rootFileIntegrity: Boolean(lookup.rootOwnerVerified),
   })
   const integrityFailed = ver.violations.some(
@@ -104,30 +131,39 @@ export function checkLocalHostStewardVeto(opts: StewardHostReceiptConfig & { tar
       v.code === 'STEWARD-RECEIPT-DIGEST-MISMATCH' ||
       v.code === 'STEWARD-RECEIPT-SCHEMA-INVALID',
   )
-  if (!integrityFailed && ver.violations.some((v) => v.code === 'STEWARD-HARD-VETO')) {
-    return { vetoed: true, receiptLookup: lookup, receiptVerification: ver }
+  if (integrityFailed) {
+    return {
+      blocked: true,
+      vetoed: false,
+      unverifiable: true,
+      receiptLookup: {
+        ...lookup,
+        error: `authoritative host receipt for ${opts.targetSha.slice(0, 12)} could not be verified under active key (fail-closed)`,
+      },
+      receiptVerification: ver,
+    }
   }
-  return { vetoed: false }
+  if (ver.violations.some((v) => v.code === 'STEWARD-HARD-VETO')) {
+    return { blocked: true, vetoed: true, receiptLookup: lookup, receiptVerification: ver }
+  }
+  return { blocked: false, vetoed: false }
 }
 
 function findLocalHostVetoAcrossCandidates(
   ghStatus: GithubStewardStatusResult | undefined,
   opts: StewardHostReceiptConfig,
-): {
-  vetoed: boolean
-  vetoSha?: string
-  receiptLookup?: ReceiptLookupResult
-  receiptVerification?: StewardReceiptVerificationResult
-} {
+): LocalHostVetoCheckResult {
   const shas = new Set<string>([
     ...(ghStatus?.carriedOverFromSha ? [ghStatus.carriedOverFromSha] : []),
     ...(ghStatus?.equivalenceCandidates?.map((c) => c.prHeadSha) ?? []),
   ])
+  let unverifiableHit: LocalHostVetoCheckResult | undefined
   for (const hSha of shas) {
-    const veto = checkLocalHostStewardVeto({ ...opts, targetSha: hSha })
-    if (veto.vetoed) return { ...veto, vetoSha: hSha }
+    const res = checkLocalHostStewardVeto({ ...opts, targetSha: hSha })
+    if (res.vetoed) return { ...res, vetoSha: hSha }
+    if (res.blocked && !unverifiableHit) unverifiableHit = { ...res, vetoSha: hSha }
   }
-  return { vetoed: false }
+  return unverifiableHit ?? { blocked: false, vetoed: false }
 }
 
 /**
@@ -217,70 +253,48 @@ export interface MergedGithubStewardInput {
 export function mergeGithubStewardOutcome(
   local: MergedGithubStewardInput,
   githubStatus: GithubStewardStatusResult,
-): {
-  ok: boolean
-  exitCode: 0 | 1
-  mode: MergedGithubStewardInput['mode']
-  headSha: string
-  baseSha: string
-  risk: StructuralRiskReport
-  receiptLookup?: ReceiptLookupResult
-  receiptVerification?: StewardReceiptVerificationResult
-  githubStatus: GithubStewardStatusResult
-} {
+): StewardOnlineGateOutput & { githubStatus: GithubStewardStatusResult } {
   const searched = [...(local.receiptLookup?.searchedLocations ?? []), githubStatus.source]
-  const failExit: 0 | 1 = local.mode === 'check-only' ? 0 : 1
-  const base = {
+  const out = (
+    ok: boolean,
+    receiptLookup?: ReceiptLookupResult,
+    receiptVerification?: StewardReceiptVerificationResult,
+  ) => ({
     mode: local.mode,
     headSha: local.headSha,
     baseSha: local.baseSha,
     risk: local.risk,
-  }
+    ok,
+    exitCode: (ok || local.mode === 'check-only' ? 0 : 1) as 0 | 1,
+    receiptLookup,
+    receiptVerification,
+    githubStatus,
+  })
   if (githubStatus.verdict === 'veto' || githubStatus.incomplete || githubStatus.invalid) {
-    return {
-      ...base,
-      ok: false,
-      exitCode: failExit,
-      receiptLookup: {
+    return out(
+      false,
+      {
         found: githubStatus.verdict === 'veto',
         channel: 'github-status',
         source: githubStatus.source,
         error: githubStatus.reason,
         searchedLocations: searched,
       },
-      receiptVerification: local.receiptVerification,
-      githubStatus,
-    }
+      local.receiptVerification,
+    )
   }
-  if (local.passed) {
-    return {
-      ...base,
-      ok: true,
-      exitCode: 0,
-      receiptLookup: local.receiptLookup,
-      receiptVerification: local.receiptVerification,
-      githubStatus,
-    }
-  }
+  if (local.passed) return out(true, local.receiptLookup, local.receiptVerification)
   if (githubStatus.valid) {
-    return {
-      ...base,
-      ok: true,
-      exitCode: 0,
-      receiptLookup: {
-        found: true,
-        channel: 'github-status',
-        source: githubStatus.source,
-        searchedLocations: searched,
-      },
-      githubStatus,
-    }
+    return out(true, {
+      found: true,
+      channel: 'github-status',
+      source: githubStatus.source,
+      searchedLocations: searched,
+    })
   }
-  return {
-    ...base,
-    ok: false,
-    exitCode: failExit,
-    receiptLookup: {
+  return out(
+    false,
+    {
       found: local.receiptLookup?.found ?? false,
       channel: local.receiptLookup?.channel,
       source: local.receiptLookup?.source ?? githubStatus.source,
@@ -290,9 +304,8 @@ export function mergeGithubStewardOutcome(
         : githubStatus.reason,
       searchedLocations: searched,
     },
-    receiptVerification: local.receiptVerification,
-    githubStatus,
-  }
+    local.receiptVerification,
+  )
 }
 
 export interface StewardRangeVerificationOptions extends StewardHostReceiptConfig {
@@ -372,11 +385,11 @@ async function checkLowRiskCommitInRange(
     }
   }
   const hostVeto = findLocalHostVetoAcrossCandidates(ghStatus, opts)
-  if (hostVeto.vetoed) {
+  if (hostVeto.blocked) {
     return {
       ok: false,
-      vetoed: true,
-      note: `commit ${commitSha.slice(0, 12)} carried-over host receipt (${hostVeto.vetoSha?.slice(0, 12)}) has HARD VETO`,
+      vetoed: hostVeto.vetoed,
+      note: `commit ${commitSha.slice(0, 12)} carried-over host receipt (${hostVeto.vetoSha?.slice(0, 12)}) ${hostVeto.vetoed ? 'has HARD VETO' : 'is unverifiable (fail-closed)'}`,
       vetoLookup: hostVeto.receiptLookup,
       vetoVerification: hostVeto.receiptVerification,
     }
@@ -477,11 +490,11 @@ async function verifyOneCommitInStewardRange(
 
   // B3: Scan carried-over candidate host HARD VETOs unconditionally BEFORE accepting local.passed or ghStatus.valid!
   const hostVeto = findLocalHostVetoAcrossCandidates(ghStatus, opts)
-  if (hostVeto.vetoed) {
+  if (hostVeto.blocked) {
     return {
       ok: false,
-      vetoed: true,
-      note: `commit ${commitSha.slice(0, 12)} carried-over host receipt (${hostVeto.vetoSha?.slice(0, 12)}) has HARD VETO`,
+      vetoed: hostVeto.vetoed,
+      note: `commit ${commitSha.slice(0, 12)} carried-over host receipt (${hostVeto.vetoSha?.slice(0, 12)}) ${hostVeto.vetoed ? 'has HARD VETO' : 'is unverifiable (fail-closed)'}`,
       vetoLookup: hostVeto.receiptLookup,
       vetoVerification: hostVeto.receiptVerification,
     }
@@ -578,23 +591,40 @@ export interface StewardOnlineGateOutput {
   githubStatus?: GithubStewardStatusResult
 }
 
+function buildStewardOutput(
+  opts: StewardOnlineGateInput,
+  ok: boolean,
+  receiptLookup?: ReceiptLookupResult,
+  receiptVerification?: StewardReceiptVerificationResult,
+  githubStatus?: GithubStewardStatusResult,
+): StewardOnlineGateOutput {
+  return {
+    mode: opts.mode,
+    headSha: opts.headSha,
+    baseSha: opts.baseSha,
+    risk: opts.risk,
+    ok,
+    exitCode: ok || opts.mode === 'check-only' ? 0 : 1,
+    receiptLookup,
+    receiptVerification,
+    ...(githubStatus ? { githubStatus } : {}),
+  }
+}
+
 async function checkStewardRangeNegativeVotes(
   commits: readonly string[],
   opts: StewardOnlineGateInput,
 ): Promise<StewardOnlineGateOutput | null> {
-  const base = { mode: opts.mode, headSha: opts.headSha, baseSha: opts.baseSha, risk: opts.risk }
-  const failExit: 0 | 1 = opts.mode === 'check-only' ? 0 : 1
   for (const commitSha of commits) {
     if (commitSha !== opts.headSha) {
       const localVeto = checkLocalHostStewardVeto({ ...opts, targetSha: commitSha })
-      if (localVeto.vetoed) {
-        return {
-          ...base,
-          ok: false,
-          exitCode: failExit,
-          receiptLookup: localVeto.receiptLookup,
-          receiptVerification: localVeto.receiptVerification,
-        }
+      if (localVeto.blocked) {
+        return buildStewardOutput(
+          opts,
+          false,
+          localVeto.receiptLookup,
+          localVeto.receiptVerification,
+        )
       }
     }
     if (!opts.github) continue
@@ -604,31 +634,29 @@ async function checkStewardRangeNegativeVotes(
       allowMergedPrCarryOver: true,
     })
     if (gh.verdict === 'veto' || gh.incomplete || gh.invalid) {
-      return {
-        ...base,
-        ok: false,
-        exitCode: failExit,
-        receiptLookup: {
+      return buildStewardOutput(
+        opts,
+        false,
+        {
           found: gh.verdict === 'veto',
           channel: 'github-status',
           source: gh.source,
           error: gh.reason,
           searchedLocations: [...(opts.receiptLookup?.searchedLocations ?? []), gh.source],
         },
-        receiptVerification: opts.receiptVerification,
-        githubStatus: gh,
-      }
+        opts.receiptVerification,
+        gh,
+      )
     }
     const candVeto = findLocalHostVetoAcrossCandidates(gh, opts)
-    if (candVeto.vetoed) {
-      return {
-        ...base,
-        ok: false,
-        exitCode: failExit,
-        receiptLookup: candVeto.receiptLookup,
-        receiptVerification: candVeto.receiptVerification,
-        githubStatus: gh,
-      }
+    if (candVeto.blocked) {
+      return buildStewardOutput(
+        opts,
+        false,
+        candVeto.receiptLookup,
+        candVeto.receiptVerification,
+        gh,
+      )
     }
   }
   return null
@@ -641,29 +669,18 @@ async function checkStewardRangeNegativeVotes(
 export async function resolveStewardGateOnlineAsync(
   opts: StewardOnlineGateInput,
 ): Promise<StewardOnlineGateOutput> {
-  const base = { mode: opts.mode, headSha: opts.headSha, baseSha: opts.baseSha, risk: opts.risk }
-  const failExit: 0 | 1 = opts.mode === 'check-only' ? 0 : 1
-  // F4: Explicit receipt file selects the positive local receipt source ONLY; it MUST NOT shadow
-  // an existing trusted host HARD VETO on headSha, nor bypass range/GitHub negative-vote checks.
   if (opts.explicitReceiptPath) {
     if (!opts.passed) {
-      return {
-        ...base,
-        ok: false,
-        exitCode: failExit,
-        receiptLookup: opts.receiptLookup,
-        receiptVerification: opts.receiptVerification,
-      }
+      return buildStewardOutput(opts, false, opts.receiptLookup, opts.receiptVerification)
     }
     const existingHostVeto = checkLocalHostStewardVeto({ ...opts, targetSha: opts.headSha })
-    if (existingHostVeto.vetoed) {
-      return {
-        ...base,
-        ok: false,
-        exitCode: failExit,
-        receiptLookup: existingHostVeto.receiptLookup,
-        receiptVerification: existingHostVeto.receiptVerification,
-      }
+    if (existingHostVeto.blocked) {
+      return buildStewardOutput(
+        opts,
+        false,
+        existingHostVeto.receiptLookup,
+        existingHostVeto.receiptVerification,
+      )
     }
   }
   const rangeInfo =
@@ -672,57 +689,45 @@ export async function resolveStewardGateOnlineAsync(
       : { kind: 'single' as const, commit: opts.headSha }
 
   if (rangeInfo.kind === 'invalid') {
-    return {
-      ...base,
-      ok: false,
-      exitCode: failExit,
-      receiptLookup: {
+    return buildStewardOutput(
+      opts,
+      false,
+      {
         found: opts.receiptLookup?.found ?? false,
         channel: opts.receiptLookup?.channel,
         source: `range:${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)}`,
         error: `cannot verify range (${rangeInfo.reason})`,
         searchedLocations: opts.receiptLookup?.searchedLocations ?? [],
       },
-      receiptVerification: opts.receiptVerification,
-    }
+      opts.receiptVerification,
+    )
   }
 
-  // F2: Both `multi` (2..20) and `oversized` (21..100) accept an explicit aggregate host receipt
-  // ONLY after scanning ALL N commits for local/GitHub negative/incomplete/invalid votes!
   if ((rangeInfo.kind === 'oversized' || rangeInfo.kind === 'multi') && opts.passed) {
     const negHit = await checkStewardRangeNegativeVotes(rangeInfo.commits, opts)
-    if (negHit) return negHit
-    return {
-      ...base,
-      ok: true,
-      exitCode: 0,
-      receiptLookup: opts.receiptLookup,
-      receiptVerification: opts.receiptVerification,
-    }
+    return negHit ?? buildStewardOutput(opts, true, opts.receiptLookup, opts.receiptVerification)
   }
   if (rangeInfo.kind === 'oversized') {
-    return {
-      ...base,
-      ok: false,
-      exitCode: failExit,
-      receiptLookup: {
+    return buildStewardOutput(
+      opts,
+      false,
+      {
         found: opts.receiptLookup?.found ?? false,
         channel: opts.receiptLookup?.channel,
         source: `range:${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)}`,
         error: `${rangeInfo.reason}; require aggregate host Steward receipt bound to both baseSha and headSha`,
         searchedLocations: opts.receiptLookup?.searchedLocations ?? [],
       },
-      receiptVerification: opts.receiptVerification,
-    }
+      opts.receiptVerification,
+    )
   }
 
   if (rangeInfo.kind === 'multi') {
     const rangeRes = await verifyStewardCommitRangeFallback({ ...opts, commits: rangeInfo.commits })
-    return {
-      ...base,
-      ok: rangeRes.ok,
-      exitCode: rangeRes.ok ? 0 : failExit,
-      receiptLookup: rangeRes.vetoLookup ?? {
+    return buildStewardOutput(
+      opts,
+      rangeRes.ok,
+      rangeRes.vetoLookup ?? {
         found: rangeRes.ok || rangeRes.vetoed,
         channel: opts.github ? 'github-status' : 'host-file',
         source: rangeRes.ok
@@ -731,9 +736,9 @@ export async function resolveStewardGateOnlineAsync(
         error: rangeRes.ok ? undefined : rangeRes.failureReason,
         searchedLocations: opts.receiptLookup?.searchedLocations ?? [],
       },
-      receiptVerification: rangeRes.vetoVerification ?? opts.receiptVerification,
-      githubStatus: rangeRes.vetoGithubStatus,
-    }
+      rangeRes.vetoVerification ?? opts.receiptVerification,
+      rangeRes.vetoGithubStatus,
+    )
   }
 
   const allowSingleCarry = opts.mode === 'enforce-commit'
@@ -743,17 +748,15 @@ export async function resolveStewardGateOnlineAsync(
       headSha: opts.headSha,
       allowMergedPrCarryOver: allowSingleCarry,
     })
-    // B3/F3: Check carried-over candidate host HARD VETO unconditionally BEFORE accepting local.passed or githubStatus.valid!
     const hostVeto = findLocalHostVetoAcrossCandidates(githubStatus, opts)
-    if (hostVeto.vetoed) {
-      return {
-        ...base,
-        ok: false,
-        exitCode: failExit,
-        receiptLookup: hostVeto.receiptLookup,
-        receiptVerification: hostVeto.receiptVerification,
+    if (hostVeto.blocked) {
+      return buildStewardOutput(
+        opts,
+        false,
+        hostVeto.receiptLookup,
+        hostVeto.receiptVerification,
         githubStatus,
-      }
+      )
     }
     const merged = mergeGithubStewardOutcome(opts, githubStatus)
     if (
@@ -772,24 +775,17 @@ export async function resolveStewardGateOnlineAsync(
         candidates: githubStatus.equivalenceCandidates,
       })
       if (hostCarry.vetoed || hostCarry.ok) {
-        return {
-          ...base,
-          ok: hostCarry.ok,
-          exitCode: hostCarry.ok ? 0 : failExit,
-          receiptLookup: hostCarry.receiptLookup,
-          receiptVerification: hostCarry.receiptVerification,
+        return buildStewardOutput(
+          opts,
+          hostCarry.ok,
+          hostCarry.receiptLookup,
+          hostCarry.receiptVerification,
           githubStatus,
-        }
+        )
       }
     }
     return merged
   }
 
-  return {
-    ...base,
-    ok: opts.passed,
-    exitCode: opts.passed || opts.mode === 'check-only' ? 0 : 1,
-    receiptLookup: opts.receiptLookup,
-    receiptVerification: opts.receiptVerification,
-  }
+  return buildStewardOutput(opts, opts.passed, opts.receiptLookup, opts.receiptVerification)
 }

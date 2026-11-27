@@ -2442,6 +2442,90 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
       false,
       'F4: explicit positive file MUST NOT shadow existing host HARD VETO on same SHA',
     )
+    assert.ok(
+      rF4HostShadow.receiptVerification?.violations.some((v) => v.code === 'STEWARD-HARD-VETO'),
+    )
+
+    // F4 3-way control: (a) empty host dir -> PASS; (b) host HMAC veto signed with DIFFERENT key -> BLOCK as unverifiable (distinct from authentic HARD VETO)!
+    const emptyHostDir = mkdtempSync(path.join(tmpdir(), 'ocv5-912-f4-empty-'))
+    const otherKeyHostDir = mkdtempSync(path.join(tmpdir(), 'ocv5-912-f4-otherkey-'))
+    t.after(() => {
+      rmSync(emptyHostDir, { recursive: true, force: true })
+      rmSync(otherKeyHostDir, { recursive: true, force: true })
+    })
+    const plainExpFile = path.join(emptyHostDir, 'plain-approve.json')
+    writeFileSync(
+      plainExpFile,
+      JSON.stringify(
+        signArchStewardReceipt(
+          makeStewardReceipt({
+            headSha: sF3,
+            baseSha: repoF3.baseSha,
+            triggers: ['CLONE_OR_T2_CORE_PATH'],
+          }),
+        ),
+        null,
+        2,
+      ),
+    )
+    const rF4AbsentPass = await runStewardGateAsync({
+      root: repoF3.dir,
+      mode: 'enforce-commit',
+      baseRef: repoF3.baseSha,
+      headRef: sF3,
+      explicitReceiptPath: plainExpFile,
+      receiptDirs: [emptyHostDir],
+      requireRootOwner: false,
+      requireHmac: false,
+    })
+    assert.equal(
+      rF4AbsentPass.ok,
+      true,
+      'F4 control: valid explicit positive file passes when host dir has no receipt',
+    )
+
+    const differentKeyVeto = signArchStewardReceipt(
+      makeStewardReceipt({
+        headSha: sF3,
+        baseSha: repoF3.baseSha,
+        verdict: 'veto',
+        blockers: [
+          {
+            dimension: 'boundaryIntegrity',
+            severity: 'P1',
+            location: 'packages/gateway/src/f3.ts',
+            reason: 'host hmac veto',
+          },
+        ],
+        dimensions: {
+          godClassAppend: { status: 'pass', notes: 'ok' },
+          wheelReinvention: { status: 'pass', notes: 'ok' },
+          boundaryIntegrity: { status: 'veto', notes: 'veto' },
+          complexityDrift: { status: 'pass', notes: 'ok' },
+        },
+      }),
+      'different-host-secret-key-99999999',
+    )
+    writeFileSync(
+      path.join(otherKeyHostDir, `${sF3}.json`),
+      JSON.stringify(differentKeyVeto, null, 2),
+    )
+    const rF4UnverifiableHost = await runStewardGateAsync({
+      root: repoF3.dir,
+      mode: 'enforce-commit',
+      baseRef: repoF3.baseSha,
+      headRef: sF3,
+      explicitReceiptPath: plainExpFile,
+      receiptDirs: [otherKeyHostDir],
+      requireRootOwner: false,
+      requireHmac: false,
+    })
+    assert.equal(
+      rF4UnverifiableHost.ok,
+      false,
+      'F4: existing authoritative host HMAC veto under different key MUST fail closed as unverifiable (never treated as absent)',
+    )
+    assert.match(rF4UnverifiableHost.receiptLookup?.error ?? '', /could not be verified/)
 
     const rF4 = await runStewardGateAsync({
       root: repoF3.dir,
