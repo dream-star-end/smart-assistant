@@ -206,7 +206,7 @@ function classifySinglePath(
     ]
   }
 
-  // 2. Non-meta gate scripts (`scripts/check-*.ts` except check-a0-monotonic.ts): auto-pass as A1
+  // 2. Non-UX/non-meta internal gate scripts (`scripts/check-*.ts` outside ux-regression-guards & a0-meta-referee): auto-pass as A1
   if (matchesAnyGlob(p, gateGlobs)) {
     return [
       status === 'A'

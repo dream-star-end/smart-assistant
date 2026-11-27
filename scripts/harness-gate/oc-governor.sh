@@ -788,7 +788,7 @@ VALID_STATUSES = {"pending", "approving", "approved", "rejected", "expired", "re
 TEST_FILE_RE = re.compile(r"^packages/commercial/src/(?:billing|payment)/(?:.*/)?__tests__/.*\.(?:test|spec)\.[cm]?[jt]sx?$|^packages/commercial/src/(?:billing|payment)/.*\.(?:test|spec)\.[cm]?[jt]sx?$")
 BILLING_DIR_RE, PAYMENT_DIR_RE = re.compile(r"^packages/commercial/src/billing/"), re.compile(r"^packages/commercial/src/payment/")
 BILLING_CORE_EXTRA_PATHS = frozenset({"packages/protocol/src/serviceTiers.ts"})
-DEFAULT_BILLING_NONCORE_ALLOWLIST = frozenset(f"packages/commercial/src/billing/{n}" for n in ("antigravityRouteContext.ts", "apiKeyMessageAudit.ts", "apiKeyUsageReport.ts", "authzModels.ts", "autoDreamModels.ts", "boardProjectAttribution.ts", "boxBillingQueries.ts", "boxToolRolloverIdentity.ts", "imageModels.ts", "ledgerRowContext.ts", "modelPublicProjection.ts", "openTurnAttribution.ts", "remoteNativeBillingIdentity.ts", "usageReport.ts", "zcodeExternalAudit.ts", "zcodeRouteContext.ts"))
+DEFAULT_BILLING_NONCORE_ALLOWLIST = frozenset(f"packages/commercial/src/billing/{n}" for n in ("apiKeyMessageAudit.ts", "apiKeyUsageReport.ts", "ledgerRowContext.ts", "usageReport.ts"))
 def _load_billing_noncore_allowlist() -> frozenset[str]:
     p = pathlib.Path(os.environ.get("OC_GOV_ROOT_RESOLVED") or "/opt/openclaude/harness-gate") / "referee" / "arch" / "a0-protected-paths.json"
     if not os.path.lexists(p): return DEFAULT_BILLING_NONCORE_ALLOWLIST

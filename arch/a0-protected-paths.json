@@ -8,28 +8,16 @@
     "receiptSchemaVersion": 1
   },
   "billingNonCoreAllowlist": [
-    "packages/commercial/src/billing/antigravityRouteContext.ts",
     "packages/commercial/src/billing/apiKeyMessageAudit.ts",
     "packages/commercial/src/billing/apiKeyUsageReport.ts",
-    "packages/commercial/src/billing/authzModels.ts",
-    "packages/commercial/src/billing/autoDreamModels.ts",
-    "packages/commercial/src/billing/boardProjectAttribution.ts",
-    "packages/commercial/src/billing/boxBillingQueries.ts",
-    "packages/commercial/src/billing/boxToolRolloverIdentity.ts",
-    "packages/commercial/src/billing/imageModels.ts",
     "packages/commercial/src/billing/ledgerRowContext.ts",
-    "packages/commercial/src/billing/modelPublicProjection.ts",
-    "packages/commercial/src/billing/openTurnAttribution.ts",
-    "packages/commercial/src/billing/remoteNativeBillingIdentity.ts",
-    "packages/commercial/src/billing/usageReport.ts",
-    "packages/commercial/src/billing/zcodeExternalAudit.ts",
-    "packages/commercial/src/billing/zcodeRouteContext.ts"
+    "packages/commercial/src/billing/usageReport.ts"
   ],
   "a0Categories": [
     {
       "id": "billing-accounting-core",
       "riskCategory": "billing_change",
-      "description": "Default-protected billing, pricing, tier multiplier, waiver, settlement, credit ledger, and payment modules (excluding explicit pure-helper billingNonCoreAllowlist, pure tests, and zero-runtime-diff TS edits)",
+      "description": "Default-protected billing, pricing, tier multiplier, model authorization, waiver, settlement, credit ledger, and payment modules (excluding strictly read-only/post-settlement audit helpers in billingNonCoreAllowlist, pure tests, and zero-runtime-diff TS edits)",
       "paths": [
         "packages/commercial/src/billing/**",
         "packages/commercial/src/payment/**",
@@ -39,18 +27,27 @@
     {
       "id": "ux-regression-guards",
       "riskCategory": "ux_degradation",
-      "description": "User-facing session display incident ledger freeze anchors, tombstones, and approvers",
+      "description": "User-facing incident ledger freeze anchors, tombstones, approvers, and UX/budget/layout/design-token/context guard executors",
       "paths": [
         "e2e/session-display/incident-ledger-baseline.json",
         "e2e/session-display/incident-ledger-baseline.sha256",
         "e2e/session-display/incident-tombstones.json",
-        "e2e/session-display/incident-tombstone-approvers.json"
+        "e2e/session-display/incident-tombstone-approvers.json",
+        "scripts/check-incident-ledger-superset.ts",
+        "scripts/check-ui-hard-gates.ts",
+        "scripts/check-monotonic-baselines.ts",
+        "scripts/lib/monotonicExtraBaselines.ts",
+        "scripts/check-context-static.ts",
+        "packages/web-react/vite.config.ts",
+        "packages/web-react/src/test/designTokens.test.ts",
+        "packages/web-react/browser-tests/layout-invariants.mjs",
+        "packages/web-react/browser-tests/vlm-rubric/**"
       ]
     },
     {
       "id": "a0-meta-referee",
       "riskCategory": "ux_degradation",
-      "description": "Full meta-referee execution, approval verification, and sync chain preventing silent weakening of UX and billing approval guards",
+      "description": "Full meta-referee, cross-family Architecture Steward verification, approval chain, and CI enforcement workflows preventing silent weakening of UX and billing approval guards",
       "paths": [
         "arch/a0-protected-paths.json",
         "scripts/check-a0-monotonic.ts",
@@ -63,10 +60,20 @@
         "scripts/lib/githubTrustedApproval.ts",
         "scripts/lib/githubMergedPrEquivalence.ts",
         "scripts/lib/commitRangeCarryOver.ts",
+        "scripts/check-cross-family-audit.ts",
+        "scripts/arch-steward-review.sh",
+        "scripts/lib/archStewardContract.ts",
+        "scripts/lib/archStewardGitDiff.ts",
+        "scripts/lib/archStewardReceipt.ts",
+        "scripts/lib/archStewardTypes.ts",
+        "scripts/lib/modelFamilyClassifier.ts",
         "scripts/harness-gate/oc-governor.sh",
         "scripts/harness-gate/sync-referee.sh",
         "scripts/lib/v5-selfhost-governance-gates.sh",
         "scripts/lib/v5-selfhost-train-guards.sh",
+        ".github/workflows/v5-selfhost-gates.yml",
+        ".github/workflows/v5-selfhost-release-gates.yml",
+        ".github/workflows/v5-selfhost-web-react.yml",
         ".github/CODEOWNERS"
       ]
     }

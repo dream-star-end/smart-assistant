@@ -1004,6 +1004,14 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
         execFileSync('git', ['-C', repoDir, ...args], { env: gitEnv, encoding: 'utf8' }).trim()
       git('init', '-q', '-b', 'feat/v5-selfhost')
       writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/ledgerRowContext.ts'),
+        'export function formatLedgerContext(x: number): string {\n  return String(x)\n}\n',
+      )
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/authzModels.ts'),
+        'export async function canUseModel(): Promise<boolean> {\n  return false\n}\n',
+      )
+      writeFileSync(
         path.join(repoDir, 'packages/commercial/src/billing/modelPublicProjection.ts'),
         'export function formatPublicProjection(x: number): string {\n  return String(x)\n}\n',
       )
@@ -1115,7 +1123,7 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
           '--branch',
           'feat/v5-selfhost',
           '--files',
-          'packages/commercial/src/billing/modelPublicProjection.ts',
+          'packages/commercial/src/billing/ledgerRowContext.ts',
           'packages/commercial/src/billing/usageReport.ts',
         ],
         env,
@@ -1126,7 +1134,7 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       assert.equal(ncDoc.classification, 'auto_pass')
       assert.equal(ncDoc.autoApprovedNonCoreBilling, true)
       assert.deepEqual(ncDoc.nonCoreBillingFiles, [
-        'packages/commercial/src/billing/modelPublicProjection.ts',
+        'packages/commercial/src/billing/ledgerRowContext.ts',
         'packages/commercial/src/billing/usageReport.ts',
       ])
       const ncAudits = readFileSync(path.join(ctrlDir, 'audit.jsonl'), 'utf8')
@@ -1135,13 +1143,26 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
         .map((l) => JSON.parse(l))
       assert.ok(ncAudits.some((ev) => ev.action === 'check_blast_radius' && ev.outcome === 'ok_auto_noncore_billing'))
 
-      // 2. Allowlisted pure display helper with runtime edit -> direct auto_pass;
-      //    real billing decision & pricing source files (remoteDriverTurnBilling.ts, remoteDriverReceiptV5.ts, codexServiceTierPricing.ts, serviceTiers.ts) -> BILLING_CORE_LOCKED!
+      // 2. Strictly read-only allowlisted helper with runtime edit -> direct auto_pass;
+      //    authzModels.ts / modelPublicProjection.ts / pricing & journal files -> BILLING_CORE_LOCKED!
+      const policyAllowlist = (
+        JSON.parse(readFileSync(path.join(REPO_ROOT, 'arch/a0-protected-paths.json'), 'utf8')) as {
+          billingNonCoreAllowlist: string[]
+        }
+      ).billingNonCoreAllowlist
+      const govShSrc = readFileSync(GOVERNOR_SH, 'utf8')
+      const fallbackMatch = govShSrc.match(/DEFAULT_BILLING_NONCORE_ALLOWLIST = frozenset\(f"packages\/commercial\/src\/billing\/\{n\}" for n in \(([^)]+)\)\)/)
+      assert.ok(fallbackMatch, 'oc-governor.sh MUST declare DEFAULT_BILLING_NONCORE_ALLOWLIST matching policy')
+      const fallbackList = [...fallbackMatch[1]!.matchAll(/"([^"]+)"/g)]
+        .map((m) => `packages/commercial/src/billing/${m[1]}`)
+        .sort()
+      assert.deepEqual(fallbackList, [...policyAllowlist].sort(), 'oc-governor.sh fallback allowlist MUST match arch/a0-protected-paths.json')
+
       writeFileSync(
-        path.join(repoDir, 'packages/commercial/src/billing/modelPublicProjection.ts'),
-        'export const PROJECTION_HEADER = "x-openclaude"\nexport function formatPublicProjection(x: number): string {\n  return String(x)\n}\n',
+        path.join(repoDir, 'packages/commercial/src/billing/ledgerRowContext.ts'),
+        'export const CONTEXT_HEADER = "x-openclaude"\nexport function formatLedgerContext(x: number): string {\n  return String(x)\n}\n',
       )
-      git('commit', '-qam', 'fix(v5): runtime edit in allowlisted pure display helper')
+      git('commit', '-qam', 'fix(v5): runtime edit in allowlisted read-only ledger context helper')
       const runtimeNonCoreSha = git('rev-parse', 'HEAD')
       const okRuntimeNonCore = runBash(
         GOVERNOR_SH,
@@ -1156,7 +1177,7 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
           '--base-ref',
           baseSha,
           '--files',
-          'packages/commercial/src/billing/modelPublicProjection.ts',
+          'packages/commercial/src/billing/ledgerRowContext.ts',
         ],
         env,
       )
@@ -1165,8 +1186,16 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       assert.equal(okNcDoc.classification, 'auto_pass')
       assert.equal(okNcDoc.autoApprovedNonCoreBilling, true)
 
-      // 2b. BLOCKER 1 + R2 #1: pricing sources & journal writers MUST be blocked (even if candidate tampers its own arch/a0-protected-paths.json)!
+      // 2b. BLOCKER 1 + R2 #1 + Steward Blocker 2: pricing, authzModels (canUseModel bypass), projection, & journal writers MUST be blocked!
       git('checkout', '-q', baseSha)
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/authzModels.ts'),
+        'export async function canUseModel(): Promise<boolean> {\n  return true\n}\n',
+      )
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/modelPublicProjection.ts'),
+        'export function formatPublicProjection(x: number): string {\n  return `free:${x}`\n}\n',
+      )
       writeFileSync(
         path.join(repoDir, 'packages/commercial/src/billing/remoteDriverTurnBilling.ts'),
         'export const WAIVE_ZERO_OUTPUT = false\n',
@@ -1189,6 +1218,8 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
         JSON.stringify({
           schemaVersion: 1,
           billingNonCoreAllowlist: [
+            'packages/commercial/src/billing/authzModels.ts',
+            'packages/commercial/src/billing/modelPublicProjection.ts',
             'packages/commercial/src/billing/remoteDriverTurnBilling.ts',
             'packages/commercial/src/billing/remoteDriverReceiptV5.ts',
             'packages/commercial/src/billing/codexServiceTierPricing.ts',
@@ -1196,9 +1227,11 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
         }),
       )
       git('add', '.')
-      git('commit', '-qam', 'feat(v5): change waiver, journal writer & tier multiplier source with candidate policy tamper')
+      git('commit', '-qam', 'feat(v5): change authz, projection, waiver, journal writer & tier multiplier source with candidate policy tamper')
       const b1RuntimeSha = git('rev-parse', 'HEAD')
       for (const b1File of [
+        'packages/commercial/src/billing/authzModels.ts',
+        'packages/commercial/src/billing/modelPublicProjection.ts',
         'packages/commercial/src/billing/remoteDriverTurnBilling.ts',
         'packages/commercial/src/billing/remoteDriverReceiptV5.ts',
         'packages/commercial/src/billing/codexServiceTierPricing.ts',
@@ -1921,7 +1954,7 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
         execFileSync('git', ['-C', repoDir, ...args], { env: gitEnv, encoding: 'utf8' }).trim()
       git('init', '-q', '-b', 'feat/v5-selfhost')
       writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/ledger.ts'), 'export function tag(x: number): string { return String(x) }\n')
-      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/modelPublicProjection.ts'), 'export const P = 1\n')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/ledgerRowContext.ts'), 'export const P = 1\n')
       writeFileSync(path.join(repoDir, 'README.md'), 'root\n')
       git('add', '.')
       git('commit', '-qm', 'chore(v5): root commit')
@@ -2099,7 +2132,7 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
           '--branch',
           'feat/v5-selfhost',
           '--files',
-          'packages/commercial/src/billing/modelPublicProjection.ts',
+          'packages/commercial/src/billing/ledgerRowContext.ts',
           '--reason',
           'Bound voucher for childSha noncore check',
         ],
@@ -2119,7 +2152,7 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
           '--voucher',
           JSON.parse(ncVoucher.stdout).id,
           '--files',
-          'packages/commercial/src/billing/modelPublicProjection.ts',
+          'packages/commercial/src/billing/ledgerRowContext.ts',
         ],
         env,
       )

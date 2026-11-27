@@ -469,14 +469,72 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       'deploy/v5/feature-flags-registry.json',
       JSON.stringify({ schema: 1, flags: [{ name: 'OC_TEMP', permanent: true, expireAt: '2027-01-15' }] }),
     )
-    write('.github/workflows/v5-selfhost-gates.yml', 'name: updated\n')
+    write('.github/workflows/v5-integ-nightly.yml', 'name: updated\n')
+    write('scripts/check-docs-links.ts', 'console.log("ok")\n')
+    write('scripts/deploy-v5-selfhost.sh', '#!/usr/bin/env bash\necho ok\n')
     write('biome.json', '{}\n')
     write('changelog.json', '[]\n')
-    commit('chore: internal engineering baselines, workflows, and non-meta gates')
+    commit('chore: internal engineering baselines, nightly workflow, deploy script, and internal gates')
     const res = checkInProcess()
     assert.equal(res.ok, true, `non-UX/billing internal surfaces MUST auto-pass: ${JSON.stringify(res.a0Blocks)}`)
     assert.equal(res.a0Blocks.length, 0)
     assert.ok(res.a1Passes.some((p) => p.rule === 'A1-AUTO-NON-UX-BILLING'))
+  })
+
+  test('A0 hard-block (steward boundaryIntegrity): neutering UX guard executors, cross-family steward verifier, enforcement workflows, or authzModels.ts MUST hard-block A0', () => {
+    // 1. Weakening/neutering UX guard executors, Steward verification chain, or CI enforcement workflows -> A0 block
+    const guardedExecutors = [
+      { path: 'scripts/check-ui-hard-gates.ts', expectedCat: 'ux-regression-guards', content: 'process.exit(0)\n' },
+      { path: 'scripts/check-monotonic-baselines.ts', expectedCat: 'ux-regression-guards', content: 'process.exit(0)\n' },
+      { path: 'scripts/check-incident-ledger-superset.ts', expectedCat: 'ux-regression-guards', content: 'process.exit(0)\n' },
+      { path: 'scripts/check-context-static.ts', expectedCat: 'ux-regression-guards', content: 'process.exit(0)\n' },
+      { path: 'scripts/check-cross-family-audit.ts', expectedCat: 'a0-meta-referee', content: 'process.exit(0)\n' },
+      { path: 'scripts/lib/archStewardReceipt.ts', expectedCat: 'a0-meta-referee', content: 'export const verifyArchStewardReceipt = () => ({ ok: true })\n' },
+      { path: '.github/workflows/v5-selfhost-gates.yml', expectedCat: 'a0-meta-referee', content: 'name: bypassed\n' },
+      { path: '.github/workflows/v5-selfhost-release-gates.yml', expectedCat: 'a0-meta-referee', content: 'name: bypassed\n' },
+      { path: '.github/workflows/v5-selfhost-web-react.yml', expectedCat: 'a0-meta-referee', content: 'name: bypassed\n' },
+    ]
+    for (const item of guardedExecutors) {
+      git('reset', '--hard', 'base')
+      write(item.path, item.content)
+      commit(`bad: neuter ${item.path}`)
+      const r = checkInProcess()
+      assert.equal(r.ok, false, `neutering ${item.path} MUST hard-block A0`)
+      assert.ok(
+        r.a0Blocks.some((b) => b.path === item.path && b.category === item.expectedCat),
+        `expected ${item.path} under ${item.expectedCat}, got ${JSON.stringify(r.a0Blocks)}`,
+      )
+    }
+
+    // 2. Bypassing model authorization in authzModels.ts (canUseModel -> return true) or editing modelPublicProjection.ts MUST hard-block A0 (billing_change)
+    git('reset', '--hard', 'base')
+    write('packages/commercial/src/billing/authzModels.ts', 'export async function canUseModel(): Promise<boolean> { return false }\n')
+    write('packages/commercial/src/billing/modelPublicProjection.ts', 'export function projectPublicModels(): string[] { return [] }\n')
+    const seededAuthzBase = commit('chore: seed authzModels & modelPublicProjection')
+
+    write('packages/commercial/src/billing/authzModels.ts', 'export async function canUseModel(): Promise<boolean> { return true }\n')
+    const bypassSha = commit('bad: bypass canUseModel plan/grant check')
+    const rBypass = runCheckA0Monotonic({ root: repo, base: seededAuthzBase, head: bypassSha, approvalDir, requireRootOwner: false })
+    assert.equal(rBypass.ok, false, 'runtime bypass in authzModels.ts MUST hard-block A0')
+    assert.equal(rBypass.a0Blocks[0]?.category, 'billing-accounting-core')
+    assert.equal(rBypass.a0Blocks[0]?.riskCategory, 'billing_change')
+
+    git('reset', '--hard', seededAuthzBase)
+    write('packages/commercial/src/billing/modelPublicProjection.ts', 'export function projectPublicModels(): string[] { return ["free"] }\n')
+    const projSha = commit('bad: alter modelPublicProjection pricing/auth semantics')
+    const rProj = runCheckA0Monotonic({ root: repo, base: seededAuthzBase, head: projSha, approvalDir, requireRootOwner: false })
+    assert.equal(rProj.ok, false, 'runtime edit in modelPublicProjection.ts MUST hard-block A0')
+    assert.equal(rProj.a0Blocks[0]?.riskCategory, 'billing_change')
+
+    // 3. Pure comment/type edit in authzModels.ts and read-only report helper usageReport.ts still auto-pass A1
+    git('reset', '--hard', seededAuthzBase)
+    write('packages/commercial/src/billing/authzModels.ts', '// doc comment\nexport type CanUseNote = string\nexport async function canUseModel(): Promise<boolean> { return false }\n')
+    write('packages/commercial/src/billing/usageReport.ts', 'export const REPORT_TITLE = "usage"\n')
+    const cleanSha = commit('refactor: zero-runtime authz comment + read-only usage report')
+    const rClean = runCheckA0Monotonic({ root: repo, base: seededAuthzBase, head: cleanSha, approvalDir, requireRootOwner: false })
+    assert.equal(rClean.ok, true, `expected auto-pass, got ${JSON.stringify(rClean.a0Blocks)}`)
+    assert.ok(rClean.a1Passes.some((p) => p.path === 'packages/commercial/src/billing/authzModels.ts' && p.rule === 'A1-BILLING-NO-RUNTIME-DIFF'))
+    assert.ok(rClean.a1Passes.some((p) => p.path === 'packages/commercial/src/billing/usageReport.ts' && p.rule === 'A1-BILLING-NONCORE-HELPER'))
   })
 
   test('A0 hard-block (ux_degradation): raising UX budgets, context-eval, UI static/layout baselines, or adding design-tokens exemptions fails with riskCategory=ux_degradation', () => {
