@@ -111,6 +111,7 @@ import { GROK_RELAY_PREFIX, makeGrokRelayHandler } from "../http/internalGrokRel
 import { ZCODE_RELAY_PREFIX, makeZcodeRelayHandler } from "../http/internalZcodeRelay.js";
 import { configureZcodeRelayKv, createIoredisZcodeRelayKv } from "../billing/zcodeRouteContext.js";
 import { ANTIGRAVITY_RELAY_PREFIX, makeAntigravityRelayHandler } from "../http/internalAntigravityRelay.js";
+import { antigravityRelayConcurrencyFromConfig } from "../http/antigravityRouteRuntime.js";
 import { configureAntigravityRouteStores } from "../http/antigravityRouteRuntime.js";
 import {
   buildCodexRelayHandler,
@@ -141,7 +142,7 @@ const log = rootLogger.child({ subsys: "egressMain" });
 const EGRESS_DRAIN_MS = Number(process.env.EGRESS_DRAIN_MS ?? 30 * 60_000);
 
 export async function startEgress(): Promise<void> {
-  configureModelAvailability(assertFlavorIdentity());
+  const flavorIdentity = assertFlavorIdentity(); configureModelAvailability(flavorIdentity);
   process.env.OC_EGRESS_PROCESS = "1";
   // D3④:进程实例标识 —— 优先 systemd invocation id(每次 (re)start 变化),否则随机
   // UUID。finalize 门槛用它区分"队列自然排空"与"egress 中途重启计数归零假绿"。
@@ -678,6 +679,7 @@ export async function startEgress(): Promise<void> {
     logger: log,
     clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
     pricing,
+    ...antigravityRelayConcurrencyFromConfig(cfg, { flavorIdentity }),
     appendCostCredits: (
       requestId,
       rawUserId,

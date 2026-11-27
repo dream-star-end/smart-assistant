@@ -16,14 +16,15 @@
   - `L2` 持久化与配置权威：`packages/commercial/src/db/`、`packages/storage/src/`、配置注册表
   - `L3–L5` 领域服务、计费权威、协议通道、引擎适配与路由组装
   - `L6` 进程入口与装配层
-- **前端细化分层（F0 → F5，`packages/web-react/src/`）**：
-  - `F0 web-primitives`：`components/ui/` + `styles.css` Token（零业务依赖）
-  - `F1 web-lib`：`lib/`（排除 `lib/chat/`；唯一允许直接 `fetch` 的前端域）
-  - `F2 web-state`：`lib/chat/` + Swarm/Workbench 状态机（禁反向依赖 `F4`）
+- **前端细化分层（F0 → F5，`packages/web-react/src/`，已全量落地进 `arch/modules.json`）**：
+  - `F0 web-primitives`：`components/ui/` + `lib/utils.ts` + `lib/ui/` + `styles.css` Token（零业务依赖）
+  - `F1 web-lib`：`lib/`（排除 `lib/chat/` 与 `lib/timeline/`；唯一允许直接 `fetch` 的前端域）
+  - `F2 web-state`：`lib/chat/`、`lib/timeline/` 与持久化/状态机（禁反向依赖 `F4`）
   - `F3 web-hooks`：`hooks/`（仅可依赖 `F0/F1/F2`，严禁反向依赖 `F4` 组件）
-  - `F4 web-domains`：10 个平行业务域（`chat | sidebar | workbench | swarm | sites | settings | manage | admin | iui | studio`），跨域仅经 `F2` 事件/状态或公开入口
-  - `F5 web-app`：`App.tsx` / `appLazyViews.tsx` / `admin/` 壳层装配，禁堆砌业务逻辑
-- **跨包导入硬规**：全仓严禁跨包相对路径导入，一律使用 `@openclaude/<pkg>`；变更 `gateway`/`protocol`/`storage`/`cli` 后必须跑 `node packages/cli/scripts/build-container-gateway.mjs`。
+  - `F4 web-domains`：10 个严格平行业务域（`web-domain-chat | sidebar | workbench | swarm | sites | settings | manage | admin | iui | studio`，零新增 `allow` 边），跨域仅经 `F2` 事件/状态或公开入口
+  - `F5 web-app`：`App.tsx` / `AppDialogs.tsx` / `appLazyViews.tsx` / `admin/{main,AdminApp,AdminShell}.tsx` 壳层装配，禁堆砌业务逻辑
+- **文件级循环禁令与模块内子域边界**：`scripts/check-architecture.ts --enforce` 叠加 Tarjan SCC 全库文件级值导入环检测（`R2-file-cycle`，基线冻结于 `arch/file-cycles-baseline.json`，支持大型 SCC 严格子集拆分消债，新增环即红）以及 5 大后端模块（`interface-ws` / `platform-pg` / `gateway-core` / `gateway-runtime` / `interface-http`）内部 `subdomains` 边界检查（`R2-intramodule-boundary`，基线冻结于 `arch/subdomain-violations-baseline.json`）。
+- **跨包导入与共享工具硬规**：全仓严禁跨包相对路径导入，一律使用 `@openclaude/<pkg>`；跨包通用纯工具（`sha256Hex` / `asRecord` / `isRecord` / `errMsg` / `sleep` / `atomicWriteJson` / `readBoundedJson` / `sendJson`）统一沉淀于 `packages/kernel/src/sharedUtils.ts`；变更 `gateway`/`protocol`/`storage`/`cli` 后必须跑 `node packages/cli/scripts/build-container-gateway.mjs`。
 
 ### 1.2 三套环境红线与容器持久化
 
@@ -43,7 +44,7 @@
 ### 2.1 强模型主权（第一红线）与跨家族审计
 
 - **禁黑盒弱模型暗降**：主对话、`/btw` 快问、Cron 定时任务、`ai_review` 预审必须保持显式选定的强模型，严禁任何后台回退分支静默降级至弱模型；轻量模型仅限显式隔离的无决策杂务（标题/索引）或用户手动显式指定（由 `scripts/check-no-silent-model-downgrade.ts` / `npm run check:no-weak-downgrade` 拦截）。
-- **主开发自写 + 跨家族 T2 审计**：主战模型在共享卷 worktree 亲自写码；T2 审计强制跨家族（GPT 家族开发 → Gemini 家族审；其余默认 GPT 家族审），派审必传精确模型 slug 并核对 `usage_log` 实跑型号（本地/派审可用 `npm run check:cross-family-audit` 即 `scripts/check-cross-family-audit.ts` 机械校验，自测已入 PR CI）。
+- **主开发自写 + 跨家族架构看护员（Architecture Steward）硬门**：主战模型在共享卷 worktree 亲自写码；当改动命中 `scripts/lib/archStewardContract.ts` 6 条确定性结构风险触发器之一（Top-20 `arch/append-magnets.json` 追加磁铁非净减行修改、净增生产代码 `>400` 行、跨 `>=2` 个架构模块、函数超 `100` 行或 `CC_direct > 20`、触碰门禁耦合、12 行克隆/T2 核心路径）时，PR CI（`--enforce-pr` 绑定真实 `pull_request.head.sha`）、push CI 与发布列车（`--enforce-commit`）强制校验绑定精确 40 位 `headSha` 的跨家族看护员只读回执（宿主 root 只读 `/opt/openclaude/harness-gate/steward-receipts/<sha>.json` 或提交外 GitHub Commit Status `oc-v5/arch-steward`，生产 schema `oc.v5.arch-steward-receipt/1`），同家族自审、弱模型、旧 SHA 重放、篡改摘要、`--dry-run` 预演回执（独立非生产 schema `oc.v5.arch-steward-dry-run/1`）、仓内未签名文件或 `veto` 不可绕过硬拒；0/6 触发的常规低风险改动秒级零开销放行。开发者可用 `scripts/arch-steward-review.sh --author-model <slug> --publish-github-status` 跑真实四维看护员审查并签发回执。
 - **团队模式「一开关两策略」**：*审议（deliberation）* 走多家族并行 panel + 五段对比（共识/矛盾/部分覆盖/独有洞见/盲点）；*执行（execution）* 走领域拆分 + 逐条核对 runId/状态/产物路径，严禁把失败/超时成员包装成功，超长证据显式标截断。
 - **顾问与只读角色执行端硬禁写**：`advisor`、`auditor`、`verifier` 与只读诊断的无写/无执行/无 `skill_save`/无嵌套委派必须在执行端工具白名单物理拦截（`packages/protocol/src/advisorNoWrite.ts`、`packages/gateway/src/actionPolicyEngine.ts`、`packages/protocol/src/actionPolicy.ts`），绝不只靠 prompt 声明；无法证明工具限制生效的引擎禁止开放为顾问。
 
@@ -86,7 +87,14 @@
 - **业务不变量优先**：每条测试必须对应真实用户可见业务不变量，走真实入口验证终态（审批核真实 permission response，计费核双池 ledger 收敛，崩溃恢复由新子进程仅靠持久态完成，UI 核真 React + 真 CSS + 真实量级数据）；**禁止**以 mock called、静态 HTML 替身或源码正则冒充功能验收。
 - **有效红绿负控**：测试对旧缺陷/关闭防线必须真红，对候选修复真绿；导入失败、全 skip、过滤后 0 用例执行均视为无效。
 - **严格证据分层口径**：`推送 ≠ 过测 ≠ 独审 PASS ≠ 合入 ≠ 上线 ≠ 容器生效`；「重启后消失」不是根治修复。报告必须含场景、expected/actual、SHA、run/fail/skip 计数与 exit code。
-- **确定性防假绿硬门**：`npm run check:v5:regression-contracts`（SHA-256 锁定 + 负例变异证明）、`npm run check:test-retries`（封堵静默 retry）、`npm run lint:integ-tiers`（集成测试梯队全登记）、OCV5-343 `npm run test:web-react` 100% 全绿（P2 计划补齐核心状态机 `fast-check` 属性测试与 Nightly 增量 `Stryker` 变异抽检）。
+- **确定性防假绿与结构质量硬门**：
+  - 防假绿与属性/变异测试：`npm run check:v5:regression-contracts`（SHA-256 锁定 + 负例变异证明）、`npm run check:test-retries`（封堵静默 retry）、`npm run lint:integ-tiers`（集成测试梯队全登记）、轻量确定性状态机属性测试引擎 `packages/kernel/src/testing/propertyCheck.ts` 驱动 4 条高爆破半径核心状态机属性测试（计费守恒、多租户隔离、Turn/Lease 收敛、Journal/Tape 恢复，PR 默认 200 runs / Nightly `PBT_RUNS=2000`），以及周度增量变异抽检 `scripts/check-mutation-weekly.ts`（`npm run check:mutation:weekly`）；
+  - 零松弛止血与结构质量棘轮：
+    - `scripts/check-file-size-ratchet.ts`（`npm run check:file-size`）：红/黄/橙三区 `slack=0`，新生产 `.ts/.tsx` 硬限 `<=800` 行，既有 801–1,999 行冻结零净增，禁止豁免续期；
+    - `scripts/check-ai-smells-ratchet.ts --enforce`（`npm run check:ai-smells`）：TS AST 拦截 4 项 AI 坏味（空 `catch`、`as any`/`as unknown as`、同步 I/O、lint 静默抑制）零净增（基线 `arch/ai-smells-baseline.json`）；
+    - `scripts/check-complexity-ratchet.ts --enforce`（`npm run check:complexity`）：函数级 `(100 行, CC_direct<=20, 嵌套<=5)` 棘轮（基线 `arch/complexity-baseline.json`）；
+    - `scripts/check-clones-ratchet.ts --enforce`（`npm run check:clones`）：12 逻辑行跨文件克隆零净增（基线 `arch/clones-baseline.json`）；
+    - `scripts/check-security-sast.ts --enforce`（`npm run check:security-sast`）：确定性密钥泄漏零容忍 + SQL 拼接 / Shell 注入 / 无界循环串行 await 棘轮（基线 `arch/security-sast-baseline.json`），叠加周度 `.github/workflows/v5-selfhost-security-weekly.yml`（gitleaks + 死码清单 `scripts/check-dead-code-weekly.ts` + `npm audit`）。
 
 ---
 
@@ -132,28 +140,26 @@
 
 任何仅靠提示词劝阻“不要放宽门禁/不要改基线”的约束都会被突破，因此建立五重机械防线：
 
-### 6.1 防线 1：A / B 分类治理（`.github/CODEOWNERS` + Rulesets + Auto-Merge）
+### 6.1 防线 1：A0 / A1 / Class B 单调分层（`arch/a0-protected-paths.json` + `.github/CODEOWNERS`）
 
-- **A 类（静态锁进 `.github/CODEOWNERS`，强制 `@dream-star-end` 人工审签）**：
-  - CI 与规则基础设施：`.github/CODEOWNERS`、`.github/workflows/`、`.github/scripts/`、`.github/known-failures/`、`.github/integ-tiers/`、`.github/file-size-ratchet-exceptions.json`、`biome.json`、`arch/modules.json`
-  - 前端预算/豁免/核心门：`packages/web-react/vite.config.ts`、`packages/web-react/budgets.json`、`packages/web-react/design-tokens-exempt.json`、`packages/web-react/src/test/designTokens.test.ts`、`packages/web-react/browser-tests/layout-invariants.mjs`、`packages/web-react/browser-tests/vlm-rubric/`、`packages/web-react/tutorial-sync-history-head.json`
-  - 校验与发布脚本：`scripts/check-*.ts`、`scripts/check-*.sh`、`scripts/v5-selfhost-migration-*.sh`、`scripts/v5-selfhost-master-release-lib.sh`、`scripts/deploy-v5-selfhost.sh`、`packages/commercial/scripts/lint-agent-containers-sql.ts`、`deploy/v5/selfhost-release-gates.json`
-  - 冻结锚点、契约、权限核心与公告：`e2e/session-display/incident-ledger-baseline.json`、`e2e/session-display/incident-ledger-baseline.sha256`、`e2e/session-display/incident-tombstones.json`、`e2e/session-display/incident-tombstone-approvers.json`、`packages/commercial/src/flavor/flavor-rules.json`、`packages/protocol/src/advisorNoWrite.ts`、`packages/protocol/src/httpContracts.ts`、`packages/protocol/rest-contract-snapshot.json`、`packages/gateway/src/actionPolicyEngine.ts`、`changelog.json`
-- **B 类（刻意不进 `CODEOWNERS`，支持 Agent 自主清债/追加，由 A 类 Checker + `--base` 机械守单调）**：
-  - `arch/violations-baseline.json`（`scripts/check-architecture.ts --enforce --base` 守只降不升）
-  - `arch/gate-couplings.json`（`scripts/check-gate-couplings.ts --check` 守路径全覆盖）
-  - `.github/file-size-baseline.json`（`scripts/check-file-size-ratchet.ts --base` 守只降不升，含 `.css` 与 2,000–3,000 行黄区冻结）
-  - `packages/web-react/design-tokens-counts.json`、`packages/web-react/ui-static-baseline.json`、`packages/web-react/layout-invariants-baseline.json`、`deploy/v5/feature-flags-registry.json`（`scripts/check-monotonic-baselines.ts --base` 守计数不升、禁增新键、TTL 不延后、不得私标 `permanent: true`）
-  - `e2e/session-display/incidents.json`（`scripts/check-incident-ledger-superset.ts` 守超集只增不减）
-  - `e2e/session-display/regression-contract-locks.json`（`scripts/check-v5-regression-contracts.ts --prove` 守旧契约哈希不可变）
-- **无摩擦双轨**：未触碰 A 类文件的 T0/T1/T2 PR 在 CI 全绿后经 Auto-Merge 秒级自动合入；凡触碰任意 A 类文件必须人类审批；宿主机发布列车纵深复用受保护基线与门禁脚本，阻断未审 A 类变更。
+为同时实现「元护栏零被篡改」与「常规加门/清债/升级免人工瓶颈」，将原 A 类拆分为 **A0（真元层）** 与 **A1（机械单调自证层）**，由 `scripts/check-a0-monotonic.ts`（`npm run check:a0-monotonic`）在 PR CI 与发布列车硬裁决：
 
-### 6.2 防线 2–5：单调校验、封堵逃生口、双轨复验与 L4 硬隔离
+- **A0（静态锁进 `.github/CODEOWNERS` 与 `arch/a0-protected-paths.json`，强制 `@dream-star-end` 对精确 `prHeadSha` 的 PR `APPROVED` 审签、或提交外 GitHub Commit Status `oc-v5/a0-approval`、或宿主 root `oc-governor approve-a0` 签发的 `a0-approval-v1` / HMAC 回执）**：
+  - 10 类真元层：A0 裁判自身（`scripts/check-a0-monotonic.ts`、`scripts/lib/a0MonotonicRules.ts`、`scripts/lib/a0ApprovalReceipt.ts`、`scripts/lib/githubTrustedApproval.ts`、`arch/a0-protected-paths.json`、`.github/CODEOWNERS`）；核心单调与棘轮检查器及其支撑库；CI Workflows 与发布门清单（`.github/workflows/`、`.github/scripts/`、`deploy/v5/selfhost-release-gates.json`、`biome.json`）；宿主控制面、发布编排与列车护栏（`scripts/harness-gate/`、`scripts/deploy-v5-selfhost.sh`、`scripts/v5-selfhost-master-release-lib.sh`、`scripts/v5-selfhost-migration-*.sh`、`scripts/v5-lease-worker.sh`、`scripts/lib/v5-lease-train-debounce.sh`、`scripts/lib/v5-selfhost-*.sh`）；事故账本冻结锚点；计费核心 7 文件；权限与契约核；豁免续期与 known-failures；`changelog.json`；以及删改任何既有门禁脚本（对 git `R` 重命名两端均按删除与新增分类校验）。
+- **A1（不锁进 `CODEOWNERS`，由 `scripts/check-a0-monotonic.ts` 机械校验后自动放行）**：
+  - 声明式镜像/CLI 版本 pin：`deploy/v5/runtime-image-pin.json`（强校验 schema + 禁 `:latest` 与非法镜像源，彻底替代直接改 `deploy-v5-selfhost.sh`；正向列车严格按 `git show <target_sha>:deploy/v5/runtime-image-pin.json` 绑定目标 commit，`--rollback` 优先读历史 release 元数据与脏工作树隔离）；
+  - 新增门禁脚本（status `A` 的 `scripts/check-*.ts` / `scripts/check-*.sh`）；
+  - 不新增 `allow` 边、不新增 `authorities`、不抬高 `layer`、不扩宽 `scope` 的 `arch/modules.json` 模块拆分与子域细化；
+  - 单调收紧 `packages/web-react/budgets.json`、`.github/context-eval-baseline.json` 与 `packages/web-react/design-tokens-exempt.json` 删减。
+- **Class B（单调只降不升债表，不进 `CODEOWNERS`，由 `scripts/check-monotonic-baselines.ts --base` + 各棘轮门机械防抬升）**：
+  - `.github/file-size-baseline.json`（三区 `slack=0`）、`arch/violations-baseline.json`、`arch/file-cycles-baseline.json`、`arch/subdomain-violations-baseline.json`、`arch/ai-smells-baseline.json`、`arch/complexity-baseline.json`、`arch/clones-baseline.json`、`arch/security-sast-baseline.json`、`arch/gate-couplings.json`、`packages/web-react/design-tokens-counts.json`、`packages/web-react/ui-static-baseline.json`、`packages/web-react/layout-invariants-baseline.json`、`deploy/v5/feature-flags-registry.json`（`--fail-on-expired`）、`e2e/session-display/incidents.json`、`e2e/session-display/regression-contract-locks.json`。
 
-2. **防线 2（`--base` 单调校验）**：CI 统一相对受保护分支 `origin/feat/v5-selfhost` 执行 `check-architecture.ts`、`check-file-size-ratchet.ts`、`check-v5-regression-contracts.ts` 与 `check-monotonic-baselines.ts`，清债降数绿灯、抬升基线硬阻断。
-3. **防线 3（封堵逃生环境变量）**：常规 `.github/workflows/v5-selfhost-gates.yml` 与发车脚本显式强制执行开关（如 `OC_TEST_RETRY_ENFORCE="1"`、`OC_PG_MIGRATION_BOSS_APPROVED="0"`），拒绝外部跳过变量；`scripts/check-changelog-guard.ts` 机械阻断 AI 修改 `changelog.json`。
-4. **防线 4（双轨独立执行与回执）**：本地快门仅用于 Shift-Left 提速，绝不替代洁净 GitHub Actions Runner 与宿主 Staging 列车复验（`.github/workflows/v5-selfhost-gate-receipts.yml`）。
-5. **防线 5（L4 元层与执行端硬隔离）**：只读/顾问在执行层物理移除写工具；宿主机门禁只读隔离；自进化一周内回滚 **≥ 2 次**自动熔断全部自动合入待人解锁；定期开展后台 GC 微 PR（清债/文档保鲜/过期 Flag）与季度 Model-Aware Harness Pruning（随强模型进步主动裁剪冗余脚手架）。
+### 6.2 防线 2–5：宿主物理外置裁判、宿主 4 总闸、债务 TTL 与自治园艺闭环
+
+2. **防线 2（`--base` 单调校验 + 债务 TTL 衰减）**：CI 与列车相对 `origin/feat/v5-selfhost` 执行 `check-architecture.ts`、`check-file-size-ratchet.ts`、`check-monotonic-baselines.ts`（纳管全部 11 份基线/预算/Flag 表）、`check-a0-monotonic.ts` 及 `check-debt-ttl.ts --enforce --base <base> --head <head>`（`arch/debt-ttl-policy.json`：月度违规/R2/大文件衰减棘轮；`emergency_stop` 恒阻断；`debt_first` 仅拦截 `feat(...)` 与非法前缀，放行预算达标或净清债的 `bug/fix/refactor/...` 修复提交）。
+3. **防线 3（宿主机物理外置隔离裁判 + 共同正向切流护栏 + 封堵逃生口）**：发布列车在 `scripts/lib/v5-selfhost-governance-gates.sh` 强制从宿主 root 只读外置裁判 `/opt/openclaude/harness-gate/referee`（由 `scripts/harness-gate/sync-referee.sh` 同步；元层/schema 首滚须经 `sync-referee.sh --stage-audited` 预装绑定精确 `targetSha` 与 A0 审签的 `TRANSITION_APPROVAL.json` + `MANIFEST.json`，严禁旧门失败回落候选）执行完全隔离的裁判视图（解释器 `tsx`/`biome` 与依赖 100% 来自可信裁判环境，候选仅作为显式只读 `--root "$staging"` 数据根传入并断言 `gatewayFiles > 0`）；`scripts/lib/v5-selfhost-train-guards.sh` 在 `cmd_deploy` 与独立正向 `cmd_cutover` 持锁改 live 前共同强制执行 Governor `mode.json`、物理调用 `oc-governor check-blast-radius`、校验目标 SHA 可信事件（`push`/`pull_request`/`merge_group`，拒 `workflow_dispatch`）的 3 条必需 CI workflow（`V5 selfhost gates`、`V5 selfhost release gates`、`V5 selfhost commercial`）全绿及 retention runner 预检；切流后在持久化 `verifying` 态先验 `/healthz` 与保留集全绿才 `committed` 结算，失败立即官方 `--rollback` 并将原 train 原子落定为 `failed`（回滚失败则进入 `recovery_required` 暂停正向切流）；`scripts/lib/v5-lease-train-debounce.sh` 对当前远端 tip 做 `success`/`pending`/`failed` 三态分类（`pending` 保持 `registered` 不误标失败）并在 SQLite 事务内 CAS 快进。
+4. **防线 4（双轨独立执行、回执与自治园艺清债）**：本地快门仅用于 Shift-Left 提速，绝不替代 GitHub Actions Runner 与宿主外置裁判复验（`.github/workflows/v5-selfhost-gate-receipts.yml`）。园艺闭环由 `scripts/gardening/arch-health-snapshot.ts`、`scripts/gardening/verify-micro-pr-bounds.ts`（硬限 `netLoc<=300`、`<=5` 文件、必净降基线）、`scripts/gardening/run-gardening-dispatch.ts`（单条 14d 隔离冷却）与 `scripts/check-cron-liveness.ts`（监控启用 Cron 停跑 >2×周期）驱动，配合 `packages/commercial/src/observability/archTelemetry.ts` 运行时遥测与 `scripts/v5-governance-cockpit-digest.ts` 周度 4 信号高管驾驶舱。
+5. **防线 5（宿主物理 4 总闸控制面 `scripts/harness-gate/oc-governor.sh`）**：通过 `sudo bash scripts/harness-gate/install-host-control-plane.sh --sync-referee` 安装到 `/opt/openclaude/harness-gate/`（root 属主，容器不可写）：① **总闸 1（运行模式）**：`oc-governor mode [autonomous|debt_first|emergency_stop]`；② **总闸 2（A0 签批）**：`oc-governor approve-a0 --sha <40hex> [--publish-github-status]` 签发 `a0-approval-v1`（含 `allowedPaths` 与可选 `0600` `.hmac-key` HMAC-SHA256，与 TS 验签字节等价）；③ **总闸 3（爆破半径硬拒）**：`oc-governor check-blast-radius` 接入共同正向切流护栏，物理拒绝商业分支与无凭证破坏性 DDL/计费核心变更；④ **总闸 4（回滚与成本熔断）**：7d 生产回滚 ≥2 次自动切 `debt_first` 并生成 5 行 `control/breaker-card.md` 待人工 `unlock-breaker`。
 
 ---
 
@@ -177,13 +183,26 @@
 # 一键全量秒级治理快门（<15s，覆盖文档死链/UI硬门/强模型红线/路由三同步/changelog/Flag TTL/REST契约/调度/SQL/重试/梯队/选择器）
 npm run check:governance:fast
 
-# 架构边界、门禁耦合、文件棘轮、跨基线单调校验、PG 迁移安全与跨家族审计
+# 架构边界、门禁耦合、文件棘轮、跨基线单调校验、A0 裁判、质量棘轮与跨家族看护员
 npx tsx scripts/check-architecture.ts --enforce
 npx tsx scripts/check-gate-couplings.ts --check
-npx tsx scripts/check-file-size-ratchet.ts
+npm run check:file-size
 npm run check:monotonic-baselines
+npm run check:a0-monotonic
+npm run check:ai-smells
+npm run check:complexity
+npm run check:clones
+npm run check:security-sast
+npm run check:debt-ttl
 npm run check:pg-migration-safety -- --base origin/feat/v5-selfhost
-npm run check:cross-family-audit -- --dev-model <dev> --audit-model <audit>
+scripts/arch-steward-review.sh --author-model <dev-model>
+
+# 园艺健康、Cron 存活、周度变异抽检、4 信号高管驾驶舱与本地 pre-push 钩子
+npm run check:cron-liveness
+npm run check:dead-code
+npm run check:mutation:weekly
+npm run check:cockpit-digest
+git config core.hooksPath .githooks
 
 # 发布门与 CI 双向守恒
 npx tsx scripts/check-release-gate-parity.ts

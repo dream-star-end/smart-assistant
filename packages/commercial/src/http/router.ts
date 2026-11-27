@@ -126,6 +126,7 @@ import {
   handleAdminBoxClaudeProfilesSelect,
 } from './admin/boxClaudeProfiles.js'
 import { handleAdminPoolKeyCreate, handleAdminPoolKeyPatch, handleAdminPoolsList } from './admin/pools.js'
+import { handleAdminModelPoolBindingPut, handleAdminModelPoolBindingsList, handleAdminModelPoolBindingsSync, setVerifiedAdminForRequest } from './admin/modelPoolBindings.js'
 import {
   handleAdminRemotePoolBindingRevoke,
   handleAdminRemotePoolGet,
@@ -1374,6 +1375,9 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/admin/pools', handler: handleAdminPoolsList },
     { method: 'POST', path: '/api/admin/pools/keys', handler: handleAdminPoolKeyCreate },
     { method: 'PATCH', pathPrefix: '/api/admin/pools/keys/', handler: handleAdminPoolKeyPatch },
+    { method: 'GET', path: '/api/admin/pools/model-bindings', handler: handleAdminModelPoolBindingsList },
+    { method: 'POST', path: '/api/admin/pools/model-bindings/sync', handler: handleAdminModelPoolBindingsSync },
+    { method: 'PUT', path: '/api/admin/pools/model-bindings', handler: handleAdminModelPoolBindingPut },
     // OCV5-721 远端底座服务池(节点、Profile 自动探测、勾选模型上架、Binding 撤销 + 预热)。
     { method: 'GET', pathPrefix: '/api/admin/remote-pool/codex-commissioning', handler: handleCodexCommissioning },
     { method: 'POST', pathPrefix: '/api/admin/remote-pool/codex-commissioning', handler: handleCodexCommissioning },
@@ -2454,7 +2458,8 @@ export function createCommercialHandler(
         labelRoute.startsWith('/api/admin/') &&
         !ADMIN_SELF_AUTH_ROUTES.has(`${route?.method ?? method} ${labelRoute}`)
       ) {
-        await requireAdminVerifyDb(req, deps.jwtSecret)
+        const verifiedAdmin = await requireAdminVerifyDb(req, deps.jwtSecret)
+        setVerifiedAdminForRequest(req, verifiedAdmin)
       }
       if (!route) {
         // method mismatch:返合并后的 Allow 头(该 path 下所有已定义 method)

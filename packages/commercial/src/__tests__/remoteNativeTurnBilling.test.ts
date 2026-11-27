@@ -237,6 +237,9 @@ class FinancialStore {
       j.state = 'committed'; Reflect.deleteProperty(j.ctx, 'settlementClaimId')
       return this.result([], 1)
     }
+    if (sql.includes('pg_advisory_xact_lock_shared') || sql.includes('FROM system_settings WHERE key = $1')) {
+      return this.result()
+    }
     throw new Error(`unhandled fixture SQL: ${sql}`)
   }
   private ack(tag: string) {
@@ -284,7 +287,20 @@ function fixture(options: {
     },
   }
   const pool = (options.dispatchPool
-    ? { query: store.query.bind(store), connect: options.dispatchPool.connect.bind(options.dispatchPool) }
+    ? {
+        query: store.query.bind(store),
+        connect: async () => {
+          const client = await options.dispatchPool!.connect()
+          const origQuery = client.query.bind(client)
+          return {
+            query: (sql: string, values?: unknown[]) =>
+              typeof sql === 'string' && sql.includes('request_finalize_journal')
+                ? store.query(sql, values)
+                : origQuery(sql, values),
+            release: () => client.release(),
+          }
+        },
+      }
     : store) as unknown as Pool
   const finance = createRemoteNativeTurnFinance({ upstreamModel: UPSTREAM, pool, preCheckRedis: redis,
     catalog: { assertFresh: async () => catalogSnapshot } as unknown as ModelCatalogCache,
@@ -319,7 +335,7 @@ function continuedFixture(first: Parameters<typeof fixture>[0] = {}) {
   }
   const query = async (sql: string, values: unknown[] = []) => {
     queries.push(sql)
-    if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql)) return turns[0].store.result()
+    if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql) || sql.includes('pg_advisory_xact_lock_shared') || sql.includes('FROM system_settings WHERE key = $1')) return turns[0].store.result()
     const f = turns.find((item) => values.includes(item.store.identity.requestId)
       || values.includes(item.store.identity.authorityTurnId))
     assert.ok(f, 'query must address one exact fixture turn')
@@ -728,6 +744,9 @@ test('isolated PG: concurrent first-turn binding locks both rows and admits exac
       await real.query(`CREATE TABLE ${schema}.authority_turn_dispatches (
         authority_turn_id TEXT PRIMARY KEY,user_id BIGINT NOT NULL,dispatch_id UUID NOT NULL,
         canonical_model TEXT NOT NULL,attempt_no INTEGER NOT NULL,session_id TEXT NOT NULL,turn_key TEXT
+      )`)
+      await real.query(`CREATE TABLE ${schema}.system_settings (
+        key TEXT PRIMARY KEY,value JSONB NOT NULL,description TEXT,updated_at TIMESTAMPTZ,updated_by BIGINT
       )`)
       await real.query(`INSERT INTO ${schema}.turn_dispatches
         (dispatch_id,user_id,billing_request_id,agent_container_id,model,attempt_no,session_id,status)

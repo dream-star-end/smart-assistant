@@ -7,14 +7,15 @@
  * `delegateConcurrencyCap` — do not duplicate the numeric literals in server.ts.
  *
  * Defaults are the exported constants. Call-time env overlays:
- *   OPENCLAUDE_DELEGATE_MAX_CONCURRENT        integer ≥1, else 5
+ *   OPENCLAUDE_DELEGATE_MAX_CONCURRENT        integer ≥1, else 6
  *   OPENCLAUDE_DELEGATE_REVIEW_RESERVED_SLOTS integer ≥0, else 1,
  *     clamped to max−1 so ordinary work always keeps ≥1 slot.
  * Non-integers (including 2.9) fall back; they are not floored.
  */
 
-export const DELEGATE_MAX_CONCURRENT_DELEGATIONS = 5
+export const DELEGATE_MAX_CONCURRENT_DELEGATIONS = 6
 export const DELEGATE_REVIEW_RESERVED_SLOTS = 1
+export const DELEGATE_MAX_PER_PARENT_DEFAULT = 4
 
 function parseDelegateEnvInt(name: string, min: number, fallback: number): number {
   const trimmed = process.env[name]?.trim()
@@ -45,12 +46,13 @@ export function getDelegateReviewReservedSlots(): number {
 /**
  * P2 债C/3.5 — 单父会话(队长)并行 fan-out 上限。非 review 委派按父分桶计数,
  * 超上限进排队;review 委派豁免此桶(有独立保留槽)。消"一个队长把全局槽占光"。
- * env OPENCLAUDE_DELEGATE_MAX_PER_PARENT 可配(下限 1,取整,否则 3),调用时读取。
+ * env OPENCLAUDE_DELEGATE_MAX_PER_PARENT 可配(下限 1,取整,否则 DELEGATE_MAX_PER_PARENT_DEFAULT=4,
+ * 与 MAX_FANOUT_TASKS=4 对齐且严格小于非 review 全局上限 5,见 OCV5-895),调用时读取。
  * 原 Gateway.MAX_CONCURRENT_DELEGATIONS_PER_PARENT 静态 getter,原样搬来(OCV5-533)。
  */
 export function getDelegateMaxPerParent(): number {
   const raw = Number(process.env.OPENCLAUDE_DELEGATE_MAX_PER_PARENT)
-  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 3
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : DELEGATE_MAX_PER_PARENT_DEFAULT
 }
 
 export function delegateConcurrencyCap(isReview: boolean): number {

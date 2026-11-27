@@ -116,6 +116,7 @@ describe("grok webSearch handler", () => {
     const token = Buffer.from(TOKEN_BYTES);
     let sentUrl = "";
     let sentAuth = "";
+    let sentClientVersion = "";
     let sentBody = "";
     const h = makeGrokWebSearchHandler({
       identityRepo: okRepo(),
@@ -124,6 +125,7 @@ describe("grok webSearch handler", () => {
       requestFn: async (url, init) => {
         sentUrl = url;
         sentAuth = init.headers.authorization;
+        sentClientVersion = init.headers["x-grok-client-version"] ?? "";
         sentBody = init.body;
         return upstreamOk({
           output: [{
@@ -138,6 +140,7 @@ describe("grok webSearch handler", () => {
     assert.equal(res.statusCode, 200);
     assert.equal(sentUrl, GROK_SEARCH_UPSTREAM);
     assert.equal(sentAuth, "Bearer grok-access-secret");
+    assert.equal(sentClientVersion, "1.0.92");
     assert.match(sentBody, /web_search/);
     assert.match(sentBody, /"effort":"low"/);
     assert.ok(!body().includes("grok-access-secret"));

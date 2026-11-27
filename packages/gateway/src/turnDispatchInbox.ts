@@ -102,6 +102,7 @@ export interface DispatchTurnContext {
 // ---------------------------------------------------------------------------
 
 const dispatchByFrame = new WeakMap<object, DispatchTurnContext>()
+const dispatchReceiptSender = new WeakMap<object, (row: TurnDispatchInboxRow) => void>()
 
 export function attachDispatchContext(frame: object, ctx: DispatchTurnContext): void {
   dispatchByFrame.set(frame, ctx)
@@ -113,6 +114,61 @@ export function getDispatchContext(
 ): DispatchTurnContext | undefined {
   if (!frame || typeof frame !== 'object') return undefined
   return dispatchByFrame.get(frame)
+}
+
+/** Attach a control-plane receipt callback keyed on an opaque turn/dispatch object (WeakMap, never serialized). */
+export function attachDispatchReceiptSender(
+  target: object,
+  send: (row: TurnDispatchInboxRow) => void,
+): void {
+  dispatchReceiptSender.set(target, send)
+}
+
+/** Copy the receipt sender from a verified DispatchTurnContext onto the session's dispatchContext object. */
+export function forwardDispatchReceiptSender(source: object, target: object): void {
+  const send = dispatchReceiptSender.get(source)
+  if (send) dispatchReceiptSender.set(target, send)
+}
+
+/**
+ * Select the bridge WebSocket to deliver a follow-up `running` dispatch receipt.
+ * Prefers the originating socket when still open; otherwise falls back strictly
+ * to an open bridge socket bound to the exact same `peerKey` and `userId`.
+ * Returns `null` (skip cleanly) when no matching bridge socket exists.
+ */
+export function selectBridgeReceiptSocket<S extends { readyState: number }>(
+  primaryWs: S,
+  peerSockets: Iterable<S> | undefined,
+  isBridge: (ws: S) => boolean,
+  expectedUserId: string,
+  getUserId: (ws: S) => string,
+  openState = 1,
+): S | null {
+  if (primaryWs.readyState === openState) return primaryWs
+  if (!peerSockets) return null
+  for (const candidate of peerSockets) {
+    if (
+      candidate.readyState === openState &&
+      isBridge(candidate) &&
+      getUserId(candidate) === expectedUserId
+    ) {
+      return candidate
+    }
+  }
+  return null
+}
+
+/** Emit the `running` receipt (with `turnKey`) once inbox running CAS commits. Fail-soft, never throws. */
+export function notifyDispatchRunningReceipt(
+  target: object | null | undefined,
+  row: TurnDispatchInboxRow,
+): void {
+  if (!target || typeof target !== 'object') return
+  const send = dispatchReceiptSender.get(target)
+  if (!send) return
+  try {
+    send(row)
+  } catch { /* transport loss must not affect turn execution */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,19 +1169,24 @@ export interface TurnDispatchReceiptFrame {
   outcome: TurnDispatchInboxOutcome | null
   ts: number
   userFailureCode?: string
+  turnKey?: string
 }
+
+const RECEIPT_TURN_KEY_RE = /^[0-9a-f]{64}$/
 
 /**
  * B2:构造 turn_dispatch_receipt 控制帧。**首次受理(INSERT queued fsync 成功)后立即回发**,
- * bridge 收到 state='queued' 即 CAS dispatch accepted 并放下 lease;重复帧回发现有行状态。
+ * bridge 收到 state='queued' 即 CAS dispatch accepted 并放下 lease;重复帧及 running 回执回发现有行状态
+ * (并在已派生合法 64-hex turnKey 时附带回传,供 master 为全引擎绑定 turn_dispatches.turn_key)。
  * 纯函数(ts 由调用方注入)→ 可断言帧形状,尤其"首次受理即 state=queued"。
  */
 export function buildTurnDispatchReceiptFrame(
   ctx: Pick<DispatchTurnContext, 'dispatchId' | 'attemptNo' | 'sessionId' | 'clientMessageId'>,
-  row: Pick<TurnDispatchInboxRow, 'state' | 'outcome' | 'userFailureCode'> | null | undefined,
+  row: (Pick<TurnDispatchInboxRow, 'state' | 'outcome' | 'userFailureCode'> & { turnKey?: string | null }) | null | undefined,
   ts: number,
 ): TurnDispatchReceiptFrame {
   const canonical = canonicalUserFailureCode(row?.userFailureCode)
+  const turnKey = typeof row?.turnKey === 'string' && RECEIPT_TURN_KEY_RE.test(row.turnKey) ? row.turnKey : undefined
   return {
     type: 'outbound.control.turn_dispatch_receipt',
     dispatchId: ctx.dispatchId,
@@ -1136,5 +1197,6 @@ export function buildTurnDispatchReceiptFrame(
     outcome: row?.outcome ?? null,
     ts,
     ...(canonical ? { userFailureCode: canonical } : {}),
+    ...(turnKey ? { turnKey } : {}),
   }
 }

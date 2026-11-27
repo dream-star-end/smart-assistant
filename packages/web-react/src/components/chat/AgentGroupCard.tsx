@@ -46,6 +46,26 @@ export function ProgressivePlainText({ text, className }: { text: string; classN
   );
 }
 
+function ChildPlanView({ steps }: { steps: unknown }) {
+  if (!Array.isArray(steps) || steps.length === 0) return null;
+  const valid = steps.filter(
+    (s): s is { status?: string; step?: string } => Boolean(s) && typeof s === "object",
+  );
+  if (valid.length === 0) return null;
+  return (
+    <ul className="oc-surface-recessed space-y-1 rounded-lg border border-border/60 px-3 py-2 text-meta text-muted">
+      {valid.map((s, idx) => (
+        <li key={`${idx}-${s.step ?? ""}`} className="flex items-start gap-2">
+          <span className="mt-0.5 shrink-0 text-caption text-faint">
+            {s.status === "completed" ? "✓" : s.status === "in_progress" ? "●" : "○"}
+          </span>
+          <span className="min-w-0 break-words">{s.step ?? ""}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export const ChildBlockView = memo(
   function ChildBlockView({
     child,
@@ -113,19 +133,8 @@ export const ChildBlockView = memo(
         />
       );
     }
-    if (child.kind === "plan" && Array.isArray(child.steps) && child.steps.length > 0) {
-      return (
-        <ul className="oc-surface-recessed space-y-1 rounded-lg border border-border/60 px-3 py-2 text-meta text-muted">
-          {child.steps.map((s, idx) => (
-            <li key={`${idx}-${s.step}`} className="flex items-start gap-2">
-              <span className="mt-0.5 shrink-0 text-caption text-faint">
-                {s.status === "completed" ? "✓" : s.status === "in_progress" ? "●" : "○"}
-              </span>
-              <span className="min-w-0 break-words">{s.step}</span>
-            </li>
-          ))}
-        </ul>
-      );
+    if (child.kind === "plan") {
+      return <ChildPlanView steps={child.steps} />;
     }
     if (child.kind === "error") {
       const msgText = (child.text || child.preview || "").trim();

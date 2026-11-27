@@ -21,9 +21,9 @@ on:
         required: false
         default: ''
       ref:
-        description: 'checkout 的 git ref(schedule 触发时回落到 feat/v5-aurora-rewrite)'
+        description: 'checkout 的 git ref(留空 = 同时覆盖 feat/v5-aurora-rewrite 与 feat/v5-selfhost)'
         required: false
-        default: 'feat/v5-aurora-rewrite'
+        default: ''
 
 permissions:
   contents: read
@@ -37,13 +37,14 @@ env:
 
 jobs:
   nightly:
-    name: integ ${{ matrix.shard }}
+    name: integ ${{ matrix.branch }} ${{ matrix.shard }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
 
     strategy:
       fail-fast: false
       matrix:
+        branch: [feat/v5-aurora-rewrite, feat/v5-selfhost]
         shard: [nightly-1, nightly-2, nightly-3, nightly-4, nightly-5]
 
     services:
@@ -80,28 +81,43 @@ jobs:
       TEST_REDIS_URL: redis://127.0.0.1:56379/0
 
     steps:
-      - name: Skip non-selected shard
+      - name: Skip non-selected shard or branch
         id: pick
         shell: bash
         run: |
-          want='${{ github.event.inputs.shard }}'
-          if [[ -n "$want" && "$want" != '${{ matrix.shard }}' ]]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
+          want_shard='${{ github.event.inputs.shard }}'
+          want_ref='${{ github.event.inputs.ref }}'
+          cur_branch='${{ matrix.branch }}'
+          run="true"
+          checkout_ref="$cur_branch"
+          if [[ -n "$want_shard" && "$want_shard" != '${{ matrix.shard }}' ]]; then
+            run="false"
+          elif [[ -n "$want_ref" ]]; then
+            if [[ "$want_ref" == "feat/v5-aurora-rewrite" || "$want_ref" == "feat/v5-selfhost" ]]; then
+              if [[ "$want_ref" != "$cur_branch" ]]; then
+                run="false"
+              fi
+            elif [[ "$cur_branch" != "feat/v5-aurora-rewrite" ]]; then
+              run="false"
+            fi
+            checkout_ref="$want_ref"
           fi
+          branch_slug="$(printf '%s' "$checkout_ref" | tr '/:@ ' '----' | tr -cd 'A-Za-z0-9._-')"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "ref=$checkout_ref" >> "$GITHUB_OUTPUT"
+          echo "branch_slug=${branch_slug:-branch}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         if: steps.pick.outputs.run == 'true'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref || 'feat/v5-aurora-rewrite' }}
+          ref: ${{ steps.pick.outputs.ref }}
 
       - name: Record checkout identity
         if: steps.pick.outputs.run == 'true'
         shell: bash
         run: |
-          echo "checked out $(git rev-parse HEAD) from ref=${{ github.event.inputs.ref || 'feat/v5-aurora-rewrite' }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "checked out $(git rev-parse HEAD) from ref=${{ steps.pick.outputs.ref }}" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Setup Node
         if: steps.pick.outputs.run == 'true'
@@ -159,7 +175,62 @@ jobs:
         if: always() && steps.pick.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: commercial-integ-tap-${{ matrix.shard }}
+          name: commercial-integ-tap-${{ steps.pick.outputs.branch_slug }}-${{ matrix.shard }}
           path: commercial-integ-${{ matrix.shard }}.tap
           if-no-files-found: error
+          retention-days: 14
+
+  # OCV5-906 / OCV5-903 (Non-blocker 4): 高强度状态机属性测试 (PBT_RUNS=2000) + 周度 T2 核心增量变异抽检
+  # 显式锁定 feat/v5-selfhost；workflow_dispatch 选商业分支(如 feat/v5-aurora-rewrite)时自动跳过。
+  selfhost-pbt-and-mutation:
+    name: selfhost PBT (2000 runs) & weekly mutation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.ref == '' || github.event.inputs.ref == 'feat/v5-selfhost' }}
+    steps:
+      - name: Checkout feat/v5-selfhost
+        uses: actions/checkout@v4
+        with:
+          ref: feat/v5-selfhost
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run 4 core state-machine property tests (PBT_RUNS=2000)
+        env:
+          PBT_RUNS: '2000'
+        run: |
+          npx tsx --test \
+            packages/kernel/src/testing/__tests__/propertyCheck.test.ts \
+            packages/commercial/src/__tests__/prop.billingConservation.test.ts \
+            packages/commercial/src/__tests__/prop.multiTenantIsolation.test.ts \
+            packages/gateway/src/__tests__/prop.turnLeaseConvergence.test.ts \
+            packages/storage/src/__tests__/prop.journalTapeRecovery.test.ts
+
+      - name: Weekly incremental mutation spot-check (Sundays & manual dispatch)
+        id: mutation
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$(date -u +%u)" = "7" ]; then
+            echo "ran=true" >> "$GITHUB_OUTPUT"
+            npx tsx scripts/check-mutation-weekly.ts --days 7 --min-score 0.60 --max-mutants 20 --json --out mutation-weekly-report.json
+          else
+            echo "ran=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping weekly mutation spot-check on weekday $(date -u +%A)"
+          fi
+
+      - name: Upload mutation weekly report
+        if: always() && steps.mutation.outputs.ran == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-mutation-weekly-report
+          path: mutation-weekly-report.json
+          if-no-files-found: ignore
           retention-days: 14

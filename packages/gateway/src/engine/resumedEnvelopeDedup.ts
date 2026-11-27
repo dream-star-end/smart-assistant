@@ -30,6 +30,10 @@ import {
 import path from 'node:path'
 import type { PromptSlotApplied } from '../promptSlots.js'
 
+function sha256Hex(input: string): string {
+  return createHash('sha256').update(input, 'utf8').digest('hex')
+}
+
 export type ResumedDedupEngine = 'cursor' | 'grok' | 'zcode'
 export type ResumedDedupMode = 'on' | 'off'
 
@@ -106,10 +110,6 @@ export interface ResumedEnvelopeElideDecision {
   reason: ResumedEnvelopeElideReason
   /** Exact slots/inputs that changed when `reason === 'inputs_changed'`; `['legacy_untracked']` for older cache files. */
   changedSlots?: string[]
-}
-
-function sha256Hex(text: string): string {
-  return createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
 export function resumedEnvelopeStatePath(

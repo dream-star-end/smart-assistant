@@ -68,8 +68,12 @@ export function continuationPrompts(code) {
   const id = crypto.randomUUID();
   return {
     // Agent memory is shared across sessions: each probe names its own purchase entity.
-    first: `采购批次 R2-${id} 的第一张采购单编号是 PO-${code}。收到请回复「收到」。`,
-    second: `采购批次 R2-${id} 的第一张采购单编号是多少？`,
+    // OCV5-891: keep C3 strictly in-session without tool or memory writes. Without this
+    // scope boundary, models like deepseek-v4-flash run multi-step core-search + Write/Edit
+    // loops (~7 LLM requests/turn), polluting canary MEMORY.md, multiplying upstream tail
+    // latency, and risking turn-2 recall via disk memory instead of session continuation.
+    first: `采购批次 R2-${id} 的第一张采购单编号是 PO-${code}（本次对话临时核对，无需调用工具、无需查询或写入记忆与文件）。收到请直接回复「收到」。`,
+    second: `采购批次 R2-${id} 的第一张采购单编号是多少？（直接依据本次对话上下文作答，无需调用工具或查询记忆）`,
   };
 }
 export function assertSameSession(first, second) {

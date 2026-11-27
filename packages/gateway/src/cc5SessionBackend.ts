@@ -16,6 +16,37 @@ function isRemoteChatModel(model: string): boolean {
 import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 import { isRemoteV4ResumeId, parseRemoteV4ResumeId } from './remotePool/resumeId.js'
 
+const VALID_CONTINUITY_TIERS = new Set([
+  'hot_native',
+  'warm_capsule',
+  'tape_rebuilt',
+  'cold_degraded',
+])
+
+export interface CrossPoolMigrationGrant {
+  readonly migrationId: string
+  readonly placementEpoch: number
+  readonly allowBackendTransition: true
+  readonly continuityTier?: 'hot_native' | 'warm_capsule' | 'tape_rebuilt' | 'cold_degraded'
+}
+
+function isValidCrossPoolMigrationGrant(grant: CrossPoolMigrationGrant | undefined): boolean {
+  if (!grant || typeof grant !== 'object') return false
+  if (grant.allowBackendTransition !== true) return false
+  if (typeof grant.migrationId !== 'string' || grant.migrationId.trim().length < 8) return false
+  if (
+    typeof grant.placementEpoch !== 'number' ||
+    !Number.isSafeInteger(grant.placementEpoch) ||
+    grant.placementEpoch < 1
+  ) {
+    return false
+  }
+  if (grant.continuityTier !== undefined && !VALID_CONTINUITY_TIERS.has(grant.continuityTier)) {
+    return false
+  }
+  return true
+}
+
 export function cc5SessionBackend(input: {
   executionAuthority?: { source?: string; executionBackend?: RemoteExecutionBackend }
   engineId: string
@@ -27,6 +58,7 @@ export function cc5SessionBackend(input: {
   usageAttribution?: unknown
   advisorExecutionLock?: unknown
   channel?: string
+  poolMigration?: CrossPoolMigrationGrant
 }): RemoteExecutionBackend | undefined {
   const scope = input.executionAuthority?.executionBackend
   // A restart must never silently replay a remote chat locally while it still names a
@@ -35,7 +67,8 @@ export function cc5SessionBackend(input: {
   if (
     isRemoteChatModel(input.executionModel) &&
     !scope &&
-    (isCc5ResumeId(input.storedResumeId) || isRemoteV4ResumeId(input.storedResumeId))
+    (isCc5ResumeId(input.storedResumeId) || isRemoteV4ResumeId(input.storedResumeId)) &&
+    !isValidCrossPoolMigrationGrant(input.poolMigration)
   ) {
     throw new Error('CC5_BACKEND_SCOPE_CHANGED_NEW_CHAT_REQUIRED')
   }
@@ -99,7 +132,11 @@ export async function assertFreshCc5Session(input: {
   executionBackend?: RemoteExecutionBackend
   sessionIds: string[]
   hasPersistedTurnActivity: (ids: string[]) => Promise<boolean>
+  poolMigration?: CrossPoolMigrationGrant
 }): Promise<void> {
+  if (isValidCrossPoolMigrationGrant(input.poolMigration)) {
+    return
+  }
   if (
     !input.current &&
     input.executionBackend &&

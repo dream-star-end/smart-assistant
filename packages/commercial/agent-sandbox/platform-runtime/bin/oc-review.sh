@@ -9,7 +9,8 @@ SELF_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "help" ]; then
   cat <<'EOF'
 usage: oc-review schema
-       oc-review collate --dir <dir> [--out <summary.md>] [--ledger <decision-ledger.json>] [--round <n>] [--strict]
+       oc-review verify --dir <dir> [--exec|--unsafe-local-exec] [--script-root <root>] [--manuscript <file>|--input-sha <id>] [--timeout <sec>] [--batch-timeout <sec>] [--out <verification-report.json>]
+       oc-review collate --dir <dir> [--out <summary.md>] [--ledger <decision-ledger.json>] [--round <n>] [--verification <verification-report.json>] [--script-root <root>] [--manuscript <file>|--input-sha <id>] [--scientific-gate] [--min-families <n>] [--max-residual <num>] [--strict]
        oc-review ledger <init|record|show> --file <path> [...]
 EOF
   exit 0

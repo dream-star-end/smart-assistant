@@ -137,7 +137,8 @@ import {
   type TeamReviewMode,
 } from './teamMode.js'
 import { resolveLocalExecutionIfEnforced, localExecutionOverride, _buildTurnStatusFrame } from './server.js'
-import { DELEGATE_DEFAULT_PREFERRED_MODELS, DELEGATE_GROK_FALLBACK_MODEL, assertKnownExplicitDelegateModel, DELEGATE_QUEUE_MAX_WAITERS, MAX_HIDDEN_DELEGATIONS_PER_TURN, MEMBER_DELEGATIONS_PER_TURN_DEFAULT, PerTurnDelegationGuard, resolveDelegateParentClientSessionId } from './delegatePolicy.js'
+import { preflightExplicitDelegateModel, resolveDelegateFlagOffModel } from './localExecution.js'
+import { DELEGATE_DEFAULT_PREFERRED_MODELS, DELEGATE_GROK_FALLBACK_MODEL, DELEGATE_QUEUE_MAX_WAITERS, MAX_HIDDEN_DELEGATIONS_PER_TURN, MEMBER_DELEGATIONS_PER_TURN_DEFAULT, PerTurnDelegationGuard, resolveDelegateParentClientSessionId } from './delegatePolicy.js'
 import type { Gateway, LocalExecutionDecision } from './server.js'
 import type { DelegateGateBlock, RunDelegateInput } from './delegatePolicy.js'
 
@@ -614,18 +615,19 @@ export async function handleDelegateTask(
   if (!goal) return this.sendError(res, 400, DELEGATE_GOAL_REQUIRED_ERROR)
   const modelNorm = parseDelegateModel(parsed.model)
   if (!modelNorm.ok) return this.sendError(res, 400, modelNorm.error)
-  // Flag-off: reject unknown explicit slugs before async job creation / spawn.
-  // Flag-on: catalog projection in resolveLocalExecutionIfEnforced remains
-  // the authority (catalog-only slugs, catalog-unavailable ≠ unknown).
-  if (modelNorm.model && !isModelAuthorityRequired()) {
+  // Entry-gate explicit model preflight (OCV5-897 B7): runs for both flag-on
+  // (catalog projection) and flag-off (baked allowlist + 4-family policy) BEFORE
+  // creating async jobs, reserving slots, or minting resume claims.
+  if (modelNorm.model && !isTeamReviewExecution(targetAgentId)) {
     try {
-      assertKnownExplicitDelegateModel(modelNorm.model)
+      await preflightExplicitDelegateModel({ model: modelNorm.model, agentId: targetAgentId })
     } catch (err) {
       const mapped = this._mapLocalExecutionError(err)
       if (mapped) {
         return this.sendJson(res, mapped.httpStatus, {
           error: mapped.message,
           code: mapped.code,
+          failure_class: failureClassFromLocalExecutionCode(mapped.code),
         })
       }
       throw err
@@ -1327,14 +1329,17 @@ export async function _runDelegateTaskCore(
   // 被 spawn(方案 §3 要求的"创建 runner 前拒",测试 ④/⑤ 断言未 spawn)。
   // 审查委派:调用方 model 忽略,改用 gateway 按「≠ 队长 / ≠ panel 家族」选出的审查员型号
   // (选不出 → undefined → 沿用 hidden-reviewer 成员绑定)。
-  const taskboardDefault = input.modelPolicy === 'taskboard-stage-agent-auto' &&
-    delegatedAgent.model && delegatedAgent.model !== AGENT_MODEL_AUTO
-    ? delegatedAgent.model : undefined
-  const requestedModel = isReview ? reviewerModelOverride : input.model || taskboardDefault
+  const isTaskboardAuto = input.modelPolicy === 'taskboard-stage-agent-auto' && !input.model
+  const hasTaskboardAgentDefault = Boolean(
+    isTaskboardAuto && delegatedAgent.model && delegatedAgent.model !== AGENT_MODEL_AUTO,
+  )
+  const requestedModel = isReview ? reviewerModelOverride : input.model || undefined
   let execAgent = requestedModel ? { ...delegatedAgent, model: requestedModel } : delegatedAgent
   let delegateExec: LocalExecutionDecision | undefined
   // 默认(未显式指定 model、非 review)委派优先 grok-build;只在 selfhost 引擎本地豁免门
   // 开着时插入(生产没有 grok 本地 turn),catalog 无该行时候选循环自然跳过。
+  // 任务板成员有非 auto 默认时,通过 preferAgentModelOverPreferred 把 agent.model 排在
+  // preferredModels 之前,在 catalog 归一后再判定四大家族与可路由性(OCV5-897 B6)。
   const preferGrokDefault = !requestedModel && !isReview && isEngineLocalTurnExempt(process.env)
   try {
     delegateExec = await resolveLocalExecutionIfEnforced({
@@ -1343,6 +1348,7 @@ export async function _runDelegateTaskCore(
       model: requestedModel,
       defaultModel: this.deps.config.defaults.model,
       preferredModels: preferGrokDefault ? DELEGATE_DEFAULT_PREFERRED_MODELS : undefined,
+      preferAgentModelOverPreferred: hasTaskboardAgentDefault,
     })
   } catch (err) {
     const mapped = this._mapLocalExecutionError(err)
@@ -1354,19 +1360,37 @@ export async function _runDelegateTaskCore(
       code: mapped.code,
     }
   }
+  let flagOffDelegateModel: string | undefined
+  if (!delegateExec && !isModelAuthorityRequired()) {
+    flagOffDelegateModel = resolveDelegateFlagOffModel({
+      requestedModel,
+      agentModel: execAgent.model,
+      defaultModel: this.deps.config.defaults.model,
+      preferredModels: preferGrokDefault ? DELEGATE_DEFAULT_PREFERRED_MODELS : undefined,
+      preferAgentModelOverPreferred: hasTaskboardAgentDefault,
+    })
+    execAgent = { ...execAgent, model: flagOffDelegateModel }
+  }
+  const explicitTaskboardAgentMatch = Boolean(
+    hasTaskboardAgentDefault &&
+      (delegateExec
+        ? delegateExec.selectedFromAgent === true
+        : delegatedAgent.model === flagOffDelegateModel),
+  )
 
   // Per-turn 委派熔断(两条策略共用 PerTurnDelegationGuard,互斥分派):
   //   - hidden 系统 agent(隐藏审查员)→ 串行硬上限(env OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN,默认 3);
-  //   - 普通成员(非 hidden 非 review)→ 每 turn 委派上限(env 默认 8),消"串行无上限"债。
+  //   - 普通成员(非 hidden 非 review)→ 每 turn 委派上限(env 默认 16),消"串行无上限"债。
   // 计数键优先取 parentSessionKey(delegate 请求里唯一的父上下文,turn 级标识拿不到 ——
   // 依据见 PerTurnDelegationGuard 注释);极端情况下 body 缺 parentSessionKey 时退化为按
-  // sourceAgent 计数,由 TTL 清扫兜底回收(无绕过口)。本地预检拒绝不占额度;预检通过后
-  // 已启动的失败/超时仍占额度。本闸先于资源闸排队:per-turn 额度等不出来 fail
-  // fast、不占等待名额(保守偏置)。
+  // sourceAgent 计数,由 TTL 清扫兜底回收(无绕过口)。本地预检拒绝不占额度;未进入执行或
+  // 零输出上游失败退还有效额度(保留 rawAttempts 防风暴),有输出/超时/用户取消仍占额度。
+  // 本闸先于资源闸排队:per-turn 额度等不出来 fail fast、不占等待名额(保守偏置)。
   const delegateGuardKey = input.delegationGuardOwnerKey || (
     typeof parentSessionKey === 'string' && parentSessionKey
       ? parentSessionKey
       : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`)
+  let refundMemberQuota = (): void => {}
   if (isTeamReviewExecution(targetAgentId)) {
     const hiddenLimit = resolveHiddenDelegationsPerTurn()
     if (!this._hiddenDelegateGuard.tryAcquire(delegateGuardKey, Date.now(), hiddenLimit)) {
@@ -1385,7 +1409,8 @@ export async function _runDelegateTaskCore(
     // 普通成员委派(队长直接派给已安装成员)。isReview 豁免(那是内部硬编排,走 hidden 分支)。
     const memberLimit = resolveMemberDelegationsPerTurn()
     const memberGuard = (this._memberDelegateGuard ??= new PerTurnDelegationGuard(memberLimit))
-    if (!memberGuard.tryAcquire(delegateGuardKey)) {
+    const acquired = memberGuard.acquireToken(delegateGuardKey, Date.now(), memberLimit)
+    if (!acquired.ok) {
       this.log.warn('delegate_member_limit', {
         targetAgentId,
         guardKey: delegateGuardKey,
@@ -1397,9 +1422,17 @@ export async function _runDelegateTaskCore(
         message: `本轮委派已达上限(${memberLimit} 次/turn)。请先整合已经收到的成员结果,基于现有产出继续推进;若确实还需要更多子任务,合并为更少的委派或分两轮进行,不要在同一轮内持续拆分委派。`,
       }
     }
+    const memberQuotaToken = acquired.token
+    let memberQuotaRefunded = false
+    refundMemberQuota = () => {
+      if (!memberQuotaRefunded) {
+        memberQuotaRefunded = true
+        memberGuard.refundToken(memberQuotaToken)
+      }
+    }
   }
 
-  input.taskboardControl?.assertOpen()
+  try { input.taskboardControl?.assertOpen() } catch (err) { refundMemberQuota(); throw err }
   const sessionKey =
     input.sessionKey ?? `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
   this.log.info('delegate', {
@@ -1628,6 +1661,7 @@ export async function _runDelegateTaskCore(
     sessionKey,
   )
   if (input.taskboardControl?.signal.aborted) {
+    refundMemberQuota()
     unregisterDelegation?.()
     this._delegateOwnerByRunId?.delete(progressRunId)
     await input.taskboardControl.waitForDescendants(sessionKey)
@@ -1727,6 +1761,7 @@ export async function _runDelegateTaskCore(
     else if (gate.status === 'queue_full') failureClass = 'capacity_queue_full'
     else if (gate.status === 'aborted') failureClass = 'cancelled'
     else failureClass = 'capacity_timeout'
+    refundMemberQuota()
     return this._applyDelegateCapacityReject(input, {
       httpStatus,
       message,
@@ -1740,6 +1775,7 @@ export async function _runDelegateTaskCore(
     antigravity?: DelegateAntigravityRouteLease | null,
     remoteLane?: DelegateRemoteLaneLease | null,
   ): Promise<DelegateTaskResult> => {
+    refundMemberQuota()
     try {
       await input.taskboardControl?.waitForDescendants(sessionKey)
       if (admission) await (this._delegateEngineBilling ?? defaultDelegateEngineBilling).abandon(admission.requestId).catch(() => {})
@@ -1759,6 +1795,7 @@ export async function _runDelegateTaskCore(
   if (isDelegateSmEnabled() && input.backgroundJobId) {
     const claimed = this._delegateJobs?.claimQueued(input.backgroundJobId)
     if (!claimed?.ok) {
+      refundMemberQuota()
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
       if (claimed && claimed.reason === 'cutover_frozen') {
@@ -1860,6 +1897,7 @@ export async function _runDelegateTaskCore(
     if (input.backgroundJobId && (!current || current.state !== 'running' || !fence ||
         current.claimToken !== fence.claimToken || current.fencingEpoch !== fence.fencingEpoch)) traceAborted = true
     if (traceAborted || traceWait.isAborted() || this._shuttingDown || input.taskboardControl?.signal.aborted) {
+      refundMemberQuota()
       if (input._leaseTimer) clearInterval(input._leaseTimer)
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
@@ -1891,6 +1929,7 @@ export async function _runDelegateTaskCore(
       return cancelPreparation(null, null, null, acquiredRemote.ok ? acquiredRemote.lease : null)
     }
     if (!acquiredRemote.ok) {
+      refundMemberQuota()
       if (input._leaseTimer) clearInterval(input._leaseTimer)
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
@@ -1920,11 +1959,12 @@ export async function _runDelegateTaskCore(
       requestedModel,
       agentModel: execAgent.model,
     })
-  if (input.taskboardControl?.signal.aborted) return cancelPreparation()
+  if (input.taskboardControl?.signal.aborted) return cancelPreparation(null, null, null, remoteLaneLease)
   let grokRoute: { baseUrl: string; routeToken: string } | null = null
   let grokRouteLease: DelegateGrokRouteLease | null = null
   if (grokDelegate) {
     if (!grokMintModelId) {
+      refundMemberQuota()
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
       return {
@@ -1938,8 +1978,10 @@ export async function _runDelegateTaskCore(
       sessionId: sessionKey,
       log: this.log,
     })
-    if (input.taskboardControl?.signal.aborted) return cancelPreparation(acquired.ok ? acquired.lease : null)
-    if (!acquired.ok && !requestedModel) {
+    if (input.taskboardControl?.signal.aborted) {
+      return cancelPreparation(acquired.ok ? acquired.lease : null, null, null, remoteLaneLease)
+    }
+    if (!acquired.ok && !requestedModel && !explicitTaskboardAgentMatch) {
       // 默认路径(用户没显式要 grok):mint 失败(订阅并发满 / 容器租约上限 / 无账号 /
       // master 通道缺失)不拒,同一请求内回落到 ccb 的 DELEGATE_GROK_FALLBACK_MODEL,
       // 名额继续持有,下方 billing admit(ccb 不进 engine-reported)与 getOrCreate 照常。
@@ -1953,11 +1995,12 @@ export async function _runDelegateTaskCore(
       try {
         delegateExec = await resolveLocalExecutionIfEnforced({
           agent: { ...delegatedAgent, model: DELEGATE_GROK_FALLBACK_MODEL },
-          kind: 'turn',
+          kind: 'billed_delegate',
           model: DELEGATE_GROK_FALLBACK_MODEL,
           defaultModel: this.deps.config.defaults.model,
         })
       } catch (err) {
+        refundMemberQuota()
         const mapped = this._mapLocalExecutionError(err)
         if (!mapped) {
           this._releaseDelegateSlot(slotOpts)
@@ -1975,8 +2018,12 @@ export async function _runDelegateTaskCore(
       }
       // 之后 grokRoute/grokRouteLease 保持 null:submit 不注入 grok route,ccb runner 正常起。
       execAgent = { ...delegatedAgent, model: DELEGATE_GROK_FALLBACK_MODEL }
+      if (!delegateExec && !isModelAuthorityRequired()) {
+        flagOffDelegateModel = DELEGATE_GROK_FALLBACK_MODEL
+      }
     } else if (!acquired.ok) {
       // 显式 model 指定 grok:与排队被拒同形,已过闸的并发名额必须在此释放(下方 finally 不会执行)。
+      refundMemberQuota()
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
       this.log.warn('delegate_grok_route_denied', {
@@ -2020,6 +2067,7 @@ export async function _runDelegateTaskCore(
   if (engineReported) {
     billingModel = delegateExec?.canonicalModel || requestedModel || execAgent.model
     if (!billingModel) {
+      refundMemberQuota()
       if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
@@ -2047,6 +2095,7 @@ export async function _runDelegateTaskCore(
           : {}),
       })
     } catch (err) {
+      refundMemberQuota()
       if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
@@ -2063,7 +2112,9 @@ export async function _runDelegateTaskCore(
       }
     }
   }
-  if (input.taskboardControl?.signal.aborted) return cancelPreparation(grokRouteLease, engineBillingAdmission)
+  if (input.taskboardControl?.signal.aborted) {
+    return cancelPreparation(grokRouteLease, engineBillingAdmission, null, remoteLaneLease)
+  }
   // codex 委派必须有 master 签发的 provider route(OCV5-729):容器里的 codex
   // CLI 没有任何 baked `model_providers.*`,裸起会退回内建 `openai` provider
   // 的 workspace routing discovery,被 relay allowlist 404 → 整轮失败。route
@@ -2088,6 +2139,7 @@ export async function _runDelegateTaskCore(
         })
       : null
     if (!codexRoute) {
+      refundMemberQuota()
       this.log.warn('delegate_codex_route_unavailable', {
         targetAgentId,
         model: billingModel,
@@ -2108,6 +2160,30 @@ export async function _runDelegateTaskCore(
         message: 'Codex 委派路由不可用（master 未签发 provider route），未启动',
       }
     }
+    if (
+      !isEngineLocalTurnExempt() &&
+      (engineBillingAdmission.creditBudgetFen === undefined ||
+        engineBillingAdmission.creditBudgetFen <= 0n)
+    ) {
+      refundMemberQuota()
+      this.log.warn('delegate_codex_credit_budget_unavailable', {
+        targetAgentId,
+        model: billingModel,
+      })
+      await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
+      if (input._leaseTimer) clearInterval(input._leaseTimer)
+      if (grokRouteLease) grokRouteLease.release().catch(() => {})
+      if (remoteLaneLease) {
+        await remoteLaneLease.release({ outcome: 'interrupted', releaseLane: true }).catch(() => {})
+      }
+      this._releaseDelegateSlot(slotOpts)
+      unregisterDelegation?.()
+      return {
+        kind: 'rejected',
+        httpStatus: 503,
+        message: 'Codex 委派计费预算不可用（master 未下发有效 creditBudgetFen），未启动',
+      }
+    }
   }
   // antigravity 委派同样必须有 master 签发的 relay route(OCV5-738):容器本地
   // turn 没有 bridge 注入 __oc_antigravity_route,adapter 在 spawn 前就
@@ -2124,7 +2200,9 @@ export async function _runDelegateTaskCore(
     })
     if (input.taskboardControl?.signal.aborted) {
       if (acquired.ok) await acquired.lease.release().catch(() => {})
-      return cancelPreparation(grokRouteLease, engineBillingAdmission)
+      const admissionToCancel =
+        !acquired.ok && acquired.alreadyMinted ? null : engineBillingAdmission
+      return cancelPreparation(grokRouteLease, admissionToCancel, null, remoteLaneLease)
     }
     if (acquired.ok) {
       // Mirror chat's inbound projection: the agent/model pair already resolves
@@ -2147,6 +2225,7 @@ export async function _runDelegateTaskCore(
       })
     }
     if (!acquired.ok || !antigravityRoute) {
+      refundMemberQuota()
       const reason = acquired.ok ? 'projection_failed' : acquired.reason
       const httpStatus = acquired.ok ? 503 : acquired.httpStatus
       this.log.warn('delegate_antigravity_route_unavailable', {
@@ -2155,7 +2234,9 @@ export async function _runDelegateTaskCore(
         reason,
       })
       if (acquired.ok) await acquired.lease.release().catch(() => {})
-      await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
+      if (acquired.ok || !acquired.alreadyMinted) {
+        await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
+      }
       if (input._leaseTimer) clearInterval(input._leaseTimer)
       if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
@@ -2200,7 +2281,11 @@ export async function _runDelegateTaskCore(
           }
         : {
             ...localExecutionOverride(delegateExec),
-            ...(delegateExec || !requestedModel ? {} : { model: requestedModel }),
+            ...(delegateExec
+              ? {}
+              : requestedModel || flagOffDelegateModel
+                ? { model: requestedModel ?? flagOffDelegateModel }
+                : {}),
           }),
       channel: input.channel ?? 'delegate',
       peerId: remoteLaneLease
@@ -2275,6 +2360,7 @@ export async function _runDelegateTaskCore(
       )
     }
   } catch (err) {
+    refundMemberQuota()
     if (engineBillingAdmission) {
       await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
     }
@@ -2363,7 +2449,7 @@ export async function _runDelegateTaskCore(
     clearTimeoutTimer()
     detachAncestorActivity?.()
     await this.sessions.destroySession(sessionKey)
-    return cancelPreparation(grokRouteLease, engineBillingAdmission, antigravityRouteLease)
+    return cancelPreparation(grokRouteLease, engineBillingAdmission, antigravityRouteLease, remoteLaneLease)
   }
   const turnStartedAt = Date.now()
   const submitPromise = this.sessions.submit(
@@ -2451,7 +2537,7 @@ export async function _runDelegateTaskCore(
     // P2 批次4 — effort 透传:子会话是新建的,首次 submit 的 effortLevel 在 runner
     // spawn 前生效(与顶层会话 safeEffortLevel 同法)。undefined = 不指定 → 成员默认档位。
     input.effort,
-    remoteLaneLease?.canonicalModel ?? delegateExec?.canonicalModel ?? requestedModel,
+    remoteLaneLease?.canonicalModel ?? delegateExec?.canonicalModel ?? requestedModel ?? flagOffDelegateModel,
     remoteLaneLease?.billingRequestId ?? engineBillingAdmission?.requestId,
     input.traceId,
     undefined,
@@ -2460,6 +2546,8 @@ export async function _runDelegateTaskCore(
       ...(remoteLaneLease ? { modelAuthority: remoteLaneLease.turnModelAuthority } : {}),
       ...(engineBillingAdmission?.grokExecutionDescriptor
         ? { grokExecutionDescriptor: engineBillingAdmission.grokExecutionDescriptor } : {}),
+      ...(engineBillingAdmission?.creditBudgetFen !== undefined
+        ? { creditBudgetFen: engineBillingAdmission.creditBudgetFen } : {}),
       ...(grokRoute ? { grokRoute } : {}),
       ...(codexRoute ? { codexRoute } : {}),
       ...(antigravityRoute ? { antigravityRoute } : {}),
@@ -2608,6 +2696,9 @@ export async function _runDelegateTaskCore(
     }
     this._runLog.complete(_dlgRun, { status: 'failed', error })
   } finally {
+    if (error && output.trim().length === 0 && !timedOut && !cancelled) {
+      refundMemberQuota()
+    }
     await input.taskboardControl?.waitForDescendants(sessionKey)
     clearTimeoutTimer()
     detachAncestorActivity?.()

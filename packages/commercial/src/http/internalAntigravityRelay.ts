@@ -38,6 +38,7 @@ import {
   classifyAntigravityUpstream,
   reportAntigravityOutcome,
 } from '../account-pool/antigravityPool.js'
+import { renewInflight } from '../account-pool/policy/affinity.js'
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import {
   ContainerIdentityError,
@@ -60,7 +61,8 @@ import {
   settleLateAntigravityRelayUsage,
   sumAntigravityRelayUsage,
 } from '../billing/antigravitySettle.js'
-import type { PricingCache } from '../billing/pricing.js'
+import { parseBillingPricing } from '../billing/persistedBillingPricing.js'
+import type { ModelPricing, PricingCache } from '../billing/pricing.js'
 import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
@@ -88,14 +90,15 @@ const METADATA_METHODS = new Set([
 ])
 const MAX_GENERATE_BODY = 32 * 1024 * 1024
 /** Title + agent call run together; Antigravity native swarm workers can run
- * multiple parallel turns on the same route (each still strictly reserved
- * against route.budgetCredits atomically below). */
-export const ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE = 12
+ * many parallel turns on the same route (each still strictly reserved against
+ * route.budgetCredits atomically below). Override via `OC_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE`
+ * (`0` disables the count cap while keeping atomic budget reservation). */
+export const ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE = 64
 /** Independent per-route concurrency cap for auxiliary light-model calls
  * (e.g. gemini-3.5-flash-lite agent_monitoring / checkpoint / web_search) so
- * monitoring bursts never contend for the primary model's 12 slots while still
- * bounding aux fan-out on a single route. */
-export const ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE = 24
+ * monitoring bursts never contend for primary slots. Override via
+ * `OC_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE` (`0` disables cap). */
+export const ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE = 128
 /** Output tokens assumed for an in-flight reservation (input comes from the body size). */
 const RESERVED_OUTPUT_TOKENS = 2048
 const MAX_METADATA_BODY = 1024 * 1024
@@ -147,6 +150,7 @@ export interface AntigravityRelayDeps {
   requestFn?: typeof request
   dispatcher?: Dispatcher
   resolveRoute?: typeof resolveAntigravityRelayRoute
+  renewInflightFn?: typeof renewInflight
   freshToken?: (accountId: bigint) => Promise<Buffer>
   reportOutcome?: (
     accountId: bigint,
@@ -182,6 +186,17 @@ export interface AntigravityRelayDeps {
     parentTurnKey?: string | null,
   ) => Promise<unknown>
   now?: () => number
+  /** Per-route concurrent primary-lane ceiling (`0` or `Infinity` disables count cap; budget reservation still applies). */
+  maxInflightPerRoute?: number
+  /** Per-route concurrent aux-lane ceiling (`0` or `Infinity` disables count cap; budget reservation still applies). */
+  maxAuxInflightPerRoute?: number
+}
+
+function resolveRelayInflightCap(explicit: number | undefined, fallback: number): number {
+  if (explicit !== undefined) {
+    return Number.isFinite(explicit) && explicit >= 1 ? Math.floor(explicit) : Number.POSITIVE_INFINITY
+  }
+  return fallback >= 1 ? fallback : Number.POSITIVE_INFINITY
 }
 
 function error(res: ServerResponse, status: number, code: string, requestId: string): void {
@@ -539,21 +554,41 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
   const reportModelOutcome = deps.reportModelOutcome ?? reportAntigravityModelOutcome
   const modelCoolingUntil = deps.modelCoolingUntil ?? antigravityModelCoolingUntil
   const recordUsage = deps.recordUsage ?? recordAntigravityRelayUsage
+  const resolvePrimaryPricing = (route: AntigravityRelayRoute): ModelPricing | null => {
+    if (route.pricingOverride) {
+      const frozen = parseBillingPricing({ v: 1, ...route.pricingOverride }, route.modelId)
+      if (frozen) return frozen
+    }
+    return deps.pricing?.get(route.modelId) ?? null
+  }
+  const resolvePricingLookup = (
+    route: AntigravityRelayRoute,
+  ): Pick<PricingCache, 'get'> | undefined => {
+    const frozen = route.pricingOverride
+      ? parseBillingPricing({ v: 1, ...route.pricingOverride }, route.modelId)
+      : null
+    if (!frozen) return deps.pricing ?? undefined
+    return {
+      get: (modelId: string) =>
+        modelId === route.modelId ? frozen : (deps.pricing?.get(modelId) ?? null),
+    }
+  }
   const meteredCost =
     deps.meteredCost ??
     (async (route: AntigravityRelayRoute) => {
-      const pricing = deps.pricing?.get(route.modelId) ?? null
+      const pricing = resolvePrimaryPricing(route)
       if (pricing === null) return null
       const totals = await sumAntigravityRelayUsage(getPool(), route.requestId, route.userId)
-      return antigravityUsageCostOrNull(totals, pricing, deps.pricing ?? undefined)
+      return antigravityUsageCostOrNull(totals, pricing, resolvePricingLookup(route))
     })
   const refreshWaived =
     deps.refreshWaived ??
     (async (route: AntigravityRelayRoute) => {
-      if (!deps.pricing) return
+      const lookup = resolvePricingLookup(route)
+      if (!lookup) return
       await refreshWaivedAntigravityUsage({
         pool: getPool(),
-        pricing: deps.pricing,
+        pricing: lookup,
         requestId: route.requestId,
         userId: route.userId,
       })
@@ -561,10 +596,11 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
   const settleLateUsage =
     deps.settleLateUsage ??
     (async (route: AntigravityRelayRoute) => {
-      if (!deps.pricing) return
+      const lookup = resolvePricingLookup(route)
+      if (!lookup) return
       await settleLateAntigravityRelayUsage({
         pool: getPool(),
-        pricing: deps.pricing,
+        pricing: lookup,
         requestId: route.requestId,
         userId: route.userId,
         appendCostCredits: deps.appendCostCredits,
@@ -578,8 +614,9 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       upstreamModel?: string,
     ) => {
       const target = resolveAntigravityBillableTarget(route.modelId, upstreamModel)
-      const pricing = deps.pricing?.get(route.modelId) ?? null
+      const pricing = resolvePrimaryPricing(route)
       if (pricing === null) return null
+      const lookup = resolvePricingLookup(route)
       const promptTokens = BigInt(Math.ceil(bodyBytes / 4))
       const candidatesTokens = BigInt(RESERVED_OUTPUT_TOKENS)
       if (target.bucket === 'aux') {
@@ -599,11 +636,11 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
             },
           },
           pricing,
-          deps.pricing ?? undefined,
+          lookup,
         )
       }
       if (target.bucket === 'model') {
-        const targetPricing = deps.pricing?.get(target.modelId) ?? null
+        const targetPricing = lookup?.get(target.modelId) ?? null
         if (targetPricing === null) return null
         return antigravityUsageCost(
           {
@@ -632,11 +669,11 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
   const totalsCost =
     deps.totalsCost ??
     ((route: AntigravityRelayRoute, totals: AntigravityUsageTotals) => {
-      const pricing = deps.pricing?.get(route.modelId) ?? null
+      const pricing = resolvePrimaryPricing(route)
       if (pricing === null) {
         return totals.extraModels && Object.keys(totals.extraModels).length > 0 ? null : 0n
       }
-      return antigravityUsageCostOrNull(totals, pricing, deps.pricing ?? undefined)
+      return antigravityUsageCostOrNull(totals, pricing, resolvePricingLookup(route))
     })
 
   return async (req, res, ctx) => {
@@ -688,6 +725,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       error(res, 404, 'ANTIGRAVITY_ROUTE_EXPIRED', requestId)
       return
     }
+    ;(deps.renewInflightFn ?? renewInflight)(route.requestId, now())
     const stage = createPassiveRelayTiming(deps.logger, {
       engine: 'antigravity', requestId, ...egressTraceFields(req), turnRequestId: route.requestId,
       uid: String(identity.userId), model: route.modelId, rpc,
@@ -803,14 +841,22 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         },
         touchedAt: ts,
       }
+      const primaryCap = resolveRelayInflightCap(
+        deps.maxInflightPerRoute,
+        ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE,
+      )
+      const auxCap = resolveRelayInflightCap(
+        deps.maxAuxInflightPerRoute,
+        ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE,
+      )
       let auxSlot: AuxInflightSlot | null = null
       if (isAuxLane) {
         auxSlot = auxInflight.get(token) ?? { count: 0, touchedAt: ts }
-        if (auxSlot.count >= ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE) {
+        if (auxSlot.count >= auxCap) {
           error(res, 429, 'ANTIGRAVITY_AUX_ROUTE_BUSY', requestId)
           return
         }
-      } else if (slot.count >= ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE) {
+      } else if (slot.count >= primaryCap) {
         error(res, 429, 'ANTIGRAVITY_ROUTE_BUSY', requestId)
         return
       }

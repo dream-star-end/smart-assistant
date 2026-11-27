@@ -768,5 +768,35 @@ BOOT_LIVE="$BG_DIR/live" BOOT_SLOT_PREFIX="$BG_DIR/slot" BOOT_RELEASES_ROOT="$BG
 assert_eq "boot-guard repairs dangling slot-B symlink to healthy live target" \
   "$BG_DIR/releases/rel-ok-20261122-000000" "$(readlink -f "$BG_DIR/slot-B")"
 
+# ── 12. Standby cold-start timeout defaults to 180s, honors env override & sanitizes invalid values ──
+if bash -c '
+  set -euo pipefail
+  export PATH="$1:$PATH"
+  source "$2"
+  export OC_SELFHOST_STANDBY_POLL_SEC=0.01
+  # (a) Explicit env override = 2 -> logs "在 2s 内未就绪"
+  out1="$(OC_SELFHOST_STANDBY_TIMEOUT_SEC=2 selfhost_wait_slot_standby_ready B 2>&1 || true)"
+  [[ "$out1" == *"在 2s 内未就绪"* ]]
+  # (b) Explicit arg overrides env
+  out2="$(OC_SELFHOST_STANDBY_TIMEOUT_SEC=2 selfhost_wait_slot_standby_ready B 1 2>&1 || true)"
+  [[ "$out2" == *"在 1s 内未就绪"* ]]
+  # (c) Invalid env falls back to default 180 (short-circuit loop on poll #1 after capturing timeout_s)
+  seen_timeout=""
+  selfhost_ds_log() { seen_timeout="$*"; }
+  selfhost_http_json_check() { return 1; }
+  sleep() { return 0; }
+  OC_SELFHOST_STANDBY_TIMEOUT_SEC=abc selfhost_wait_slot_standby_ready B || true
+  [[ "$seen_timeout" == *"在 180s 内未就绪"* ]]
+  # (d) Unset env defaults to 180
+  seen_timeout=""
+  unset OC_SELFHOST_STANDBY_TIMEOUT_SEC
+  selfhost_wait_slot_standby_ready B || true
+  [[ "$seen_timeout" == *"在 180s 内未就绪"* ]]
+' _ "$TMP/curl-fail7" "$ROOT/scripts/v5-selfhost-dual-slot-lib.sh"; then
+  pass "B03: standby ready timeout defaults to 180s, honors OC_SELFHOST_STANDBY_TIMEOUT_SEC, and sanitizes invalid values"
+else
+  fail "B03: standby ready timeout default/override/sanitization check failed"
+fi
+
 printf 'passed=%d failed=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

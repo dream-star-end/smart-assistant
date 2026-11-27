@@ -7,17 +7,19 @@ const ROOT = resolve(import.meta.dirname, "../../../..");
 const read = (path: string): string => readFileSync(resolve(ROOT, path), "utf8");
 
 describe("V5 release verification wiring", () => {
-  test("CCB bridge persists the freshly minted turn id before sealing the same id", () => {
+  test("CCB bridge persists the freshly minted turn id before forwarding the sealed frame", () => {
     const source = read("packages/commercial/src/ws/userChatBridge.ts");
     const ccb = source.indexOf("dispatchRecordC = lookupAdmittedDispatch(enrichedParsed)");
     const mint = source.indexOf("signer.mintAuthorityTurnId()", ccb);
-    const admit = source.indexOf("bindAuthorityTurnDispatch", mint);
-    const seal = source.indexOf("sealAuthorityFieldsOrReject", admit);
-    assert.ok(ccb >= 0 && ccb < mint && mint < admit && admit < seal);
-    const bindingBlock = source.slice(admit, seal);
+    const seal = source.indexOf("sealAuthorityFieldsOrReject", mint);
+    const admit = source.indexOf("bindAuthorityTurnDispatch", seal);
+    const forward = source.indexOf("forwardPreparedFrame", admit);
+    assert.ok(ccb >= 0 && ccb < mint && mint < seal && seal < admit && admit < forward);
+    const sealBlock = source.slice(seal, admit);
+    assert.match(sealBlock, /authorityTurnId/);
+    const bindingBlock = source.slice(admit, forward);
     assert.match(bindingBlock, /authorityTurnId/);
     assert.match(bindingBlock, /rejectPromptQueueDispatch\("DURABLE_DISPATCH_UNAVAILABLE"\)/);
-    assert.match(source.slice(seal, seal + 900), /authorityTurnId/);
   });
 
   test("Cursor bridge persists the freshly minted turn id before sealing the same id", () => {

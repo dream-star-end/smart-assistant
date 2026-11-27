@@ -32,7 +32,6 @@
 
 // 必须第一个 import:stdout 只留给 JSON-RPC + 未捕获异常不退出(见 mcpStdioGuard 注释)。
 import './mcpStdioGuard.js'
-import { readFileSync } from 'node:fs'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
@@ -40,11 +39,6 @@ import {
   SkillDraftStore,
   isPlatformReservedSkillName,
   parseSkillEvalsJson,
-  paths,
-  recordLocalSkillSearchHits,
-  recordLocalSkillView,
-  searchArchivedSkills,
-  searchSkillMetadata,
   serializeSkillEvals,
   syncMarketplaceHub,
   validateSkillName,
@@ -63,6 +57,11 @@ import {
   rewriteSelfDelegateErrorForMcp,
 } from './delegateArgs.js'
 import { normalizeSkillSaveArgs } from './skillSaveArgs.js'
+import {
+  handleSkillListRead,
+  handleSkillSearchRead,
+  handleSkillViewRead,
+} from './skillReadTools.js'
 import { buildMcpSkillStore } from './skillStoreContext.js'
 import { delegateResumeIdempotencyKey } from './delegateStartCli.js'
 import {
@@ -141,7 +140,8 @@ import {
   runMcpDelegateWait,
 } from './delegateWaitMcp.js'
 
-const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
+const MCP_ENV = process.env
+const AGENT_ID = MCP_ENV.OPENCLAUDE_AGENT_ID ?? 'main'
 /** 本 MCP 子进程的委派深度(由网关 spawn env 注入)。>0 = 子 agent 环境,
  *  没有直接面向用户的交互面 —— ask_user 直接短路返回 skipped。 */
 const DELEGATION_DEPTH = Math.max(
@@ -160,39 +160,10 @@ const consumePresentTaskApprovalCall = createPresentOptionsCallBudget(4)
 
 const skills = buildMcpSkillStore()
 
-// ── Skill-eval arm 控制(评测隔离会话专用,普通会话两个 env 均缺省) ──
-// EXCLUDE:'without' 基线 —— 目标技能对本会话完全不可见(list/search/view 全隐藏,
-// 与 promptSlots SKILLS 摘要的同名过滤配对;漏一半就是假基线)。
-// DRAFT:'draft' arm —— 目标技能以草稿目录内容替换现版(view 返草稿,list 描述用草稿)。
+// ── Skill-eval arm 控制(评测隔离会话专用,普通会话 env 缺省) ──
+// EXCLUDE/DRAFT 读过滤已下沉至 skillReadTools.ts(MCP 与 oc-memory CLI 同源);
 // 评测会话总开关:置 1 时本会话禁止 skill_save/skill_delete(评测跑分不得污染技能库)。
 const SKILL_EVAL_MODE = (process.env.OPENCLAUDE_SKILL_EVAL_MODE ?? '').trim() === '1'
-const SKILL_EVAL_EXCLUDE = (process.env.OPENCLAUDE_SKILL_EVAL_EXCLUDE ?? '').trim()
-const SKILL_EVAL_DRAFT_NAME = (process.env.OPENCLAUDE_SKILL_EVAL_DRAFT_NAME ?? '').trim()
-const SKILL_EVAL_DRAFT_DIR = (process.env.OPENCLAUDE_SKILL_EVAL_DRAFT_DIR ?? '').trim()
-
-function evalDraftRaw(): string | null {
-  if (!SKILL_EVAL_DRAFT_NAME || !SKILL_EVAL_DRAFT_DIR) return null
-  try {
-    return readFileSync(`${SKILL_EVAL_DRAFT_DIR}/SKILL.md`, 'utf8')
-  } catch {
-    return null
-  }
-}
-
-/** list() 结果按评测 arm 调整(exclude 滤掉 / draft 换描述)。 */
-function applyEvalArmToList<T extends { name: string; description: string }>(list: T[]): T[] {
-  let out = list
-  if (SKILL_EVAL_EXCLUDE) out = out.filter((s) => s.name !== SKILL_EVAL_EXCLUDE)
-  if (SKILL_EVAL_DRAFT_NAME) {
-    const raw = evalDraftRaw()
-    if (raw) {
-      const m = raw.match(/^description:\s*(.+)$/m)
-      const desc = m ? m[1].trim().replace(/^"|"$/g, '') : null
-      if (desc) out = out.map((s) => (s.name === SKILL_EVAL_DRAFT_NAME ? { ...s, description: desc } : s))
-    }
-  }
-  return out
-}
 
 // Skill-training run id, set by the gateway ONLY when this mcp-memory subprocess is
 // itself a skill-training session. When present, the draft-only `skill_propose` tool
@@ -402,192 +373,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 })
 
 async function handleSkillList() {
-  const list = applyEvalArmToList(await skills.list())
-  if (list.length === 0) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: 'No skills yet. Use `skill_save` to distill successful task resolutions into reusable skills.',
-        },
-      ],
-    }
-  }
-  // PR4: group by source so the agent can tell platform-baseline (read-only,
-  // auto-loaded by Claude Code) from user-created skills it can edit/delete.
-  const platform = list.filter((s) => s.source === 'platform')
-  const user = list.filter((s) => s.source === 'user')
-  const lines = [`You have ${list.length} skill(s):`, '']
-  if (platform.length > 0) {
-    lines.push('## Platform baseline (read-only)')
-    lines.push('')
-    for (const s of platform) {
-      lines.push(`### ${s.name}`)
-      lines.push(s.description)
-      if (s.tags && s.tags.length > 0) lines.push(`tags: ${s.tags.join(', ')}`)
-      lines.push('')
-    }
-  }
-  if (user.length > 0) {
-    lines.push('## User-created')
-    lines.push('')
-    for (const s of user) {
-      lines.push(`### ${s.name}`)
-      lines.push(s.description)
-      if (s.tags && s.tags.length > 0) lines.push(`tags: ${s.tags.join(', ')}`)
-      lines.push('')
-    }
-  }
-  lines.push('Use `skill_view(name)` to load full instructions for any skill above.')
-  lines.push(
-    'Baseline skills cannot be overwritten via `skill_save` (name is reserved) or deleted via `skill_delete`.',
-  )
-  return { content: [{ type: 'text', text: lines.join('\n') }] }
-}
-
-/**
- * v3 semantic skill ranking via the master embedding relay. The DashScope key
- * lives on master (never in the container) — we send only raw skill metadata
- * (master computes the content hash + embed text itself, so a container can't
- * poison the shared cache), and the cleaned query is embedded master-side.
- * Returns validated ranked {name, score} or null to signal "fall back to the
- * deterministic keyword search" (no master configured = personal version, or
- * any relay/embedding failure). Never throws.
- */
-async function semanticSkillRank(
-  list: Array<{ name: string; description: string; tags?: string[]; related_skills?: string[] }>,
-  query: string,
-  limit: number | undefined,
-): Promise<Array<{ name: string; score: number }> | null> {
-  const base = process.env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
-  const token = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
-  if (!base || !token || list.length === 0) return null
-  try {
-    const res = await postJsonToGateway(`${base.replace(/\/+$/, '')}/internal/v3/skill-embed`, {
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({
-        query,
-        limit,
-        skills: list.map((s) => ({
-          name: s.name,
-          description: s.description,
-          tags: s.tags,
-          related_skills: s.related_skills,
-        })),
-      }),
-      timeoutMs: 3500,
-    })
-    if (res.statusCode < 200 || res.statusCode >= 300) return null
-    const data = JSON.parse(res.body) as { ok?: boolean; ranked?: unknown }
-    if (!data.ok || !Array.isArray(data.ranked)) return null
-    const ranked = data.ranked.filter(
-      (r): r is { name: string; score: number } =>
-        !!r && typeof r.name === 'string' && typeof r.score === 'number',
-    )
-    return ranked.length > 0 ? ranked : null
-  } catch {
-    return null // fail-closed → keyword
-  }
+  return handleSkillListRead(skills, { agentId: AGENT_ID, env: MCP_ENV, allowSideEffects: true })
 }
 
 async function handleSkillSearch(args: { query: string; limit?: number } | undefined) {
-  const query = typeof args?.query === 'string' ? args.query.trim() : ''
-  if (!query) return toolError('query required')
-
-  const list = applyEvalArmToList(await skills.list())
-
-  // v3: semantic ranking via master relay (key stays on master); any miss → keyword fallback.
-  const semantic = await semanticSkillRank(list, query, args?.limit)
-  if (semantic) {
-    const byName = new Map(list.map((s) => [s.name, s]))
-    const matched = semantic.map((r) => ({ r, s: byName.get(r.name) })).filter((x) => x.s)
-    // If none of the ranked names map back to a known skill, treat as a miss
-    // and fall through to keyword rather than emitting an empty "Found N".
-    if (matched.length > 0) {
-      await recordLocalSkillSearchHits(
-        matched.map(({ r }) => r.name),
-        'user',
-      ).catch(() => {})
-      const lines = [`Found ${matched.length} relevant skill(s) for "${query}" (semantic):`, '']
-      for (const { r, s } of matched) {
-        lines.push(`### ${r.name} [source: ${s!.source}, relevance: ${r.score.toFixed(3)}]`)
-        lines.push(s!.description)
-        if (s!.tags && s!.tags.length > 0) lines.push(`tags: ${s!.tags.join(', ')}`)
-        if (s!.related_skills && s!.related_skills.length > 0)
-          lines.push(`related_skills: ${s!.related_skills.join(', ')}`)
-        lines.push('')
-      }
-      lines.push('Next: call `skill_view(name)` for the best match before applying it.')
-      return { content: [{ type: 'text', text: lines.join('\n') }] }
-    }
-  }
-
-  const hits = searchSkillMetadata(list, query, args?.limit)
-  if (hits.length === 0) {
-    const archivedHits = await searchArchivedSkills(paths.sharedSkillsDir, query, 3, {
-      agentId: AGENT_ID,
-    }).catch(() => [])
-    const baseLines = [
-      `No matching skills found for "${query}".`,
-      'Try a broader query or call `skill_list()` to browse all available skills.',
-      'If this was a reusable workflow you just validated, create it with `skill_save` after the task is complete.',
-    ]
-    if (archivedHits.length > 0) {
-      baseLines.push(
-        '',
-        'Archived skills that match this topic (previously auto-archived due to inactivity; can be restored anytime via Archived Records or `/api/skills/archive/restore`):',
-        ...archivedHits.map(
-          (h) => `- **${h.target}** — ${h.description || h.snippet || h.reason} (id: ${h.id})`,
-        ),
-      )
-    }
-    return {
-      content: [
-        {
-          type: 'text',
-          text: baseLines.join('\n'),
-        },
-      ],
-    }
-  }
-
-  const lines = [`Found ${hits.length} matching skill(s) for "${query}":`, '']
-  await recordLocalSkillSearchHits(
-    hits.map((s) => s.name),
-    'user',
-  ).catch(() => {})
-  for (const s of hits) {
-    lines.push(`### ${s.name} [source: ${s.source}, score: ${s.score}]`)
-    lines.push(s.description)
-    if (s.tags && s.tags.length > 0) lines.push(`tags: ${s.tags.join(', ')}`)
-    if (s.related_skills && s.related_skills.length > 0)
-      lines.push(`related_skills: ${s.related_skills.join(', ')}`)
-    if (s.matched.length > 0) lines.push(`matched: ${s.matched.join(', ')}`)
-    lines.push('')
-  }
-  lines.push('Next: call `skill_view(name)` for the best match before applying it.')
-  return { content: [{ type: 'text', text: lines.join('\n') }] }
+  return handleSkillSearchRead(skills, args, { agentId: AGENT_ID, env: MCP_ENV, allowSideEffects: true })
 }
 
 async function handleSkillView(args: { name: string; subfile?: string }) {
-  if (SKILL_EVAL_EXCLUDE && args.name === SKILL_EVAL_EXCLUDE) return toolError('skill not found')
-  if (SKILL_EVAL_DRAFT_NAME && args.name === SKILL_EVAL_DRAFT_NAME && !args.subfile) {
-    const raw = evalDraftRaw()
-    if (raw) return { content: [{ type: 'text', text: `[source: user]\n\n${raw}` }] }
-  }
-  const v = await skills.view(args.name, args.subfile)
-  if (!v) return toolError('skill not found')
-  if (typeof v === 'string') {
-    await recordLocalSkillView(args.name, 'user').catch(() => {})
-    // Subfile read returns a bare string; we have no source metadata here without
-    // a second lookup, but the containing skill_view call can be assumed to land
-    // in whichever root actually owned the parent name (baseline-wins).
-    return { content: [{ type: 'text', text: v }] }
-  }
-  const usageLayer = v.layer === 'hub' ? 'hub' : v.source === 'platform' ? 'platform' : 'user'
-  await recordLocalSkillView(args.name, usageLayer).catch(() => {})
-  const header = `[source: ${v.source}]`
-  return { content: [{ type: 'text', text: `${header}\n\n${v.rawContent}` }] }
+  return handleSkillViewRead(skills, args, { agentId: AGENT_ID, env: MCP_ENV, allowSideEffects: true })
 }
 
 // Cosine threshold above which a new skill is treated as a near-duplicate of an

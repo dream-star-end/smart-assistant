@@ -132,6 +132,11 @@ export async function pickAntigravityAccount(
      * settlement releases it otherwise.
      */
     reserveToken?: string
+    /**
+     * When true (delegate turns, OCV5-897 B3), return null when all accounts are
+     * at their in-flight or per-minute capacity instead of soft-spilling onto order[0].
+     */
+    strictCapacity?: boolean
   } = {},
 ): Promise<AntigravityAccountPick | null> {
   const res = await (deps.pool ?? getPool()).query<{
@@ -175,6 +180,7 @@ export async function pickAntigravityAccount(
       inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, r.id) < caps.antigravityInflight &&
       underRateCap(ANTIGRAVITY_AFFINITY_SERVICE, r.id, caps.antigravityRatePerMin),
   )
+  if (deps.strictCapacity && open.length === 0) return null
   const uncapped = open.length > 0 ? open : usable
   const bestTier = Math.min(...uncapped.map(tier))
   const candidates = uncapped.filter((r) => tier(r) === bestTier)
@@ -236,7 +242,9 @@ export async function pickAntigravityAccount(
       caps.antigravityInflight,
       Date.now(),
       caps.antigravityRatePerMin,
+      deps.strictCapacity === true,
     )
+    if (id === null) return null
     row = usable.find((r) => r.id === id) ?? preferred
   }
   const action: AffinityAction | undefined = resolved ? (row.id === resolved.member.id ? resolved.action : 'spill') : undefined

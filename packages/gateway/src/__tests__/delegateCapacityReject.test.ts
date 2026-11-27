@@ -116,39 +116,39 @@ async function call(
 }
 
 describe('reject copy reports the effective cap', () => {
-  it('non-review cap is MAX−reserved (4), review cap is MAX (5)', () => {
-    assert.equal(DELEGATE_MAX_CONCURRENT_DELEGATIONS, 5)
+  it('non-review cap is MAX−reserved (5), review cap is MAX (6)', () => {
+    assert.equal(DELEGATE_MAX_CONCURRENT_DELEGATIONS, 6)
     assert.equal(DELEGATE_REVIEW_RESERVED_SLOTS, 1)
-    assert.equal(delegateConcurrencyCap(false), 4)
-    assert.equal(delegateConcurrencyCap(true), 5)
+    assert.equal(delegateConcurrencyCap(false), 5)
+    assert.equal(delegateConcurrencyCap(true), 6)
   })
 
-  it('non-review timeout names max 4 and per-parent occupancy', () => {
+  it('non-review timeout names max 5 and per-parent occupancy', () => {
     const msg = formatDelegateConcurrencyReject({
       isReview: false,
-      inUse: 4,
-      perParentInUse: 3,
-      perParentMax: 3,
+      inUse: 5,
+      perParentInUse: 4,
+      perParentMax: 4,
       waitedS: 90,
     })
-    assert.match(msg, /max 4 non-review/)
-    assert.match(msg, /in-use 4\/4/)
-    assert.match(msg, /per-parent 3\/3 full/)
+    assert.match(msg, /max 5 non-review/)
+    assert.match(msg, /in-use 5\/5/)
+    assert.match(msg, /per-parent 4\/4 full/)
     assert.match(msg, /已等待 90s/)
-    assert.doesNotMatch(msg, /max 5/)
+    assert.doesNotMatch(msg, /max 6/)
   })
 
-  it('review queue_full names max 5 and does not mention per-parent', () => {
+  it('review queue_full names max 6 and does not mention per-parent', () => {
     const msg = formatDelegateConcurrencyReject({
       isReview: true,
-      inUse: 5,
-      perParentInUse: 3,
-      perParentMax: 3,
+      inUse: 6,
+      perParentInUse: 4,
+      perParentMax: 4,
       queueFull: true,
       queueMaxWaiters: 8,
     })
-    assert.match(msg, /max 5 review/)
-    assert.match(msg, /in-use 5\/5/)
+    assert.match(msg, /max 6 review/)
+    assert.match(msg, /in-use 6\/6/)
     assert.doesNotMatch(msg, /per-parent/)
     assert.match(msg, /排队等待者已满\(8 个\)/)
   })
@@ -237,7 +237,7 @@ describe('capacity_timeout production path leaves no executable job', () => {
     assert.equal(view.status, 'failed')
     if (view.status !== 'failed') return
     assert.equal(view.failure_class, 'capacity_timeout')
-    assert.match(String(view.failure_detail), /max 4 non-review/)
+    assert.match(String(view.failure_detail), /max 5 non-review/)
     assert.equal(gw._created, undefined, 'timeout must not spawn a child session')
     assert.equal(gw._submitted, undefined)
     assert.equal(gw._delegateJobs.claimQueued(jobId).ok, false)
@@ -283,9 +283,9 @@ describe('capacity_timeout production path leaves no executable job', () => {
       parentSessionKey: PARENT_KEY,
     })
     assert.equal(nonReview.status, 429)
-    assert.match(nonReview.body.error, /max 4 non-review/)
-    assert.match(nonReview.body.error, /in-use 4\/4/)
-    assert.doesNotMatch(nonReview.body.error, /max 5 review/)
+    assert.match(nonReview.body.error, /max 5 non-review/)
+    assert.match(nonReview.body.error, /in-use 5\/5/)
+    assert.doesNotMatch(nonReview.body.error, /max 6 review/)
 
     gw._activeDelegations = DELEGATE_MAX_CONCURRENT_DELEGATIONS
     const review = await call(
@@ -295,8 +295,8 @@ describe('capacity_timeout production path leaves no executable job', () => {
       'hidden-reviewer',
     )
     assert.equal(review.status, 429)
-    assert.match(review.body.error, /max 5 review/)
-    assert.match(review.body.error, /in-use 5\/5/)
+    assert.match(review.body.error, /max 6 review/)
+    assert.match(review.body.error, /in-use 6\/6/)
     assert.doesNotMatch(review.body.error, /per-parent/)
   })
 })

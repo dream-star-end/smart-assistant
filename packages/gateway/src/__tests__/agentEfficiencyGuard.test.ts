@@ -391,13 +391,18 @@ describe('sessionManager mount contract', () => {
     // server.ts `/MAX_CONCURRENT_DELEGATIONS = 5/` source match: bumping the
     // number without evidence fails this test. Gate + reject copy both call
     // delegateConcurrencyCap, so a second assignment in server.ts is also a fail.
+    // OCV5-895 commercial real-run evidence (oc-v5-u4 3.4h 11-round scientific deep audit):
+    //   - MAX_FANOUT_TASKS=4 deadlocked against per-parent=3 (4th task timed out 90s);
+    //     raised global cap 5→6 (non-review 5, review 6) & per-parent default 3→4.
+    //   - R1+R2 two-round cross-family audit exhausted member limit=8; raised 8→16.
     const capSrc = readFileSync(new URL('../delegateCapacity.ts', import.meta.url), 'utf8')
-    assert.match(capSrc, /export const DELEGATE_MAX_CONCURRENT_DELEGATIONS = 5/)
+    assert.match(capSrc, /export const DELEGATE_MAX_CONCURRENT_DELEGATIONS = 6/)
     assert.match(capSrc, /export const DELEGATE_REVIEW_RESERVED_SLOTS = 1/)
+    assert.match(capSrc, /export const DELEGATE_MAX_PER_PARENT_DEFAULT = 4/)
     // Gateway source set (server.ts + split-out modules, FINDINGS §7/§10): the per-turn member default
     // and the cap call moved to delegatePolicy.ts / delegateGuard.ts (OCV5-533).
     const src = readGatewaySource()
-    assert.match(src, /MEMBER_DELEGATIONS_PER_TURN_DEFAULT = 8/)
+    assert.match(src, /MEMBER_DELEGATIONS_PER_TURN_DEFAULT = 16/)
     assert.match(src, /delegateConcurrencyCap\(/)
     assert.doesNotMatch(src, /MAX_CONCURRENT_DELEGATIONS\s*=\s*\d+/)
     assert.doesNotMatch(src, /DELEGATE_REVIEW_RESERVED_SLOTS\s*=\s*\d+/)

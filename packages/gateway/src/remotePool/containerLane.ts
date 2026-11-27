@@ -13,6 +13,8 @@ import { dirname, join } from 'node:path'
 import {
   TURN_LEASE_RENEW_AFTER_MS,
   assertLeaseMatchesAuthority,
+  computeSchemaFilteredArgsSha256,
+  computeToolIdempotencyKey,
   isAdvisorReadOnlyMcpTool,
   parseRemoteDriverExecutionBackend,
   remoteCanonicalSha256,
@@ -24,11 +26,17 @@ import {
   type PromptPrivacyPolicy,
   type RemoteControlReply,
   type RemoteDriverExecutionBackend,
+  type RemoteDriverTurnContentBlock,
   type RemotePendingToolRequest,
   type RemotePresentationItem,
   type RemoteReceiptV4,
   type RemoteSecurityEvent,
 } from '@openclaude/protocol'
+import type {
+  ToolBrokerTransport,
+  ToolCallEnvelope,
+  ToolResultEnvelope,
+} from '@openclaude/protocol/exec-env'
 import { CC5_MOUNT, readCc5AuthorityKeyring } from '../cc5BridgePort.js'
 import type { Cc5FinanceTerminalOutcome } from '../cc5Finance.js'
 import { privateDir, syncDir } from '../cc5FixedTool.js'
@@ -65,6 +73,12 @@ import { isRemoteResourceCode, nodeMemoryError } from '../remoteNodeMemory.js'
 import { lookupRemoteSwarmMcpContext } from '../remoteSwarmRuntime.js'
 import { SubprocessRunner } from '../subprocessRunner.js'
 import { RemoteObservationGate } from './observationGate.js'
+import {
+  DEFAULT_MAX_IMAGE_BYTES,
+  inferImageMimeFromPath,
+  materializeRemoteTurnContentBlocks,
+  resolveTrustedMediaRoots,
+} from './remoteMediaMaterializer.js'
 import {
   assertRemotePoolBinding,
   remotePoolBackendOf,
@@ -105,6 +119,127 @@ const POLL_IDLE_MS = 15
 const TOOL_IDLE_MS = 20
 const DEFAULT_EXECUTION_ROOT = '/home/agent/.openclaude/.cc5-native-tools'
 const LEASE_RENEW_RETRY_MS = 60_000
+const EXEC_ENV_IDENT_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const TEXT_ONLY_REMOTE_DRIVERS = new Set<string>()
+const inferredMimeBlocks = new WeakSet<RemoteDriverTurnContentBlock>()
+
+function normalizeRemoteServiceTier(
+  tier: unknown,
+): 'standard' | 'fast' | 'ultrafast' | undefined {
+  return tier === 'standard' || tier === 'fast' || tier === 'ultrafast' ? tier : undefined
+}
+
+function extractRemoteTurnContent(
+  input: TurnParams['input'],
+): RemoteDriverTurnContentBlock[] | undefined {
+  if (!Array.isArray(input)) return undefined
+  const hasMedia = input.some(
+    (b) => b.type === 'image' || b.type === 'blob_ref' || b.type === 'image_ref',
+  )
+  if (!hasMedia) return undefined
+  const blocks: RemoteDriverTurnContentBlock[] = []
+  for (const block of input) {
+    if (block.type === 'text' && typeof block.text === 'string') {
+      blocks.push({ type: 'text', text: block.text })
+      continue
+    }
+    if (block.type === 'image' || block.type === 'blob_ref' || block.type === 'image_ref') {
+      const source =
+        block.source && typeof block.source === 'object' && !Array.isArray(block.source)
+          ? (block.source as Record<string, unknown>)
+          : undefined
+      const explicitMime =
+        typeof block.mimeType === 'string' && block.mimeType.length > 0
+          ? block.mimeType
+          : typeof block.media_type === 'string' && block.media_type.length > 0
+            ? block.media_type
+            : typeof source?.media_type === 'string' && source.media_type.length > 0
+              ? source.media_type
+              : typeof source?.mimeType === 'string' && source.mimeType.length > 0
+                ? source.mimeType
+                : undefined
+      const data =
+        typeof block.data === 'string' && block.data.length > 0
+          ? block.data
+          : typeof source?.data === 'string' && source.data.length > 0
+            ? source.data
+            : undefined
+      const blobId =
+        typeof block.blobId === 'string' && block.blobId.length > 0 ? block.blobId : undefined
+      const path =
+        typeof block.path === 'string' && block.path.length > 0
+          ? block.path
+          : typeof source?.path === 'string' && source.path.length > 0
+            ? source.path
+            : undefined
+      const rawMime = explicitMime ?? (path ? inferImageMimeFromPath(path) : 'image/png')
+      remotePoolNeed(
+        rawMime.length > 0 && (data !== undefined || blobId !== undefined || path !== undefined),
+        block.type === 'image' ? 'REMOTE_CONTENT_BLOCK_INVALID' : 'REMOTE_IMAGE_BLOB_UNRESOLVED',
+      )
+      const normalizedBlock: RemoteDriverTurnContentBlock = {
+        type: 'image',
+        mimeType: rawMime,
+        ...(data ? { data } : {}),
+        ...(blobId ? { blobId } : {}),
+        ...(path ? { path } : {}),
+      }
+      if (explicitMime === undefined && path !== undefined) {
+        inferredMimeBlocks.add(normalizedBlock)
+      }
+      blocks.push(normalizedBlock)
+    }
+  }
+  return blocks.some((b) => b.type === 'image') ? blocks : undefined
+}
+
+function toolResultEnvelopeToCc5Result(
+  envelope: ToolResultEnvelope,
+  toolName: string,
+): Cc5ToolResult {
+  const isError = envelope.status !== 'ok'
+  const out = envelope.output
+  if (out && typeof out === 'object' && !Array.isArray(out)) {
+    const rec = out as { content?: unknown; isError?: unknown }
+    if (
+      Array.isArray(rec.content) &&
+      rec.content.every(
+        (b) => b && typeof b === 'object' && !Array.isArray(b) && typeof (b as { type?: unknown }).type === 'string',
+      )
+    ) {
+      return {
+        content: rec.content as Array<Record<string, unknown> & { type: string }>,
+        isError: isError || rec.isError === true,
+      }
+    }
+  }
+  if (
+    Array.isArray(out) &&
+    out.every(
+      (b) => b && typeof b === 'object' && !Array.isArray(b) && typeof (b as { type?: unknown }).type === 'string',
+    )
+  ) {
+    return { content: out as Array<Record<string, unknown> & { type: string }>, isError }
+  }
+  if (typeof out === 'string') {
+    return { content: [{ type: 'text', text: out }], isError }
+  }
+  if (out !== undefined) {
+    return { content: [{ type: 'text', text: JSON.stringify(out) }], isError }
+  }
+  if (isError) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: envelope.errorMessage ?? envelope.errorCode ?? `Tool ${toolName} failed (${envelope.status})`,
+        },
+      ],
+      isError: true,
+    }
+  }
+  return { content: [{ type: 'text', text: '' }], isError: false }
+}
 
 function pause(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms).unref())
@@ -359,7 +494,11 @@ export class RemotePoolRelayClient {
     turnKey: string
     catalog: { tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> }
     instructions?: string
-  }): Promise<{ seq: number; nativeSessionId: string }> {
+  }): Promise<{
+    seq: number
+    nativeSessionId: string
+    countersBaseline?: Readonly<Record<string, number>>
+  }> {
     this.adopt()
     const reply = await this.call('/admit', {
       ...this.scope(),
@@ -378,8 +517,32 @@ export class RemotePoolRelayClient {
         reply.nativeSessionId.length > 0,
       'REMOTE_ADMIT_UNKNOWN',
     )
+    let countersBaseline: Readonly<Record<string, number>> | undefined
+    const rawBaseline =
+      reply.countersBaseline ?? reply.threadUsageBaseline ?? reply.baselineUsage
+    if (
+      rawBaseline &&
+      typeof rawBaseline === 'object' &&
+      !Array.isArray(rawBaseline)
+    ) {
+      const parsed: Record<string, number> = {}
+      let hasAny = false
+      for (const [k, v] of Object.entries(rawBaseline as Record<string, unknown>)) {
+        if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+          parsed[k] = Math.trunc(v)
+          hasAny = true
+        }
+      }
+      if (hasAny) {
+        countersBaseline = Object.freeze(parsed)
+      }
+    }
     this.startSeq = reply.seq
-    return { seq: reply.seq, nativeSessionId: reply.nativeSessionId }
+    return {
+      seq: reply.seq,
+      nativeSessionId: reply.nativeSessionId,
+      ...(countersBaseline !== undefined ? { countersBaseline } : {}),
+    }
   }
 
   async command(command: Readonly<Record<string, unknown>>): Promise<Record<string, unknown>> {
@@ -520,15 +683,25 @@ export interface RemoteContainerLaneOptions {
   readonly leaseRenewAfterMs?: number
   readonly toolAuthorizeTimeoutMs?: number
   readonly platformPrompt?: string
+  readonly brokerTransport?: ToolBrokerTransport
+  readonly execEnvLeaseId?: string
+  readonly fencingTokenProvider?: () => { fencingToken: string; brainGen: number }
+  readonly blobResolver?: (
+    blobId: string,
+  ) => Promise<{ readonly mimeType: string; readonly data: string }>
+  readonly trustedMediaRoots?: readonly string[]
+  readonly maxImageBytes?: number
   readonly observationOptions?: {
     readonly testFaultBypassObservation?: boolean
     readonly testFaultAllowDuplicateClaim?: boolean
     readonly allowTestBypassInTmp?: boolean
+    readonly toolInputSchemas?: ReadonlyMap<string, Record<string, unknown>>
   }
 }
 
 export interface RemoteTurnHandlers {
   readonly onNativeSession: (nativeSessionId: string) => void
+  readonly onAdmittedBaseline?: (countersBaseline: Readonly<Record<string, number>>) => void
   readonly onSubmitted: () => void
   readonly onSecurityEvent: (event: RemoteSecurityEvent) => void
   readonly onPresentationItem: (item: RemotePresentationItem) => void
@@ -586,8 +759,10 @@ export class RemoteContainerLane {
   private readonly socketPath?: string
   private readonly client: RemotePoolRelayClient
   private readonly allowedAliases = new Set<string>()
+  private readonly toolInputSchemas = new Map<string, Record<string, unknown>>()
   private readonly observation: RemoteObservationGate
   private readonly seenAuthorityTurnIds = new Set<string>()
+  private activeBrokerCallId?: string
 
   private host?: LaneToolHost
   private cleanupContext?: () => void
@@ -641,6 +816,11 @@ export class RemoteContainerLane {
         ? () => refreshRemotePoolBinding(this.binding, this.socketPath!)
         : () => this.binding,
     )
+    if (laneOptions.observationOptions?.toolInputSchemas) {
+      for (const [alias, schema] of laneOptions.observationOptions.toolInputSchemas) {
+        this.toolInputSchemas.set(alias, schema)
+      }
+    }
     this.observation = new RemoteObservationGate(
       {
         operationId: binding.operationId,
@@ -650,7 +830,10 @@ export class RemoteContainerLane {
       },
       this.allowedAliases,
       (reason) => this.fence(reason),
-      laneOptions.observationOptions,
+      {
+        ...laneOptions.observationOptions,
+        toolInputSchemas: this.toolInputSchemas,
+      },
     )
   }
 
@@ -853,6 +1036,7 @@ export class RemoteContainerLane {
     this.catalog = undefined
     this.clientNameByRemoteName = {}
     this.allowedAliases.clear()
+    this.toolInputSchemas.clear()
     this.appliedRemoteSwarmMcpKey = undefined
   }
 
@@ -898,6 +1082,15 @@ export class RemoteContainerLane {
         this.allowedAliases.clear()
         for (const remoteName of Object.keys(compiled.clientNameByRemoteName)) {
           this.allowedAliases.add(remoteName.slice('mcp__ocbridge__'.length))
+        }
+        const parsedCompiled = JSON.parse(compiled.json) as {
+          tools: Array<{ name: string; inputSchema?: Record<string, unknown> }>
+        }
+        this.toolInputSchemas.clear()
+        for (const tool of parsedCompiled.tools) {
+          if (tool.inputSchema && typeof tool.inputSchema === 'object' && !Array.isArray(tool.inputSchema)) {
+            this.toolInputSchemas.set(tool.name, tool.inputSchema)
+          }
         }
         this.appliedRemoteSwarmMcpKey = swarmMcpKeyAtBuild
         return compiled
@@ -974,6 +1167,8 @@ export class RemoteContainerLane {
     readonly payload: ModelAuthorityPayload
     readonly prompt: string
     readonly readOnly: boolean
+    readonly serviceTier?: 'standard' | 'fast' | 'ultrafast'
+    readonly content?: readonly RemoteDriverTurnContentBlock[]
   } {
     remotePoolNeed(
       !params.consultTurn && !this.opts.hermeticNoTools,
@@ -999,6 +1194,9 @@ export class RemoteContainerLane {
             .join('\n')
     remotePoolNeed(prompt.trim().length > 0, 'REMOTE_PROMPT_EMPTY')
 
+    const serviceTier = normalizeRemoteServiceTier(params.serviceTier)
+    const content = extractRemoteTurnContent(params.input)
+
     const payload = verifyAuthority(authority, this.keyring, Date.now(), { allowExpired: true })
     const leasePayload = verifyTurnLease(lease, this.keyring, Date.now())
     assertLeaseMatchesAuthority(leasePayload, payload)
@@ -1015,7 +1213,34 @@ export class RemoteContainerLane {
       'REMOTE_TURN_AUTHORITY_REPLAYED',
     )
     this.seenAuthorityTurnIds.add(payload.authorityTurnId)
-    return { authority, lease, turnKey, payload, prompt, readOnly: params.readOnly === true }
+    return {
+      authority,
+      lease,
+      turnKey,
+      payload,
+      prompt,
+      readOnly: params.readOnly === true,
+      ...(serviceTier !== undefined ? { serviceTier } : {}),
+      ...(content !== undefined ? { content } : {}),
+    }
+  }
+
+  private async resolveTurnContentBlocks(
+    blocks: readonly RemoteDriverTurnContentBlock[],
+  ): Promise<RemoteDriverTurnContentBlock[]> {
+    const repoSnap = this.opts.sessionId ? this.opts.getRepoSnapshot?.(this.opts.sessionId) : null
+    const trustedMediaRoots = resolveTrustedMediaRoots({
+      trustedMediaRoots: this.laneOptions.trustedMediaRoots,
+      agentBaseDir: this.opts.agentBaseDir,
+      promptCwd: this.resolvedPromptCwd,
+      repoWorkspaceDir: repoSnap?.workspaceDir ?? undefined,
+    })
+    return await materializeRemoteTurnContentBlocks(blocks, {
+      trustedMediaRoots,
+      maxImageBytes: this.laneOptions.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES,
+      blobResolver: this.laneOptions.blobResolver,
+      isInferredMimeBlock: (block) => inferredMimeBlocks.has(block),
+    })
   }
 
   async executeTurn(
@@ -1026,6 +1251,8 @@ export class RemoteContainerLane {
       readonly payload: ModelAuthorityPayload
       readonly prompt: string
       readonly effort?: string
+      readonly serviceTier?: 'standard' | 'fast' | 'ultrafast'
+      readonly content?: readonly RemoteDriverTurnContentBlock[]
       readonly readOnly?: boolean
     },
     handlers: RemoteTurnHandlers,
@@ -1062,6 +1289,18 @@ export class RemoteContainerLane {
       const frozenPolicy = this.stagedPromptPrivacy ? structuredClone(this.stagedPromptPrivacy) : undefined
       const epochAtStart = this.configEpoch
       const supportsVision = validated.payload.executionDescriptor.supportsVision
+      const hasImageContent = validated.content?.some((b) => b.type === 'image') === true
+      let resolvedContent: RemoteDriverTurnContentBlock[] | undefined = validated.content
+        ? [...validated.content]
+        : undefined
+      if (hasImageContent) {
+        const visionTransportSupported =
+          supportsVision === true &&
+          !TEXT_ONLY_REMOTE_DRIVERS.has(this.binding.authorityEngine) &&
+          !TEXT_ONLY_REMOTE_DRIVERS.has(this.binding.driverId)
+        remotePoolNeed(visionTransportSupported, 'REMOTE_VISION_CONTENT_UNSUPPORTED')
+        resolvedContent = await this.resolveTurnContentBlocks(validated.content!)
+      }
       const desiredFingerprint = frozenPolicy
         ? promptPrivacyFingerprint(frozenPolicy, this.opts.sessionId)
         : undefined
@@ -1140,6 +1379,9 @@ export class RemoteContainerLane {
       this.observation.bindSession(admittedReply.nativeSessionId)
       this.observation.beginTurn()
       handlers.onNativeSession(admittedReply.nativeSessionId)
+      if (admittedReply.countersBaseline !== undefined) {
+        handlers.onAdmittedBaseline?.(admittedReply.countersBaseline)
+      }
       this.startLeaseRenewal(turn)
 
       if (turn.cancelRequested || turn.abort.signal.aborted) {
@@ -1157,6 +1399,8 @@ export class RemoteContainerLane {
         prompt: validated.prompt,
         nativeSessionId: admittedReply.nativeSessionId,
         ...(validated.effort ? { effort: validated.effort } : {}),
+        ...(validated.serviceTier ? { serviceTier: validated.serviceTier } : {}),
+        ...(resolvedContent && resolvedContent.length > 0 ? { content: resolvedContent } : {}),
         instructions,
       })
       handlers.onSubmitted()
@@ -1320,8 +1564,12 @@ export class RemoteContainerLane {
       this.laneOptions.toolAuthorizeTimeoutMs ?? 5_000,
     )
 
+    const broker = this.laneOptions.brokerTransport
     const host = this.host
-    remotePoolNeed(host !== undefined && this.stopRun === undefined, 'REMOTE_TOOLHOST_CLOSED')
+    remotePoolNeed(
+      (broker !== undefined || host !== undefined) && this.stopRun === undefined,
+      'REMOTE_TOOLHOST_CLOSED',
+    )
 
     if (turn.readOnly && !isAllowedInReadOnlyTurn(clientToolName, req.arguments)) {
       const result: Cc5ToolResult = {
@@ -1353,16 +1601,71 @@ export class RemoteContainerLane {
     })
 
     let result: Cc5ToolResult
-    try {
-      result = await host.execute(clientToolName, req.arguments, {
-        nativeSessionId: toHostSessionUuid(this.binding.operationId, req.nativeSessionId),
-        turnKey: admitted.turnKey,
-        toolUseId: req.callId,
-      })
-    } catch (err) {
-      throw err instanceof Error && /^CC5_[A-Z0-9_]+$/.test(err.message)
-        ? err
-        : new Error('REMOTE_TOOL_EFFECT_UNKNOWN')
+    if (broker) {
+      const leaseId = this.laneOptions.execEnvLeaseId ?? this.binding.operationId
+      const idempotencyKey = computeToolIdempotencyKey(leaseId, admitted.authorityTurnId, req.callId)
+      const schema = this.toolInputSchemas.get(req.name)
+      const schemaProps =
+        schema &&
+        typeof schema.properties === 'object' &&
+        schema.properties !== null &&
+        !Array.isArray(schema.properties)
+          ? Object.keys(schema.properties as Record<string, unknown>)
+          : []
+      const argsSha256 =
+        schemaProps.length > 0
+          ? computeSchemaFilteredArgsSha256(req.arguments, schema)
+          : remoteCanonicalSha256(req.arguments)
+      const fencing = this.laneOptions.fencingTokenProvider?.()
+      const candidateGrant = fencing ? `${fencing.fencingToken}:${fencing.brainGen}` : undefined
+      const grantId =
+        candidateGrant && EXEC_ENV_IDENT_RE.test(candidateGrant) ? candidateGrant : undefined
+      const envelope: ToolCallEnvelope = {
+        schemaVersion: 1,
+        leaseId,
+        turnId: admitted.authorityTurnId,
+        callId: req.callId,
+        idempotencyKey,
+        canonicalName: clientToolName,
+        arguments: req.arguments,
+        argsSha256,
+        attestation: {
+          kind: schemaProps.length > 0 ? 'schema_filtered_hook' : 'dual_channel_observed',
+          argsSha256,
+          observedAt: new Date().toISOString(),
+          ...(grantId ? { grantId } : {}),
+          ...(schemaProps.length > 0 ? { filteredKeys: schemaProps } : {}),
+        },
+      }
+      this.activeBrokerCallId = req.callId
+      try {
+        const brokerResult = await broker.invoke(envelope)
+        remotePoolNeed(
+          brokerResult.callId === req.callId && brokerResult.idempotencyKey === idempotencyKey,
+          'REMOTE_TOOL_EFFECT_UNKNOWN',
+        )
+        result = toolResultEnvelopeToCc5Result(brokerResult, clientToolName)
+      } catch (err) {
+        throw err instanceof Error && /^(CC5|REMOTE)_[A-Z0-9_]+$/.test(err.message)
+          ? err
+          : new Error('REMOTE_TOOL_EFFECT_UNKNOWN')
+      } finally {
+        if (this.activeBrokerCallId === req.callId) {
+          this.activeBrokerCallId = undefined
+        }
+      }
+    } else {
+      try {
+        result = await host!.execute(clientToolName, req.arguments, {
+          nativeSessionId: toHostSessionUuid(this.binding.operationId, req.nativeSessionId),
+          turnKey: admitted.turnKey,
+          toolUseId: req.callId,
+        })
+      } catch (err) {
+        throw err instanceof Error && /^CC5_[A-Z0-9_]+$/.test(err.message)
+          ? err
+          : new Error('REMOTE_TOOL_EFFECT_UNKNOWN')
+      }
     }
 
     handlers.onToolExecuted?.({
@@ -1446,6 +1749,9 @@ export class RemoteContainerLane {
 
   interrupt(): boolean {
     let hit = false
+    if (this.activeBrokerCallId && this.laneOptions.brokerTransport) {
+      void this.laneOptions.brokerTransport.cancel(this.activeBrokerCallId, 'TURN_INTERRUPTED').catch(() => {})
+    }
     for (const pending of this.pendingTurns) {
       if (!pending.cancelRequested) {
         pending.cancelRequested = true
@@ -1470,6 +1776,9 @@ export class RemoteContainerLane {
   }
 
   stopLane(): Promise<void> {
+    if (this.activeBrokerCallId && this.laneOptions.brokerTransport) {
+      void this.laneOptions.brokerTransport.cancel(this.activeBrokerCallId, 'REMOTE_LANE_STOPPING').catch(() => {})
+    }
     for (const pending of this.pendingTurns) {
       pending.cancelRequested = true
       pending.abort.abort(new Error('REMOTE_LANE_STOPPING'))

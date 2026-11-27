@@ -109,7 +109,7 @@ export function classifyUpstreamReadFailure(error: unknown, stalled: boolean): s
   }
   return message || 'Cursor Sand inference failed'
 }
-const DEFAULT_CLIENT_VERSION = 'cli-2026.10.16-e3cb207'
+const DEFAULT_CLIENT_VERSION = 'cli-2026.11.22-e9042b2'
 const MAX_BODY_BYTES = 16 * 1024 * 1024
 const PING_MS = 5_000
 const toolSchemaValidator = new Ajv2020({ strict: false, allErrors: false, validateFormats: false })

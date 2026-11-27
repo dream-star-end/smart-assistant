@@ -15,11 +15,10 @@ import type { AntigravityRouteRenewResult } from '../delegateAntigravityRoute.js
 
 /**
  * Default max concurrent local native Antigravity CLI swarm processes per user container.
- * A single 4 GB user container running 4 concurrent `agy` swarms (0.43–1.00 GB RSS each)
- * triggered cgroup OOM SIGKILL in production; capping active local swarm processes at 2
- * keeps peak swarm RSS <= ~2.0 GB while queueing excess swarm turns FIFO with live status.
+ * `0` means uncapped (no FIFO queueing by default). Operators on memory-constrained hosts
+ * can still opt into an explicit cap via `OC_MAX_CONCURRENT_LOCAL_SWARMS=<N>` (`N >= 1`).
  */
-export const DEFAULT_MAX_CONCURRENT_LOCAL_SWARMS = 2
+export const DEFAULT_MAX_CONCURRENT_LOCAL_SWARMS = 0
 
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const SWARM_BRANCH_RE = /^swarm\/[A-Za-z0-9._/-]{1,120}$/
@@ -27,6 +26,7 @@ const MAX_ROSTER_BYTES = 512 * 1024
 
 interface SwarmSlotWaiter {
   cancelled: boolean
+  readonly limit: number
   grant: (release: () => void) => void
   abort: () => void
 }
@@ -35,11 +35,29 @@ let activeLocalSwarms = 0
 let limitOverrideForTests: number | null = null
 const waitQueue: SwarmSlotWaiter[] = []
 
-function effectiveSwarmLimit(): number {
-  if (limitOverrideForTests !== null && limitOverrideForTests >= 1) {
-    return Math.floor(limitOverrideForTests)
+export function parseLocalSwarmConcurrencyCap(raw: string | undefined): number {
+  const clean = (raw ?? '').trim().toLowerCase()
+  if (!clean || clean === '0' || clean === 'unlimited' || clean === 'inf' || clean === 'infinity') {
+    return Number.POSITIVE_INFINITY
   }
-  return DEFAULT_MAX_CONCURRENT_LOCAL_SWARMS
+  const parsed = Number.parseInt(clean, 10)
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : Number.POSITIVE_INFINITY
+}
+
+function effectiveSwarmLimit(overrideLimit?: number): number {
+  if (limitOverrideForTests !== null) {
+    return Number.isFinite(limitOverrideForTests) && limitOverrideForTests >= 1
+      ? Math.floor(limitOverrideForTests)
+      : Number.POSITIVE_INFINITY
+  }
+  if (overrideLimit !== undefined) {
+    return Number.isFinite(overrideLimit) && overrideLimit >= 1
+      ? Math.floor(overrideLimit)
+      : Number.POSITIVE_INFINITY
+  }
+  return DEFAULT_MAX_CONCURRENT_LOCAL_SWARMS >= 1
+    ? DEFAULT_MAX_CONCURRENT_LOCAL_SWARMS
+    : Number.POSITIVE_INFINITY
 }
 
 export function setLocalSwarmConcurrencyLimitForTests(limit: number | null): void {
@@ -70,10 +88,15 @@ function makeSlotRelease(): () => void {
 }
 
 function drainWaitQueue(): void {
-  const limit = effectiveSwarmLimit()
-  while (activeLocalSwarms < limit && waitQueue.length > 0) {
-    const next = waitQueue.shift()!
-    if (next.cancelled) continue
+  while (waitQueue.length > 0) {
+    const next = waitQueue[0]!
+    if (next.cancelled) {
+      waitQueue.shift()
+      continue
+    }
+    const effectiveCap = limitOverrideForTests !== null ? effectiveSwarmLimit() : next.limit
+    if (activeLocalSwarms >= effectiveCap) break
+    waitQueue.shift()
     activeLocalSwarms += 1
     next.grant(makeSlotRelease())
   }
@@ -110,6 +133,7 @@ export async function awaitLocalAntigravitySwarmSlotIfActive(opts: {
   keepaliveMs: number
   renewRouteIntervalMs?: number
   transientRetryDelayMs?: number
+  maxConcurrent?: number
   onStatus: (detail: string) => void
   onHeartbeat: () => void
   onRenewRoute?: () => Promise<boolean | AntigravityRouteRenewResult>
@@ -122,6 +146,7 @@ export async function awaitLocalAntigravitySwarmSlotIfActive(opts: {
   }
   const nowFn = opts.now ?? Date.now
   const slot = acquireLocalAntigravitySwarmSlot({
+    maxConcurrent: opts.maxConcurrent,
     onWaitStart: (active, limit, pos) => {
       opts.onStatus(`等待蜂群容器内存槽位（运行中 ${active}/${limit}，排队 #${pos}）…`)
     },
@@ -174,9 +199,10 @@ export async function awaitLocalAntigravitySwarmSlotIfActive(opts: {
 }
 
 export function acquireLocalAntigravitySwarmSlot(opts?: {
+  maxConcurrent?: number
   onWaitStart?: (active: number, limit: number, position: number) => void
 }): LocalSwarmSlotAcquisition {
-  const limit = effectiveSwarmLimit()
+  const limit = effectiveSwarmLimit(opts?.maxConcurrent)
   if (activeLocalSwarms < limit) {
     activeLocalSwarms += 1
     const release = makeSlotRelease()
@@ -193,6 +219,7 @@ export function acquireLocalAntigravitySwarmSlot(opts?: {
   const promise = new Promise<() => void>((resolveSlot, rejectSlot) => {
     waiterRef = {
       cancelled: false,
+      limit,
       grant: (release) => {
         if (waiterRef.cancelled) {
           release()

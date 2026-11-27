@@ -13,7 +13,7 @@
  *          `AntigravitySwarmWatcher` & `swarmCommand.ts` (live SwarmBoard UI, delta frames,
  *          telemetry, human steer, honest `[control:kill]`, playbooks) work seamlessly
  *        - Full Master-side billing & audit via `remoteDriverTurnBilling`
- *        - Bounded concurrency semaphore (default 3 parallel workers) protecting remote node lane caps
+ *        - Uncapped parallel worker execution by default (optional cap via `OC_REMOTE_SWARM_MAX_WORKERS` or constructor option)
  */
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { appendFileSync, existsSync } from 'node:fs'
@@ -53,8 +53,18 @@ import {
   executeReadBoardTool,
   executeSwarmAddAction,
   executeSwarmChannelAction,
+  executeSwarmModelAction,
+  executeSwarmModelsAction,
   executeSwarmStatusAction,
 } from './remoteSwarmTools.js'
+import {
+  extractRouteAllowedRemoteSwarmModels,
+  filterAvailableRemoteSwarmModels,
+  formatAvailableRemoteSwarmModelsHint,
+  formatRemoteSwarmModelsResponse,
+  resolveRemoteSwarmMemberModel,
+  resolveWorkerTurnEffort,
+} from './remoteSwarmModelPolicy.js'
 
 export type {
   BoardPostRecord,
@@ -67,10 +77,15 @@ export {
   DEFAULT_READ_BOARD_MAX_BYTES,
   MAX_READ_BOARD_MAX_BYTES,
   MAX_SWARM_POST_CHARS,
+  extractRouteAllowedRemoteSwarmModels,
+  filterAvailableRemoteSwarmModels,
+  formatAvailableRemoteSwarmModelsHint,
+  formatRemoteSwarmModelsResponse,
   reconcileRemoteSwarmOnBoot,
+  resolveRemoteSwarmMemberModel,
 }
 
-const DEFAULT_MAX_PARALLEL_WORKERS = 3
+export const DEFAULT_MAX_PARALLEL_WORKERS = 0
 /** Staggered away from SwarmStallMonitor's 180s quiet threshold (P1-4). */
 export const DEFAULT_WAIT_TIMEOUT_MS = 240_000
 const MAX_WAIT_TIMEOUT_MS = 300_000
@@ -200,6 +215,7 @@ interface SwarmSessionState {
   readonly location: RemoteSwarmLocation
   model: string
   effort?: string
+  allowedModels?: readonly string[]
   workspaceCwd: string
   parentAgentId: string
   allowedToolsets?: readonly string[]
@@ -287,10 +303,10 @@ export class RemoteSwarmRuntime {
     hmacSecret?: Buffer
   }) {
     this.rootBase = opts?.rootBase ?? antigravityRoot()
-    const envCap = Number.parseInt(process.env.OC_REMOTE_SWARM_MAX_WORKERS ?? '', 10)
-    const configured =
-      opts?.maxParallelWorkers ?? (Number.isFinite(envCap) ? envCap : DEFAULT_MAX_PARALLEL_WORKERS)
-    this.maxParallelWorkers = Math.max(1, Math.min(4, configured))
+    const envRaw = (process.env.OC_REMOTE_SWARM_MAX_WORKERS ?? '').trim().toLowerCase()
+    const envCap = !envRaw || envRaw === '0' || envRaw === 'unlimited' || envRaw === 'inf' || envRaw === 'infinity' ? 0 : Number.parseInt(envRaw, 10)
+    const configured = opts?.maxParallelWorkers !== undefined ? opts.maxParallelWorkers : Number.isFinite(envCap) ? envCap : DEFAULT_MAX_PARALLEL_WORKERS
+    this.maxParallelWorkers = Number.isFinite(configured) && configured >= 1 ? Math.floor(configured) : Number.POSITIVE_INFINITY
     this.executor = opts?.executor
     this.hmacSecret = opts?.hmacSecret ?? randomBytes(32)
   }
@@ -379,6 +395,7 @@ export class RemoteSwarmRuntime {
     sessionKey: string
     model: string
     effort?: string
+    allowedModels?: readonly string[]
     workspaceCwd: string
     parentAgentId?: string
     allowedToolsets?: readonly string[]
@@ -394,6 +411,7 @@ export class RemoteSwarmRuntime {
         location,
         model: input.model,
         effort: input.effort,
+        allowedModels: input.allowedModels !== undefined ? [...input.allowedModels] : undefined,
         workspaceCwd: input.workspaceCwd,
         parentAgentId,
         allowedToolsets: input.allowedToolsets ? [...input.allowedToolsets] : undefined,
@@ -408,6 +426,7 @@ export class RemoteSwarmRuntime {
     } else {
       state.model = input.model
       if (input.effort !== undefined) state.effort = input.effort
+      if (input.allowedModels !== undefined) state.allowedModels = [...input.allowedModels]
       if (input.workspaceCwd) state.workspaceCwd = input.workspaceCwd
       if (input.parentAgentId) state.parentAgentId = parentAgentId
       if (input.allowedToolsets !== undefined) state.allowedToolsets = [...input.allowedToolsets]
@@ -487,6 +506,13 @@ export class RemoteSwarmRuntime {
     this.sessions.set(key, state)
     activeRuntimeBySession.set(key, this)
     return state
+  }
+
+  setSessionAllowedModels(sessionKey: string, allowedModels: readonly string[] | undefined, defaultEffort?: string): void {
+    const state = this.sessions.get(sessionKey.trim())
+    if (!state || state.shuttingDown) return
+    if (allowedModels !== undefined) state.allowedModels = [...allowedModels]
+    if (defaultEffort !== undefined) state.effort = defaultEffort
   }
 
   disableCoordinatorMcp(sessionKey: string): void {
@@ -1231,6 +1257,10 @@ export class RemoteSwarmRuntime {
 
           const targetCwd = freshMember.workspace?.path || state.workspaceCwd
           if (isCancelled()) return
+          const verifiedWorkerModel = resolveRemoteSwarmMemberModel(
+            freshMember.model || state.model,
+            { defaultModel: state.model, defaultEffort: state.effort, allowedModels: state.allowedModels },
+          )
           let emittedErrorThisTurn = false
           const result = await this.executor!.runWorkerTurn({
             coordinatorSessionKey: state.sessionKey,
@@ -1242,8 +1272,8 @@ export class RemoteSwarmRuntime {
             parentAgentId: state.parentAgentId,
             allowedToolsets: state.allowedToolsets,
             callerToken: workerCallerToken,
-            model: freshMember.model || state.model,
-            effort: state.effort,
+            model: verifiedWorkerModel.canonicalModel,
+            effort: resolveWorkerTurnEffort(freshMember, state.effort),
             workspaceCwd: targetCwd,
             prompt: workerPrompt,
             signal: runAc.signal,
@@ -1609,6 +1639,8 @@ export class RemoteSwarmRuntime {
     const toolHost: RemoteSwarmToolHost = {
       location: state.location,
       model: state.model,
+      effort: state.effort,
+      allowedModels: state.allowedModels,
       workspaceCwd: state.workspaceCwd,
       isWorkerRunning: (name) => Boolean(state.workers.get(name)?.running),
       getInterruptGeneration: () => state.interruptGeneration,
@@ -1841,21 +1873,9 @@ export class RemoteSwarmRuntime {
       return executeSwarmStatusAction(toolHost)
     }
 
-    if (action === 'models') {
-      return {
-        ok: true,
-        current_model: state.model,
-        note: 'Leave model omitted on add so workers inherit the active session model.',
-      }
-    }
-
-    if (action === 'channel') {
-      return executeSwarmChannelAction(toolHost, caller, input.args)
-    }
-
-    if (action === 'add') {
-      return executeSwarmAddAction(toolHost, caller, input.args)
-    }
+    if (action === 'models') return executeSwarmModelsAction(toolHost)
+    if (action === 'channel') return executeSwarmChannelAction(toolHost, caller, input.args)
+    if (action === 'add') return executeSwarmAddAction(toolHost, caller, input.args)
 
     if (action === 'kill') {
       const target =
@@ -1873,23 +1893,7 @@ export class RemoteSwarmRuntime {
       }
     }
 
-    if (action === 'model') {
-      const target =
-        typeof input.args.name === 'string' && input.args.name.trim()
-          ? input.args.name.trim().toLowerCase()
-          : caller
-      const nextModel = typeof input.args.model === 'string' ? input.args.model.trim() : ''
-      if (!nextModel) throw new Error('SWARM_MODEL_REQUIRED')
-      if (state.workers.get(target)?.running) {
-        throw new Error(`SWARM_MEMBER_BUSY:${target}`)
-      }
-      await this.mutateRoster(state, (roster) => {
-        const rec = roster.members[target]
-        if (!rec) throw new Error(`SWARM_MEMBER_NOT_FOUND:${target}`)
-        rec.model = nextModel
-      })
-      return { ok: true, name: target, model: nextModel }
-    }
+    if (action === 'model') return executeSwarmModelAction(toolHost, caller, input.args)
 
     throw new Error(`SWARM_ACTION_UNSUPPORTED:${action}`)
   }

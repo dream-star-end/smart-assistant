@@ -55,9 +55,9 @@ function clearKnobEnv(): void {
 }
 
 describe('Gateway.MAX_CONCURRENT_DELEGATIONS env getter', () => {
-  it('缺省回落 5', () => {
+  it('缺省回落 6', () => {
     clearKnobEnv()
-    assert.equal(caps().max, 5)
+    assert.equal(caps().max, 6)
   })
 
   it('合法值生效', () => {
@@ -65,16 +65,16 @@ describe('Gateway.MAX_CONCURRENT_DELEGATIONS env getter', () => {
     assert.equal(caps().max, 8)
   })
 
-  it('非法值回默认 5', () => {
+  it('非法值回默认 6', () => {
     for (const raw of ['', 'abc', '-1', '0', 'NaN', 'Infinity']) {
       process.env.OPENCLAUDE_DELEGATE_MAX_CONCURRENT = raw
-      assert.equal(caps().max, 5, `raw=${JSON.stringify(raw)} 应回落 5`)
+      assert.equal(caps().max, 6, `raw=${JSON.stringify(raw)} 应回落 6`)
     }
   })
 
-  it('小数 2.9 回落默认 5（非整数非法，不 floor）', () => {
+  it('小数 2.9 回落默认 6（非整数非法，不 floor）', () => {
     process.env.OPENCLAUDE_DELEGATE_MAX_CONCURRENT = '2.9'
-    assert.equal(caps().max, 5)
+    assert.equal(caps().max, 6)
   })
 })
 

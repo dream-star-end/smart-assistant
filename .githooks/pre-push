@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# .githooks/pre-push — Lightweight (<15s) pre-push guard for feat/v5-selfhost (OCV5-904).
+#
+# Activation: git config core.hooksPath .githooks
+#
+# Protections when pushing to refs/heads/feat/v5-selfhost:
+#   1. Block branch deletion and force-push (non-fast-forward history rewrite).
+#   2. Block pushing with uncommitted tracked modifications (prevents pushing untested dirty worktree state).
+#   3. Run Incident trailer gate (scripts/check-v5-fix-trailers.sh) against the pushed commit.
+#   4. Run incremental file-size ratchet (scripts/check-file-size-ratchet.ts --base <base> --head <local_sha>) if present.
+#   5. Run A0 monotonic guard (scripts/check-a0-monotonic.ts --base <base>) if present.
+#
+# Pushes to non-protected feature branches return 0 immediately so normal development is never impeded.
+set -euo pipefail
+
+ZERO_SHA="0000000000000000000000000000000000000000"
+PROTECTED_REF="${OC_PRE_PUSH_TARGET_REF:-refs/heads/feat/v5-selfhost}"
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$REPO_ROOT"
+
+say() { printf '[pre-push] %s\n' "$*" >&2; }
+fail() { printf '✗ [pre-push] %s\n' "$*" >&2; exit 1; }
+
+run_tsx() {
+  local script_path="$1"
+  shift
+  if [[ -n "${OC_PRE_PUSH_TSX_BIN:-}" ]]; then
+    "$OC_PRE_PUSH_TSX_BIN" "$script_path" "$@"
+  elif [[ -x "$REPO_ROOT/node_modules/.bin/tsx" ]]; then
+    "$REPO_ROOT/node_modules/.bin/tsx" "$script_path" "$@"
+  elif command -v tsx >/dev/null 2>&1; then
+    tsx "$script_path" "$@"
+  else
+    npx --no-install tsx "$script_path" "$@"
+  fi
+}
+
+# Collect push ref updates from stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>
+target_local_sha=""
+target_remote_sha=""
+found_target=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [[ -n "${remote_ref:-}" ]] || continue
+  if [[ "$remote_ref" == "$PROTECTED_REF" ]]; then
+    found_target=1
+    target_local_sha="$local_sha"
+    target_remote_sha="$remote_sha"
+  fi
+done
+
+if [[ "$found_target" -eq 0 ]]; then
+  exit 0
+fi
+
+# 1. Block branch deletion and force-push (non-fast-forward).
+if [[ "$target_local_sha" == "$ZERO_SHA" ]]; then
+  fail "refusing to delete protected branch $PROTECTED_REF"
+fi
+
+if [[ "$target_remote_sha" != "$ZERO_SHA" ]]; then
+  if ! git cat-file -e "${target_remote_sha}^{commit}" 2>/dev/null; then
+    fail "remote commit ${target_remote_sha:0:12} is not fetched locally; run 'git fetch' and rebase/merge instead of force-pushing $PROTECTED_REF"
+  fi
+  if ! git merge-base --is-ancestor "$target_remote_sha" "$target_local_sha" 2>/dev/null; then
+    fail "force-push / non-fast-forward push to $PROTECTED_REF is forbidden (${target_remote_sha:0:12} is not an ancestor of ${target_local_sha:0:12})"
+  fi
+fi
+
+# 2. Block pushing when tracked files have uncommitted staged/unstaged changes.
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  dirty_list="$(git status --short --untracked-files=no | head -n 20)"
+  fail $'tracked working tree has uncommitted changes; commit or stash and re-verify before pushing to '"$PROTECTED_REF"$':\n'"$dirty_list"
+fi
+
+# Resolve incremental comparison base for ratchet / monotonic checks.
+base_ref=""
+if [[ "$target_remote_sha" != "$ZERO_SHA" ]] && git cat-file -e "${target_remote_sha}^{commit}" 2>/dev/null; then
+  base_ref="$target_remote_sha"
+elif git rev-parse --verify --quiet "origin/feat/v5-selfhost^{commit}" >/dev/null 2>&1; then
+  base_ref="origin/feat/v5-selfhost"
+elif git rev-parse --verify --quiet "${target_local_sha}~1^{commit}" >/dev/null 2>&1; then
+  base_ref="${target_local_sha}~1"
+fi
+
+# 3. Incident trailer closure fast check (pure git + jq, <2s).
+if [[ -f "$REPO_ROOT/scripts/check-v5-fix-trailers.sh" ]]; then
+  say "checking Incident trailers on ${target_local_sha:0:12}..."
+  bash "$REPO_ROOT/scripts/check-v5-fix-trailers.sh" --repo "$REPO_ROOT" --head "$target_local_sha"
+fi
+
+# 4. Incremental file-size ratchet (if present and base resolvable).
+if [[ -f "$REPO_ROOT/scripts/check-file-size-ratchet.ts" && -n "$base_ref" ]]; then
+  say "checking incremental file-size ratchet (${base_ref:0:12}..${target_local_sha:0:12})..."
+  run_tsx "$REPO_ROOT/scripts/check-file-size-ratchet.ts" --base "$base_ref" --head "$target_local_sha"
+fi
+
+# 5. A0 monotonic governance check (if present and base resolvable).
+if [[ -f "$REPO_ROOT/scripts/check-a0-monotonic.ts" && -n "$base_ref" ]]; then
+  say "checking A0 monotonic guard (base ${base_ref:0:12})..."
+  run_tsx "$REPO_ROOT/scripts/check-a0-monotonic.ts" --base "$base_ref"
+elif [[ -f "$REPO_ROOT/scripts/check-a0-monotonic.sh" && -n "$base_ref" ]]; then
+  say "checking A0 monotonic guard (base ${base_ref:0:12})..."
+  bash "$REPO_ROOT/scripts/check-a0-monotonic.sh" --base "$base_ref"
+fi
+
+say "PASS ($PROTECTED_REF @ ${target_local_sha:0:12})"
+exit 0

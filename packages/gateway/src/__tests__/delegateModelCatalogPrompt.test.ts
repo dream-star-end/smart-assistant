@@ -33,8 +33,11 @@ const CURSOR_REAL = [
   'cursor-sonnet-5-high', 'cursor-sonnet-5-low', 'cursor-sonnet-5-max', 'cursor-sonnet-5-medium', 'cursor-sonnet-5-xhigh',
 ]
 
-const mk = (ids: readonly string[], engine: 'ccb' | 'codex' | 'grok' | 'cursor', available = true) =>
-  ids.map((modelId) => ({ modelId, engine, available }))
+const mk = (
+  ids: readonly string[],
+  engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'antigravity',
+  available = true,
+) => ids.map((modelId) => ({ modelId, engine, available }))
 
 describe('parseCursorSlug', () => {
   it('拆出 family / effort / fast', () => {
@@ -80,22 +83,36 @@ describe('renderCursorFamilies:压缩后展开必须与输入集合逐个相等'
 
 describe('renderDelegateModelSection', () => {
   const models = [
-    ...mk(['glm-5.3-zai', 'kimi-k3'], 'ccb'),
+    ...mk(['deepseek-v4-flash', 'glm-5.3-zai', 'kimi-k3'], 'ccb'),
     ...mk(['gpt-6-astra', 'gpt-5.6-sol'], 'codex'),
-    ...mk(['glm-5.3'], 'ccb', false), // 不可用:不得出现
+    ...mk(['deepseek-v4-pro'], 'ccb', false), // 不可用:不得出现
     ...mk(['grok-build'], 'grok'),
+    ...mk(['antigravity-gemini-4-neon', 'antigravity-claude-sonnet-5.5'], 'antigravity'),
     ...mk(CURSOR_REAL, 'cursor'),
   ]
-  it('按 engine 分组、只列 available、不含易变投影戳与在线缓存态、声明服务端重校验', () => {
+  it('按 engine 分组、只列四大家族 available、不含易变投影戳与在线缓存态、声明服务端重校验', () => {
     const s = renderAllModels({ models, projectionRevision: 'rev-42', verifiedAt: 1 })
     assert.ok(s.startsWith(DELEGATE_MODEL_SECTION_HEADING))
     assert.doesNotMatch(s, /rev-42|已在线核验|仅本地缓存/)
     assert.match(s, /服务端仍会重新校验/)
-    assert.match(s, /^- CCB: `glm-5\.3-zai`, `kimi-k3`$/m)
+    assert.match(s, /Grok \/ Gemini \/ GPT \/ DeepSeek/)
+    assert.match(s, /DELEGATE_MODEL_FAMILY_NOT_ALLOWED/)
+    assert.match(s, /^- CCB: `deepseek-v4-flash`$/m)
     assert.match(s, /^- Codex: `gpt-5\.6-sol`, `gpt-6-astra`$/m)
     assert.match(s, /^- Grok: `grok-build`$/m)
-    assert.match(s, /^- Cursor: .*`cursor-fable-5\.1-\{low,medium,high,xhigh,max\}`/m)
-    assert.ok(!/`glm-5\.3`[,\n]/.test(s), '不可用型号不得列出')
+    assert.match(s, /^- Antigravity: `antigravity-gemini-4-neon`$/m)
+    assert.match(s, /^- Cursor: `cursor-gemini-3\.8-flash-\{low,medium,high\}`, `cursor-grok-4\.6-\{low,medium,high,xhigh\}\[-fast\]`$/m)
+    for (const forbidden of [
+      'deepseek-v4-pro',
+      'glm-5.3-zai',
+      'kimi-k3',
+      'antigravity-claude-sonnet-5.5',
+      'cursor-fable-5.1',
+      'cursor-opus-5',
+      'cursor-sonnet-5',
+    ]) {
+      assert.ok(!s.includes(forbidden), `非四大家族或不可用型号不得列出: ${forbidden}`)
+    }
   })
   it('verifiedAt / projectionRevision 变化不改变渲染字节（缓存前缀稳定）', () => {
     const online = renderAllModels({ models, projectionRevision: 'rev-1', verifiedAt: 100 })
@@ -138,20 +155,31 @@ describe('suggestDelegateModels(DELEGATE_MODEL_UNKNOWN 自愈候选)', () => {
 
 describe('buildAgentsSlot 注入「委派可用型号」', () => {
   it('ctx 注入投影 → 段出现在 slot 里', async () => {
-    const slot = await buildAgentsSlot({
-      agentId: 'main',
-      model: 'glm-5.3-zai',
-      delegateModelCatalog: {
-        models: [...mk(['deepseek-v4-flash'], 'ccb'), ...mk(['gpt-6-astra'], 'codex')],
-        projectionRevision: 'p1',
-        verifiedAt: 5,
-      },
-    })
-    assert.match(slot.content, /## 委派可用型号/)
-    assert.match(slot.content, /- CCB: `deepseek-v4-flash`/)
-    const section = slot.content.slice(slot.content.indexOf(DELEGATE_MODEL_SECTION_HEADING))
-      .split(/\n## /)[0]
-    assert.doesNotMatch(section, /- Codex:/)
+    const savedExempt = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+    Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+    try {
+      const slot = await buildAgentsSlot({
+        agentId: 'main',
+        model: 'glm-5.3-zai',
+        delegateModelCatalog: {
+          models: [
+            ...mk(['deepseek-v4-flash'], 'ccb'),
+            ...mk(['gpt-6-astra'], 'codex'),
+            ...mk(['cursor-grok-4.6-high'], 'cursor'),
+          ],
+          projectionRevision: 'p1',
+          verifiedAt: 5,
+        },
+      })
+      assert.match(slot.content, /## 委派可用型号/)
+      assert.match(slot.content, /- CCB: `deepseek-v4-flash`/)
+      const section = slot.content.slice(slot.content.indexOf(DELEGATE_MODEL_SECTION_HEADING))
+        .split(/\n## /)[0]
+      assert.match(section, /- Codex: `gpt-6-astra`/)
+      assert.doesNotMatch(section, /- Cursor:/)
+    } finally {
+      if (savedExempt !== undefined) process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = savedExempt
+    }
   })
   it('无投影(null)→ 提示行而非静默消失', async () => {
     const slot = await buildAgentsSlot({ agentId: 'main', model: 'glm-5.3-zai', delegateModelCatalog: null })
@@ -194,12 +222,15 @@ describe('commercial delegation catalog matches billed execution', () => {
     { modelId: 'deepseek-v4-flash', engine: 'ccb' as const, available: true },
     { modelId: 'grok-build', engine: 'grok' as const, available: true },
     { modelId: 'gpt-6-astra', engine: 'codex' as const, available: true },
+    { modelId: 'antigravity-gemini-4-neon', engine: 'antigravity' as const, available: true },
     { modelId: 'cursor-grok-4.6-high', engine: 'cursor' as const, available: true },
     { modelId: 'zcode-glm-5.3', engine: 'zcode' as const, available: true },
-    { modelId: 'antigravity-gemini-4-argon', engine: 'antigravity' as const, available: true },
+    { modelId: 'glm-5.3-flash-go', engine: 'ccb' as const, available: true },
+    { modelId: 'antigravity-claude-sonnet-5.5', engine: 'antigravity' as const, available: true },
+    { modelId: 'antigravity-gpt-oss-120b', engine: 'antigravity' as const, available: true },
   ]
   const input = { models, projectionRevision: 'contract', verifiedAt: 1 }
-  it('every advertised commercial slug passes billed_delegate local preflight', () => {
+  it('every advertised commercial slug passes billed_delegate local preflight (including Antigravity Gemini)', () => {
     const text = renderDelegateModelSection(input, {})
     const catalog = parseCatalogResponse({ projection_revision: 'contract', security_epoch: '1',
       models: models.map(m => ({ model_id: m.modelId, display_name: m.modelId,
@@ -207,16 +238,56 @@ describe('commercial delegation catalog matches billed execution', () => {
         supported_efforts: [], supports_vision: false, capability_zero: false, supports_thinking: false })) })
     const advertised = [...text.matchAll(/^- [^:]+: (.+)$/gm)]
       .flatMap(line => [...line[1].matchAll(/`([^`]+)`/g)].map(match => match[1]))
-    assert.deepEqual(advertised, ['deepseek-v4-flash', 'grok-build'])
+    assert.deepEqual(advertised, [
+      'deepseek-v4-flash',
+      'gpt-6-astra',
+      'grok-build',
+      'antigravity-gemini-4-neon',
+    ])
     for (const model of advertised) {
       assert.doesNotThrow(() => decideLocalExecution({ view: catalog, agent: { id: 'member' },
         model, kind: 'billed_delegate', env: {} }))
     }
-    for (const m of models.slice(2)) assert.ok(!text.includes(m.modelId), m.modelId)
+    assert.ok(!text.includes('cursor-grok-4.6-high'))
+    assert.throws(
+      () => decideLocalExecution({ view: catalog, agent: { id: 'member' },
+        model: 'cursor-grok-4.6-high', kind: 'billed_delegate', env: {} }),
+      (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_CODEX_UNSUPPORTED',
+    )
+    for (const forbidden of [
+      'zcode-glm-5.3',
+      'glm-5.3-flash-go',
+      'antigravity-claude-sonnet-5.5',
+      'antigravity-gpt-oss-120b',
+    ]) {
+      assert.ok(!text.includes(forbidden), forbidden)
+      assert.throws(
+        () => decideLocalExecution({ view: catalog, agent: { id: 'member' },
+          model: forbidden, kind: 'billed_delegate', env: {} }),
+        (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_MODEL_FAMILY_NOT_ALLOWED',
+      )
+    }
+    assert.match(text, /DELEGATE_MODEL_FAMILY_NOT_ALLOWED/)
     assert.match(text, /DELEGATE_CODEX_UNSUPPORTED/)
   })
-  it('selfhost exemption retains every available engine', () => {
+  it('selfhost exemption retains 4-family engines (including cursor-grok) while excluding non-4-family models', () => {
     const text = renderDelegateModelSection(input, { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' })
-    for (const m of models) assert.ok(text.includes(m.modelId), m.modelId)
+    for (const allowed of [
+      'deepseek-v4-flash',
+      'grok-build',
+      'gpt-6-astra',
+      'antigravity-gemini-4-neon',
+      'cursor-grok-4.6-high',
+    ]) {
+      assert.ok(text.includes(allowed), allowed)
+    }
+    for (const forbidden of [
+      'zcode-glm-5.3',
+      'glm-5.3-flash-go',
+      'antigravity-claude-sonnet-5.5',
+      'antigravity-gpt-oss-120b',
+    ]) {
+      assert.ok(!text.includes(forbidden), `selfhost must still hide non-4-family: ${forbidden}`)
+    }
   })
 })

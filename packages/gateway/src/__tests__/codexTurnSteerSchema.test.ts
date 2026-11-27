@@ -436,3 +436,37 @@ describe('Codex 0.171.0 generated schema fixture (runtime image pin 2026-11-23, 
     assert.deepEqual(audioKeys, [['url'], ['fileId']])
   })
 })
+
+describe('Codex 0.172.0 generated schema fixture (runtime image pin 2026-11-26, OCV5-899)', () => {
+  const root172 = new URL('./fixtures/codex-app-server-0.172.0/', import.meta.url)
+  const read172 = (name: string): Buffer => readFileSync(new URL(name, root172))
+  const manifest172 = JSON.parse(read172('manifest.json').toString('utf8')) as JsonObject
+
+  it('pins 0.172.0 and proves turn/steer and requestUserInput are byte-identical to 0.171.0', () => {
+    assert.equal(manifest172.codexVersion, '0.172.0')
+    assert.equal(
+      manifest172.binarySha256,
+      'ad83b94c093f0cdd8176a6bc8005a461bdf23a759863e157d40f562b8a9d664d',
+    )
+    assert.equal(manifest172.identicalTo, 'codex-app-server-0.171.0')
+    assert.deepEqual(manifest172.methods, ['turn/steer', 'item/tool/requestUserInput'])
+    const generated172 = object(manifest172.generatedFiles, 'manifest172.generatedFiles')
+    const repository172 = object(manifest172.repositoryFiles, 'manifest172.repositoryFiles')
+    const manifest171 = JSON.parse(
+      readFileSync(new URL('./fixtures/codex-app-server-0.171.0/manifest.json', import.meta.url)).toString('utf8'),
+    ) as JsonObject
+    const generated171 = object(manifest171.generatedFiles, 'manifest171.generatedFiles')
+    for (const name of [
+      'TurnSteerParams.json',
+      'TurnSteerResponse.json',
+      'ToolRequestUserInputParams.json',
+      'ToolRequestUserInputResponse.json',
+    ] as const) {
+      const raw = read172(name)
+      assert.equal(repository172[name], sha256(raw), `${name} repository bytes`)
+      assert.equal(raw.at(-1), 0x0a, `${name} repository fixture must end in LF`)
+      assert.equal(generated172[name], sha256(raw.subarray(0, -1)), `${name} generator bytes`)
+      assert.equal(generated172[name], generated171[name], `${name} must not drift from 0.171.0`)
+    }
+  })
+})

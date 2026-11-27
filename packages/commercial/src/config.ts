@@ -632,6 +632,9 @@ export const commercialConfigSchema = z
      * - 未配置 → Antigravity relay 与账号接入返回 ANTIGRAVITY_NOT_CONFIGURED
      */
     OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET: z.string().trim().regex(/^GOCSPX-[A-Za-z0-9_-]{20,64}$/).optional(),
+    /** OCV5-894: Optional per-route Antigravity relay primary/aux concurrency cap (`0` = unlimited). */
+    OC_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE: z.coerce.number().int().min(0).optional(),
+    OC_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE: z.coerce.number().int().min(0).optional(),
     /**
      * Deepgram Nova-3 streaming ASR key for browser voice input.
      *

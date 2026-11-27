@@ -446,12 +446,15 @@ describe('layering', () => {
       }
     }
     visit('index.ts')
-    assert.deepEqual([...seen].sort(), ['errors.ts', 'index.ts', 'log.ts', 'redact.ts', 'trace.ts'])
+    assert.deepEqual(
+      [...seen].sort(),
+      ['errors.ts', 'index.ts', 'log.ts', 'redact.ts', 'sharedUtils.ts', 'trace.ts'],
+    )
     assert.deepEqual(
       readdirSync(SRC)
         .filter((f) => f.endsWith('.ts'))
         .sort(),
-      ['errors.ts', 'index.ts', 'log.ts', 'node.ts', 'redact.ts', 'trace.ts'],
+      ['errors.ts', 'index.ts', 'log.ts', 'node.ts', 'redact.ts', 'sharedUtils.ts', 'trace.ts'],
       'a new kernel file must be reachable from index.ts or node.ts and checked here',
     )
   })

@@ -1,4 +1,7 @@
-import { mintAntigravityRelayRoute } from '../billing/antigravityRouteContext.js'
+import {
+  type AntigravityRelayPricingOverride,
+  mintAntigravityRelayRoute,
+} from '../billing/antigravityRouteContext.js'
 /**
  * Per-turn Antigravity admission on master (OCV5-415 P2): pick a gemini OAuth
  * account, mint the CLI's limited token for it, then mint the relay route
@@ -55,6 +58,10 @@ export async function admitAntigravityTurn(
     relayPort: number
     /** Optional canonical Antigravity model ids additionally allowed for local native swarm members. */
     allowedModelIds?: readonly string[]
+    /** Optional admission-frozen pricing override for delegate relay budget checks (OCV5-897 B2). */
+    pricingOverride?: AntigravityRelayPricingOverride
+    /** When true (delegation, OCV5-897 B3), fail closed with ANTIGRAVITY_NO_ACCOUNT when pool is full. */
+    strictCapacity?: boolean
   },
   deps: {
     clientSecret: string
@@ -75,6 +82,7 @@ export async function admitAntigravityTurn(
       userId: args.userId,
       modelId: args.modelId,
       reserveToken: args.requestId,
+      ...(args.strictCapacity ? { strictCapacity: true } : {}),
       skip: async (accountId) => {
         if (deadGrants.has(accountId)) return true
         // A KV hiccup must not block admission: treat the model as usable.
@@ -138,6 +146,7 @@ export async function admitAntigravityTurn(
       budgetCredits: args.budgetCredits,
       relayPort: args.relayPort,
       ...(effectiveAllowedModelIds ? { allowedModelIds: effectiveAllowedModelIds } : {}),
+      ...(args.pricingOverride ? { pricingOverride: args.pricingOverride } : {}),
     })
   } catch (err) {
     releaseInflight(args.requestId)

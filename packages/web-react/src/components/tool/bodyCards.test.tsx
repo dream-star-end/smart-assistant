@@ -255,6 +255,6 @@ describe("OCV5-838 Edit Diff 词级高亮 / sticky +/- / 折行与复制新代�
     const copyBtn = screen.getByRole("button", { name: "复制新代码" });
     fireEvent.click(copyBtn);
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("const mode = 'atelier';"));
-    expect(copyBtn.querySelector("svg")).toHaveClass("oc-check-pop");
+    await waitFor(() => expect(copyBtn.querySelector("svg")).toHaveClass("oc-check-pop"));
   });
 });

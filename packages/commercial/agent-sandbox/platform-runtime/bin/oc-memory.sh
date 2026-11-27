@@ -19,6 +19,10 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "help" ]; then
   cat <<'EOF'
 usage:
   oc-memory core-search "<query>" [--limit N] [--offset N]
+  oc-memory project-search "<query>" [--project UUID] [--limit N] [--offset N]
+  oc-memory skill-list [--source platform|user]
+  oc-memory skill-search "<query>" [--limit N]
+  oc-memory skill-view <name> [--subfile <path>]
   oc-memory session-search "<query>" [--limit N] [--agent-id ID] [--summarize]
   oc-memory archival-add "<text>" [--tags a,b,c]
   oc-memory archival-search "<query>" [--limit N]

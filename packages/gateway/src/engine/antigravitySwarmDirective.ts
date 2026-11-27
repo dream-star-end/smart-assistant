@@ -15,7 +15,13 @@ import {
   parseSwarmSlashCommand,
 } from '@openclaude/protocol'
 import { antigravityRoot, antigravitySessionBrainDir } from './antigravityPlatform.js'
-import { remoteSwarmLocationForSession } from '../remoteSwarmRuntime.js'
+import {
+  extractRouteAllowedRemoteSwarmModels,
+  filterAvailableRemoteSwarmModels,
+  formatAvailableRemoteSwarmModelsHint,
+  lookupRemoteSwarmRuntimeForSession,
+  remoteSwarmLocationForSession,
+} from '../remoteSwarmRuntime.js'
 
 function formatLocalSwarmCliModelGroup(canonicalModelId: string): string | null {
   const entry = ANTIGRAVITY_ENGINE_MODELS.find((m) => m.id === canonicalModelId)
@@ -113,6 +119,12 @@ export const ANTIGRAVITY_SWARM_OFF_DIRECTIVE = [
   '',
 ].join('\n')
 
+export {
+  extractRouteAllowedRemoteSwarmModels,
+  filterAvailableRemoteSwarmModels,
+  formatAvailableRemoteSwarmModelsHint,
+}
+
 export interface AntigravitySwarmCompactionContext {
   readonly isAntigravityTurn: boolean
   readonly isRemoteAntigravity: boolean
@@ -121,6 +133,7 @@ export interface AntigravitySwarmCompactionContext {
   readonly appliedMode?: 'on_full' | 'on_resumed' | 'off_with_history'
   readonly appliedDirectivePrefix?: string
   readonly availableLocalSwarmModels?: readonly string[]
+  readonly availableRemoteSwarmModels?: readonly string[]
   readonly liveMonitorNames?: readonly string[]
 }
 
@@ -313,9 +326,10 @@ function buildAntigravitySwarmOnDirective(opts: {
   hasHistoricalSwarm: boolean
   liveMonitorNames?: readonly string[]
   availableLocalSwarmModels?: readonly string[]
+  availableRemoteSwarmModels?: readonly string[]
 }): string {
   const swarmToolsIntro = opts.isRemoteAntigravity
-    ? '用户已显式开启远端 Antigravity 蜂群（Swarm）模式（由容器侧蜂群运行时驱动，通过 `swarm`、`post_message`、`read_board`、`swarm_wait` 四个 MCP 工具编排并行成员，每个成员同样运行在远端 Gemini 并拥有完整的本地工作区工具与 Git Worktree 隔离）。请按以下规则作为 Coordinator 编排蜂群：'
+    ? '用户已显式开启远端 Antigravity 蜂群（Swarm）模式（由容器侧蜂群运行时驱动，通过 `swarm`、`post_message`、`read_board`、`swarm_wait` 四个 MCP 工具编排并行成员，每个成员同样运行在远端 Antigravity 节点并拥有完整的本地工作区工具与 Git Worktree 隔离）。请按以下规则作为 Coordinator 编排蜂群：'
     : '用户已显式开启 Antigravity 原生蜂群（Swarm）模式。本 OpenClaude 蜂群指令覆盖原生蜂群说明中的模型选择、工作分派、看板链接与推送条款；请按以下规则作为 Coordinator 编排蜂群：'
   const liveMonitors = (opts.liveMonitorNames ?? [])
     .map((n) => n.trim())
@@ -330,23 +344,36 @@ function buildAntigravitySwarmOnDirective(opts: {
   const localModelsHint = opts.isRemoteAntigravity
     ? null
     : formatAvailableLocalSwarmModelsHint(opts.availableLocalSwarmModels)
+  const hasExplicitRemoteAllowlist =
+    opts.isRemoteAntigravity && Array.isArray(opts.availableRemoteSwarmModels)
+  const remoteModelsHint = opts.isRemoteAntigravity
+    ? formatAvailableRemoteSwarmModelsHint(opts.availableRemoteSwarmModels)
+    : null
   const modelRuleLine = opts.isRemoteAntigravity
-    ? '2. 招募成员时**不要指定 `model` 参数**（留空以继承当前会话模型，确保计费与权限一致）。'
+    ? remoteModelsHint
+      ? `2. **按成员模型选择**：默认留空 \`model\` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可在 \`swarm{action:"add", model:"..."}\` 中指定（或对 \`waiting\` 成员用 \`swarm{action:"model", name:"...", model:"..."}\` 切换，亦可用 \`swarm{action:"models"}\` 查询）。仅可使用本次已放行的远端 Antigravity 模型：${remoteModelsHint}（未在白名单内、非远端或跨引擎模型会被运行时拒绝；系统按各成员实际模型独立计费与配额隔离）。`
+      : hasExplicitRemoteAllowlist
+        ? '2. **按成员模型选择**：本轮未放行额外远端蜂群成员模型，招募成员时请留空 `model` 继承当前会话模型（切勿指定未放行、非远端或跨引擎模型）。'
+        : '2. **按成员模型选择**：默认留空 `model` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可先用 `swarm{action:"models"}` 查看本次可用远端 Antigravity 模型，再在 `swarm{action:"add", model:"..."}` 中指定（或对 `waiting` 成员用 `swarm{action:"model", name:"...", model:"..."}` 切换；仅限已放行的远端 Antigravity 模型，不支持非远端或跨引擎模型，系统按各成员实际模型独立计费与配额隔离）。'
     : localModelsHint
-      ? `2. **按成员模型选择**：默认留空 \`model\` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可在 \`swarm{action:"add", model:"..."}\` 中指定（或对 \`waiting\` 成员用 \`swarm{action:"model", name:"...", model:"..."}\` 切换）。仅可使用本次已放行的 Antigravity 自带模型：${localModelsHint}（即使 \`swarm{action:"models"}\` 显示其他未授权或旧版模型也请勿选用，中继会按白名单拒放；不支持外部非 Antigravity 模型，系统按各成员实际模型独立计费）。`
+      ? `2. **按成员模型选择（显式分层）**：默认留空 \`model\` 继承当前会话模型；如需按分工显式异构提速（例如轻量调研/整理/快验选更快档位如 \`low\`/\`medium\` 或 \`hydrogen\`，核心攻坚/深度分析用重推理档位如 \`high\`/\`xhigh\`）或按用户要求指定不同模型，可在 \`swarm{action:"add", model:"..."}\` 中指定（或对 \`waiting\` 成员用 \`swarm{action:"model", name:"...", model:"..."}\` 切换；绝不黑盒降级）。仅可使用本次已放行的 Antigravity 自带模型：${localModelsHint}（即使 \`swarm{action:"models"}\` 显示其他未授权或旧版模型也请勿选用，中继会按白名单拒放；不支持外部非 Antigravity 模型，系统按各成员实际模型独立计费）。`
       : hasExplicitLocalAllowlist
         ? '2. **按成员模型选择**：本轮绑定账号未放行额外蜂群成员模型，招募成员时请留空 `model` 继承当前会话模型（切勿指定未放行或外部模型）。'
-        : '2. **按成员模型选择**：默认留空 `model` 继承当前会话模型；如需按分工或用户要求为特定成员指定不同模型，可先用 `swarm{action:"models"}` 查看 Antigravity 自带可用模型，再在 `swarm{action:"add", model:"..."}` 中指定（或对 `waiting` 成员用 `swarm{action:"model", name:"...", model:"..."}` 切换；仅限平台已放行的 Antigravity 自带模型，不支持外部模型，系统按实际模型独立计费）。'
+        : '2. **按成员模型选择（显式分层）**：默认留空 `model` 继承当前会话模型；如需按分工显式异构选模（轻量探索/整理可选快档，重推理攻坚用高档）或按用户要求指定不同模型，可先用 `swarm{action:"models"}` 查看 Antigravity 自带可用模型，再在 `swarm{action:"add", model:"..."}` 中指定（或对 `waiting` 成员用 `swarm{action:"model", name:"...", model:"..."}` 切换；仅限平台已放行的 Antigravity 自带模型，不支持外部模型，系统按实际模型独立计费）。'
   const resumedModelRule = opts.isRemoteAntigravity
-    ? '招募成员不传 `model`'
+    ? remoteModelsHint
+      ? `招募成员默认留空 \`model\` 继承主模型，也可按需指定已放行的远端 Antigravity 模型（${remoteModelsHint}；勿选列表外模型）`
+      : hasExplicitRemoteAllowlist
+        ? '招募成员留空 `model` 继承主模型'
+        : '招募成员默认留空 `model` 继承主模型，也可按需指定已放行的远端 Antigravity 模型'
     : localModelsHint
-      ? `招募成员默认留空 \`model\` 继承主模型，也可按需指定已放行的 Antigravity 自带模型（${localModelsHint}；勿选列表外模型）`
+      ? `招募成员默认留空 \`model\` 继承主模型，也可按分工显式指定已放行的 Antigravity 自带模型（${localModelsHint}；勿选列表外模型）`
       : hasExplicitLocalAllowlist
         ? '招募成员留空 `model` 继承主模型'
         : '招募成员默认留空 `model` 继承主模型，也可按需指定已放行的 Antigravity 自带模型'
   const resumedLocalWorkerBoundary = opts.isRemoteAntigravity
     ? ''
-    : '；原生 worker 无 MCP 工具（`brief` 勿要求调 MCP）'
+    : '；原生 worker 无 MCP 工具（`brief` 勿要求调 MCP，但可在 `run_command` 直调 `oc-memory`/`oc-web`/`oc-lit`/`oc-cite`/`oc-docx`/`oc-review`/`rg` 等 CLI）'
 
   // Remote Antigravity runs via containerLane.ts and cannot inspect remote CLI
   // internal 512k compaction (`step_type=23`), so remote swarm-ON turns always
@@ -354,7 +381,7 @@ function buildAntigravitySwarmOnDirective(opts: {
   if (opts.hasHistoricalSwarm && !opts.isRemoteAntigravity) {
     return [
       ANTIGRAVITY_SWARM_ACTIVE_MARKER,
-      `${ANTIGRAVITY_SWARM_RESUMED_PREFIX}同任务可复用既有蜂群，多写手并行改码传 \`workspace:"share"\` 划清文件所有权，**同任务收口或切换无关新任务前均须先合入所有 \`share\`/\`branch\` 改动**再 \`swarm{action:"kill"}\`；${resumedModelRule}${resumedLocalWorkerBoundary}；**严禁招募 \`monitor\` / \`monitor-N\` 与 \`narrator\` / \`narrator-N\`**；收口前先 \`kill\` 已完工且不再需要的 worker，再发不带 \`@all\` 的 \`[done] <总结>\`（**严禁 \`@all [done]\`**），切勿输出本地 \`open_board\` 链接。`,
+      `${ANTIGRAVITY_SWARM_RESUMED_PREFIX}去中心化减负：上下游 P2P 直接 \`@下一环\` 交接（禁把 \`@coordinator\` 当 CC，仅终态/阻塞才唤醒），引历史贴写 \`#seq\`，热上下文可 \`fork:"coordinator"\`，多写手收口可派 \`integrator\` 预合并自检；同任务可复用既有蜂群，多写手并行改码传 \`workspace:"share"\` 划清文件所有权，**同任务收口或切换无关新任务前均须先合入所有 \`share\`/\`branch\` 改动**再 \`swarm{action:"kill"}\`；${resumedModelRule}${resumedLocalWorkerBoundary}；**严禁招募 \`monitor\` / \`monitor-N\` 与 \`narrator\` / \`narrator-N\`**；收口前先 \`kill\` 已完工且不再需要的 worker，再发不带 \`@all\` 的 \`[done] <总结>\`（**严禁 \`@all [done]\`**），切勿输出本地 \`open_board\` 链接。`,
       ...(legacyMonitorCleanupLine ? [legacyMonitorCleanupLine] : []),
       '',
     ].join('\n')
@@ -364,12 +391,12 @@ function buildAntigravitySwarmOnDirective(opts: {
     ANTIGRAVITY_SWARM_ACTIVE_MARKER,
     swarmToolsIntro,
     opts.isRemoteAntigravity
-      ? '1. 若任务可拆分为 2 个及以上可并行推进的独立子方向（或需要独立校验者 review），先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员（蜂群内 `verifier` 仅做功能自测/交叉核验，T0/T1 无需配，不替代 T2 跨家族独立 `auditor`；需跨引擎/跨家族审计时用 `delegate_task`；**严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N`**，OpenClaude 网关已内置零推理停滞检测与网页端实时 SwarmBoard 渲染），随后调用 `swarm_wait{since:...}` 等待成员汇报并用 `read_board` 审阅结果。'
-      : '1. **自包含编排与工具边界**：若任务可拆分为 2 个及以上可并行推进的独立子方向，先用 `swarm{action:"title", title:"..."}` 命名蜂群，再用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员，随后调用 `swarm_wait{since:...}` 等待汇报并用 `read_board` 审阅结果。注意：① 原生蜂群 worker **仅有 Antigravity 内置工具、不含 `openclaude-memory` MCP 工具**（写 `brief` 时勿要求 worker 调用 `oc_bash` / `oc_grep` / `skill_view` 等 MCP 工具）；② 蜂群内 `verifier` 仅做功能自测/交叉核验（T0/T1 无需配，不替代 T2 跨家族独立 `auditor`；需跨引擎/跨家族审计时请改用 `delegate_task`）；③ **严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N` 成员**（OpenClaude 网关已接管零推理停滞检测与网页端 SwarmBoard 实时渲染）。',
+      ? '1. **去中心化编排与工具边界**：若任务可拆分为 2 个及以上可并行推进的独立子方向（简单/强串行任务或无正文的 `/swarm` 直接回复或给出拆分建议，不必强行招募），协调者不做重活/单点路由——开局仅做最小边界切分与契约约定即用 `swarm{action:"title", title:"..."}` 命名并发车，用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员，随后 `swarm_wait{since:...}` 等终态或阻塞汇报并用 `read_board` 审阅。注意：① **P2P 交接防瓶颈**：`@name` 是唤醒门铃而非抄送（CC），在 `brief` 中明确下游交接链（如 `scout -> author <-> verifier/integrator`），要求成员直接 `@下一环` 完成交接与返修，**仅在最终 `[done]` 交付、需要拍板或遇无法自解阻塞时才 `@coordinator`**；② **分层自治与降噪**：远端 worker 每次以全新独立会话启动，须靠自包含 `brief` 与历史贴号 `#seq` 传递上下文（严禁整段复制粘贴转述），成员 >4 或多模块时用 `swarm{action:"channel", op:"create"}` 开独立 `#channel` 消化过程讨论（`main` 只留跨区决策与终态），允许主 worker 按需自主 `swarm{action:"add"}` 拉 helper 并自行整合回收；③ 蜂群内 `verifier` 仅做功能自测/交叉核验（T0/T1 无需配，不替代 T2 跨家族独立 `auditor`；需跨引擎/跨家族审计时用 `delegate_task`）；④ **严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N`**（OpenClaude 网关已内置零推理停滞检测与网页端实时 SwarmBoard 渲染）。'
+      : '1. **自包含编排与工具边界**：若任务可拆分为 2 个及以上可并行推进的独立子方向（简单/强串行任务或无正文的 `/swarm` 直接回复或给出拆分建议，不必强行招募），协调者不做重活/单点路由——开局仅做最小边界切分与契约约定即用 `swarm{action:"title", title:"..."}` 命名并发车，用 `swarm{action:"add", name:"...", brief:"..."}` 招募精简、职责不重叠的成员，随后 `swarm_wait{since:...}` 等终态或阻塞汇报并用 `read_board` 审阅。注意：① **P2P 交接与分层自治（防协调者瓶颈）**：`@name` 是唤醒门铃而非抄送（CC），在 `brief` 中明确下游交接链（如 `scout -> author <-> verifier/integrator`），要求成员直接 `@下一环` 完成交接与返修，**仅在最终 `[done]` 交付、需要拍板或遇无法自解阻塞时才 `@coordinator`**；跨成员引用历史汇报一律写贴号 `#seq`（严禁复制粘贴全文转述），需继承协调者已读热上下文时传 `fork:"coordinator"`，成员 >4 或多模块时用 `swarm{action:"channel", op:"create"}` 开独立 `#channel` 消化过程讨论（`main` 只留跨区决策与终态），允许主 worker 自主 `swarm{action:"add"}` 拉 helper 并自行整合回收；② **本地原生 worker 工具边界**：原生蜂群 worker **仅有 Antigravity 内置工具、不含 `openclaude-memory` MCP 工具**（写 `brief` 时勿要求调 `oc_bash` / `oc_grep` / `skill_view` 等 MCP 工具名），但**可直接在 `run_command` 中调用容器预装 OpenClaude CLI**（`oc-memory core-search/project-search/session-search/archival-search/skill-search/skill-view/skill-list`、`oc-web`、`oc-lit`、`oc-cite`、`oc-docx`、`oc-review`、`oc-stylecheck`、`oc-figcheck`、`rg`），耗时 >10s 的命令配合 `NotificationTimeoutSeconds` 等系统异步唤醒（禁 `manage_task` 轮询），尽量由 worker 自主完成查询与长测，无需回传协调者代跑；③ 蜂群内 `verifier` 仅做功能自测/交叉核验（T0/T1 无需配，不替代 T2 跨家族独立 `auditor`；需跨引擎/跨家族审计时请改用 `delegate_task`）；④ **严禁招募 `monitor` / `monitor-N` 与 `narrator` / `narrator-N` 成员**（OpenClaude 网关已接管零推理停滞检测与网页端 SwarmBoard 实时渲染）。',
     ...(legacyMonitorCleanupLine ? [legacyMonitorCleanupLine] : []),
     modelRuleLine,
     '3. **生命周期边界（仅限本轮蜂群开启时）**：同任务续聊可复用既有蜂群；若切换到全新无关任务，确认旧成员无未合入改动后再 `swarm{action:"kill"}` 回收旧 worker（或开独立频道隔离）并更新 `title`。后续若关闭蜂群开关，不得再自动复用旧蜂群。',
-    '4. **Git 仓库并行写手与防丢合入**：`workspace:"share"` 仅用于零交集文件切片的并行写码，须在 `brief` 中划分清晰文件所有权（只读调研/校验成员保留默认 `inherit`）；worker 禁止自行 `git push`，收尾由 coordinator 检查并合入所有 `share`/`branch` 改动到主工作区再 `kill`，最后按项目规范统一 commit/push。',
+    '4. **Git 仓库并行写手与防丢合入**：`workspace:"share"` 仅用于零交集文件切片的并行写码，须在 `brief` 中划分清晰文件所有权（只读调研/校验成员保留默认 `inherit`）；worker 禁止自行 `git push`。多写手完工时，可指派专职 `integrator` / `verifier` worker 在独立工作区先完成各分支预合并、冲突消解与目标单测/类型自检，再交由 coordinator 终审并合入所有 `share`/`branch` 改动到主工作区再 `kill`，最后按项目规范统一 commit/push（避免协调者单线程串行消化全部 diff 与测试）。',
     '5. OpenClaude 网页端会实时原生渲染蜂群看板，**切勿**在回复中输出本地 `open_board` 链接或终端 `/swarm board` 命令。',
     '6. 所有成员收口后，先调用 `swarm{action:"kill"}` 清理已完工且不再需要的 worker（避免残留空挂），再在讨论板发一行不带 `@all` 的 `[done] <总结>`（**严禁使用 `@all [done]`**，避免无谓唤醒休眠成员），最后向用户交付清晰、完整的最终汇总（含各独立 worktree 的合入确认结果）。',
     '',
@@ -386,6 +413,8 @@ export function applyAntigravitySwarmTurnDirective(opts: {
   liveMonitorNames?: readonly string[]
   /** Server-projected local Antigravity canonical model ids available to this user (OCV5-879). */
   availableLocalSwarmModels?: readonly string[]
+  /** Authoritative remote Antigravity canonical `*-remote` model ids available for this session (OCV5-893). */
+  availableRemoteSwarmModels?: readonly string[]
 }): AntigravitySwarmTurnDirectiveResult {
   const slashSwarm = parseSwarmSlashCommand(opts.rawUserText)
   const viaSlash = Boolean(slashSwarm?.matched)
@@ -410,6 +439,7 @@ export function applyAntigravitySwarmTurnDirective(opts: {
       hasHistoricalSwarm: opts.hasHistoricalSwarm,
       liveMonitorNames: opts.liveMonitorNames,
       availableLocalSwarmModels: opts.availableLocalSwarmModels,
+      availableRemoteSwarmModels: opts.availableRemoteSwarmModels,
     })
     const appliedDirectivePrefix = `${swarmDirective}\n`
     return {
@@ -503,6 +533,7 @@ const EFFICIENCY_GUARD_CLOSE = '\n</oc-efficiency-guard>\n\n'
             ? []
             : ctx.liveMonitorNames,
         availableLocalSwarmModels: ctx.availableLocalSwarmModels,
+        availableRemoteSwarmModels: ctx.availableRemoteSwarmModels,
       })
       return `${fullDirective}\n${body}`
     }
@@ -625,6 +656,7 @@ export async function prepareAntigravitySwarmInboundDirective(opts: {
   compactionCtx?: AntigravitySwarmCompactionContext
 }> {
   let availableLocalSwarmModels: string[] | undefined
+  let availableRemoteSwarmModels: string[] | undefined
   if (opts.isAntigravityTurn && !opts.isRemoteAntigravity && opts.swarmRequested) {
     const routeAllowed = extractRouteAllowedLocalSwarmModels(opts.routeAllowedModelsRaw)
     if (routeAllowed !== undefined) {
@@ -637,6 +669,24 @@ export async function prepareAntigravitySwarmInboundDirective(opts: {
         // Best-effort discovery hint only; relay enforces authoritative allowlist server-side.
       }
     }
+  } else if (opts.isAntigravityTurn && opts.isRemoteAntigravity && opts.swarmRequested) {
+    const routeAllowed = extractRouteAllowedRemoteSwarmModels(opts.routeAllowedModelsRaw)
+    if (routeAllowed !== undefined) {
+      availableRemoteSwarmModels = routeAllowed
+    } else {
+      try {
+        availableRemoteSwarmModels = filterAvailableRemoteSwarmModels(
+          await opts.loadLocalCatalogModels(),
+        )
+      } catch {
+        // Fail closed on missing/unreadable catalog: restrict to signed primary model only (W1).
+        availableRemoteSwarmModels = []
+      }
+    }
+    lookupRemoteSwarmRuntimeForSession(opts.sessionKey)?.setSessionAllowedModels(
+      opts.sessionKey,
+      availableRemoteSwarmModels,
+    )
   }
   const liveMonitorNames =
     opts.isAntigravityTurn && opts.swarmRequested
@@ -665,6 +715,7 @@ export async function prepareAntigravitySwarmInboundDirective(opts: {
       : false,
     liveMonitorNames,
     ...(availableLocalSwarmModels !== undefined ? { availableLocalSwarmModels } : {}),
+    ...(availableRemoteSwarmModels !== undefined ? { availableRemoteSwarmModels } : {}),
   })
   const compactionCtx: AntigravitySwarmCompactionContext | undefined =
     opts.isAntigravityTurn && result.mode !== 'none'
@@ -683,6 +734,7 @@ export async function prepareAntigravitySwarmInboundDirective(opts: {
             ? { appliedDirectivePrefix: result.appliedDirectivePrefix }
             : {}),
           ...(availableLocalSwarmModels !== undefined ? { availableLocalSwarmModels } : {}),
+          ...(availableRemoteSwarmModels !== undefined ? { availableRemoteSwarmModels } : {}),
           ...(liveMonitorNames.length > 0 ? { liveMonitorNames } : {}),
         }
       : undefined

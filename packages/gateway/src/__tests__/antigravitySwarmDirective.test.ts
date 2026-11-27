@@ -30,7 +30,10 @@ import {
   reconcileAntigravitySwarmDirectiveAfterCompaction,
   type AntigravitySwarmCompactionContext,
 } from '../engine/antigravitySwarmDirective.js'
-import { remoteSwarmLocationForSession } from '../remoteSwarmRuntime.js'
+import {
+  RemoteSwarmRuntime,
+  remoteSwarmLocationForSession,
+} from '../remoteSwarmRuntime.js'
 
 const VALID_CONV_ID = '45696571-dce5-4471-8319-847f203f0b20'
 
@@ -461,13 +464,36 @@ test('OCV5-879: local native swarm allows selecting built-in Antigravity models 
     isRemoteAntigravity: true,
     swarmMode: true,
     hasHistoricalSwarm: false,
-    availableLocalSwarmModels: ['antigravity-gemini-4-neon'],
+    availableRemoteSwarmModels: [
+      'antigravity-gemini-4-neon-remote',
+      'antigravity-gemini-4-carbon-remote',
+      'antigravity-orchestrator-neon-remote',
+    ],
   })
-  assert.ok(remoteFresh.text.includes('不要指定 `model` 参数'))
-  assert.ok(!remoteFresh.text.includes('按成员模型选择'))
+  assert.ok(remoteFresh.text.includes('按成员模型选择'))
+  assert.ok(remoteFresh.text.includes('`antigravity-gemini-4-neon-remote`'))
+  assert.ok(remoteFresh.text.includes('`antigravity-gemini-4-carbon-remote`'))
+  assert.ok(!remoteFresh.text.includes('antigravity-orchestrator-neon-remote'))
+  assert.ok(!remoteFresh.text.includes('不要指定 `model` 参数'))
+
+  const remoteEmptyAllowlist = applyAntigravitySwarmTurnDirective({
+    finalText: '远端受限任务',
+    rawUserText: '远端受限任务',
+    isAntigravityTurn: true,
+    isRemoteAntigravity: true,
+    swarmMode: true,
+    hasHistoricalSwarm: false,
+    availableRemoteSwarmModels: [],
+  })
+  assert.ok(remoteEmptyAllowlist.text.includes('未放行额外远端蜂群成员模型'))
+  assert.ok(!remoteEmptyAllowlist.text.includes('swarm{action:"models"}'))
 
   assert.ok(!ANTIGRAVITY_PREAMBLE.includes('omit `model` on `swarm{action:"add"}`'))
-  assert.ok(ANTIGRAVITY_PREAMBLE.includes('local native swarm allows choosing built-in Antigravity models'))
+  assert.ok(
+    ANTIGRAVITY_PREAMBLE.includes(
+      'both local native swarm and remote swarm allow choosing authorized models from the turn\'s Swarm directive when helpful',
+    ),
+  )
 })
 
 test('OCV5-881: extractRouteAllowedLocalSwarmModels honors master-injected bound-account allowlist and fails closed on empty set', () => {
@@ -631,7 +657,9 @@ test('OCV5-882: swarm directives drop unreachable native swarm skill and enforce
   })
   assert.ok(!remoteResumed.text.includes(ANTIGRAVITY_SWARM_RESUMED_PREFIX))
   assert.ok(remoteResumed.text.includes('4. **Git 仓库并行写手与防丢合入**'))
-  assert.ok(remoteResumed.text.includes('不要指定 `model` 参数'))
+  assert.ok(remoteResumed.text.includes('按成员模型选择'))
+  assert.ok(remoteResumed.text.includes('swarm{action:"models"}'))
+  assert.ok(!remoteResumed.text.includes('不要指定 `model` 参数'))
   assert.ok(!remoteResumed.text.includes('原生 worker 无 MCP 工具'))
 })
 
@@ -691,7 +719,7 @@ test('OCV5-882 P0-3: reconcileAntigravitySwarmDirectiveAfterCompaction upgrades 
   assert.equal(remoteWithHistory.mode, 'on')
   assert.equal(remoteWithHistory.isResumedCompact, false)
   assert.ok(!remoteWithHistory.text.includes(ANTIGRAVITY_SWARM_RESUMED_PREFIX))
-  assert.ok(remoteWithHistory.text.includes('不要指定 `model` 参数'))
+  assert.ok(remoteWithHistory.text.includes('按成员模型选择'))
   assert.ok(remoteWithHistory.text.includes('6. 所有成员收口后'))
   assert.ok(remoteWithHistory.text.includes('残留原生辅助成员（`monitor`）'))
   assert.ok(remoteWithHistory.text.endsWith(`\n${userBody}`))
@@ -985,10 +1013,100 @@ test('OCV5-882 Blocker-2: prepareAntigravitySwarmInboundDirective always sends f
     assert.equal(prepared.result.mode, 'on')
     assert.equal(prepared.result.isResumedCompact, false)
     assert.equal(prepared.compactionCtx?.appliedMode, 'on_full')
+    assert.deepEqual(
+      prepared.compactionCtx?.availableRemoteSwarmModels,
+      [],
+      'W1: missing route allowlist + empty catalog must fail closed to [] instead of expanding to full built-in set',
+    )
     assert.ok(!prepared.result.text.includes(ANTIGRAVITY_SWARM_RESUMED_PREFIX))
-    assert.ok(prepared.result.text.includes('不要指定 `model` 参数'))
+    assert.ok(prepared.result.text.includes('按成员模型选择'))
+    assert.ok(prepared.result.text.includes('未放行额外远端蜂群成员模型'))
     assert.ok(prepared.result.text.includes('6. 所有成员收口后'))
     assert.ok(prepared.result.text.endsWith('\n继续远端任务'))
+
+    // OCV5-893 W1: catalog read error ALSO fails closed to [] and overwrites any stale prior-turn allowlist on runtime
+    const staleRt = new RemoteSwarmRuntime({ rootBase: root })
+    staleRt.registerSession({
+      sessionKey,
+      model: 'antigravity-gemini-4-neon-remote',
+      allowedModels: ['antigravity-gemini-4-neon-remote', 'antigravity-gemini-4-carbon-remote'],
+      workspaceCwd: root,
+    })
+    try {
+      const preparedOnCatalogErr = await prepareAntigravitySwarmInboundDirective({
+        finalText: '目录异常回合',
+        rawUserText: '目录异常回合',
+        sessionKey,
+        isAntigravityTurn: true,
+        isRemoteAntigravity: true,
+        swarmMode: true,
+        swarmRequested: true,
+        remoteSwarmRootBase: root,
+        routeAllowedModelsRaw: undefined,
+        loadLocalCatalogModels: async () => {
+          throw new Error('CATALOG_UNREACHABLE')
+        },
+      })
+      assert.deepEqual(preparedOnCatalogErr.compactionCtx?.availableRemoteSwarmModels, [])
+      assert.ok(preparedOnCatalogErr.result.text.includes('未放行额外远端蜂群成员模型'))
+      await assert.rejects(
+        () =>
+          staleRt.handleToolCall({
+            sessionKey,
+            callerMember: 'coordinator',
+            tool: 'swarm',
+            args: { action: 'add', name: 'blocked-carbon', brief: 'x', model: 'gemini-4-carbon-high' },
+          }),
+        /SWARM_MODEL_NOT_ALLOWED:gemini-4-carbon-high/,
+      )
+    } finally {
+      await staleRt.shutdownAll()
+    }
+
+    // OCV5-893: remote route allowlist / catalog projection populates availableRemoteSwarmModels in directive & compactionCtx
+    const preparedWithRemoteAllowlist = await prepareAntigravitySwarmInboundDirective({
+      finalText: '拆分远端任务',
+      rawUserText: '拆分远端任务',
+      sessionKey,
+      isAntigravityTurn: true,
+      isRemoteAntigravity: true,
+      swarmMode: true,
+      swarmRequested: true,
+      remoteSwarmRootBase: root,
+      routeAllowedModelsRaw: [
+        'antigravity-gemini-4-neon-remote',
+        'antigravity-claude-opus-5.5-remote',
+        'gpt-6.2-astra-remote',
+      ],
+      loadLocalCatalogModels: async () => [],
+    })
+    assert.deepEqual(preparedWithRemoteAllowlist.compactionCtx?.availableRemoteSwarmModels, [
+      'antigravity-gemini-4-neon-remote',
+      'antigravity-claude-opus-5.5-remote',
+    ])
+    assert.ok(preparedWithRemoteAllowlist.result.text.includes('`antigravity-claude-opus-5.5-remote`'))
+    assert.ok(!preparedWithRemoteAllowlist.result.text.includes('gpt-6.2-astra-remote'))
+
+    const preparedFromCatalog = await prepareAntigravitySwarmInboundDirective({
+      finalText: '按目录选模',
+      rawUserText: '按目录选模',
+      sessionKey,
+      isAntigravityTurn: true,
+      isRemoteAntigravity: true,
+      swarmMode: true,
+      swarmRequested: true,
+      remoteSwarmRootBase: root,
+      routeAllowedModelsRaw: undefined,
+      loadLocalCatalogModels: async () => [
+        { modelId: 'antigravity-gemini-4-carbon-remote', engine: 'antigravity', available: true },
+        { modelId: 'antigravity-gemini-4-neon', engine: 'antigravity', available: true },
+        { modelId: 'gpt-6.2-astra-remote', engine: 'codex', available: true },
+      ],
+    })
+    assert.deepEqual(preparedFromCatalog.compactionCtx?.availableRemoteSwarmModels, [
+      'antigravity-gemini-4-carbon-remote',
+    ])
+    assert.ok(preparedFromCatalog.result.text.includes('`antigravity-gemini-4-carbon-remote`'))
 
     // Remote toggle-OFF with historical roster still injects off_with_history suppression
     const preparedOff = await prepareAntigravitySwarmInboundDirective({
@@ -1133,4 +1251,66 @@ test('OCV5-887: hasLiveCoreAntigravitySwarmWorkers detects live core workers for
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('OCV5-894: decentralized swarm directives enforce P2P handoff, #seq citation, fork, #channel, integrator pre-merge, model tiering, and local CLI tools', () => {
+  const localFresh = applyAntigravitySwarmTurnDirective({
+    finalText: '重构五个模块',
+    rawUserText: '重构五个模块',
+    isAntigravityTurn: true,
+    isRemoteAntigravity: false,
+    swarmMode: true,
+    hasHistoricalSwarm: false,
+    availableLocalSwarmModels: ['antigravity-gemini-4-neon', 'antigravity-gemini-4-hydrogen'],
+  })
+  assert.ok(localFresh.text.includes('若任务可拆分为 2 个及以上'))
+  assert.ok(localFresh.text.includes('P2P 交接'))
+  assert.ok(localFresh.text.includes('唤醒门铃而非抄送（CC）'))
+  assert.ok(localFresh.text.includes('#seq'))
+  assert.ok(localFresh.text.includes('fork:"coordinator"'))
+  assert.ok(localFresh.text.includes('#channel'))
+  assert.ok(localFresh.text.includes('integrator'))
+  assert.ok(localFresh.text.includes('oc-memory'))
+  assert.ok(localFresh.text.includes('skill-search'))
+  assert.ok(localFresh.text.includes('NotificationTimeoutSeconds'))
+  assert.ok(localFresh.text.includes('显式分层'))
+
+  const localResumed = applyAntigravitySwarmTurnDirective({
+    finalText: '继续下一阶段',
+    rawUserText: '继续下一阶段',
+    isAntigravityTurn: true,
+    isRemoteAntigravity: false,
+    swarmMode: true,
+    hasHistoricalSwarm: true,
+    availableLocalSwarmModels: ['antigravity-gemini-4-neon', 'antigravity-gemini-4-hydrogen'],
+  })
+  assert.ok(localResumed.text.includes('P2P'))
+  assert.ok(localResumed.text.includes('#seq'))
+  assert.ok(localResumed.text.includes('integrator'))
+  assert.ok(localResumed.text.includes('oc-memory'))
+  assert.ok(
+    localResumed.text.length < localFresh.text.length * 0.6,
+    `resumed directive (${localResumed.text.length}) must stay < 60% of fresh (${localFresh.text.length})`,
+  )
+
+  const remoteFresh = applyAntigravitySwarmTurnDirective({
+    finalText: '远端重构五个模块',
+    rawUserText: '远端重构五个模块',
+    isAntigravityTurn: true,
+    isRemoteAntigravity: true,
+    swarmMode: true,
+    hasHistoricalSwarm: false,
+  })
+  assert.ok(remoteFresh.text.includes('若任务可拆分为 2 个及以上'))
+  assert.ok(remoteFresh.text.includes('P2P 交接'))
+  assert.ok(remoteFresh.text.includes('#seq'))
+  assert.ok(remoteFresh.text.includes('自包含 `brief`'))
+  assert.ok(!remoteFresh.text.includes('fork:"coordinator"'), 'remote swarm must not promise unsupported context fork')
+  assert.ok(remoteFresh.text.includes('integrator'))
+
+  assert.ok(ANTIGRAVITY_PREAMBLE.includes('peer-to-peer'))
+  assert.ok(ANTIGRAVITY_PREAMBLE.includes('#seq'))
+  assert.ok(ANTIGRAVITY_PREAMBLE.includes('integrator'))
+  assert.ok(ANTIGRAVITY_PREAMBLE.includes('oc-memory'))
+  assert.ok(ANTIGRAVITY_PREAMBLE.includes('NotificationTimeoutSeconds'))
 })

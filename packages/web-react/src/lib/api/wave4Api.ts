@@ -579,10 +579,10 @@ export const SWARM_PLAYBOOK_PRESETS: readonly SwarmPlaybookPreset[] = Object.fre
     title: "并行实现+验收",
     category: "engineering",
     categoryLabel: "工程交付",
-    summary: "按零冲突文件所有权并行拆解实现切片，并配独立只读验收员做类型与单测闭环。",
+    summary: "按零冲突文件所有权并行拆解实现切片，P2P 直接交接验收与预整合闭环，避免协调者单点阻塞。",
     roles: ["coordinator", "worker-a", "worker-b", "verifier"],
     defaultTaskHint: "请填写要并行开发的功能需求、目标模块与验收标准",
-    guardrailSummary: "严格文件所有权隔离，验收员只读复核并点名原作者返修",
+    guardrailSummary: "严格文件所有权隔离，P2P 直交 @verifier（勿 CC @coordinator），引前文写 #seq",
   },
   {
     id: "multi-source-lit-verify",

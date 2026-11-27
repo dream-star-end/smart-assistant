@@ -6,6 +6,7 @@
  */
 import { join, resolve } from 'node:path'
 import {
+  isAllowedDelegateModel,
   isCodexEngineModel,
   isGrokEngineModel,
   isCursorEngineModel,
@@ -18,11 +19,29 @@ import { isEngineLocalTurnExempt, isModelAuthorityRequired } from './modelAuthor
 import {
   LocalExecutionRejected,
   getLocalCatalogView,
+  type LocalCatalogModel,
   type LocalCatalogView,
 } from './modelCatalogClient.js'
 import { suggestDelegateModels } from './delegateModelCatalogPrompt.js'
+import {
+  isBilledDelegateMasterAdmittedEngine,
+  isCommercialBilledDelegateEngine,
+} from './engine/engineDelegateCapabilities.js'
 import { ALLOWED_INBOUND_MODELS, assertKnownExplicitDelegateModel } from './delegatePolicy.js'
 import type { LiveRunnerSessionView } from './server.js'
+
+function delegateSuggestionPool(
+  models: readonly Pick<LocalCatalogModel, 'modelId' | 'engine' | 'available'>[],
+  env: NodeJS.ProcessEnv,
+): readonly Pick<LocalCatalogModel, 'modelId' | 'engine' | 'available'>[] {
+  const localExempt = isEngineLocalTurnExempt(env)
+  return models.filter(
+    (m) =>
+      m.available === true &&
+      isAllowedDelegateModel(m.modelId) &&
+      (localExempt || isCommercialBilledDelegateEngine(m.engine)),
+  )
+}
 
 /**
  * 纯函数:给定 per-uid 投影 + 执行意图 → 本地路径判定(真值表实现体,便于单测)。
@@ -56,6 +75,11 @@ export function decideLocalExecution(args: {
    * grok-build 优先)。不可路由 / 非 ccb 且未豁免的条目由候选循环静默跳过。
    */
   preferredModels?: readonly string[]
+  /**
+   * 为 true 时把 agent.model 排在 preferredModels 之前(任务板成员默认优先于 grok-build,
+   * 并在 catalog 归一后检验四大家族与可路由性;旧 GLM 绑定仍自动跳过回落 preferredModels)。
+   */
+  preferAgentModelOverPreferred?: boolean
   kind: LocalTurnKind
   env?: NodeJS.ProcessEnv
   /** 沿用会话模型失败并回退时调用(dispatchInbound 接到 this.log.warn)。 */
@@ -86,7 +110,10 @@ export function decideLocalExecution(args: {
     const canonical = view.canonicalize(explicitModel)
     if (!view.isRoutable(canonical) || view.resolve(canonical)?.engine == null) {
       // 自愈提示:只从**可路由**集合里挑近邻(不泄露不可用/无权限型号),仅作建议不自动替换。
-      const suggestions = suggestDelegateModels(explicitModel, view.models)
+      // billed_delegate 候选池额外限制为四大家族可委派型号（商业模式还要求商业引擎）。
+      const pool =
+        kind === 'billed_delegate' ? delegateSuggestionPool(view.models, env) : view.models
+      const suggestions = suggestDelegateModels(explicitModel, pool)
       const hint =
         suggestions.length > 0
           ? ` 你是不是想填: ${suggestions.map((s) => `'${s}'`).join(' / ')}?`
@@ -95,6 +122,21 @@ export function decideLocalExecution(args: {
         'DELEGATE_MODEL_UNKNOWN',
         `model '${explicitModel}' is not in the current catalog projection (not inherited).` +
           `${hint} model 只能填精确 catalog slug,不要猜或截短;不填则用成员绑定型号。`,
+      )
+    }
+    if (kind === 'billed_delegate' && !isAllowedDelegateModel(canonical)) {
+      const suggestions = suggestDelegateModels(
+        explicitModel,
+        delegateSuggestionPool(view.models, env),
+      )
+      const hint =
+        suggestions.length > 0
+          ? ` 可选候选: ${suggestions.map((s) => `'${s}'`).join(' / ')}。`
+          : ' 系统提示「委派可用型号」段列出了可填的精确 slug。'
+      throw new LocalExecutionRejected(
+        'DELEGATE_MODEL_FAMILY_NOT_ALLOWED',
+        `model '${explicitModel}' (canonical '${canonical}') is not allowed for delegation: ` +
+          `委派仅允许 Grok / Gemini / GPT / DeepSeek 四大家族。${hint}`,
       )
     }
   }
@@ -139,35 +181,53 @@ export function decideLocalExecution(args: {
   // ② 候选阶梯:归一 → 投影可用性 → engine,三件事**全取投影**。
   // 无票 inbound 把存活 runner 的 model 插在 agent.model 之前;有显式 model 时不插入
   // (用户换模型 / 带 model 的普通消息行为不变)。
-  const candidates = explicitModel
-    ? [explicitModel]
-    : [
-        ticketlessReuse && liveSessionModel && liveSkipReason === undefined
-          ? liveSessionModel
-          : undefined,
-        ...(args.preferredModels ?? []),
-        agent.model,
-        args.defaultModel,
-        ...EXECUTION_MODEL_FALLBACK_ROUTE,
+  type CandidateEntry = { raw: string | undefined | null; fromAgent: boolean }
+  const orderedDefaults: CandidateEntry[] = args.preferAgentModelOverPreferred
+    ? [
+        { raw: agent.model, fromAgent: true },
+        ...(args.preferredModels ?? []).map((raw) => ({ raw, fromAgent: false })),
       ]
-  for (const raw of candidates) {
+    : [
+        ...(args.preferredModels ?? []).map((raw) => ({ raw, fromAgent: false })),
+        { raw: agent.model, fromAgent: true },
+      ]
+  const candidates: CandidateEntry[] = explicitModel
+    ? [{ raw: explicitModel, fromAgent: false }]
+    : [
+        {
+          raw:
+            ticketlessReuse && liveSessionModel && liveSkipReason === undefined
+              ? liveSessionModel
+              : undefined,
+          fromAgent: false,
+        },
+        ...orderedDefaults,
+        { raw: args.defaultModel, fromAgent: false },
+        ...EXECUTION_MODEL_FALLBACK_ROUTE.map((raw) => ({ raw, fromAgent: false })),
+      ]
+  for (const { raw, fromAgent } of candidates) {
     if (typeof raw !== 'string' || raw === '') continue
     const canonicalModel = view.canonicalize(raw)
     if (!view.isRoutable(canonicalModel)) continue // 未 active / 未授权 / 未知 → 下一档
+    if (kind === 'billed_delegate' && !isAllowedDelegateModel(canonicalModel)) continue
     const descriptor = view.resolve(canonicalModel)
     const engine = descriptor?.engine
     if (engine === undefined || descriptor == null) continue
+    const agentMark = fromAgent ? { selectedFromAgent: true as const } : {}
     if (engine === 'ccb')
-      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
+      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision, ...agentMark })
 
     // codex 意图(engine 取自投影,不看 baked)。
     if (kind === 'prewarm' || kind === 'auto_dream') {
-      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
+      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision, ...agentMark })
     }
-    // These callers admit master billing before executing locally.
-    if ((kind === 'billed_delegate' && engine === 'grok') ||
-      (kind === 'billed_advisor' && engine === 'codex')) {
-      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
+    // These callers admit master billing before executing locally (OCV5-895: codex delegates
+    // also admit master billing + provider route via OCV5-729).
+    if (
+      (kind === 'billed_delegate' && isBilledDelegateMasterAdmittedEngine(engine)) ||
+      (kind === 'billed_advisor' && engine === 'codex')
+    ) {
+      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision, ...agentMark })
     }
     if (kind === 'turn' || kind === 'billed_delegate' || kind === 'billed_advisor') {
       // selfhost 豁免门(OC_SELFHOST_ENGINE_LOCAL_TURNS=1)未开 -> 结构化拒(现状)。
@@ -193,7 +253,7 @@ export function decideLocalExecution(args: {
       }
       // 豁免门开 -> 按投影 engine 放行执行(单租户自用部署接受该 turn 不走 master
       // 计费编排:usage 不结算,仍落 event/usage log 与 durable tape)。
-      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
+      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision, ...agentMark })
     }
     return decorate(downgradeSyntheticCodex(view, canonicalModel, args.defaultModel, env))
   }
@@ -242,6 +302,8 @@ export async function resolveLocalExecutionIfEnforced(args: {
   defaultModel?: string | null
   /** 见 decideLocalExecution.preferredModels(仅 delegate 默认路径传)。 */
   preferredModels?: readonly string[]
+  /** 见 decideLocalExecution.preferAgentModelOverPreferred。 */
+  preferAgentModelOverPreferred?: boolean
   env?: NodeJS.ProcessEnv
   warn?: (message: string, fields?: Record<string, unknown>) => void
 }): Promise<LocalExecutionDecision | undefined> {
@@ -252,12 +314,84 @@ export async function resolveLocalExecutionIfEnforced(args: {
   // so catalog-only slugs are not rejected by the baked snapshot.
   if (explicitModel && !isModelAuthorityRequired(env)) {
     assertKnownExplicitDelegateModel(explicitModel)
+    if (args.kind === 'billed_delegate' && !isAllowedDelegateModel(explicitModel)) {
+      const suggestions = suggestDelegateModels(
+        explicitModel,
+        [...ALLOWED_INBOUND_MODELS]
+          .filter((modelId) => isAllowedDelegateModel(modelId))
+          .map((modelId) => ({ modelId, available: true })),
+      )
+      const hint =
+        suggestions.length > 0
+          ? ` 可选候选: ${suggestions.map((s) => `'${s}'`).join(' / ')}。`
+          : ' 系统提示「委派可用型号」段列出了可填的精确 slug。'
+      throw new LocalExecutionRejected(
+        'DELEGATE_MODEL_FAMILY_NOT_ALLOWED',
+        `model '${explicitModel}' is not allowed for delegation: ` +
+          `委派仅允许 Grok / Gemini / GPT / DeepSeek 四大家族。${hint}`,
+      )
+    }
   }
   if (!isModelAuthorityRequired(env)) return undefined
   const view = await getLocalCatalogView()
   const liveSessionModel = args.resolveLiveSessionModel?.() ?? args.liveSessionModel
   const liveSessionSkipReason = args.resolveLiveSessionSkipReason?.() ?? args.liveSessionSkipReason
   return decideLocalExecution({ ...args, liveSessionModel, liveSessionSkipReason, view, env })
+}
+
+/**
+ * Flag-off implicit delegate model selection (OCV5-897 B5):
+ * When OC_MODEL_AUTHORITY is off, delegate runs must still never implicitly
+ * bind a non-4-family model from legacy agent.model / config.defaults.model.
+ */
+export function resolveDelegateFlagOffModel(args: {
+  requestedModel?: string
+  agentModel?: string | null
+  defaultModel?: string | null
+  preferredModels?: readonly string[]
+  preferAgentModelOverPreferred?: boolean
+}): string {
+  const orderedDefaults = args.preferAgentModelOverPreferred
+    ? [args.agentModel, ...(args.preferredModels ?? [])]
+    : [...(args.preferredModels ?? []), args.agentModel]
+  const candidates = args.requestedModel
+    ? [args.requestedModel]
+    : [
+        ...orderedDefaults,
+        args.defaultModel,
+        ...EXECUTION_MODEL_FALLBACK_ROUTE,
+      ]
+  for (const raw of candidates) {
+    if (
+      typeof raw === 'string' &&
+      raw !== '' &&
+      ALLOWED_INBOUND_MODELS.has(raw) &&
+      isAllowedDelegateModel(raw)
+    ) {
+      return raw
+    }
+  }
+  return EXECUTION_MODEL_FALLBACK
+}
+
+/**
+ * Sync/async HTTP entry preflight for an explicit delegate `model` (OCV5-897 B7).
+ * Delegates to `resolveLocalExecutionIfEnforced` so both flag-on (catalog) and
+ * flag-off (baked allowlist + 4-family policy) fail fast before async job
+ * creation, slot reservation, or resume claim minting.
+ */
+export async function preflightExplicitDelegateModel(args: {
+  model?: string
+  agentId: string
+  env?: NodeJS.ProcessEnv
+}): Promise<void> {
+  if (!args.model) return
+  await resolveLocalExecutionIfEnforced({
+    agent: { id: args.agentId },
+    kind: 'billed_delegate',
+    model: args.model,
+    env: args.env,
+  })
 }
 
 /** decision → getOrCreate 的执行覆盖入参(flag 未开 → `{}`,展开后零影响)。 */
@@ -287,6 +421,8 @@ export interface LocalExecutionDecision {
   /** 取自投影的 engine(不查 baked MODEL_ENGINE_MAP)。 */
   readonly engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
   readonly supportsVision: boolean
+  /** true = 命中候选阶梯里的 agent.model(用于区分任务板显式成员绑定与隐式 preferredModels 回落)。 */
+  readonly selectedFromAgent?: true
   /** 非空 = 发生了 codex → 非 codex 降级('synthetic' kind);原模型供透明披露(MAJOR-2)。 */
   readonly downgradedFrom?: string
   /**

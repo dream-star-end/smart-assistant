@@ -21,9 +21,12 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
+import type { RemoteExecutionBackend } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
 import type { AgentSession } from './sessionTypes.js'
+import { log } from './sessionManagerLog.js'
 import { reconcileAntigravitySwarmDirectiveAfterCompaction } from './engine/antigravitySwarmDirective.js'
+import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 
 export interface PersistedCheckpointRecord {
   sessionKey: string
@@ -31,7 +34,16 @@ export interface PersistedCheckpointRecord {
   summary: string
   createdAt: number
   instructions?: string
+  placementEpoch?: number
 }
+
+interface CheckpointWatermarkRecord {
+  sessionKey: string
+  highestPlacementEpoch?: number
+  consumedGenerations: string[]
+}
+
+const MAX_CONSUMED_GENERATIONS_HISTORY = 64
 
 const activeCompactions = new Set<string>()
 
@@ -58,6 +70,63 @@ export function checkpointFilePath(sessionKey: string, baseDir?: string): string
   return join(checkpointRootDir(baseDir), `${hash}.json`)
 }
 
+export function checkpointWatermarkFilePath(sessionKey: string, baseDir?: string): string {
+  const hash = createHash('sha256').update(sessionKey).digest('hex').slice(0, 32)
+  return join(checkpointRootDir(baseDir), `${hash}.watermark.json`)
+}
+
+function readCheckpointWatermark(sessionKey: string, baseDir?: string): CheckpointWatermarkRecord {
+  const filePath = checkpointWatermarkFilePath(sessionKey, baseDir)
+  try {
+    const st = lstatSync(filePath)
+    if (st.isSymbolicLink() || !st.isFile()) {
+      return { sessionKey, consumedGenerations: [] }
+    }
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Partial<CheckpointWatermarkRecord>
+    if (!parsed || parsed.sessionKey !== sessionKey) {
+      return { sessionKey, consumedGenerations: [] }
+    }
+    const consumedGenerations = Array.isArray(parsed.consumedGenerations)
+      ? parsed.consumedGenerations.filter((g): g is string => typeof g === 'string' && g.length > 0)
+      : []
+    const highestPlacementEpoch =
+      typeof parsed.highestPlacementEpoch === 'number' &&
+      Number.isSafeInteger(parsed.highestPlacementEpoch) &&
+      parsed.highestPlacementEpoch >= 1
+        ? parsed.highestPlacementEpoch
+        : undefined
+    return {
+      sessionKey,
+      consumedGenerations: consumedGenerations.slice(-MAX_CONSUMED_GENERATIONS_HISTORY),
+      ...(highestPlacementEpoch !== undefined ? { highestPlacementEpoch } : {}),
+    }
+  } catch {
+    return { sessionKey, consumedGenerations: [] }
+  }
+}
+
+function writeCheckpointWatermark(record: CheckpointWatermarkRecord, baseDir?: string): void {
+  const dir = checkpointRootDir(baseDir)
+  ensureSafeCheckpointDir(dir)
+  const filePath = checkpointWatermarkFilePath(record.sessionKey, baseDir)
+  ensureNotSymlinkIfExists(filePath)
+  const bounded: CheckpointWatermarkRecord = {
+    sessionKey: record.sessionKey,
+    consumedGenerations: record.consumedGenerations.slice(-MAX_CONSUMED_GENERATIONS_HISTORY),
+    ...(record.highestPlacementEpoch !== undefined
+      ? { highestPlacementEpoch: record.highestPlacementEpoch }
+      : {}),
+  }
+  const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+  const realDir = realpathSync(dir)
+  writeFileSync(tmpPath, JSON.stringify(bounded), { encoding: 'utf8', mode: 0o600 })
+  if (!realpathSync(tmpPath).startsWith(realDir)) {
+    rmSync(tmpPath, { force: true })
+    throw new Error('CHECKPOINT_PATH_ESCAPE')
+  }
+  renameSync(tmpPath, filePath)
+}
+
 function ensureSafeCheckpointDir(dir: string): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   const st = lstatSync(dir)
@@ -78,25 +147,59 @@ function ensureNotSymlinkIfExists(filePath: string): void {
   }
 }
 
-/** Atomically persist a rolling checkpoint (0600) before invalidating native resume handles. */
-export function savePendingCheckpoint(
+/**
+ * OCV5-902 P0-1 + W2: Atomically persist a rolling checkpoint (0600) with an explicit generation
+ * and optional `placementEpoch` watermark.
+ * - Rejects replay of any already-consumed generation (`CHECKPOINT_GENERATION_ALREADY_CONSUMED`).
+ * - Rejects out-of-order older `placementEpoch` (`CHECKPOINT_STALE_PLACEMENT_EPOCH`).
+ * - Idempotent: if an on-disk pending checkpoint already carries the exact same generation,
+ *   returns it directly without rewriting disk.
+ */
+export function savePendingCheckpointWithGeneration(
   sessionKey: string,
   summary: string,
-  opts?: { instructions?: string; baseDir?: string },
+  opts: { generation: string; instructions?: string; baseDir?: string; placementEpoch?: number },
 ): PersistedCheckpointRecord {
   const trimmed = summary.trim()
   if (!trimmed) throw new Error('EMPTY_CHECKPOINT_SUMMARY')
-  const dir = checkpointRootDir(opts?.baseDir)
+  const generation = typeof opts.generation === 'string' ? opts.generation.trim() : ''
+  if (!generation || generation.length > 128) throw new Error('EMPTY_CHECKPOINT_GENERATION')
+  if (
+    opts.placementEpoch !== undefined &&
+    (typeof opts.placementEpoch !== 'number' ||
+      !Number.isSafeInteger(opts.placementEpoch) ||
+      opts.placementEpoch < 1)
+  ) {
+    throw new Error('INVALID_CHECKPOINT_PLACEMENT_EPOCH')
+  }
+
+  const watermark = readCheckpointWatermark(sessionKey, opts.baseDir)
+  if (watermark.consumedGenerations.includes(generation)) {
+    throw new Error('CHECKPOINT_GENERATION_ALREADY_CONSUMED')
+  }
+
+  const existing = peekPendingCheckpoint(sessionKey, opts.baseDir)
+  const highestEpoch = Math.max(watermark.highestPlacementEpoch ?? 0, existing?.placementEpoch ?? 0)
+  if (opts.placementEpoch !== undefined && highestEpoch > 0 && opts.placementEpoch < highestEpoch) {
+    throw new Error('CHECKPOINT_STALE_PLACEMENT_EPOCH')
+  }
+
+  if (existing && existing.generation === generation) {
+    return existing
+  }
+
+  const dir = checkpointRootDir(opts.baseDir)
   ensureSafeCheckpointDir(dir)
-  const filePath = checkpointFilePath(sessionKey, opts?.baseDir)
+  const filePath = checkpointFilePath(sessionKey, opts.baseDir)
   ensureNotSymlinkIfExists(filePath)
 
   const record: PersistedCheckpointRecord = {
     sessionKey,
-    generation: `${Date.now()}-${randomBytes(6).toString('hex')}`,
+    generation,
     summary: trimmed,
     createdAt: Date.now(),
-    ...(opts?.instructions?.trim() ? { instructions: opts.instructions.trim() } : {}),
+    ...(opts.instructions?.trim() ? { instructions: opts.instructions.trim() } : {}),
+    ...(opts.placementEpoch !== undefined ? { placementEpoch: opts.placementEpoch } : {}),
   }
   const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
   const realDir = realpathSync(dir)
@@ -106,7 +209,211 @@ export function savePendingCheckpoint(
     throw new Error('CHECKPOINT_PATH_ESCAPE')
   }
   renameSync(tmpPath, filePath)
+  if (
+    opts.placementEpoch !== undefined &&
+    opts.placementEpoch > (watermark.highestPlacementEpoch ?? 0)
+  ) {
+    writeCheckpointWatermark(
+      {
+        sessionKey,
+        highestPlacementEpoch: opts.placementEpoch,
+        consumedGenerations: watermark.consumedGenerations,
+      },
+      opts.baseDir,
+    )
+  }
   return record
+}
+
+type LocalCheckpointSavedObserver = (record: PersistedCheckpointRecord) => void
+let localCheckpointSavedObserver: LocalCheckpointSavedObserver | null = null
+
+export function setLocalCheckpointSavedObserver(
+  observer: LocalCheckpointSavedObserver | null,
+): void {
+  localCheckpointSavedObserver = observer
+}
+
+/** Atomically persist a rolling checkpoint (0600) before invalidating native resume handles. */
+export function savePendingCheckpoint(
+  sessionKey: string,
+  summary: string,
+  opts?: { instructions?: string; baseDir?: string },
+): PersistedCheckpointRecord {
+  const record = savePendingCheckpointWithGeneration(sessionKey, summary, {
+    generation: `${Date.now()}-${randomBytes(6).toString('hex')}`,
+    ...(opts?.instructions !== undefined ? { instructions: opts.instructions } : {}),
+    ...(opts?.baseDir !== undefined ? { baseDir: opts.baseDir } : {}),
+  })
+  if (localCheckpointSavedObserver) {
+    try {
+      localCheckpointSavedObserver(record)
+    } catch {
+      /* fail-open: never disrupt local compaction checkpoint durability */
+    }
+  }
+  return record
+}
+
+export interface PendingAuthorityAckEntry {
+  readonly sessionKey: string
+  readonly generation: string
+  readonly turnKey: string
+  readonly createdAt: number
+}
+
+const MAX_PENDING_AUTHORITY_ACKS = 1024
+
+function pendingAuthorityAcksPath(baseDir?: string): string {
+  return join(checkpointRootDir(baseDir), 'pending-authority-acks.json')
+}
+
+export function listPendingAuthorityAcks(baseDir?: string): PendingAuthorityAckEntry[] {
+  const filePath = pendingAuthorityAcksPath(baseDir)
+  try {
+    const st = lstatSync(filePath)
+    if (st.isSymbolicLink() || !st.isFile()) return []
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8'))
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (x): x is PendingAuthorityAckEntry =>
+        Boolean(x) &&
+        typeof x.sessionKey === 'string' &&
+        typeof x.generation === 'string' &&
+        typeof x.turnKey === 'string' &&
+        typeof x.createdAt === 'number',
+    )
+  } catch {
+    return []
+  }
+}
+
+function writeAtomicAuthorityQueueFile(filePath: string, payload: unknown, baseDir?: string): void {
+  const dir = checkpointRootDir(baseDir)
+  ensureSafeCheckpointDir(dir)
+  ensureNotSymlinkIfExists(filePath)
+  const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+  const realDir = realpathSync(dir)
+  writeFileSync(tmpPath, JSON.stringify(payload), { encoding: 'utf8', mode: 0o600 })
+  if (!realpathSync(tmpPath).startsWith(realDir)) {
+    rmSync(tmpPath, { force: true })
+    throw new Error('CHECKPOINT_PATH_ESCAPE')
+  }
+  renameSync(tmpPath, filePath)
+}
+
+function writePendingAuthorityAcks(entries: PendingAuthorityAckEntry[], baseDir?: string): void {
+  writeAtomicAuthorityQueueFile(pendingAuthorityAcksPath(baseDir), entries, baseDir)
+}
+
+export function enqueuePendingAuthorityAck(
+  entry: PendingAuthorityAckEntry,
+  baseDir?: string,
+): void {
+  const list = listPendingAuthorityAcks(baseDir)
+  if (list.some((x) => x.sessionKey === entry.sessionKey && x.generation === entry.generation)) {
+    return
+  }
+  if (list.length >= MAX_PENDING_AUTHORITY_ACKS) {
+    // W1: Never silently evict unconfirmed acks; log saturation and retain existing entries.
+    log.warn('pending authority ack queue reached cap; retaining existing unconfirmed entries', {
+      cap: MAX_PENDING_AUTHORITY_ACKS,
+      sessionKey: entry.sessionKey,
+      generation: entry.generation,
+    })
+    return
+  }
+  list.push(entry)
+  writePendingAuthorityAcks(list, baseDir)
+}
+
+export function removePendingAuthorityAck(
+  sessionKey: string,
+  generation: string,
+  baseDir?: string,
+): void {
+  const list = listPendingAuthorityAcks(baseDir)
+  const next = list.filter((x) => !(x.sessionKey === sessionKey && x.generation === generation))
+  if (next.length !== list.length) {
+    writePendingAuthorityAcks(next, baseDir)
+  }
+}
+
+export type PendingAuthorityOpEntry =
+  | {
+      readonly kind: 'checkpoint'
+      readonly id: string
+      readonly sessionKey: string
+      readonly generation: string
+      readonly summary: string
+      readonly instructions?: string
+      readonly engine: string
+      readonly placementEpoch: number
+      readonly createdAt: number
+    }
+  | {
+      readonly kind: 'reset'
+      readonly id: string
+      readonly sessionKey: string
+      readonly engine: string
+      readonly expectedPlacementEpoch?: number
+      readonly afterCheckpointGeneration?: string
+      readonly createdAt: number
+    }
+
+const MAX_PENDING_AUTHORITY_OPS = 512
+
+function pendingAuthorityOpsPath(baseDir?: string): string {
+  return join(checkpointRootDir(baseDir), 'pending-authority-ops.json')
+}
+
+export function listPendingAuthorityOps(baseDir?: string): PendingAuthorityOpEntry[] {
+  const filePath = pendingAuthorityOpsPath(baseDir)
+  try {
+    const st = lstatSync(filePath)
+    if (st.isSymbolicLink() || !st.isFile()) return []
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8'))
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (x): x is PendingAuthorityOpEntry =>
+        Boolean(x) &&
+        typeof x.id === 'string' &&
+        typeof x.sessionKey === 'string' &&
+        (x.kind === 'checkpoint' || x.kind === 'reset'),
+    )
+  } catch {
+    return []
+  }
+}
+
+export function enqueuePendingAuthorityOp(
+  entry: PendingAuthorityOpEntry,
+  baseDir?: string,
+): void {
+  const list = listPendingAuthorityOps(baseDir)
+  const idx = list.findIndex((x) => x.id === entry.id)
+  if (idx >= 0) {
+    list[idx] = entry
+  } else {
+    if (list.length >= MAX_PENDING_AUTHORITY_OPS) {
+      log.warn('pending authority ops queue reached cap; retaining existing durable ops', {
+        cap: MAX_PENDING_AUTHORITY_OPS,
+        kind: entry.kind,
+        sessionKey: entry.sessionKey,
+      })
+      return
+    }
+    list.push(entry)
+  }
+  writeAtomicAuthorityQueueFile(pendingAuthorityOpsPath(baseDir), list, baseDir)
+}
+
+export function removePendingAuthorityOp(id: string, baseDir?: string): void {
+  const list = listPendingAuthorityOps(baseDir)
+  const next = list.filter((x) => x.id !== id)
+  if (next.length !== list.length) {
+    writeAtomicAuthorityQueueFile(pendingAuthorityOpsPath(baseDir), next, baseDir)
+  }
 }
 
 /** Read pending checkpoint without deleting it. Fail-open on ENOENT or corrupt JSON. */
@@ -128,12 +435,21 @@ export function peekPendingCheckpoint(
       typeof parsed.summary === 'string' &&
       parsed.summary.trim().length > 0
     ) {
+      const watermark = readCheckpointWatermark(sessionKey, baseDir)
+      if (watermark.consumedGenerations.includes(parsed.generation)) {
+        return null
+      }
       return {
         sessionKey: parsed.sessionKey,
         generation: parsed.generation,
         summary: parsed.summary,
         createdAt: typeof parsed.createdAt === 'number' ? parsed.createdAt : 0,
         ...(typeof parsed.instructions === 'string' ? { instructions: parsed.instructions } : {}),
+        ...(typeof parsed.placementEpoch === 'number' &&
+        Number.isSafeInteger(parsed.placementEpoch) &&
+        parsed.placementEpoch >= 1
+          ? { placementEpoch: parsed.placementEpoch }
+          : {}),
       }
     }
     return null
@@ -151,6 +467,25 @@ export function ackPendingCheckpoint(
   const current = peekPendingCheckpoint(sessionKey, baseDir)
   if (!current || current.generation !== generation) return false
   try {
+    // W2: Atomically persist the consumed watermark BEFORE deleting the pending checkpoint file
+    // so a crash between the two operations can never allow the same generation to be re-installed
+    // (and peekPendingCheckpoint treats watermarked generations as already consumed).
+    const watermark = readCheckpointWatermark(sessionKey, baseDir)
+    const nextConsumed = watermark.consumedGenerations.includes(generation)
+      ? watermark.consumedGenerations
+      : [...watermark.consumedGenerations, generation]
+    const nextHighestEpoch = Math.max(
+      watermark.highestPlacementEpoch ?? 0,
+      current.placementEpoch ?? 0,
+    )
+    writeCheckpointWatermark(
+      {
+        sessionKey,
+        consumedGenerations: nextConsumed,
+        ...(nextHighestEpoch > 0 ? { highestPlacementEpoch: nextHighestEpoch } : {}),
+      },
+      baseDir,
+    )
     rmSync(checkpointFilePath(sessionKey, baseDir), { force: true })
     return true
   } catch {
@@ -158,10 +493,15 @@ export function ackPendingCheckpoint(
   }
 }
 
-/** Unconditionally delete any persisted checkpoint for a destroyed session. Fail-open. */
+/** Unconditionally delete any persisted checkpoint and watermark for a destroyed session. Fail-open. */
 export function clearPendingCheckpoint(sessionKey: string, baseDir?: string): void {
   try {
     rmSync(checkpointFilePath(sessionKey, baseDir), { force: true })
+  } catch {
+    /* fail-open */
+  }
+  try {
+    rmSync(checkpointWatermarkFilePath(sessionKey, baseDir), { force: true })
   } catch {
     /* fail-open */
   }
@@ -231,9 +571,85 @@ export function ackPendingCheckpointIfTurnSucceeded(
   session: AgentSession,
   generation: string,
   baseDir?: string,
+  beforeLocalAck?: () => void,
 ): boolean {
   const outcome = checkpointTurnOutcomes.get(session)
   checkpointTurnOutcomes.delete(session)
   if (outcome !== 'completed') return false
+  if (beforeLocalAck) {
+    try {
+      beforeLocalAck()
+    } catch {
+      /* fail-open: never block local checkpoint consumption */
+    }
+  }
   return ackPendingCheckpoint(session.sessionKey, generation, baseDir)
+}
+
+const REMOTE_V4_RESUME_PREFIX = 'remotev4:'
+const REMOTE_V4_UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
+const REMOTE_V4_NATIVE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+
+function parseBoundRemoteV4ResumeId(
+  value: string | null | undefined,
+): { readonly bindingId: string; readonly nativeId: string } | null {
+  if (typeof value !== 'string' || !value.startsWith(REMOTE_V4_RESUME_PREFIX)) return null
+  const rest = value.slice(REMOTE_V4_RESUME_PREFIX.length)
+  const sep = rest.indexOf(':')
+  if (sep !== 36) return null
+  const bindingId = rest.slice(0, 36)
+  const nativeId = rest.slice(37)
+  if (!REMOTE_V4_UUID_RE.test(bindingId) || !REMOTE_V4_NATIVE_ID_RE.test(nativeId)) return null
+  return { bindingId: bindingId.toLowerCase(), nativeId }
+}
+
+export interface MigrationAwareStoredResumeResult {
+  readonly effectiveStoredResumeId: string | undefined
+  readonly clearStaleResume: boolean
+}
+
+/**
+ * OCV5-902 B3: Migration-aware isolation of stored native resume IDs during runner creation.
+ * Lives in `gateway-session` (L3) alongside `sessionSubmit.ts` to keep zero cross-module L3 edges.
+ */
+export function resolveMigrationAwareStoredResume(input: {
+  readonly storedResumeId?: string
+  readonly executionBackend?: RemoteExecutionBackend
+  readonly hasAuthorizedMigration: boolean
+}): MigrationAwareStoredResumeResult {
+  const { storedResumeId, executionBackend, hasAuthorizedMigration } = input
+  const cc5Backend = executionBackend?.kind === 'cc5-interactive-v1' ? executionBackend : undefined
+  const v4Backend = executionBackend?.kind === 'remote-driver-v4' ? executionBackend : undefined
+
+  if (cc5Backend && storedResumeId) {
+    if (parseCc5ResumeId(storedResumeId)?.bindingId !== cc5Backend.operationId) {
+      if (hasAuthorizedMigration) {
+        return Object.freeze({ effectiveStoredResumeId: undefined, clearStaleResume: true })
+      }
+      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
+    }
+    return Object.freeze({ effectiveStoredResumeId: storedResumeId, clearStaleResume: false })
+  }
+
+  if (v4Backend && storedResumeId) {
+    if (parseBoundRemoteV4ResumeId(storedResumeId)?.bindingId !== v4Backend.operationId) {
+      if (hasAuthorizedMigration) {
+        return Object.freeze({ effectiveStoredResumeId: undefined, clearStaleResume: true })
+      }
+      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
+    }
+    return Object.freeze({ effectiveStoredResumeId: storedResumeId, clearStaleResume: false })
+  }
+
+  if (executionBackend && storedResumeId && hasAuthorizedMigration) {
+    return Object.freeze({ effectiveStoredResumeId: undefined, clearStaleResume: true })
+  }
+
+  if (!executionBackend && storedResumeId && hasAuthorizedMigration) {
+    if (storedResumeId.startsWith(REMOTE_V4_RESUME_PREFIX) || isCc5ResumeId(storedResumeId)) {
+      return Object.freeze({ effectiveStoredResumeId: undefined, clearStaleResume: true })
+    }
+  }
+
+  return Object.freeze({ effectiveStoredResumeId: storedResumeId, clearStaleResume: false })
 }

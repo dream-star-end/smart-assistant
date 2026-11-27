@@ -166,6 +166,7 @@ export class ModelCatalogUnavailableError extends Error {
  * 本地路径(无 envelope)的**结构化拒绝**码(方案 §3 真值表 / §6)。
  *
  *  - `DELEGATE_MODEL_UNKNOWN`:caller 显式指定了当前投影里不可路由的型号,不得 inherit。
+ *  - `DELEGATE_MODEL_FAMILY_NOT_ALLOWED`:委派显式指定了非四大家族（Grok / Gemini / GPT / DeepSeek）的型号,在起进程前 fail-loud 拒绝（OCV5-897）。
  *  - `DELEGATE_CODEX_UNSUPPORTED`:codex delegate / provider pin 的本地 turn。现状是
  *    晚期被 CODEX_BILLING_GUARD(submit 时)拒 —— 那时 runner 已 spawn、容器已起进程;
  *    本批**产品化提前到创建 runner 之前**,给出稳定错误码而不是一句 guard 文案。
@@ -176,6 +177,7 @@ export class ModelCatalogUnavailableError extends Error {
 export type LocalExecutionRejectCode =
   | 'DELEGATE_CODEX_UNSUPPORTED'
   | 'DELEGATE_MODEL_UNKNOWN'
+  | 'DELEGATE_MODEL_FAMILY_NOT_ALLOWED'
   | 'MODEL_NOT_AVAILABLE'
   | 'MODEL_CATALOG_UNAVAILABLE'
 

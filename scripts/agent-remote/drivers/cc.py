@@ -31,6 +31,8 @@ DRIVER_ID = "cc"
 DRIVER_VERSION = "1.0.0"
 ENGINE_ID = "cc"
 SEMANTICS_ID = "cc-result-per-turn-v1"
+VALID_SERVICE_TIERS = frozenset({"fast", "ultrafast", "standard"})
+CONTENT_MIME_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*\Z", re.IGNORECASE)
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z", re.IGNORECASE)
 FORBIDDEN_LAUNCH_FLAGS = frozenset(
     {"-p", "--print", "--input-format", "--output-format", "--include-partial-messages", "--replay-user-messages"}
@@ -361,6 +363,74 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
     return spec
 
 
+def _normalize_content_blocks(raw_content: Any) -> List[Dict[str, Any]]:
+    need(isinstance(raw_content, list) and len(raw_content) > 0, "CC_CONTENT_INVALID")
+    content_blocks: List[Dict[str, Any]] = []
+    for blk in raw_content:
+        need(isinstance(blk, dict) and isinstance(blk.get("type"), str), "CC_CONTENT_INVALID")
+        btype = blk["type"]
+        if btype == "text":
+            need(isinstance(blk.get("text"), str) and "\x00" not in blk["text"], "CC_CONTENT_INVALID")
+            content_blocks.append({"type": "text", "text": blk["text"]})
+        elif btype in ("image", "document"):
+            src = blk.get("source")
+            if isinstance(src, dict):
+                stype = src.get("type")
+                if stype == "base64":
+                    need(
+                        isinstance(src.get("data"), str)
+                        and len(src["data"]) > 0
+                        and isinstance(src.get("media_type"), str)
+                        and len(src["media_type"]) > 0,
+                        "CC_CONTENT_INVALID",
+                    )
+                    content_blocks.append({"type": btype, "source": dict(src)})
+                elif stype == "url":
+                    need(isinstance(src.get("url"), str) and len(src["url"].strip()) > 0, "CC_CONTENT_INVALID")
+                    content_blocks.append({"type": btype, "source": dict(src)})
+                else:
+                    raise ValueError("CC_CONTENT_INVALID")
+            elif btype == "image" and "data" in blk and blk["data"] is not None:
+                data_val = blk["data"]
+                mime = blk.get("mimeType")
+                need(
+                    isinstance(data_val, str)
+                    and len(data_val) > 0
+                    and "\x00" not in data_val
+                    and isinstance(mime, str)
+                    and len(mime) <= 128
+                    and CONTENT_MIME_RE.fullmatch(mime),
+                    "CC_CONTENT_INVALID",
+                )
+                content_blocks.append(
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": mime, "data": data_val},
+                    }
+                )
+            elif btype == "image" and isinstance(blk.get("url"), str) and blk["url"].strip():
+                url_val = blk["url"].strip()
+                if url_val.startswith("data:") and ";base64," in url_val:
+                    header, b64_data = url_val.split(";base64,", 1)
+                    media_type = header[len("data:") :] or "image/png"
+                    need(len(b64_data) > 0, "CC_CONTENT_INVALID")
+                    content_blocks.append(
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media_type, "data": b64_data},
+                        }
+                    )
+                else:
+                    content_blocks.append({"type": "image", "source": {"type": "url", "url": url_val}})
+            elif btype == "image" and "blobId" in blk and blk["blobId"] is not None:
+                raise ValueError("CC_IMAGE_BLOB_UNRESOLVED")
+            else:
+                raise ValueError("CC_CONTENT_INVALID")
+        else:
+            raise ValueError("CC_CONTENT_INVALID")
+    return content_blocks
+
+
 def encode(command: Dict[str, Any], native_state: Dict[str, Any]) -> Dict[str, Any]:
     kind = command.get("kind")
     cmd_id = command.get("commandId")
@@ -408,20 +478,35 @@ def encode(command: Dict[str, Any], native_state: Dict[str, Any]) -> Dict[str, A
 
     elif kind == "newTurn":
         prompt = command.get("prompt")
-        need(isinstance(prompt, str) and len(prompt.strip()) > 0, "CC_EMPTY_PROMPT")
+        raw_content = command.get("content")
+        if raw_content is not None:
+            content_blocks = _normalize_content_blocks(raw_content)
+            has_meaningful = any(
+                (b["type"] == "text" and len(b["text"].strip()) > 0) or b["type"] in ("image", "document")
+                for b in content_blocks
+            )
+            need(has_meaningful, "CC_EMPTY_PROMPT")
+        else:
+            need(isinstance(prompt, str) and len(prompt.strip()) > 0, "CC_EMPTY_PROMPT")
+            content_blocks = [{"type": "text", "text": prompt}]
         if state.get("activeTurn"):
             raise ValueError("CC_TURN_ALREADY_ACTIVE")
+        raw_tier = command.get("serviceTier")
+        if raw_tier is not None:
+            need(isinstance(raw_tier, str) and raw_tier in VALID_SERVICE_TIERS, "CC_SERVICE_TIER_INVALID")
         state["activeTurn"] = True
         state["activeTurnCommandId"] = cmd_id
         state.pop("turnErrorCode", None)
         state.pop("turnErrorText", None)
-        msg = {
+        msg: Dict[str, Any] = {
             "type": "user",
             "message": {
                 "role": "user",
-                "content": [{"type": "text", "text": prompt}],
+                "content": content_blocks,
             },
         }
+        if raw_tier in ("fast", "ultrafast"):
+            msg["serviceTier"] = raw_tier
         lines.append(json.dumps(msg, ensure_ascii=False, separators=(",", ":")))
         immediate.append(
             {
@@ -854,7 +939,7 @@ def probe(context: Dict[str, Any], previous_step_result: Optional[Dict[str, Any]
                 "supportedEfforts": efforts,
                 "defaultEffort": default_effort,
                 "supportsAdaptiveThinking": bool(m.get("supportsAdaptiveThinking", False)),
-                "supportsVision": True,
+                "supportsVision": bool(m.get("supportsVision", True)),
             }
         )
     need(len(models) > 0, "CC_PROBE_MODELS_EMPTY")

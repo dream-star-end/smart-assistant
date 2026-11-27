@@ -69,6 +69,12 @@ import {
 import { CONSULT_INVOCATION_HEADER, DELEGATE_CONTEXT_HEADER } from './gatewayClient.js'
 import { resolveConsultInvocationId } from './consultInvocation.js'
 import { consultAdvisorUntilAdvice, formatConsultAdvisorToolPayload } from './consultAdvisorClient.js'
+import { buildMcpSkillStore } from './skillStoreContext.js'
+import {
+  handleSkillListRead,
+  handleSkillSearchRead,
+  handleSkillViewRead,
+} from './skillReadTools.js'
 
 const TOOL = 'oc-memory'
 
@@ -115,6 +121,9 @@ const USAGE = [
   'usage:',
   '  oc-memory core-search "<query>" [--limit N] [--offset N]',
   '  oc-memory project-search "<query>" [--project UUID] [--limit N] [--offset N]',
+  '  oc-memory skill-list [--source platform|user]',
+  '  oc-memory skill-search "<query>" [--limit N]',
+  '  oc-memory skill-view <name> [--subfile <path>]',
   '  oc-memory session-search "<query>" [--limit N] [--agent-id ID] [--summarize]',
   '  oc-memory archival-add "<text>" [--tags a,b,c]',
   '  oc-memory archival-search "<query>" [--limit N]',
@@ -144,15 +153,15 @@ function coreMemoryMigrationNotice(agentId: string): string {
   ].join('\n')
 }
 
-/** Print the handler's text to stdout and exit non-zero on isError. */
-function emit(res: MemoryToolResult): never {
+/** Write the entire payload (flushing >64 KiB OS pipes completely) before exiting. */
+async function emit(res: MemoryToolResult): Promise<never> {
   const text = res.content?.[0]?.text ?? ''
-  if (res.isError) {
-    process.stderr.write(text.endsWith('\n') ? text : `${text}\n`)
-    process.exit(1)
-  }
-  process.stdout.write(text.endsWith('\n') ? text : `${text}\n`)
-  process.exit(0)
+  const payload = text.endsWith('\n') ? text : `${text}\n`
+  const stream = res.isError ? process.stderr : process.stdout
+  await new Promise<void>((resolveWrite, rejectWrite) => {
+    stream.write(payload, 'utf8', (err) => (err ? rejectWrite(err) : resolveWrite()))
+  })
+  process.exit(res.isError ? 1 : 0)
 }
 
 async function observeMemoryResult(input: {
@@ -195,7 +204,7 @@ async function observeAndEmit(input: {
   result: MemoryToolResult
 }): Promise<never> {
   await observeMemoryResult(input)
-  return emit(input.result)
+  return await emit(input.result)
 }
 
 async function main(): Promise<void> {
@@ -206,8 +215,9 @@ async function main(): Promise<void> {
   }
 
   // CCB: OPENCLAUDE_AGENT_ID(ambient);codex: 该 env 被 scrub → OC_AGENT_ID(spawn 注入)。
+  const cliEnv = process.env
   const agentId =
-    process.env.OPENCLAUDE_AGENT_ID?.trim() || process.env.OC_AGENT_ID?.trim() || 'main'
+    cliEnv.OPENCLAUDE_AGENT_ID?.trim() || cliEnv.OC_AGENT_ID?.trim() || 'main'
 
   // memdir:Core 记忆改为引擎原生直接编辑文件,`memory` 子命令退役。在建 context(触发
   // sessions.db / embedding 初始化)之前就短路,迁移提示不依赖任何后端。exit 2(非 0),
@@ -368,6 +378,37 @@ async function main(): Promise<void> {
       startedAt,
       result,
     })
+  }
+  if (cmd === 'skill-list') {
+    const skills = buildMcpSkillStore(cliEnv)
+    const result = await handleSkillListRead(
+      skills,
+      { agentId, env: cliEnv, allowSideEffects: false },
+      { source: flags.source },
+    )
+    await emit(result)
+  }
+  if (cmd === 'skill-search') {
+    const query = flags.query || positional[0]
+    if (!query) fail('skill-search requires a "<query>" positional argument')
+    const skills = buildMcpSkillStore(cliEnv)
+    const result = await handleSkillSearchRead(
+      skills,
+      { query, limit: parseLimit(flags.limit) },
+      { agentId, env: cliEnv, allowSideEffects: false },
+    )
+    await emit(result)
+  }
+  if (cmd === 'skill-view') {
+    const name = flags.name || positional[0]
+    if (!name) fail('skill-view requires a <name> positional argument')
+    const skills = buildMcpSkillStore(cliEnv)
+    const result = await handleSkillViewRead(
+      skills,
+      { name, subfile: flags.subfile },
+      { agentId, env: cliEnv, allowSideEffects: false },
+    )
+    await emit(result)
   }
   if (cmd === 'project-search') {
     const query = positional[0]

@@ -165,10 +165,7 @@ import {
   type SessionRepoBindFrame,
   type SessionRepoStatusOut,
 } from './sessionRepoWorkspace.js'
-import {
-  SessionManager,
-  persistInterruptedPromptQueueTurn,
-} from './sessionManager.js'
+import { SessionManager, persistInterruptedPromptQueueTurn } from './sessionManager.js'
 import type { WebhookRouter } from './webhooks.js'
 import type {
   ToolFailureReporter,
@@ -215,7 +212,7 @@ import { type HttpMiscHandlersHost, _resolveMediaDirs as _resolveMediaDirsImpl, 
 import { handleChunkedUpload as handleChunkedUploadImpl } from './httpUploadChunks.js'
 import { LiveBrowserController, handleLiveBrowserActionHttp, handleLiveBrowserLiveHttp } from './liveBrowserController.js'
 import { type ChannelHandlersHost, _updateWechatIdempotency as _updateWechatIdempotencyImpl, checkInboundBypass as checkInboundBypassImpl, handleTurnCancelIfQueued as handleTurnCancelIfQueuedImpl, handleTurnRejectIfAbsent as handleTurnRejectIfAbsentImpl, handleTurnDispatchState as handleTurnDispatchStateImpl, handleWechatInbound as handleWechatInboundImpl, handleWechatStop as handleWechatStopImpl, handleWechatInboundCompensate as handleWechatInboundCompensateImpl, _handleWechat as _handleWechatImpl, handleEnginePreheat as handleEnginePreheatImpl } from './channelHandlers.js'
-import { type InboundDispatchHost, dispatchInbound as dispatchInboundImpl } from './inboundDispatch.js'
+import { type EngineCapsuleRuntime, type InboundDispatchHost, dispatchInbound as dispatchInboundImpl, installTurnAuthorityRuntime } from './inboundDispatch.js'
 import { type WsConnectionHost, handleWsConnection as handleWsConnectionImpl, autoResumeFromHello as autoResumeFromHelloImpl, handleStop as handleStopImpl, deliver as deliverImpl, _sendStatusFrame as _sendStatusFrameImpl, _sendStampedSessionFrame as _sendStampedSessionFrameImpl, _consumeFrameAuthority as _consumeFrameAuthorityImpl } from './wsConnection.js'
 // Moved to ./gatewayFilePolicy.js (FINDINGS §7.6, OCV5-484); re-exported for existing importers.
 export { FILE_BLOCKED_PATTERNS, isFileAllowed, FILE_ALLOWED_DIRS, MIME_MAP, uploadExtForMime, UPLOAD_MIME_TO_EXT, isUploadMimeAllowed, makeUserScopedMediaPredicate, COMMERCIAL_USER_VOLUME_MEDIA_GATE, MEDIA_EXTENSIONS, TRUSTED_CONTAINER_HOME, isTrustedContainerFileServeEnabled, OPT_OPENCLAUDE_EXPORT_RE, TEMP_PREFIX, isFileBlocked, safeUploadExtension } from './gatewayFilePolicy.js'
@@ -384,6 +381,7 @@ export class Gateway {
   private httpServer!: ReturnType<typeof createServer>
   private router: Router
   private sessions: SessionManager
+  readonly capsuleRuntime: EngineCapsuleRuntime | undefined
   private autoDream: AutoDreamService
   private autoDreamOptimizer: AutoDreamOptimizerService
   private cron: CronScheduler | null = null
@@ -742,7 +740,7 @@ export class Gateway {
 
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
-    this.sessions = new SessionManager(deps.config)
+    this.sessions = new SessionManager(deps.config); this.capsuleRuntime = installTurnAuthorityRuntime(this.sessions).capsuleRuntime
     installSystemHelpRelay(this.sessions)
     this.sessions.onCcbTaskNotification = (session, payload) => {
       void this.handleCcbLocalAgentNotification(session, payload)
@@ -1429,7 +1427,8 @@ export class Gateway {
         // 503:master 不可达/投影拉不到 —— 拒新 turn(无 baked 回落),可重试。
         return { code, httpStatus: 503, message: `MODEL_CATALOG_UNAVAILABLE: ${detail}` }
       case 'DELEGATE_MODEL_UNKNOWN':
-        return { code, httpStatus: 400, message: `DELEGATE_MODEL_UNKNOWN: ${detail}` }
+      case 'DELEGATE_MODEL_FAMILY_NOT_ALLOWED':
+        return { code, httpStatus: 400, message: `${code}: ${detail}` }
     }
   }
   /** 500 兜底收口:真实错误进日志(可排障),响应只回受控文案 —— 此前 39 处

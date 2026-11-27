@@ -19,6 +19,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import type { Dispatcher } from "undici";
 import type { CitationStyle, EvidenceManifest, NormalizedDocument } from "@openclaude/protocol/research";
 import { resolveEvidenceGrade } from "@openclaude/protocol/research";
 import {
@@ -46,6 +47,7 @@ import { buildExternalPdfExtractor } from "./externalExtract.js";
 import type { FetchFulltextConfig, FetchRecordInput } from "./fetchFulltext.js";
 import { type LitSourceName, searchMultiSource } from "./litSearch.js";
 import { type SemanticQueryDeps, queryDocuments } from "./litrag.js";
+import { type PlatformFlashFetch, type ResolveMinicheckDeps, resolveMinicheckEntail } from "./minicheck.js";
 import {
   type FetchRecordOutcome,
   fetchRecordIntoLibrary,
@@ -200,6 +202,12 @@ export interface ResearchProxyDeps {
   externalExtractTimeoutMs?: number;
   /** 外部 PDF 解析响应字节上限覆盖(测试用)。 */
   externalExtractMaxResponseBytes?: number;
+  /** 平台 flash API key（MiniCheck backend=llm 注入，由调用方传入）。 */
+  platformFlashApiKey?: string;
+  /** 平台 flash 执行器（L6 bootstrap 注入 fetchPlatformFlash）。 */
+  platformFlashFetch?: PlatformFlashFetch;
+  /** MiniCheck LLM 出口 dispatcher 工厂覆写（L6 bootstrap 注入 directEgressDispatcher）。 */
+  minicheckDispatcher?: () => Dispatcher | undefined;
 }
 
 /** fetch-batch / job-status 用的 durable job store 面(注入 seam)。 */
@@ -459,11 +467,11 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
         return;
       }
       if (reqPath === `${RESEARCH_PREFIX}cite/check`) {
-        await handleCiteCheck(res, body, cfg, identity.userId, store, citeDeps, requestId);
+        await handleCiteCheck(res, body, cfg, identity.userId, store, citeDeps, { fetchImpl: deps.fetchImpl, platformFlashApiKey: deps.platformFlashApiKey, platformFlashFetch: deps.platformFlashFetch, makeDispatcher: deps.minicheckDispatcher, log }, requestId);
         return;
       }
       if (reqPath === `${RESEARCH_PREFIX}cite/fix`) {
-        await handleCiteFix(res, body, cfg, identity.userId, store, citeDeps, requestId);
+        await handleCiteFix(res, body, cfg, identity.userId, store, citeDeps, { fetchImpl: deps.fetchImpl, platformFlashApiKey: deps.platformFlashApiKey, platformFlashFetch: deps.platformFlashFetch, makeDispatcher: deps.minicheckDispatcher, log }, requestId);
         return;
       }
       sendErr(res, 404, "NOT_FOUND", `unknown research route ${reqPath}`, requestId);
@@ -1183,6 +1191,7 @@ async function handleCiteCheck(
   userId: number,
   store: ResearchStoreDeps,
   citeDeps: { mailto?: string; fetchImpl?: FetchLike },
+  minicheckDeps: ResolveMinicheckDeps,
   requestId: string,
 ): Promise<void> {
   const raw = (body.manifest ?? body) as Partial<EvidenceManifest>;
@@ -1210,8 +1219,7 @@ async function handleCiteCheck(
     },
   };
   const mc = cfg.config.minicheck;
-  const entail =
-    mc?.backend === "http" && mc.endpoint ? makeEntail(mc.endpoint, citeDeps.fetchImpl) : undefined;
+  const entail = resolveMinicheckEntail(mc, minicheckDeps);
   const result = await runCheck(userId, manifest, {
     getDocument: store.getDocument,
     verifyIdentifier: (id) => verifyIdentifier(id, citeDeps),
@@ -1230,6 +1238,7 @@ async function handleCiteFix(
   userId: number,
   store: ResearchStoreDeps,
   citeDeps: { mailto?: string; fetchImpl?: FetchLike },
+  minicheckDeps: ResolveMinicheckDeps,
   requestId: string,
 ): Promise<void> {
   const raw = (body.manifest ?? body) as Partial<EvidenceManifest>;
@@ -1261,8 +1270,7 @@ async function handleCiteFix(
     },
   };
   const mc = cfg.config.minicheck;
-  const entail =
-    mc?.backend === "http" && mc.endpoint ? makeEntail(mc.endpoint, citeDeps.fetchImpl) : undefined;
+  const entail = resolveMinicheckEntail(mc, minicheckDeps);
   // docs 预加载一次(避免每 claim 重读 DB);query 在内存权威 docs 上跑 master litrag。
   const docs = (await Promise.all(docIds.map((id) => store.getDocument(userId, id)))).filter(
     (d): d is NonNullable<typeof d> => d != null,
@@ -1279,36 +1287,4 @@ async function handleCiteFix(
     fixMinScore: 0.5,
   });
   sendJson(res, 200, result, requestId);
-}
-
-/**
- * 闸⑤ MiniCheck 蕴含 adapter:POST endpoint {claim, quotes} → {score:0~1}。
- * 失败/超时/解析不出 → 返 null(checkManifest 据此跳过该 claim 蕴含判定,不降级)。
- * endpoint 是 admin 配置的可信内网地址(非用户输入)。
- */
-function makeEntail(
-  endpoint: string,
-  fetchImpl: FetchLike | undefined,
-): (claimText: string, quoteTexts: string[]) => Promise<number | null> {
-  const fetchFn = fetchImpl ?? fetch;
-  return async (claimText, quoteTexts) => {
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 15_000);
-    try {
-      const res = await fetchFn(endpoint, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ claim: claimText, quotes: quoteTexts }),
-        signal: ctrl.signal,
-      });
-      if (!res.ok) return null;
-      const j = (await res.json()) as { score?: unknown };
-      const s = typeof j.score === "number" ? j.score : null;
-      return s != null && s >= 0 && s <= 1 ? s : null;
-    } catch {
-      return null;
-    } finally {
-      clearTimeout(to);
-    }
-  };
 }

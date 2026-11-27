@@ -22,12 +22,55 @@
  * Usage: npx tsx scripts/check-architecture.ts [--root <repo>] [--enforce] [--base <git-ref>]
  *          [--json <out.json>] [--write-baseline]
  */
-import { execFileSync, spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
+import {
+  type BaselineDelta,
+  type CompiledSubdomainRule,
+  FILE_CYCLES_BASELINE_REL,
+  type FileCycle,
+  RULE_REMEDIATION,
+  SUBDOMAIN_BASELINE_REL,
+  type SubdomainDef,
+  ambiguousSubdomainMatch,
+  carryFileCycles,
+  checkIntramoduleEdge,
+  compareFileCycles,
+  compareFileCyclesBaseline,
+  emitArchitectureSummary,
+  evaluateAuxBaselines,
+  fileCycleKey,
+  findCycle,
+  findFileCycles,
+  formatGateRemediation,
+  gitShowFileAt,
+  globToRegExp,
+  matchSubdomain,
+  sha256Hex,
+  specificity,
+  tallyFileCycles,
+  validateAndCompileSubdomains,
+  writeRequestedBaselines,
+} from './lib/archMapUpgrades.ts'
+
+export {
+  FILE_CYCLES_BASELINE_REL,
+  RULE_REMEDIATION,
+  SUBDOMAIN_BASELINE_REL,
+  carryFileCycles,
+  compareFileCycles,
+  compareFileCyclesBaseline,
+  fileCycleKey,
+  findFileCycles,
+  formatGateRemediation,
+  globToRegExp,
+  sha256Hex,
+  tallyFileCycles,
+}
+export type { BaselineDelta, FileCycle, SubdomainDef }
 
 type Layer =
   | 'L0'
@@ -49,6 +92,8 @@ interface ModuleDef {
   match: string[]
   allow?: string[]
   authorities?: string[]
+  boundaryBaseline?: 'main' | 'subdomain'
+  subdomains?: Record<string, SubdomainDef>
   note?: string
 }
 interface ModulesFile {
@@ -94,21 +139,6 @@ function fail(msg: string): never {
   process.exit(2)
 }
 
-/** Glob with `*` (no slash) and `**` (any depth), anchored. */
-export function globToRegExp(glob: string): RegExp {
-  let re = ''
-  for (let i = 0; i < glob.length; i++) {
-    const c = glob[i]!
-    if (c === '*' && glob[i + 1] === '*') {
-      re += glob[i + 2] === '/' ? '(?:.*/)?' : '.*'
-      i += glob[i + 2] === '/' ? 2 : 1
-    } else if (c === '*') re += '[^/]*'
-    else if ('\\^$+?.()|{}[]'.includes(c)) re += `\\${c}`
-    else re += c
-  }
-  return new RegExp(`^${re}$`)
-}
-
 export function isProductionSource(rel: string): boolean {
   return (
     /\.(ts|tsx|mts)$/.test(rel) &&
@@ -143,6 +173,7 @@ export function productionFiles(root: string): string[] {
 
 export class ModuleMap {
   private readonly rules: { id: string; re: RegExp; score: number }[] = []
+  private readonly subdomainRules = new Map<string, CompiledSubdomainRule[]>()
   constructor(readonly def: ModulesFile) {
     if (def.schema !== 1 || typeof def.modules !== 'object')
       throw new Error('modules.json: schema must be 1 with a modules object')
@@ -151,6 +182,14 @@ export class ModuleMap {
         throw new Error(`modules.json: ${id} has unknown layer ${m.layer}`)
       if (!Array.isArray(m.match) || !m.match.length)
         throw new Error(`modules.json: ${id} has no match globs`)
+      if (
+        m.boundaryBaseline !== undefined &&
+        m.boundaryBaseline !== 'main' &&
+        m.boundaryBaseline !== 'subdomain'
+      )
+        throw new Error(
+          `modules.json: ${id} has invalid boundaryBaseline ${String(m.boundaryBaseline)}`,
+        )
       for (const a of m.allow ?? [])
         if (!(a in def.modules)) throw new Error(`modules.json: ${id} allows unknown module ${a}`)
       for (const a of m.authorities ?? []) {
@@ -158,6 +197,9 @@ export class ModuleMap {
           throw new Error(`modules.json: ${id} has unknown authority ${a}`)
       }
       for (const g of m.match) this.rules.push({ id, re: globToRegExp(g), score: specificity(g) })
+      if (m.subdomains !== undefined) {
+        this.subdomainRules.set(id, validateAndCompileSubdomains(id, m.subdomains))
+      }
     }
     // Same-layer `allow` edges must form a DAG.
     const cyc = findCycle(
@@ -187,40 +229,20 @@ export class ModuleMap {
     const ids = [...new Set(hits.filter((r) => r.score === top).map((r) => r.id))]
     return ids.length > 1 ? ids : []
   }
+  subdomainOf(modId: string, file: string): string | null {
+    const rules = this.subdomainRules.get(modId)
+    return rules ? matchSubdomain(rules, file) : null
+  }
+  ambiguousSubdomain(modId: string, file: string): string[] {
+    const rules = this.subdomainRules.get(modId)
+    return rules ? ambiguousSubdomainMatch(rules, file) : []
+  }
+  usesSubdomainBoundaryBaseline(modId: string): boolean {
+    return this.def.modules[modId]?.boundaryBaseline === 'subdomain'
+  }
   get(id: string): ModuleDef {
     return this.def.modules[id]!
   }
-}
-
-function specificity(glob: string): number {
-  const star = glob.indexOf('*')
-  const prefix = star < 0 ? glob.length + 10_000 : star
-  return prefix * 1000 + glob.replace(/\*/g, '').length
-}
-
-function findCycle(g: Record<string, string[]>): string[] | null {
-  const state = new Map<string, number>()
-  const stack: string[] = []
-  const visit = (n: string): string[] | null => {
-    state.set(n, 1)
-    stack.push(n)
-    for (const m of g[n] ?? []) {
-      if (state.get(m) === 1) return [...stack.slice(stack.indexOf(m)), m]
-      if (!state.get(m)) {
-        const c = visit(m)
-        if (c) return c
-      }
-    }
-    stack.pop()
-    state.set(n, 2)
-    return null
-  }
-  for (const n of Object.keys(g))
-    if (!state.get(n)) {
-      const c = visit(n)
-      if (c) return c
-    }
-  return null
 }
 
 // ── package resolution ─────────────────────────────────────────────────────────
@@ -524,12 +546,26 @@ export function factsOf(fileName: string, text: string): FileFacts {
 export function check(
   root: string,
   map: ModuleMap,
-): { violations: Violation[]; files: number; edges: number } {
+): {
+  violations: Violation[]
+  subdomainViolations: Violation[]
+  fileCycles: FileCycle[]
+  files: number
+  edges: number
+  intramoduleEdges: number
+} {
   const pkgs = packages(root)
   const files = productionFiles(root)
+  const prodFileSet = new Set(files)
+  const fileGraph = new Map<string, Set<string>>(files.map((f) => [f, new Set<string>()]))
   const out: Violation[] = []
+  const subdomainOut: Violation[] = []
   let edges = 0
+  let intramoduleEdges = 0
   const v = (rule: string, file: string, target = '-') => out.push({ rule, file, target })
+  const pushBoundary = (toSubdomain: boolean, rule: string, file: string, target: string) =>
+    (toSubdomain ? subdomainOut : out).push({ rule, file, target })
+
   for (const file of files) {
     const mod = map.moduleOf(file)
     // parse every production file first: an unmapped file that does not parse is still exit 2
@@ -545,8 +581,14 @@ export function check(
     }
     const amb = map.ambiguous(file)
     if (amb.length) fail(`modules.json maps ${file} to ${amb.join(' and ')} with equal specificity`)
+    const ambSub = map.ambiguousSubdomain(mod, file)
+    if (ambSub.length)
+      fail(
+        `modules.json maps ${file} in ${mod} to subdomains ${ambSub.join(' and ')} with equal specificity`,
+      )
     const me = map.get(mod)
     const myPkg = pkgOf(pkgs, file)
+    const fromSub = me.subdomains ? map.subdomainOf(mod, file) : null
     for (const imp of facts.imports) {
       if (imp.spec.startsWith('node:') && me.layer === 'L0' && !imp.type)
         v('R2-contract-node', file, imp.spec)
@@ -558,6 +600,7 @@ export function check(
         continue
       }
       for (const target of r.files) {
+        if (target !== file && prodFileSet.has(target)) fileGraph.get(file)!.add(target)
         if (imp.spec.startsWith('.') && r.pkg !== myPkg)
           v('R2-cross-package-internal', file, target)
         if (
@@ -569,19 +612,33 @@ export function check(
           continue
         }
         const tm = map.moduleOf(target)
-        if (!tm || tm === mod) continue
+        if (!tm) continue
+        if (tm === mod) {
+          if (me.subdomains && fromSub && target !== file) {
+            const toSub = map.subdomainOf(mod, target)
+            if (toSub && toSub !== fromSub) {
+              intramoduleEdges++
+              const bad = checkIntramoduleEdge(mod, me.subdomains, fromSub, toSub)
+              if (bad) subdomainOut.push({ rule: 'R2-intramodule-boundary', file, target: bad })
+            }
+          }
+          continue
+        }
         edges++
         const t = map.get(tm)
+        const toSubdomain =
+          map.usesSubdomainBoundaryBaseline(mod) || map.usesSubdomainBoundaryBaseline(tm)
         const front = me.layer.startsWith('F')
         if (front !== t.layer.startsWith('F') && !(front && t.layer === 'L0'))
-          v('R2-front-back', file, tm)
-        else if (LAYER_RANK[t.layer]! > LAYER_RANK[me.layer]!) v('R2-upward', file, tm)
+          pushBoundary(toSubdomain, 'R2-front-back', file, tm)
+        else if (LAYER_RANK[t.layer]! > LAYER_RANK[me.layer]!)
+          pushBoundary(toSubdomain, 'R2-upward', file, tm)
         else if (t.layer === me.layer && !(me.allow ?? []).includes(tm))
-          v('R2-same-layer', file, tm)
+          pushBoundary(toSubdomain, 'R2-same-layer', file, tm)
         const ms = me.scope ?? []
         const tsc = t.scope ?? []
         if (ms.length > 1 && tsc.length && !ms.every((s) => tsc.includes(s)))
-          v('R2-scope', file, tm)
+          pushBoundary(toSubdomain, 'R2-scope', file, tm)
       }
     }
     if (facts.dynamicNonLiteral)
@@ -599,7 +656,15 @@ export function check(
     count(facts.handlerAuth, 'handler-auth')
     count(facts.specialCase, 'special-case')
   }
-  return { violations: out, files: files.length, edges }
+  const fileCycles = findFileCycles(fileGraph)
+  return {
+    violations: out,
+    subdomainViolations: subdomainOut,
+    fileCycles,
+    files: files.length,
+    edges,
+    intramoduleEdges,
+  }
 }
 
 export const keyOf = (x: Violation) => `${x.rule}|${x.file}|${x.target}`
@@ -635,17 +700,7 @@ export function renamesSince(root: string, base: string): Map<string, string> {
 
 /** Raw text of `arch/violations-baseline.json` as committed at `rev`, or null when absent. */
 export function baselineRawAt(root: string, rev: string): string | null {
-  const r = spawnSync('git', ['show', `${rev}:arch/violations-baseline.json`], {
-    cwd: root,
-    encoding: 'utf8',
-    maxBuffer: 1 << 28,
-  })
-  if (r.status !== 0) {
-    // only "path not in that commit" means no baseline; a bad ref or any other git error fails closed
-    if (/does not exist in|exists on disk, but not in/.test(r.stderr)) return null
-    fail(`git show ${rev}:arch/violations-baseline.json: ${r.stderr.trim().split('\n')[0]}`)
-  }
-  return r.stdout
+  return gitShowFileAt(root, rev, 'arch/violations-baseline.json', fail)
 }
 
 /** The baseline entries as committed at `rev`, or null when that commit has no baseline file. */
@@ -678,95 +733,13 @@ export function compare(
   renames = new Map<string, string>(),
 ) {
   const moved = carry(baseline, renames)
-  const grown: { key: string; baseline: number; now: number }[] = []
-  const stale: { key: string; baseline: number; now: number }[] = []
+  const grown: BaselineDelta[] = []
+  const stale: BaselineDelta[] = []
   for (const [k, n] of Object.entries(current))
     if (n > (moved[k] ?? 0)) grown.push({ key: k, baseline: moved[k] ?? 0, now: n })
   for (const [k, n] of Object.entries(moved))
     if ((current[k] ?? 0) < n) stale.push({ key: k, baseline: n, now: current[k] ?? 0 })
   return { grown, stale }
-}
-
-export const RULE_REMEDIATION: Record<string, { why: string; fix: string }> = {
-  'R1-unmapped': {
-    why: 'Every production source file must belong to a declared layer/module in arch/modules.json.',
-    fix: 'Move the file into an existing domain directory or register its glob in arch/modules.json (CODEOWNERS-protected).',
-  },
-  'R2-upward': {
-    why: 'Value imports must only flow downward across layers (L6→L0 backend, F5→F0 frontend).',
-    fix: 'Use `import type` if only types are needed, move shared contracts to a lower layer (e.g. @openclaude/protocol L0 or web-lib F1), or invert control via DI.',
-  },
-  'R2-same-layer': {
-    why: 'Same-layer modules may only import along the registered acyclic DAG (`allow` in arch/modules.json).',
-    fix: 'Use `import type`, extract shared primitives to a lower layer, or orchestrate cross-domain calls from an upper composition layer (L4/L5/L6 or F5).',
-  },
-  'R2-cross-package-internal': {
-    why: 'Relative imports across package boundaries bypass package.json `exports` and break container/bundle isolation.',
-    fix: 'Import from the public package entrypoint (`@openclaude/<pkg>` or its declared `exports` subpath) instead of relative `../../*/src/` paths.',
-  },
-  'R2-contract-node': {
-    why: 'L0 contract modules (@openclaude/protocol) must stay runtime-agnostic with zero value imports of `node:*`.',
-    fix: 'Remove runtime `node:*` imports from L0 contracts; use pure JS/Web APIs, `import type`, or move Node logic to L1/L2 (@openclaude/kernel / storage / gateway).',
-  },
-  'R3-billing-sql': {
-    why: 'Mutations to billing/ledger/credit/order tables belong strictly to single-authority `billing` / `payment` modules.',
-    fix: 'Delegate all writes to credit_ledger, usage_records, orders, or users.credits through billing/payment service APIs instead of raw SQL DML.',
-  },
-  'R3-env': {
-    why: 'Direct `process.env` reads outside `platform-config` cause config drift and hidden runtime coupling.',
-    fix: 'Declare and parse the variable in `packages/commercial/src/config.ts` (platform-config) or accept it via injected config/deps.',
-  },
-  'R3-net': {
-    why: 'Direct `fetch`/`undici`/`node:http(s)` calls outside registered `net` authorities bypass egress, timeout, and observability controls.',
-    fix: 'Route outbound requests through a registered `net` adapter module (e.g. `adapters-providers`, `web-lib` API client) or inject `fetchImpl`.',
-  },
-  'R3-handler-auth': {
-    why: 'Handler-level auth guards (`requireAuth`, `requireAdmin`, `verifyContainerIdentity`) belong strictly in L5 HTTP boundary modules.',
-    fix: 'Authenticate requests in the HTTP boundary (`interface-http` / `gateway-interface`) and pass the verified principal/identity into lower layers.',
-  },
-  'R3-crypto': {
-    why: 'Cryptographic primitives must be centralized in `platform-auth-crypto` to guarantee safe algorithms and key hygiene.',
-    fix: 'Reuse helpers from `packages/commercial/src/crypto/**` or `platform-auth-crypto` instead of calling low-level `node:crypto` APIs directly.',
-  },
-  'R3-special-case': {
-    why: 'Provider/engine name branching outside adapter boundaries leaks upstream quirks across the codebase.',
-    fix: 'Encapsulate provider/engine-specific behavior behind capabilities/adapters in `adapters-providers` or `gateway-engines`.',
-  },
-  'R2-scope': {
-    why: 'A multi-process shared module must not depend on a module with narrower process scope.',
-    fix: 'Move the dependency to a shared-scope module or pass process-specific behavior in via dependency injection.',
-  },
-  'R2-front-back': {
-    why: 'Frontend (F0-F5) and backend (L1-L6) must stay isolated; frontend may only import L0 contracts.',
-    fix: 'Share types/schemas through `@openclaude/protocol` (L0) instead of importing backend implementation modules.',
-  },
-}
-
-export function formatGateRemediation(
-  items: ReadonlyArray<{ key: string; baseline: number; now: number }>,
-  kind: 'NEW/GROWN' | 'BASELINE-GROWN',
-): string[] {
-  const byRule = new Map<string, { count: number; sample: string }>()
-  for (const item of items) {
-    const [rule, file, target] = item.key.split('|')
-    if (!rule) continue
-    const prev = byRule.get(rule)
-    const sample = target && target !== '-' ? `${file} -> ${target}` : (file ?? item.key)
-    if (!prev) byRule.set(rule, { count: 1, sample })
-    else prev.count++
-  }
-  const lines: string[] = []
-  for (const [rule, info] of byRule) {
-    const guide = RULE_REMEDIATION[rule]
-    if (!guide) continue
-    lines.push(
-      `[GATE-ERROR] ${rule} (${kind}, ${info.count} identit${info.count === 1 ? 'y' : 'ies'}, e.g. ${info.sample})`,
-      `  Why       : ${guide.why}`,
-      `  How to Fix: ${guide.fix}`,
-      '  Re-verify : npx tsx scripts/check-architecture.ts --enforce',
-    )
-  }
-  return lines
 }
 
 export interface ApprovedRebaseline {
@@ -787,10 +760,6 @@ export const APPROVED_REBASELINE: ApprovedRebaseline = {
   ticket: 'OCV5-847',
   fromBaselineSha256: 'fa8553f1bf291dcf3e887f7a4e4a138c0c94a24b311c2ab19eaebffaa9b71eb6',
   toBaselineSha256: '897f3d1626d20b563406811442962fe550c445146dabc74f8f9bb42aadc6d3f4',
-}
-
-export function sha256Hex(text: string): string {
-  return createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
 export function isApprovedRebaseline(
@@ -827,16 +796,22 @@ function main() {
   }
   const res = check(root, map)
   const current = tally(res.violations)
-  if (argv.includes('--write-baseline')) {
-    writeFileSync(
+  const currentSubdomains = tally(res.subdomainViolations)
+  const currentFileCycles = tallyFileCycles(res.fileCycles)
+  if (
+    writeRequestedBaselines({
+      root,
       bf,
-      `${JSON.stringify({ schema: 1, note: 'rule|file|target → count; may only shrink (plan §5.3)', entries: current }, null, 1)}\n`,
-    )
-    console.log(
-      `[architecture] wrote baseline: ${Object.keys(current).length} identities, ${res.violations.length} violations`,
-    )
+      argv,
+      current,
+      currentSubdomains,
+      currentFileCycles,
+      mainCount: res.violations.length,
+      subCount: res.subdomainViolations.length,
+    })
+  )
     return
-  }
+
   if (!existsSync(bf)) fail(`missing ${bf}`)
   const baselineRaw = readFileSync(bf, 'utf8')
   const baseline = JSON.parse(baselineRaw)
@@ -854,18 +829,15 @@ function main() {
   const base = opt('--base')
   const renames = base ? renamesSince(root, base) : undefined
   const { grown, stale } = compare(baseline.entries, current, renames)
-  // Rule 4 also holds for the baseline file itself: against the base commit's baseline it may only
-  // shrink, otherwise a PR could add a violation and raise its count in the same diff.
-  let baselineGrown: { key: string; baseline: number; now: number }[] = []
+  let baselineGrown: BaselineDelta[] = []
   let baseHasBaseline = false
   let rebaselineAnchored = false
   if (base) {
     const prevRaw = baselineRawAt(root, base)
     if (prevRaw !== null) {
       baseHasBaseline = true
-      if (isApprovedRebaseline(prevRaw, baselineRaw)) {
-        rebaselineAnchored = true
-      } else {
+      if (isApprovedRebaseline(prevRaw, baselineRaw)) rebaselineAnchored = true
+      else {
         let prev: Record<string, number>
         try {
           const j = JSON.parse(prevRaw)
@@ -879,53 +851,67 @@ function main() {
       }
     }
   }
+  const aux = evaluateAuxBaselines({
+    root,
+    base,
+    renames,
+    currentFileCycles,
+    currentSubdomains,
+    compareEntries: compare,
+    carryEntries: carry,
+    fail,
+  })
+  const allGrown = [...grown, ...aux.fileCycleGrown, ...aux.subdomainGrown]
+  const allStale = [...stale, ...aux.fileCycleStale, ...aux.subdomainStale]
+  const allBaselineGrown = [
+    ...baselineGrown,
+    ...aux.fileCycleBaselineGrown,
+    ...aux.subdomainBaselineGrown,
+  ]
   const byRule: Record<string, number> = {}
   for (const x of res.violations) byRule[x.rule] = (byRule[x.rule] ?? 0) + 1
+  for (const x of res.subdomainViolations) byRule[x.rule] = (byRule[x.rule] ?? 0) + 1
+  if (res.fileCycles.length) byRule['R2-file-cycle'] = res.fileCycles.length
   const unmapped = res.violations.filter((x) => x.rule === 'R1-unmapped').length
   const seconds = (Date.now() - t0) / 1000
   const report = {
-    mode: enforce ? 'enforce' : 'report',
+    mode: enforce ? ('enforce' as const) : ('report' as const),
     files: res.files,
     edges: res.edges,
+    intramoduleEdges: res.intramoduleEdges,
     seconds,
     unmapped,
     byRule,
     identities: Object.keys(current).length,
+    fileCycles: res.fileCycles.length,
+    subdomainIdentities: Object.keys(currentSubdomains).length,
     grown,
     stale,
     baselineGrown,
+    ...aux,
   }
   const jout = opt('--json')
   if (jout) writeFileSync(jout, `${JSON.stringify(report, null, 1)}\n`)
-  console.log(
-    `[architecture] ${report.mode}: ${res.files} files, ${res.edges} cross-module value edges, ${seconds.toFixed(1)} s`,
-  )
-  console.log(
-    `[architecture] violations by rule: ${
-      Object.entries(byRule)
-        .map(([r, n]) => `${r}=${n}`)
-        .join(' ') || 'none'
-    }`,
-  )
-  for (const g of grown.slice(0, 50)) console.log(`  NEW/GROWN ${g.key} ${g.baseline} → ${g.now}`)
-  if (grown.length > 50) console.log(`  … ${grown.length - 50} more new/grown`)
-  for (const s of stale.slice(0, 50))
-    console.log(`  STALE     ${s.key} ${s.baseline} → ${s.now} (remove from the baseline)`)
-  if (stale.length > 50) console.log(`  … ${stale.length - 50} more stale`)
-  for (const g of baselineGrown)
-    console.log(`  BASELINE-GROWN ${g.key} ${g.baseline} → ${g.now} (the baseline may only shrink)`)
-  for (const line of formatGateRemediation(grown, 'NEW/GROWN')) console.log(line)
-  for (const line of formatGateRemediation(baselineGrown, 'BASELINE-GROWN')) console.log(line)
-  if (rebaselineAnchored)
-    console.log(
-      `[architecture] approved rebaseline anchor matched (${APPROVED_REBASELINE.ticket}, ${APPROVED_REBASELINE.fromBaselineSha256.slice(0, 12)} -> ${APPROVED_REBASELINE.toBaselineSha256.slice(0, 12)}): skipping baseline-grown diff; enforcing new/grown=0 stale=0 unmapped=0`,
-    )
-  if (base && !baseHasBaseline)
-    console.log(`[architecture] ${base} has no baseline: introduced here`)
-  console.log(
-    `[architecture] new/grown=${grown.length} stale=${stale.length} baseline-grown=${baselineGrown.length} unmapped=${unmapped}`,
-  )
-  if (enforce && (grown.length || stale.length || baselineGrown.length || unmapped)) process.exit(1)
+  emitArchitectureSummary({
+    mode: report.mode,
+    files: res.files,
+    edges: res.edges,
+    intramoduleEdges: res.intramoduleEdges,
+    fileCyclesCount: res.fileCycles.length,
+    seconds,
+    byRule,
+    allGrown,
+    allStale,
+    allBaselineGrown,
+    unmapped,
+    rebaselineNotice: rebaselineAnchored
+      ? `[architecture] approved rebaseline anchor matched (${APPROVED_REBASELINE.ticket}, ${APPROVED_REBASELINE.fromBaselineSha256.slice(0, 12)} -> ${APPROVED_REBASELINE.toBaselineSha256.slice(0, 12)}): skipping baseline-grown diff; enforcing new/grown=0 stale=0 unmapped=0`
+      : null,
+    baseIntroducedNotice:
+      base && !baseHasBaseline ? `[architecture] ${base} has no baseline: introduced here` : null,
+  })
+  if (enforce && (allGrown.length || allStale.length || allBaselineGrown.length || unmapped))
+    process.exit(1)
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main()

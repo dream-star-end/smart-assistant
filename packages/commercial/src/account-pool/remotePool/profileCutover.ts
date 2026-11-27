@@ -26,6 +26,7 @@ import {
 } from '@openclaude/protocol'
 import type { Pool } from 'pg'
 import { computeProbeFingerprintTs } from './driftCoordinator.js'
+import { assertLegacyTrackNotRetiredTx } from './legacyRetirementRuntime.js'
 import { legacyProfileEngineForAuthority, loadRemoteDriverRegistry } from './registry.js'
 
 const SHA256_RE = /^[a-f0-9]{64}$/
@@ -429,7 +430,7 @@ export async function revertDriverV4ProfileToLegacy(
 
   const client = await pool.connect()
   try {
-    await client.query('BEGIN')
+    await client.query('BEGIN'); await assertLegacyTrackNotRetiredTx(client, 'placement')
     const profRes = await client.query<Record<string, any>>(
       'SELECT * FROM remote_agent_profiles WHERE id = $1 FOR UPDATE',
       [input.profileId],

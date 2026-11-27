@@ -60,6 +60,8 @@ export interface DelegateEngineBillingAdmission {
   grokExecutionDescriptor?: GrokExecutionDescriptor
   /** Master-issued provider route for any codex admit (advisor or delegate). */
   route?: unknown
+  /** Remaining spendable credits (fen) captured at master admission (OCV5-895 B1). */
+  creditBudgetFen?: bigint
 }
 
 export type DelegateEngineBillingSettlePayload = Omit<DurableCodexBilling, 'terminalCode'> & {
@@ -139,6 +141,12 @@ export function mapDelegateEngineBillingError(err: unknown): {
     // Regular delegation and advisor consults share this mapper; the message
     // must read correctly for both (audit follow-up on PR #1371).
     return { httpStatus: 503, message: '委派模型路由不可用，未启动' }
+  }
+  if (code.includes('MODEL_FAMILY_NOT_ALLOWED')) {
+    return {
+      httpStatus: 400,
+      message: '委派仅允许 Grok / Gemini / GPT / DeepSeek 四大家族模型，未启动',
+    }
   }
   if (code.includes('INVALID_')) {
     return { httpStatus: 400, message: `engine-reported 委派计费初始化失败: ${code}` }
@@ -359,11 +367,16 @@ export function createDelegateEngineBillingClient(args?: {
             routeTokenHash: createHash('sha256').update(input.grokRouteToken ?? '').digest('hex'),
           })
         : undefined
+      const creditBudgetFen =
+        typeof result.creditBudgetFen === 'string' && /^\d{1,32}$/.test(result.creditBudgetFen)
+          ? BigInt(result.creditBudgetFen)
+          : undefined
       return {
         requestId: result.requestId,
         engineSessionId: result.engineSessionId,
         ...(grokExecutionDescriptor ? { grokExecutionDescriptor } : {}),
         ...(result.route !== undefined ? { route: result.route } : {}),
+        ...(creditBudgetFen !== undefined ? { creditBudgetFen } : {}),
       }
     },
     async settle(billing) {

@@ -34,8 +34,8 @@ export interface Gate {
   /** a repo script the train runs, or `command` for a non-script step */
   script?: string;
   command?: string;
-  /** build (default) = build_master_release; deploy = deploy-v5-selfhost.sh itself */
-  stage?: "build" | "deploy";
+  /** build (default) = build_master_release; deploy = deploy-v5-selfhost.sh; governance = v5-selfhost-governance-gates.sh */
+  stage?: "build" | "deploy" | "governance";
   /** deploy stage only: the call chain that really runs the script (Codex final r1: a file-name
    * mention is not a run). `caller` must call `function` at command position, `function` must run
    * "$<variable>" at command position, and `variable` must be assigned the script's path. */
@@ -190,7 +190,7 @@ export function shellCommands(text: string): string[] {
  * a file-presence test naming a gate is not a run. */
 export function functionCommands(src: string, name: string): string[] {
   const lines = src.split("\n");
-  const start = lines.findIndex((line) => new RegExp(`^${name}\\(\\) \\{\\s*$`).test(line));
+  const start = lines.findIndex((line) => new RegExp(`^${name}\\(\\) \\{(?:\\s*#.*)?\\s*$`).test(line));
   if (start < 0) return [];
   const end = lines.findIndex((line, i) => i > start && /^\}/.test(line));
   return shellCommands(lines.slice(start + 1, end < 0 ? undefined : end).join("\n"));
@@ -348,16 +348,36 @@ export function deployRuns(deployScript: string, gate: Gate): boolean {
   return assigns.length > 0 && assigns.every((line) => line === want);
 }
 
+const GOV_GATE_RUN = new RegExp(
+  `${PREFIX}_master_governance_run_gate\\s+(?:"[^"]*"|\\S+)\\s+(?:"[^"]*"|\\S+)\\s+(?:"[^"]*"|\\S+)\\s+((?:packages\\/[\\w.-]+\\/)?scripts\\/[\\w./-]+)`,
+  "g",
+);
+
+/** Governance fast-gate scripts executed by master_run_governance_fast_gates() via _master_governance_run_gate. */
+export function governanceRunsIn(governanceLib: string): Set<string> {
+  const scripts = new Set<string>();
+  for (const line of functionCommands(governanceLib, "master_run_governance_fast_gates")) {
+    for (const m of line.matchAll(GOV_GATE_RUN)) scripts.add(m[1]!);
+  }
+  return scripts;
+}
+
 export function check(input: {
   manifest: Manifest;
   masterLib: string;
   deployScript: string;
+  governanceLib?: string;
   workflows: Record<string, string>;
   pkgScripts: Record<string, string>;
 }): Problem[] {
-  const { manifest, masterLib, deployScript, workflows, pkgScripts } = input;
+  const { manifest, masterLib, deployScript, governanceLib, workflows, pkgScripts } = input;
   const problems: Problem[] = [];
-  const train = runsIn(functionCommands(masterLib, "build_master_release"));
+  const buildCommands = functionCommands(masterLib, "build_master_release");
+  const train = runsIn(buildCommands);
+  const callsGovGates = buildCommands.some((line) =>
+    new RegExp(`${PREFIX}(?:if\\s+)?(?:!\\s*)?master_run_governance_fast_gates(?:\\s|$)`).test(line),
+  );
+  const govTrain = governanceLib && callsGovGates ? governanceRunsIn(governanceLib) : new Set<string>();
   const helpers = new Set(manifest.helpers);
   const byKey = new Map<string, Gate>();
   for (const gate of manifest.gates) {
@@ -375,6 +395,11 @@ export function check(input: {
   for (const c of train.npm) {
     if (!byKey.has(c)) problems.push({ kind: "train-not-in-manifest", message: `build_master_release runs \`${c}\`, which is not in the gate manifest` });
   }
+  for (const s of govTrain) {
+    if (!helpers.has(s) && !byKey.has(s)) {
+      problems.push({ kind: "train-not-in-manifest", message: `master_run_governance_fast_gates runs ${s}, which is not in the gate manifest` });
+    }
+  }
   // manifest → train, manifest → CI
   const ci = ciRuns(workflows, pkgScripts);
   for (const gate of manifest.gates) {
@@ -383,7 +408,9 @@ export function check(input: {
     const stage = gate.stage ?? "build";
     const inTrain = stage === "build"
       ? (gate.script ? train.scripts.has(key) : train.npm.has(key))
-      : deployRuns(deployScript, gate);
+      : stage === "governance"
+        ? (gate.script ? govTrain.has(key) : false)
+        : deployRuns(deployScript, gate);
     if (!inTrain) {
       problems.push({ kind: "manifest-not-in-train", message: `${gate.id}: the ${stage} stage no longer runs ${key}` });
     }
@@ -422,10 +449,12 @@ function main(): void {
     process.exit(2);
   }
   const deployPath = "scripts/deploy-v5-selfhost.sh";
+  const govLibPath = "scripts/lib/v5-selfhost-governance-gates.sh";
   const problems = check({
     manifest,
     masterLib: read("scripts/v5-selfhost-master-release-lib.sh"),
     deployScript: existsSync(join(root, deployPath)) ? read(deployPath) : "",
+    governanceLib: existsSync(join(root, govLibPath)) ? read(govLibPath) : "",
     workflows,
     pkgScripts: (JSON.parse(read("package.json")) as { scripts: Record<string, string> }).scripts,
   });

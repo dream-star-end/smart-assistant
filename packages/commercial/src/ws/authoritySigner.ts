@@ -94,6 +94,7 @@ import {
   AUTHORITY_TTL_MS,
   type AuthorityBillingAttribution,
   type AuthorityKeyring,
+  type AuthorityPoolMigrationGrant,
   type RemoteExecutionBackend,
   type DispatchAuthorityPayload,
   MODEL_AUTHORITY_KEYRING_ENV,
@@ -544,6 +545,8 @@ export interface AuthorityMintInput {
   billingAttribution?: AuthorityBillingAttribution
   /** Trusted supervisor selection, never copied from a browser frame. */
   executionBackend?: RemoteExecutionBackend
+  /** Trusted cross-pool migration grant signed by Master authority (OCV5-890). */
+  poolMigration?: AuthorityPoolMigrationGrant
 }
 
 export interface MintOptions {
@@ -723,6 +726,7 @@ export class AuthoritySigner {
         ? {}
         : { billingAttribution: input.billingAttribution }),
       ...(input.executionBackend === undefined ? {} : { executionBackend: input.executionBackend }),
+      ...(input.poolMigration === undefined ? {} : { poolMigration: input.poolMigration }),
     }
 
     const lease: TurnLease = {

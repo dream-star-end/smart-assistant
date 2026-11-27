@@ -19,6 +19,7 @@ const real = () => ({
   manifest: JSON.parse(read("deploy/v5/selfhost-release-gates.json")) as Manifest,
   masterLib: read("scripts/v5-selfhost-master-release-lib.sh"),
   deployScript: read("scripts/deploy-v5-selfhost.sh"),
+  governanceLib: read("scripts/lib/v5-selfhost-governance-gates.sh"),
   workflows: realWorkflows(),
   pkgScripts: (JSON.parse(read("package.json")) as { scripts: Record<string, string> }).scripts,
 });
@@ -330,4 +331,27 @@ test("a CI step that always runs and fails CI on error still counts", () => {
   bare.workflows[wf] = before.replace("on:\n  pull_request:\n    branches: [feat/v5-selfhost]\n  push:\n    branches: [feat/v5-selfhost]\n  workflow_dispatch:\n", "on: [pull_request, push]\n");
   assert.notEqual(bare.workflows[wf], before);
   assert.deepEqual(check(bare), []);
+});
+
+test("red: governance fast-gate parity catches missing manifest or CI wiring", () => {
+  const missingInManifest = real();
+  missingInManifest.governanceLib = missingInManifest.governanceLib.replace(
+    'scripts/check-debt-ttl.ts tsx',
+    'scripts/check-debt-ttl.ts tsx "$staging" "$pinned_gitdir" "$staging" "" 1 -- --enforce || return 1\n  _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-new-gov-only.ts tsx',
+  );
+  assert.deepEqual(kinds(check(missingInManifest)), ["train-not-in-manifest"]);
+
+  const removedFromTrain = real();
+  removedFromTrain.governanceLib = removedFromTrain.governanceLib.replace(
+    /^\s*_master_governance_run_gate .*scripts\/check-debt-ttl\.ts.*$/m,
+    "",
+  );
+  assert.deepEqual(kinds(check(removedFromTrain)), ["manifest-not-in-train"]);
+
+  const removedFromCi = real();
+  removedFromCi.workflows["v5-selfhost-gates.yml"] = removedFromCi.workflows["v5-selfhost-gates.yml"]!.replace(
+    "npx tsx scripts/check-debt-ttl.ts",
+    "echo skipped",
+  );
+  assert.deepEqual(kinds(check(removedFromCi)), ["ci-missing"]);
 });

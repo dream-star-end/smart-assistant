@@ -381,6 +381,34 @@ export async function sumAntigravityRelayUsage(
   return totals
 }
 
+/**
+ * Shared terminal status authority for delegate_antigravity settlement (OCV5-897 B1).
+ * Both HTTP settle and durable tape settle call this so a container-reported error
+ * cannot waive real non-aux, non-retired output already metered by the master relay,
+ * while USER_CANCELLED retains its waiver contract and zero-output errors stay waived.
+ */
+export async function resolveDelegateAntigravityEngineStatus(
+  pool: Pick<Pool, 'query'>,
+  requestId: string,
+  userId: bigint,
+  requestedStatus: 'success' | 'error',
+  terminalCode?: string | null,
+  sumUsageFn: typeof sumAntigravityRelayUsage = sumAntigravityRelayUsage,
+): Promise<'success' | 'error'> {
+  if (requestedStatus === 'success' || terminalCode === 'USER_CANCELLED') {
+    return requestedStatus
+  }
+  const metered = await sumUsageFn(pool, requestId, userId, { excludeRetired: true })
+  let extraOutput = 0n
+  if (metered.extraModels) {
+    for (const extra of Object.values(metered.extraModels)) {
+      extraOutput += extra.candidatesTokens + extra.thoughtsTokens
+    }
+  }
+  const nonAuxOutput = metered.candidatesTokens + metered.thoughtsTokens + extraOutput
+  return nonAuxOutput > 0n ? 'success' : 'error'
+}
+
 function scaledTokenCost(
   usage: TokenUsage,
   pricing: Pick<
@@ -793,12 +821,14 @@ export interface AntigravityTurnRecord {
 export async function recordAntigravityTurn(
   pool: Pick<Pool, 'query'>,
   turn: AntigravityTurnRecord,
-): Promise<void> {
-  await pool.query(
+): Promise<{ inserted: boolean }> {
+  const res = await pool.query<{ request_id: string }>(
     `INSERT INTO antigravity_turns (request_id, user_id, model_id, session_id, trace_id)
-     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (request_id) DO NOTHING`,
+     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (request_id) DO NOTHING RETURNING request_id`,
     [turn.requestId, turn.userId.toString(), turn.modelId, turn.sessionId, turn.traceId],
   )
+  const inserted = (res.rows?.length ?? 0) > 0 || (res.rowCount ?? 0) > 0
+  return { inserted }
 }
 
 /** Admission failed after the row was written: nothing ran on the route. */
@@ -806,7 +836,17 @@ export async function abandonAntigravityTurn(
   pool: Pick<Pool, 'query'>,
   requestId: string,
   userId: bigint,
+  expectedTraceId?: string | null,
 ): Promise<void> {
+  if (typeof expectedTraceId === 'string' && expectedTraceId.length > 0) {
+    await pool.query(
+      `UPDATE antigravity_turns SET status = 'abandoned', updated_at = NOW()
+        WHERE request_id = $1 AND user_id = $2 AND trace_id = $3 AND status = 'pending'
+          AND NOT EXISTS (SELECT 1 FROM antigravity_relay_usage u WHERE u.request_id = $1 AND u.user_id = $2)`,
+      [requestId, userId.toString(), expectedTraceId],
+    )
+    return
+  }
   await pool.query(
     `UPDATE antigravity_turns SET status = 'abandoned', updated_at = NOW()
       WHERE request_id = $1 AND user_id = $2 AND status = 'pending'

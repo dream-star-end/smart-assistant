@@ -43,6 +43,7 @@ import type { PromptSlotApplied } from '../promptSlots.js'
 import { ANTIGRAVITY_PREAMBLE } from './antigravityPlatform.js'
 
 export type AntigravityDedupMode = 'on' | 'off'
+export const ANTIGRAVITY_PROMPT_STATE_ENGINE = 'antigravity' as const
 
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const STATE_DIR = 'prompt-state'
@@ -316,24 +317,62 @@ function pruneStaleStates(stateDir: string, now: number): void {
   }
 }
 
+let promptStateObserver: ((state: AntigravityInjectedContextState) => void) | null = null
+
+export function setAntigravityPromptStateObserver(
+  observer: ((state: AntigravityInjectedContextState) => void) | null,
+): void {
+  promptStateObserver = observer
+}
+
 export function writeAntigravityPromptState(
   antigravityRootDir: string,
   state: AntigravityInjectedContextState,
   now = Date.now(),
 ): void {
+  const wrote = writeAntigravityPromptStateFile(antigravityRootDir, state, now)
+  if (wrote && promptStateObserver) {
+    try {
+      promptStateObserver(state)
+    } catch {
+      /* fail-open: never break local prompt-state persistence */
+    }
+  }
+}
+
+/**
+ * W5: Restore prompt-state from authoritative PG into the local cache WITHOUT
+ * firing `promptStateObserver` (prevents authority read-through writeback loops).
+ */
+export function restoreAntigravityPromptStateSilently(
+  antigravityRootDir: string,
+  state: AntigravityInjectedContextState,
+  now = Date.now(),
+): void {
+  writeAntigravityPromptStateFile(antigravityRootDir, state, now)
+}
+
+function writeAntigravityPromptStateFile(
+  antigravityRootDir: string,
+  state: AntigravityInjectedContextState,
+  now: number,
+): boolean {
   invalidateConversationInspectCacheForId(state.conversationId)
   const dir = path.join(antigravityRootDir, STATE_DIR)
   const target = stateFilePath(antigravityRootDir, state.sessionKey)
   const tmp = `${target}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+  let wrote = false
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 })
     writeFileSync(tmp, `${JSON.stringify(state)}\n`, { encoding: 'utf8', mode: 0o600 })
     chmodSync(tmp, 0o600)
     renameSync(tmp, target)
+    wrote = true
   } catch {
     try { rmSync(tmp, { force: true }) } catch { /* ignore */ }
   }
   pruneStaleStates(dir, now)
+  return wrote
 }
 
 export function clearAntigravityPromptState(antigravityRootDir: string, sessionKey: string): void {

@@ -10,6 +10,7 @@ import { codexManifestHash, parseCodexExecutionSnapshot, projectCodexRemoteCapab
 import { remoteNodeExecKeyDir } from './remoteBrainPool.js'
 import type { CommissionContainerSource } from './codexCommissioningContainer.js'
 import { admitDispatch } from '../dispatch/turnDispatchStore.js'
+import { assertLegacyTrackNotRetiredTx } from './remotePool/legacyRetirementRuntime.js'
 export const COMMISSION_MODEL = 'gpt-6-luna-remote'
 export const COMMISSION_UPSTREAM = 'gpt-6-luna'
 export const controllerSha = () => createHash('sha256').update(readFileSync(new URL('../../../../scripts/agent-remote/codex-host-controller.py',import.meta.url))).digest('hex')
@@ -65,7 +66,9 @@ export async function admitCommission(pool: Pool, adminId: string, profileId: st
   requireCommission(process.env.OC_REMOTE_POOL_EXECUTION_ENABLED!=='0','DISABLED')
   const q=await pool.connect()
   try {
-    await q.query('BEGIN'); const c=await adminContainer(q,adminId,container); const p=await profile(q,profileId,true); const s=observed(p)
+    await q.query('BEGIN')
+    await assertLegacyTrackNotRetiredTx(q, 'placement')
+    const c=await adminContainer(q,adminId,container); const p=await profile(q,profileId,true); const s=observed(p)
     const occupied=(await q.query(`SELECT COUNT(*)::int AS n FROM remote_agent_bindings WHERE profile_id=$1 AND state<>'released'`,[profileId])).rows[0].n
     requireCommission(occupied<Number(p.max_concurrent_lanes),'CAPACITY_EXHAUSTED')
     const id=randomUUID(), operationId=randomUUID(), runId=randomUUID(), authEpoch=p.auth_epoch ?? randomUUID()

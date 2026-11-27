@@ -39,6 +39,7 @@ import { makeSystemRuntimeStatusRead } from './system-assistant/runtimeStatusRea
 import { assembleSystemActions, type SystemSessionReadBackend } from './system-assistant/assemble.js';
 import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js';
 import { getV3ContainerStatus } from './agent-sandbox/v3supervisor.js';
+import type { LocalCasArtifactBlobStore } from './agent-sandbox/artifactBlobStore.js';
 import { startLogTimingReporter } from './logging/logTimingReporter.js';
 import { setContentReviewAlerter, setContentReviewPrefilter } from '@openclaude/gateway';
 import { omniHardHit } from './openai/omniModeration.js';
@@ -893,6 +894,7 @@ export async function registerCommercial(
   // reads this forward ref at request time; startup windows fail closed 503.
   let modelAuthoritySigner: AuthoritySigner | undefined;
   let modelCatalogCache: ModelCatalogCache | undefined;
+  let artifactBlobStore: LocalCasArtifactBlobStore | undefined;
   // 前向引用占位:userChatBridge 在下方创建,但 anthropicProxy 在这里就要它的 broadcastToUser。
   // 给 proxy 的 dep 是稳定的闭包(总是调 bridgeBroadcastRef.current),创建 bridge 后赋值。
   // 在 bridge 初始化完成前到达的 cost_charged broadcast 会走到 noop,不 throw 也不落盘(前端
@@ -1157,6 +1159,7 @@ export async function registerCommercial(
     qqOutboundRef,
     qqProactiveRef,
     getModelAuthoritySigner: () => modelAuthoritySigner,
+    getArtifactBlobStore: () => artifactBlobStore,
     getCronOriginBridge: () => cronOriginBridgeRef,
     getSystemActions: () => systemActions,
     setDesktopTlsClose: (fn) => { desktopTlsClose = fn; },
@@ -1200,18 +1203,19 @@ export async function registerCommercial(
     mediaSignKey,
     wechatLiveLinkKey,
     thumbnailCache,
+    artifactBlobStore: bootArtifactBlobStore,
     modelAuthorityProvisionRequired,
     modelAuthoritySigner: bootModelAuthoritySigner,
     modelCatalogCache: bootModelCatalogCache,
   } = await bootstrapMailerBridgeAndAuthority({ env: process.env });
+  artifactBlobStore = bootArtifactBlobStore;
   modelAuthoritySigner = bootModelAuthoritySigner;
   modelCatalogCache = bootModelCatalogCache;
 
   // V3 Phase 3 supervisor 装配 —— 必须在 createCommercialHandler 之前构造,
   // 因为 admin/containers HIGH#6 路径要在 deps.v3Supervisor 上 dispatch v3 行。
   // 见下方 idleSweep / volumeGc / orphanReconcile / makeV3EnsureRunning 都复用 v3Deps。
-  let v3Deps: V3SupervisorDeps | undefined;
-  let cc5Runtime: ReturnType<typeof createMasterCc5Runtime>;
+  let v3Deps: V3SupervisorDeps | undefined; let cc5Runtime: ReturnType<typeof createMasterCc5Runtime>; let legacyRetirementGate: ReturnType<typeof assembleV3SupervisorCore>["legacyRetirementGate"] | undefined;
   if (cfg.OC_RUNTIME_IMAGE) {
     const assembled = assembleV3SupervisorCore({
       env: process.env,
@@ -1226,9 +1230,7 @@ export async function registerCommercial(
       selfHostUuid,
       sessionsDeletedRef,
     });
-    const v3Docker = assembled.v3Docker;
-    v3Deps = assembled.v3Deps;
-    cc5Runtime = assembled.cc5Runtime;
+    const v3Docker = assembled.v3Docker; v3Deps = assembled.v3Deps; cc5Runtime = assembled.cc5Runtime; legacyRetirementGate = assembled.legacyRetirementGate;
     cc5RuntimeRef.current = cc5Runtime;
 
     if (dualMasterEnabled && controlPlaneEnabled) {
@@ -1450,7 +1452,7 @@ export async function registerCommercial(
     && modelAuthoritySigner && modelAuthorityProvisionRequired && modelCatalogCache && v3Deps
     ? new CodexCommissioning({pool:getPool(),preCheckRedis,catalog:modelCatalogCache,keyring:()=>modelAuthoritySigner!.publicKeyring(),
       signer:modelAuthoritySigner,loadUserModelAuthz,log:rootLogger.child({subsys:"codexCommissioning"}),
-      containerSource:makeAdminCommissionContainerSource(v3Deps)}) : undefined;
+      containerSource:makeAdminCommissionContainerSource(v3Deps),legacyRetirementGate}) : undefined;
   const v4ExecutorDeps = runtimeChannel === "v5" && flavorIdentity.status === "ok" && flavorIdentity.flavor === "selfhost"
     && modelAuthoritySigner && modelAuthorityProvisionRequired && modelCatalogCache && v3Deps
     ? { pool: getPool(), preCheckRedis, catalog: modelCatalogCache, keyring: () => modelAuthoritySigner!.publicKeyring(),
@@ -1458,7 +1460,7 @@ export async function registerCommercial(
         containerSource: makeAdminCommissionContainerSource(v3Deps) }
     : undefined;
   const remoteDriverV4 = v4ExecutorDeps
-    ? new RemoteDriverV4CommissioningService({ executorDeps: v4ExecutorDeps })
+    ? new RemoteDriverV4CommissioningService({ executorDeps: v4ExecutorDeps, legacyRetirementGate })
     : undefined;
   const qqBotServiceRef: { current: QqBotService | undefined } = { current: undefined };
   const pendingDecisionsRuntime = createCommercialPendingDecisionsRuntime({

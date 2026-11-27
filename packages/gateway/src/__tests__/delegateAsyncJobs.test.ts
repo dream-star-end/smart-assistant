@@ -37,6 +37,12 @@ after(() => {
 
 import { DelegateJobStore } from '../delegateJobs.js'
 import {
+  ModelCatalogClient,
+  ModelCatalogUnavailableError,
+  _setModelCatalogClientForTests,
+  parseCatalogResponse,
+} from '../modelCatalogClient.js'
+import {
   DELEGATE_CONTEXT_HEADER,
   issueDelegateContextToken,
   resetDelegateContextKeyForTests,
@@ -376,7 +382,7 @@ describe('handleDelegateTask model override', () => {
     assert.equal(gw._submitted[0].model, 'cursor-grok-4.6-high-fast')
   })
 
-  it('不传 model 时不覆盖成员默认', async () => {
+  it('不传 model 时 flag-off 隐式选型真实绑定四大家族模型（旧 GLM 默认回落 deepseek-v4-flash）', async () => {
     const gw = makeGateway(false)
     const r = await call(gw, 'handleDelegateTask', {
       goal: '普通',
@@ -384,7 +390,8 @@ describe('handleDelegateTask model override', () => {
       parentSessionKey: PARENT_KEY,
     })
     assert.equal(r.status, 200)
-    assert.equal(gw._submitted[0].model, undefined)
+    assert.equal(gw._created[0].model, 'deepseek-v4-flash')
+    assert.equal(gw._submitted[0].model, 'deepseek-v4-flash')
   })
 
   it('flag-off explicit unknown model returns 400 DELEGATE_MODEL_UNKNOWN', async () => {
@@ -421,8 +428,8 @@ describe('handleDelegateTask model override', () => {
     assert.doesNotThrow(() => assertKnownExplicitDelegateModel('cursor-grok-4.6-high-fast'))
     const gw = makeGateway(false)
     // grok-build is baked-known but HTTP mint of a Grok relay is out of scope
-    // for this stub gateway (503 GROK_ROUTE). Probe CCB/Cursor slugs here.
-    for (const model of ['glm-5.3-zai', 'cursor-grok-4.6-high-fast']) {
+    // for this stub gateway (503 GROK_ROUTE). Probe CCB/Cursor 4-family slugs here.
+    for (const model of ['deepseek-v4-flash', 'cursor-grok-4.6-high-fast']) {
       gw._created = undefined
       gw._submitted = undefined
       const r = await call(gw, 'handleDelegateTask', {
@@ -433,6 +440,166 @@ describe('handleDelegateTask model override', () => {
       })
       assert.equal(r.status, 200, model)
       assert.equal(gw._created[0].model, model, model)
+    }
+    // Non-4-family explicit slug rejects 400 DELEGATE_MODEL_FAMILY_NOT_ALLOWED even when flag-off.
+    gw._created = undefined
+    const rejected = await call(gw, 'handleDelegateTask', {
+      goal: '测',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      model: 'glm-5.3-zai',
+    })
+    assert.equal(rejected.status, 400)
+    assert.equal(rejected.body.code, 'DELEGATE_MODEL_FAMILY_NOT_ALLOWED')
+    assert.equal(rejected.body.failure_class, 'invalid_model')
+    assert.equal(gw._created, undefined)
+  })
+
+  it('OCV5-897 B7: async explicit non-4-family model rejects 400 at entry (flag-off and flag-on) before job/slot/queue-429/resume', async () => {
+    const prevAuth = process.env.OC_MODEL_AUTHORITY
+    const prevSm = process.env.OC_DELEGATE_SM
+    try {
+      // Flag-off async with full queue (0 jobs created, 400 beats 429)
+      process.env.OC_MODEL_AUTHORITY = '0'
+      process.env.OC_DELEGATE_SM = '1'
+      {
+        const gw = makeGateway(false)
+        let admitCreateCalls = 0
+        gw._admitDelegateCreate = () => {
+          admitCreateCalls += 1
+          return { ok: false, httpStatus: 429, error: 'queue full' }
+        }
+        const token = issueDelegateContextToken({
+          agentId: 'main',
+          sessionKey: PARENT_KEY,
+          depth: 0,
+        })
+        const r = await call(
+          gw,
+          'handleDelegateTask',
+          { goal: 'bad family async flag-off', model: 'glm-5.3-zai', async: true },
+          'coding-assistant',
+          { [DELEGATE_CONTEXT_HEADER]: token },
+        )
+        assert.equal(r.status, 400)
+        assert.equal(r.body.code, 'DELEGATE_MODEL_FAMILY_NOT_ALLOWED')
+        assert.equal(r.body.failure_class, 'invalid_model')
+        assert.equal(r.body.jobId, undefined)
+        assert.equal(admitCreateCalls, 0, '400 invalid model must reject before 429 queue/slot gate')
+        assert.equal(gw._delegateJobs?.size ?? 0, 0, 'must create 0 async jobs')
+        assert.equal(gw._created, undefined)
+      }
+
+      // Flag-on async with catalog projection: non-4-family -> 400, catalog unavailable -> 503
+      process.env.OC_MODEL_AUTHORITY = '1'
+      const catalogView = parseCatalogResponse({
+        models: [
+          {
+            model_id: 'glm-5.2',
+            display_name: 'glm-5.2',
+            engine: 'ccb',
+            provider_id: 'ark',
+            context_window: 200_000,
+            supported_efforts: ['high'],
+            supports_vision: false,
+            capability_zero: true,
+            supports_thinking: true,
+            default_effort: 'high',
+          },
+          {
+            model_id: 'deepseek-v4-flash',
+            display_name: 'deepseek-v4-flash',
+            engine: 'ccb',
+            provider_id: 'ark',
+            context_window: 200_000,
+            supported_efforts: ['high'],
+            supports_vision: false,
+            capability_zero: true,
+            supports_thinking: true,
+            default_effort: 'high',
+          },
+          {
+            model_id: 'antigravity-gemini-4-neon',
+            display_name: 'antigravity-gemini-4-neon',
+            engine: 'antigravity',
+            provider_id: 'antigravity',
+            context_window: 200_000,
+            supported_efforts: ['high'],
+            supports_vision: true,
+            capability_zero: false,
+            supports_thinking: true,
+            default_effort: 'high',
+          },
+        ],
+        aliases: {},
+        projection_revision: 'proj-1',
+        security_epoch: '7',
+      })
+      _setModelCatalogClientForTests({
+        getView: async () => catalogView,
+        getRoutingView: async () => catalogView,
+      } as unknown as ModelCatalogClient)
+      {
+        const gw = makeGateway(false)
+        let admitCreateCalls = 0
+        gw._admitDelegateCreate = () => {
+          admitCreateCalls += 1
+          return { ok: false, httpStatus: 429, error: 'queue full' }
+        }
+        const token = issueDelegateContextToken({
+          agentId: 'main',
+          sessionKey: PARENT_KEY,
+          depth: 0,
+        })
+        const r = await call(
+          gw,
+          'handleDelegateTask',
+          { goal: 'bad family async flag-on', model: 'glm-5.2', async: true },
+          'coding-assistant',
+          { [DELEGATE_CONTEXT_HEADER]: token },
+        )
+        assert.equal(r.status, 400)
+        assert.equal(r.body.code, 'DELEGATE_MODEL_FAMILY_NOT_ALLOWED')
+        assert.equal(r.body.failure_class, 'invalid_model')
+        assert.equal(r.body.jobId, undefined)
+        assert.equal(admitCreateCalls, 0)
+        assert.equal(gw._delegateJobs?.size ?? 0, 0)
+      }
+
+      // Flag-on catalog unavailable -> 503 MODEL_CATALOG_UNAVAILABLE, 0 jobs
+      _setModelCatalogClientForTests({
+        getView: async () => {
+          throw new ModelCatalogUnavailableError('catalog down')
+        },
+        getRoutingView: async () => {
+          throw new ModelCatalogUnavailableError('catalog down')
+        },
+      } as unknown as ModelCatalogClient)
+      {
+        const gw = makeGateway(false)
+        const token = issueDelegateContextToken({
+          agentId: 'main',
+          sessionKey: PARENT_KEY,
+          depth: 0,
+        })
+        const r = await call(
+          gw,
+          'handleDelegateTask',
+          { goal: 'catalog down async flag-on', model: 'deepseek-v4-flash', async: true },
+          'coding-assistant',
+          { [DELEGATE_CONTEXT_HEADER]: token },
+        )
+        assert.equal(r.status, 503)
+        assert.equal(r.body.code, 'MODEL_CATALOG_UNAVAILABLE')
+        assert.equal(r.body.jobId, undefined)
+        assert.equal(gw._delegateJobs?.size ?? 0, 0)
+      }
+    } finally {
+      _setModelCatalogClientForTests(null)
+      if (prevAuth === undefined) delete process.env.OC_MODEL_AUTHORITY
+      else process.env.OC_MODEL_AUTHORITY = prevAuth
+      if (prevSm === undefined) delete process.env.OC_DELEGATE_SM
+      else process.env.OC_DELEGATE_SM = prevSm
     }
   })
 

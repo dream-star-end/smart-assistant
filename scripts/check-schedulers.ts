@@ -14,10 +14,36 @@
 // For each, require at least one reference from another non-test file. A
 // type-only import counts as a reference — that's intentional, see plan.
 
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const ROOT = new URL("../packages/commercial/src/", import.meta.url).pathname;
+function parseRepoRoot(argv: string[]): string {
+  let root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--root") {
+      const val = argv[++i];
+      if (!val) {
+        console.error("✗ check-schedulers: --root requires a directory");
+        process.exit(2);
+      }
+      root = resolve(val);
+    } else if (arg?.startsWith("--root=")) {
+      root = resolve(arg.slice("--root=".length));
+    } else {
+      console.error(`✗ check-schedulers: unknown argument: ${arg}`);
+      process.exit(2);
+    }
+  }
+  return root;
+}
+
+const ROOT = join(parseRepoRoot(process.argv.slice(2)), "packages", "commercial", "src");
+if (!existsSync(ROOT)) {
+  console.error(`✗ check-schedulers: commercial src directory not found: ${ROOT}`);
+  process.exit(2);
+}
 
 // Catch factory functions:  startXxxScheduler / getHealthPoller etc.
 const FN_RE = /^export\s+(?:async\s+)?function\s+((?:start|get)\w*(?:Scheduler|Poller|Worker|Sweeper|Monitor))\b/gm;

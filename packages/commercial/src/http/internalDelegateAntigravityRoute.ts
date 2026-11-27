@@ -22,31 +22,40 @@
  * renew scope the route to the caller's (containerId, userId), so one
  * container can never expire or slide another container's route.
  *
- * Mount gating: only routed when master runs the selfhost engine-local-turn
- * exemption (OC_SELFHOST_ENGINE_LOCAL_TURNS=1). Production masters never mount
- * it, and production containers already reject antigravity delegate turns in
- * decideLocalExecution.
+ * Mount gating: mounted across both selfhost and commercial masters (OCV5-897),
+ * aligned with internalDelegateGrokRoute. Every mint requires verified container
+ * identity plus an owned inflight `delegate_antigravity` billing journal row,
+ * and `antigravityRouteAuthority.ts` re-validates that journal on relay traffic.
  */
 
+import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Pool } from 'pg'
 
-import { isAntigravityEngineModel } from '@openclaude/protocol'
+import { isAllowedDelegateModel, isAntigravityEngineModel } from '@openclaude/protocol'
 
 import {
   AntigravityAdmissionError,
   admitAntigravityTurn,
 } from '../account-pool/antigravityAdmission.js'
-import { releaseInflight } from '../account-pool/policy/affinity.js'
+import { releaseInflight, renewInflight } from '../account-pool/policy/affinity.js'
 import {
   abandonAntigravityTurn,
   recordAntigravityTurn,
 } from '../billing/antigravitySettle.js'
 import {
+  type AntigravityRelayPricingOverride,
+  claimDelegateAntigravityMint,
   expireAntigravityRelayRoute,
   expireAntigravityRelayRouteForRequest,
+  persistDelegateAntigravityRouteToken,
+  releaseDelegateAntigravityMintClaim,
   resolveAntigravityRelayRoute,
 } from '../billing/antigravityRouteContext.js'
+import {
+  parseBillingPricing,
+  serializeBillingPricing,
+} from '../billing/persistedBillingPricing.js'
 import {
   ContainerIdentityError,
   type ContainerIdentityRepo,
@@ -89,6 +98,7 @@ export interface DelegateAntigravityRouteDeps {
   expireRequest?: typeof expireAntigravityRelayRouteForRequest
   resolveRoute?: typeof resolveAntigravityRelayRoute
   releaseInflightFn?: typeof releaseInflight
+  renewInflightFn?: typeof renewInflight
   /** Optional live spendable balance lookup; falls back to journal antigravityBudgetCredits / precheck_credits. */
   readBalance?: (userId: bigint) => Promise<bigint>
 }
@@ -122,6 +132,7 @@ export function makeDelegateAntigravityRouteHandler(
   const runResolve = deps.resolveRoute ?? resolveAntigravityRelayRoute
   const runExpire = deps.expireRoute ?? expireAntigravityRelayRoute
   const runReleaseInflight = deps.releaseInflightFn ?? releaseInflight
+  const runRenewInflight = deps.renewInflightFn ?? renewInflight
   const mintInFlight = new Set<string>()
 
   return async (req, res, ctx) => {
@@ -220,10 +231,13 @@ export function makeDelegateAntigravityRouteHandler(
         }
         const claim = row as JournalAdmissionRow
         const ctxJson = claim.ctx ?? {}
-        if (typeof ctxJson.antigravityRouteToken === 'string') {
-          // A retry whose response was lost. The route itself cannot be replayed
-          // (access tokens are not stored), so fail closed; the container
-          // abandons the admission and the journal token is released there.
+        if (
+          typeof ctxJson.antigravityRouteToken === 'string' ||
+          typeof ctxJson.antigravityMintClaim === 'string'
+        ) {
+          // A retry whose response was lost or a concurrent cross-instance mint.
+          // The route itself cannot be replayed (access tokens are not stored),
+          // so fail closed; caller must NOT abandon an active winner's admission.
           sendJson(res, 409, {
             error: {
               code: 'DELEGATE_ANTIGRAVITY_ROUTE_ALREADY_MINTED',
@@ -242,6 +256,15 @@ export function makeDelegateAntigravityRouteHandler(
           })
           return
         }
+        if (!isAllowedDelegateModel(modelId)) {
+          sendJson(res, 409, {
+            error: {
+              code: 'DELEGATE_ANTIGRAVITY_ROUTE_MODEL_FAMILY_NOT_ALLOWED',
+              message: 'admission model family is not allowed for delegation',
+            },
+          })
+          return
+        }
         const userId = BigInt(identity.userId)
         const ctxBudgetCredits =
           typeof ctxJson.antigravityBudgetCredits === 'string' &&
@@ -252,27 +275,100 @@ export function makeDelegateAntigravityRouteHandler(
           typeof claim.precheck_credits === 'string' && /^\d+$/.test(claim.precheck_credits)
             ? BigInt(claim.precheck_credits)
             : 0n
-        // A multi-step turn may spend what the user can spend now; the precheck reservation is
-        // always covered. Without a live read, the balance recorded at admission stands in.
-        let spendable = ctxBudgetCredits
+        // Live spendable balance is the authoritative budget ceiling when available:
+        // if balance has dropped to 0, fail closed with 402 instead of falling back
+        // to stale precheck_credits. Only fall back when live read is absent/errors.
+        let budgetCredits: bigint
         if (deps.readBalance) {
           try {
-            spendable = await deps.readBalance(userId)
+            budgetCredits = await deps.readBalance(userId)
           } catch (err) {
             log.warn('delegate_antigravity_route_balance_lookup_failed', {
               requestId,
               userId: String(identity.userId),
               err: (err as Error).message,
             })
+            budgetCredits = ctxBudgetCredits > precheckCredits ? ctxBudgetCredits : precheckCredits
           }
+        } else {
+          budgetCredits = ctxBudgetCredits > precheckCredits ? ctxBudgetCredits : precheckCredits
         }
-        const budgetCredits = spendable > precheckCredits ? spendable : precheckCredits
         if (budgetCredits <= 0n) {
-          sendJson(res, 503, {
-            error: { code: 'ANTIGRAVITY_BUDGET_UNAVAILABLE', message: 'admission budget missing' },
+          sendJson(res, 402, {
+            error: {
+              code: 'ANTIGRAVITY_BUDGET_UNAVAILABLE',
+              message: 'insufficient spendable balance for antigravity delegate',
+            },
           })
           return
         }
+        const parsedBillingPricing = parseBillingPricing(ctxJson.billingPricing, modelId)
+        const pricingOverride: AntigravityRelayPricingOverride | undefined = parsedBillingPricing
+          ? (() => {
+              const s = serializeBillingPricing(parsedBillingPricing)
+              return {
+                modelId: s.modelId,
+                displayName: s.displayName,
+                inputPerMtok: s.inputPerMtok,
+                outputPerMtok: s.outputPerMtok,
+                cacheReadPerMtok: s.cacheReadPerMtok,
+                cacheWritePerMtok: s.cacheWritePerMtok,
+                multiplier: s.multiplier,
+              }
+            })()
+          : undefined
+
+        // Cross-instance atomic mint claim BEFORE touching pool/Redis (OCV5-897 B4):
+        // in-process mintInFlight cannot serialize two master replicas, so claim
+        // the journal row in PG first; a racing replica sees 0 rows and returns 409
+        // without allocating slots or clobbering the winner's Redis route key.
+        const mintClaimId = randomUUID()
+        const releaseMintClaim = async (): Promise<void> => {
+          try {
+            await releaseDelegateAntigravityMintClaim(deps.pool, {
+              requestId: journalRequestId,
+              claimId: mintClaimId,
+              userId: identity.userId,
+              containerId: identity.containerId,
+            })
+          } catch (err) {
+            log.warn('delegate_antigravity_route_claim_release_failed', {
+              requestId,
+              err: (err as Error).message,
+            })
+          }
+        }
+        let claimed: boolean
+        try {
+          claimed = await claimDelegateAntigravityMint(deps.pool, {
+            requestId: journalRequestId,
+            claimId: mintClaimId,
+            userId: identity.userId,
+            containerId: identity.containerId,
+          })
+        } catch (err) {
+          log.error('delegate_antigravity_route_claim_failed', {
+            requestId,
+            err: (err as Error).message,
+          })
+          sendJson(res, 503, {
+            error: {
+              code: 'ANTIGRAVITY_ROUTE_JOURNAL_UNAVAILABLE',
+              message: 'journal claim failed',
+            },
+          })
+          return
+        }
+        if (!claimed) {
+          sendJson(res, 409, {
+            error: {
+              code: 'DELEGATE_ANTIGRAVITY_ROUTE_ALREADY_MINTED',
+              message: 'route mint already in progress or minted for this admission',
+            },
+          })
+          return
+        }
+
         let minted: Awaited<ReturnType<typeof admitAntigravityTurn>>
         try {
           minted = await runAdmit(
@@ -283,10 +379,13 @@ export function makeDelegateAntigravityRouteHandler(
               modelId,
               budgetCredits,
               relayPort: deps.relayPort,
+              strictCapacity: true,
+              ...(pricingOverride ? { pricingOverride } : {}),
             },
             { clientSecret: deps.clientSecret },
           )
         } catch (err) {
+          await releaseMintClaim()
           const code = err instanceof AntigravityAdmissionError ? err.code : 'ANTIGRAVITY_UNAVAILABLE'
           log.warn('delegate_antigravity_route_mint_failed', {
             requestId,
@@ -311,6 +410,7 @@ export function makeDelegateAntigravityRouteHandler(
           })
         } catch (err) {
           await cleanupMinted({ deps, runExpire, runAbandon, runReleaseInflight, log, requestId, userId, journalRequestId, token: minted.token })
+          await releaseMintClaim()
           sendJson(res, 503, {
             error: { code: 'ANTIGRAVITY_ROUTE_RECORD_FAILED', message: 'turn record failed' },
           })
@@ -319,25 +419,24 @@ export function makeDelegateAntigravityRouteHandler(
 
         // Persist the opaque token into the admission journal before returning:
         // settle/abandon read it even after a gateway restart.
-        let persisted: { rows: Record<string, unknown>[] }
+        let persisted: boolean
         try {
-          persisted = await deps.pool.query(
-            `UPDATE request_finalize_journal
-                SET ctx = ctx || jsonb_build_object('antigravityRouteToken', $2::text),
-                    updated_at = NOW()
-              WHERE request_id=$1 AND user_id=$3 AND container_id=$4
-                AND state='inflight' AND NOT (ctx ? 'antigravityRouteToken')
-              RETURNING request_id`,
-            [journalRequestId, minted.token, identity.userId, identity.containerId],
-          )
+          persisted = await persistDelegateAntigravityRouteToken(deps.pool, {
+            requestId: journalRequestId,
+            token: minted.token,
+            claimId: mintClaimId,
+            userId: identity.userId,
+            containerId: identity.containerId,
+          })
         } catch (err) {
           await cleanupMinted({ deps, runExpire, runAbandon, runReleaseInflight, log, requestId, userId, journalRequestId, token: minted.token })
+          await releaseMintClaim()
           sendJson(res, 503, {
             error: { code: 'ANTIGRAVITY_ROUTE_PERSIST_FAILED', message: 'journal persist failed' },
           })
           return
         }
-        if (persisted.rows.length !== 1) {
+        if (!persisted) {
           // If another process won the persist race and already bound a
           // routeToken onto this journal — or if the verification query fails
           // so ownership is unknown — only expire our own orphan token so we
@@ -363,6 +462,7 @@ export function makeDelegateAntigravityRouteHandler(
           } else {
             await runExpire(minted.token).catch(() => {})
           }
+          await releaseMintClaim()
           if (lookupFailed) {
             sendJson(res, 503, {
               error: {
@@ -456,15 +556,19 @@ export function makeDelegateAntigravityRouteHandler(
 
     if (path === DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH) {
       // Relay calls already renew the KV TTL; this endpoint keeps the delegate
-      // lease contract symmetric with grok and proves liveness for the caller.
+      // lease contract symmetric with grok, proves liveness, and slides the
+      // account-pool in-flight slot TTL for long-running delegations (OCV5-897 B3).
       let live = false
       try {
-        live =
-          (await runResolve({
-            token: routeToken,
-            containerId: identity.containerId,
-            userId,
-          })) !== null
+        const route = await runResolve({
+          token: routeToken,
+          containerId: identity.containerId,
+          userId,
+        })
+        live = route !== null
+        if (route?.requestId) {
+          runRenewInflight(route.requestId)
+        }
       } catch (err) {
         log.error('delegate_antigravity_route_renew_failed', {
           requestId,

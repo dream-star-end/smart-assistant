@@ -46,10 +46,10 @@ for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
-cursor_bin=/opt/cursor-agent/versions/2026.10.16-e3cb207/cursor-agent
+cursor_bin=/opt/cursor-agent/versions/2026.11.22-e9042b2/cursor-agent
 # platform/current reaches a running container before its image is recycled: a container
 # created from the previous image keeps that image's pinned CLI (and its own Sand marker).
-[ -x "$cursor_bin" ] || cursor_bin=/opt/cursor-agent/versions/2026.08.11-e8db854/cursor-agent
+[ -x "$cursor_bin" ] || cursor_bin=/opt/cursor-agent/versions/2026.10.16-e3cb207/cursor-agent
 cursor_probe_bin=/usr/bin/curl
 cursor_probe_url=https://api2.cursor.sh
 cursor_select_budget=45
@@ -1374,7 +1374,7 @@ fi
 [ -z "$mode" ] || set -- --mode "$mode" "$@"
 [ "$force" -eq 0 ] || set -- --force "$@"
 if [ "${OPENCLAUDE_ADVISOR_READ_ONLY:-0}" = "1" ]; then
-  # Pinned Cursor 2026.10.16 supports this exact proto-tool allowlist. Ask
+  # Pinned Cursor 2026.11.22 supports this exact proto-tool allowlist. Ask
   # mode also stays on, but write/shell/delegate/mode-switch schemas are absent.
   set -- --allowed-tools "read_tool_call,glob_tool_call,grep_tool_call,ls_tool_call,sem_search_tool_call,read_lints_tool_call,read_todos_tool_call,mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_resource_tool_call" "$@"
 fi

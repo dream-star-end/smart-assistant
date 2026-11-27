@@ -46,10 +46,10 @@ describe("OCV5-575 box-gpt-6-astra-pro allowlist", () => {
 describe("OCV5-575 box-gpt-6-astra-pro is never billed", () => {
   test("no Cursor audit row, no balance requirement, no credit budget", async () => {
     const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
-    assert.match(source, /const cursorBilled = !isBoxGptWebModel\(modelCapture\);/);
+    assert.match(source, /const cursorBilled = !isBoxGptWebModel\(activeCursorModel\);/);
     assert.match(source, /if \(cursorBilled\) cursorSpendable = await readTotalSpendableBalance\(uid\);/);
     assert.match(source, /if \(cursorSpendable !== null && cursorSpendable <= 0n\) \{/);
-    assert.match(source, /if \(!isBoxGptWebModel\(modelCapture\)\) \{\n\s+await deps\.pgPool\.query\(\n\s+`INSERT INTO cursor_external_usage_audit/);
+    assert.match(source, /if \(!isBoxGptWebModel\(activeCursorModel\)\) \{\n\s+await deps\.pgPool\.query\(\n\s+`INSERT INTO cursor_external_usage_audit/);
   });
 
   test("edition migration stages a hidden disabled seed with exact commercial vs selfhost owner grant", async () => {

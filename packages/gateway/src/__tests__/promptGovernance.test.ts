@@ -349,7 +349,7 @@ describe('OCV5-840 cache prefix hygiene & promptFreeze defaults', () => {
       delegateModelCatalog: {
         models: [
           { modelId: 'deepseek-v4-flash', engine: 'ccb', available: true },
-          { modelId: 'kimi-k3', engine: 'ccb', available: true },
+          { modelId: 'gpt-6-astra', engine: 'codex', available: true },
         ],
         projectionRevision: 'rev-b',
         verifiedAt: 0,

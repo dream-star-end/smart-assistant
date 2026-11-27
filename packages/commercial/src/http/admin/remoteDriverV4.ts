@@ -10,6 +10,71 @@ import { HttpError, readJsonBody, sendJson } from '../util.js'
 
 const UUID_RE = /^[a-f0-9-]{36}$/i
 
+type DriverV4Service = NonNullable<CommercialHttpDeps['remoteDriverV4']>
+
+async function handleLegacyRetirementSubroute(
+  method: string | undefined,
+  suffix: string,
+  parsedUrl: URL,
+  service: DriverV4Service,
+  adminUid: number,
+): Promise<{ targetId: string; action: string; result: unknown } | null> {
+  if (method === 'GET' && suffix === '/legacy-retirement') {
+    return {
+      targetId: 'legacy-retirement',
+      action: 'legacy_retirement.status',
+      result: await service.getLegacyRetirementStatus(),
+    }
+  }
+  if (method === 'GET' && suffix.startsWith('/legacy-retirement/turns/')) {
+    const requestId = decodeURIComponent(suffix.slice('/legacy-retirement/turns/'.length)).trim()
+    if (!requestId) throw new HttpError(400, 'VALIDATION', 'LEGACY_BILLING_REQUEST_ID_INVALID')
+    const rawUserId = parsedUrl.searchParams.get('userId')?.trim()
+    let userId: bigint | undefined
+    if (rawUserId) {
+      if (!/^[1-9][0-9]{0,18}$/.test(rawUserId)) {
+        throw new HttpError(400, 'VALIDATION', 'LEGACY_BILLING_USER_ID_INVALID')
+      }
+      userId = BigInt(rawUserId)
+    }
+    const record = await service.lookupLegacyHistoricalTurn({
+      requestId,
+      ...(userId !== undefined ? { userId } : {}),
+    })
+    return { targetId: requestId, action: 'legacy_retirement.lookup_turn', result: { found: record !== null, record } }
+  }
+  if (method === 'POST' && suffix === '/legacy-retirement/seal') {
+    return {
+      targetId: 'legacy-retirement',
+      action: 'legacy_retirement.seal',
+      result: await service.sealLegacyRetirement(adminUid),
+    }
+  }
+  if (method === 'POST' && suffix === '/legacy-retirement/unseal') {
+    return {
+      targetId: 'legacy-retirement',
+      action: 'legacy_retirement.unseal',
+      result: await service.unsealLegacyRetirement(adminUid),
+    }
+  }
+  return null
+}
+
+function mapDriverV4RouteError(err: unknown): HttpError {
+  if (err instanceof HttpError) return err
+  const msg = err instanceof Error ? err.message : ''
+  if (msg === 'LEGACY_BILLING_REQUEST_ID_INVALID' || msg === 'LEGACY_BILLING_USER_ID_INVALID') {
+    return new HttpError(400, 'VALIDATION', msg)
+  }
+  return new HttpError(
+    409,
+    'CONFLICT',
+    /^(?:REMOTE|LEGACY)_[A-Z0-9_]+(?::[A-Z0-9_,]+)?$/.test(msg)
+      ? msg
+      : 'REMOTE_DRIVER_V4_COMMISSION_REJECTED',
+  )
+}
+
 export async function handleAdminRemoteDriverV4(
   req: IncomingMessage,
   res: ServerResponse,
@@ -33,7 +98,8 @@ export async function handleAdminRemoteDriverV4(
     )
   }
 
-  const pathname = new URL(req.url ?? '/', 'http://localhost').pathname
+  const parsedUrl = new URL(req.url ?? '/', 'http://localhost')
+  const pathname = parsedUrl.pathname
   const base = '/api/admin/remote-pool/driver-v4'
   if (!pathname.startsWith(base)) {
     throw new HttpError(404, 'NOT_FOUND', 'unknown remote-driver-v4 path')
@@ -46,7 +112,11 @@ export async function handleAdminRemoteDriverV4(
     let targetId = 'policy'
     let action = suffix.replace(/^\//, '') || 'unknown'
 
-    if (req.method === 'GET' && suffix === '/policy') {
+    if (suffix.startsWith('/legacy-retirement')) {
+      const legacy = await handleLegacyRetirementSubroute(req.method, suffix, parsedUrl, service, Number(admin.id))
+      if (!legacy) throw new HttpError(404, 'NOT_FOUND', 'unknown remote-driver-v4 action')
+      targetId = legacy.targetId; action = legacy.action; result = legacy.result
+    } else if (req.method === 'GET' && suffix === '/policy') {
       result = await service.getPolicy()
       action = 'policy.get'
     } else if (req.method === 'POST' && suffix === '/policy') {
@@ -131,13 +201,6 @@ export async function handleAdminRemoteDriverV4(
     )
     sendJson(res, statusCode, result)
   } catch (err) {
-    if (err instanceof HttpError) throw err
-    throw new HttpError(
-      409,
-      'CONFLICT',
-      err instanceof Error && /^REMOTE_[A-Z0-9_]+$/.test(err.message)
-        ? err.message
-        : 'REMOTE_DRIVER_V4_COMMISSION_REJECTED',
-    )
+    throw mapDriverV4RouteError(err)
   }
 }

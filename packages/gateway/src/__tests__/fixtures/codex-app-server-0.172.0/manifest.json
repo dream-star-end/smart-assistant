@@ -1,0 +1,31 @@
+{
+  "codexVersion": "0.172.0",
+  "npmPackage": "@openai/codex@0.172.0 (dist-tag latest, published 2026-11-24T00:09:39.503Z)",
+  "binaryPath": "/tmp/oc-probe-codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+  "binarySha256": "ad83b94c093f0cdd8176a6bc8005a461bdf23a759863e157d40f562b8a9d664d",
+  "command": "<binaryPath> app-server generate-json-schema --experimental --out <outputDir>",
+  "methods": [
+    "turn/steer",
+    "item/tool/requestUserInput"
+  ],
+  "generatedPaths": {
+    "TurnSteerParams.json": "v2/TurnSteerParams.json",
+    "TurnSteerResponse.json": "v2/TurnSteerResponse.json",
+    "ToolRequestUserInputParams.json": "ToolRequestUserInputParams.json",
+    "ToolRequestUserInputResponse.json": "ToolRequestUserInputResponse.json"
+  },
+  "generatedFiles": {
+    "TurnSteerParams.json": "ba7034e96620c999cf0164f08bc753f58ff2b214f2025ab409f8ce42dc4cc708",
+    "TurnSteerResponse.json": "866ba9a77c12b5d570c837d58f73bf40b24e50fa93404bdf792dd984d313b1aa",
+    "ToolRequestUserInputParams.json": "fda15b62e7446105b59c8ed85c908abed2a47db70653e57c92c47a2f204fa77a",
+    "ToolRequestUserInputResponse.json": "5073b245f741fa8ce62ec52e4dd1809b7831f9c4284c279a78abc9b171f8e3f2"
+  },
+  "repositoryFiles": {
+    "TurnSteerParams.json": "83d1e4529dd64284c004ef59411d853017896a42f353e6ce3998c515cf317d4e",
+    "TurnSteerResponse.json": "fe782ecf0ba6516616967c8fb5366fd1253cd834f6903502fb03f8c57986b671",
+    "ToolRequestUserInputParams.json": "75429f49e09b3dcfecb3dc9bb33eb2e76ffcca62c193c6f29cac71bb4c0ac582",
+    "ToolRequestUserInputResponse.json": "4f2fe3e98cd00462df03e51fe2b984ae4f63feb6337d5f21b72d8bdbee88011f"
+  },
+  "identicalTo": "codex-app-server-0.171.0",
+  "note": "OCV5-899. All four schemas (TurnSteerParams, TurnSteerResponse, ToolRequestUserInputParams, ToolRequestUserInputResponse) are byte-identical to 0.171.0. Runner code does not consume these files."
+}

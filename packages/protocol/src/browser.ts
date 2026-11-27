@@ -178,3 +178,15 @@ export type {
   LiveBrowserServerMessage,
   LiveBrowserServerControlMessage,
 } from './liveBrowser.js'
+
+// Sync missing node-free root exports for browser entry (OCV5-903)
+export { TRACE_ID_REGEX, newTraceId, TRACE_ID_HEADER, parseTraceIdCandidate } from './traceId.js'
+export type { TraceIdIssue } from './traceId.js'
+export { DELEGATE_ALLOWED_MODEL_FAMILIES, SCIENTIFIC_AUDIT_STRONG_POOL_LABEL, resolveCanonicalModelFamily, isAllowedDelegateModelFamily, isAllowedDelegateModel, evaluateScientificAuditReviewer } from './delegateModelPolicy.js'
+export type { DelegateAllowedModelFamily, ScientificAuditRejectReason, ScientificAuditEligibility } from './delegateModelPolicy.js'
+export { G8_REPLAY_POINTS, G8_REPLAY_VERDICTS, G8_BOX_REJECT_CODES, sanitizeG8TraceId, judgeG8Replay, setG8ReplayCheckpoint, setG8ReplayChecker, resetG8ReplayCheckpointForTest, runG8ReplayCheckpoint, g8TurnEndCheckpointInput, g8CompactSummaryCheckpointInput } from './g8ReplayJudge.js'
+export type { G8ReplayPoint, G8ReplayVerdictName, G8DispatchStatus, G8DispatchOutcome, G8EngineReported, G8ReplayObservation, G8ReplayVerdict, G8ReplaySink, G8ReplayChecker } from './g8ReplayJudge.js'
+export { ACTION_POLICY_TIERS, ACTION_POLICY_CATEGORIES, ACTION_POLICY_TIER_SEVERITY, ACTION_CATEGORY_RISK_ORDER, isActionPolicyTier, isActionPolicyCategory, compareActionPolicyTier, DEFAULT_ACTION_POLICY, splitShellCommandSegments, extractCommandTarget, classifyActionCategories, classifyActionCategory, validateActionPolicyDocument, sortActionPolicyRules, mergeActionPolicyWithDefaults, matchActionPolicyRuleInProtocol, evaluateActionPolicyDocumentSync } from './actionPolicy.js'
+export type { ActionPolicyTier, ActionPolicyCategory, ActionPolicyMatcher, ActionPolicyRule, ActionPolicyAiReviewConfig, ActionPolicyDocument, ActionPolicyRequest, AiReviewOutcome, ActionPolicyEvaluation, ValidateActionPolicyResult } from './actionPolicy.js'
+export { PENDING_DECISION_SOURCES, PENDING_DECISION_STATUSES, PENDING_DECISION_ACTIONS, PENDING_DECISION_RISK_LEVELS, PENDING_DECISION_SOURCE_LABELS, PENDING_DECISIONS_LIST_PATH, isPendingDecisionSource, isPendingDecisionAction, encodePendingDecisionId, parsePendingDecisionId, emptyPendingDecisionCounts } from './pendingDecisions.js'
+export type { PendingDecisionSource, PendingDecisionStatus, PendingDecisionAction, PendingDecisionRiskLevel, PendingDecisionItem, PendingDecisionWarning, ListPendingDecisionsResponse, ResolvePendingDecisionRequest, ResolvePendingDecisionResponse } from './pendingDecisions.js'

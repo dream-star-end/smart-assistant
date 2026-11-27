@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto'
 
 import {
   DELEGATE_ENGINE_BILLING_SESSION_KEY_RE,
+  isAllowedDelegateModel,
   type DurableCodexBilling,
 } from '@openclaude/protocol'
 import type { Pool } from 'pg'
@@ -51,8 +52,10 @@ import {
 } from './proxyBilling.js'
 import {
   abandonAntigravityTurn,
+  resolveDelegateAntigravityEngineStatus,
   settleAntigravityTurnRecord,
   settleLateAntigravityRelayUsage,
+  sumAntigravityRelayUsage,
 } from './antigravitySettle.js'
 import {
   expireAntigravityRelayRoute,
@@ -107,6 +110,7 @@ export interface DelegateEngineBillingRuntimeDeps {
   finalizeInflightJournalFn?: typeof finalizeInflightJournal
   settleAntigravityTurnFn?: typeof settleAntigravityTurnRecord
   abandonAntigravityTurnFn?: typeof abandonAntigravityTurn
+  sumAntigravityUsageFn?: typeof sumAntigravityRelayUsage
   expireAntigravityRoute?: (token: string) => Promise<void> | void
   expireAntigravityRouteForRequest?: (requestId: string, expectedUserId: bigint) => Promise<void> | void
   releaseAntigravityInflightFn?: typeof releaseInflight
@@ -242,6 +246,7 @@ export function createDelegateEngineBillingRuntime(
   const runFinalizeJournal = deps.finalizeInflightJournalFn ?? finalizeInflightJournal
   const runSettleAntigravity = deps.settleAntigravityTurnFn ?? settleAntigravityTurnRecord
   const runAbandonAntigravity = deps.abandonAntigravityTurnFn ?? abandonAntigravityTurn
+  const runSumAntigravityUsage = deps.sumAntigravityUsageFn ?? sumAntigravityRelayUsage
   const runExpireAntigravityRoute = deps.expireAntigravityRoute ?? expireAntigravityRelayRoute
   const runExpireAntigravityRouteForRequest =
     deps.expireAntigravityRouteForRequest ?? expireAntigravityRelayRouteForRequest
@@ -286,6 +291,9 @@ export function createDelegateEngineBillingRuntime(
         if (!descriptor) throw new Error('DELEGATE_ENGINE_BILLING_MODEL_UNAVAILABLE')
         if (descriptor.engine !== engine) {
           throw new Error('DELEGATE_ENGINE_BILLING_INVALID_ENGINE')
+        }
+        if (!isAllowedDelegateModel(canonical)) {
+          throw new Error('DELEGATE_ENGINE_BILLING_MODEL_FAMILY_NOT_ALLOWED')
         }
         if (!snapshot.canUseModel(scope, canonical)) {
           throw new Error('DELEGATE_ENGINE_BILLING_NOT_AUTHORIZED')
@@ -406,10 +414,24 @@ export function createDelegateEngineBillingRuntime(
           }
           throw err
         }
+        const creditBudgetFen =
+          typeof precheck.balance === 'bigint' && precheck.balance > 0n
+            ? precheck.balance.toString()
+            : undefined
         if (codexRouteRequired) {
-          return { requestId, engineSessionId, route: codexRoute }
+          return {
+            requestId,
+            engineSessionId,
+            route: codexRoute,
+            ...(creditBudgetFen !== undefined ? { creditBudgetFen } : {}),
+          }
         }
-        return { requestId, engineSessionId, ...(grokExecutionDescriptor ? { grokExecutionDescriptor } : {}) }
+        return {
+          requestId,
+          engineSessionId,
+          ...(grokExecutionDescriptor ? { grokExecutionDescriptor } : {}),
+          ...(creditBudgetFen !== undefined ? { creditBudgetFen } : {}),
+        }
       }
 
       const requestId = requireString(body, 'requestId', REQUEST_ID_RE)
@@ -435,16 +457,11 @@ export function createDelegateEngineBillingRuntime(
         throw new Error('DELEGATE_ENGINE_BILLING_INVALID_JOURNAL_IDENTITY')
       }
 
-      if (path === DELEGATE_ENGINE_BILLING_SETTLE_PATH && source === 'delegate_antigravity') {
-        const engineStatus = body.status === 'success' ? 'success' : 'error'
-        // The route is done the moment the turn is: stop relay traffic before
-        // the (idempotent) usage settle so no late call can add unattributed
-        // spend to this turn.
-        const routeToken = journalString(journalRow.ctx, 'antigravityRouteToken', ROUTE_TOKEN_RE)
-        if (routeToken) {
-          await Promise.resolve(runExpireAntigravityRoute(routeToken)).catch(() => {})
-        }
-        await Promise.resolve(runExpireAntigravityRouteForRequest(requestId, userId)).catch(() => {})
+      const settleDelegateAntigravityJournal = async (args: {
+        reportedStatus: 'success' | 'error'
+        terminalCode: ReturnType<typeof normalizeTerminalCode>
+        attribution: ReturnType<typeof resolveDelegateBillingAttribution>
+      }): Promise<{ settled: boolean }> => {
         const pool = deps.getPool()
         const reservation = { userId: String(identity.userId), requestId }
         const claimId = await runClaimJournal(pool, requestId)
@@ -459,6 +476,16 @@ export function createDelegateEngineBillingRuntime(
           throw new Error('DELEGATE_ENGINE_BILLING_JOURNAL_CONFLICT')
         }
         try {
+          // OCV5-897 B1: Shared authority — do not allow a container-reported error
+          // to waive real non-aux, non-retired output metered by master relay.
+          const engineStatus = await resolveDelegateAntigravityEngineStatus(
+            pool,
+            requestId,
+            userId,
+            args.reportedStatus,
+            args.terminalCode,
+            runSumAntigravityUsage,
+          )
           // OCV5-738 blocker 2: settle with the immutable price snapshot frozen
           // at admission (includes composed agent multiplier). Fall back to
           // live pricing cache only for legacy journals without billingPricing.
@@ -492,8 +519,8 @@ export function createDelegateEngineBillingRuntime(
             requestId,
             userId,
             engineStatus,
-            terminalCode: normalizeTerminalCode(body.terminalCode),
-            attribution: resolveDelegateBillingAttribution(journalRow.ctx, body),
+            terminalCode: args.terminalCode,
+            attribution: args.attribution,
           })
           if (done === null) {
             // No turn row (route never minted → nothing ran), pricing missing,
@@ -586,6 +613,24 @@ export function createDelegateEngineBillingRuntime(
         return { settled: true }
       }
 
+      if (path === DELEGATE_ENGINE_BILLING_SETTLE_PATH && source === 'delegate_antigravity') {
+        const reportedStatus = body.status === 'success' ? 'success' : 'error'
+        const terminalCode = normalizeTerminalCode(body.terminalCode)
+        // The route is done the moment the turn is: stop relay traffic before
+        // the (idempotent) usage settle so no late call can add unattributed
+        // spend to this turn.
+        const routeToken = journalString(journalRow.ctx, 'antigravityRouteToken', ROUTE_TOKEN_RE)
+        if (routeToken) {
+          await Promise.resolve(runExpireAntigravityRoute(routeToken)).catch(() => {})
+        }
+        await Promise.resolve(runExpireAntigravityRouteForRequest(requestId, userId)).catch(() => {})
+        return settleDelegateAntigravityJournal({
+          reportedStatus,
+          terminalCode,
+          attribution: resolveDelegateBillingAttribution(journalRow.ctx, body),
+        })
+      }
+
       if (path === DELEGATE_ENGINE_BILLING_SETTLE_PATH) {
         const status = body.status === 'success' ? 'success' : 'error'
         const durationMs =
@@ -628,19 +673,48 @@ export function createDelegateEngineBillingRuntime(
       }
 
       if (path === DELEGATE_ENGINE_BILLING_ABANDON_PATH && source === 'delegate_antigravity') {
-        // Exactly-once terminal cleanup for an admission whose turn never
-        // started: drop the route, mark the durable turn abandoned (refuses
-        // when relay usage proves a turn ran), give back the account in-flight
-        // slot and the precheck reservation, then abort the journal.
+        // OCV5-897 B1: Prove zero relay usage and abandoned/absent turn BEFORE
+        // aborting the journal or releasing precheck. Never swallow abandon DB
+        // errors; if any relay usage exists or the turn could not be abandoned,
+        // keep the journal inflight for settlement/reconciliation.
         const routeToken = journalString(journalRow.ctx, 'antigravityRouteToken', ROUTE_TOKEN_RE)
         if (routeToken) {
           await Promise.resolve(runExpireAntigravityRoute(routeToken)).catch(() => {})
         }
         await Promise.resolve(runExpireAntigravityRouteForRequest(requestId, userId)).catch(() => {})
-        await runAbandonAntigravity(deps.getPool(), requestId, userId).catch(() => {})
+        const pool = deps.getPool()
+        await runAbandonAntigravity(pool, requestId, userId)
+        const proof = await pool.query<{
+          status: string | null
+          has_usage: boolean
+        }>(
+          `SELECT (SELECT t.status FROM antigravity_turns t
+                    WHERE t.request_id = $1 AND t.user_id = $2 LIMIT 1) AS status,
+                  EXISTS (
+                    SELECT 1 FROM antigravity_relay_usage u
+                     WHERE u.request_id = $1 AND u.user_id = $2
+                  ) AS has_usage`,
+          [requestId, String(identity.userId)],
+        )
+        const proofRow = proof.rows[0]
+        if (
+          proofRow?.has_usage === true ||
+          (typeof proofRow?.status === 'string' && proofRow.status !== 'abandoned')
+        ) {
+          // OCV5-897 B1 R2: Durably hand off conflicted abandon to frozen-price
+          // settlement instead of leaving gateway looping on 409 forever.
+          // Transient errors propagate for retry; success returns 2xx so gateway
+          // clears pendingAbandons with ledger/usage/journal committed at most once.
+          const outcome = await settleDelegateAntigravityJournal({
+            reportedStatus: 'error',
+            terminalCode: 'ENGINE_ERROR',
+            attribution: resolveDelegateBillingAttribution(journalRow.ctx, body),
+          })
+          return { abandoned: false, settled: outcome.settled }
+        }
         runReleaseAntigravityInflight(requestId)
         await runAbort(
-          deps.getPool(),
+          pool,
           requestId,
           'delegate_engine_billing_abandoned',
           'INTERNAL_ERROR',

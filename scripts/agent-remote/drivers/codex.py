@@ -26,6 +26,29 @@ DRIVER_ID = "codex"
 DRIVER_VERSION = "1.0.0"
 ENGINE_ID = "codex"
 SEMANTICS_ID = "codex-0.167-total-v1"
+VALID_SERVICE_TIERS = frozenset({"fast", "ultrafast", "standard"})
+SERVICE_TIER_MIN_CLI_VERSION = (0, 170, 0)
+SERVICE_TIER_WIRE_MAP: Dict[str, str] = {
+    "fast": "priority",
+    "ultrafast": "ultrafast",
+    "standard": "default",
+}
+CODEX_EXPLICIT_STANDARD_MODELS = frozenset(
+    {
+        "gpt-6.2-astra",
+        "gpt-6.2-astra-1m",
+        "gpt-6.2-sol",
+        "gpt-6.2-sol-1m",
+        "gpt-6-astra",
+        "gpt-6-astra-1m",
+        "gpt-6.1-sol",
+        "gpt-6.1-sol-1m",
+        "gpt-6-luna",
+        "gpt-6-luna-1m",
+    }
+)
+CONTENT_MIME_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*\Z", re.IGNORECASE)
+REL_SUBPATH_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\Z")
 
 CODEX_DISABLE = (
     "shell_tool",
@@ -265,6 +288,38 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
         "XDG_DATA_HOME": str(root / "home/data"),
         "XDG_CACHE_HOME": str(root / "home/cache"),
     }
+    dirs = ["home/config", "home/data", "home/cache"]
+    raw_rollout_dir = context.get("sessionRolloutDir")
+    if raw_rollout_dir is not None and raw_rollout_dir != "":
+        need(
+            isinstance(raw_rollout_dir, str) and "\x00" not in raw_rollout_dir,
+            "CODEX_SESSION_ROLLOUT_DIR_INVALID",
+        )
+        rollout_candidate = Path(raw_rollout_dir)
+        if not rollout_candidate.is_absolute():
+            need(
+                bool(REL_SUBPATH_RE.fullmatch(raw_rollout_dir)) and ".." not in raw_rollout_dir.split("/"),
+                "CODEX_SESSION_ROLLOUT_DIR_INVALID",
+            )
+            rollout_path = (root / raw_rollout_dir).resolve()
+            need(rollout_path.is_relative_to(root) and rollout_path != root, "CODEX_SESSION_ROLLOUT_DIR_INVALID")
+            if raw_rollout_dir not in dirs:
+                dirs.append(raw_rollout_dir)
+        else:
+            need(".." not in rollout_candidate.parts, "CODEX_SESSION_ROLLOUT_DIR_INVALID")
+            rollout_path = rollout_candidate.resolve()
+            in_root = rollout_path.is_relative_to(root) and rollout_path != root
+            in_codex_home = rollout_path.is_relative_to(codex_home) and rollout_path != codex_home
+            need(in_root or in_codex_home, "CODEX_SESSION_ROLLOUT_DIR_INVALID")
+            if in_root:
+                rel_rollout = rollout_path.relative_to(root).as_posix()
+                if REL_SUBPATH_RE.fullmatch(rel_rollout) and rel_rollout not in dirs:
+                    dirs.append(rel_rollout)
+        _check_config_sources(rollout_path, root / "cwd", system_root=system_root)
+        env["CODEX_ROLLOUT_DIR"] = str(rollout_path)
+        env["XDG_STATE_HOME"] = str(rollout_path)
+        if (rollout_path / "auth.json").is_file() and not (rollout_path / "auth.json").is_symlink():
+            env["CODEX_HOME"] = str(rollout_path)
     policy_sha256 = remote_canonical_sha256(
         {
             "driverId": DRIVER_ID,
@@ -288,9 +343,83 @@ def launch_spec(context: Dict[str, Any], verified_probe: Dict[str, Any]) -> Dict
                 "mode": 0o400,
             }
         },
-        "dirs": ["home/config", "home/data", "home/cache"],
+        "dirs": dirs,
         "artifactDigests": artifact_digests,
     }
+
+
+def _parse_cli_semver(raw: Any) -> Optional[tuple[int, int, int]]:
+    if not isinstance(raw, str):
+        return None
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", raw)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _normalize_content_blocks(raw_content: Any) -> List[Dict[str, Any]]:
+    need(isinstance(raw_content, list) and len(raw_content) > 0, "CODEX_CONTENT_INVALID")
+    input_blocks: List[Dict[str, Any]] = []
+    for blk in raw_content:
+        need(isinstance(blk, dict) and isinstance(blk.get("type"), str), "CODEX_CONTENT_INVALID")
+        btype = blk["type"]
+        if btype == "text":
+            need(isinstance(blk.get("text"), str) and "\x00" not in blk["text"], "CODEX_CONTENT_INVALID")
+            input_blocks.append({"type": "text", "text": blk["text"]})
+        elif btype == "localImage":
+            img_path = blk.get("path")
+            need(
+                isinstance(img_path, str)
+                and len(img_path.strip()) > 0
+                and "\x00" not in img_path
+                and ".." not in img_path.split("/"),
+                "CODEX_CONTENT_INVALID",
+            )
+            input_blocks.append({"type": "localImage", "path": img_path})
+        elif btype == "image":
+            if "data" in blk and blk["data"] is not None:
+                data_val = blk["data"]
+                mime = blk.get("mimeType")
+                need(
+                    isinstance(data_val, str)
+                    and len(data_val) > 0
+                    and "\x00" not in data_val
+                    and isinstance(mime, str)
+                    and len(mime) <= 128
+                    and CONTENT_MIME_RE.fullmatch(mime),
+                    "CODEX_CONTENT_INVALID",
+                )
+                input_blocks.append({"type": "image", "url": f"data:{mime};base64,{data_val}"})
+            elif "path" in blk and blk["path"] is not None:
+                img_path = blk["path"]
+                need(
+                    isinstance(img_path, str)
+                    and len(img_path.strip()) > 0
+                    and "\x00" not in img_path
+                    and ".." not in img_path.split("/"),
+                    "CODEX_CONTENT_INVALID",
+                )
+                input_blocks.append({"type": "localImage", "path": img_path})
+            elif isinstance(blk.get("url"), str) and blk["url"].strip():
+                input_blocks.append({"type": "image", "url": blk["url"]})
+            elif isinstance(blk.get("source"), dict):
+                src = blk["source"]
+                if src.get("type") == "base64" and isinstance(src.get("data"), str) and src["data"]:
+                    media = str(src.get("media_type") or src.get("mediaType") or "image/png")
+                    input_blocks.append({"type": "image", "url": f"data:{media};base64,{src['data']}"})
+                elif src.get("type") == "url" and isinstance(src.get("url"), str) and src["url"].strip():
+                    input_blocks.append({"type": "image", "url": src["url"]})
+                else:
+                    raise ValueError("CODEX_CONTENT_INVALID")
+            elif isinstance(blk.get("image_url"), str) and blk["image_url"].strip():
+                input_blocks.append({"type": "image", "url": blk["image_url"]})
+            elif "blobId" in blk and blk["blobId"] is not None:
+                raise ValueError("CODEX_IMAGE_BLOB_UNRESOLVED")
+            else:
+                raise ValueError("CODEX_CONTENT_INVALID")
+        else:
+            raise ValueError("CODEX_CONTENT_INVALID")
+    return input_blocks
 
 
 def encode(command: Dict[str, Any], native_state: Dict[str, Any]) -> Dict[str, Any]:
@@ -375,16 +504,37 @@ def encode(command: Dict[str, Any], native_state: Dict[str, Any]) -> Dict[str, A
         need(not state.get("activeTurnId"), "CODEX_TURN_ALREADY_ACTIVE")
         prompt = command.get("prompt")
         model = command.get("model") or state.get("expectedModel")
-        need(isinstance(prompt, str) and len(prompt.strip()) > 0 and isinstance(model, str), "CODEX_PROMPT_INVALID")
+        need(isinstance(model, str) and len(model) > 0, "CODEX_PROMPT_INVALID")
+        raw_content = command.get("content")
+        if raw_content is not None:
+            input_blocks = _normalize_content_blocks(raw_content)
+        else:
+            need(isinstance(prompt, str) and len(prompt.strip()) > 0, "CODEX_PROMPT_INVALID")
+            input_blocks = [{"type": "text", "text": prompt}]
         params: Dict[str, Any] = {
             "threadId": state["sessionId"],
             "model": model,
             "approvalPolicy": "never",
             "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
-            "input": [{"type": "text", "text": prompt}],
+            "input": input_blocks,
         }
         if isinstance(command.get("effort"), str) and command["effort"]:
             params["effort"] = command["effort"]
+        raw_tier = command.get("serviceTier")
+        if raw_tier is not None:
+            need(isinstance(raw_tier, str) and raw_tier in VALID_SERVICE_TIERS, "CODEX_SERVICE_TIER_INVALID")
+            if raw_tier in ("fast", "ultrafast"):
+                parsed_ver = _parse_cli_semver(state.get("cliVersion"))
+                need(
+                    parsed_ver is not None and parsed_ver >= SERVICE_TIER_MIN_CLI_VERSION,
+                    "CODEX_SERVICE_TIER_UNSUPPORTED",
+                )
+            params["serviceTierForTurn"] = SERVICE_TIER_WIRE_MAP[raw_tier]
+        elif model in CODEX_EXPLICIT_STANDARD_MODELS:
+            cli_ver = state.get("cliVersion")
+            parsed_ver = _parse_cli_semver(cli_ver) if cli_ver is not None else None
+            if cli_ver is None or (parsed_ver is not None and parsed_ver >= SERVICE_TIER_MIN_CLI_VERSION):
+                params["serviceTierForTurn"] = SERVICE_TIER_WIRE_MAP["standard"]
         _next_rpc("turn/start", params, "newTurn")
 
     elif kind == "interrupt":
@@ -499,6 +649,9 @@ def decode(channel: str, raw_frame: bytes, native_state: Dict[str, Any]) -> Dict
             res = frame.get("result") or {}
             if method == "initialize":
                 state["initialized"] = True
+                ua = res.get("userAgent")
+                if isinstance(ua, str) and "/" in ua and ua.split("/", 1)[1].strip():
+                    state["cliVersion"] = ua.split("/", 1)[1].strip().split()[0]
             elif method in ("thread/start", "thread/resume"):
                 tid = (res.get("thread") or {}).get("id")
                 need(isinstance(tid, str) and IDENT_RE.fullmatch(tid), "CODEX_THREAD_ID_INVALID")

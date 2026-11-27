@@ -38,6 +38,15 @@ export const DRAIN_WS_PATH = "/internal/v5/drain-ws";
 
 const MAX_FENCE_BODY_BYTES = 4_096;
 
+export interface RemoteRelayReadinessSnapshot {
+  readonly external: boolean;
+  readonly healthy: boolean;
+  readonly disabled?: boolean;
+  readonly slot: "A" | "B" | null;
+  readonly instanceId: string | null;
+  readonly activeCount: number;
+}
+
 export interface CutoverControlDeps {
   slot: Slot;
   secret: string | undefined;
@@ -52,6 +61,8 @@ export interface CutoverControlDeps {
   getContainerLinkEnabled?: () => boolean;
   /** Optional extra hook invoked after desiredWatch refreshes. */
   onDesiredRefreshed?: () => Promise<void> | void;
+  /** Optional live readiness probe for the standalone external remote-relay daemon. */
+  probeRemoteRelayReadiness?: () => Promise<RemoteRelayReadinessSnapshot>;
 }
 
 function sendJson(res: ServerResponse, statusCode: number, body: Record<string, unknown>): void {
@@ -133,23 +144,75 @@ export function handleCutoverControlRequest(
       return true;
     }
     if (!authorizePrivateControl(req, res, deps)) return true;
-    const snap = tracker.snapshot();
-    const activeBrowserWs = Math.max(0, deps.getActiveBrowserWs?.() ?? 0);
-    const leadership = deps.getLeadership();
-    sendJson(res, 200, {
-      ok: true,
-      slot: deps.slot,
-      role: leadership.state,
-      vipOwner: isVipOwned(deps),
-      fencing: snap.fencing,
-      containerLinkEnabled: Boolean(deps.getContainerLinkEnabled?.()),
-      activeExternalApi: snap.activeExternalApi,
-      activeCursorExternal: snap.activeCursorExternal,
-      activeChatgptProxy: snap.activeChatgptProxy,
-      activeMuse: snap.activeMuse,
-      activeBrowserWs,
-      nonSurvivableInFlight: snap.nonSurvivableInFlight,
-    });
+
+    const defaultRelay: RemoteRelayReadinessSnapshot = {
+      external: false,
+      healthy: false,
+      disabled: false,
+      slot: null,
+      instanceId: null,
+      activeCount: 0,
+    };
+    const buildReadinessBody = (relay: RemoteRelayReadinessSnapshot): Record<string, unknown> => {
+      const snap = tracker.snapshot();
+      const activeBrowserWs = Math.max(0, deps.getActiveBrowserWs?.() ?? 0);
+      const leadership = deps.getLeadership();
+      return {
+        ok: true,
+        slot: deps.slot,
+        role: leadership.state,
+        vipOwner: isVipOwned(deps),
+        fencing: snap.fencing,
+        containerLinkEnabled: Boolean(deps.getContainerLinkEnabled?.()),
+        activeExternalApi: snap.activeExternalApi,
+        activeCursorExternal: snap.activeCursorExternal,
+        activeChatgptProxy: snap.activeChatgptProxy,
+        activeMuse: snap.activeMuse,
+        activeBrowserWs,
+        nonSurvivableInFlight: snap.nonSurvivableInFlight,
+        remoteRelayExternal: relay.external,
+        remoteRelayHealthy: relay.healthy,
+        remoteRelayDisabled: Boolean(relay.disabled),
+        remoteRelaySlot: relay.slot,
+        remoteRelayInstanceId: relay.instanceId,
+        remoteRelayActiveCount: Math.max(0, relay.activeCount),
+      };
+    };
+
+    const probe = deps.probeRemoteRelayReadiness;
+    if (!probe) {
+      sendJson(res, 200, buildReadinessBody(defaultRelay));
+      return true;
+    }
+
+    void (async () => {
+      let relay: RemoteRelayReadinessSnapshot = defaultRelay;
+      try {
+        const probed = await probe();
+        const external = Boolean(probed.external);
+        const disabled = external && Boolean(probed.disabled);
+        const slot = probed.slot === "A" || probed.slot === "B" ? probed.slot : null;
+        const instanceId =
+          typeof probed.instanceId === "string" && probed.instanceId.length > 0
+            ? probed.instanceId
+            : null;
+        const activeCount =
+          typeof probed.activeCount === "number" && Number.isFinite(probed.activeCount)
+            ? Math.max(0, probed.activeCount)
+            : 0;
+        relay = {
+          external,
+          healthy: external && !disabled && Boolean(probed.healthy) && instanceId !== null,
+          disabled,
+          slot,
+          instanceId,
+          activeCount: disabled ? 0 : activeCount,
+        };
+      } catch {
+        relay = defaultRelay;
+      }
+      sendJson(res, 200, buildReadinessBody(relay));
+    })();
     return true;
   }
 

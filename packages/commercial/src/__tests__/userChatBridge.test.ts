@@ -3688,7 +3688,7 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(cursorBranch, /readTotalSpendableBalance\(uid\)/);
     assert.match(cursorBranch, /ERR_INSUFFICIENT_CREDITS/);
     assert.match(cursorBranch, /_creditBudget: cursorSpendable === null \? undefined : cursorSpendable\.toString\(\)/);
-    assert.match(cursorBranch, /peerCapture, modelCapture/);
+    assert.match(cursorBranch, /peerCapture, activeCursorModel/);
     assert.match(cursorBranch, /cursorTurnIdentity/);
     assert.match(
       cursorBranch,
@@ -3726,8 +3726,8 @@ describe("Cursor external authority regression tripwire", () => {
     assert.doesNotMatch(zcodeBranch, /settleCursorExternalUsage/);
     assert.match(source, /closeZcodeAudit/);
     assert.match(source, /closePendingZcodeAudits/);
-    assert.match(source, /isCursorModel\(authorityModelForFrame\)/);
-    assert.match(source, /isZcodeModel\(authorityModelForFrame\)/);
+    assert.match(source, /isCursorModel\(peekedAuthorityModel\)/);
+    assert.match(source, /isZcodeModel\(peekedAuthorityModel\)/);
   });
 
   test("OCV5-415: Antigravity admission gates on authority and balance before minting; settle reads relay rows", async () => {
