@@ -73,6 +73,25 @@ describe('resolveToolStatus:卡片与面板共用的单一权威状态(T-05)', (
       tool: { _completed: true, output: '{"oc_connect":{"type":"confirmation_required"}}' },
     })
     expect(s.isConfirmation).toBe(true)
+
+    // OCV5-920: 搜索源码命中 "kind":"task_approval" 不得误判为确认卡自动展开
+    const grepHit = resolveToolStatus({
+      name: 'oc_grep',
+      tool: {
+        _completed: true,
+        output: 'src/lib/sessionStatus.ts:374: m.output.includes(\'"kind":"task_approval"\')',
+      },
+    })
+    expect(grepHit.isConfirmation).toBe(false)
+
+    const approvalCard = resolveToolStatus({
+      name: 'mcp__openclaude-memory__present_task_approval',
+      tool: {
+        _completed: true,
+        output: '{"ok":true,"kind":"task_approval","status":"presented"}',
+      },
+    })
+    expect(approvalCard.isConfirmation).toBe(true)
   })
 })
 

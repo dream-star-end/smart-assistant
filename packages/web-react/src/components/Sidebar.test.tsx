@@ -845,8 +845,8 @@ describe("Sidebar 会话状态点", () => {
 
     const unreadImgs = leadImgs("未读完成");
     expect(unreadImgs).toHaveLength(1);
-    // 未读 = 实心点，与运行中同色调（「有新结果未看」的通用语汇，SIDEBAR-R1；UI-SPEC §4.3）。
-    expect(unreadImgs[0]).toHaveClass("bg-status-running");
+    // 未读完成 = 语义绿点（与运行中暖陶土色区分，「只在未读时出绿点」，OCV5-920）。
+    expect(unreadImgs[0]).toHaveClass("bg-status-done");
     expect(unreadImgs[0]).toHaveAttribute("data-dot-kind", "unread");
     expect(unreadImgs[0]).toHaveAccessibleName("未读");
     expect(screen.getAllByRole("img", { name: "未读" })).toHaveLength(1);

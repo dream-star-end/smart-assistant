@@ -28,6 +28,16 @@ describe("HeaderCountBadge（OCV5-820 6px 克制状态点）", () => {
     expect(accentDot).not.toHaveClass("motion-safe:animate-pulse");
 
     rerender(
+      <HeaderCountBadge count={12} testId="dot" tone="success" ariaLabel="12 条未读会话" />,
+    );
+    const successDot = screen.getByTestId("dot");
+    expect(successDot).toHaveTextContent("");
+    expect(successDot).toHaveAttribute("aria-label", "12 条未读会话");
+    expect(successDot).toHaveAttribute("data-unread-count", "12");
+    expect(successDot).toHaveClass("size-1.5", "rounded-full", "bg-success");
+    expect(successDot).not.toHaveClass("oc-alive-dot");
+
+    rerender(
       <HeaderCountBadge count={40} testId="dot" tone="danger" ariaLabel="40 条未读站内信" />,
     );
     const dangerDot = screen.getByTestId("dot");
@@ -69,7 +79,7 @@ describe("WorkspaceShellHeader", () => {
     expect(dots).toHaveLength(2);
     for (const dot of dots) {
       expect(dot).toHaveTextContent("");
-      expect(dot).toHaveClass("size-1.5", "bg-accent");
+      expect(dot).toHaveClass("size-1.5", "bg-success");
       expect(dot).not.toHaveClass("oc-alive-dot");
       expect(dot).not.toHaveClass("motion-safe:animate-pulse");
     }
