@@ -44,13 +44,13 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$REPO_ROOT"; export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$(pwd -P)"
 # shellcheck source=scripts/lib/assert-flavor.sh
 source "$SCRIPT_DIR/lib/assert-flavor.sh"
 if [[ "${1:-}" == "--mint-flavor-manifest" ]]; then
   dest="${2:?usage: --mint-flavor-manifest DIR [flavor] [commit]}"
   flavor="${3:-selfhost}"
-  commit="${4:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+  commit="${4:-$(git -c safe.directory='*' -C "$REPO_ROOT" rev-parse HEAD)}"
   write_flavor_manifest "$dest" "$flavor" "$commit"
   exit $?
 fi
@@ -1421,7 +1421,7 @@ read_env_db_url() {
 }
 
 source_commit() {
-  git -C "$REPO_ROOT" rev-parse HEAD
+  git -c safe.directory='*' -C "$REPO_ROOT" rev-parse HEAD
 }
 
 # ── Lease Center train 账本(OCV5-131)────────────────────────────────────────
@@ -1497,7 +1497,7 @@ build_platform_bundle() {
   if [[ "$PLATFORM_FROM_HEAD" == 1 ]]; then
     PLATFORM_ARCHIVE_TMP="$(mktemp -d -t oc-v5-selfhost-platform.XXXXXX)" \
       || die "mktemp 平台 bundle 临时目录失败"
-    git -C "$REPO_ROOT" archive --format=tar "$sha" -- packages/commercial/agent-sandbox/platform-runtime \
+    git -c safe.directory='*' -C "$REPO_ROOT" archive --format=tar "$sha" -- packages/commercial/agent-sandbox/platform-runtime \
       | tar -x -C "$PLATFORM_ARCHIVE_TMP" \
       || { rm -rf "$PLATFORM_ARCHIVE_TMP"; PLATFORM_ARCHIVE_TMP=""; die "git archive platform-runtime 失败"; }
     src="$PLATFORM_ARCHIVE_TMP/packages/commercial/agent-sandbox/platform-runtime"
@@ -2078,6 +2078,7 @@ cmd_deploy() {
     # same operation's original receipt; closure still verifies real history.
     local CUTOVER_BACKUP=""
     cc5_activation_finalize || { log "CC5 activation receipt unresolved after policy recovery; hold"; return 79; }
+    if [[ "${RELEASE_POLICY_SAMPLER_RESTORE:-0}" != 1 ]] && declare -F v5_selfhost_post_committed_sync_referee >/dev/null 2>&1; then v5_selfhost_post_committed_sync_referee "${CUTOVER_REL:-}" "${LEASE_TARGET_SHA:-}" || log "  ⚠ 外置裁判刷新失败(仅告警,不回滚)"; fi
     log "✓ same-operation policy recovery verified; no serving pointer changed"
     return 0
   fi
@@ -2088,7 +2089,7 @@ cmd_deploy() {
   log "      前端不再吃工作树;masterRelease/transitionKind 记新 live rel-*"
   sha="$(source_commit)"; if declare -F v5_selfhost_load_runtime_image_pin_for_commit >/dev/null 2>&1; then v5_selfhost_load_runtime_image_pin_for_commit "$sha"; fi; preflight_common
   explain_dirty_semantics
-  dirty="$(git -C "$REPO_ROOT" status --porcelain)"
+  dirty="$(git -c safe.directory='*' -C "$REPO_ROOT" status --porcelain)"
   if [[ -n "$dirty" && "$ALLOW_DIRTY" != 1 ]]; then
     die "工作区不干净。master/runtime 虽来自 git archive、不受这些脏文件污染,
 但默认 platform bundle 仍拷工作树,脏的 platform-runtime 会进全员容器:
@@ -3129,9 +3130,8 @@ cmd_cutover() {
   sync_watch_from "$rel" \
     || cutover_clog "  ⚠ 看护同步失败(仅告警,不回滚;--smoke 会因看护漂移失败)"
   fi
-  if [[ "${SELFHOST_SPLIT_PREPARED:-0}" == 1 ]]; then
-    selfhost_prepared_complete "$head" "$rel" || cutover_clog "  ⚠ prepared receipt cleanup deferred"
-  fi
+  if [[ "${CUTOVER_ROLLBACK:-0}" != 1 ]] && declare -F v5_selfhost_post_committed_sync_referee >/dev/null 2>&1; then v5_selfhost_post_committed_sync_referee "$rel" "$head" || cutover_clog "  ⚠ 外置裁判刷新失败(仅告警,不回滚)"; fi
+  if [[ "${SELFHOST_SPLIT_PREPARED:-0}" == 1 ]]; then selfhost_prepared_complete "$head" "$rel" || cutover_clog "  ⚠ prepared receipt cleanup deferred"; fi
   # 收尾 GC(仅告警,不回滚):master keep 3(OCV5-376) + runtime/overlay/assets 保护集 GC。
   selfhost_prepared_gc bash "$SCRIPT_DIR/v5-release-gc.sh" \
     "$MASTER_RELEASES_ROOT" 3 \

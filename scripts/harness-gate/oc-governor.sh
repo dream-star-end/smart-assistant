@@ -35,10 +35,7 @@ die_usage() { echo "✗ [oc-governor] $*" >&2; exit 2; }
 die_gate() { echo "✗ [oc-governor] $*" >&2; exit 1; }
 ensure_dirs() { mkdir -p "$CTRL_DIR" "$APPROVALS_DIR" "$VOUCHERS_DIR" "$PENDING_APPROVALS_DIR" "$PENDING_LOCKS_DIR"; }
 actor_name() { id -un 2>/dev/null || echo "unknown"; }
-now_iso() {
-  if [[ -n "${OC_GOVERNOR_NOW_ISO:-}" ]]; then printf '%s\n' "$OC_GOVERNOR_NOW_ISO"
-  else date -u +%Y-%m-%dT%H:%M:%SZ; fi
-}
+now_iso() { [[ -n "${OC_GOVERNOR_NOW_ISO:-}" ]] && printf '%s\n' "$OC_GOVERNOR_NOW_ISO" || date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 append_audit_safe() {
   local payload="$1"
@@ -51,12 +48,9 @@ append_audit_safe() {
 }
 
 atomic_write_file() {
-  local dest="$1" content="$2" mode="${3:-0644}"
-  local tmp="${dest}.tmp.$$.${RANDOM}"
+  local dest="$1" content="$2" mode="${3:-0644}" tmp="${1}.tmp.$$.${RANDOM}"
   mkdir -p "$(dirname "$dest")"
-  printf '%s\n' "$content" >"$tmp"
-  chmod "$mode" "$tmp"
-  mv -f "$tmp" "$dest"
+  printf '%s\n' "$content" >"$tmp"; chmod "$mode" "$tmp"; mv -f "$tmp" "$dest"
 }
 
 _assert_safe_dir_chain() {
@@ -66,53 +60,30 @@ import os, stat, sys
 gov_root, ctrl_dir, pending_dir, locks_dir, skip_owner_s = sys.argv[1:]
 skip_owner = skip_owner_s == "1"
 for d in (gov_root, ctrl_dir, pending_dir, locks_dir):
-    if not os.path.lexists(d):
-        continue
+    if not os.path.lexists(d): continue
     st = os.lstat(d)
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        sys.stderr.write(f"UNSAFE_CONTROL_DIR: symlink or non-directory in control chain: {d}\n")
-        sys.exit(1)
-    if not skip_owner and os.geteuid() == 0 and d.startswith("/opt/openclaude/"):
-        if st.st_uid != 0 or (st.st_mode & 0o022) != 0:
-            sys.stderr.write(f"UNSAFE_CONTROL_DIR: untrusted owner/mode on {d} (uid={st.st_uid} mode={oct(st.st_mode & 0o777)})\n")
-            sys.exit(1)
+        sys.stderr.write(f"UNSAFE_CONTROL_DIR: symlink or non-directory in control chain: {d}\n"); sys.exit(1)
+    if not skip_owner and os.geteuid() == 0 and d.startswith("/opt/openclaude/") and (st.st_uid != 0 or (st.st_mode & 0o022) != 0):
+        sys.stderr.write(f"UNSAFE_CONTROL_DIR: untrusted owner/mode on {d} (uid={st.st_uid} mode={oct(st.st_mode & 0o777)})\n"); sys.exit(1)
 PY
 }
 
 _resolve_steward_verifier_path() {
-  if [[ -n "${OC_GOVERNOR_STEWARD_VERIFIER:-}" ]]; then
-    printf '%s\n' "$OC_GOVERNOR_STEWARD_VERIFIER"
-    return 0
-  fi
-  if [[ -f "$GOV_ROOT/referee/scripts/lib/archStewardReceipt.ts" && ! -L "$GOV_ROOT/referee/scripts/lib/archStewardReceipt.ts" ]]; then
-    printf '%s\n' "$GOV_ROOT/referee/scripts/lib/archStewardReceipt.ts"
-    return 0
-  fi
-  if [[ -f "$SCRIPT_DIR/../lib/archStewardReceipt.ts" && ! -L "$SCRIPT_DIR/../lib/archStewardReceipt.ts" ]]; then
-    printf '%s\n' "$SCRIPT_DIR/../lib/archStewardReceipt.ts"
-    return 0
-  fi
+  [[ -n "${OC_GOVERNOR_STEWARD_VERIFIER:-}" ]] && { printf '%s\n' "$OC_GOVERNOR_STEWARD_VERIFIER"; return 0; }
+  [[ -f "$GOV_ROOT/referee/scripts/lib/archStewardReceipt.ts" && ! -L "$GOV_ROOT/referee/scripts/lib/archStewardReceipt.ts" ]] && { printf '%s\n' "$GOV_ROOT/referee/scripts/lib/archStewardReceipt.ts"; return 0; }
+  [[ -f "$SCRIPT_DIR/../lib/archStewardReceipt.ts" && ! -L "$SCRIPT_DIR/../lib/archStewardReceipt.ts" ]] && { printf '%s\n' "$SCRIPT_DIR/../lib/archStewardReceipt.ts"; return 0; }
   return 1
 }
 
 _resolve_trusted_node_modules_dir() {
-  local verifier_path="${1:-}"
-  if [[ -d "$GOV_ROOT/referee/node_modules" ]]; then
-    printf '%s\n' "$GOV_ROOT/referee/node_modules"
-    return 0
-  fi
+  local verifier_path="${1:-}" candidate=""
+  [[ -d "$GOV_ROOT/referee/node_modules" ]] && { printf '%s\n' "$GOV_ROOT/referee/node_modules"; return 0; }
   if [[ -n "$verifier_path" ]]; then
-    local candidate=""
     candidate="$(cd "$(dirname "$verifier_path")/../.." 2>/dev/null && pwd)/node_modules"
-    if [[ -d "$candidate" ]]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
+    [[ -d "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
   fi
-  if [[ -d "/opt/openclaude/node_modules" ]]; then
-    printf '%s\n' "/opt/openclaude/node_modules"
-    return 0
-  fi
+  [[ -d "/opt/openclaude/node_modules" ]] && { printf '%s\n' "/opt/openclaude/node_modules"; return 0; }
   return 1
 }
 
@@ -167,26 +138,19 @@ PY
   local verifier_path="" nm_dir="" tsx_cli=""
   verifier_path="$(_resolve_steward_verifier_path || true)"
   if [[ -z "$verifier_path" || ! -e "$verifier_path" ]]; then
-    printf '{"present":true,"ok":false,"verdict":"invalid","hmacVerified":false,"reason":"steward_verifier_missing","summary":"缺少宿主可信权威 Steward 校验器，按 fail-closed 拦截"}\n'
-    return 0
+    printf '{"present":true,"ok":false,"verdict":"invalid","hmacVerified":false,"reason":"steward_verifier_missing","summary":"缺少宿主可信权威 Steward 校验器，按 fail-closed 拦截"}\n'; return 0
   fi
   if [[ -x "$verifier_path" && "$verifier_path" != *.ts && "$verifier_path" != *.mjs && "$verifier_path" != *.js ]]; then
     local hook_out="" hook_rc=0
-    set +e
-    hook_out="$(env -u NODE_OPTIONS -u NODE_PATH -u TSX_TSCONFIG_PATH "$verifier_path" "$receipt_path" "$sha" "$base_sha" "$HMAC_KEY_FILE" 2>/dev/null)"
-    hook_rc=$?
-    set -e
-    if [[ "$hook_rc" -eq 0 && "$hook_out" == \{* ]]; then printf '%s\n' "$hook_out"; return 0; fi
-    printf '{"present":true,"ok":false,"verdict":"invalid","hmacVerified":false,"reason":"steward_verifier_hook_failed","summary":"权威 Steward 校验器执行失败"}\n'
-    return 0
+    set +e; hook_out="$(env -u NODE_OPTIONS -u NODE_PATH -u TSX_TSCONFIG_PATH "$verifier_path" "$receipt_path" "$sha" "$base_sha" "$HMAC_KEY_FILE" 2>/dev/null)"; hook_rc=$?; set -e
+    [[ "$hook_rc" -eq 0 && "$hook_out" == \{* ]] && { printf '%s\n' "$hook_out"; return 0; }
+    printf '{"present":true,"ok":false,"verdict":"invalid","hmacVerified":false,"reason":"steward_verifier_hook_failed","summary":"权威 Steward 校验器执行失败"}\n'; return 0
   fi
-
   nm_dir="$(_resolve_trusted_node_modules_dir "$verifier_path" || true)"
   if [[ -n "$nm_dir" && -f "$nm_dir/tsx/dist/cli.mjs" ]]; then tsx_cli="$nm_dir/tsx/dist/cli.mjs"
   elif [[ -f "/opt/openclaude/node_modules/tsx/dist/cli.mjs" ]]; then tsx_cli="/opt/openclaude/node_modules/tsx/dist/cli.mjs"; fi
   if [[ -z "$tsx_cli" ]]; then
-    printf '{"present":true,"ok":false,"verdict":"invalid","hmacVerified":false,"reason":"steward_tsx_missing","summary":"缺少宿主可信 tsx 运行时，无法执行权威 Steward 校验"}\n'
-    return 0
+    printf '{"present":true,"ok":false,"verdict":"invalid","hmacVerified":false,"reason":"steward_tsx_missing","summary":"缺少宿主可信 tsx 运行时，无法执行权威 Steward 校验"}\n'; return 0
   fi
 
   local node_out="" node_rc=0
@@ -252,30 +216,12 @@ EOF
 }
 
 resolve_github_repo_slug() {
-  local explicit="${1:-}"
-  if [[ -n "$explicit" ]]; then
-    printf '%s\n' "$explicit"
-    return 0
-  fi
-  if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
-    printf '%s\n' "$GITHUB_REPOSITORY"
-    return 0
-  fi
-  if [[ -n "${GH_REPO:-}" ]]; then
-    printf '%s\n' "$GH_REPO"
-    return 0
-  fi
-  local origin_url=""
+  local explicit="${1:-}" origin_url=""
+  [[ -n "$explicit" ]] && { printf '%s\n' "$explicit"; return 0; }
+  [[ -n "${GITHUB_REPOSITORY:-}" ]] && { printf '%s\n' "$GITHUB_REPOSITORY"; return 0; }
+  [[ -n "${GH_REPO:-}" ]] && { printf '%s\n' "$GH_REPO"; return 0; }
   origin_url="$(git remote get-url origin 2>/dev/null || true)"
-  if [[ -n "$origin_url" ]]; then
-    python3 - "$origin_url" <<'PY'
-import re, sys
-url = sys.argv[1].strip()
-m = re.search(r"github\.com[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?$", url)
-if m:
-    print(m.group(1))
-PY
-  fi
+  [[ -n "$origin_url" ]] && python3 -c 'import re,sys; m=re.search(r"github\.com[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?$",sys.argv[1].strip()); print(m.group(1)) if m else None' "$origin_url" || true
 }
 
 # ── Gate 1: Global Operating Mode ──────────────────────────────────────────
@@ -310,18 +256,12 @@ for p in sys.argv[1:]:
     if os.path.isfile(p) and not os.path.islink(p):
         try:
             d = json.loads(open(p, encoding="utf-8").read())
-            if isinstance(d, dict) and d.get("tripped") is True:
-                print("1")
-                sys.exit(0)
-        except Exception:
-            print("1")
-            sys.exit(0)
+            if isinstance(d, dict) and d.get("tripped") is True: print("1"); sys.exit(0)
+        except Exception: print("1"); sys.exit(0)
 print("0")
 PY
 )"
-    if [[ "$breaker_tripped" == "1" ]]; then
-      die_gate "BREAKER_TRIPPED_USE_UNLOCK: circuit breaker is currently tripped; verify root cause and run 'oc-governor unlock-breaker --reason \"...\"' instead of switching mode to autonomous"
-    fi
+    [[ "$breaker_tripped" == "1" ]] && die_gate "BREAKER_TRIPPED_USE_UNLOCK: circuit breaker is currently tripped; verify root cause and run 'oc-governor unlock-breaker --reason \"...\"' instead of switching mode to autonomous"
   fi
   local ts actor prev_mode="autonomous" frozen="false"
   ts="$(now_iso)"; actor="$(actor_name)"
@@ -833,21 +773,19 @@ cmd_check_blast_radius() {
     append_audit_safe "$(python3 -c 'import json,sys; t,a,b,raw=sys.argv[1:]; d=json.loads(raw) if raw.startswith("{") else {}; print(json.dumps({"ts":t,"action":"check_blast_radius","actor":a,"branch":b,"code":d.get("code","BLOCKED"),"classification":d.get("classification"),"outcome":"blocked"}, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$branch" "$check_res")"
     printf '%s\n' "$check_res" >&2; exit 1
   fi
-  append_audit_safe "$(python3 -c 'import json,sys; t,a,b,s,raw=sys.argv[1:]; d=json.loads(raw) if raw.startswith("{") else {}; ev={"ts":t,"action":"check_blast_radius","actor":a,"branch":b,"classification":d.get("classification"),"outcome":"ok_semantic_noncore" if d.get("semanticNonCorePassed") else "ok"}; (ev.update({"sha":s}) if s else None); (ev.update({"nonCoreBillingFiles":d.get("nonCoreBillingFiles")}) if d.get("semanticNonCorePassed") else None); print(json.dumps(ev, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$branch" "$sha" "$check_res")"
+  append_audit_safe "$(python3 -c 'import json,sys; t,a,b,s,raw=sys.argv[1:]; d=json.loads(raw) if raw.startswith("{") else {}; ev={"ts":t,"action":"check_blast_radius","actor":a,"branch":b,"classification":d.get("classification"),"outcome":"ok_semantic_noncore" if d.get("semanticNonCorePassed") else "ok"}; (ev.update({"sha":s}) if s else None); (ev.update({"nonCoreBillingFiles":d.get("nonCoreBillingFiles")}) if d.get("semanticNonCorePassed") else None); (ev.update({"voucherId":d["voucherId"]}) if d.get("voucherId") else None); (ev.update({"voucherAutoDiscovered":bool(d["voucherAutoDiscovered"])}) if "voucherAutoDiscovered" in d else None); print(json.dumps(ev, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$branch" "$sha" "$check_res")"
   printf '%s\n' "$check_res"
 }
 
 # ── Gate 3b: Structured Pending Approvals Queue (OCV5-914) ─────────────────
-
 # Single shared Python engine for blast_p1/blast_p3/record/list/decide_prep/decide_commit/reconcile/update_resume/resolve
 _pending_approval_py() {
   python3 - "$@" <<'PY'
 import datetime as dt, hashlib, hmac, json, os, pathlib, re, secrets, stat, subprocess, sys
-
 op, args = sys.argv[1], sys.argv[2:]
-SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
-ID_RE = re.compile(r"^gov-[a-z0-9_-]{4,80}$")
-ID_FILE_RE = re.compile(r"^gov-[a-z0-9_-]{4,80}\.json$")
+SHA40_RE, SHA64_RE = re.compile(r"^[0-9a-f]{40}$"), re.compile(r"^[0-9a-f]{64}$")
+ID_RE, ID_FILE_RE = re.compile(r"^gov-[a-z0-9_-]{4,80}$"), re.compile(r"^gov-[a-z0-9_-]{4,80}\.json$")
+VOUCHER_FILE_RE = re.compile(r"^bv-[a-z0-9_-]{4,64}\.json$")
 MAX_BYTES = 256 * 1024
 VALID_STATUSES = {"pending", "approving", "approved", "rejected", "expired", "reconcile_required"}
 TEST_FILE_RE = re.compile(r"^packages/commercial/src/(?:billing|payment)/(?:.*/)?__tests__/.*\.(?:test|spec)\.[cm]?[jt]sx?$|^packages/commercial/src/(?:billing|payment)/.*\.(?:test|spec)\.[cm]?[jt]sx?$")
@@ -992,34 +930,97 @@ def run_git(repo_dir: str, git_args: list[str]):
     try: return subprocess.run(["git", "-C", repo_dir, "-c", "safe.directory=*", *git_args], capture_output=True, text=True, encoding="utf-8", errors="replace")
     except Exception: return None
 
-def verify_voucher_file(voucher_arg: str, vouchers_dir: str, now_iso: str, sha_arg: str, norm_branch: str, ddl_hits: list, billing_hits: list) -> tuple[bool, int, dict]:
+def is_safe_vouchers_dir(vouchers_dir: str):
+    if not vouchers_dir or not os.path.lexists(vouchers_dir): return None
+    vdir_abs = os.path.abspath(vouchers_dir)
+    chain = [d for d in dict.fromkeys((vdir_abs, os.path.dirname(vdir_abs), os.path.dirname(os.path.dirname(vdir_abs)))) if d and d != os.path.dirname(d)]
+    stats = []
+    for d in chain:
+        try: dst = os.lstat(d)
+        except OSError: return None
+        if stat.S_ISLNK(dst.st_mode) or not stat.S_ISDIR(dst.st_mode): return None
+        stats.append(dst)
+    try: vdir_res = pathlib.Path(vouchers_dir).resolve()
+    except Exception: return None
+    skip_owner = os.environ.get("OC_GOVERNOR_UNSAFE_TEST_SKIP_OWNER") == "1"
+    in_opt = vdir_abs.startswith("/opt/openclaude/") or str(vdir_res).startswith("/opt/openclaude/")
+    if not skip_owner and os.geteuid() == 0 and in_opt and any(dst.st_uid != 0 or (dst.st_mode & 0o022) != 0 for dst in stats): return None
+    return vdir_res, in_opt
+
+def verify_voucher_file(voucher_arg: str, vouchers_dir: str, now_iso: str, sha_arg: str, norm_branch: str, ddl_hits: list, billing_hits: list, require_bound: bool = False) -> tuple[bool, int, dict]:
+    inv_path = {"ok": False, "classification": "human_review_required", "code": "INVALID_VOUCHER_PATH", "branch": norm_branch}
+    tampered = {"ok": False, "classification": "human_review_required", "code": "VOUCHER_TAMPERED", "branch": norm_branch}
+    dir_ok = is_safe_vouchers_dir(vouchers_dir)
+    if dir_ok is None: return False, 23, inv_path
+    vdir_res, in_opt = dir_ok
     vpath = pathlib.Path(voucher_arg)
     if not vpath.is_absolute(): vpath = pathlib.Path(vouchers_dir) / (voucher_arg if voucher_arg.endswith(".json") else f"{voucher_arg}.json")
-    if vpath.is_symlink() or not vpath.is_file() or vpath.resolve().parent != pathlib.Path(vouchers_dir).resolve():
-        return False, 23, {"ok": False, "classification": "human_review_required", "code": "INVALID_VOUCHER_PATH", "branch": norm_branch}
+    try: st = os.lstat(vpath)
+    except OSError: return False, 23, inv_path
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_size > MAX_BYTES or (st.st_mode & 0o022) != 0: return False, 23, inv_path
+    try: vpath_res = vpath.resolve()
+    except Exception: return False, 23, inv_path
+    skip_owner = os.environ.get("OC_GOVERNOR_UNSAFE_TEST_SKIP_OWNER") == "1"
+    v_in_opt = in_opt or os.path.abspath(str(vpath)).startswith("/opt/openclaude/") or str(vpath_res).startswith("/opt/openclaude/")
+    if vpath_res.parent != vdir_res or (not skip_owner and os.geteuid() == 0 and v_in_opt and st.st_uid != 0): return False, 23, inv_path
     try: vdoc = json.loads(vpath.read_text(encoding="utf-8"))
-    except Exception: return False, 24, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_TAMPERED", "branch": norm_branch}
-    vid, scope, issued, expires, reason = str(vdoc.get("id") or ""), str(vdoc.get("scope") or ""), str(vdoc.get("issuedAt") or ""), str(vdoc.get("expiresAt") or ""), str(vdoc.get("reason") or "")
-    vsha, vbranch, vapproval_id = str(vdoc.get("sha") or ""), str(vdoc.get("branch") or ""), str(vdoc.get("approvalId") or "")
-    vfiles = sorted(str(x) for x in (vdoc.get("files") or []))
+    except Exception: return False, 24, tampered
+    if not isinstance(vdoc, dict) or type(vdoc.get("schemaVersion")) is not int or vdoc.get("schemaVersion") != 1: return False, 24, tampered
+    vid, scope, issued, expires, reason, raw_files = vdoc.get("id"), vdoc.get("scope"), vdoc.get("issuedAt"), vdoc.get("expiresAt"), vdoc.get("reason"), vdoc.get("files")
+    if not all(isinstance(x, str) for x in (vid, scope, issued, expires, reason)) or not vid or vid != vpath.stem: return False, 24, tampered
+    if not isinstance(raw_files, list) or not all(isinstance(x, str) and x for x in raw_files): return False, 24, tampered
+    vsha, vbranch, vapproval_id = vdoc.get("sha") or "", vdoc.get("branch") or "", vdoc.get("approvalId") or ""
+    if not all(isinstance(x, str) for x in (vsha, vbranch, vapproval_id)): return False, 24, tampered
+    vfiles = sorted(raw_files)
     canonical = f"blast-voucher-v1\nid={vid}\nscope={scope}\nissuedAt={issued}\nexpiresAt={expires}\nfiles={','.join(vfiles)}\nreason={reason}\n"
     if vsha: canonical += f"sha={vsha}\n"
     if vbranch: canonical += f"branch={vbranch}\n"
     if vapproval_id: canonical += f"approvalId={vapproval_id}\n"
-    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != vdoc.get("sha256"):
-        return False, 24, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_TAMPERED", "branch": norm_branch}
-    if dt.datetime.fromisoformat(now_iso.replace("Z", "+00:00")) >= dt.datetime.fromisoformat(expires.replace("Z", "+00:00")):
-        return False, 25, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_EXPIRED", "branch": norm_branch}
-    if vsha and (not SHA40_RE.fullmatch(sha_arg) or sha_arg != vsha):
-        return False, 29, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_SHA_MISMATCH", "voucherSha": vsha, "targetSha": sha_arg, "branch": norm_branch}
-    if vbranch and norm_branch_name(vbranch) != norm_branch:
-        return False, 30, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_BRANCH_MISMATCH", "voucherBranch": vbranch, "branch": norm_branch}
+    stored_sha = vdoc.get("sha256")
+    if not isinstance(stored_sha, str) or not SHA64_RE.fullmatch(stored_sha) or not hmac.compare_digest(stored_sha, hashlib.sha256(canonical.encode("utf-8")).hexdigest()): return False, 24, tampered
+    hmac_val = vdoc.get("hmacSha256")
+    if hmac_val is not None:
+        hmac_path, hmac_ok = vdir_res.parent / ".hmac-key", False
+        if isinstance(hmac_val, str) and SHA64_RE.fullmatch(hmac_val) and os.path.lexists(hmac_path):
+            try:
+                kst = os.lstat(hmac_path)
+                if not stat.S_ISLNK(kst.st_mode) and stat.S_ISREG(kst.st_mode) and (kst.st_mode & 0o077) == 0 and (skip_owner or os.geteuid() != 0 or not (in_opt or str(hmac_path.resolve()).startswith("/opt/openclaude/")) or kst.st_uid == 0):
+                    kstr = hmac_path.read_text(encoding="utf-8").strip()
+                    if kstr: hmac_ok = hmac.compare_digest(hmac_val, hmac.new(kstr.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest())
+            except OSError: hmac_ok = False
+        if not hmac_ok: return False, 24, tampered
+    try:
+        now_dt, expires_dt = dt.datetime.fromisoformat(now_iso.replace("Z", "+00:00")), dt.datetime.fromisoformat(expires.replace("Z", "+00:00"))
+        if now_dt.tzinfo is None or expires_dt.tzinfo is None: raise ValueError("naive")
+    except Exception: return False, 24, tampered
+    if now_dt >= expires_dt: return False, 25, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_EXPIRED", "branch": norm_branch}
+    if require_bound:
+        if "<inline-sql>" in ddl_hits: return False, 28, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_FILES_UNCOVERED", "uncovered": ["<inline-sql>"]}
+        if not SHA40_RE.fullmatch(sha_arg) or not SHA40_RE.fullmatch(vsha) or sha_arg != vsha: return False, 29, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_SHA_MISMATCH", "voucherSha": vsha, "targetSha": sha_arg, "branch": norm_branch}
+        vnb = norm_branch_name(vbranch)
+        if not norm_branch or not vnb or vnb != norm_branch: return False, 30, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_BRANCH_MISMATCH", "voucherBranch": vbranch, "branch": norm_branch}
+    else:
+        if vsha and (not SHA40_RE.fullmatch(sha_arg) or sha_arg != vsha): return False, 29, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_SHA_MISMATCH", "voucherSha": vsha, "targetSha": sha_arg, "branch": norm_branch}
+        if vbranch and norm_branch_name(vbranch) != norm_branch: return False, 30, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_BRANCH_MISMATCH", "voucherBranch": vbranch, "branch": norm_branch}
     scopes = set(scope.split("+"))
     if ddl_hits and "ddl" not in scopes: return False, 26, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_SCOPE_MISMATCH", "need": "ddl"}
     if billing_hits and "billing" not in scopes: return False, 27, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_SCOPE_MISMATCH", "need": "billing"}
     uncovered = [x for x in (ddl_hits + billing_hits) if x != "<inline-sql>" and x not in set(vfiles)]
     if uncovered: return False, 28, {"ok": False, "classification": "human_review_required", "code": "VOUCHER_FILES_UNCOVERED", "uncovered": uncovered}
-    return True, 0, {"vid": vid}
+    return True, 0, {"vid": vid, "expiresAt": expires, "expiresDt": expires_dt}
+
+def find_matching_voucher(vouchers_dir: str, now_iso: str, sha_arg: str, norm_branch: str, ddl_hits: list, billing_hits: list):
+    if not SHA40_RE.fullmatch(sha_arg) or "<inline-sql>" in ddl_hits or (not ddl_hits and not billing_hits) or is_safe_vouchers_dir(vouchers_dir) is None: return None
+    try: entries = sorted(pathlib.Path(vouchers_dir).iterdir(), key=lambda p: p.name)
+    except OSError: return None
+    best = None
+    for ent in entries:
+        if not VOUCHER_FILE_RE.fullmatch(ent.name): continue
+        ok_v, _, v_pay = verify_voucher_file(ent.name, vouchers_dir, now_iso, sha_arg, norm_branch, ddl_hits, billing_hits, require_bound=True)
+        if not ok_v: continue
+        cand_key = (v_pay["expiresDt"], v_pay["vid"])
+        if best is None or cand_key > best[0]: best = (cand_key, v_pay)
+    return best[1] if best is not None else None
 
 def reconcile_approving_doc(fpath: pathlib.Path, doc: dict, vouchers_dir: str, approvals_dir: str, breaker_file: str, cost_breaker_file: str) -> tuple[str, dict]:
     kind = str(doc.get("kind") or "")
@@ -1171,6 +1172,9 @@ elif op == "blast_p3":
     elif core_b: semantic_reason = "命中核心计费/支付生产文件，必须人工签发凭证"
     billing_hits = core_b + noncore_b
     if not voucher_arg:
+        auto_v = find_matching_voucher(vouchers_dir, now_iso, sha_arg, norm_branch, ddl_hits, billing_hits)
+        if auto_v is not None:
+            print(json.dumps({"ok": True, "classification": "human_review_required", "branch": branch, "voucherId": auto_v["vid"], "voucherAutoDiscovered": True, "ddlFiles": ddl_hits, "billingFiles": billing_hits, "coreBillingFiles": core_b, "nonCoreBillingFiles": noncore_b}, ensure_ascii=False)); sys.exit(0)
         code = "DESTRUCTIVE_DDL_LOCKED" if ddl_hits else "BILLING_CORE_LOCKED"
         print(json.dumps({"ok": False, "classification": "human_review_required", "code": code, "branch": branch, "ddlFiles": ddl_hits, "billingFiles": billing_hits, "coreBillingFiles": core_b, "nonCoreBillingFiles": noncore_b, "semanticReason": semantic_reason}, ensure_ascii=False)); sys.exit(22)
     ok_v, v_rc, v_pay = verify_voucher_file(voucher_arg, vouchers_dir, now_iso, sha_arg, norm_branch, ddl_hits, billing_hits)

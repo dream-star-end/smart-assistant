@@ -26,18 +26,51 @@ selfhost_prepared_state() { # <action> <sha> [identity/paths...]
   python3 "$SCRIPT_DIR/lib/v5-selfhost-prepared.py" "$1" "$SELFHOST_PREPARED_ROOT" "${@:2}"
 }
 
-selfhost_prepare_assert_tip() { # <sha>; no ref update, live state or canonical checkout mutation
-  local sha="$1" tip
-  tip="$(git -C "$REPO_ROOT" ls-remote --exit-code origin refs/heads/feat/v5-selfhost)" \
+_prepare_git() { git -c safe.directory='*' -C "$REPO_ROOT" "$@"; }
+
+selfhost_prepare_assert_tip() { # <sha> [exact|allow-ancestor]; no local ref/HEAD/live mutation
+  local sha="$1" mode="${2:-exact}" tip tip_sha live_root live_sha
+  [[ "$mode" == exact || "$mode" == allow-ancestor ]] \
+    || die "invalid tip assertion mode: $mode"
+  tip="$(_prepare_git ls-remote --exit-code origin refs/heads/feat/v5-selfhost)" \
     || die "cannot verify selfhost remote tip; prepared candidate refused"
-  [[ "$tip" == "$sha"$'\t'refs/heads/feat/v5-selfhost ]] \
-    || die "selfhost tip changed; discard prepared $sha and prepare the new tip"
-  git -C "$REPO_ROOT" cat-file -e "$sha^{commit}" \
+  tip_sha="${tip%%$'\t'*}"
+  [[ "$tip" == "$tip_sha"$'\t'refs/heads/feat/v5-selfhost && "$tip_sha" =~ ^[0-9a-fA-F]{40}$ ]] \
+    || die "cannot verify selfhost remote tip; prepared candidate refused"
+  _prepare_git cat-file -e "$sha^{commit}" \
     || die "prepared source object missing; fetch the selfhost tip first"
+  if [[ "$tip_sha" != "$sha" ]]; then
+    if [[ "$mode" != allow-ancestor ]]; then
+      die "selfhost tip changed; discard prepared $sha and prepare the new tip"
+    fi
+    if ! _prepare_git cat-file -e "$tip_sha^{commit}" 2>/dev/null; then
+      _prepare_git fetch --no-tags --quiet --refmap= origin refs/heads/feat/v5-selfhost \
+        || die "cannot fetch advanced selfhost tip ($tip_sha); discard prepared $sha"
+      _prepare_git cat-file -e "$tip_sha^{commit}" 2>/dev/null \
+        || die "advanced selfhost tip object missing after fetch ($tip_sha); discard prepared $sha"
+    fi
+    _prepare_git merge-base --is-ancestor "$sha" "$tip_sha" \
+      || die "selfhost tip diverged or reverted ($sha -> $tip_sha); discard prepared $sha"
+    if [[ -n "${MASTER_LIVE_LINK:-}" && ( -L "$MASTER_LIVE_LINK" || -e "$MASTER_LIVE_LINK" ) ]]; then
+      live_root="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+      [[ -n "$live_root" && -f "$live_root/.complete" ]] \
+        || die "cannot verify current live release (.complete missing); refuse advanced-tip cutover"
+      live_sha="$(jq -er '.sourceCommit // empty' "$live_root/.complete" 2>/dev/null || true)"
+      [[ "$live_sha" =~ ^[0-9a-fA-F]{40}$ ]] \
+        || die "cannot verify current live sourceCommit; refuse advanced-tip cutover"
+      [[ "${live_sha,,}" != "${sha,,}" ]] \
+        || die "selfhost live ($live_sha) already equals prepared $sha; refuse redundant advanced-tip cutover"
+      _prepare_git cat-file -e "$live_sha^{commit}" 2>/dev/null \
+        && _prepare_git merge-base --is-ancestor "$live_sha" "$sha" 2>/dev/null \
+        || die "cannot prove current live ($live_sha) is a strict ancestor of prepared $sha; refuse potential downgrade/divergence"
+    fi
+    log "  ⚠ selfhost tip 线性前进 (${sha:0:12} -> ${tip_sha:0:12}); 保留全绿制品先切流推进 live，下一班列车将消化新 tip"
+    tsum_note tipAdvancedAncestor "${sha:0:12}->${tip_sha:0:12}" 2>/dev/null || :
+  fi
   # Ahead-of-HEAD preparation may use this controller only when its build/guard
   # definitions are byte-identical to the target. Gate scripts themselves execute
   # from the pinned archive. Controller changes require refreshing the checkout.
-  git -C "$REPO_ROOT" diff --quiet "$sha" -- scripts/deploy-v5-selfhost.sh \
+  _prepare_git diff --quiet "$sha" -- scripts/deploy-v5-selfhost.sh \
     scripts/v5-selfhost-master-release-lib.sh scripts/v5-runtime-release-lib.sh scripts/lib \
     || die "prepared source changes the build controller; refresh canonical before preparing"
 }
@@ -58,7 +91,7 @@ selfhost_prepare_identity() { # must run with artifact mutex held
 
 selfhost_prepared_receipt() { # <read|write> <sha>
   local action="$1" sha="$2" tree
-  tree="$(git -C "$REPO_ROOT" rev-parse "$sha^{tree}")" || return 1
+  tree="$(_prepare_git rev-parse "$sha^{tree}")" || return 1
   local -a args=("$tree" "$SELFHOST_PREPARED_OPTIONS" "$RUNTIME_IMAGE" "$RUNTIME_IMAGE_ID"
     "$MASTER_RELEASES_ROOT" "$OC_HOTCFG_RELEASES_ROOT" "$OC_HOTCFG_PLATFORM_ROOT/bundles")
   if [[ "$action" == write ]]; then
@@ -115,7 +148,7 @@ selfhost_prepare_candidate() { # <sha>; default deploy and standalone prepare sh
   local SEED_CLI="$BUILT_MASTER_RELEASE/packages/commercial/agent-sandbox/platform-runtime/entrypoint/validatePlatformSeedCli.ts"
   build_platform_bundle "$sha"
   CUTOVER_TUPLE_BUNDLE="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
-  selfhost_prepare_assert_tip "$sha"
+  selfhost_prepare_assert_tip "$sha" allow-ancestor
   selfhost_prepared_receipt write "$sha" || die "cannot seal prepared receipt"
   selfhost_prepare_unlock
 }
@@ -125,7 +158,7 @@ selfhost_prepared_enter_flip() { # <sha>; no build/resource wait while deploy.lo
   tsum_mark A.flip-lock-wait 2>/dev/null || :
   acquire_selfhost_deploy_lock
   prewarm_quiesce "$SELFHOST_DEPLOY_LOCK" || die "prewarm did not stop; flip refused"
-  selfhost_prepare_assert_tip "$sha"
+  selfhost_prepare_assert_tip "$sha" allow-ancestor
   [[ "$(source_commit)" == "$sha" ]] \
     || die "canonical HEAD changed; prepared candidate refused at flip"
   # Never hold deploy.lock waiting behind a long preparation: fail and retry later.
@@ -178,7 +211,7 @@ selfhost_prepared_gc() { # <command...>; subshell owns the GC artifact lock unti
     if [[ -e "$SELFHOST_PREPARED_ROOT" || -L "$SELFHOST_PREPARED_ROOT" ]]; then
       # A read error also defers GC. No prepared evidence may disappear underneath flip.
       local rc=0 tip
-      tip="$(git -C "$REPO_ROOT" ls-remote --exit-code origin refs/heads/feat/v5-selfhost)" \
+      tip="$(_prepare_git ls-remote --exit-code origin refs/heads/feat/v5-selfhost)" \
         || { log "  GC deferred: remote tip unverifiable"; exit 0; }
       tip="${tip%%$'\t'*}"
       selfhost_prepared_state prune "$tip" \

@@ -835,7 +835,7 @@ selfhost_release_preflight() { # <target-sha> [prepared: immutable source may be
   if [[ "${2:-head}" == prepared ]]; then
     # selfhost_prepare_assert_tip already verified the exact remote tip/controller.
     # A prebuild is allowed ahead of canonical HEAD; archive/object identity is its pin.
-    if [[ "$target" =~ ^[0-9a-f]{40}$ ]] && git -C "$REPO_ROOT" cat-file -e "$target^{commit}"; then
+    if [[ "$target" =~ ^[0-9a-f]{40}$ ]] && git -c safe.directory='*' -C "$REPO_ROOT" cat-file -e "$target^{commit}"; then
       rpf_add ok source-pin "prepared immutable source ${target:0:12}"
     else
       rpf_add fail source-pin "prepared source is not an available commit"
@@ -919,7 +919,7 @@ master_web_dist_key() { # <full-sha> → stdout 64-hex;任一输入取不到 →
   local sha="$1" p oid parts node_ver
   parts="$WEB_DIST_REUSE_SCHEMA"
   for p in "${WEB_DIST_KEY_PATHS[@]}"; do
-    oid="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "${sha}:${p}" 2>/dev/null)" || return 1
+    oid="$(git -c safe.directory='*' -C "$REPO_ROOT" rev-parse --verify --quiet "${sha}:${p}" 2>/dev/null)" || return 1
     [[ "$oid" =~ ^[0-9a-f]{40}$ ]] || return 1
     parts+=$'\n'"$p $oid"
   done
@@ -1344,9 +1344,9 @@ build_master_release() {
   MASTER_FRONTEND_MODE=""
 
   # Explicit invocation pin; build-master-only keeps the no-argument HEAD snapshot.
-  full_sha="${1:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+  full_sha="${1:-$(git -c safe.directory='*' -C "$REPO_ROOT" rev-parse HEAD)}"
   [[ "$full_sha" =~ ^[0-9a-f]{40}$ ]] || die "source commit 不是 40 位 hex: $full_sha"
-  short_sha="$(git -C "$REPO_ROOT" rev-parse --short=9 "$full_sha")"
+  short_sha="$(git -c safe.directory='*' -C "$REPO_ROOT" rev-parse --short=9 "$full_sha")"
   ts="$(date -u +%Y%m%d-%H%M%S)"
   staging="$MASTER_RELEASES_ROOT/.staging-${short_sha}-$$-${ts}"
   reldir="$MASTER_RELEASES_ROOT/rel-${short_sha}-${ts}"
@@ -1389,7 +1389,7 @@ build_master_release() {
   MASTER_STAGING_DEV="$(stat -c '%d' -- "$MASTER_STAGING")"
   MASTER_STAGING_INO="$(stat -c '%i' -- "$MASTER_STAGING")"
   staging="$MASTER_STAGING"
-  if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" \
+  if ! git -c safe.directory='*' -C "$REPO_ROOT" archive --format=tar "$full_sha" \
       | ( umask 022 && tar --no-same-permissions --no-same-owner -x -C "$staging" ); then
     cleanup_master_staging
     die "git archive/解包失败"
@@ -2014,11 +2014,11 @@ git_migration_name_diff() { # <from-commit> <to-commit>
   local from="$1" to="$2"
   [[ "$from" =~ ^[0-9a-f]{7,40}$ ]] || { mlog "迁移门: from 非法"; return 1; }
   [[ "$to" =~ ^[0-9a-f]{7,40}$ ]] || { mlog "迁移门: to 非法"; return 1; }
-  git -C "$REPO_ROOT" cat-file -e "${from}^{commit}" \
+  git -c safe.directory='*' -C "$REPO_ROOT" cat-file -e "${from}^{commit}" \
     || { mlog "迁移门: from 不是存在的 commit: $from"; return 1; }
-  git -C "$REPO_ROOT" cat-file -e "${to}^{commit}" \
+  git -c safe.directory='*' -C "$REPO_ROOT" cat-file -e "${to}^{commit}" \
     || { mlog "迁移门: to 不是存在的 commit: $to"; return 1; }
-  git -C "$REPO_ROOT" diff --name-only "$from" "$to" -- '**/migrations/**'
+  git -c safe.directory='*' -C "$REPO_ROOT" diff --name-only "$from" "$to" -- '**/migrations/**'
 }
 
 # 只读比对 DB schema_migrations.version 与候选 requiredMigrations。不 apply。
@@ -2099,7 +2099,7 @@ gate_cutover_migrations() { # <rel>
   CUTOVER_MIGRATION_FILES=""
   to_commit="$(jq -er '.sourceCommit' "$rel/.complete")"
   [[ "$to_commit" =~ ^[0-9a-f]{40}$ ]] || die "迁移门: to_commit 非法"
-  git -C "$REPO_ROOT" cat-file -e "${to_commit}^{commit}" \
+  git -c safe.directory='*' -C "$REPO_ROOT" cat-file -e "${to_commit}^{commit}" \
     || die "迁移门: to_commit 不是存在的 commit: $to_commit"
 
   if ! gap="$(read_required_migration_gap "$rel")"; then
@@ -2128,7 +2128,7 @@ gate_cutover_migrations() { # <rel>
   # 禁止把工作树 .complete 当运行证明。无 live 时只信 DB 缺口。
   if [[ -n "$from_commit" ]]; then
     [[ "$from_commit" =~ ^[0-9a-f]{40}$ ]] || die "迁移门: live sourceCommit 非法"
-    git -C "$REPO_ROOT" cat-file -e "${from_commit}^{commit}" \
+    git -c safe.directory='*' -C "$REPO_ROOT" cat-file -e "${from_commit}^{commit}" \
       || die "迁移门: live sourceCommit 不是存在的 commit: $from_commit"
     if ! changed="$(git_migration_name_diff "$from_commit" "$to_commit")"; then
       die "迁移门: git diff $from_commit..$to_commit 失败。fail-closed,禁止当成无 migration。"
@@ -2160,7 +2160,7 @@ gate_cutover_migrations() { # <rel>
 
 resolve_cutover_release() { # uses CUTOVER_RELEASE / HEAD
   local head cand
-  head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  head="$(git -c safe.directory='*' -C "$REPO_ROOT" rev-parse HEAD)"
   if [[ -n "${CUTOVER_RELEASE:-}" ]]; then
     [[ "$CUTOVER_RELEASE" == /* ]] || die "--release 必须是绝对路径"
     [[ -d "$CUTOVER_RELEASE" && ! -L "$CUTOVER_RELEASE" ]] || die "--release 不是普通目录: $CUTOVER_RELEASE"

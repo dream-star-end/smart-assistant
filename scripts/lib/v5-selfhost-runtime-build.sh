@@ -4,7 +4,7 @@
 
 runtime_caps_from_metadata() {
   local sha="$1"
-  git -C "$REPO_ROOT" show "${sha}:deploy/v5/release-metadata.json" \
+  git -c safe.directory='*' -C "$REPO_ROOT" show "${sha}:deploy/v5/release-metadata.json" \
     | jq -er '.runtimeCapabilities | join(" ")'
 }
 
@@ -36,7 +36,7 @@ build_runtime_release() {
   mkdir -p "$OC_HOTCFG_RELEASES_ROOT"
   rm -rf "$raw" "$staging"
   mkdir -p "$raw" "$staging"
-  git -C "$REPO_ROOT" archive --format=tar "$sha" | tar -x -C "$raw" \
+  git -c safe.directory='*' -C "$REPO_ROOT" archive --format=tar "$sha" | tar -x -C "$raw" \
     || { rm -rf "$raw" "$staging"; die "git archive 失败"; }
   rsync -a --exclude-from="$raw/packages/commercial/agent-sandbox/runtime-src-excludes.txt" "$raw/" "$staging/" \
     || { rm -rf "$raw" "$staging"; die "rsync prune 失败"; }
