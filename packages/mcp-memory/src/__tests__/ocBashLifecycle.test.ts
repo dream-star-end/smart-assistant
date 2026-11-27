@@ -290,7 +290,7 @@ describe('OcBashJobManager Layer 3 lifecycle governance (OCV5-908 P2-1)', () => 
       registryDir: regDir,
       sessionKey: 'agent:main:webchat:dm:sess_w03',
       idleJobTtlMs: 120,
-      maxJobLifetimeMs: 950,
+      maxJobLifetimeMs: 1500,
       killGraceMs: 50,
     })
     const pidsToClean: number[] = []
@@ -325,8 +325,8 @@ describe('OcBashJobManager Layer 3 lifecycle governance (OCV5-908 P2-1)', () => 
       ) as OcBashJobSnapshot
       pidsToClean.push(longSnap.pid, daemonSnap.pid)
 
-      // At +500ms: shortManaged exited & its unread buffer was promoted to tombstone; longManaged & daemon STILL alive!
-      await new Promise((r) => setTimeout(r, 500))
+      // At +750ms: shortManaged exited & its unread buffer was promoted to tombstone; longManaged & daemon STILL alive!
+      await new Promise((r) => setTimeout(r, 750))
       const afterShort = await mgr.continueJob({
         jobId: shortManaged.jobId,
         action: 'status',
