@@ -399,10 +399,16 @@ export function releaseSwarmSlotAfterBoundedReap(
     termGraceMs?: number
     killGraceMs?: number
     snapshot?: ProcessTreeSnapshot | null
+    treeOpts?: KillProcessTreeOpts
   },
 ): void {
   if (!release) return
-  if (!proc || (isClosed() && !hasAnyTrackedProcessGroupAlive(proc.pid, opts?.snapshot))) {
+  if (
+    !proc ||
+    (isClosed() &&
+      !opts?.treeOpts?.turnReapTag &&
+      !hasAnyTrackedProcessGroupAlive(proc.pid, opts?.snapshot))
+  ) {
     release()
     return
   }
@@ -411,6 +417,7 @@ export function releaseSwarmSlotAfterBoundedReap(
     termGraceMs: opts?.termGraceMs ?? 800,
     killGraceMs: opts?.killGraceMs ?? 400,
     snapshot: opts?.snapshot,
+    treeOpts: opts?.treeOpts,
   }).finally(() => {
     release()
   })

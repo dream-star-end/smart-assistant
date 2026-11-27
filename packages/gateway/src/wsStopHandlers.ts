@@ -64,16 +64,22 @@ function classifyOlderBlockingTurn(
   makeStopKey: (peerId: string, cmid: string) => string,
 ): { kind: 'cmid'; runningCmid: string } | { kind: 'persist_only' } | null {
   const runningCmid = blockingLive._runningClientMessageId
-  const hasActivePersist = Boolean(blockingLive._persistActiveTurn)
   if (runningCmid === clientMessageId) return null
   if (typeof runningCmid === 'string' && runningCmid.length > 0) {
     const runningMeta = host._admittedClientTurnMeta?.get(makeStopKey(peerId, runningCmid))
     const provenOlder =
-      (runningMeta !== undefined && runningMeta.seq < meta.seq) ||
-      (runningMeta === undefined && meta.runningCmidAtAdmission === runningCmid)
+      runningMeta !== undefined
+        ? runningMeta.seq < meta.seq
+        : meta.admissionSnapshot?.runningCmid === runningCmid
     return provenOlder ? { kind: 'cmid', runningCmid } : null
   }
-  if (hasActivePersist && meta.hadActivePersistAtAdmission === true) {
+  const activePersist = blockingLive._persistActiveTurn
+  if (
+    activePersist !== undefined &&
+    activePersist !== null &&
+    meta.admissionSnapshot?.persistTurnRef !== undefined &&
+    activePersist === meta.admissionSnapshot.persistTurnRef
+  ) {
     return { kind: 'persist_only' }
   }
   return null
@@ -104,6 +110,7 @@ async function tryInterruptProvenOlderBlockingTurn(
       : host.sessions.interrupt(blockingLive.sessionKey, 'user')
   if (!blockingSelf) return { interrupted: false }
   const runningCmid = older.kind === 'cmid' ? older.runningCmid : undefined
+  host._cancelToolBrokerSession?.(blockingLive.sessionKey, 'user_stop')
   const blockingDelegates = host._interruptDelegationsForParent(blockingLive.sessionKey)
   const blockingSwarm = await deps.interruptRemoteSwarm(host, blockingLive.sessionKey, 'user_stop')
   host._settlePendingPermissionsForStop(blockingLive.sessionKey, runningCmid)

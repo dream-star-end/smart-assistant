@@ -177,11 +177,17 @@ function stepToolName(obj: Record<string, unknown> | null): string {
   return normTool(strOf(obj.tool_name || obj.name))
 }
 
-interface PlannerNonBoardCall {
+interface PlannerCallSpec {
   readonly name: string
   readonly norm: string
   readonly id: string
+  readonly isBoard: boolean
   readonly args: Record<string, unknown> | null
+}
+
+interface TerminalToolStep {
+  readonly id: string
+  readonly norm: string
 }
 
 function findDirectUnfinishedNonBoardStep(
@@ -204,62 +210,86 @@ function findDirectUnfinishedNonBoardStep(
   return null
 }
 
-function extractPlannerNonBoardCalls(lastPlannerCalls: readonly unknown[]): PlannerNonBoardCall[] {
-  const out: PlannerNonBoardCall[] = []
+function extractPlannerCallSpecs(lastPlannerCalls: readonly unknown[]): PlannerCallSpec[] {
+  const out: PlannerCallSpec[] = []
   for (const raw of lastPlannerCalls) {
     const obj = recOf(raw)
     const name = strOf(obj?.name)
     const norm = normTool(name)
-    if (!norm || BOARD_COORD_TOOLS.has(norm)) continue
-    out.push({ name, norm, id: stepCallId(obj), args: recOf(obj?.arguments ?? obj?.args) })
+    if (!norm) continue
+    out.push({
+      name,
+      norm,
+      id: stepCallId(obj),
+      isBoard: BOARD_COORD_TOOLS.has(norm),
+      args: recOf(obj?.arguments ?? obj?.args),
+    })
   }
   return out
 }
 
-function collectAfterPlannerCompletion(afterPlanner: readonly Record<string, unknown>[]): {
-  completedIds: Set<string>
-  completedByName: Map<string, number>
-  totalTerminalResults: number
-  anyUnfinishedStep: boolean
-} {
-  const completedIds = new Set<string>()
-  const completedByName = new Map<string, number>()
-  let totalTerminalResults = 0
-  let anyUnfinishedStep = false
+function collectAfterPlannerTerminals(afterPlanner: readonly Record<string, unknown>[]): TerminalToolStep[] {
+  const seenIds = new Set<string>()
+  const terminals: TerminalToolStep[] = []
   for (const s of afterPlanner) {
     const st = strOf(s.status).toUpperCase()
-    if (st === 'DONE' || st === 'ERROR') {
-      totalTerminalResults += 1
-      const cid = stepCallId(s)
-      if (cid) completedIds.add(cid)
-      const tname = stepToolName(s)
-      if (tname) completedByName.set(tname, (completedByName.get(tname) ?? 0) + 1)
-    } else if (st !== '') {
-      anyUnfinishedStep = true
+    if (st !== 'DONE' && st !== 'ERROR') continue
+    const cid = stepCallId(s)
+    if (cid) {
+      if (seenIds.has(cid)) continue
+      seenIds.add(cid)
     }
+    const tname = stepToolName(s)
+    if (!cid && !tname) continue
+    terminals.push({ id: cid, norm: tname })
   }
-  return { completedIds, completedByName, totalTerminalResults, anyUnfinishedStep }
+  return terminals
 }
 
-function firstUnaccountedPlannerCall(
-  nonBoardCalls: readonly PlannerNonBoardCall[],
-  completedIds: ReadonlySet<string>,
-  completedByName: Map<string, number>,
-): { name: string; args: Record<string, unknown> | null } | null {
-  for (const call of nonBoardCalls) {
-    if (call.id && completedIds.has(call.id)) {
-      const n = completedByName.get(call.norm) ?? 0
-      if (n > 0) completedByName.set(call.norm, n - 1)
-      continue
-    }
-    const remaining = completedByName.get(call.norm) ?? 0
-    if (remaining > 0) {
-      completedByName.set(call.norm, remaining - 1)
-      continue
-    }
-    return { name: call.name, args: call.args }
+function findUnambiguousNameFallbackIndex(
+  calls: readonly PlannerCallSpec[],
+  accounted: ReadonlySet<number>,
+  idMatchedNorms: ReadonlySet<string>,
+  term: TerminalToolStep,
+): number {
+  const candidates: number[] = []
+  for (let i = 0; i < calls.length; i += 1) {
+    const c = calls[i]!
+    if (accounted.has(i) || c.norm !== term.norm) continue
+    if (term.id && c.id) continue
+    candidates.push(i)
   }
-  return null
+  if (candidates.length === 0) return -1
+  const firstIdx = candidates[0]!
+  if (calls[firstIdx]!.id === '') return firstIdx
+  if (candidates.length === 1 && !idMatchedNorms.has(term.norm)) return firstIdx
+  return -1
+}
+
+function matchAccountedPlannerCalls(
+  calls: readonly PlannerCallSpec[],
+  terminals: readonly TerminalToolStep[],
+): Set<number> {
+  const accounted = new Set<number>()
+  const idMatchedNorms = new Set<string>()
+  const unconsumed: TerminalToolStep[] = []
+  for (const term of terminals) {
+    if (term.id) {
+      const idx = calls.findIndex((c, i) => !accounted.has(i) && c.id === term.id)
+      if (idx >= 0) {
+        accounted.add(idx)
+        idMatchedNorms.add(calls[idx]!.norm)
+        continue
+      }
+    }
+    unconsumed.push(term)
+  }
+  for (const term of unconsumed) {
+    if (!term.norm) continue
+    const fallbackIdx = findUnambiguousNameFallbackIndex(calls, accounted, idMatchedNorms, term)
+    if (fallbackIdx >= 0) accounted.add(fallbackIdx)
+  }
+  return accounted
 }
 
 /**
@@ -275,10 +305,15 @@ export function findActiveNonBoardToolInTurn(
   const directActive = findDirectUnfinishedNonBoardStep(turnSteps)
   if (directActive) return directActive
   if (lastPlannerIdx < 0 || lastPlannerCalls.length === 0) return null
-  const nonBoardCalls = extractPlannerNonBoardCalls(lastPlannerCalls)
-  if (nonBoardCalls.length === 0) return null
-  const { completedIds, completedByName, totalTerminalResults, anyUnfinishedStep } =
-    collectAfterPlannerCompletion(turnSteps.slice(lastPlannerIdx + 1))
-  if (totalTerminalResults >= lastPlannerCalls.length && !anyUnfinishedStep) return null
-  return firstUnaccountedPlannerCall(nonBoardCalls, completedIds, completedByName)
+  const calls = extractPlannerCallSpecs(lastPlannerCalls)
+  if (!calls.some((c) => !c.isBoard)) return null
+  const terminals = collectAfterPlannerTerminals(turnSteps.slice(lastPlannerIdx + 1))
+  const accounted = matchAccountedPlannerCalls(calls, terminals)
+  for (let i = 0; i < calls.length; i += 1) {
+    const call = calls[i]!
+    if (!call.isBoard && !accounted.has(i)) {
+      return { name: call.name, args: call.args }
+    }
+  }
+  return null
 }

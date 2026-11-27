@@ -789,6 +789,14 @@ export class ToolBrokerServer implements ToolBrokerTransport {
     return count
   }
 
+  listActiveTurnIds(sessionKey: string): string[] {
+    const turnIds = new Set<string>()
+    for (const active of this.inFlight.values()) {
+      if (active.sessionKey === sessionKey && active.turnId) turnIds.add(active.turnId)
+    }
+    return [...turnIds]
+  }
+
   cancelTurn(sessionKey: string, turnId: string, reason = 'turn_revoked', grantId?: string): number {
     let count = 0
     for (const active of [...this.inFlight.values()]) {

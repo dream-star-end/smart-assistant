@@ -886,7 +886,13 @@ export class Gateway {
   private _ensureToolBrokerRuntimeOrNull(): GatewayToolBrokerRuntime | null { return this._isToolBrokerEnabled() ? this._ensureToolBrokerRuntime() : null }
   private _handleToolBrokerBridgeFrame(ws: WebSocket, frame: ToolBrokerWireFrame): void { this._ensureToolBrokerRuntimeOrNull()?.handleBridgeWireFrame(ws, frame, (raw) => { if (ws.readyState === ws.OPEN) ws.send(raw) }) }
   private _detachToolBrokerBridgeSocket(ws: WebSocket): void { this._toolBrokerRuntime?.detachBridgeSocket(ws) }
-  private _cancelToolBrokerSession(sessionKey: string, reason = 'user_stop'): void { this._toolBrokerRuntime?.cancelSessionCalls(sessionKey, reason) }
+  private _cancelToolBrokerSession(sessionKey: string, reason = 'user_stop'): void {
+    if (reason === 'user_stop') {
+      this._toolBrokerRuntime?.cancelActiveTurnCalls(sessionKey, reason)
+      return
+    }
+    this._toolBrokerRuntime?.cancelSessionCalls(sessionKey, reason)
+  }
   private _interruptRemoteSwarmForSession(sessionKey: string, reason = 'user_stop'): Promise<boolean> { return interruptGatewayRemoteSwarmSession(this._remoteSwarmRuntime, sessionKey, reason) }
   private _recordRingEvictions(stats: EvictionStats): void {
     if (stats.entries) outboundRingEvictedTotal.inc({ cause: 'entries' }, stats.entries)

@@ -23,42 +23,77 @@ import { userSentTurnFrames } from './turnFrames.js'
 const RECENT_SETTLEMENT_MAX = 1000
 const RECENT_SETTLEMENT_TTL_MS = 5 * 60_000
 
+/** Immutable snapshot of the blocking turn state observed synchronously when a turn was admitted. */
+export interface BlockingTurnSnapshotAtAdmission {
+  readonly observed: true
+  readonly runningCmid?: string
+  readonly persistTurnRef?: unknown
+}
+
 /** OCV5-923 — metadata for admitted webchat turns awaiting or running dispatch. */
 export interface AdmittedClientTurnMeta {
   peerId: string
   clientMessageId: string
   targetSessionKey?: string
-  /** Running turn already occupying targetSessionKey at admission/route-binding time (proves happens-before for non-admitted old turns). */
-  runningCmidAtAdmission?: string
-  hadActivePersistAtAdmission?: boolean
+  /** Immutable blocking-turn identity observed synchronously at admission (distinguishes observed-empty from unbound). */
+  admissionSnapshot?: BlockingTurnSnapshotAtAdmission
+  /** Synchronous admission-time snapshots across live sessions (used when route binds after async pre-checks). */
+  peerSnapshotsAtAdmission?: ReadonlyMap<string, BlockingTurnSnapshotAtAdmission>
   /** Monotonic admission order sequence on this gateway instance. */
   seq: number
 }
 
-function captureBlockingTurnAtAdmission(
-  sessions: { getByKey?: (key: string) => unknown },
-  targetSessionKey: string,
-  meta: AdmittedClientTurnMeta,
-): void {
-  if (meta.runningCmidAtAdmission !== undefined || meta.hadActivePersistAtAdmission !== undefined) return
-  const live = typeof sessions.getByKey === 'function' ? sessions.getByKey(targetSessionKey) : undefined
-  if (!live || typeof live !== 'object') return
+function snapshotLiveSessionAtAdmission(
+  live: unknown,
+  selfClientMessageId: string,
+): BlockingTurnSnapshotAtAdmission {
+  if (!live || typeof live !== 'object') return { observed: true }
   const runningCmid = (live as { _runningClientMessageId?: unknown })._runningClientMessageId
-  if (typeof runningCmid === 'string' && runningCmid.length > 0 && runningCmid !== meta.clientMessageId) {
-    meta.runningCmidAtAdmission = runningCmid
+  const persistTurnRef = (live as { _persistActiveTurn?: unknown })._persistActiveTurn
+  return {
+    observed: true,
+    ...(typeof runningCmid === 'string' && runningCmid.length > 0 && runningCmid !== selfClientMessageId
+      ? { runningCmid }
+      : {}),
+    ...(persistTurnRef !== undefined && persistTurnRef !== null ? { persistTurnRef } : {}),
   }
-  if ((live as { _persistActiveTurn?: unknown })._persistActiveTurn) {
-    meta.hadActivePersistAtAdmission = true
+}
+
+function snapshotAllLiveSessionsAtAdmission(
+  sessions: { list?: () => readonly unknown[]; getByKey?: (key: string) => unknown },
+  selfClientMessageId: string,
+  targetSessionKey?: string,
+): Map<string, BlockingTurnSnapshotAtAdmission> {
+  const out = new Map<string, BlockingTurnSnapshotAtAdmission>()
+  const list = typeof sessions.list === 'function' ? sessions.list() : []
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue
+    const key = (item as { sessionKey?: unknown }).sessionKey
+    if (typeof key === 'string' && key.length > 0) {
+      const realLive = typeof sessions.getByKey === 'function' ? (sessions.getByKey(key) ?? item) : item
+      out.set(key, snapshotLiveSessionAtAdmission(realLive, selfClientMessageId))
+    }
   }
+  if (targetSessionKey && !out.has(targetSessionKey) && typeof sessions.getByKey === 'function') {
+    const direct = sessions.getByKey(targetSessionKey)
+    if (direct !== undefined) {
+      out.set(targetSessionKey, snapshotLiveSessionAtAdmission(direct, selfClientMessageId))
+    }
+  }
+  return out
 }
 
 /**
  * OCV5-923 (B2): Bind the single authoritative execution sessionKey resolved by
  * `inboundDispatch` onto the admitted turn's metadata so pre-start Stop and
- * execution always share the exact same routing decision (even across router hot-reloads).
+ * execution always share the exact same routing decision (even across router hot-reloads),
+ * while strictly using the synchronous admission-time session snapshot (never re-sampling post-await).
  */
 export function bindAdmittedClientTurnSessionKey(
-  host: { _admittedClientTurnMeta?: Map<string, AdmittedClientTurnMeta>; sessions: { getByKey?: (key: string) => unknown } },
+  host: {
+    _admittedClientTurnMeta?: Map<string, AdmittedClientTurnMeta>
+    sessions: { list?: () => readonly unknown[]; getByKey?: (key: string) => unknown }
+  },
   frame: InboundFrame,
   sessionKey: string,
 ): void {
@@ -67,7 +102,13 @@ export function bindAdmittedClientTurnSessionKey(
   const meta = host._admittedClientTurnMeta?.get(preStartStopKey(frame.peer.id, clientMessageId))
   if (!meta || !sessionKey) return
   meta.targetSessionKey = sessionKey
-  captureBlockingTurnAtAdmission(host.sessions, sessionKey, meta)
+  if (meta.admissionSnapshot) return
+  if (meta.peerSnapshotsAtAdmission !== undefined) {
+    meta.admissionSnapshot = meta.peerSnapshotsAtAdmission.get(sessionKey) ?? { observed: true }
+    return
+  }
+  const live = typeof host.sessions.getByKey === 'function' ? host.sessions.getByKey(sessionKey) : undefined
+  meta.admissionSnapshot = snapshotLiveSessionAtAdmission(live, meta.clientMessageId)
 }
 
 let nextAdmittedTurnSeq = 1
@@ -275,14 +316,22 @@ export async function _dispatchAdmittedClientTurn(this: TurnDispatchHost, frame:
       const safePeerId = frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')
       targetSessionKey = `agent:${frame.agentId.trim()}:${frame.channel}:${frame.peer.kind}:${safePeerId}`
     }
+    const peerSnapshots = snapshotAllLiveSessionsAtAdmission(
+      this.sessions,
+      clientMessageId,
+      targetSessionKey,
+    )
     const entry: AdmittedClientTurnMeta = {
       peerId: frame.peer.id,
       clientMessageId,
-      ...(targetSessionKey ? { targetSessionKey } : {}),
+      ...(targetSessionKey
+        ? {
+            targetSessionKey,
+            admissionSnapshot: peerSnapshots.get(targetSessionKey) ?? { observed: true },
+          }
+        : {}),
+      peerSnapshotsAtAdmission: peerSnapshots,
       seq: nextAdmittedTurnSeq++,
-    }
-    if (targetSessionKey) {
-      captureBlockingTurnAtAdmission(this.sessions, targetSessionKey, entry)
     }
     metaMap.set(key, entry)
   }

@@ -997,8 +997,200 @@ process.stdin.on('data', (c) => {
       assert.equal(monCase2.evaluate(snapWaitErr, 1_800_000), null)
       assert.equal(monCase2.isStallSuppressedAllParked(), false)
       assert.equal(exhaustedCase2.length, 0, 'unfinished run_command must NEVER be auto-killed because sibling swarm_wait errored')
+
+      // R2 P1-1: [run_command(A, id=tc-a), run_command(B, id=tc-b), swarm_wait(C, id=tc-c)] where
+      // later sibling B completes FIRST (with both id & tool_name) + emits duplicate DONE + anonymous GENERIC DONE!
+      // A is still unfinished, so B's single ID-bound completion MUST NOT cancel both A and B!
+      const outOfOrderSameNameTranscript = [
+        JSON.stringify({
+          step_index: 0,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            { id: 'tc-a', name: 'run_command', args: { CommandLine: 'python3 job_a.py' } },
+            { id: 'tc-b', name: 'run_command', args: { CommandLine: 'python3 job_b.py' } },
+            { id: 'tc-c', name: 'swarm_wait', args: { since: 1 } },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'TOOL_RESULT',
+          tool_call_id: 'tc-b',
+          tool_name: 'run_command',
+          status: 'DONE',
+          content: 'job_b finished first',
+        }),
+        // Duplicate DONE for tc-b + anonymous GENERIC DONE (total DONE lines >= 3, yet A is still running!)
+        JSON.stringify({
+          step_index: 2,
+          type: 'TOOL_RESULT',
+          tool_call_id: 'tc-b',
+          tool_name: 'run_command',
+          status: 'DONE',
+          content: 'job_b duplicate log',
+        }),
+        JSON.stringify({
+          step_index: 3,
+          type: 'GENERIC',
+          status: 'DONE',
+          content: 'Waiting...',
+        }),
+      ].join('\n') + '\n'
+      await writeFile(path.join(workerLogs, 'transcript.jsonl'), outOfOrderSameNameTranscript)
+      const snapP11 = readAntigravitySwarmSnapshot({
+        brainDir,
+        conversationId: convId,
+        phase: 'running',
+        revision: 4,
+        now: 1_000,
+      })
+      assert.ok(snapP11)
+      const workerP11 = snapP11.members.find((m) => m.name === 'worker-a')
+      assert.equal(workerP11?.status, 'working', 'P1-1: B finishing first + duplicate DONE must NOT cancel A')
+      assert.equal(workerP11?.waitingOnBoard, false)
+      const exhaustedP11: SwarmStallExhaustion[] = []
+      const monP11 = new SwarmStallMonitor({ onStallExhausted: (e) => exhaustedP11.push(e) })
+      assert.equal(monP11.evaluate(snapP11, 0), null)
+      assert.equal(monP11.evaluate(snapP11, 180_000), null)
+      assert.equal(monP11.evaluate(snapP11, 720_000), null)
+      assert.equal(monP11.evaluate(snapP11, 1_260_000), null)
+      assert.equal(monP11.evaluate(snapP11, 1_800_000), null)
+      assert.equal(monP11.isStallSuppressedAllParked(), false)
+      assert.equal(exhaustedP11.length, 0, 'P1-1: swarm must NOT be reaped while run_command(A) is still unfinished')
     } finally {
       await rm(brainDir, { recursive: true, force: true })
+    }
+  })
+
+  test('R2 P1-3: spontaneous non-zero CLI exit WITHOUT prior Stop reaps reparented escaped-PGID worker (stdio: ignore), preserves managed_job, and releases swarm slot', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-agy-p13-reparent-'))
+    const workerPidFile = path.join(dir, 'escaped-worker.pid')
+    const managedPidFile = path.join(dir, 'managed-job.pid')
+    const saved = {
+      OC_ANTIGRAVITY_CLI_BIN: process.env.OC_ANTIGRAVITY_CLI_BIN,
+      OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME,
+    }
+    let workerPid = 0
+    let managedPid = 0
+    const { setLocalSwarmConcurrencyLimitForTests, getLocalSwarmConcurrencyStateForTests } = await import(
+      '../engine/antigravitySwarmConcurrency.js'
+    )
+    try {
+      setLocalSwarmConcurrencyLimitForTests(1)
+      const fakeCli = path.join(dir, 'fake-p13-spontaneous-exit.cjs')
+      await writeFile(
+        fakeCli,
+        `#!${process.execPath}
+const fs = require('node:fs')
+const { spawn } = require('node:child_process')
+process.stdin.setEncoding('utf8')
+let buf = ''
+process.stdin.on('data', (c) => {
+  buf += c
+  if (!buf.includes('\\n')) return
+  if (process.env.MODE === 'followup') {
+    for (const line of fs.readFileSync(${JSON.stringify(path.join(FIXTURES, 'stream-text.ndjson'))}, 'utf8').split('\\n')) {
+      if (line.trim()) process.stdout.write(line + '\\n')
+    }
+    return
+  }
+  // 1) Independent PGID worker (detached: true, stdio: 'ignore') that reparents to PID 1 on CLI exit!
+  const worker = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], {
+    detached: true,
+    stdio: 'ignore',
+  })
+  worker.unref()
+  fs.writeFileSync(${JSON.stringify(workerPidFile)}, String(worker.pid))
+
+  // 2) Survivable managed_job in its own PGID (carries OPENCLAUDE_LIFECYCLE_CLASS=managed_job) -> MUST SURVIVE!
+  const managedEnv = { ...process.env, OPENCLAUDE_LIFECYCLE_CLASS: 'managed_job' }
+  delete managedEnv.OPENCLAUDE_TURN_REAP_TAG
+  const managed = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    detached: true,
+    stdio: 'ignore',
+    env: managedEnv,
+  })
+  managed.unref()
+  fs.writeFileSync(${JSON.stringify(managedPidFile)}, String(managed.pid))
+
+  process.stderr.write('error: spontaneous cli crash\\n')
+  process.exit(1)
+})
+process.stdin.on('end', () => {
+  if (process.env.MODE === 'followup') process.exit(0)
+})
+`,
+      )
+      await chmod(fakeCli, 0o755)
+      process.env.OC_ANTIGRAVITY_CLI_BIN = fakeCli
+      process.env.OPENCLAUDE_HOME = path.join(dir, 'oc-home')
+      _internals.setTimingTestHooks({ deadlockTermGraceMs: 60, deadlockKillGraceMs: 120 })
+
+      const adapter = new AntigravityAdapter({
+        sessionKey: 'agent:main:webchat:dm:agy-p13-reparent',
+        agentId: 'main',
+        agentBaseDir: dir,
+        config: makeConfig(),
+        model: 'antigravity-gemini-3.8-flash',
+        effortLevel: 'high',
+      } as EngineCreateOpts)
+      adapter.on('error', () => {})
+      adapter.setAntigravityRoute(ROUTE)
+
+      const run = adapter.submitTurn({
+        input: 'swarm turn crashing spontaneously',
+        requestId: '3'.repeat(32),
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+        antigravitySwarmCompaction: { appliedMode: 'on_full' } as never,
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+
+      assert.equal(summary?.isError, true)
+      workerPid = Number(readFileSync(workerPidFile, 'utf8').trim())
+      managedPid = Number(readFileSync(managedPidFile, 'utf8').trim())
+      assert.ok(workerPid > 1 && managedPid > 1)
+      assert.equal(
+        await waitUntil(() => !isPgrpAlive(workerPid), 1_500),
+        true,
+        'P1-3: reparented escaped-PGID worker (stdio: ignore) must be reaped even without prior Stop',
+      )
+      assert.equal(isPgrpAlive(managedPid), true, 'P1-3: survivable managed_job must remain alive')
+      assert.equal(getLocalSwarmConcurrencyStateForTests().active, 0, 'swarm slot must be released after reap')
+
+      // Successor swarm turn must acquire the slot cleanly without blocking
+      process.env.MODE = 'followup'
+      _internals.setTimingTestHooks(null)
+      const next = adapter.submitTurn({
+        input: 'followup swarm turn',
+        requestId: '4'.repeat(32),
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 1 },
+        toolUseIdToName: new Map(),
+        antigravitySwarmCompaction: { appliedMode: 'on_full' } as never,
+      })
+      await next.submitted
+      const nextSummary = await next.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(nextSummary?.isError, false)
+    } finally {
+      setLocalSwarmConcurrencyLimitForTests(null)
+      _internals.setTimingTestHooks(null)
+      Reflect.deleteProperty(process.env, 'MODE')
+      if (workerPid > 1) {
+        try { process.kill(-workerPid, 'SIGKILL') } catch { /* already dead */ }
+      }
+      if (managedPid > 1) {
+        try { process.kill(-managedPid, 'SIGKILL') } catch { /* already dead */ }
+      }
+      if (saved.OC_ANTIGRAVITY_CLI_BIN === undefined) Reflect.deleteProperty(process.env, 'OC_ANTIGRAVITY_CLI_BIN')
+      else process.env.OC_ANTIGRAVITY_CLI_BIN = saved.OC_ANTIGRAVITY_CLI_BIN
+      if (saved.OPENCLAUDE_HOME === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_HOME')
+      else process.env.OPENCLAUDE_HOME = saved.OPENCLAUDE_HOME
+      await rm(dir, { recursive: true, force: true })
     }
   })
 })

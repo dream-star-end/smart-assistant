@@ -284,11 +284,16 @@ export class BrokerBashJobManager {
       }
     }
     const startedAtMs = Math.floor(this.clock())
+    const scrubbedEnv = scrubToolBrokerEnv(input.env)
+    if (input.lifecycleClass !== 'ephemeral_turn') {
+      delete scrubbedEnv.OPENCLAUDE_TURN_REAP_TAG
+      scrubbedEnv.OPENCLAUDE_LIFECYCLE_CLASS = input.lifecycleClass
+    }
     let child: ChildProcess
     try {
       child = spawn('/bin/bash', ['-lc', input.command], {
         cwd: input.cwd,
-        env: scrubToolBrokerEnv(input.env),
+        env: scrubbedEnv,
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
@@ -585,6 +590,16 @@ export class BrokerBashJobManager {
       killTimer.unref()
       hardTimer.unref()
     })
+  }
+
+  listActiveEphemeralTurnIds(sessionKey: string): string[] {
+    const turnIds = new Set<string>()
+    for (const job of this.jobs.values()) {
+      if (!job.exited && job.sessionKey === sessionKey && job.lifecycleClass === 'ephemeral_turn' && job.turnId) {
+        turnIds.add(job.turnId)
+      }
+    }
+    return [...turnIds]
   }
 
   reapTurn(sessionKey: string, turnId: string): number {

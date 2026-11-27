@@ -39,9 +39,12 @@ export interface ProcessTreeOpts {
   selfPid?: number
   selfPpid?: number
   selfPgid?: number
+  /** Per-turn ownership tag (`OPENCLAUDE_TURN_REAP_TAG`) so orphaned escaped-PGID workers remain discoverable after rootPid exits. */
+  turnReapTag?: string
   readProcDir?: () => string[]
   readProcStat?: (pid: number) => string | null
   readProcCmdline?: (pid: number) => string | null
+  readProcEnviron?: (pid: number) => string | null
 }
 
 export type KillProcessTreeOpts = KillProcessGroupOpts &
@@ -130,6 +133,29 @@ function createProcProtectionGuard(
   }
 }
 
+export const TURN_REAP_TAG_ENV = 'OPENCLAUDE_TURN_REAP_TAG'
+export const LIFECYCLE_CLASS_ENV = 'OPENCLAUDE_LIFECYCLE_CLASS'
+
+function hasSurvivableLifecycleEnviron(rawEnviron: string | null): boolean {
+  if (!rawEnviron) return false
+  for (const entry of rawEnviron.split('\0')) {
+    if (
+      entry === `${LIFECYCLE_CLASS_ENV}=managed_job` ||
+      entry === `${LIFECYCLE_CLASS_ENV}=daemon_service`
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+function matchesTurnReapEnviron(rawEnviron: string | null, turnReapTag: string | undefined): boolean {
+  if (!rawEnviron || !turnReapTag) return false
+  if (hasSurvivableLifecycleEnviron(rawEnviron)) return false
+  const expected = `${TURN_REAP_TAG_ENV}=${turnReapTag}`
+  return rawEnviron.split('\0').includes(expected)
+}
+
 function enqueueDescendantChildren(input: {
   curPid: number
   rootPid: number
@@ -137,6 +163,7 @@ function enqueueDescendantChildren(input: {
   curIsMemoryMcp: boolean
   children: readonly number[]
   statsByPid: ReadonlyMap<number, ParsedProcStat>
+  readEnviron: (pid: number) => string | null
   visited: Set<number>
   descendantPids: number[]
   descendantPgidSet: Set<number>
@@ -148,6 +175,9 @@ function enqueueDescendantChildren(input: {
     const childStat = input.statsByPid.get(childPid)
     if (!childStat || input.visited.has(childPid) || input.isProtectedPid(childPid)) continue
     if (input.curIsMemoryMcp && childStat.pgid !== input.rootPgid) continue
+    if (childStat.pgid !== input.rootPgid && hasSurvivableLifecycleEnviron(input.readEnviron(childPid))) {
+      continue
+    }
     input.visited.add(childPid)
     input.descendantPids.push(childPid)
     if (childStat.pgid !== input.rootPid && childStat.pgid !== input.rootPgid && !input.isProtectedPgid(childStat.pgid)) {
@@ -157,16 +187,53 @@ function enqueueDescendantChildren(input: {
   }
 }
 
+function seedTurnTaggedOrphanRoots(input: {
+  rootPid: number
+  rootPgid: number
+  turnReapTag: string | undefined
+  statsByPid: ReadonlyMap<number, ParsedProcStat>
+  readCmdline: (pid: number) => string | null
+  readEnviron: (pid: number) => string | null
+  visited: Set<number>
+  descendantPids: number[]
+  descendantPgidSet: Set<number>
+  queue: number[]
+  isProtectedPid: (pid: number) => boolean
+  isProtectedPgid: (pgid: number) => boolean
+}): void {
+  if (!input.turnReapTag) return
+  for (const stat of input.statsByPid.values()) {
+    if (input.visited.has(stat.pid) || input.isProtectedPid(stat.pid)) continue
+    const parentStat = input.statsByPid.get(stat.ppid)
+    if (
+      parentStat &&
+      stat.pgid !== input.rootPgid &&
+      isOcMemoryMcpProcess(parentStat.comm, input.readCmdline(parentStat.pid))
+    ) {
+      continue
+    }
+    if (!matchesTurnReapEnviron(input.readEnviron(stat.pid), input.turnReapTag)) continue
+    input.visited.add(stat.pid)
+    input.descendantPids.push(stat.pid)
+    if (stat.pgid !== input.rootPid && stat.pgid !== input.rootPgid && !input.isProtectedPgid(stat.pgid)) {
+      input.descendantPgidSet.add(stat.pgid)
+    }
+    input.queue.push(stat.pid)
+  }
+}
+
 function walkDescendantProcessGraph(input: {
   rootPid: number
+  turnReapTag?: string
   statsByPid: ReadonlyMap<number, ParsedProcStat>
   childrenByPpid: ReadonlyMap<number, readonly number[]>
   readCmdline: (pid: number) => string | null
+  readEnviron: (pid: number) => string | null
   selfPid: number
   selfPpid: number
   selfPgid: number | undefined
 }): ProcessTreeSnapshot {
-  const { rootPid, statsByPid, childrenByPpid, readCmdline, selfPid, selfPpid, selfPgid } = input
+  const { rootPid, turnReapTag, statsByPid, childrenByPpid, readCmdline, readEnviron, selfPid, selfPpid, selfPgid } = input
   const empty: ProcessTreeSnapshot = { rootPid, descendantPgids: [], descendantPids: [] }
   const { isProtectedPid, isProtectedPgid } = createProcProtectionGuard(selfPid, selfPpid, selfPgid)
 
@@ -185,6 +252,20 @@ function walkDescendantProcessGraph(input: {
       queue.push(stat.pid)
     }
   }
+  seedTurnTaggedOrphanRoots({
+    rootPid,
+    rootPgid,
+    turnReapTag,
+    statsByPid,
+    readCmdline,
+    readEnviron,
+    visited,
+    descendantPids,
+    descendantPgidSet,
+    queue,
+    isProtectedPid,
+    isProtectedPgid,
+  })
 
   for (let head = 0; head < queue.length; head += 1) {
     const curPid = queue[head]!
@@ -198,6 +279,7 @@ function walkDescendantProcessGraph(input: {
       curIsMemoryMcp,
       children: childrenByPpid.get(curPid) ?? [],
       statsByPid,
+      readEnviron,
       visited,
       descendantPids,
       descendantPgidSet,
@@ -223,15 +305,18 @@ export function snapshotDescendantProcessGroups(
   if (!Number.isInteger(rootPid) || rootPid <= 1 || !opts?.readProcDir) return empty
   const readStat = opts.readProcStat ?? (() => null)
   const readCmdline = opts.readProcCmdline ?? (() => null)
+  const readEnviron = opts.readProcEnviron ?? (() => null)
   const selfPid = opts.selfPid ?? process.pid
   const selfPpid = opts.selfPpid ?? process.ppid
   const { statsByPid, childrenByPpid } = buildProcGraphFromEntries(opts.readProcDir(), readStat)
   const selfPgid = opts.selfPgid ?? statsByPid.get(selfPid)?.pgid ?? parseProcStat(selfPid, readStat(selfPid))?.pgid
   return walkDescendantProcessGraph({
     rootPid,
+    turnReapTag: opts.turnReapTag,
     statsByPid,
     childrenByPpid,
     readCmdline,
+    readEnviron,
     selfPid,
     selfPpid,
     selfPgid,
@@ -240,7 +325,7 @@ export function snapshotDescendantProcessGroups(
 
 /**
  * Non-blocking async Linux `/proc` snapshot of all descendant PIDs & escaped PGIDs
- * of `rootPid` BEFORE signaling `rootPid` (preserving detached `oc-memory-mcp` jobs).
+ * of `rootPid` (plus any orphaned turn-tagged workers) while preserving survivable jobs.
  */
 export async function snapshotDescendantProcessGroupsAsync(
   rootPid: number,
@@ -261,6 +346,8 @@ export async function snapshotDescendantProcessGroupsAsync(
 
   const statTexts = new Map<number, string>()
   const cmdlineTexts = new Map<number, string>()
+  const environTexts = new Map<number, string>()
+  const needEnviron = Boolean(opts?.turnReapTag)
   await Promise.all(
     pids.map(async (pid) => {
       const statRaw = await readFile(`/proc/${pid}/stat`, 'utf8').catch(() => null)
@@ -268,6 +355,10 @@ export async function snapshotDescendantProcessGroupsAsync(
       statTexts.set(pid, statRaw)
       const cmdRaw = await readFile(`/proc/${pid}/cmdline`, 'utf8').catch(() => null)
       if (cmdRaw !== null) cmdlineTexts.set(pid, cmdRaw)
+      if (needEnviron) {
+        const envRaw = await readFile(`/proc/${pid}/environ`, 'utf8').catch(() => null)
+        if (envRaw !== null) environTexts.set(pid, envRaw)
+      }
     }),
   )
 
@@ -280,9 +371,11 @@ export async function snapshotDescendantProcessGroupsAsync(
   const selfPgid = opts?.selfPgid ?? statsByPid.get(selfPid)?.pgid
   return walkDescendantProcessGraph({
     rootPid,
+    turnReapTag: opts?.turnReapTag,
     statsByPid,
     childrenByPpid,
     readCmdline: (pid) => cmdlineTexts.get(pid) ?? null,
+    readEnviron: opts?.readProcEnviron ?? ((pid) => environTexts.get(pid) ?? null),
     selfPid,
     selfPpid,
     selfPgid,

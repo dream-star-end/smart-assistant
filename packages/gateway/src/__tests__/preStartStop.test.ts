@@ -694,4 +694,101 @@ describe('handleStop preStart blocking-turn interrupt (OCV5-923)', () => {
     release()
     await d2
   })
+
+  it('R2 P1-2a: un-numbered blocking turn A finishing and un-numbered callback C replacing _persistActiveTurn is NEVER interrupted by Stop(B)', async () => {
+    const B = 'm-p12a-queued-b'
+    const persistA = () => Promise.resolve()
+    const persistC = () => Promise.resolve()
+    // At B admission, un-numbered turn A is running on MAIN_SESSION_KEY (`_persistActiveTurn = persistA`).
+    const liveMain: MockLiveSession = { sessionKey: MAIN_SESSION_KEY, _persistActiveTurn: persistA }
+    const {
+      gateway,
+      fences,
+      interrupts,
+      clientTurnInterrupts,
+      delegateInterrupts,
+      swarmInterrupts,
+      settledPermissions,
+    } = makeBlockingGateway([liveMain])
+
+    let release!: () => void
+    gateway.dispatchInbound = () =>
+      new Promise<void>((resolve) => {
+        release = resolve
+      })
+
+    const dB = gateway._dispatchAdmittedClientTurn(msgFor(B))
+    // Turn A finishes and a newer un-numbered callback turn C starts before B runs or Stop(B) arrives!
+    liveMain._persistActiveTurn = persistC
+
+    const ok = await gateway.handleStop({
+      type: 'inbound.control.stop',
+      channel: 'webchat',
+      peer: PEER,
+      clientMessageId: B,
+    })
+
+    assert.equal(ok, true)
+    assert.deepEqual(fences, [preStartStopKey(PEER_ID, B)])
+    assert.deepEqual(interrupts, [], 'P1-2a: must NOT interrupt replacement un-numbered turn C')
+    assert.deepEqual(clientTurnInterrupts, [])
+    assert.deepEqual(delegateInterrupts, [])
+    assert.deepEqual(swarmInterrupts, [])
+    assert.deepEqual(settledPermissions, [])
+
+    release()
+    await dB
+  })
+
+  it('R2 P1-2b: session observed empty at B admission -> un-numbered callback C starting BEFORE bindAdmittedClientTurnSessionKey is NEVER interrupted by Stop(B)', async () => {
+    const B = 'm-p12b-routed-b'
+    const persistC = () => Promise.resolve()
+    // Session is empty/idle when B enters _dispatchAdmittedClientTurn (without explicit agentId).
+    const liveMain: MockLiveSession = { sessionKey: MAIN_SESSION_KEY }
+    const {
+      gateway,
+      fences,
+      interrupts,
+      clientTurnInterrupts,
+      delegateInterrupts,
+      swarmInterrupts,
+      settledPermissions,
+    } = makeBlockingGateway([liveMain])
+    gateway.router = { route: () => ({ sessionKey: MAIN_SESSION_KEY }) }
+
+    const { bindAdmittedClientTurnSessionKey } = await import('../turnDispatch.js')
+    let release!: () => void
+    gateway.dispatchInbound = async (frame: any) => {
+      // Simulate async pre-bind gap (`await syncMarketplaceHub` / `await fetchIdentityCompatProjection`)
+      // during which un-numbered callback turn C starts on MAIN_SESSION_KEY!
+      await Promise.resolve()
+      liveMain._persistActiveTurn = persistC
+      bindAdmittedClientTurnSessionKey(gateway, frame, MAIN_SESSION_KEY)
+      await new Promise<void>((resolve) => {
+        release = resolve
+      })
+    }
+
+    const dB = gateway._dispatchAdmittedClientTurn(msgFor(B, { agentId: undefined }))
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const ok = await gateway.handleStop({
+      type: 'inbound.control.stop',
+      channel: 'webchat',
+      peer: PEER,
+      clientMessageId: B,
+    })
+
+    assert.equal(ok, true)
+    assert.deepEqual(fences, [preStartStopKey(PEER_ID, B)])
+    assert.deepEqual(interrupts, [], 'P1-2b: C started after B admission and must NOT be interrupted')
+    assert.deepEqual(clientTurnInterrupts, [])
+    assert.deepEqual(delegateInterrupts, [])
+    assert.deepEqual(swarmInterrupts, [])
+    assert.deepEqual(settledPermissions, [])
+
+    release()
+    await dB
+  })
 })

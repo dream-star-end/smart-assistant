@@ -29,7 +29,7 @@ import { identityCompatEnvironment } from '@openclaude/storage'
  * Probe evidence for every behaviour below: docs/ocv5-415-antigravity-cli.md
  * and the fixtures under __tests__/fixtures/antigravity/.
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
@@ -55,7 +55,7 @@ import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock
 import { buildCodexEnv } from './codexShared.js'
 import { createLogger } from '../logger.js'
 import { probeEnvFacts } from '../envProbe.js'
-import { detachChildStdio, killProcessGroup, killProcessTree, shutdownTimeoutMs, waitForCloseWithin, type ProcessTreeSnapshot } from '../processGroupShutdown.js'
+import { TURN_REAP_TAG_ENV, detachChildStdio, killProcessGroup, killProcessTree, shutdownTimeoutMs, waitForCloseWithin, type ProcessTreeSnapshot } from '../processGroupShutdown.js'
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext, memoryInstructionsFingerprint } from '../promptSlots.js'
@@ -244,6 +244,7 @@ interface TurnContext {
   interruptSnapDone: Promise<void> | null
   deadlockReapDone: Promise<void> | null
   processTreeSnapshot: ProcessTreeSnapshot | null
+  readonly turnReapTag: string
   /** Ends this turn's route-token trace binding for the container relay (OCV5-595). */
   releaseRelayTrace: (() => void) | null
   sawOutput: boolean
@@ -454,7 +455,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       settling: false, settlingDone: null, nativeBinding: null, nativeRecovery: null,
       sawResult: false, pendingResult: null, resultTimer: null, keepalive: null,
       routeToken: null, routeRenewAt: 0, routeRenewBusy: false, routeRenewRevokedCount: 0, routeRenewFailureCount: 0,
-      deadlockTerminating: false, interruptSignaled: false, interruptSnapDone: null, deadlockReapDone: null, processTreeSnapshot: null,
+      deadlockTerminating: false, interruptSignaled: false, interruptSnapDone: null, deadlockReapDone: null, processTreeSnapshot: null, turnReapTag: randomUUID(),
       releaseRelayTrace: null, sawOutput: false, terminal: false, deliveredSuccess: false, procClosed: false,
       abandoned: false, interrupted: false, interruptReason: null, errorDetail: null,
       firstOwnStepIndex: null, usageSteps: new Set(), inputBytes: 0, stdoutEvents: 0, stepEvents: 0, resultResponseBytes: 0,
@@ -663,7 +664,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       return
     }
 
-    const env = this.buildTurnSpawnEnv(projection, route.baseUrl, readOnly, hermeticNoTools)
+    const env = this.buildTurnSpawnEnv(projection, route.baseUrl, readOnly, hermeticNoTools, ctx.turnReapTag)
     const args = [
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
@@ -731,6 +732,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     cloudCodeUrl: string,
     readOnly: boolean,
     hermeticNoTools: boolean,
+    turnReapTag: string,
   ): NodeJS.ProcessEnv {
     const isolatedEnv = buildCodexEnv()
     const stripPrefixes = ['GEMINI_', 'GOOGLE_', 'AGY_', 'CODEX_', 'OPENCLAUDE_TOOL_BROKER_', 'OC_TOOL_BROKER_']
@@ -743,6 +745,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       PATH: antigravitySpawnPath(projection.hostPathDir), HOME: projection.launchHome, XDG_CACHE_HOME: projection.cacheDir,
       OC_AGENT_ID: this.opts.agentId, OPENCLAUDE_AGENT_ID: this.opts.agentId, ...identityCompatEnvironment(this.opts.identityCompat),
       OC_SESSION_KEY: this.opts.sessionKey, OPENCLAUDE_SESSION_KEY: this.opts.sessionKey, OPENCLAUDE_ENGINE: 'antigravity',
+      [TURN_REAP_TAG_ENV]: turnReapTag,
       OPENCLAUDE_DELEGATION_DEPTH: String(this.opts.delegationDepth ?? 0), OPENCLAUDE_HOME: projection.openClaudeHome,
       ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),
       ...(projection.baselineSkillsDir ? { OPENCLAUDE_BASELINE_SKILLS_DIR: projection.baselineSkillsDir } : {}),
@@ -949,7 +952,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       // Fail fast instead of waiting out the CLI's 60 s OAuth prompt.
       if (!ctx.terminal && AUTH_PROMPT_RE.test(ctx.stderr)) {
         ctx.errorDetail = 'ANTIGRAVITY_AUTH_REQUIRED: CLI fell back to interactive Google sign-in'
-        ctx.processTreeSnapshot = killProcessTree(proc, 'SIGKILL', { snapshot: ctx.processTreeSnapshot })
+        ctx.processTreeSnapshot = killProcessTree(proc, 'SIGKILL', { snapshot: ctx.processTreeSnapshot, turnReapTag: ctx.turnReapTag })
       }
     })
     proc.once('error', (err) => {
@@ -964,7 +967,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       scheduleAbnormalExitProcessTreeReap({
         proc, isClosed: () => ctx.procClosed, getSnapshot: () => ctx.processTreeSnapshot,
         setSnapshot: (s) => { ctx.processTreeSnapshot = s }, getReapPromise: () => ctx.deadlockReapDone,
-        setReapPromise: (p) => { ctx.deadlockReapDone = p },
+        setReapPromise: (p) => { ctx.deadlockReapDone = p }, turnReapTag: ctx.turnReapTag,
         termGraceMs: timingTestHooks?.deadlockTermGraceMs, killGraceMs: timingTestHooks?.deadlockKillGraceMs,
       })
     })
@@ -1664,16 +1667,17 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     this.commitTerminalSwarmBoard(ctx, ctx.interrupted ? 'interrupted' : 'error', { emitEvent: false, readDisk: false })
     const release = ctx.releaseSwarmSlot
     ctx.releaseSwarmSlot = null
+    const treeOpts = { turnReapTag: ctx.turnReapTag }
     if (ctx.terminal) {
-      releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 150, snapshot: ctx.processTreeSnapshot })
+      releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 150, snapshot: ctx.processTreeSnapshot, treeOpts })
       return
     }
     ctx.deliveredSuccess = false
     ctx.terminal = true
     if (ctx.proc && !ctx.procClosed) {
-      ctx.processTreeSnapshot = killProcessTree(ctx.proc, 'SIGTERM', { snapshot: ctx.processTreeSnapshot })
+      ctx.processTreeSnapshot = killProcessTree(ctx.proc, 'SIGTERM', { snapshot: ctx.processTreeSnapshot, turnReapTag: ctx.turnReapTag })
     }
-    releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 0, snapshot: ctx.processTreeSnapshot })
+    releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 0, snapshot: ctx.processTreeSnapshot, treeOpts })
     ctx.resolveSummary(null)
   }
 
@@ -1682,9 +1686,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const release = ctx.releaseSwarmSlot
     ctx.releaseSwarmSlot = null
     if (release) {
-      releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 0, snapshot: ctx.processTreeSnapshot })
+      releaseSwarmSlotAfterBoundedReap(ctx.proc, () => ctx.procClosed, release, { naturalExitGraceMs: 0, snapshot: ctx.processTreeSnapshot, treeOpts: { turnReapTag: ctx.turnReapTag } })
     } else if (ctx.procClosed) {
-      reapClosedTurnLingeringProcessGroup(ctx.proc, ctx.processTreeSnapshot)
+      reapClosedTurnLingeringProcessGroup(ctx.proc, ctx.processTreeSnapshot, { turnReapTag: ctx.turnReapTag })
     }
     ctx.toolBackfiller?.dispose()
     ctx.toolBackfiller = null
@@ -1768,7 +1772,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     try {
       await reapDeadlockedSwarmProcess(
         ctx.proc, () => ctx.procClosed, ctx.processTreeSnapshot, (s) => { ctx.processTreeSnapshot = s },
-        { termGraceMs: timingTestHooks?.deadlockTermGraceMs, killGraceMs: timingTestHooks?.deadlockKillGraceMs },
+        { termGraceMs: timingTestHooks?.deadlockTermGraceMs, killGraceMs: timingTestHooks?.deadlockKillGraceMs, turnReapTag: ctx.turnReapTag },
       )
     } finally { resolveReap() }
     if (!ctx.terminal && !ctx.abandoned) this.abandonTurn(ctx, ctx.proc, ctx.errorDetail)
@@ -1799,7 +1803,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     ctx.interruptSignaled = true
     if (!ctx.procClosed) {
       const proc = ctx.proc
-      ctx.interruptSnapDone = captureProcessTreeSnapshotAsync(proc, ctx.processTreeSnapshot)
+      ctx.interruptSnapDone = captureProcessTreeSnapshotAsync(proc, ctx.processTreeSnapshot, ctx.turnReapTag)
         .then((snap) => {
           ctx.processTreeSnapshot = snap
           if (!ctx.procClosed) killProcessGroup(proc, 'SIGINT')
@@ -1828,14 +1832,14 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       }
     }
     ctx.deliveredSuccess = false
-    const preTermSnap = await captureProcessTreeSnapshotAsync(proc, ctx.processTreeSnapshot)
-    const snapBeforeTerm = killProcessTree(proc, 'SIGTERM', { snapshot: preTermSnap })
+    const preTermSnap = await captureProcessTreeSnapshotAsync(proc, ctx.processTreeSnapshot, ctx.turnReapTag)
+    const snapBeforeTerm = killProcessTree(proc, 'SIGTERM', { snapshot: preTermSnap, turnReapTag: ctx.turnReapTag })
     ctx.processTreeSnapshot = snapBeforeTerm
     let closed = await waitForCloseWithin(barrier, grace)
     if (!closed) {
-      const merged = await captureProcessTreeSnapshotAsync(proc, snapBeforeTerm)
+      const merged = await captureProcessTreeSnapshotAsync(proc, snapBeforeTerm, ctx.turnReapTag)
       ctx.processTreeSnapshot = merged
-      killProcessTree(proc, 'SIGKILL', { snapshot: merged })
+      killProcessTree(proc, 'SIGKILL', { snapshot: merged, turnReapTag: ctx.turnReapTag })
       closed = await waitForCloseWithin(barrier, shutdownTimeoutMs('OPENCLAUDE_ANTIGRAVITY_SHUTDOWN_FINAL_DRAIN_MS', SHUTDOWN_FINAL_DRAIN_DEFAULT_MS))
     }
     if (closed) return

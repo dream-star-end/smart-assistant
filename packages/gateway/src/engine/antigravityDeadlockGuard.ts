@@ -69,24 +69,30 @@ export function advanceAntigravityRouteHeartbeatCounters(
 export function reapClosedTurnLingeringProcessGroup(
   proc: ChildProcess | null,
   snapshot?: ProcessTreeSnapshot | null,
-  opts?: { termGraceMs?: number; killGraceMs?: number },
+  opts?: { termGraceMs?: number; killGraceMs?: number; turnReapTag?: string },
 ): void {
-  if (!proc || !hasAnyTrackedProcessGroupAlive(proc.pid, snapshot)) return
+  if (!proc) return
+  if (!opts?.turnReapTag && !hasAnyTrackedProcessGroupAlive(proc.pid, snapshot)) return
   void reapLingeringCliProcessGroup(proc, () => true, {
     naturalExitGraceMs: 0,
     termGraceMs: opts?.termGraceMs ?? 300,
     killGraceMs: opts?.killGraceMs ?? 300,
     snapshot,
+    ...(opts?.turnReapTag ? { treeOpts: { turnReapTag: opts.turnReapTag } } : {}),
   })
 }
 
 export async function captureProcessTreeSnapshotAsync(
   proc: ChildProcess | null,
   prevSnapshot: ProcessTreeSnapshot | null,
+  turnReapTag?: string,
 ): Promise<ProcessTreeSnapshot | null> {
   const pid = proc?.pid
   if (typeof pid !== 'number' || pid <= 1) return prevSnapshot
-  const fresh = await snapshotDescendantProcessGroupsAsync(pid)
+  const fresh = await snapshotDescendantProcessGroupsAsync(
+    pid,
+    turnReapTag ? { turnReapTag } : undefined,
+  )
   return mergeProcessTreeSnapshots(prevSnapshot, fresh)
 }
 
@@ -108,13 +114,18 @@ export function scheduleAbnormalExitProcessTreeReap(args: {
   setSnapshot: (snap: ProcessTreeSnapshot | null) => void
   getReapPromise: () => Promise<void> | null
   setReapPromise: (p: Promise<void>) => void
+  turnReapTag?: string
   naturalExitGraceMs?: number
   termGraceMs?: number
   killGraceMs?: number
 }): void {
   if (args.getReapPromise()) return
   const reapPromise = (async () => {
-    const merged = await captureProcessTreeSnapshotAsync(args.proc, args.getSnapshot())
+    const merged = await captureProcessTreeSnapshotAsync(
+      args.proc,
+      args.getSnapshot(),
+      args.turnReapTag,
+    )
     args.setSnapshot(merged)
     if (args.isClosed() && !hasAnyTrackedProcessGroupAlive(args.proc.pid, merged)) return
     await reapLingeringCliProcessGroup(args.proc, args.isClosed, {
@@ -122,6 +133,7 @@ export function scheduleAbnormalExitProcessTreeReap(args: {
       termGraceMs: Math.max(20, args.termGraceMs ?? 300),
       killGraceMs: Math.max(20, args.killGraceMs ?? 300),
       snapshot: merged,
+      ...(args.turnReapTag ? { treeOpts: { turnReapTag: args.turnReapTag } } : {}),
     })
   })().catch((err) => {
     void err
@@ -134,16 +146,17 @@ export async function reapDeadlockedSwarmProcess(
   isClosed: () => boolean,
   prevSnapshot: ProcessTreeSnapshot | null,
   onSnapshot: (snap: ProcessTreeSnapshot | null) => void,
-  opts?: { termGraceMs?: number; killGraceMs?: number },
+  opts?: { termGraceMs?: number; killGraceMs?: number; turnReapTag?: string },
 ): Promise<void> {
   if (!proc) return
-  const snap = await captureProcessTreeSnapshotAsync(proc, prevSnapshot)
+  const snap = await captureProcessTreeSnapshotAsync(proc, prevSnapshot, opts?.turnReapTag)
   onSnapshot(snap)
   await reapLingeringCliProcessGroup(proc, isClosed, {
     naturalExitGraceMs: 0,
     termGraceMs: Math.max(20, opts?.termGraceMs ?? 800),
     killGraceMs: Math.max(20, opts?.killGraceMs ?? 400),
     snapshot: snap,
+    ...(opts?.turnReapTag ? { treeOpts: { turnReapTag: opts.turnReapTag } } : {}),
   })
 }
 
