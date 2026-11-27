@@ -147,3 +147,19 @@ export type {
   ValidateExecutableBindingTupleInput,
   ValidateExecutableBindingTupleResult,
 } from './logicalModelBindingsSync.js'
+export { selectSelfhostRemoteDriverViaUnifiedRouter } from './remoteDriverRouterSelection.js'
+export type {
+  SelectSelfhostRemoteDriverInput,
+  SelectSelfhostRemoteDriverOptions,
+  SelfhostRemoteDriverSelectionResult,
+} from './remoteDriverRouterSelection.js'
+export {
+  evaluateProfileDualPoolParityStatus,
+  verifyDualPoolParityConformance,
+} from './dualPoolParityGate.js'
+export type {
+  DualPoolParityGateCheck,
+  DualPoolParityGateInput,
+  DualPoolParityGateResult,
+  ProfileDualPoolParitySummary,
+} from './dualPoolParityGate.js'

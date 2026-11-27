@@ -8,6 +8,7 @@
 
 export const DETACHED_ASK_USER_TTL_MS = 24 * 60 * 60_000
 export const DETACHED_ASK_USER_REQUEST_PREFIX = 'ask-user:'
+export const TOOL_BROKER_APPROVAL_REQUEST_PREFIX = 'ask-user:tb:'
 
 export type DetachedAskUserPending = {
   sessionKey: string
@@ -19,14 +20,27 @@ export type DetachedAskUserPending = {
   peer: { id: string; kind: 'dm' | 'group' }
   expiresAt: number
   detachedAskUser: true
+  brokerApproval?: true
 }
 
 export function isDetachedAskUserRequestId(requestId: string): boolean {
   return requestId.startsWith(DETACHED_ASK_USER_REQUEST_PREFIX)
 }
 
+export function isToolBrokerApprovalRequestId(requestId: string): boolean {
+  return requestId.startsWith(TOOL_BROKER_APPROVAL_REQUEST_PREFIX)
+}
+
 export function isDetachedAskUserPending(pending: { detachedAskUser?: boolean } | null | undefined): boolean {
   return pending?.detachedAskUser === true
+}
+
+export function isToolBrokerApprovalPending(pending: unknown): boolean {
+  return (
+    pending !== null &&
+    typeof pending === 'object' &&
+    (pending as { brokerApproval?: unknown }).brokerApproval === true
+  )
 }
 
 export function formatAskUserAnswerMessage(
@@ -270,8 +284,10 @@ export function buildDetachedAskUserPersistMessage(args: {
   _askUserChannel: string
   _askUserPeer: { id: string; kind: 'dm' | 'group' }
   _source: 'server'
+  _brokerApproval?: true
 } {
   const input = { questions: args.questions }
+  const isBroker = isToolBrokerApprovalRequestId(args.requestId)
   return {
     id: args.requestId,
     role: 'permission',
@@ -289,7 +305,26 @@ export function buildDetachedAskUserPersistMessage(args: {
     _askUserChannel: args.channel,
     _askUserPeer: args.peer,
     _source: 'server',
+    ...(isBroker ? { _brokerApproval: true as const } : {}),
   }
+}
+
+function resolveStoredAskUserPeer(
+  storedPeer: unknown,
+  fallback: { id: string; kind: 'dm' | 'group' },
+): { id: string; kind: 'dm' | 'group' } {
+  if (
+    storedPeer &&
+    typeof storedPeer === 'object' &&
+    !Array.isArray(storedPeer) &&
+    typeof (storedPeer as { id?: unknown }).id === 'string'
+  ) {
+    return {
+      id: (storedPeer as { id: string }).id,
+      kind: (storedPeer as { kind?: unknown }).kind === 'group' ? 'group' : 'dm',
+    }
+  }
+  return fallback
 }
 
 export function pendingFromDetachedAskUserMessage(
@@ -318,15 +353,8 @@ export function pendingFromDetachedAskUserMessage(
       : { questions: [] }
   const userId = typeof msg._askUserUserId === 'string' ? msg._askUserUserId : fallbacks.userId
   const channel = typeof msg._askUserChannel === 'string' ? msg._askUserChannel : fallbacks.channel
-  const storedPeer = msg._askUserPeer
-  const peer =
-    storedPeer && typeof storedPeer === 'object' && !Array.isArray(storedPeer) &&
-    typeof (storedPeer as { id?: unknown }).id === 'string'
-      ? {
-          id: (storedPeer as { id: string }).id,
-          kind: (storedPeer as { kind?: unknown }).kind === 'group' ? ('group' as const) : ('dm' as const),
-        }
-      : fallbacks.peer
+  const peer = resolveStoredAskUserPeer(msg._askUserPeer, fallbacks.peer)
+  const brokerApproval = isToolBrokerApprovalRequestId(requestId) || msg._brokerApproval === true
   return {
     sessionKey,
     toolName: typeof msg.toolName === 'string' ? msg.toolName : 'AskUserQuestion',
@@ -337,5 +365,6 @@ export function pendingFromDetachedAskUserMessage(
     peer,
     expiresAt: expiresAt > 0 ? expiresAt : Date.now() + DETACHED_ASK_USER_TTL_MS,
     detachedAskUser: true,
+    ...(brokerApproval ? { brokerApproval: true as const } : {}),
   }
 }

@@ -409,6 +409,13 @@ export function createGrokRelayRouteAllocator(scheduler: AccountScheduler) {
   };
 }
 
+function resolveContainerServiceBrokerOpts<T>(
+  isSelfhostV5: boolean,
+  brokerFrameLinkOpener: T | undefined,
+): { readonly brokerFrameLinkOpener: T } | undefined {
+  return isSelfhostV5 && brokerFrameLinkOpener ? { brokerFrameLinkOpener } : undefined;
+}
+
 export function assembleV3SupervisorCore(deps: {
   env: NodeJS.ProcessEnv;
   cfg: CommercialConfig;
@@ -421,6 +428,7 @@ export function assembleV3SupervisorCore(deps: {
   loadUserModelAuthz: ReturnType<typeof makeLoadUserModelAuthz>;
   selfHostUuid: string | undefined;
   sessionsDeletedRef: { current: (userId: string, sessionIds: readonly string[]) => void };
+  brokerFrameLinkOpener?: Parameters<typeof createContainerService>[1] extends { readonly brokerFrameLinkOpener?: infer T } ? T : never;
 }): {
   v3Docker: Docker;
   v3Deps: V3SupervisorDeps;
@@ -571,28 +579,18 @@ export function assembleV3SupervisorCore(deps: {
       : {}),
     ...(deps.selfHostUuid
       ? {
-          containerService: createContainerService(v3Docker),
+          containerService: createContainerService(
+            v3Docker,
+            resolveContainerServiceBrokerOpts(isSelfhostV5, deps.brokerFrameLinkOpener),
+          ),
           selfHostId: deps.selfHostUuid,
-          putRemoteCodexAuth: async (
-            hostUuid: string,
-            containerId: string,
-            accessToken: string,
-            lastRefreshIso: string,
-          ) => {
+          putRemoteCodexAuth: async (hostUuid: string, containerId: string, accessToken: string, lastRefreshIso: string) => {
             const target = await resolveServiceableHostTarget(hostUuid);
-            try {
-              await putRemoteCodexContainerAuth(target, containerId, accessToken, lastRefreshIso);
-            } finally {
-              target.psk?.fill(0);
-            }
+            try { await putRemoteCodexContainerAuth(target, containerId, accessToken, lastRefreshIso); } finally { target.psk?.fill(0); }
           },
           deleteRemoteCodexAuth: async (hostUuid: string, containerId: string) => {
             const target = await resolveServiceableHostTarget(hostUuid);
-            try {
-              await deleteRemoteCodexContainerAuth(target, containerId);
-            } finally {
-              target.psk?.fill(0);
-            }
+            try { await deleteRemoteCodexContainerAuth(target, containerId); } finally { target.psk?.fill(0); }
           },
         }
       : {}),

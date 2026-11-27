@@ -42,9 +42,16 @@ import {
   type LegacyRetirementGateStatus,
   LegacyTrackRetirementGate,
 } from './legacyRetirementRuntime.js'
+import {
+  type DualPoolParityGateInput,
+  type DualPoolParityGateResult,
+  evaluateProfileDualPoolParityStatus,
+  verifyDualPoolParityConformance,
+} from './dualPoolParityGate.js'
 
 const UUID_RE = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i
 const DEFAULT_CUTOVER_DEADLINE_MS = 12 * 60_000
+const MAX_PARITY_CACHE_ENTRIES = 2048
 
 function need(condition: unknown, code = 'REMOTE_DRIVER_COMMISSION_INVALID'): asserts condition {
   if (!condition) throw new Error(code)
@@ -63,6 +70,7 @@ export interface CutoverJobRecord {
   evidenceUri?: string
   reverted?: boolean
   error?: string
+  dualPoolParity?: DualPoolParityGateResult
 }
 
 export interface RemoteDriverV4CommissioningServiceDeps {
@@ -77,6 +85,11 @@ export interface RemoteDriverV4CommissioningServiceDeps {
   readonly recoveryFixtures?: Parameters<typeof reconcileRemoteLane>[3]
   readonly onJobSettled?: (job: CutoverJobRecord) => void
   readonly legacyRetirementGate?: LegacyTrackRetirementGate
+  readonly extendedRedProofArtifact?: unknown
+  readonly requireExtendedRedProof?: boolean
+  readonly dualPoolParityPrecheck?: (
+    input: DualPoolParityGateInput,
+  ) => Promise<DualPoolParityGateResult> | DualPoolParityGateResult
 }
 
 async function releaseVerificationBindingsForProfile(
@@ -116,8 +129,19 @@ async function releaseVerificationBindingsForProfile(
 export class RemoteDriverV4CommissioningService {
   private readonly jobs = new Map<string, CutoverJobRecord>()
   private readonly latestJobByProfile = new Map<string, string>()
+  private readonly latestParityByProfile = new Map<string, DualPoolParityGateResult>()
 
   constructor(private readonly deps: RemoteDriverV4CommissioningServiceDeps) {}
+
+  private recordParityStatus(profileId: string, parity: DualPoolParityGateResult): void {
+    if (this.latestParityByProfile.has(profileId)) {
+      this.latestParityByProfile.delete(profileId)
+    } else if (this.latestParityByProfile.size >= MAX_PARITY_CACHE_ENTRIES) {
+      const oldest = this.latestParityByProfile.keys().next().value
+      if (oldest !== undefined) this.latestParityByProfile.delete(oldest)
+    }
+    this.latestParityByProfile.set(profileId, parity)
+  }
 
   async getPolicy(): Promise<RemoteDriverVerificationPolicy> {
     return await loadVerificationPolicy(this.deps.executorDeps.pool)
@@ -183,12 +207,23 @@ export class RemoteDriverV4CommissioningService {
         )
       ).rows[0] ?? null
 
+    const profileRow = profRes.rows[0]
+    const dualPoolParity = await evaluateProfileDualPoolParityStatus({
+      driverId: typeof profileRow?.driver_id === 'string' ? profileRow.driver_id : null,
+      canonicalModel: offers[0]?.canonical_model_id,
+      registryPath: this.deps.executorDeps.registryPath,
+      extendedRedProofArtifact: this.deps.extendedRedProofArtifact,
+      requireExtendedRedProof: this.deps.requireExtendedRedProof,
+      cached: this.latestParityByProfile.get(profileId) ?? null,
+    })
+
     return {
-      profile: profRes.rows[0],
+      profile: profileRow,
       offers,
       eligibleOfferCounts: eligibleCounts,
       latestVerificationRun: latestRun,
       latestJob: this.getJobStatus(profileId),
+      dualPoolParity,
     }
   }
 
@@ -316,6 +351,136 @@ export class RemoteDriverV4CommissioningService {
     return { ...job }
   }
 
+  private async runDualPoolParityPrecheck(
+    job: CutoverJobRecord,
+    input: { readonly profileId: string; readonly driverId?: string },
+    suiteDigest: string,
+  ): Promise<void> {
+    const pool = this.deps.executorDeps.pool
+    const regPath = this.deps.executorDeps.registryPath
+    const precheckProfile = (
+      await pool.query<{ driver_id: string | null; engine: string | null }>(
+        'SELECT driver_id, engine FROM remote_agent_profiles WHERE id = $1',
+        [input.profileId],
+      )
+    ).rows[0]
+    const profileDriver = precheckProfile?.driver_id || precheckProfile?.engine || undefined
+    const precheckDriverId = input.driverId ?? profileDriver
+    if (!precheckDriverId) return
+    const precheckOffer = (
+      await pool.query<{ canonical_model_id: string; upstream_model_id: string }>(
+        `SELECT canonical_model_id, upstream_model_id
+           FROM remote_model_offers
+          WHERE profile_id = $1 AND enabled = TRUE
+          ORDER BY canonical_model_id ASC
+          LIMIT 1`,
+        [input.profileId],
+      )
+    ).rows[0]
+    const redProofPath = this.deps.executorDeps.fixtures?.redProofPath
+    const precheckInput: DualPoolParityGateInput = {
+      driverId: precheckDriverId,
+      ...(precheckOffer
+        ? {
+            canonicalModel: precheckOffer.canonical_model_id,
+            upstreamModel: precheckOffer.upstream_model_id,
+          }
+        : {}),
+      ...(regPath ? { registryPath: regPath } : {}),
+      ...(this.deps.extendedRedProofArtifact !== undefined
+        ? { extendedRedProofArtifact: this.deps.extendedRedProofArtifact }
+        : {}),
+      ...(this.deps.requireExtendedRedProof === true ? { requireExtendedRedProof: true } : {}),
+      expectedSuiteDigest: suiteDigest,
+      ...(redProofPath ? { redProofPath } : {}),
+    }
+    const parityResult = await (
+      this.deps.dualPoolParityPrecheck ?? verifyDualPoolParityConformance
+    )(precheckInput)
+    job.dualPoolParity = parityResult
+    this.recordParityStatus(input.profileId, parityResult)
+    need(parityResult.ok, parityResult.errorCode ?? 'DUAL_POOL_PARITY_PRECHECK_FAILED')
+  }
+
+  private async executeVerificationWithDeadline(
+    claimed: NonNullable<Awaited<ReturnType<typeof claimDriverVerificationRun>>>,
+    suiteDigest: string,
+    leaseOwner: string,
+    deadlineMs: number,
+  ): Promise<Awaited<ReturnType<typeof executeDriverVerificationRun>>> {
+    const abortController = new AbortController()
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+    const runPromise = executeDriverVerificationRun(
+      this.deps.executorDeps,
+      {
+        id: claimed.id,
+        nodeId: claimed.nodeId,
+        profileId: claimed.profileId,
+        driverId: claimed.driverId,
+        engineId: claimed.engineId,
+        targetFingerprint: claimed.targetFingerprint,
+        driverDigest: claimed.driverDigest,
+        coreDigest: claimed.coreDigest,
+        suiteDigest: claimed.suiteDigest ?? suiteDigest,
+        readyGeneration: claimed.readyGeneration,
+        leaseOwner: claimed.leaseOwner ?? leaseOwner,
+      },
+      { signal: abortController.signal },
+    )
+    return await Promise.race([
+      runPromise,
+      new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          abortController.abort()
+          reject(new Error('REMOTE_CUTOVER_DEADLINE_EXCEEDED'))
+        }, deadlineMs)
+        timeoutHandle.unref()
+      }),
+    ])
+      .catch(async (runErr) => {
+        abortController.abort()
+        await runPromise.catch(() => {})
+        throw runErr
+      })
+      .finally(() => {
+        if (timeoutHandle) clearTimeout(timeoutHandle)
+      })
+  }
+
+  private async rollbackLegacyCutover(
+    job: CutoverJobRecord,
+    profileId: string,
+    cutoverReadyGeneration: string,
+    claimedRunId: string | undefined,
+    liveDockerId: string | undefined,
+    msg: string,
+  ): Promise<void> {
+    const pool = this.deps.executorDeps.pool
+    try {
+      await releaseVerificationBindingsForProfile(
+        pool,
+        profileId,
+        claimedRunId,
+        this.deps.recoveryFixtures,
+        liveDockerId,
+      )
+      await revertDriverV4ProfileToLegacy(pool, {
+        profileId,
+        expectedMinReadyGeneration: cutoverReadyGeneration,
+        ...(this.deps.recoveryFixtures ? { allowEmbeddedBackupFallback: true } : {}),
+      })
+      if (!this.deps.executorDeps.fixtures?.skipCatalogSync) {
+        await syncProfileOffersCatalogState(pool, profileId)
+      }
+      job.reverted = true
+      job.status = 'reverted'
+    } catch (rollbackErr) {
+      job.reverted = false
+      job.status = 'failed'
+      job.error = `${msg}; rollback failed: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`
+    }
+  }
+
   private async runJobInternal(
     job: CutoverJobRecord,
     input: {
@@ -337,6 +502,8 @@ export class RemoteDriverV4CommissioningService {
     let liveDockerId: string | undefined
 
     try {
+      await this.runDualPoolParityPrecheck(job, input, suiteDigest)
+
       const container = await this.deps.executorDeps.containerSource()
       need(container !== null, 'REMOTE_VERIFICATION_CONTAINER_NOT_RUNNING')
       liveDockerId = container.dockerId
@@ -425,44 +592,12 @@ export class RemoteDriverV4CommissioningService {
       claimedRunId = claimed.id
       job.verificationRunId = claimed.id
 
-      const deadlineMs = input.deadlineMs ?? DEFAULT_CUTOVER_DEADLINE_MS
-      const abortController = new AbortController()
-      let timeoutHandle: ReturnType<typeof setTimeout> | undefined
-      const runPromise = executeDriverVerificationRun(
-        this.deps.executorDeps,
-        {
-          id: claimed.id,
-          nodeId: claimed.nodeId,
-          profileId: claimed.profileId,
-          driverId: claimed.driverId,
-          engineId: claimed.engineId,
-          targetFingerprint: claimed.targetFingerprint,
-          driverDigest: claimed.driverDigest,
-          coreDigest: claimed.coreDigest,
-          suiteDigest: claimed.suiteDigest ?? suiteDigest,
-          readyGeneration: claimed.readyGeneration,
-          leaseOwner: claimed.leaseOwner ?? leaseOwner,
-        },
-        { signal: abortController.signal },
+      const result = await this.executeVerificationWithDeadline(
+        claimed,
+        suiteDigest,
+        leaseOwner,
+        input.deadlineMs ?? DEFAULT_CUTOVER_DEADLINE_MS,
       )
-      const result = await Promise.race([
-        runPromise,
-        new Promise<never>((_, reject) => {
-          timeoutHandle = setTimeout(() => {
-            abortController.abort()
-            reject(new Error('REMOTE_CUTOVER_DEADLINE_EXCEEDED'))
-          }, deadlineMs)
-          timeoutHandle.unref()
-        }),
-      ])
-        .catch(async (runErr) => {
-          abortController.abort()
-          await runPromise.catch(() => {})
-          throw runErr
-        })
-        .finally(() => {
-          if (timeoutHandle) clearTimeout(timeoutHandle)
-        })
 
       if (!this.deps.executorDeps.fixtures?.skipCatalogSync) {
         await syncProfileOffersCatalogState(pool, input.profileId)
@@ -476,29 +611,14 @@ export class RemoteDriverV4CommissioningService {
       const msg = err instanceof Error ? err.message : String(err)
       job.error = msg
       if (convertedFromLegacy && cutoverReadyGeneration !== undefined) {
-        try {
-          await releaseVerificationBindingsForProfile(
-            pool,
-            input.profileId,
-            claimedRunId,
-            this.deps.recoveryFixtures,
-            liveDockerId,
-          )
-          await revertDriverV4ProfileToLegacy(pool, {
-            profileId: input.profileId,
-            expectedMinReadyGeneration: cutoverReadyGeneration,
-            ...(this.deps.recoveryFixtures ? { allowEmbeddedBackupFallback: true } : {}),
-          })
-          if (!this.deps.executorDeps.fixtures?.skipCatalogSync) {
-            await syncProfileOffersCatalogState(pool, input.profileId)
-          }
-          job.reverted = true
-          job.status = 'reverted'
-        } catch (rollbackErr) {
-          job.reverted = false
-          job.status = 'failed'
-          job.error = `${msg}; rollback failed: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`
-        }
+        await this.rollbackLegacyCutover(
+          job,
+          input.profileId,
+          cutoverReadyGeneration,
+          claimedRunId,
+          liveDockerId,
+          msg,
+        )
       } else {
         job.status = 'failed'
       }

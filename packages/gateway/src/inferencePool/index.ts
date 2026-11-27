@@ -42,3 +42,29 @@ export type {
   RemoteV5LaneEvent,
   RemoteV5TurnDispatchPayload,
 } from './remotePoolV5Adapter.js'
+
+export {
+  GatewayInferencePoolRouter,
+  LiveCatalogCreditGuard,
+  LiveRemoteV5LaneBridge,
+  MAX_RECEIPT_CACHE_ENTRIES,
+  createCatalogCreditEstimator,
+  wrapEngineWithUnifiedPoolDriver,
+} from './livePoolDriverRuntime.js'
+export type {
+  CatalogPricingLookupFn,
+  CatalogPricingReader,
+  GatewayInferencePoolRouterOptions,
+  LiveCatalogCreditGuardOptions,
+  LiveExecutablePoolKind,
+  UnifiedPoolAdapterStatus,
+  UnifiedPoolEngineAdapter,
+  WrapEngineWithUnifiedPoolDriverOptions,
+} from './livePoolDriverRuntime.js'
+
+export { runDualPoolParityConformance } from './dualPoolParityConformance.js'
+export type {
+  DualPoolParityCheckResult,
+  DualPoolParityConformanceOptions,
+  DualPoolParityConformanceReport,
+} from './dualPoolParityConformance.js'

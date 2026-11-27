@@ -64,12 +64,39 @@ export type EngineRemoteContextBuilder = (
   input: EngineRemoteContextInput,
 ) => Promise<EngineRemotePreparedContext>
 
+/**
+ * L2 inversion-of-control hook allowing L3 `inferencePool/*` to wrap every constructed
+ * `EngineAdapter` behind the unified dual-pool `InferencePoolDriver` facade without
+ * introducing an upward L2 -> L3 value import (`R2-upward`).
+ */
+export interface UnifiedPoolAdapterWrapContext {
+  readonly engineId: string
+  readonly poolKind: 'local_pool' | 'remote_pool'
+  readonly opts: EngineCreateOpts
+}
+
+export type UnifiedPoolAdapterWrapper = (
+  adapter: EngineAdapter,
+  ctx: UnifiedPoolAdapterWrapContext,
+) => EngineAdapter
+
 const engineFactories = new Map<string, EngineFactory>()
 const engineRemoteContextBuilders = new Map<string, EngineRemoteContextBuilder>()
 let remoteDriverAdapterFactory: EngineFactory | undefined
+let unifiedPoolAdapterWrapper: UnifiedPoolAdapterWrapper | undefined
 
 export function registerRemoteDriverAdapter(factory: EngineFactory): void {
   remoteDriverAdapterFactory = factory
+}
+
+export function registerUnifiedPoolAdapterWrapper(
+  wrapper: UnifiedPoolAdapterWrapper | undefined,
+): void {
+  unifiedPoolAdapterWrapper = wrapper
+}
+
+export function getUnifiedPoolAdapterWrapper(): UnifiedPoolAdapterWrapper | undefined {
+  return unifiedPoolAdapterWrapper
 }
 
 export function registerEngineRemoteContext(
@@ -96,6 +123,10 @@ export class EngineNotEnabledError extends Error {
   }
 }
 
+function readDefaultProcessEnv(): NodeJS.ProcessEnv {
+  return process.env
+}
+
 export function parseEnabledEngines(
   raw: string | undefined = process.env.OPENCLAUDE_ENGINES,
 ): Set<string> | null {
@@ -106,11 +137,22 @@ export function parseEnabledEngines(
 
 export function isEngineEnabled(
   engineId: string,
-  env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = readDefaultProcessEnv(),
 ): boolean {
   const allowed = parseEnabledEngines(env.OPENCLAUDE_ENGINES)
   if (allowed === null) return true
   return allowed.has(engineId)
+}
+
+/**
+ * Selfhost-only product gate for Wave 4 unified dual-pool adapter wrapping (OCV5-915 B05).
+ * Commercial deployments leave `OC_SELFHOST_ENGINE_LOCAL_TURNS` unset -> returns `false`,
+ * preserving untouched baseline adapters and zero registry/lifecycle side effects.
+ */
+export function isUnifiedPoolSelfhostEnabled(
+  env: NodeJS.ProcessEnv = readDefaultProcessEnv(),
+): boolean {
+  return env.OC_SELFHOST_ENGINE_LOCAL_TURNS === '1'
 }
 
 export function registerEngine(engineId: string, factory: EngineFactory): void {
@@ -244,11 +286,23 @@ export function resolveEngine(
   return (model && MODEL_ENGINE_MAP[model]) || 'ccb'
 }
 
+export interface CreateEngineRuntimeOpts {
+  /** Explicit override for Wave 4 selfhost unified-pool wrapping (defaults to `isUnifiedPoolSelfhostEnabled()`). */
+  readonly isSelfhost?: boolean
+}
+
 /** 构造 engine adapter。未注册 engine → fail-closed 抛错(v5 硬闸的升级形态)。 */
-export function createEngine(engineId: string, opts: EngineCreateOpts): EngineAdapter {
+export function createEngine(
+  engineId: string,
+  opts: EngineCreateOpts,
+  runtimeOpts?: CreateEngineRuntimeOpts,
+): EngineAdapter {
   if (!isEngineEnabled(engineId)) {
     throw new EngineNotEnabledError(engineId)
   }
+  const wrapSelfhost =
+    (runtimeOpts?.isSelfhost ?? isUnifiedPoolSelfhostEnabled()) &&
+    unifiedPoolAdapterWrapper !== undefined
   if (isRemoteDriverExecutionBackend(opts.executionBackend)) {
     const backend = parseRemoteDriverExecutionBackend(opts.executionBackend)
     if (backend.authorityEngine !== engineId) {
@@ -259,7 +313,10 @@ export function createEngine(engineId: string, opts: EngineCreateOpts): EngineAd
     if (!remoteDriverAdapterFactory) {
       throw new Error('[engine] no remote-driver-v4 adapter registered — fail-closed')
     }
-    return remoteDriverAdapterFactory(opts)
+    const baseRemote = remoteDriverAdapterFactory(opts)
+    return wrapSelfhost
+      ? unifiedPoolAdapterWrapper!(baseRemote, { engineId, poolKind: 'remote_pool', opts })
+      : baseRemote
   }
   const factory = engineFactories.get(engineId)
   if (!factory) {
@@ -267,5 +324,8 @@ export function createEngine(engineId: string, opts: EngineCreateOpts): EngineAd
       `[engine] no adapter registered for engine '${engineId}' — fail-closed (registered: ${registeredEngines().join(', ') || 'none'})`,
     )
   }
-  return factory(opts)
+  const baseLocal = factory(opts)
+  return wrapSelfhost
+    ? unifiedPoolAdapterWrapper!(baseLocal, { engineId, poolKind: 'local_pool', opts })
+    : baseLocal
 }
