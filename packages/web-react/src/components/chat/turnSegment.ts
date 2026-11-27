@@ -382,3 +382,16 @@ export function projectVisibleAssistantRows(messages: ChatMessage[],
   }
   return projected.filter((_, index) => !hidden.has(index));
 }
+
+export function explicitRowTurnRoot(
+  message: ChatMessage | undefined,
+  rootOf: (id: string) => string,
+): string | undefined {
+  if (!message) return undefined;
+  const raw = message.role === "user"
+    ? message.id
+    : (typeof message._turnOwnerId === "string" && message._turnOwnerId) ||
+      (typeof message._clientMessageId === "string" && message._clientMessageId) ||
+      undefined;
+  return raw ? rootOf(raw) : undefined;
+}
