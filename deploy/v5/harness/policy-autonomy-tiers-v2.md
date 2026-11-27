@@ -6,25 +6,27 @@
 
 ---
 
-## 一、个人版人工审批极简原则（2026-11-27 升级）
+## 一、个人版人工审批降噪与白话清晰化原则（2026-11-27 升级）
 
-个人版遵循「**尽可能减少人工审批，除以下两类外全部自动审批放行**」原则（策略标识：`approvalPolicy: "ux_or_billing_only"`）：
+个人版遵循「**在严格守恒 A0 元护栏与单调棘轮不变量的前提下，最大程度减少常规开发与发布的无谓人工审批；所有呈现给人拍板的审批单必须白话清晰、一键批准即自动续跑**」原则：
 
+### 1. 审批界面两类白话风险标签（与底层 A0 保护范围解耦）
 1. **用户体验可能下降（`riskCategory: "ux_degradation"`）**：
    - 破坏性或无法证明安全增量的数据库结构变更（`DESTRUCTIVE_DDL_LOCKED`，如 `DROP`/`TRUNCATE`/`DELETE FROM`/`ALTER COLUMN ... TYPE`/`RENAME`/无 `DEFAULT` 的 `NOT NULL` 列等）；
-   - 放宽、抬升或删除用户体验/性能/视觉回归基线（`packages/web-react/budgets.json`、`.github/context-eval-baseline.json`、`packages/web-react/ui-static-baseline.json`、`packages/web-react/layout-invariants-baseline.json`、`packages/web-react/design-tokens-counts.json`、`packages/web-react/design-tokens-exempt.json`）；
-   - 修改用户侧会话体验回归冻结点与体验门禁执行器（`e2e/session-display/incident-ledger-baseline*`、`incident-tombstones*`、`scripts/check-incident-ledger-superset.ts`、`scripts/check-ui-hard-gates.ts`、`scripts/check-monotonic-baselines.ts`、`scripts/check-context-static.ts`、`packages/web-react/vite.config.ts`、`designTokens.test.ts`、`layout-invariants.mjs`、`vlm-rubric/**`）；
-   - 触发连续异常回滚熔断后的恢复确认（`breaker_unlock`），以及元裁判/跨家族看护员/CI 强制工作流锁链（`a0-meta-referee`），防止静默削弱上述体验与计费防线。
+   - 放宽、抬升或删除单调基线/体验预算/豁免与架构边界（`budgets.json`、`context-eval-baseline.json`、`ui-static-baseline.json`、`layout-invariants-baseline.json`、`arch/modules.json` 新增 `allow`/`authorities`、`file-size` / `ai-smells` / `violations` 基线抬升等）；
+   - 修改发布编排/宿主控制面、权限/契约核心、既有门禁执行器、跨家族看护员链与元裁判路径（A0 保护范围保持完整不可静默削弱）；
+   - 触发连续异常回滚熔断后的恢复确认（`breaker_unlock`）。
 2. **计费方式可能变化（`riskCategory: "billing_change"`）**：
-   - 修改计费、模型套餐授权、价格展示、结算恢复与支付生产代码且存在真实运行时逻辑变更（默认保护 `packages/commercial/src/billing/**`、`packages/commercial/src/payment/**`、`packages/protocol/src/serviceTiers.ts`，仅放行严格只读报表/展示上下文/结算后异步审计白名单与零运行时差异 TS 改动）。
+   - 修改计费、模型套餐授权、价格展示、结算恢复与支付生产代码且存在真实运行时逻辑变更（默认保护 `packages/commercial/src/billing/**`、`packages/commercial/src/payment/**`、`packages/protocol/src/serviceTiers.ts`）。
 
-### 全部自动审批放行范围（`auto_pass` / `A1`）
+### 2. 自动审批放行范围（`auto_pass` / `A1`）
+- **常规业务功能、交互修复与测试**：不触及 A0 保护路径与破坏性 SQL 时全程自动审批放行；
 - **严格只读/后置审计计费辅助文件**：仅限 `arch/a0-protected-paths.json` 中 `billingNonCoreAllowlist` 显式列明的 4 个零授权/零定价/零结算辅助文件（`apiKeyMessageAudit.ts`、`apiKeyUsageReport.ts`、`ledgerRowContext.ts`、`usageReport.ts`），个人版直接 `auto_pass`（审计记 `ok_auto_noncore_billing`）；其余全部计费/授权/支付文件默认受保护；
 - **核心计费纯注释/类型改动**：计费/支付 TS 文件经 TypeScript AST 证明零运行时代码差异（仅注释或类型声明）直接 `auto_pass`（`semanticNoRuntimeBillingChange: true`），纯测试文件（`*.test.*` / `*.spec.*`）继续 `auto_pass`；
 - **安全幂等 SQL 迁移**：除现有安全增量语句外，支持安全幂等的 `DO $$ ... $$` 块（条件仅允许严格受限的只读系统目录 `EXISTS`/`NOT EXISTS` 查询，内部全部为安全增量语句且不含任何破坏性子句）直接 `auto_pass`；
-- **工程内部基线与脚本**：`file-size-baseline.json`、`file-size-ratchet-exceptions.json`、`ai-smells-baseline.json`、`violations-baseline.json`、`arch/modules.json`、`shrinkOnlyBaselines`、`featureFlagsRegistry`、非强制夜跑工作流、发版与部署脚本、`biome.json`、`changelog.json`、契约快照、以及除体验门禁/元裁判/跨家族看护员外的内部 `scripts/check-*.ts` 门禁脚本，全部自动审批为 `A1`（`A1-AUTO-NON-UX-BILLING`）。
-- **物理红线不变**：商业分支 `feat/v5-aurora-rewrite` 继续保持永久 `absolute_reject`（`COMMERCIAL_BRANCH_HARD_LOCK`），不可任何方式创建或批准审批单。
-- **审批单白话化**：所有提交给人拍板的审批单必须附带清晰白话字段 `riskCategory`、`whatChanged`、`whyNeedYou`、`recommendation`，杜绝内部技术黑话。
+- **A1 单调收紧与声明式升级**：所有基线单调核减、新增 `check-*.ts` 门禁、`arch/modules.json` 拆分不扩权、合法固定 tag 的 `runtime-image-pin.json` 升级，全部自动放行；
+- **物理红线不变**：商业分支 `feat/v5-aurora-rewrite` 继续保持永久 `absolute_reject`（`COMMERCIAL_BRANCH_HARD_LOCK`），不可任何方式创建或批准审批单；
+- **审批单白话化与一键自动续跑**：所有提交给人拍板的审批单附带清晰白话字段 `riskCategory`、`whatChanged`、`whyNeedYou`、`recommendation`，主卡隐藏 git SHA/voucher/systemd 等内部黑话，点击批准后立即自动续跑并自动通知助手继续。
 
 ---
 
@@ -36,8 +38,8 @@
 | **L2 配置层** | model catalog、`cron.yaml`（4 节拍内参数）、`agents.yaml`、tier 参数 | 全自动 | YAML/JSON schema 校验 + `check-cron-liveness.ts` + 6/6 保留集 + 自动回滚 |
 | **L3 代码层 · 展示与园艺微 PR（白名单内）** | 纯展示组件 + **5 类受限园艺清债微 PR**（见第三节） | **全自动至 PR Auto-Merge 与搭车发布** | `verify-micro-pr-bounds.ts` + 单包测试 + 全套单调棘轮 + 外置宿主裁判 + 切流后保留集 |
 | **L3 代码层 · 核心业务（T2 白名单外）** | 网关核心生命周期、协议/schema、非核心计费辅助、账号池、egress、发布脚本、Top-10 大文件 | **个人版全自动推进与放行**（不触及两类人工审批红线时免人工卡点） | 完整发布列车 + 跨家族 `Architecture Steward` 审计 + 切流后保留集 |
-| **A1 自动放行层** | `deploy/v5/runtime-image-pin.json`（合法固定 tag）、体验基线收紧、严格只读计费报表辅助、以及非体验/非元锁内部工程基线与脚本（`file-size`、`ai-smells`、`violations`、`modules.json`、部署脚本、内部 `check-*.ts`） | **全自动放行** | `check-a0-monotonic.ts` + GitHub Required Checks 全绿 |
-| **A0 人工审批层（仅两类 + 完整元裁判锁链）** | ① `billing-accounting-core`（默认全计费/授权/定价/支付代码）；② `ux-regression-guards`（体验基线放宽/删除、回归冻结点与体验门禁执行器）；③ `a0-meta-referee`（A0 元裁判、跨家族看护员链、核心 CI 强制工作流与 `CODEOWNERS`） | **人工确认（白话审批单）+ 宿主机 root 签章** | 宿主机 `/opt/openclaude/harness-gate/bin/oc-governor` 审批回执或 CODEOWNER PR APPROVED |
+| **A1 自动放行层** | `deploy/v5/runtime-image-pin.json`（合法固定 tag）、新增 `check-*.ts` 门禁、所有单调基线收紧、模块拆分不扩权、4 个只读计费辅助、纯测试与零运行时差异 TS 改动 | **全自动放行** | `check-a0-monotonic.ts` + GitHub Required Checks 全绿 |
+| **A0 人工审批层（完整不变量 + 两类白话标签）** | ① `billing-accounting-core`（计费/授权/定价/支付运行时改动）；② 体验回归冻结点/门禁执行器与基线放宽；③ 权限/契约核心、发布控制面、CI 工作流、既有门禁与元裁判/跨家族看护员链（严禁自主削弱） | **人工确认（白话审批单 + 一键自动续跑）+ 宿主机 root 签章** | 宿主机 `/opt/openclaude/harness-gate/bin/oc-governor` 审批回执或 CODEOWNER PR APPROVED |
 
 ---
 

@@ -259,7 +259,7 @@ function buildRefereeManifest(refereeDir: string): void {
   )
 }
 
-describe('B1: A0 full meta-referee lock chain & CODEOWNERS coverage for trust-core libraries', () => {
+describe('B1: A0 & CODEOWNERS self-protection for trust-core, deploy, permission, and gate chains', () => {
   const newTrustLibs = [
     'scripts/lib/globMatch.ts',
     'scripts/lib/gitRangeInspect.ts',
@@ -268,65 +268,58 @@ describe('B1: A0 full meta-referee lock chain & CODEOWNERS coverage for trust-co
     'scripts/lib/commitRangeCarryOver.ts',
     'scripts/lib/a0RangeCarryOver.ts',
   ]
-  const fullMetaLockPaths = [
+  const criticalProtectedPaths = [
+    ...newTrustLibs,
     'arch/a0-protected-paths.json',
     'scripts/check-a0-monotonic.ts',
     'scripts/lib/a0MonotonicRules.ts',
     'scripts/lib/a0ApprovalReceipt.ts',
-    'scripts/lib/a0RangeCarryOver.ts',
-    'scripts/lib/gitRangeInspect.ts',
-    'scripts/lib/globMatch.ts',
-    'scripts/lib/githubApprovalParsers.ts',
     'scripts/lib/githubTrustedApproval.ts',
-    'scripts/lib/githubMergedPrEquivalence.ts',
-    'scripts/lib/commitRangeCarryOver.ts',
     'scripts/check-cross-family-audit.ts',
     'scripts/arch-steward-review.sh',
-    'scripts/lib/archStewardContract.ts',
-    'scripts/lib/archStewardGitDiff.ts',
     'scripts/lib/archStewardReceipt.ts',
-    'scripts/lib/archStewardTypes.ts',
-    'scripts/lib/modelFamilyClassifier.ts',
+    'scripts/check-architecture.ts',
+    'scripts/check-ui-hard-gates.ts',
     'scripts/harness-gate/oc-governor.sh',
     'scripts/harness-gate/sync-referee.sh',
+    'scripts/deploy-v5-selfhost.sh',
     'scripts/lib/v5-selfhost-governance-gates.sh',
     'scripts/lib/v5-selfhost-train-guards.sh',
+    'packages/protocol/src/advisorNoWrite.ts',
+    'packages/gateway/src/actionPolicyEngine.ts',
     '.github/workflows/v5-selfhost-gates.yml',
-    '.github/workflows/v5-selfhost-release-gates.yml',
-    '.github/workflows/v5-selfhost-web-react.yml',
     '.github/CODEOWNERS',
   ]
 
-  test('CODEOWNERS covers trust-core libraries and arch/a0-protected-paths.json enforces full a0-meta-referee lock chain under ux_or_billing_only', (t) => {
+  test('every trust-core library is listed in arch/a0-protected-paths.json and .github/CODEOWNERS, and critical meta/deploy/permission/gate paths hard-block on solo edit', (t) => {
     const policyRaw = JSON.parse(
       readFileSync(path.join(REPO_ROOT, 'arch/a0-protected-paths.json'), 'utf8'),
-    ) as { approvalPolicy?: string; a0Categories: Array<{ id: string; paths?: string[] }> }
-    assert.equal(policyRaw.approvalPolicy, 'ux_or_billing_only')
+    ) as { a0Categories: Array<{ id: string; paths?: string[] }> }
     const metaCat = policyRaw.a0Categories.find((c) => c.id === 'a0-meta-referee')
     assert.ok(metaCat?.paths, 'a0-meta-referee category must exist')
-    assert.deepEqual([...metaCat.paths].sort(), [...fullMetaLockPaths].sort())
     const codeowners = readFileSync(path.join(REPO_ROOT, '.github/CODEOWNERS'), 'utf8')
 
     for (const rel of newTrustLibs) {
+      assert.ok(metaCat.paths.includes(rel), `arch/a0-protected-paths.json missing ${rel}`)
       assert.match(
         codeowners,
         new RegExp(`^${rel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+@`, 'm'),
       )
     }
 
-    // Verify editing ANY SINGLE meta-referee chain file triggers A0 hard-block under real repo policy
+    // Verify editing ANY SINGLE critical protected path triggers A0 hard-block under real repo policy
     const repo = initTempRepo(t)
     cpSync(
       path.join(REPO_ROOT, 'arch/a0-protected-paths.json'),
       path.join(repo.dir, 'arch/a0-protected-paths.json'),
     )
-    for (const rel of fullMetaLockPaths) {
+    for (const rel of criticalProtectedPaths) {
       if (rel === 'arch/a0-protected-paths.json') continue
       repo.write(rel, rel === '.github/CODEOWNERS' ? '* @dream-star-end\n' : 'export const v = 1\n')
     }
-    const seededBase = repo.commit('chore(v5): seed real policy and meta-referee chain files')
+    const seededBase = repo.commit('chore(v5): seed real policy and protected paths')
 
-    for (const rel of fullMetaLockPaths) {
+    for (const rel of criticalProtectedPaths) {
       repo.write(rel, rel.endsWith('.json') ? '{"schemaVersion":1,"a0Categories":[],"a1MonotonicSurfaces":{}}\n' : 'export const v = 2\n')
       const head = repo.commit(`chore(v5): solo edit ${rel}`)
       const res = runCheckA0Monotonic({
@@ -338,8 +331,8 @@ describe('B1: A0 full meta-referee lock chain & CODEOWNERS coverage for trust-co
       })
       assert.equal(res.ok, false, `solo edit to ${rel} MUST hard-block A0`)
       assert.ok(
-        res.a0Blocks.some((b) => b.path === rel && b.category === 'a0-meta-referee'),
-        `expected a0-meta-referee block for ${rel}`,
+        res.a0Blocks.some((b) => b.path === rel),
+        `expected A0 block for ${rel}`,
       )
       repo.git(['reset', '--hard', seededBase])
     }

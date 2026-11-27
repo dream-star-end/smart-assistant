@@ -144,14 +144,6 @@ function findGateGlobs(policy: A0Policy): string[] {
   return [...globs]
 }
 
-function autoApproveNonUxBilling(findings: A0Finding[]): A0Finding[] {
-  return findings.map((f) =>
-    f.tier === 'A0'
-      ? { path: f.path, tier: 'A1', rule: 'A1-AUTO-NON-UX-BILLING', detail: `auto-approved non-UX/billing surface (${f.detail})` }
-      : f,
-  )
-}
-
 function categoryRisk(cat: A0Category): 'ux_degradation' | 'billing_change' {
   return cat.riskCategory ?? (cat.id === 'billing-accounting-core' ? 'billing_change' : 'ux_degradation')
 }
@@ -187,7 +179,7 @@ function classifySinglePath(
 ): A0Finding[] {
   const s = policy.a1MonotonicSurfaces
 
-  // 1. Direct A0 protected categories (billing/payment, UX regression guards, meta-referee chain)
+  // 1. Direct A0 protected categories (meta, deploy, permission, billing/payment, UX guards, CI workflows)
   const a0Cat = findA0PathCategory(p, policy)
   if (a0Cat) {
     if (a0Cat.id === 'billing-accounting-core') {
@@ -206,12 +198,21 @@ function classifySinglePath(
     ]
   }
 
-  // 2. Non-UX/non-meta internal gate scripts (`scripts/check-*.ts` outside ux-regression-guards & a0-meta-referee): auto-pass as A1
+  // 2. Gate scripts (`scripts/check-*.ts`, `scripts/check-*.sh`, `packages/commercial/scripts/lint-*.ts`):
+  //    Brand-new gate (status A) -> A1 auto-pass; modifying or deleting pre-existing gate -> A0 block
   if (matchesAnyGlob(p, gateGlobs)) {
+    if (status === 'A') {
+      return [{ path: p, tier: 'A1', rule: 'A1-NEW-GATE-ADDED', detail: `added new gate script "${p}"` }]
+    }
     return [
-      status === 'A'
-        ? { path: p, tier: 'A1', rule: 'A1-NEW-GATE-ADDED', detail: `added new gate script "${p}"` }
-        : { path: p, tier: 'A1', rule: 'A1-AUTO-NON-UX-BILLING', detail: `auto-approved internal gate script "${p}"` },
+      {
+        path: p,
+        tier: 'A0',
+        category: 'existing-gate-deletion-or-modification',
+        riskCategory: 'ux_degradation',
+        rule: status === 'D' ? 'A0-GATE-DELETED' : 'A0-GATE-MODIFIED',
+        detail: `${status === 'D' ? 'deleted' : 'modified'} pre-existing gate script "${p}"`,
+      },
     ]
   }
 
@@ -220,7 +221,20 @@ function classifySinglePath(
     return evaluateRuntimeImagePinChange(p, status === 'D' ? null : readHead(p))
   }
 
-  // 4. UX-related baselines: tightening -> A1; loosening/raising/deleting -> A0 (ux_degradation)
+  // 4. Architecture module map -> A1 only if no allow/authority/scope/layer loosening
+  if (p === s.moduleMap) {
+    return evaluateModulesJsonChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p))
+  }
+
+  // 5. File-size baseline & exceptions -> strict monotonic shrink-only
+  if (p === s.fileSizeBaseline) {
+    return evaluateFileSizeBaselineChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p))
+  }
+  if (p === s.fileSizeExceptions) {
+    return evaluateFileSizeExceptionsChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p))
+  }
+
+  // 6. Exemptions, budgets & monotonic baselines -> tightening is A1, loosening/raising/deleting is A0
   if (p === s.designTokensExempt) {
     return evaluateShrinkOnlyJsonChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p), { allowDelete: true, mode: 'exemptList', riskCategory: 'ux_degradation' })
   }
@@ -230,25 +244,16 @@ function classifySinglePath(
   if (p === s.contextEvalBaseline) {
     return evaluateShrinkOnlyJsonChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p), { mode: 'contextEval', riskCategory: 'ux_degradation' })
   }
-  if (s.countRatchetBaselines.includes(p)) {
-    return evaluateShrinkOnlyJsonChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p), { mode: 'counts', riskCategory: 'ux_degradation' })
-  }
-
-  // 5. Non-UX/non-billing internal engineering baselines -> A1 auto-approved (no manual A0 bottleneck)
-  if (p === s.moduleMap) {
-    return autoApproveNonUxBilling(evaluateModulesJsonChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p)))
-  }
-  if (p === s.fileSizeBaseline) {
-    return autoApproveNonUxBilling(evaluateFileSizeBaselineChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p)))
-  }
-  if (p === s.fileSizeExceptions) {
-    return autoApproveNonUxBilling(evaluateFileSizeExceptionsChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p)))
-  }
   if (p === s.featureFlagsRegistry) {
-    return autoApproveNonUxBilling(evaluateShrinkOnlyJsonChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p), { mode: 'featureFlags' }))
+    return evaluateShrinkOnlyJsonChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p), { mode: 'featureFlags', riskCategory: 'ux_degradation' })
   }
-  if (p === s.aiSmellsBaseline || p === s.violationsBaseline || s.shrinkOnlyBaselines.includes(p)) {
-    return autoApproveNonUxBilling(evaluateShrinkOnlyJsonChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p), { mode: 'counts' }))
+  if (
+    p === s.aiSmellsBaseline ||
+    p === s.violationsBaseline ||
+    s.countRatchetBaselines.includes(p) ||
+    s.shrinkOnlyBaselines.includes(p)
+  ) {
+    return evaluateShrinkOnlyJsonChange(p, status === 'A' ? null : readBase(p), status === 'D' ? null : readHead(p), { mode: 'counts', riskCategory: 'ux_degradation' })
   }
 
   // Non-governance application code: passes neutrally
@@ -287,9 +292,11 @@ export function classifyDiffEntry(
     } else if (matchesAnyGlob(entry.oldPath, gateGlobs)) {
       findings.push({
         path: entry.oldPath,
-        tier: 'A1',
-        rule: 'A1-AUTO-NON-UX-BILLING',
-        detail: `auto-approved internal gate rename "${entry.oldPath}" -> "${entry.path}"`,
+        tier: 'A0',
+        category: 'existing-gate-deletion-or-modification',
+        riskCategory: 'ux_degradation',
+        rule: 'A0-GATE-RENAMED',
+        detail: `existing gate "${entry.oldPath}" renamed to "${entry.path}"`,
       })
     } else {
       findings.push(

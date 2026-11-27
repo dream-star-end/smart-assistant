@@ -682,8 +682,12 @@ export interface DiffEntry {
 
 const REQUIRED_BOOTSTRAP_CATEGORIES = [
   'a0-meta-referee',
+  'monotonic-baseline-checkers',
+  'incident-ledger-freeze-anchors',
+  'ci-workflows-and-gate-manifests',
+  'host-control-plane-and-deploy',
   'billing-accounting-core',
-  'ux-regression-guards',
+  'permission-and-contract-core',
 ] as const
 
 const REQUIRED_META_REFEREE_PATHS = [
@@ -691,19 +695,19 @@ const REQUIRED_META_REFEREE_PATHS = [
   'scripts/check-a0-monotonic.ts',
   'scripts/lib/a0MonotonicRules.ts',
   'scripts/lib/a0ApprovalReceipt.ts',
-  'scripts/harness-gate/oc-governor.sh',
-  'scripts/harness-gate/sync-referee.sh',
-  'scripts/lib/v5-selfhost-governance-gates.sh',
-  'scripts/lib/v5-selfhost-train-guards.sh',
   '.github/CODEOWNERS',
 ] as const
 
 const DISALLOWED_BOOTSTRAP_RULES = new Set([
   'A0-PROTECTED-DELETED',
   'A0-PROTECTED-RENAMED',
+  'A0-GATE-DELETED',
+  'A0-GATE-RENAMED',
+  'A0-FILESIZE-SLACK-NONZERO',
   'A0-PIN-DELETED',
   'A0-PIN-INVALID-JSON',
   'A0-PIN-SCHEMA-INVALID',
+  'A0-MODULES-DELETED',
   'A0-BASELINE-DELETED',
   'A0-BASELINE-RAISED',
   'A0-BASELINE-ENTRY-ADDED',
@@ -713,6 +717,11 @@ const DISALLOWED_BOOTSTRAP_RULES = new Set([
   'A0-THRESHOLD-REMOVED',
   'A0-WAIVER-ADDED',
   'A0-EXEMPTION-ADDED',
+  'A0-FLAG-TTL-EXTENDED',
+  'A0-FLAG-MADE-PERMANENT',
+  'A0-EXCEPTION-ADDED',
+  'A0-EXCEPTION-RENEWED',
+  'A0-EXCEPTION-RAISED',
 ])
 
 export function validateBootstrapNonWeakening(
