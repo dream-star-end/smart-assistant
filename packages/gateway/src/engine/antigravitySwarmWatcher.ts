@@ -1466,9 +1466,7 @@ export class AntigravitySwarmWatcher {
   }
 
   private finishPollEmit(snap: SwarmSnapshot, ts: number): void {
-    if (this.telemetryCache.hasAnyBacklog()) {
-      this.scheduleBacklogCatchup()
-    }
+    if (this.telemetryCache.hasAnyBacklog()) this.scheduleBacklogCatchup()
     const hash = snapshotFingerprint(snap)
     const structHash = structuralFingerprint(snap)
     if (this.startedAt === undefined) {
@@ -1476,7 +1474,11 @@ export class AntigravitySwarmWatcher {
       snap.startedAt = this.startedAt
     }
     if (hash === this.lastHash) {
-      if (this.turnActive) this.evaluateStall(snap, ts)
+      if (!this.turnActive || !this.stallMonitor) return
+      // Wire dedup ignores lastActiveAt; keep the quiet-tick input fresh anyway.
+      this.lastSnapshot = { ...snap, revision: this.revision }
+      if (this.pendingActivitySnap) this.pendingActivitySnap = this.lastSnapshot
+      this.evaluateStall(this.lastSnapshot, ts)
       return
     }
     const isStructuralChange = !this.emittedInTurn || structHash !== this.lastStructuralHash
@@ -1487,11 +1489,9 @@ export class AntigravitySwarmWatcher {
     if (!isStructuralChange && this.activityThrottleMs > 0) {
       const elapsed = ts - this.lastEmitAt
       if (elapsed < this.activityThrottleMs) {
-        // Keep `lastSnapshot` fresh (without advancing wire revision yet) and coalesce
-        // trailing activity update so UI stays responsive without flooding PG/WS.
         this.lastSnapshot = { ...snap, revision: this.revision }
         this.scheduleThrottledActivityEmit(snap, this.activityThrottleMs - elapsed)
-        this.evaluateStall(snap, ts)
+        this.evaluateStall(this.lastSnapshot, ts)
         return
       }
     }

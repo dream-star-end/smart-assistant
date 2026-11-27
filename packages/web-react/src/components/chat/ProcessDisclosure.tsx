@@ -1,3 +1,4 @@
+import type { SwarmSnapshot } from "@openclaude/protocol/browser";
 import { ChevronDown, Pencil } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { type ChatMessage, isRetryingTurnStatus } from "../../lib/chat/model";
@@ -21,6 +22,8 @@ import { useArtifactInspect } from "../tool/context";
 import { cn, groupDigits } from "../../lib/utils";
 import { toolChangedFileCount } from "./workPane";
 import { ProcessStages } from "./lazyProcessStages";
+import { QUIET_TAIL_MS, RUNNING_META_MS, formatElapsed, swarmGapStatus, isSwarmWaitTool, type ProcessLiveStatus } from "./processWaitStatus";
+export type { ProcessLiveStatus } from "./processWaitStatus";
 import type { PhaseKind } from "./phaseTimeline";
 
 // 展开时间轴与阶段时间线懒块只从外壳拿这些符号。懒块若直接 import cards / meta / status,
@@ -995,7 +998,7 @@ export function delegateTitle(rows: readonly ChatMessage[]): string {
   return goal ? `委派给 ${names[0]}：${goal}` : `委派给 ${names[0]}`;
 }
 
-function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pending: boolean } {
+function stepLiveStatus(messages: readonly ChatMessage[]): ProcessLiveStatus {
   const work = messages.filter((message) => message.role !== "assistant" && message.role !== "user");
   const runningTool = [...work].reverse().find(toolStillRunning);
   const latest = runningTool ?? work.at(-1);
@@ -1012,7 +1015,11 @@ function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pendi
       // The raw miss stays in the expanded card. The live line only says the step did not succeed.
       return { text: "未成功", pending: false };
     }
-    if (!latest._completed) return { text: runningToolPhrase(latest), pending: true };
+    if (!latest._completed) {
+      return isSwarmWaitTool(latest)
+        ? { text: "等待蜂群回复", pending: true, kind: "swarm" }
+        : { text: runningToolPhrase(latest), pending: true };
+    }
     return { text: "工具执行完成", pending: false };
   }
   return { text: countLabel(latest), pending: false };
@@ -1048,14 +1055,7 @@ function ShellGlyph({ active, outcome }: { active: boolean; outcome: "done" | "s
 }
 
 
-export function formatElapsed(ms: number): string {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  if (total < 60) return `${total} 秒`;
-  const minutes = Math.floor(total / 60);
-  if (minutes < 60) return `${minutes} 分 ${String(total % 60).padStart(2, "0")} 秒`;
-  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
-}
-
+export { formatElapsed } from "./processWaitStatus";
 /** 1s 一跳的「现在」(统一驱动外壳已耗时与静默/运行计时)。只在有可信时间源时开表,结束即停。 */
 function useNowTicker(enabled: boolean): number {
   const [now, setNow] = useState(() => Date.now());
@@ -1067,11 +1067,6 @@ function useNowTicker(enabled: boolean): number {
   }, [enabled]);
   return now;
 }
-
-/** 可见进展结束后,静默多久才显示等待模型响应(避免步骤间闪一下)。 */
-const QUIET_TAIL_MS = 3_000;
-/** 当前步骤里的工具连续跑多久才在摘要行旁显示「已运行 N 秒」。 */
-const RUNNING_META_MS = 5_000;
 
 /** 当前段里仍在运行的工具中最早的开始时刻(行的 ts = 工具调用到达浏览器的时刻)。不早于本轮起点。 */
 function earliestRunningSince(messages: readonly ChatMessage[], turnStartedAt: number | null | undefined): number | null {
@@ -1103,19 +1098,20 @@ function completedToolsSince(messages: readonly ChatMessage[]): number | null {
   return latest;
 }
 
-/** Only a thinking row proves thinking; silence is waiting for a model response. */
 function shellLivePhrase<T>(
-  sections: readonly ProcessSection<T>[],
-  currentIndex: number,
-  narrativeSettled = false,
-): { text: string; pending: boolean } {
-  const current = sections[currentIndex];
+  current: ProcessSection<T> | undefined,
+  narrativeSettled: boolean,
+  swarm: SwarmSnapshot | null | undefined,
+  completedSince: number | null,
+): ProcessLiveStatus {
   if (!current) return { text: "正在处理", pending: true };
-  if (current.narrative) return { text: narrativeSettled ? "等待模型响应" : "正在组织回复", pending: true };
-  const status = stepLiveStatus(current.messages);
-  if (!status.text) return { text: "正在处理", pending: true };
-  if (status.pending) return status;
-  return { text: "等待模型响应", pending: true };
+  if (current.narrative && !narrativeSettled) return { text: "正在组织回复", pending: true };
+  if (!current.narrative) {
+    const status = stepLiveStatus(current.messages);
+    if (!status.text) return { text: "正在处理", pending: true };
+    if (status.pending) return status;
+  }
+  return swarmGapStatus(current, swarm, completedSince) ?? { text: "等待模型响应", pending: true };
 }
 
 
@@ -1171,6 +1167,7 @@ export function ProcessDisclosure<T>({
   olderSteps,
   activity,
   bounds,
+  swarm,
   tokenUsageOf,
 }: {
   sections: ProcessSection<T>[];
@@ -1197,6 +1194,8 @@ export function ProcessDisclosure<T>({
    * following = 过程之后、下一条用户消息之前的行。结局看其中的终态行,不看 next 单独一行。
    */
   bounds?: { startedAt: number | null; endedAt: number | null; next?: ChatMessage; following?: readonly ChatMessage[] };
+  /** The current render segment’s board (its card is outside the folded steps). */
+  swarm?: SwarmSnapshot | null;
   /** 一步所在模型调用的 token 用量,只进耗时的悬停说明。 */
   tokenUsageOf?: (item: T) => DisplayTokenUsage | undefined;
 }) {
@@ -1254,7 +1253,7 @@ export function ProcessDisclosure<T>({
   const runningFor = runningSince !== null && runningMs >= RUNNING_META_MS && runningMs <= 24 * 3600_000 ? formatElapsed(runningMs) : "";
   // 同一时刻只有一行运行状态:阶段归 TurnActivity 时外壳不说「正在…」;展开时那一行落在时间轴里
   // 在干活的段(或「等待模型响应」尾行),外壳只留标题和计时(OCV5-308)。
-  const live = active && !blockedOnPrompt && !keepDistinctActivity(activity) ? shellLivePhrase(sections, currentIndex, narrativeSettled) : null;
+  const live = active && !blockedOnPrompt && !keepDistinctActivity(activity) ? shellLivePhrase(currentSection, narrativeSettled, swarm, completedSince) : null;
   const liveInRail = !!live && open && (waiting || (!!currentSection && !currentSection.narrative));
   const title = active ? "处理过程" : "工作过程";
   const outcome = turnOutcome(bounds?.following);

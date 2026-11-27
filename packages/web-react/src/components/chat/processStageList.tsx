@@ -1,3 +1,4 @@
+import { mcpOpName, normalizeSingleUnderscoreMcp } from "./processToolName";
 /**
  * 展开后的过程时间轴(人话步骤、技术详情、组摘要)。
  * 收起时的外壳总览留在 ProcessDisclosure,首屏同步渲染。
@@ -20,6 +21,7 @@ import {
   Target,
   Terminal,
   TriangleAlert,
+  Users,
   Wrench,
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
@@ -52,6 +54,7 @@ import {
   workKind,
   workSummary,
   type PhaseKind,
+  type ProcessLiveStatus,
   type ProcessSection,
   type ToolInput,
 } from "./ProcessDisclosure";
@@ -90,22 +93,6 @@ const TASK_OPS = new Set([
 ]);
 const TICKET_ID_RE = /^[A-Z][A-Z0-9]{1,9}-\d+$/;
 const INTERNAL_SUMMARY_RE = /\/(?:home|opt|root|usr)\/|HOME=|You are |subagentType/i;
-
-function normalizeSingleUnderscoreMcp(name: string): string {
-  if (name.startsWith("mcp__")) return name;
-  const m = /^mcp_([a-z0-9]+-[a-z0-9-]+)_(.+)$/i.exec(name);
-  return m ? `mcp__${m[1]}__${m[2]}` : name;
-}
-
-function mcpOpName(name: string): string {
-  const norm = normalizeSingleUnderscoreMcp(name);
-  if (norm.startsWith("mcp__")) {
-    const rest = norm.slice(5);
-    const sep = rest.indexOf("__");
-    return (sep >= 0 ? rest.slice(sep + 2) : rest).toLowerCase();
-  }
-  return norm.toLowerCase();
-}
 
 function parseRecord(value: unknown): Record<string, unknown> | null {
   if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
@@ -459,7 +446,7 @@ export type ProcessStageListProps<T> = {
   sections: ProcessSection<T>[];
   active: boolean;
   currentIndex: number;
-  live: { text: string; pending: boolean } | null;
+  live: ProcessLiveStatus | null;
   toolsSettled: boolean;
   runningFor: string;
   waiting: boolean;
@@ -812,11 +799,13 @@ export function ProcessStageList<T>({
             })}
             {waiting && live ? (
               <div key="__live-tail" data-testid="process-live-tail" className="oc-step-enter flex min-h-8 items-center gap-2 py-1 [@media(hover:none)]:min-h-10">
-                <StepIcon Icon={Brain} tone="live" />
-                <span data-testid="process-step-live" data-live-pending="true" className="oc-live-status-shine min-w-0 truncate text-body text-muted">等待模型响应</span>
-                <span aria-hidden className="shrink-0 whitespace-nowrap text-caption tabular-nums text-faint">
-                  {formatElapsed(waitingMs)}
-                </span>
+                <StepIcon Icon={live.kind === "swarm" ? Users : Brain} tone="live" />
+                <span data-testid="process-step-live" data-live-pending="true" className="oc-live-status-shine min-w-0 truncate text-body text-muted">{live.text}</span>
+                {live.kind !== "swarm" ? (
+                  <span aria-hidden className="shrink-0 whitespace-nowrap text-caption tabular-nums text-faint">
+                    {formatElapsed(waitingMs)}
+                  </span>
+                ) : null}
               </div>
             ) : null}
             </div>
