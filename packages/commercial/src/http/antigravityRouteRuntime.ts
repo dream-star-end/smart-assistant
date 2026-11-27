@@ -47,17 +47,36 @@ export interface AntigravityRelayConcurrencyConfig {
   OC_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE?: number
 }
 
+/** Commercial multi-tenant default per-route caps (pre-OCV5-894 safe ceilings). */
+export const COMMERCIAL_DEFAULT_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE = 12
+export const COMMERCIAL_DEFAULT_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE = 24
+
 /** Shared config → relay concurrency cap mapper for BOTH master bootstrap and split egress. */
 export function antigravityRelayConcurrencyFromConfig(
   cfg: AntigravityRelayConcurrencyConfig,
+  opts?: {
+    readonly isCommercial?: boolean
+    readonly flavorIdentity?: { readonly status: string; readonly flavor?: string }
+  },
 ): Pick<AntigravityRelayDeps, 'maxInflightPerRoute' | 'maxAuxInflightPerRoute'> {
+  const isCommercial =
+    opts?.isCommercial === true ||
+    (opts?.flavorIdentity?.status === 'ok' && opts?.flavorIdentity.flavor === 'commercial')
+  const maxInflightPerRoute =
+    cfg.OC_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE !== undefined
+      ? cfg.OC_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE
+      : isCommercial
+        ? COMMERCIAL_DEFAULT_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE
+        : undefined
+  const maxAuxInflightPerRoute =
+    cfg.OC_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE !== undefined
+      ? cfg.OC_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE
+      : isCommercial
+        ? COMMERCIAL_DEFAULT_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE
+        : undefined
   return {
-    ...(cfg.OC_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE !== undefined
-      ? { maxInflightPerRoute: cfg.OC_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE }
-      : {}),
-    ...(cfg.OC_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE !== undefined
-      ? { maxAuxInflightPerRoute: cfg.OC_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE }
-      : {}),
+    ...(maxInflightPerRoute !== undefined ? { maxInflightPerRoute } : {}),
+    ...(maxAuxInflightPerRoute !== undefined ? { maxAuxInflightPerRoute } : {}),
   }
 }
 

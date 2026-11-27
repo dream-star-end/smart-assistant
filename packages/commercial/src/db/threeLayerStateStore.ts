@@ -2,7 +2,7 @@
  * OCV5-890 Wave 1B — Layer 1 PostgreSQL Authoritative State Stores.
  *
  * Implements the PostgreSQL-backed authoritative stores matching migration
- * `0354_three_layer_pool_unification.sql`:
+ * `0350_commercial_three_layer_pool_unification.sql` (selfhost `0354_three_layer_pool_unification.sql`):
  * - `PgSessionAuthorityStateStore` (`session_engine_pointers`,
  *   `session_rolling_checkpoints`, `session_placement_migrations`)
  * - `PgLogicalModelBindingStore` (`model_logical_pool_bindings`)

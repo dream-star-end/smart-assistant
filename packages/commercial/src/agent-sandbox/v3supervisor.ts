@@ -75,6 +75,8 @@ import { V3_AGENT_GID, V3_AGENT_UID, buildContainerExtraHosts } from "./constant
 import { SupervisorError } from "./types.js";
 import { assertFlavorIdentity, FlavorIdentityError } from "../flavor/assertFlavor.js";
 import { taskboardContainerEnv } from "./taskboardEnv.js";
+import { localSwarmConcurrencyContainerEnv } from "./localSwarmConcurrencyEnv.js";
+import { capsuleRuntimeContainerEnv } from "./artifactCasEnv.js";
 import { getCodexTokenSnapshot } from "../account-pool/store.js";
 import { pickCodexAccountForBinding } from "../account-pool/scheduler.js";
 import { buildCodexRelayLocalBaseUrl, readCodexUpstreamBaseUrl } from "../http/internalCodexRelay.js";
@@ -84,10 +86,7 @@ import { isPromptQueueV1Enabled } from "../http/internalPromptQueue.js";
 import { skillShadowContainerEnv } from "../http/internalSkillShadow.js";
 import { zeroBuffer } from "../crypto/keys.js";
 import { boxGptWebContainerEnv, isCursorCredentialMember } from "../cursor/access.js";
-import {
-  removeCodexContainerAuthDir,
-  writeCodexContainerAuthFile,
-} from "../codex-auth/codexAuthFile.js";
+import { removeCodexContainerAuthDir, writeCodexContainerAuthFile } from "../codex-auth/codexAuthFile.js";
 import {
   // 单一实现:baseline / bundle / release 共用的 leaf 不变量(原在本文件,已移入 platformBundle)。
   assertBaselineLeaf,
@@ -2939,7 +2938,7 @@ export async function provisionV3Container(
       const value = process.env[key];
       if (value && /^[0-9]+$/.test(value)) env.push(`${key}=${value}`);
     }
-    env.push(...buildDelegateKnobContainerEnv(process.env));
+    const supervisorEnv = process.env; env.push(...buildDelegateKnobContainerEnv(supervisorEnv), ...localSwarmConcurrencyContainerEnv({ env: supervisorEnv }), ...capsuleRuntimeContainerEnv({ env: supervisorEnv }));
 
     // 市场技能使用信号门控透传:与 tool-failure 相反 = **默认开**(低敏产品质量信号,
     // 只记 slug/agent/trace 不记内容)。master 未显式设 → 恒注入 '1';仅当 master 显式

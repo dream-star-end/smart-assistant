@@ -7,7 +7,13 @@ import { fileURLToPath } from 'node:url'
 import { parseOrderDependency } from '../db/migrationOrder.js'
 
 const repo = fileURLToPath(new URL('../../../../', import.meta.url))
-const migrationRelPath = 'packages/commercial/src/db/migrations/0354_three_layer_pool_unification.sql'
+const commercialMigrationRelPath = 'packages/commercial/src/db/migrations/0350_commercial_three_layer_pool_unification.sql'
+const selfhostMigrationRelPath = 'packages/commercial/src/db/migrations/0354_three_layer_pool_unification.sql'
+const isCommercialMigration = existsSync(path.join(repo, commercialMigrationRelPath))
+const migrationRelPath = isCommercialMigration ? commercialMigrationRelPath : selfhostMigrationRelPath
+const expectedOrderDep = isCommercialMigration
+  ? '0349_commercial_context_eval_observability'
+  : '0353_context_eval_observability'
 const migrationAbsPath = path.join(repo, migrationRelPath)
 
 function stripSqlComments(sql: string): string {
@@ -16,15 +22,15 @@ function stripSqlComments(sql: string): string {
     .replace(/--[^\n]*/g, ' ')
 }
 
-test('0354_three_layer_pool_unification.sql exists and declares order-dependency on 0353', () => {
+test('three_layer_pool_unification migration exists and declares expected order-dependency', () => {
   assert.equal(existsSync(migrationAbsPath), true, `missing migration file: ${migrationRelPath}`)
   const sql = readFileSync(migrationAbsPath, 'utf8')
   const firstLine = sql.split(/\r?\n/, 1)[0]?.trim()
-  assert.equal(firstLine, '-- order-dependency: 0353_context_eval_observability')
+  assert.equal(firstLine, `-- order-dependency: ${expectedOrderDep}`)
 
   const parsed = parseOrderDependency(sql)
   assert.equal(parsed.declared, true)
-  assert.deepEqual(parsed.dependsOn, ['0353_context_eval_observability'])
+  assert.deepEqual(parsed.dependsOn, [expectedOrderDep])
 })
 
 test('0354 sets lock_timeout and defines all 6 three-layer pool tables with key constraints and indexes', () => {

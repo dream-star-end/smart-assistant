@@ -134,6 +134,16 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
     column: "observed_at",
     days: 90,
   },
+  // OCV5-890 / OCV5-913 (0350/0354): terminal multipart CAS upload sessions (30d TTL; active 'open' uploads never swept).
+  // Note: `session_placement_migrations` is intentionally excluded from TTL deletion and registered as
+  // DURABLE in `retentionRegistry.ts` because `migrationCoordinator.ts` relies on reading back authoritative
+  // terminal (`committed`/`aborted`) rows during post-crash credential/ExecEnv reconciliation.
+  {
+    table: "artifact_blob_uploads",
+    column: "updated_at",
+    days: 30,
+    predicate: "status IN ('completed','aborted')",
+  },
 ] as const;
 
 /** 显式声明永久保留的审计表——出现在删除政策里=编程错误。 */

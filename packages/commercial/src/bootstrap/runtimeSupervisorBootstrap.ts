@@ -30,7 +30,7 @@ import {
 import { syncLogicalModelPoolBindingsFromCatalog } from "../account-pool/remotePool/logicalModelBindingsSync.js";
 import { bootstrapLegacyRetirementGate, type LegacyTrackRetirementGate } from "../account-pool/remotePool/legacyRetirementRuntime.js";
 import type { LocalCasArtifactBlobStore } from "../agent-sandbox/artifactBlobStore.js";
-import { createMasterArtifactBlobStore } from "../agent-sandbox/artifactBlobRuntime.js";
+import { initMasterArtifactBlobStoreForBootstrap } from "../agent-sandbox/artifactBlobRuntime.js";
 import { createMasterCc5Runtime } from "../agent-sandbox/cc5Runtime.js";
 import {
   makeDraftPreparation,
@@ -1184,28 +1184,13 @@ export async function bootstrapMailerBridgeAndAuthority(deps: {
     });
   }
 
-  let artifactBlobStore: LocalCasArtifactBlobStore | undefined;
-  try {
-    const home = deps.env.OPENCLAUDE_HOME ?? path.join(homedir(), ".openclaude");
-    const created = createMasterArtifactBlobStore({
-      openClaudeHome: home,
-      casRootDir: deps.env.OC_ARTIFACT_CAS_ROOT,
-      pgPool: getPool(),
-      bridgeSecret,
-    });
-    artifactBlobStore = created.store;
-    // eslint-disable-next-line no-console
-    console.log("[commercial] artifact CAS blob store ready", {
-      rootDir: created.rootDir,
-      ticketSigning: Boolean(bridgeSecret),
-    });
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error("[commercial] artifact CAS blob store init failed; blob RPC DISABLED", {
-      error: (err as Error)?.message ?? String(err),
-    });
-    artifactBlobStore = undefined;
-  }
+  const artifactBlobStore = initMasterArtifactBlobStoreForBootstrap({
+    openClaudeHome: deps.env.OPENCLAUDE_HOME ?? path.join(homedir(), ".openclaude"),
+    casRootDir: deps.env.OC_ARTIFACT_CAS_ROOT,
+    pgPool: getPool(),
+    bridgeSecret,
+    env: deps.env,
+  });
 
   return {
     mailer,

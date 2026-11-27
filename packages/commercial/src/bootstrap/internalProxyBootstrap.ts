@@ -781,7 +781,7 @@ export async function bootstrapInternalProxyAndListeners(
         rootLogger,
         pricing: deps.pricing,
         appendCostCredits: deps.appendCostCreditsForUser,
-        ...antigravityRelayConcurrencyFromConfig(deps.cfg),
+        ...antigravityRelayConcurrencyFromConfig(deps.cfg, { flavorIdentity: deps.flavorIdentity }),
       });
       // OCV5-897: Mount mint/renew/release unconditionally across selfhost and commercial;
       // authorization is enforced by container identity + owned inflight delegate_antigravity journal.
