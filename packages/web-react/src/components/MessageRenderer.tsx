@@ -16,7 +16,7 @@ import {
   useScrollToBottomVisibility,
 } from "./chat/ScrollToBottomButton";
 import { snapScrollToBottomOnce } from "./chat/stickToBottom";
-import { processSwarmSnapshot } from "./chat/swarmDetect";
+import { processSwarmSnapshot } from "../lib/chat/swarmBoardEvidence";
 import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isInteractiveToolMessage, isProcessMessage, keepDistinctActivity, processSections, promptShadowedToolIds, turnOutcome } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronUp, Info, X } from "lucide-react";
 import {

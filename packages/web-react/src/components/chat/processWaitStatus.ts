@@ -1,7 +1,7 @@
 import type { SwarmSnapshot } from "@openclaude/protocol/browser";
 import type { ChatMessage } from "../../lib/chat/model";
 import { normalizeSingleUnderscoreMcp } from "./processToolName";
-import { isSwarmActive } from "./swarmDetect";
+import { isSwarmActive } from "../../lib/chat/swarmBoardEvidence";
 
 function swarmToolName(message: ChatMessage | undefined): string {
   if (message?.role !== "tool") return "";
