@@ -25,12 +25,22 @@ import {
 } from "react";
 import type { TicketStatus } from "../../lib/taskboard";
 import { Button } from "../ui";
-import { useChatInteraction, useToolCardActions } from "./context";
+import { type ChatInteraction, useChatInteraction, useToolCardActions } from "./context";
 export {
   coalesceTaskApprovalGroups,
   extractTaskApprovalTicketId,
   isTaskApprovalToolMessage,
 } from "./taskApprovalCoalesce";
+
+type SummarySendStatus = "idle" | "sending" | "sent" | "failed";
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === "object" || typeof value === "function") &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
 
 export type TaskApprovalDecisionKind = "approve" | "reject" | "defer";
 
@@ -368,117 +378,282 @@ export function TaskApprovalGroupProvider({
   );
 }
 
-/** 多张任务审批卡底部的统一操作与汇总发送条。 */
-export function TaskApprovalGroupFooter() {
-  const store = useTaskApprovalGroup();
-  const snap = useTaskApprovalGroupSnapshot();
-  const { taskApproval } = useToolCardActions();
-  const { sendUserText, busy: chatBusy } = useChatInteraction();
-  const [noteOpen, setNoteOpen] = useState(false);
-  const [groupNote, setGroupNote] = useState("");
-  const [batchError, setBatchError] = useState<string | null>(null);
+function selectApprovableEntries(snap: TaskApprovalGroupSnapshot | null): TaskApprovalGroupEntry[] {
+  if (!snap) return [];
+  const seen = new Set<string>();
+  const out: TaskApprovalGroupEntry[] = [];
+  for (const e of snap.entries) {
+    if (e.loading || !e.approvable || e.decision || !e.triggerApprove) continue;
+    const norm = normalizeTicketKey(e.identifier || e.ticketId);
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    out.push(e);
+  }
+  return out;
+}
 
-  const approvableEntries = useMemo(() => {
-    if (!snap) return [];
-    const seen = new Set<string>();
-    const out: TaskApprovalGroupEntry[] = [];
-    for (const e of snap.entries) {
-      if (e.loading || !e.approvable || e.decision || !e.triggerApprove) continue;
-      const norm = normalizeTicketKey(e.identifier || e.ticketId);
-      if (seen.has(norm)) continue;
-      seen.add(norm);
-      out.push(e);
+function resolveFooterHint(params: {
+  sendingSummary: boolean;
+  autoSendFailed: boolean;
+  readyForAutoSend: boolean;
+  chatBusy: boolean;
+  batchApproving: boolean;
+  hasSendUserText: boolean;
+  decidedCount: number;
+  allHandled: boolean;
+  remaining: number;
+}): string {
+  const {
+    sendingSummary,
+    autoSendFailed,
+    readyForAutoSend,
+    chatBusy,
+    batchApproving,
+    hasSendUserText,
+    decidedCount,
+    allHandled,
+    remaining,
+  } = params;
+  if (sendingSummary) return "正在发送审批结果…";
+  if (autoSendFailed) return "发送失败，请点击重试（单据已生效）";
+  if (readyForAutoSend && chatBusy) return "全部审批已生效，待当前回合结束后自动发给助手";
+  if (chatBusy) return "等待当前回合结束后可操作";
+  if (batchApproving) return "正在逐项提交审批…";
+  if (!hasSendUserText) return "单据已实时生效，请手动回复助手继续";
+  if (decidedCount === 0) return "单张审批实时生效，批完后一起发给助手";
+  if (allHandled) return "全部已处理，可一次性发给助手";
+  return `还有 ${remaining} 项未处理，现在也可先发送`;
+}
+
+function formatApproveAllLabel(approvableEntries: readonly TaskApprovalGroupEntry[]): string {
+  const allBacklog = approvableEntries.length > 0 && approvableEntries.every((e) => e.ticketStatus === "backlog");
+  if (approvableEntries.length === 1) return allBacklog ? "批准剩余 1 项" : "通过剩余 1 项";
+  return allBacklog ? `全部批准（${approvableEntries.length}）` : `全部通过（${approvableEntries.length}）`;
+}
+
+function isGroupReadyForAutoSend(params: {
+  snap: TaskApprovalGroupSnapshot;
+  allHandled: boolean;
+  noteOpen: boolean;
+  groupNote: string;
+  batchError: string | null;
+  sendStatus: SummarySendStatus;
+  hasSendUserText: boolean;
+}): boolean {
+  const { snap, allHandled, noteOpen, groupNote, batchError, sendStatus, hasSendUserText } = params;
+  if (!allHandled || snap.decidedCount < 1 || !hasSendUserText) return false;
+  if (snap.anyLoading || snap.anyDeciding || snap.batchApproving || snap.sent) return false;
+  if (noteOpen || groupNote.trim() || batchError) return false;
+  return sendStatus === "idle";
+}
+
+function buildFooterDisplayState(params: {
+  snap: TaskApprovalGroupSnapshot;
+  approvableEntries: readonly TaskApprovalGroupEntry[];
+  chatBusy: boolean;
+  hasSendUserText: boolean;
+  noteOpen: boolean;
+  groupNote: string;
+  batchError: string | null;
+  sendStatus: SummarySendStatus;
+}) {
+  const { snap, approvableEntries, chatBusy, hasSendUserText, noteOpen, groupNote, batchError, sendStatus } = params;
+  const sendingSummary = sendStatus === "sending";
+  const autoSendFailed = sendStatus === "failed";
+  const busy = chatBusy || snap.batchApproving || snap.anyDeciding || sendingSummary;
+  const canSend = hasSendUserText && snap.decidedCount >= 1 && !busy;
+  const remaining = Math.max(0, snap.totalCount - snap.handledCount);
+  const allHandled = remaining === 0 && snap.handledCount > 0 && !snap.anyLoading && snap.approvableCount === 0;
+  const readyForAutoSend = isGroupReadyForAutoSend({
+    snap, allHandled, noteOpen, groupNote, batchError, sendStatus, hasSendUserText,
+  });
+  const hint = resolveFooterHint({
+    sendingSummary,
+    autoSendFailed,
+    readyForAutoSend,
+    chatBusy,
+    batchApproving: snap.batchApproving,
+    hasSendUserText,
+    decidedCount: snap.decidedCount,
+    allHandled,
+    remaining,
+  });
+  const approveAllLabel = formatApproveAllLabel(approvableEntries);
+
+  return { busy, canSend, allHandled, readyForAutoSend, sendingSummary, hint, approveAllLabel };
+}
+
+type FooterDisplayState = ReturnType<typeof buildFooterDisplayState>;
+
+function summaryFailMessage(auto: boolean, unaccepted: boolean): string {
+  if (auto) {
+    return unaccepted
+      ? "全部审批已生效，但自动通知助手未受理，请点击「重试发送审批结果」。"
+      : "全部审批已生效，但自动通知助手失败，请点击「重试发送审批结果」。";
+  }
+  return unaccepted
+    ? "发送审批结果未受理，请点击「重试发送审批结果」。"
+    : "发送审批结果失败，请点击「重试发送审批结果」。";
+}
+
+function useTaskApprovalSummaryDelivery(params: {
+  store: TaskApprovalGroupStore | null;
+  sendUserText?: ChatInteraction["sendUserText"];
+}) {
+  const { store, sendUserText } = params;
+  const [sendStatus, setSendStatus] = useState<SummarySendStatus>("idle");
+  const [sendError, setSendError] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
+  const mountedRef = useRef(true);
+  const storeRef = useRef(store);
+  const sendUserTextRef = useRef(sendUserText);
+
+  storeRef.current = store;
+  sendUserTextRef.current = sendUserText;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const deliverSummary = useCallback(async (text: string, opts: { auto: boolean }): Promise<boolean> => {
+    const targetStore = storeRef.current;
+    const sender = sendUserTextRef.current;
+    if (!targetStore || !sender || inFlightRef.current) return false;
+    const current = targetStore.getSnapshot();
+    if (current.sent || current.decidedCount < 1 || current.batchApproving || current.anyDeciding) return false;
+
+    const isStillCurrent = () =>
+      mountedRef.current && storeRef.current === targetStore && !targetStore.getSnapshot().sent;
+    const failWith = (unaccepted: boolean) => {
+      if (!isStillCurrent()) return false;
+      setSendStatus("failed");
+      setSendError(summaryFailMessage(opts.auto, unaccepted));
+      return false;
+    };
+    const settle = (accepted: unknown): boolean => {
+      if (!isStillCurrent()) return false;
+      if (accepted === false) return failWith(true);
+      targetStore.markSent();
+      setSendStatus("sent");
+      setSendError(null);
+      return true;
+    };
+
+    inFlightRef.current = true;
+    setSendError(null);
+    try {
+      const result = sender(text);
+      if (isPromiseLike(result)) {
+        setSendStatus("sending");
+        try {
+          return settle(await result);
+        } catch {
+          return failWith(false);
+        } finally {
+          inFlightRef.current = false;
+        }
+      }
+      inFlightRef.current = false;
+      return settle(result);
+    } catch {
+      inFlightRef.current = false;
+      return failWith(false);
     }
-    return out;
-  }, [snap]);
+  }, []);
 
-  const allPendingAreBacklog =
-    approvableEntries.length > 0 && approvableEntries.every((e) => e.ticketStatus === "backlog");
+  return { sendStatus, sendError, deliverSummary };
+}
 
-  const summaryText = useMemo(() => {
-    if (!snap) return "";
-    return formatTaskApprovalSummary(snap.entries, groupNote);
-  }, [snap, groupNote]);
+function resolveBatchErrorFromFailedKeys(
+  snap: TaskApprovalGroupSnapshot | null,
+  failedBatchKeys: readonly string[],
+): string | null {
+  if (!snap || failedBatchKeys.length === 0) return null;
+  const settled = new Set<string>();
+  for (const e of snap.entries) {
+    if (e.decision || e.alreadySettledExternally) {
+      settled.add(normalizeTicketKey(e.identifier || e.ticketId));
+    }
+  }
+  const unresolved = failedBatchKeys.filter((k) => !settled.has(k));
+  return unresolved.length > 0 ? `有 ${unresolved.length} 项审批未成功，请查看上方对应卡片重试。` : null;
+}
 
-  const handleApproveAll = useCallback(async () => {
-    if (!store || approvableEntries.length === 0 || chatBusy) return;
-    setBatchError(null);
+function useTaskApprovalBatchApprove(params: {
+  store: TaskApprovalGroupStore | null;
+  approvableEntries: readonly TaskApprovalGroupEntry[];
+  chatBusy: boolean;
+  setFailedBatchKeys: (keys: string[]) => void;
+}) {
+  const { store, approvableEntries, chatBusy, setFailedBatchKeys } = params;
+  const mountedRef = useRef(true);
+  const chatBusyRef = useRef(chatBusy);
+  chatBusyRef.current = chatBusy;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  return useCallback(async () => {
+    if (!store || approvableEntries.length === 0 || chatBusyRef.current) return;
+    setFailedBatchKeys([]);
     store.setBatchApproving(true);
-    let failed = 0;
+    const failedKeys: string[] = [];
     try {
       for (const entry of approvableEntries) {
-        const trigger = entry.triggerApprove;
-        if (!trigger) continue;
+        if (!entry.triggerApprove) continue;
+        const normKey = normalizeTicketKey(entry.identifier || entry.ticketId);
         try {
-          const ok = await trigger();
-          if (!ok) failed += 1;
+          if (!(await entry.triggerApprove())) failedKeys.push(normKey);
         } catch {
-          failed += 1;
+          failedKeys.push(normKey);
         }
       }
     } finally {
       store.setBatchApproving(false);
     }
-    if (failed > 0) {
-      setBatchError(`有 ${failed} 项审批未成功，请查看上方对应卡片重试。`);
+    if (mountedRef.current && failedKeys.length > 0) {
+      setFailedBatchKeys(failedKeys);
     }
-  }, [store, approvableEntries, chatBusy]);
+  }, [store, approvableEntries, setFailedBatchKeys]);
+}
 
-  const handleSendSummary = useCallback(() => {
-    if (!store || !sendUserText || !snap || snap.decidedCount < 1 || snap.batchApproving || chatBusy) return;
-    setBatchError(null);
-    store.markSent();
-    sendUserText(summaryText);
-  }, [store, sendUserText, snap, chatBusy, summaryText]);
+function TaskApprovalGroupSentNotice({ snap }: { snap: TaskApprovalGroupSnapshot }) {
+  const unhandled = Math.max(0, snap.totalCount - snap.handledCount);
+  return (
+    <p data-testid="task-approval-group-sent" className="flex items-center gap-1.5 px-1 text-caption text-faint">
+      <ClipboardCheck className="size-3.5 text-success" strokeWidth={1.75} />
+      {unhandled > 0 ? `已汇总发送审批结果（另有 ${unhandled} 项标为暂未处理）。` : "已汇总发送全部审批结果。"}
+    </p>
+  );
+}
 
-  if (!store || !snap || !snap.grouped || !taskApproval) return null;
-
-  // 全部卡片加载完成且都是历史已生效状态（0 待批且本页 0 操作）→ 历史记录不渲染多余操作条。
-  const hasAnyActionableOrSessionWork =
-    snap.anyLoading || snap.approvableCount > 0 || snap.decidedCount > 0 || snap.sent;
-  if (!hasAnyActionableOrSessionWork) return null;
-
-  if (snap.sent) {
-    const unhandled = Math.max(0, snap.totalCount - snap.handledCount);
-    return (
-      <p
-        data-testid="task-approval-group-sent"
-        className="flex items-center gap-1.5 px-1 text-caption text-faint"
-      >
-        <ClipboardCheck className="size-3.5 text-success" strokeWidth={1.75} />
-        {unhandled > 0
-          ? `已汇总发送审批结果（另有 ${unhandled} 项标为暂未处理）。`
-          : "已汇总发送全部审批结果。"}
-      </p>
-    );
-  }
-
-  const busy = !!chatBusy || snap.batchApproving || snap.anyDeciding;
-  const canSend = !!sendUserText && snap.decidedCount >= 1 && !busy;
-  const remaining = Math.max(0, snap.totalCount - snap.handledCount);
-  const allHandled = remaining === 0 && snap.handledCount > 0 && !snap.anyLoading;
-
-  const hint = chatBusy
-    ? "等待当前回合结束后可操作"
-    : snap.batchApproving
-      ? "正在逐项提交审批…"
-      : !sendUserText
-        ? "单据已实时生效，请手动回复助手继续"
-        : snap.decidedCount === 0
-          ? "单张审批实时生效，批完后一起发给助手"
-          : allHandled
-            ? "全部已处理，可一次性发给助手"
-            : `还有 ${remaining} 项未处理，现在也可先发送`;
-
-  const approveAllLabel =
-    approvableEntries.length === 1
-      ? allPendingAreBacklog
-        ? "批准剩余 1 项"
-        : "通过剩余 1 项"
-      : allPendingAreBacklog
-        ? `全部批准（${approvableEntries.length}）`
-        : `全部通过（${approvableEntries.length}）`;
-
+function TaskApprovalGroupFooterCard(props: {
+  snap: TaskApprovalGroupSnapshot;
+  display: FooterDisplayState;
+  approvableCount: number;
+  sendStatus: SummarySendStatus;
+  hasSendUserText: boolean;
+  chatBusy: boolean;
+  noteOpen: boolean;
+  groupNote: string;
+  errorMessage: string | null;
+  onApproveAll: () => void;
+  onToggleNote: () => void;
+  onNoteChange: (val: string) => void;
+  onSendSummary: () => void;
+}) {
+  const {
+    snap, display, approvableCount, sendStatus, hasSendUserText, chatBusy, noteOpen, groupNote,
+    errorMessage, onApproveAll, onToggleNote, onNoteChange, onSendSummary,
+  } = props;
+  const { busy, canSend, allHandled, sendingSummary, hint, approveAllLabel } = display;
   return (
     <div
       data-testid="task-approval-group-footer"
@@ -490,73 +665,99 @@ export function TaskApprovalGroupFooter() {
           <span className="inline-flex items-center rounded-md bg-accent-soft px-1.5 py-0.5 font-mono text-caption font-semibold tabular-nums text-accent">
             {snap.handledCount} / {snap.totalCount}
           </span>{" "}
-          项
-          {hint ? <span className="text-faint"> · {hint}</span> : null}
+          项{hint ? <span className="text-faint"> · {hint}</span> : null}
         </output>
-
         <div className="flex flex-wrap items-center gap-2">
-          {approvableEntries.length >= 1 ? (
+          {approvableCount >= 1 ? (
             <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              data-testid="task-approval-approve-all"
-              disabled={busy}
-              loading={snap.batchApproving}
-              onClick={() => void handleApproveAll()}
+              type="button" variant="secondary" size="sm" data-testid="task-approval-approve-all"
+              disabled={busy} loading={snap.batchApproving} onClick={onApproveAll}
             >
               <CheckCheck className="size-3.5" strokeWidth={1.75} />
               {approveAllLabel}
             </Button>
           ) : null}
-
-          {sendUserText ? (
+          {hasSendUserText ? (
             <>
               <button
-                type="button"
-                aria-expanded={noteOpen}
-                disabled={busy}
-                onClick={() => setNoteOpen((v) => !v)}
+                type="button" aria-expanded={noteOpen} disabled={busy} onClick={onToggleNote}
                 className="oc-btn-tactile rounded-md px-2 py-1 text-caption font-medium text-muted transition-colors hover:bg-hover hover:text-fg disabled:opacity-40 [@media(hover:none)]:min-h-11"
               >
                 {noteOpen ? "收起补充说明" : "补充说明"}
               </button>
               <Button
-                type="button"
-                variant={allHandled ? "accent" : "primary"}
-                size="sm"
-                data-testid="task-approval-send-summary"
-                disabled={!canSend}
-                title={chatBusy ? "等待当前回合结束后可发送" : undefined}
-                onClick={handleSendSummary}
+                type="button" variant={allHandled ? "accent" : "primary"} size="sm"
+                data-testid="task-approval-send-summary" disabled={!canSend} loading={sendingSummary}
+                title={chatBusy ? "等待当前回合结束后可发送" : undefined} onClick={onSendSummary}
               >
                 <Send className="size-3.5" strokeWidth={1.75} />
-                发送审批结果
+                {sendStatus === "failed" ? "重试发送审批结果" : "发送审批结果"}
               </Button>
             </>
           ) : null}
         </div>
       </div>
-
-      {batchError ? (
-        <p className="oc-callout oc-callout-danger rounded-md px-2.5 py-1.5 text-caption text-danger">
-          {batchError}
-        </p>
+      {errorMessage ? (
+        <p className="oc-callout oc-callout-danger rounded-md px-2.5 py-1.5 text-caption text-danger">{errorMessage}</p>
       ) : null}
-
-      {noteOpen && sendUserText ? (
+      {noteOpen && hasSendUserText ? (
         <input
-          type="text"
-          aria-label="审批补充说明"
-          data-testid="task-approval-group-note-input"
-          value={groupNote}
-          disabled={busy}
-          onChange={(e) => setGroupNote(e.target.value)}
+          type="text" aria-label="审批补充说明" data-testid="task-approval-group-note-input"
+          value={groupNote} disabled={busy} onChange={(e) => onNoteChange(e.target.value)}
           placeholder="选填：输入统一要求或优先级，随审批结果一并发出"
           className="oc-surface-recessed w-full rounded-lg border border-border-control/70 bg-elevated px-3 py-1.5 text-base text-fg outline-none transition-[border-color,box-shadow] focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-meta"
         />
       ) : null}
     </div>
+  );
+}
+
+/** 多张任务审批卡底部的统一操作与汇总发送条。 */
+export function TaskApprovalGroupFooter() {
+  const store = useTaskApprovalGroup();
+  const snap = useTaskApprovalGroupSnapshot();
+  const { taskApproval } = useToolCardActions();
+  const { sendUserText, busy: chatBusy } = useChatInteraction();
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [groupNote, setGroupNote] = useState("");
+  const [failedBatchKeys, setFailedBatchKeys] = useState<string[]>([]);
+
+  const approvableEntries = useMemo(() => selectApprovableEntries(snap), [snap]);
+  const summaryText = useMemo(() => (snap ? formatTaskApprovalSummary(snap.entries, groupNote) : ""), [snap, groupNote]);
+  const batchError = useMemo(() => resolveBatchErrorFromFailedKeys(snap, failedBatchKeys), [snap, failedBatchKeys]);
+  const { sendStatus, sendError, deliverSummary } = useTaskApprovalSummaryDelivery({ store, sendUserText });
+  const handleApproveAll = useTaskApprovalBatchApprove({ store, approvableEntries, chatBusy: Boolean(chatBusy), setFailedBatchKeys });
+
+  const display = snap
+    ? buildFooterDisplayState({
+        snap, approvableEntries, chatBusy: Boolean(chatBusy), hasSendUserText: Boolean(sendUserText),
+        noteOpen, groupNote, batchError, sendStatus,
+      })
+    : null;
+  const readyForAutoSend = Boolean(store && snap?.grouped && taskApproval && display?.readyForAutoSend);
+
+  useEffect(() => {
+    if (!readyForAutoSend || chatBusy) return;
+    void deliverSummary(summaryText, { auto: true });
+  }, [readyForAutoSend, chatBusy, deliverSummary, summaryText]);
+
+  const handleSendSummary = useCallback(() => {
+    if (!store || !sendUserText || !snap || snap.decidedCount < 1 || snap.batchApproving || chatBusy) return;
+    setFailedBatchKeys([]);
+    void deliverSummary(summaryText, { auto: false });
+  }, [store, sendUserText, snap, chatBusy, deliverSummary, summaryText]);
+
+  if (!store || !snap || !snap.grouped || !taskApproval || !display) return null;
+  if (!(snap.anyLoading || snap.approvableCount > 0 || snap.decidedCount > 0 || snap.sent)) return null;
+  if (snap.sent) return <TaskApprovalGroupSentNotice snap={snap} />;
+
+  return (
+    <TaskApprovalGroupFooterCard
+      snap={snap} display={display} approvableCount={approvableEntries.length} sendStatus={sendStatus}
+      hasSendUserText={Boolean(sendUserText)} chatBusy={Boolean(chatBusy)} noteOpen={noteOpen} groupNote={groupNote}
+      errorMessage={batchError ?? sendError} onApproveAll={() => void handleApproveAll()}
+      onToggleNote={() => setNoteOpen((v) => !v)} onNoteChange={setGroupNote} onSendSummary={handleSendSummary}
+    />
   );
 }
 

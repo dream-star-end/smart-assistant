@@ -19,7 +19,7 @@ const MODE_CARDS: ReadonlyArray<{
   mode: GovernanceMode; title: string; subtitle: string;
   tone: "success" | "warning" | "danger"; activeRing: string; icon: typeof Zap;
 }> = [
-  { mode: "autonomous", title: "全自动自治", subtitle: "自动修复、审计与自托管发版；触及高危红线时自动拦截待你拍板。", tone: "success", activeRing: "border-success bg-success-soft/40", icon: Zap },
+  { mode: "autonomous", title: "全自动自治", subtitle: "仅在可能影响用户体验或改变计费方式时拦下待你拍板，其余改动均自动审批放行。", tone: "success", activeRing: "border-success bg-success-soft/40", icon: Zap },
   { mode: "debt_first", title: "仅修债暂停新功能", subtitle: "冻结新功能自动合入，仅保留故障修复、安全维护与稳定性治理。", tone: "warning", activeRing: "border-warning bg-warning-soft/45", icon: PauseCircle },
   { mode: "emergency_stop", title: "紧急急停", subtitle: "立即冻结全部自动合入与自动发版，等待管理员排查后手动恢复。", tone: "danger", activeRing: "oc-callout oc-callout-danger", icon: ShieldAlert },
 ];
@@ -292,7 +292,7 @@ function ApprovalInboxSection(props: {
   return (
     <SectionCard
       title="待你拍板"
-      hint="高风险改动已自动拦下，由你一键批准放行或驳回退回。"
+      hint="仅在可能影响用户体验或改变计费方式时拦下待你拍板，其余改动均已自动审批放行。"
       icon={Inbox}
       iconTone={pending.length > 0 ? "warning" : "success"}
       action={<Badge tone={pending.length > 0 ? "warning" : "success"}>{pending.length} 项待处理</Badge>}
@@ -601,7 +601,7 @@ export function GovernancePage() {
     <div className="space-y-5">
       <PageHeader
         title="自治治理"
-        desc="个人版自托管可视化控制面：物理总闸、熔断解锁、一键审批拍板与健康驾驶舱。"
+        desc="仅在可能影响用户体验或改变计费方式时拦下待你拍板，其余改动均自动审批放行；支持总闸切换、熔断解锁与健康驾驶舱。"
         icon={Shield}
         actions={
           <Button variant="secondary" size="sm" loading={ctrl.loading} onClick={() => void ctrl.loadOverview()}>
