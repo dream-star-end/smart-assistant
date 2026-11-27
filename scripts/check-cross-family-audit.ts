@@ -501,6 +501,7 @@ async function main(argv: string[]): Promise<number> {
         headRef,
         requireRootOwner: false,
       })
+      const requestedBaseSha = baseRef ? resolveGitSha(root, baseRef) : gate.baseSha
       console.log(
         JSON.stringify({
           authorModel: cross.devModel,
@@ -508,7 +509,8 @@ async function main(argv: string[]): Promise<number> {
           stewardModel: cross.auditModel,
           stewardFamily: cross.auditFamily,
           headSha: gate.headSha,
-          baseSha: gate.baseSha,
+          baseSha: requestedBaseSha,
+          diffBaseSha: gate.baseSha,
           risk: gate.risk,
         }),
       )

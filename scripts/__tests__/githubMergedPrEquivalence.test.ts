@@ -1567,7 +1567,7 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
     // C1 touches A0 billing/ledger.ts AND high-risk gateway T2 path; C2..C21 are 20 more commits (21 total!)
     repo.write('packages/commercial/src/billing/ledger.ts', 'export const ledgerV = 21\n')
     repo.write('packages/gateway/src/over20.ts', 'export const over20 = 1\n')
-    repo.commit('feat(v5): c1 A0 + gateway change')
+    const c1Sha = repo.commit('feat(v5): c1 A0 + gateway change')
     let tipSha = ''
     for (let i = 2; i <= 21; i++) {
       repo.write('packages/web-react/src/components/Btn.tsx', `export const Btn = () => "v${i}"\n`)
@@ -1795,6 +1795,45 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
       rA021MidRev.ok,
       false,
       'F2: intermediate commit A0 revocation in 21-commit range MUST block aggregate A0 receipt',
+    )
+
+    // F2b: Intermediate A0-touching commit C1 with narrow scope-invalid status MUST block 21-commit aggregate A0 receipt!
+    const rA021C1NarrowInvalid = await runCheckA0MonotonicAsync({
+      root: repo.dir,
+      base: repo.baseSha,
+      head: tipSha,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: async (url) => {
+          const p = new URL(url).pathname
+          if (p === `/repos/${TEST_REPO}/commits/${c1Sha}/statuses`) {
+            return {
+              ok: true,
+              status: 200,
+              headers: { get: () => null },
+              json: async () => [
+                {
+                  id: 997,
+                  context: 'oc-v5/a0-approval',
+                  state: 'success',
+                  description: `sha=${c1Sha.slice(0, 12)} exp=${futureExp} paths=docs/unrelated.md | Narrow scope does not cover ledger.ts`,
+                  creator: { login: 'dream-star-end' },
+                },
+              ],
+            }
+          }
+          return { ok: true, status: 200, headers: { get: () => null }, json: async () => [] }
+        },
+      },
+    })
+    assert.equal(
+      rA021C1NarrowInvalid.ok,
+      false,
+      'F2: 21-commit A0 scan MUST evaluate each A0 commit against its real paths and block scope-invalid status',
     )
 
     // 5. Offline 2-commit A0 range where S1 is unapproved and ONLY plain tip S2 receipt exists -> MUST FAIL!
@@ -2318,7 +2357,34 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
       'F3: direct GitHub A0 approve on S MUST STILL block on revocation on equivalent H',
     )
 
-    // F4: explicitReceiptPath MUST NOT bypass online GitHub VETO!
+    // F1b: --steward-preflight also preserves requestedBaseSha (not merge-base) on diverged base!
+    const preflightOut = execFileSync(
+      process.execPath,
+      [
+        '--import',
+        path.join(REPO_ROOT, 'node_modules/tsx/dist/loader.mjs'),
+        path.join(REPO_ROOT, 'scripts/check-cross-family-audit.ts'),
+        '--steward-preflight',
+        '--root',
+        repoDiv.dir,
+        '--base',
+        divergedBase,
+        '--head',
+        divHead,
+        '--author-model',
+        'antigravity-gemini-4-neon',
+      ],
+      { encoding: 'utf8' },
+    )
+    const preflightJson = JSON.parse(preflightOut) as { baseSha: string; diffBaseSha: string }
+    assert.equal(
+      preflightJson.baseSha,
+      divergedBase,
+      'F1: preflight baseSha MUST preserve requested diverged base',
+    )
+    assert.notEqual(preflightJson.baseSha, preflightJson.diffBaseSha)
+
+    // F4: explicitReceiptPath MUST NOT bypass online GitHub VETO OR shadow existing host HARD VETO on same SHA!
     const expFile = path.join(vetoDir, 'explicit-approve.json')
     writeFileSync(
       expFile,
@@ -2335,6 +2401,48 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
         2,
       ),
     )
+    const hostVetoS = signArchStewardReceipt(
+      makeStewardReceipt({
+        headSha: sF3,
+        baseSha: repoF3.baseSha,
+        verdict: 'veto',
+        blockers: [
+          {
+            dimension: 'boundaryIntegrity',
+            severity: 'P1',
+            location: 'packages/gateway/src/f3.ts',
+            reason: 'host veto on S',
+          },
+        ],
+        dimensions: {
+          godClassAppend: { status: 'pass', notes: 'ok' },
+          wheelReinvention: { status: 'pass', notes: 'ok' },
+          boundaryIntegrity: { status: 'veto', notes: 'veto' },
+          complexityDrift: { status: 'pass', notes: 'ok' },
+        },
+      }),
+      hmacKey,
+    )
+    const hostVetoDirS = mkdtempSync(path.join(tmpdir(), 'ocv5-912-f4-hostveto-'))
+    t.after(() => rmSync(hostVetoDirS, { recursive: true, force: true }))
+    writeFileSync(path.join(hostVetoDirS, `${sF3}.json`), JSON.stringify(hostVetoS, null, 2))
+    const rF4HostShadow = await runStewardGateAsync({
+      root: repoF3.dir,
+      mode: 'enforce-commit',
+      baseRef: repoF3.baseSha,
+      headRef: sF3,
+      explicitReceiptPath: expFile,
+      receiptDirs: [hostVetoDirS],
+      requireRootOwner: false,
+      hmacKey,
+      requireHmac: true,
+    })
+    assert.equal(
+      rF4HostShadow.ok,
+      false,
+      'F4: explicit positive file MUST NOT shadow existing host HARD VETO on same SHA',
+    )
+
     const rF4 = await runStewardGateAsync({
       root: repoF3.dir,
       mode: 'enforce-commit',
@@ -2363,7 +2471,7 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
     })
     assert.equal(rF4.ok, false, 'F4: explicitReceiptPath MUST NOT bypass online GitHub VETO')
 
-    // W1: Strict standalone range= token parsing rejects embedded/duplicate tokens
+    // W1: Strict standalone range= token parsing rejects embedded, duplicate, and empty range= tokens
     const b12 = SHA_P1.slice(0, 12)
     const h12 = SHA_S.slice(0, 12)
     assert.equal(hasExplicitA0RangeBinding(`range=${b12}..${h12} approved`, SHA_P1, SHA_S), true)
@@ -2378,6 +2486,10 @@ describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate 
         SHA_P1,
         SHA_S,
       ),
+      false,
+    )
+    assert.equal(
+      hasExplicitA0RangeBinding(`range= range=${b12}..${h12} approved`, SHA_P1, SHA_S),
       false,
     )
 

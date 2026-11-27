@@ -98,7 +98,13 @@ export function checkLocalHostStewardVeto(opts: StewardHostReceiptConfig & { tar
     requireHmac: opts.requireHmac,
     rootFileIntegrity: Boolean(lookup.rootOwnerVerified),
   })
-  if (ver.violations.some((v) => v.code === 'STEWARD-HARD-VETO')) {
+  const integrityFailed = ver.violations.some(
+    (v) =>
+      v.code === 'STEWARD-RECEIPT-SHA-MISMATCH' ||
+      v.code === 'STEWARD-RECEIPT-DIGEST-MISMATCH' ||
+      v.code === 'STEWARD-RECEIPT-SCHEMA-INVALID',
+  )
+  if (!integrityFailed && ver.violations.some((v) => v.code === 'STEWARD-HARD-VETO')) {
     return { vetoed: true, receiptLookup: lookup, receiptVerification: ver }
   }
   return { vetoed: false }
@@ -637,15 +643,27 @@ export async function resolveStewardGateOnlineAsync(
 ): Promise<StewardOnlineGateOutput> {
   const base = { mode: opts.mode, headSha: opts.headSha, baseSha: opts.baseSha, risk: opts.risk }
   const failExit: 0 | 1 = opts.mode === 'check-only' ? 0 : 1
-  // F4: Explicit receipt file selects the positive local receipt source ONLY; it MUST NOT bypass
-  // range classification or negative-vote checks (and a failing explicit file never falls back to GitHub approve).
-  if (opts.explicitReceiptPath && !opts.passed) {
-    return {
-      ...base,
-      ok: false,
-      exitCode: failExit,
-      receiptLookup: opts.receiptLookup,
-      receiptVerification: opts.receiptVerification,
+  // F4: Explicit receipt file selects the positive local receipt source ONLY; it MUST NOT shadow
+  // an existing trusted host HARD VETO on headSha, nor bypass range/GitHub negative-vote checks.
+  if (opts.explicitReceiptPath) {
+    if (!opts.passed) {
+      return {
+        ...base,
+        ok: false,
+        exitCode: failExit,
+        receiptLookup: opts.receiptLookup,
+        receiptVerification: opts.receiptVerification,
+      }
+    }
+    const existingHostVeto = checkLocalHostStewardVeto({ ...opts, targetSha: opts.headSha })
+    if (existingHostVeto.vetoed) {
+      return {
+        ...base,
+        ok: false,
+        exitCode: failExit,
+        receiptLookup: existingHostVeto.receiptLookup,
+        receiptVerification: existingHostVeto.receiptVerification,
+      }
     }
   }
   const rangeInfo =
@@ -669,24 +687,9 @@ export async function resolveStewardGateOnlineAsync(
     }
   }
 
-  // F2: 21..100 linear commits (`oversized`) require an explicit aggregate host receipt bound to
-  // BOTH baseSha & headSha AND a complete negative-vote scan across ALL N commits!
-  if (rangeInfo.kind === 'oversized') {
-    if (!opts.passed) {
-      return {
-        ...base,
-        ok: false,
-        exitCode: failExit,
-        receiptLookup: {
-          found: opts.receiptLookup?.found ?? false,
-          channel: opts.receiptLookup?.channel,
-          source: `range:${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)}`,
-          error: `${rangeInfo.reason}; require aggregate host Steward receipt bound to both baseSha and headSha`,
-          searchedLocations: opts.receiptLookup?.searchedLocations ?? [],
-        },
-        receiptVerification: opts.receiptVerification,
-      }
-    }
+  // F2: Both `multi` (2..20) and `oversized` (21..100) accept an explicit aggregate host receipt
+  // ONLY after scanning ALL N commits for local/GitHub negative/incomplete/invalid votes!
+  if ((rangeInfo.kind === 'oversized' || rangeInfo.kind === 'multi') && opts.passed) {
     const negHit = await checkStewardRangeNegativeVotes(rangeInfo.commits, opts)
     if (negHit) return negHit
     return {
@@ -697,19 +700,23 @@ export async function resolveStewardGateOnlineAsync(
       receiptVerification: opts.receiptVerification,
     }
   }
+  if (rangeInfo.kind === 'oversized') {
+    return {
+      ...base,
+      ok: false,
+      exitCode: failExit,
+      receiptLookup: {
+        found: opts.receiptLookup?.found ?? false,
+        channel: opts.receiptLookup?.channel,
+        source: `range:${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)}`,
+        error: `${rangeInfo.reason}; require aggregate host Steward receipt bound to both baseSha and headSha`,
+        searchedLocations: opts.receiptLookup?.searchedLocations ?? [],
+      },
+      receiptVerification: opts.receiptVerification,
+    }
+  }
 
   if (rangeInfo.kind === 'multi') {
-    if (opts.passed) {
-      const negHit = await checkStewardRangeNegativeVotes(rangeInfo.commits, opts)
-      if (negHit) return negHit
-      return {
-        ...base,
-        ok: true,
-        exitCode: 0,
-        receiptLookup: opts.receiptLookup,
-        receiptVerification: opts.receiptVerification,
-      }
-    }
     const rangeRes = await verifyStewardCommitRangeFallback({ ...opts, commits: rangeInfo.commits })
     return {
       ...base,

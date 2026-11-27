@@ -18,6 +18,7 @@
 import {
   type ApprovalVerification,
   computeA0ReceiptDigest,
+  verifyA0ApprovalReceipt,
   verifyA0ApprovalUnified,
 } from './a0ApprovalReceipt.js'
 import { type FirstParentRangeInfo, inspectFirstParentRange } from './gitRangeInspect.js'
@@ -49,9 +50,9 @@ export interface A0CommitRangeOptions {
   github?: A0RangeGithubConfig
 }
 
-const RANGE_TOKEN_RE = /(?:^|[\s|;])range=([^\s|;]+)(?=$|[\s|;])/gi
+const RANGE_TOKEN_RE = /(?:^|[\s|;])range=([^\s|;]*)(?=$|[\s|;])/gi
 
-/** W1: Strict standalone token check — requires exact `range=<base12>..<head12>` with no conflicting duplicates. */
+/** W1: Strict standalone token check — counts ALL `range=` tokens (including empty) and requires exact match. */
 export function hasExplicitA0RangeBinding(
   reason: string,
   baseSha: string,
@@ -67,20 +68,21 @@ export function hasExplicitA0RangeBinding(
   return found.length === 1 && found[0] === expected
 }
 
-async function checkNonA0CommitOnlineNegativeVote(
+async function checkCommitOnlineNegativeVote(
   commitSha: string,
+  commitA0Paths: readonly string[],
   opts: Omit<A0CommitRangeOptions, 'commits' | 'classifyCommitA0Paths'>,
 ): Promise<Extract<ApprovalVerification, { valid: false }> | null> {
   const ghRepo = opts.github?.repo?.trim()
   const ghToken = opts.github?.token?.trim()
   if (!ghRepo || !ghToken) return null
-  // W2: Pass empty a0Paths (`[]`) so a valid narrow-scope status on a non-A0 commit is not falsely
-  // marked invalid for failing to cover another commit's A0 path, while revocation/malformed/incomplete still block.
+  // F2/W2: Pass each commit's actual A0 paths (`[]` for truly non-A0 commits, real paths for A0 commits)
+  // so scope-invalid statuses on A0 commits are caught identically across 2..20 and 21..100 ranges.
   const ghRes = await verifyGithubA0Approval({
     repo: ghRepo,
     token: ghToken,
     headSha: commitSha,
-    a0Paths: [],
+    a0Paths: commitA0Paths,
     trustedApprovers: opts.github?.trustedApprovers,
     apiBaseUrl: opts.github?.apiBaseUrl,
     allowMergedPrCarryOver: true,
@@ -103,13 +105,16 @@ async function checkNonA0CommitOnlineNegativeVote(
 
 async function scanCommitsForOnlineA0NegativeVotes(
   commits: readonly string[],
-  opts: Omit<A0CommitRangeOptions, 'commits' | 'classifyCommitA0Paths'>,
+  opts: Omit<A0CommitRangeOptions, 'commits'>,
 ): Promise<Extract<ApprovalVerification, { valid: false }> | null> {
   let revokedHit: Extract<ApprovalVerification, { valid: false }> | undefined
   let incompleteHit: Extract<ApprovalVerification, { valid: false }> | undefined
   let invalidHit: Extract<ApprovalVerification, { valid: false }> | undefined
+  let parent = opts.baseSha
   for (const commitSha of commits) {
-    const neg = await checkNonA0CommitOnlineNegativeVote(commitSha, opts)
+    const commitA0Paths = opts.classifyCommitA0Paths(parent, commitSha)
+    parent = commitSha
+    const neg = await checkCommitOnlineNegativeVote(commitSha, commitA0Paths, opts)
     if (!neg) continue
     if (neg.revoked) revokedHit = revokedHit ?? neg
     else if (neg.incomplete) incompleteHit = incompleteHit ?? neg
@@ -136,7 +141,7 @@ export async function verifyA0CommitRangeFallback(
     const commitA0Paths = opts.classifyCommitA0Paths(parent, commitSha)
     parent = commitSha
     if (commitA0Paths.length === 0) {
-      const neg = await checkNonA0CommitOnlineNegativeVote(commitSha, opts)
+      const neg = await checkCommitOnlineNegativeVote(commitSha, [], opts)
       if (neg) {
         if (neg.revoked) revokedHit = revokedHit ?? neg
         else if (neg.incomplete) incompleteHit = incompleteHit ?? neg
@@ -219,6 +224,25 @@ async function verifyExplicitAggregateRangeA0Approval(
   opts: Omit<A0CommitRangeOptions, 'commits' | 'classifyCommitA0Paths'>,
   fallbackFailure: Extract<ApprovalVerification, { valid: false }>,
 ): Promise<ApprovalVerification> {
+  // W2: All commits (including headSha with its actual per-commit A0 paths) have already been
+  // scanned online for revocation/denial/incomplete/invalid before reaching aggregate fallback.
+  // Check the aggregate host receipt directly first so a valid narrow-scope status on a non-A0
+  // tip cannot falsely invalidate a valid host aggregate receipt covering aggregateA0Paths.
+  const hostRes = verifyA0ApprovalReceipt({
+    approvalDir: opts.approvalDir,
+    targetSha: opts.headSha,
+    a0Paths: opts.aggregateA0Paths,
+    requireRootOwner: opts.requireRootOwner,
+    hmacKeyFile: opts.hmacKeyFile,
+    hmacKey: opts.hmacKey,
+    nowMs: opts.nowMs,
+  })
+  if (
+    hostRes.valid &&
+    hasExplicitA0RangeBinding(hostRes.receipt.reason, opts.baseSha, opts.headSha)
+  ) {
+    return hostRes
+  }
   const direct = await verifyA0ApprovalUnified({
     approvalDir: opts.approvalDir,
     targetSha: opts.headSha,
