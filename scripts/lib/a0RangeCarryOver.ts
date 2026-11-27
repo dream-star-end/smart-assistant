@@ -1,16 +1,17 @@
 /**
  * Multi-Commit A0 Release-Train Range Verification (OCV5-912).
  *
- * Separated cleanly from Steward range verification (`commitRangeCarryOver.ts`) so A0 and
- * Steward range orchestration remain single-responsibility and independently A0-protected.
- *
  * Security invariants (B2 / B3 / B4 / B5):
- *   - On multi-commit first-parent ranges (`N >= 2`), ALWAYS decomposes commit-by-commit FIRST.
- *   - Every commit touching A0 paths under the pinned base policy must have its own valid,
- *     non-revoked, non-incomplete A0 approval; union of approved paths must cover 100% of the
- *     aggregate A0 diff.
- *   - Only allows a direct aggregate tip approval (`allowMergedPrCarryOver: false`) when tip is
- *     NOT a merged PR whose approval only scoped the final sub-interval.
+ *   - On multi-commit first-parent ranges (`2 <= N <= 20`), scans EVERY commit `C1..CN`:
+ *       * Commits touching A0 paths require valid, non-revoked, non-incomplete, non-invalid A0 approval.
+ *       * Non-A0 commits (including a non-A0 release tip `headSha`) are STILL checked online for
+ *         explicit A0 revocation / `CHANGES_REQUESTED` / `incomplete` / `invalid` statuses (B3).
+ *       * Negative/incomplete/invalid votes are aggregated across the ENTIRE range before any
+ *         approval or fallback decision (never short-circuited by an earlier unapproved commit).
+ *   - For un-decomposable (`> 20` commits / non-linear) OR partially unapproved ranges (with zero
+ *     negative/incomplete/invalid votes), a tip-only single-commit approval NEVER authorizes the
+ *     range (online OR offline): ONLY an explicit aggregate approval whose signed `reason` binds
+ *     `range=<base12>..<head12>` (and has no online revocation/incomplete/invalid) may pass (B2).
  *   - Preserves actual earliest `expiresAt` across constituent approvals instead of extending TTL.
  */
 import {
@@ -18,8 +19,8 @@ import {
   computeA0ReceiptDigest,
   verifyA0ApprovalUnified,
 } from './a0ApprovalReceipt.js'
-import { verifyCommitIsMergedPr } from './githubMergedPrEquivalence.js'
-import type { FetchLike } from './githubTrustedApproval.js'
+import { type FirstParentRangeInfo, inspectFirstParentRange } from './gitRangeInspect.js'
+import { type FetchLike, verifyGithubA0Approval } from './githubTrustedApproval.js'
 
 export interface A0RangeGithubConfig {
   repo?: string
@@ -47,6 +48,47 @@ export interface A0CommitRangeOptions {
   github?: A0RangeGithubConfig
 }
 
+export function hasExplicitA0RangeBinding(
+  reason: string,
+  baseSha: string,
+  headSha: string,
+): boolean {
+  const token = `range=${baseSha.slice(0, 12).toLowerCase()}..${headSha.slice(0, 12).toLowerCase()}`
+  return reason.toLowerCase().includes(token)
+}
+
+async function checkNonA0CommitOnlineNegativeVote(
+  commitSha: string,
+  opts: A0CommitRangeOptions,
+): Promise<ApprovalVerification | null> {
+  const ghRepo = opts.github?.repo?.trim()
+  const ghToken = opts.github?.token?.trim()
+  if (!ghRepo || !ghToken) return null
+  const ghRes = await verifyGithubA0Approval({
+    repo: ghRepo,
+    token: ghToken,
+    headSha: commitSha,
+    a0Paths: opts.aggregateA0Paths,
+    trustedApprovers: opts.github?.trustedApprovers,
+    apiBaseUrl: opts.github?.apiBaseUrl,
+    allowMergedPrCarryOver: true,
+    expectedBaseRef: opts.github?.expectedBaseRef,
+    nowMs: opts.nowMs,
+    fetchImpl: opts.github?.fetchImpl,
+  })
+  if (ghRes.revoked || ghRes.denied || ghRes.incomplete || ghRes.invalid) {
+    return {
+      valid: false,
+      receiptPath: ghRes.source,
+      reason: `commit ${commitSha.slice(0, 12)} blocked by online A0 negative/invalid/incomplete status: ${ghRes.reason}`,
+      ...(ghRes.revoked || ghRes.denied ? { revoked: true } : {}),
+      ...(ghRes.incomplete ? { incomplete: true } : {}),
+      ...(ghRes.invalid ? { invalid: true } : {}),
+    }
+  }
+  return null
+}
+
 export async function verifyA0CommitRangeFallback(
   opts: A0CommitRangeOptions,
 ): Promise<ApprovalVerification> {
@@ -55,12 +97,24 @@ export async function verifyA0CommitRangeFallback(
   let primarySource: 'host-file' | 'github-status' | 'github-pr-review' = 'host-file'
   let primaryApprover: string | undefined
   let earliestExpiresMs = Number.POSITIVE_INFINITY
+  let revokedHit: ApprovalVerification | undefined
+  let incompleteHit: ApprovalVerification | undefined
+  let invalidHit: ApprovalVerification | undefined
+  let firstUnapproved: ApprovalVerification | undefined
   let parent = opts.baseSha
 
   for (const commitSha of opts.commits) {
     const commitA0Paths = opts.classifyCommitA0Paths(parent, commitSha)
     parent = commitSha
-    if (commitA0Paths.length === 0) continue
+    if (commitA0Paths.length === 0) {
+      const neg = await checkNonA0CommitOnlineNegativeVote(commitSha, opts)
+      if (neg && !neg.valid) {
+        if (neg.revoked) revokedHit = revokedHit ?? neg
+        else if (neg.incomplete) incompleteHit = incompleteHit ?? neg
+        else if (neg.invalid) invalidHit = invalidHit ?? neg
+      }
+      continue
+    }
 
     const res = await verifyA0ApprovalUnified({
       approvalDir: opts.approvalDir,
@@ -73,13 +127,19 @@ export async function verifyA0CommitRangeFallback(
       github: opts.github ? { ...opts.github, allowMergedPrCarryOver: true } : undefined,
     })
     if (!res.valid) {
-      return {
+      const fail: ApprovalVerification = {
         valid: false,
         receiptPath: res.receiptPath,
         reason: `commit ${commitSha.slice(0, 12)} unapproved A0 change (${commitA0Paths.join(', ')}): ${res.reason}`,
         ...(res.revoked ? { revoked: true } : {}),
         ...(res.incomplete ? { incomplete: true } : {}),
+        ...(res.invalid ? { invalid: true } : {}),
       }
+      if (res.revoked) revokedHit = revokedHit ?? fail
+      else if (res.incomplete) incompleteHit = incompleteHit ?? fail
+      else if (res.invalid) invalidHit = invalidHit ?? fail
+      else firstUnapproved = firstUnapproved ?? fail
+      continue
     }
     for (const p of commitA0Paths) approvedPaths.add(p)
     primarySource = res.source
@@ -88,6 +148,11 @@ export async function verifyA0CommitRangeFallback(
     if (Number.isFinite(expMs) && expMs < earliestExpiresMs) earliestExpiresMs = expMs
     approvedTrail.push(`${commitSha.slice(0, 12)}[${res.source}]`)
   }
+
+  if (revokedHit) return revokedHit
+  if (incompleteHit) return incompleteHit
+  if (invalidHit) return invalidHit
+  if (firstUnapproved) return firstUnapproved
 
   const uncovered = opts.aggregateA0Paths.filter((p) => !approvedPaths.has(p))
   if (uncovered.length > 0) {
@@ -121,29 +186,11 @@ export async function verifyA0CommitRangeFallback(
   }
 }
 
-export async function resolveA0ApprovalForMultiCommitRange(
-  opts: A0CommitRangeOptions,
+async function verifyExplicitAggregateRangeA0Approval(
+  opts: Omit<A0CommitRangeOptions, 'commits' | 'classifyCommitA0Paths'>,
+  fallbackFailure: Extract<ApprovalVerification, { valid: false }>,
 ): Promise<ApprovalVerification> {
-  const rangeRes = await verifyA0CommitRangeFallback(opts)
-  if (rangeRes.valid || rangeRes.revoked || rangeRes.incomplete) return rangeRes
-
-  // B2: Only accept an explicit direct aggregate approval on tip (NO carry-over!) when tip is NOT
-  // itself a merged PR whose approval only covered the final sub-interval!
-  const ghRepo = opts.github?.repo?.trim()
-  const ghToken = opts.github?.token?.trim()
-  const expectedBase = opts.github?.expectedBaseRef?.trim()
-  if (ghRepo && ghToken && expectedBase) {
-    const tipPr = await verifyCommitIsMergedPr({
-      repo: ghRepo,
-      token: ghToken,
-      targetSha: opts.headSha,
-      expectedBaseRef: expectedBase,
-      apiBaseUrl: opts.github?.apiBaseUrl,
-      fetchImpl: opts.github?.fetchImpl,
-    })
-    if (tipPr.incomplete || tipPr.merged) return rangeRes
-  }
-  const directTip = await verifyA0ApprovalUnified({
+  const direct = await verifyA0ApprovalUnified({
     approvalDir: opts.approvalDir,
     targetSha: opts.headSha,
     a0Paths: opts.aggregateA0Paths,
@@ -153,5 +200,55 @@ export async function resolveA0ApprovalForMultiCommitRange(
     nowMs: opts.nowMs,
     github: opts.github ? { ...opts.github, allowMergedPrCarryOver: false } : undefined,
   })
-  return directTip.valid || directTip.revoked || directTip.incomplete ? directTip : rangeRes
+  if (!direct.valid) {
+    return direct.revoked || direct.incomplete || direct.invalid ? direct : fallbackFailure
+  }
+  if (hasExplicitA0RangeBinding(direct.receipt.reason, opts.baseSha, opts.headSha)) {
+    return direct
+  }
+  return {
+    valid: false,
+    receiptPath: fallbackFailure.receiptPath,
+    reason: `${fallbackFailure.reason} (tip approval on ${opts.headSha.slice(0, 12)} lacks required aggregate binding range=${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)})`,
+  }
+}
+
+/**
+ * Resolve A0 approval for a non-PR base..head range:
+ *   - `single`: standard direct + merged-PR carry-over verification.
+ *   - `multi` (`2..20`): full commit-by-commit decomposition (with negative-vote scan across ALL
+ *     commits including non-A0 tip), falling back ONLY to an explicit `range=<base12>..<head12>`
+ *     aggregate approval if zero negative/incomplete/invalid votes exist.
+ *   - `invalid` (`>20` or non-linear): fails closed unless an explicit `range=<base12>..<head12>`
+ *     aggregate approval exists on `headSha` (plain tip-only approval NEVER passes!).
+ */
+export async function resolveA0ApprovalForBaseRange(
+  opts: Omit<A0CommitRangeOptions, 'commits'> & { rangeInfo?: FirstParentRangeInfo },
+): Promise<ApprovalVerification> {
+  const rangeInfo = opts.rangeInfo ?? inspectFirstParentRange(opts.root, opts.baseSha, opts.headSha)
+  if (rangeInfo.kind === 'single') {
+    return verifyA0ApprovalUnified({
+      approvalDir: opts.approvalDir,
+      targetSha: opts.headSha,
+      a0Paths: opts.aggregateA0Paths,
+      requireRootOwner: opts.requireRootOwner,
+      hmacKeyFile: opts.hmacKeyFile,
+      hmacKey: opts.hmacKey,
+      nowMs: opts.nowMs,
+      github: opts.github,
+    })
+  }
+  if (rangeInfo.kind === 'multi') {
+    const rangeRes = await verifyA0CommitRangeFallback({ ...opts, commits: rangeInfo.commits })
+    if (rangeRes.valid || rangeRes.revoked || rangeRes.incomplete || rangeRes.invalid) {
+      return rangeRes
+    }
+    return verifyExplicitAggregateRangeA0Approval(opts, rangeRes)
+  }
+  const invalidFail: ApprovalVerification = {
+    valid: false,
+    receiptPath: `range:${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)}`,
+    reason: `cannot decompose A0 range (${rangeInfo.reason}); require aggregate approval binding range=${opts.baseSha.slice(0, 12)}..${opts.headSha.slice(0, 12)}`,
+  }
+  return verifyExplicitAggregateRangeA0Approval(opts, invalidFail)
 }

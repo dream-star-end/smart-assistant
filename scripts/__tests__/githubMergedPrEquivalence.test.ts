@@ -261,6 +261,7 @@ function buildRefereeManifest(refereeDir: string): void {
 describe('B1: A0 & CODEOWNERS self-protection for all trust-core carry-over libraries', () => {
   const newTrustLibs = [
     'scripts/lib/globMatch.ts',
+    'scripts/lib/gitRangeInspect.ts',
     'scripts/lib/githubApprovalParsers.ts',
     'scripts/lib/githubMergedPrEquivalence.ts',
     'scripts/lib/commitRangeCarryOver.ts',
@@ -1342,6 +1343,7 @@ describe('B7: Host release train (v5-selfhost-governance-gates.sh) trusted refer
       'scripts/lib/githubApprovalParsers.ts',
       'scripts/lib/githubMergedPrEquivalence.ts',
       'scripts/lib/githubTrustedApproval.ts',
+      'scripts/lib/gitRangeInspect.ts',
       'scripts/lib/globMatch.ts',
       'scripts/lib/modelFamilyClassifier.ts',
       'scripts/lib/runtimeImagePin.ts',
@@ -1546,5 +1548,513 @@ describe('B7: Host release train (v5-selfhost-governance-gates.sh) trusted refer
       server.closeAllConnections?.()
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
+  })
+})
+
+describe('R2 P1 Closure: >20-commit cap (B2), non-A0 tip revocation & aggregate veto scan (B3), and online invalid vs host approve (B4)', () => {
+  test('R2-B2: 21-commit range rejects tip-only GitHub/offline approval and requires explicit aggregate binding; offline 2-commit plain tip receipt rejected', async (t) => {
+    const repo = initTempRepo(t)
+    const approvalDir = mkdtempSync(path.join(tmpdir(), 'ocv5-912-r2-b2-a0-'))
+    const receiptDir = mkdtempSync(path.join(tmpdir(), 'ocv5-912-r2-b2-st-'))
+    t.after(() => {
+      rmSync(approvalDir, { recursive: true, force: true })
+      rmSync(receiptDir, { recursive: true, force: true })
+    })
+    const hmacKey = 'ocv5-912-r2-b2-hmac-secret-0123456789'
+    const futureExp = new Date(Date.now() + 3_600_000).toISOString()
+
+    // C1 touches A0 billing/ledger.ts AND high-risk gateway T2 path; C2..C21 are 20 more commits (21 total!)
+    repo.write('packages/commercial/src/billing/ledger.ts', 'export const ledgerV = 21\n')
+    repo.write('packages/gateway/src/over20.ts', 'export const over20 = 1\n')
+    repo.commit('feat(v5): c1 A0 + gateway change')
+    let tipSha = ''
+    for (let i = 2; i <= 21; i++) {
+      repo.write('packages/web-react/src/components/Btn.tsx', `export const Btn = () => "v${i}"\n`)
+      tipSha = repo.commit(`ui(v5): c${i} button update`)
+    }
+
+    // 1. Steward RED on 21-commit range: tip-only GitHub approve (no baseSha!) MUST FAIL
+    const rSteward21GhOnly = await runStewardGateAsync({
+      root: repo.dir,
+      mode: 'enforce-commit',
+      baseRef: repo.baseSha,
+      headRef: tipSha,
+      receiptDirs: [receiptDir],
+      requireRootOwner: false,
+      hmacKey,
+      requireHmac: true,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch({
+          [`/repos/${TEST_REPO}/commits/${tipSha}/statuses`]: [
+            {
+              id: 1,
+              context: 'oc-v5/arch-steward',
+              state: 'success',
+              description: `verdict=approve sha=${tipSha.slice(0, 12)} author=google-gemini steward=openai-gpt digest=hmac-sha256:0123456789abcdef`,
+              creator: { login: 'dream-star-end' },
+            },
+          ],
+        }),
+      },
+    })
+    assert.equal(
+      rSteward21GhOnly.ok,
+      false,
+      'R2-B2: tip-only GitHub Steward approve MUST NOT authorize >20-commit range',
+    )
+
+    // 2. Steward GREEN on 21-commit range: explicit aggregate host receipt bound to BOTH baseSha & tipSha passes!
+    const aggSteward = signArchStewardReceipt(
+      makeStewardReceipt({
+        headSha: tipSha,
+        baseSha: repo.baseSha,
+        triggers: ['MULTI_MODULE_SPAN', 'CLONE_OR_T2_CORE_PATH'],
+      }),
+      hmacKey,
+    )
+    writeFileSync(path.join(receiptDir, `${tipSha}.json`), JSON.stringify(aggSteward, null, 2))
+    const rSteward21HostAgg = await runStewardGateAsync({
+      root: repo.dir,
+      mode: 'enforce-commit',
+      baseRef: repo.baseSha,
+      headRef: tipSha,
+      receiptDirs: [receiptDir],
+      requireRootOwner: false,
+      hmacKey,
+      requireHmac: true,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch({ [`/repos/${TEST_REPO}/commits/${tipSha}/statuses`]: [] }),
+      },
+    })
+    assert.equal(
+      rSteward21HostAgg.ok,
+      true,
+      'R2-B2: explicit aggregate Steward host receipt bound to base+head passes >20-commit range',
+    )
+
+    // 3. A0 RED on 21-commit range: plain direct GitHub status AND plain offline host receipt (without range=base..head) MUST FAIL
+    writeA0HostReceipt(
+      approvalDir,
+      tipSha,
+      ['*'],
+      'Plain tip-only A0 receipt without range binding',
+    )
+    const rA021Plain = await runCheckA0MonotonicAsync({
+      root: repo.dir,
+      base: repo.baseSha,
+      head: tipSha,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch({
+          [`/repos/${TEST_REPO}/commits/${tipSha}/statuses`]: [
+            {
+              id: 2,
+              context: 'oc-v5/a0-approval',
+              state: 'success',
+              description: `sha=${tipSha.slice(0, 12)} exp=${futureExp} paths=* | Plain tip-only approve`,
+              creator: { login: 'dream-star-end' },
+            },
+          ],
+          [`/repos/${TEST_REPO}/commits/${tipSha}/pulls`]: [],
+        }),
+      },
+    })
+    assert.equal(
+      rA021Plain.ok,
+      false,
+      'R2-B2: plain tip-only A0 approval MUST NOT authorize >20-commit range',
+    )
+
+    // 4. A0 GREEN on 21-commit range: explicit aggregate host receipt binding range=<base12>..<head12> passes!
+    writeA0HostReceipt(
+      approvalDir,
+      tipSha,
+      ['packages/commercial/src/billing/ledger.ts'],
+      `range=${repo.baseSha.slice(0, 12)}..${tipSha.slice(0, 12)} explicit aggregate A0 release approval`,
+    )
+    const rA021Agg = await runCheckA0MonotonicAsync({
+      root: repo.dir,
+      base: repo.baseSha,
+      head: tipSha,
+      approvalDir,
+      requireRootOwner: false,
+    })
+    assert.equal(
+      rA021Agg.ok,
+      true,
+      'R2-B2: aggregate A0 receipt binding range=<base12>..<head12> passes >20-commit range',
+    )
+
+    // 5. Offline 2-commit A0 range where S1 is unapproved and ONLY plain tip S2 receipt exists -> MUST FAIL!
+    const repo2 = initTempRepo(t)
+    const offlineDir = mkdtempSync(path.join(tmpdir(), 'ocv5-912-r2-b2-off-'))
+    t.after(() => rmSync(offlineDir, { recursive: true, force: true }))
+    repo2.write('packages/commercial/src/billing/ledger.ts', 'export const ledgerV = 9\n')
+    repo2.commit('feat(v5): unapproved S1 ledger edit')
+    repo2.write('packages/commercial/src/billing/wallet.ts', 'export const walletV = 9\n')
+    const s2Off = repo2.commit('feat(v5): S2 wallet edit')
+    writeA0HostReceipt(offlineDir, s2Off, ['*'], 'Plain tip-only offline receipt for S2')
+    const rOffline2Plain = await runCheckA0MonotonicAsync({
+      root: repo2.dir,
+      base: repo2.baseSha,
+      head: s2Off,
+      approvalDir: offlineDir,
+      requireRootOwner: false,
+    })
+    assert.equal(
+      rOffline2Plain.ok,
+      false,
+      'R2-B2: offline plain tip receipt MUST NOT skip unapproved S1',
+    )
+  })
+
+  test('R2-B3: A0 range with approved S1 + non-A0 tip S2 blocks when S2 has online revocation (passes when absent); Steward aggregate receipt blocks on intermediate commit HARD VETO; Steward local S approve blocks on carried H HARD VETO', async (t) => {
+    // 1. A0: S1 approved A0 + S2 non-A0 -> PASS when S2 absent, BLOCK when S2 revoked!
+    const repoA0 = initTempRepo(t)
+    const approvalDir = mkdtempSync(path.join(tmpdir(), 'ocv5-912-r2-b3-a0-'))
+    t.after(() => rmSync(approvalDir, { recursive: true, force: true }))
+    repoA0.write('packages/commercial/src/billing/ledger.ts', 'export const ledgerV = 77\n')
+    const s1 = repoA0.commit('feat(v5): approved A0 S1')
+    writeA0HostReceipt(approvalDir, s1)
+    repoA0.write('packages/web-react/src/components/Btn.tsx', 'export const Btn = () => "non-a0"\n')
+    const s2 = repoA0.commit('ui(v5): non-A0 tip S2')
+
+    const baseA0Routes: Record<string, MockRouteSpec> = {
+      [`/repos/${TEST_REPO}/commits/${s1}/statuses`]: [],
+      [`/repos/${TEST_REPO}/commits/${s1}/pulls`]: [],
+      [`/repos/${TEST_REPO}/commits/${s2}/statuses`]: [],
+      [`/repos/${TEST_REPO}/commits/${s2}/pulls`]: [],
+    }
+    const rNoRev = await runCheckA0MonotonicAsync({
+      root: repoA0.dir,
+      base: repoA0.baseSha,
+      head: s2,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch(baseA0Routes),
+      },
+    })
+    assert.equal(rNoRev.ok, true, 'control: approved S1 + non-A0 S2 with no revocation passes')
+
+    const rTipRev = await runCheckA0MonotonicAsync({
+      root: repoA0.dir,
+      base: repoA0.baseSha,
+      head: s2,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch({
+          ...baseA0Routes,
+          [`/repos/${TEST_REPO}/commits/${s2}/statuses`]: [
+            {
+              id: 500,
+              context: 'oc-v5/a0-approval',
+              state: 'failure',
+              description: `revoked sha=${s2.slice(0, 12)} paths=* | Release target revoked`,
+              creator: { login: 'dream-star-end' },
+            },
+          ],
+        }),
+      },
+    })
+    assert.equal(
+      rTipRev.ok,
+      false,
+      'R2-B3: explicit revocation on non-A0 release tip S2 MUST block A0 range',
+    )
+    assert.equal(
+      rTipRev.approval && !rTipRev.approval.valid ? rTipRev.approval.revoked : false,
+      true,
+    )
+
+    // 2. Steward: Aggregate host receipt bound to base..S2 MUST FAIL if intermediate S1 has local host HARD VETO!
+    const repoSt = initTempRepo(t)
+    const receiptDir = mkdtempSync(path.join(tmpdir(), 'ocv5-912-r2-b3-st-'))
+    t.after(() => rmSync(receiptDir, { recursive: true, force: true }))
+    const hmacKey = 'ocv5-912-r2-b3-hmac-secret-0123456789'
+    repoSt.write('packages/gateway/src/step1.ts', 'export const step1 = 1\n')
+    const st1 = repoSt.commit('feat(v5): gateway step 1')
+    repoSt.write('packages/web-react/src/components/Btn.tsx', 'export const Btn = () => "step2"\n')
+    const st2 = repoSt.commit('ui(v5): button step 2')
+
+    const aggApprove = signArchStewardReceipt(
+      makeStewardReceipt({
+        headSha: st2,
+        baseSha: repoSt.baseSha,
+        triggers: ['MULTI_MODULE_SPAN', 'CLONE_OR_T2_CORE_PATH'],
+      }),
+      hmacKey,
+    )
+    const vetoSt1 = signArchStewardReceipt(
+      makeStewardReceipt({
+        headSha: st1,
+        baseSha: repoSt.baseSha,
+        verdict: 'veto',
+        blockers: [
+          {
+            dimension: 'boundaryIntegrity',
+            severity: 'P1',
+            location: 'packages/gateway/src/step1.ts',
+            reason: 'hard veto on st1',
+          },
+        ],
+        dimensions: {
+          godClassAppend: { status: 'pass', notes: 'ok' },
+          wheelReinvention: { status: 'pass', notes: 'ok' },
+          boundaryIntegrity: { status: 'veto', notes: 'veto' },
+          complexityDrift: { status: 'pass', notes: 'ok' },
+        },
+      }),
+      hmacKey,
+    )
+    writeFileSync(path.join(receiptDir, `${st2}.json`), JSON.stringify(aggApprove, null, 2))
+    writeFileSync(path.join(receiptDir, `${st1}.json`), JSON.stringify(vetoSt1, null, 2))
+    const rAggIntermVeto = await runStewardGateAsync({
+      root: repoSt.dir,
+      mode: 'enforce-commit',
+      baseRef: repoSt.baseSha,
+      headRef: st2,
+      receiptDirs: [receiptDir],
+      requireRootOwner: false,
+      hmacKey,
+      requireHmac: true,
+    })
+    assert.equal(
+      rAggIntermVeto.ok,
+      false,
+      'R2-B3: intermediate commit HARD VETO MUST override aggregate Steward receipt',
+    )
+
+    // 3. Steward: Single commit S with valid local host approve on S + absent GitHub status + local host HARD VETO on carried H -> BLOCK!
+    const singleDir = mkdtempSync(path.join(tmpdir(), 'ocv5-912-r2-b3-single-'))
+    t.after(() => rmSync(singleDir, { recursive: true, force: true }))
+    const st1Tree = repoSt.git(['rev-parse', `${st1}^{tree}`])
+    const approveSt1 = signArchStewardReceipt(
+      makeStewardReceipt({
+        headSha: st1,
+        baseSha: repoSt.baseSha,
+        triggers: ['CLONE_OR_T2_CORE_PATH'],
+      }),
+      hmacKey,
+    )
+    const vetoH = signArchStewardReceipt(
+      makeStewardReceipt({
+        headSha: SHA_H,
+        baseSha: repoSt.baseSha,
+        verdict: 'veto',
+        blockers: [
+          {
+            dimension: 'boundaryIntegrity',
+            severity: 'P1',
+            location: 'packages/gateway/src/step1.ts',
+            reason: 'veto on H',
+          },
+        ],
+        dimensions: {
+          godClassAppend: { status: 'pass', notes: 'ok' },
+          wheelReinvention: { status: 'pass', notes: 'ok' },
+          boundaryIntegrity: { status: 'veto', notes: 'veto' },
+          complexityDrift: { status: 'pass', notes: 'ok' },
+        },
+      }),
+      hmacKey,
+    )
+    writeFileSync(path.join(singleDir, `${st1}.json`), JSON.stringify(approveSt1, null, 2))
+    writeFileSync(path.join(singleDir, `${SHA_H}.json`), JSON.stringify(vetoH, null, 2))
+    const rLocalSWithVetoH = await runStewardGateAsync({
+      root: repoSt.dir,
+      mode: 'enforce-commit',
+      baseRef: repoSt.baseSha,
+      headRef: st1,
+      receiptDirs: [singleDir],
+      requireRootOwner: false,
+      hmacKey,
+      requireHmac: true,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch({
+          [`/repos/${TEST_REPO}/commits/${st1}/statuses`]: [],
+          [`/repos/${TEST_REPO}/commits/${st1}/pulls`]: [
+            {
+              number: 1600,
+              merged_at: '2026-11-27T03:00:00Z',
+              merge_commit_sha: st1,
+              base: { ref: BASE_BRANCH, sha: repoSt.baseSha, repo: { full_name: TEST_REPO } },
+              head: { sha: SHA_H },
+            },
+          ],
+          [`/repos/${TEST_REPO}/commits/${st1}`]: {
+            sha: st1,
+            commit: { tree: { sha: st1Tree } },
+            parents: [{ sha: repoSt.baseSha }],
+          },
+          [`/repos/${TEST_REPO}/commits/${SHA_H}`]: {
+            sha: SHA_H,
+            commit: { tree: { sha: st1Tree } },
+          },
+          [`/repos/${TEST_REPO}/commits/${SHA_H}/statuses`]: [],
+        }),
+      },
+    })
+    assert.equal(
+      rLocalSWithVetoH.ok,
+      false,
+      'R2-B3: local host HARD VETO on equivalent PR head H MUST override local approve on S',
+    )
+  })
+
+  test('R2-B4: Online malformed/invalid trusted status + valid local host approve on SAME SHA => BLOCK for BOTH A0 and Steward (control: clean absent => PASS)', async (t) => {
+    const repo = initTempRepo(t)
+    const approvalDir = mkdtempSync(path.join(tmpdir(), 'ocv5-912-r2-b4-a0-'))
+    const receiptDir = mkdtempSync(path.join(tmpdir(), 'ocv5-912-r2-b4-st-'))
+    t.after(() => {
+      rmSync(approvalDir, { recursive: true, force: true })
+      rmSync(receiptDir, { recursive: true, force: true })
+    })
+    const hmacKey = 'ocv5-912-r2-b4-hmac-secret-0123456789'
+
+    repo.write('packages/commercial/src/billing/ledger.ts', 'export const ledgerV = 88\n')
+    repo.write('packages/gateway/src/b4Check.ts', 'export const b4 = 1\n')
+    const s = repo.commit('feat(v5): single commit touching A0 + T2 gateway')
+    writeA0HostReceipt(approvalDir, s)
+    const stRec = signArchStewardReceipt(
+      makeStewardReceipt({
+        headSha: s,
+        baseSha: repo.baseSha,
+        triggers: ['CLONE_OR_T2_CORE_PATH'],
+      }),
+      hmacKey,
+    )
+    writeFileSync(path.join(receiptDir, `${s}.json`), JSON.stringify(stRec, null, 2))
+
+    // Control: clean online absent + valid host receipt => PASS for BOTH A0 and Steward
+    const absentFetch = makeMockFetch({
+      [`/repos/${TEST_REPO}/commits/${s}/statuses`]: [],
+      [`/repos/${TEST_REPO}/commits/${s}/pulls`]: [],
+    })
+    const a0Control = await runCheckA0MonotonicAsync({
+      root: repo.dir,
+      base: repo.baseSha,
+      head: s,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: absentFetch,
+      },
+    })
+    assert.equal(a0Control.ok, true, 'control: clean online absent + valid host A0 receipt passes')
+
+    const stControl = await runStewardGateAsync({
+      root: repo.dir,
+      mode: 'enforce-commit',
+      baseRef: repo.baseSha,
+      headRef: s,
+      receiptDirs: [receiptDir],
+      requireRootOwner: false,
+      hmacKey,
+      requireHmac: true,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: absentFetch,
+      },
+    })
+    assert.equal(
+      stControl.ok,
+      true,
+      'control: clean online absent + valid host Steward receipt passes',
+    )
+
+    // R2-B4 RED (A0): online malformed trusted status (missing paths=) + valid host receipt => BLOCK!
+    const a0Invalid = await runCheckA0MonotonicAsync({
+      root: repo.dir,
+      base: repo.baseSha,
+      head: s,
+      approvalDir,
+      requireRootOwner: false,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch({
+          [`/repos/${TEST_REPO}/commits/${s}/statuses`]: [
+            {
+              id: 700,
+              context: 'oc-v5/a0-approval',
+              state: 'success',
+              description: `sha=${s.slice(0, 12)} | Malformed status without paths scope`,
+              creator: { login: 'dream-star-end' },
+            },
+          ],
+          [`/repos/${TEST_REPO}/commits/${s}/pulls`]: [],
+        }),
+      },
+    })
+    assert.equal(
+      a0Invalid.ok,
+      false,
+      'R2-B4: malformed online A0 status MUST block even with valid host receipt',
+    )
+    assert.equal(
+      a0Invalid.approval && !a0Invalid.approval.valid ? a0Invalid.approval.invalid : false,
+      true,
+    )
+
+    // R2-B4 RED (Steward): online malformed/same-family trusted status + valid host HMAC receipt => BLOCK!
+    const stInvalid = await runStewardGateAsync({
+      root: repo.dir,
+      mode: 'enforce-commit',
+      baseRef: repo.baseSha,
+      headRef: s,
+      receiptDirs: [receiptDir],
+      requireRootOwner: false,
+      hmacKey,
+      requireHmac: true,
+      github: {
+        repo: TEST_REPO,
+        token: 'ghs_tok',
+        expectedBaseRef: BASE_BRANCH,
+        fetchImpl: makeMockFetch({
+          [`/repos/${TEST_REPO}/commits/${s}/statuses`]: [
+            {
+              id: 701,
+              context: 'oc-v5/arch-steward',
+              state: 'success',
+              description: `verdict=approve sha=${s.slice(0, 12)} author=google-gemini steward=google-gemini digest=hmac-sha256:0123456789abcdef`,
+              creator: { login: 'dream-star-end' },
+            },
+          ],
+        }),
+      },
+    })
+    assert.equal(
+      stInvalid.ok,
+      false,
+      'R2-B4: malformed online Steward status MUST block even with valid host HMAC receipt',
+    )
+    assert.equal(stInvalid.githubStatus?.invalid, true)
   })
 })

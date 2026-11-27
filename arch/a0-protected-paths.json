@@ -15,6 +15,7 @@
         "scripts/lib/a0MonotonicRules.ts",
         "scripts/lib/a0ApprovalReceipt.ts",
         "scripts/lib/a0RangeCarryOver.ts",
+        "scripts/lib/gitRangeInspect.ts",
         "scripts/lib/globMatch.ts",
         "scripts/lib/githubApprovalParsers.ts",
         "scripts/lib/githubTrustedApproval.ts",

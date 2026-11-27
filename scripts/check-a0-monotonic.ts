@@ -50,8 +50,7 @@ import {
   verifyA0ApprovalReceipt,
   verifyA0ApprovalUnified,
 } from './lib/a0MonotonicRules.js'
-import { resolveA0ApprovalForMultiCommitRange } from './lib/a0RangeCarryOver.js'
-import { inspectFirstParentRange } from './lib/commitRangeCarryOver.js'
+import { resolveA0ApprovalForBaseRange } from './lib/a0RangeCarryOver.js'
 import { type FetchLike, resolveGithubToken } from './lib/githubTrustedApproval.js'
 
 export {
@@ -533,41 +532,20 @@ export async function runCheckA0MonotonicAsync(opts: CheckA0Options): Promise<Ch
   let approval: ApprovalVerification
   if (prep.mode === 'base' && !isOpenPr && opts.base) {
     const baseSha = git(opts.root, ['rev-parse', '--verify', `${opts.base}^{commit}`]).trim()
-    const rangeInfo = inspectFirstParentRange(opts.root, baseSha, prep.targetSha)
-    if (rangeInfo.kind === 'multi') {
-      approval = await resolveA0ApprovalForMultiCommitRange({
-        root: opts.root,
-        baseSha,
-        headSha: prep.targetSha,
-        commits: rangeInfo.commits,
-        aggregateA0Paths: a0Paths,
-        classifyCommitA0Paths: (pSha, cSha) =>
-          classifyCommitRangeA0Paths(opts.root, prep.policy, pSha, cSha),
-        approvalDir,
-        requireRootOwner,
-        hmacKeyFile: opts.hmacKeyFile,
-        hmacKey: opts.hmacKey,
-        nowMs: opts.nowMs,
-        github: ghOpts,
-      })
-    } else {
-      approval = await verifyA0ApprovalUnified({
-        approvalDir,
-        targetSha: prep.targetSha,
-        a0Paths,
-        requireRootOwner,
-        hmacKeyFile: opts.hmacKeyFile,
-        hmacKey: opts.hmacKey,
-        nowMs: opts.nowMs,
-        github: ghOpts
-          ? {
-              ...ghOpts,
-              allowMergedPrCarryOver:
-                rangeInfo.kind === 'single' ? ghOpts.allowMergedPrCarryOver : false,
-            }
-          : undefined,
-      })
-    }
+    approval = await resolveA0ApprovalForBaseRange({
+      root: opts.root,
+      baseSha,
+      headSha: prep.targetSha,
+      aggregateA0Paths: a0Paths,
+      classifyCommitA0Paths: (pSha, cSha) =>
+        classifyCommitRangeA0Paths(opts.root, prep.policy, pSha, cSha),
+      approvalDir,
+      requireRootOwner,
+      hmacKeyFile: opts.hmacKeyFile,
+      hmacKey: opts.hmacKey,
+      nowMs: opts.nowMs,
+      github: ghOpts,
+    })
   } else {
     approval = await verifyA0ApprovalUnified({
       approvalDir,

@@ -40,7 +40,14 @@ export type ApprovalVerification =
       source: 'host-file' | 'github-status' | 'github-pr-review'
       receipt: A0ApprovalReceipt
     }
-  | { valid: false; receiptPath: string; reason: string; revoked?: boolean; incomplete?: boolean }
+  | {
+      valid: false
+      receiptPath: string
+      reason: string
+      revoked?: boolean
+      incomplete?: boolean
+      invalid?: boolean
+    }
 
 export const SHA40_RE = /^[0-9a-f]{40}$/
 export const SHA64_RE = /^[0-9a-f]{64}$/
@@ -497,14 +504,16 @@ export async function verifyA0ApprovalUnified(opts: {
     fetchImpl: opts.github?.fetchImpl,
   })
 
-  // B3/B4: Online revocation, denial, or incomplete/truncated history supersedes ANY local receipt!
-  if (ghRes.revoked || ghRes.denied || ghRes.incomplete) {
+  // B3/B4: Online revocation, denial, incomplete/truncated history, or malformed/invalid trusted
+  // status supersedes ANY local receipt! Only clean online `absent` allows local host fallback.
+  if (ghRes.revoked || ghRes.denied || ghRes.incomplete || ghRes.invalid) {
     return {
       valid: false,
       receiptPath: `${hostRes.receiptPath} | ${ghRes.source}`,
       reason: `github: ${ghRes.reason}`,
       ...(ghRes.revoked || ghRes.denied ? { revoked: true } : {}),
       ...(ghRes.incomplete ? { incomplete: true } : {}),
+      ...(ghRes.invalid ? { invalid: true } : {}),
     }
   }
   if (hostRes.valid) return hostRes

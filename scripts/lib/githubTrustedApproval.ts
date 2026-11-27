@@ -244,9 +244,10 @@ async function tryA0MergedPrCarryOver(
     if (eqRes.notes.length > 0) failureNotes.push(`carry-over: ${eqRes.notes.join('; ')}`)
     return { candidates: [] }
   }
-  // B3/B4: Aggregate ALL negative/incomplete votes across ALL candidates BEFORE picking any approve!
+  // B3/B4: Aggregate ALL negative/incomplete/invalid votes across ALL candidates BEFORE picking any approve!
   let negativeHit: GithubA0ApprovalResult | undefined
   let incompleteHit: GithubA0ApprovalResult | undefined
+  let invalidHit: GithubA0ApprovalResult | undefined
   let firstApproved: GithubA0ApprovalResult | undefined
   const cleanAbsentCandidates: MergedPrEquivalenceCandidate[] = []
 
@@ -263,12 +264,14 @@ async function tryA0MergedPrCarryOver(
     if (revCheck.state === 'denied') negativeHit = negativeHit ?? revCheck.result
     if (stCheck.state === 'incomplete') incompleteHit = incompleteHit ?? stCheck.result
     if (revCheck.state === 'incomplete') incompleteHit = incompleteHit ?? revCheck.result
+    if (stCheck.state === 'invalid') invalidHit = invalidHit ?? stCheck.result
     if (stCheck.note) failureNotes.push(`PR#${cand.prNumber} status: ${stCheck.note}`)
     if (revCheck.note) failureNotes.push(`PR#${cand.prNumber} review: ${revCheck.note}`)
 
     const candBlocked =
       stCheck.state === 'revoked' ||
       stCheck.state === 'incomplete' ||
+      stCheck.state === 'invalid' ||
       revCheck.state === 'denied' ||
       revCheck.state === 'incomplete'
     if (!candBlocked && !firstApproved) {
@@ -284,6 +287,7 @@ async function tryA0MergedPrCarryOver(
   }
   if (negativeHit) return { result: negativeHit, candidates: [] }
   if (incompleteHit) return { result: incompleteHit, candidates: [] }
+  if (invalidHit) return { result: invalidHit, candidates: [] }
   if (firstApproved) return { result: firstApproved, candidates: [] }
   return { candidates: cleanAbsentCandidates }
 }
@@ -503,6 +507,7 @@ export async function verifyGithubStewardStatus(
 
   let vetoHit: GithubStewardStatusResult | undefined
   let incompleteHit: GithubStewardStatusResult | undefined
+  let invalidHit: GithubStewardStatusResult | undefined
   let firstApproved: GithubStewardStatusResult | undefined
   const cleanAbsentCandidates: MergedPrEquivalenceCandidate[] = []
   const carryNotes: string[] = []
@@ -511,6 +516,7 @@ export async function verifyGithubStewardStatus(
     const candCheck = await verifyGithubStewardStatusExactSha(ctx, cand.prHeadSha)
     if (candCheck.state === 'veto') vetoHit = vetoHit ?? candCheck.result
     else if (candCheck.state === 'incomplete') incompleteHit = incompleteHit ?? candCheck.result
+    else if (candCheck.state === 'invalid') invalidHit = invalidHit ?? candCheck.result
     else if (candCheck.state === 'approved' && !firstApproved) {
       const tag = `PR#${cand.prNumber}@${cand.prHeadSha.slice(0, 12)} via ${cand.equivalenceProof}`
       firstApproved = {
@@ -530,6 +536,7 @@ export async function verifyGithubStewardStatus(
 
   if (vetoHit) return vetoHit
   if (incompleteHit) return incompleteHit
+  if (invalidHit) return invalidHit
   if (firstApproved) return firstApproved
 
   const extra = carryNotes.length > 0 ? carryNotes.join('; ') : eqRes.notes.join('; ')
