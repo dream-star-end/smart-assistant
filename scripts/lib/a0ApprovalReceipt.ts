@@ -15,10 +15,7 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { lstatSync, readFileSync } from 'node:fs'
 import path from 'node:path'
-import {
-  type FetchLike,
-  verifyGithubA0Approval,
-} from './githubTrustedApproval.js'
+import { type FetchLike, verifyGithubA0Approval } from './githubTrustedApproval.js'
 
 export interface A0ApprovalReceipt {
   schemaVersion: 1
@@ -40,7 +37,7 @@ export type ApprovalVerification =
       source: 'host-file' | 'github-status' | 'github-pr-review'
       receipt: A0ApprovalReceipt
     }
-  | { valid: false; receiptPath: string; reason: string }
+  | { valid: false; receiptPath: string; reason: string; revoked?: boolean }
 
 export const SHA40_RE = /^[0-9a-f]{40}$/
 export const SHA64_RE = /^[0-9a-f]{64}$/
@@ -375,7 +372,8 @@ export function verifyA0ApprovalFile(opts: {
       return {
         valid: false,
         receiptPath,
-        reason: 'HMAC key is active; receipt missing valid hmacSha256 (plain sha256 downgrade rejected)',
+        reason:
+          'HMAC key is active; receipt missing valid hmacSha256 (plain sha256 downgrade rejected)',
       }
     }
     const expectedHmac = computeA0ReceiptHmac(fields, activeHmacKey)
@@ -464,6 +462,8 @@ export async function verifyA0ApprovalUnified(opts: {
     prNumber?: number
     trustedApprovers?: readonly string[]
     apiBaseUrl?: string
+    allowMergedPrCarryOver?: boolean
+    expectedBaseRef?: string
     fetchImpl?: FetchLike
   }
 }): Promise<ApprovalVerification> {
@@ -489,6 +489,8 @@ export async function verifyA0ApprovalUnified(opts: {
       prNumber: opts.github?.prNumber,
       trustedApprovers: opts.github?.trustedApprovers,
       apiBaseUrl: opts.github?.apiBaseUrl,
+      allowMergedPrCarryOver: opts.github?.allowMergedPrCarryOver,
+      expectedBaseRef: opts.github?.expectedBaseRef,
       nowMs: opts.nowMs,
       fetchImpl: opts.github?.fetchImpl,
     })
@@ -517,10 +519,32 @@ export async function verifyA0ApprovalUnified(opts: {
         },
       }
     }
+    if (!ghRes.revoked && ghRes.equivalenceCandidates && ghRes.equivalenceCandidates.length > 0) {
+      for (const cand of ghRes.equivalenceCandidates) {
+        const carriedHost = verifyA0ApprovalReceipt({
+          approvalDir: opts.approvalDir,
+          targetSha: cand.prHeadSha,
+          a0Paths: opts.a0Paths,
+          requireRootOwner: opts.requireRootOwner ?? true,
+          hmacKeyFile: opts.hmacKeyFile,
+          hmacKey: opts.hmacKey,
+          nowMs: opts.nowMs,
+        })
+        if (carriedHost.valid) {
+          return {
+            valid: true,
+            receiptPath: `${carriedHost.receiptPath} (carried-over from PR#${cand.prNumber}@${cand.prHeadSha.slice(0, 12)} via ${cand.equivalenceProof})`,
+            source: 'host-file',
+            receipt: { ...carriedHost.receipt, sha: opts.targetSha },
+          }
+        }
+      }
+    }
     return {
       valid: false,
       receiptPath: `${hostRes.receiptPath} | ${ghRes.source}`,
       reason: `host: ${hostRes.reason}; github: ${ghRes.reason}`,
+      ...(ghRes.revoked ? { revoked: true } : {}),
     }
   }
 

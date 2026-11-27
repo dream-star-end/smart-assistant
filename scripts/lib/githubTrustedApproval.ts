@@ -16,7 +16,30 @@
  *        non-dry-run cross-family approval (`stewardFamily !== authorFamily`,
  *        `verdict=approve`, valid `digest=(sha256|hmac-sha256):<hex>`).
  */
+import {
+  type FetchLike,
+  type GithubCommitPullEntry,
+  type GithubPrReviewEntry,
+  type GithubStatusEntry,
+  type MergedPrEquivalenceCandidate,
+  type MergedPrEquivalenceProof,
+  extractA0StatusReason,
+  githubGetPaginatedList,
+  globToRegExpLocal,
+  parseKvTokens,
+  resolveMergedPrEquivalence,
+  sortStatusesNewestFirst,
+} from './githubMergedPrEquivalence.js'
 import { MODEL_FAMILIES, type ModelFamily } from './modelFamilyClassifier.js'
+
+export type {
+  FetchLike,
+  GithubCommitPullEntry,
+  GithubPrReviewEntry,
+  GithubStatusEntry,
+  MergedPrEquivalenceCandidate,
+  MergedPrEquivalenceProof,
+}
 
 export const DEFAULT_GITHUB_API_BASE = 'https://api.github.com'
 export const DEFAULT_TRUSTED_APPROVERS = ['dream-star-end'] as const
@@ -29,45 +52,6 @@ const DIGEST_PREFIX_RE = /^(?:sha256|hmac-sha256):[0-9a-f]{12,64}$/i
 const DRY_RUN_MARKER_RE = /\b(?:dry[-_]?run|example|mock|placeholder|stub|fake)\b/i
 const VALID_MODEL_FAMILY_SET = new Set<string>(MODEL_FAMILIES)
 
-export type FetchLike = (
-  input: string,
-  init?: { headers?: Record<string, string> },
-) => Promise<{
-  ok: boolean
-  status: number
-  headers?: { get(name: string): string | null }
-  json(): Promise<unknown>
-  text?(): Promise<string>
-}>
-
-export interface GithubStatusEntry {
-  id?: number
-  context?: string
-  state?: string
-  description?: string | null
-  target_url?: string | null
-  created_at?: string
-  updated_at?: string
-  creator?: { login?: string } | null
-}
-
-export interface GithubPrReviewEntry {
-  id?: number
-  state?: string
-  commit_id?: string | null
-  submitted_at?: string
-  body?: string | null
-  user?: { login?: string } | null
-}
-
-export interface GithubCommitPullEntry {
-  number?: number
-  state?: string
-  merged_at?: string | null
-  base?: { ref?: string } | null
-  head?: { sha?: string } | null
-}
-
 export interface GithubA0ApprovalOptions {
   repo: string
   token: string
@@ -77,6 +61,8 @@ export interface GithubA0ApprovalOptions {
   trustedApprovers?: readonly string[]
   apiBaseUrl?: string
   nowMs?: number
+  allowMergedPrCarryOver?: boolean
+  expectedBaseRef?: string
   fetchImpl?: FetchLike
 }
 
@@ -90,6 +76,10 @@ export interface GithubA0ApprovalResult {
   issuedAt?: string
   expiresAt?: string
   digestRef?: string
+  carriedOverFromPr?: number
+  carriedOverFromSha?: string
+  equivalenceProof?: MergedPrEquivalenceProof
+  equivalenceCandidates?: MergedPrEquivalenceCandidate[]
 }
 
 export interface GithubStewardStatusOptions {
@@ -98,6 +88,8 @@ export interface GithubStewardStatusOptions {
   headSha: string
   trustedPublishers?: readonly string[]
   apiBaseUrl?: string
+  allowMergedPrCarryOver?: boolean
+  expectedBaseRef?: string
   fetchImpl?: FetchLike
 }
 
@@ -111,31 +103,10 @@ export interface GithubStewardStatusResult {
   receiptDigest?: string
   createdAt?: string
   reason: string
-}
-
-function globToRegExpLocal(glob: string): RegExp {
-  let re = ''
-  for (let i = 0; i < glob.length; i++) {
-    const ch = glob[i]!
-    if (ch === '*') {
-      if (glob[i + 1] === '*') {
-        if (glob[i + 2] === '/') {
-          re += '(?:.+/)?'
-          i += 2
-        } else {
-          re += '.*'
-          i += 1
-        }
-      } else {
-        re += '[^/]*'
-      }
-    } else if ('+?^${}()|[]\\.'.includes(ch)) {
-      re += `\\${ch}`
-    } else {
-      re += ch
-    }
-  }
-  return new RegExp(`^${re}$`)
+  carriedOverFromPr?: number
+  carriedOverFromSha?: string
+  equivalenceProof?: MergedPrEquivalenceProof
+  equivalenceCandidates?: MergedPrEquivalenceCandidate[]
 }
 
 export function normalizeTrustedLogins(raw?: readonly string[] | string): Set<string> {
@@ -153,7 +124,10 @@ export function normalizeTrustedLogins(raw?: readonly string[] | string): Set<st
   return new Set(DEFAULT_TRUSTED_APPROVERS)
 }
 
-export function resolveGithubApiBase(apiBaseUrl?: string, env: NodeJS.ProcessEnv = process.env): string {
+export function resolveGithubApiBase(
+  apiBaseUrl?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
   const raw = (apiBaseUrl ?? env.GITHUB_API_URL ?? DEFAULT_GITHUB_API_BASE).trim()
   return raw.replace(/\/+$/, '') || DEFAULT_GITHUB_API_BASE
 }
@@ -169,79 +143,15 @@ export function resolveGithubToken(
   return env.GITHUB_TOKEN?.trim() || env.GH_TOKEN?.trim() || undefined
 }
 
-function parseNextLink(linkHeader: string | null | undefined): string | null {
-  if (!linkHeader) return null
-  for (const part of linkHeader.split(',')) {
-    const m = /<([^>]+)>;\s*rel="next"/.exec(part.trim())
-    if (m?.[1]) return m[1]
-  }
-  return null
-}
-
 async function githubGetPaginated<T>(
   initialUrl: string,
   token: string,
   fetchImpl: FetchLike,
   maxPages = 10,
 ): Promise<{ ok: true; items: T[] } | { ok: false; reason: string }> {
-  const items: T[] = []
-  let nextUrl: string | null = initialUrl
-  for (let page = 0; page < maxPages && nextUrl; page++) {
-    let resp: Awaited<ReturnType<FetchLike>>
-    try {
-      resp = await fetchImpl(nextUrl, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: 'application/vnd.github+json',
-          'X-GitHub-Api-Version': '2022-11-28',
-          'User-Agent': 'openclaude-v5-governance-gate',
-        },
-      })
-    } catch (err) {
-      return { ok: false, reason: `GitHub API request error: ${(err as Error).message}` }
-    }
-    if (!resp.ok) {
-      return { ok: false, reason: `GitHub API HTTP ${resp.status} for ${nextUrl}` }
-    }
-    const body = await resp.json()
-    if (!Array.isArray(body)) {
-      return { ok: false, reason: `GitHub API returned non-array payload for ${nextUrl}` }
-    }
-    items.push(...(body as T[]))
-    nextUrl = parseNextLink(resp.headers?.get('link'))
-  }
-  return { ok: true, items }
-}
-
-function sortStatusesNewestFirst(statuses: readonly GithubStatusEntry[]): GithubStatusEntry[] {
-  return [...statuses].sort((a, b) => {
-    const ta = a.created_at ? Date.parse(a.created_at) : Number.NaN
-    const tb = b.created_at ? Date.parse(b.created_at) : Number.NaN
-    if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return tb - ta
-    return (b.id ?? 0) - (a.id ?? 0)
-  })
-}
-
-function parseKvTokens(description: string): Map<string, string> {
-  const map = new Map<string, string>()
-  const re = /\b([a-zA-Z][a-zA-Z0-9_-]*)=([^\s|;]+)/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(description)) !== null) {
-    map.set(m[1]!.toLowerCase(), m[2]!)
-  }
-  return map
-}
-
-function extractA0StatusReason(description: string): string {
-  const pipeIdx = description.indexOf('|')
-  if (pipeIdx >= 0) {
-    return description.slice(pipeIdx + 1).trim()
-  }
-  const stripped = description
-    .replace(/\b[a-zA-Z][a-zA-Z0-9_-]*=[^\s|;]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-  return stripped
+  const res = await githubGetPaginatedList<T>(initialUrl, token, fetchImpl, maxPages)
+  if (!res.ok) return res
+  return { ok: true, items: res.items }
 }
 
 const REVOKED_MARKER_RE = /\brevok(?:e|ed|ing)\b/i
@@ -288,6 +198,14 @@ function findStewardVetoStatus(
   return null
 }
 
+function rejectA0Status(
+  source: string,
+  approvedBy: string,
+  reason: string,
+): GithubA0ApprovalResult {
+  return { valid: false, source, approvedBy, reason }
+}
+
 function evaluateA0CommitStatus(
   statuses: readonly GithubStatusEntry[],
   headSha: string,
@@ -298,13 +216,13 @@ function evaluateA0CommitStatus(
 ): GithubA0ApprovalResult | null {
   const matching = sortStatusesNewestFirst(
     statuses.filter((s) => {
-      if (s.context !== A0_GITHUB_STATUS_CONTEXT) return false
       const creator = s.creator?.login?.trim().toLowerCase()
-      return Boolean(creator && trustedApprovers.has(creator))
+      return (
+        s.context === A0_GITHUB_STATUS_CONTEXT && Boolean(creator && trustedApprovers.has(creator))
+      )
     }),
   )
   if (matching.length === 0) return null
-
   const source = `${sourceBase}:status:${A0_GITHUB_STATUS_CONTEXT}@${headSha.slice(0, 12)}`
   const revokedHit = findRevokedA0Status(matching, source)
   if (revokedHit) return revokedHit
@@ -312,111 +230,87 @@ function evaluateA0CommitStatus(
   const latest = matching[0]!
   const creator = latest.creator?.login?.trim() ?? 'unknown'
   if (latest.state !== 'success') {
-    return {
-      valid: false,
+    return rejectA0Status(
       source,
-      approvedBy: creator,
-      reason: `latest trusted ${A0_GITHUB_STATUS_CONTEXT} status has state=${JSON.stringify(latest.state)} (expected "success")`,
-    }
+      creator,
+      `latest trusted ${A0_GITHUB_STATUS_CONTEXT} status has state=${JSON.stringify(latest.state)} (expected "success")`,
+    )
   }
-
   const desc = (latest.description ?? '').trim()
-  if (!desc) {
-    return {
-      valid: false,
+  if (!desc)
+    return rejectA0Status(
       source,
-      approvedBy: creator,
-      reason: `${A0_GITHUB_STATUS_CONTEXT} status description is empty`,
-    }
-  }
+      creator,
+      `${A0_GITHUB_STATUS_CONTEXT} status description is empty`,
+    )
   if (DRY_RUN_MARKER_RE.test(desc)) {
-    return {
-      valid: false,
+    return rejectA0Status(
       source,
-      approvedBy: creator,
-      reason: `${A0_GITHUB_STATUS_CONTEXT} status contains forbidden dry-run/example marker`,
-    }
+      creator,
+      `${A0_GITHUB_STATUS_CONTEXT} status contains forbidden dry-run/example marker`,
+    )
   }
-
   const kv = parseKvTokens(desc)
   const boundSha = (kv.get('sha') ?? '').toLowerCase()
   const shortSha12 = headSha.slice(0, 12).toLowerCase()
   const shaBound =
-    (boundSha.length >= 8 && /^[0-9a-f]+$/.test(boundSha) && headSha.toLowerCase().startsWith(boundSha)) ||
+    (boundSha.length >= 8 &&
+      /^[0-9a-f]+$/.test(boundSha) &&
+      headSha.toLowerCase().startsWith(boundSha)) ||
     desc.toLowerCase().includes(shortSha12)
-  if (!shaBound) {
-    return {
-      valid: false,
+  if (!shaBound)
+    return rejectA0Status(
       source,
-      approvedBy: creator,
-      reason: `${A0_GITHUB_STATUS_CONTEXT} description does not bind headSha ${shortSha12}`,
-    }
-  }
+      creator,
+      `${A0_GITHUB_STATUS_CONTEXT} description does not bind headSha ${shortSha12}`,
+    )
 
   const expStr = kv.get('exp') ?? kv.get('expires') ?? kv.get('expiresat')
   if (expStr) {
     const expMs = Date.parse(expStr)
-    if (!Number.isFinite(expMs)) {
-      return {
-        valid: false,
+    if (!Number.isFinite(expMs))
+      return rejectA0Status(
         source,
-        approvedBy: creator,
-        reason: `${A0_GITHUB_STATUS_CONTEXT} has invalid exp timestamp "${expStr}"`,
-      }
-    }
-    if (expMs <= nowMs) {
-      return {
-        valid: false,
-        source,
-        approvedBy: creator,
-        reason: `${A0_GITHUB_STATUS_CONTEXT} expired at ${expStr}`,
-      }
-    }
+        creator,
+        `${A0_GITHUB_STATUS_CONTEXT} has invalid exp timestamp "${expStr}"`,
+      )
+    if (expMs <= nowMs)
+      return rejectA0Status(source, creator, `${A0_GITHUB_STATUS_CONTEXT} expired at ${expStr}`)
   }
 
   const pathsRaw = kv.get('paths')?.trim() ?? ''
   if (!pathsRaw) {
-    return {
-      valid: false,
+    return rejectA0Status(
       source,
-      approvedBy: creator,
-      reason: `${A0_GITHUB_STATUS_CONTEXT} missing required explicit paths= scope token (refusing to treat omitted paths as unrestricted)`,
-    }
+      creator,
+      `${A0_GITHUB_STATUS_CONTEXT} missing required explicit paths= scope token (refusing to treat omitted paths as unrestricted)`,
+    )
   }
   if (pathsRaw !== '*') {
     const globs = pathsRaw
       .split(',')
       .map((p) => p.trim())
       .filter(Boolean)
-    if (globs.length === 0) {
-      return {
-        valid: false,
-        source,
-        approvedBy: creator,
-        reason: `${A0_GITHUB_STATUS_CONTEXT} has empty paths scope`,
-      }
-    }
+    if (globs.length === 0)
+      return rejectA0Status(source, creator, `${A0_GITHUB_STATUS_CONTEXT} has empty paths scope`)
     const uncovered = a0Paths.filter((p) => !globs.some((g) => globToRegExpLocal(g).test(p)))
     if (uncovered.length > 0) {
-      return {
-        valid: false,
+      return rejectA0Status(
         source,
-        approvedBy: creator,
-        reason: `${A0_GITHUB_STATUS_CONTEXT} paths scope does not cover A0 changes: ${uncovered.join(', ')}`,
-      }
+        creator,
+        `${A0_GITHUB_STATUS_CONTEXT} paths scope does not cover A0 changes: ${uncovered.join(', ')}`,
+      )
     }
   }
 
   const reasonText = extractA0StatusReason(desc)
   if (reasonText.length < 8) {
-    return {
-      valid: false,
+    return rejectA0Status(
       source,
-      approvedBy: creator,
-      reason: `${A0_GITHUB_STATUS_CONTEXT} description must include a reason of at least 8 characters`,
-    }
+      creator,
+      `${A0_GITHUB_STATUS_CONTEXT} description must include a reason of at least 8 characters`,
+    )
   }
-
   return {
     valid: true,
     channel: 'github-status',
@@ -489,9 +383,127 @@ function evaluatePrReviews(
   }
 }
 
+interface GithubCheckContext {
+  repo: string
+  token: string
+  apiBase: string
+  trusted: ReadonlySet<string>
+  fetchImpl: FetchLike
+}
+
+async function checkA0StatusOnExactSha(
+  ctx: GithubCheckContext,
+  sha: string,
+  a0Paths: readonly string[],
+  nowMs: number,
+  sourceBase: string,
+): Promise<{ result?: GithubA0ApprovalResult; note?: string }> {
+  const statusUrl = `${ctx.apiBase}/repos/${ctx.repo}/commits/${sha}/statuses?per_page=100`
+  const statusResp = await githubGetPaginated<GithubStatusEntry>(
+    statusUrl,
+    ctx.token,
+    ctx.fetchImpl,
+    5,
+  )
+  if (!statusResp.ok) return { note: statusResp.reason }
+  const statusEval = evaluateA0CommitStatus(
+    statusResp.items,
+    sha,
+    a0Paths,
+    ctx.trusted,
+    nowMs,
+    sourceBase,
+  )
+  if (statusEval?.valid || statusEval?.revoked) return { result: statusEval }
+  return {
+    note: statusEval
+      ? statusEval.reason
+      : `no trusted ${A0_GITHUB_STATUS_CONTEXT} status on ${sha.slice(0, 12)}`,
+  }
+}
+
+async function checkA0PrReviewOnExactSha(
+  ctx: GithubCheckContext,
+  prNum: number,
+  sha: string,
+  sourceBase: string,
+): Promise<{ result?: GithubA0ApprovalResult; note?: string }> {
+  const revSource = `${sourceBase}:pr#${prNum}:review@${sha.slice(0, 12)}`
+  const revUrl = `${ctx.apiBase}/repos/${ctx.repo}/pulls/${prNum}/reviews?per_page=100`
+  const revResp = await githubGetPaginated<GithubPrReviewEntry>(
+    revUrl,
+    ctx.token,
+    ctx.fetchImpl,
+    10,
+  )
+  if (!revResp.ok) return { note: revResp.reason }
+  const revEval = evaluatePrReviews(revResp.items, sha, ctx.trusted, revSource)
+  if (revEval.valid) return { result: revEval }
+  return { note: revEval.reason }
+}
+
+function attachA0CarryOver(
+  res: GithubA0ApprovalResult,
+  cand: MergedPrEquivalenceCandidate,
+): GithubA0ApprovalResult {
+  const tag = `PR#${cand.prNumber}@${cand.prHeadSha.slice(0, 12)} via ${cand.equivalenceProof}`
+  return {
+    ...res,
+    source: `${res.source} (carried-over from ${tag})`,
+    reason: `${res.reason} [carried-over from ${tag}]`,
+    carriedOverFromPr: cand.prNumber,
+    carriedOverFromSha: cand.prHeadSha,
+    equivalenceProof: cand.equivalenceProof,
+  }
+}
+
+async function tryA0MergedPrCarryOver(
+  ctx: GithubCheckContext,
+  opts: GithubA0ApprovalOptions,
+  headSha: string,
+  nowMs: number,
+  sourceBase: string,
+  failureNotes: string[],
+): Promise<{ result?: GithubA0ApprovalResult; candidates: MergedPrEquivalenceCandidate[] }> {
+  const eqRes = await resolveMergedPrEquivalence({
+    repo: ctx.repo,
+    token: ctx.token,
+    targetSha: headSha,
+    expectedBaseRef: opts.expectedBaseRef,
+    apiBaseUrl: ctx.apiBase,
+    fetchImpl: ctx.fetchImpl,
+  })
+  if (eqRes.candidates.length === 0) {
+    if (eqRes.notes.length > 0) failureNotes.push(`carry-over: ${eqRes.notes.join('; ')}`)
+    return { candidates: [] }
+  }
+  for (const cand of eqRes.candidates) {
+    const stCheck = await checkA0StatusOnExactSha(
+      ctx,
+      cand.prHeadSha,
+      opts.a0Paths,
+      nowMs,
+      sourceBase,
+    )
+    if (stCheck.result?.revoked) return { result: stCheck.result, candidates: eqRes.candidates }
+    if (stCheck.result?.valid) {
+      return { result: attachA0CarryOver(stCheck.result, cand), candidates: eqRes.candidates }
+    }
+    if (stCheck.note) failureNotes.push(`PR#${cand.prNumber} status: ${stCheck.note}`)
+
+    const revCheck = await checkA0PrReviewOnExactSha(ctx, cand.prNumber, cand.prHeadSha, sourceBase)
+    if (revCheck.result?.valid) {
+      return { result: attachA0CarryOver(revCheck.result, cand), candidates: eqRes.candidates }
+    }
+    if (revCheck.note) failureNotes.push(`PR#${cand.prNumber} review: ${revCheck.note}`)
+  }
+  return { candidates: eqRes.candidates }
+}
+
 /**
  * Verify out-of-commit A0 approval via GitHub Commit Status `oc-v5/a0-approval`
- * OR CODEOWNER PR `APPROVED` review bound to exact `headSha`.
+ * OR CODEOWNER PR `APPROVED` review bound to exact `headSha` (or cryptographically
+ * equivalent squash/rebase merged PR head on post-merge push/train verification).
  */
 export async function verifyGithubA0Approval(
   opts: GithubA0ApprovalOptions,
@@ -508,46 +520,36 @@ export async function verifyGithubA0Approval(
     return { valid: false, source: sourceBase, reason: 'missing GitHub API token' }
   }
 
-  const fetchImpl: FetchLike = opts.fetchImpl ?? (globalThis.fetch as unknown as FetchLike)
-  const apiBase = resolveGithubApiBase(opts.apiBaseUrl)
-  const trusted = normalizeTrustedLogins(opts.trustedApprovers)
+  const ctx: GithubCheckContext = {
+    repo: opts.repo,
+    token: opts.token,
+    apiBase: resolveGithubApiBase(opts.apiBaseUrl),
+    trusted: normalizeTrustedLogins(opts.trustedApprovers),
+    fetchImpl: opts.fetchImpl ?? (globalThis.fetch as unknown as FetchLike),
+  }
   const nowMs = opts.nowMs ?? Date.now()
   const failureNotes: string[] = []
 
-  // Channel 1: Commit status `oc-v5/a0-approval` on exact `headSha`
-  const statusUrl = `${apiBase}/repos/${opts.repo}/commits/${headSha}/statuses?per_page=100`
-  const statusResp = await githubGetPaginated<GithubStatusEntry>(statusUrl, opts.token, fetchImpl, 5)
-  if (!statusResp.ok) {
-    failureNotes.push(statusResp.reason)
-  } else {
-    const statusEval = evaluateA0CommitStatus(
-      statusResp.items,
-      headSha,
-      opts.a0Paths,
-      trusted,
-      nowMs,
-      sourceBase,
-    )
-    if (statusEval?.valid) return statusEval
-    if (statusEval?.revoked) return statusEval
-    if (statusEval) failureNotes.push(statusEval.reason)
-    else failureNotes.push(`no trusted ${A0_GITHUB_STATUS_CONTEXT} status on ${headSha.slice(0, 12)}`)
-  }
+  // Channel 1: Commit status `oc-v5/a0-approval` on exact `headSha` (revocation always takes precedence!)
+  const directStatus = await checkA0StatusOnExactSha(ctx, headSha, opts.a0Paths, nowMs, sourceBase)
+  if (directStatus.result) return directStatus.result
+  if (directStatus.note) failureNotes.push(directStatus.note)
 
   // Channel 2: PR CODEOWNER APPROVED review bound to exact `headSha`
   const prNumbersToCheck: number[] = []
   if (typeof opts.prNumber === 'number' && Number.isInteger(opts.prNumber) && opts.prNumber > 0) {
     prNumbersToCheck.push(opts.prNumber)
   } else {
-    // For push events (e.g. fast-forward merged PRs), only accept PRs whose head.sha === headSha
-    const pullsUrl = `${apiBase}/repos/${opts.repo}/commits/${headSha}/pulls?per_page=30`
-    const pullsResp = await githubGetPaginated<GithubCommitPullEntry>(pullsUrl, opts.token, fetchImpl, 2)
+    const pullsUrl = `${ctx.apiBase}/repos/${ctx.repo}/commits/${headSha}/pulls?per_page=30`
+    const pullsResp = await githubGetPaginated<GithubCommitPullEntry>(
+      pullsUrl,
+      ctx.token,
+      ctx.fetchImpl,
+      2,
+    )
     if (pullsResp.ok) {
       for (const pr of pullsResp.items) {
-        if (
-          typeof pr.number === 'number' &&
-          pr.head?.sha?.trim().toLowerCase() === headSha
-        ) {
+        if (typeof pr.number === 'number' && pr.head?.sha?.trim().toLowerCase() === headSha) {
           prNumbersToCheck.push(pr.number)
         }
       }
@@ -555,78 +557,35 @@ export async function verifyGithubA0Approval(
   }
 
   for (const prNum of prNumbersToCheck) {
-    const revSource = `${sourceBase}:pr#${prNum}:review@${headSha.slice(0, 12)}`
-    const revUrl = `${apiBase}/repos/${opts.repo}/pulls/${prNum}/reviews?per_page=100`
-    const revResp = await githubGetPaginated<GithubPrReviewEntry>(revUrl, opts.token, fetchImpl, 10)
-    if (!revResp.ok) {
-      failureNotes.push(revResp.reason)
-      continue
-    }
-    const revEval = evaluatePrReviews(revResp.items, headSha, trusted, revSource)
-    if (revEval.valid) return revEval
-    failureNotes.push(revEval.reason)
+    const revCheck = await checkA0PrReviewOnExactSha(ctx, prNum, headSha, sourceBase)
+    if (revCheck.result) return revCheck.result
+    if (revCheck.note) failureNotes.push(revCheck.note)
+  }
+
+  // Channel 3: Merged-PR squash/rebase carry-over (strictly disabled on open PR checks where prNumber is set)
+  const allowCarryOver = opts.allowMergedPrCarryOver ?? opts.prNumber === undefined
+  let equivalenceCandidates: MergedPrEquivalenceCandidate[] | undefined
+  if (allowCarryOver) {
+    const carry = await tryA0MergedPrCarryOver(ctx, opts, headSha, nowMs, sourceBase, failureNotes)
+    if (carry.result) return carry.result
+    if (carry.candidates.length > 0) equivalenceCandidates = carry.candidates
   }
 
   return {
     valid: false,
     source: `${sourceBase}@${headSha.slice(0, 12)}`,
     reason: failureNotes.join('; ') || `no trusted GitHub A0 approval for ${headSha.slice(0, 12)}`,
+    ...(equivalenceCandidates ? { equivalenceCandidates } : {}),
   }
 }
 
-/**
- * Verify out-of-commit Architecture Steward approval via GitHub Commit Status `oc-v5/arch-steward`.
- *
- * Expected description format (<= 140 chars):
- *   verdict=approve sha=<12+hex> author=<authorFamily> steward=<stewardFamily> digest=<sha256|hmac-sha256>:<12+hex>
- */
-export async function verifyGithubStewardStatus(
-  opts: GithubStewardStatusOptions,
-): Promise<GithubStewardStatusResult> {
-  const headSha = opts.headSha.trim().toLowerCase()
-  const source = `github:${opts.repo}:status:${STEWARD_GITHUB_STATUS_CONTEXT}@${headSha.slice(0, 12)}`
-  if (!REPO_SLUG_RE.test(opts.repo)) {
-    return { valid: false, source, reason: `invalid github repo slug "${opts.repo}"` }
-  }
-  if (!SHA40_RE.test(headSha)) {
-    return { valid: false, source, reason: `invalid headSha "${opts.headSha}"` }
-  }
-  if (!opts.token.trim()) {
-    return { valid: false, source, reason: 'missing GitHub API token' }
-  }
-
-  const fetchImpl: FetchLike = opts.fetchImpl ?? (globalThis.fetch as unknown as FetchLike)
-  const apiBase = resolveGithubApiBase(opts.apiBaseUrl)
-  const trusted = normalizeTrustedLogins(opts.trustedPublishers)
-
-  const statusUrl = `${apiBase}/repos/${opts.repo}/commits/${headSha}/statuses?per_page=100`
-  const resp = await githubGetPaginated<GithubStatusEntry>(statusUrl, opts.token, fetchImpl, 5)
-  if (!resp.ok) {
-    return { valid: false, source, reason: resp.reason }
-  }
-
-  const matching = sortStatusesNewestFirst(
-    resp.items.filter((s) => {
-      if (s.context !== STEWARD_GITHUB_STATUS_CONTEXT) return false
-      const creator = s.creator?.login?.trim().toLowerCase()
-      return Boolean(creator && trusted.has(creator))
-    }),
-  )
-  if (matching.length === 0) {
-    return {
-      valid: false,
-      source,
-      reason: `no trusted ${STEWARD_GITHUB_STATUS_CONTEXT} commit status found for ${headSha.slice(0, 12)}`,
-    }
-  }
-
-  const vetoHit = findStewardVetoStatus(matching, source)
-  if (vetoHit) return vetoHit
-
-  const latest = matching[0]!
+function parseApprovedStewardStatusEntry(
+  latest: GithubStatusEntry,
+  targetSha: string,
+  source: string,
+): GithubStewardStatusResult {
   const publishedBy = latest.creator?.login?.trim() ?? 'unknown'
   const desc = (latest.description ?? '').trim()
-
   if (latest.state !== 'success') {
     return {
       valid: false,
@@ -637,7 +596,12 @@ export async function verifyGithubStewardStatus(
     }
   }
   if (!desc) {
-    return { valid: false, source, publishedBy, reason: `${STEWARD_GITHUB_STATUS_CONTEXT} status description is empty` }
+    return {
+      valid: false,
+      source,
+      publishedBy,
+      reason: `${STEWARD_GITHUB_STATUS_CONTEXT} status description is empty`,
+    }
   }
   if (DRY_RUN_MARKER_RE.test(desc)) {
     return {
@@ -647,7 +611,6 @@ export async function verifyGithubStewardStatus(
       reason: `${STEWARD_GITHUB_STATUS_CONTEXT} status contains forbidden dry-run/example/mock marker`,
     }
   }
-
   const kv = parseKvTokens(desc)
   const verdict = (kv.get('verdict') ?? '').toLowerCase()
   const shaToken = (kv.get('sha') ?? '').toLowerCase()
@@ -664,12 +627,12 @@ export async function verifyGithubStewardStatus(
       reason: `${STEWARD_GITHUB_STATUS_CONTEXT} requires verdict=approve (got ${JSON.stringify(verdict || 'missing')})`,
     }
   }
-  if (shaToken.length < 12 || !/^[0-9a-f]+$/.test(shaToken) || !headSha.startsWith(shaToken)) {
+  if (shaToken.length < 12 || !/^[0-9a-f]+$/.test(shaToken) || !targetSha.startsWith(shaToken)) {
     return {
       valid: false,
       source,
       publishedBy,
-      reason: `${STEWARD_GITHUB_STATUS_CONTEXT} sha=${JSON.stringify(shaToken)} does not bind headSha ${headSha.slice(0, 12)}`,
+      reason: `${STEWARD_GITHUB_STATUS_CONTEXT} sha=${JSON.stringify(shaToken)} does not bind headSha ${targetSha.slice(0, 12)}`,
     }
   }
   if (!VALID_MODEL_FAMILY_SET.has(authorFamily) || !VALID_MODEL_FAMILY_SET.has(stewardFamily)) {
@@ -696,7 +659,6 @@ export async function verifyGithubStewardStatus(
       reason: `${STEWARD_GITHUB_STATUS_CONTEXT} missing valid receiptDigest token (expected sha256:<hex> or hmac-sha256:<hex>)`,
     }
   }
-
   return {
     valid: true,
     source,
@@ -707,5 +669,111 @@ export async function verifyGithubStewardStatus(
     receiptDigest: digest,
     createdAt: latest.created_at,
     reason: `trusted ${STEWARD_GITHUB_STATUS_CONTEXT} approved by @${publishedBy} (${authorFamily} -> ${stewardFamily}, digest=${digest})`,
+  }
+}
+
+async function verifyGithubStewardStatusExactSha(
+  ctx: GithubCheckContext,
+  targetSha: string,
+): Promise<{ result: GithubStewardStatusResult; statusMissing: boolean }> {
+  const source = `github:${ctx.repo}:status:${STEWARD_GITHUB_STATUS_CONTEXT}@${targetSha.slice(0, 12)}`
+  const statusUrl = `${ctx.apiBase}/repos/${ctx.repo}/commits/${targetSha}/statuses?per_page=100`
+  const resp = await githubGetPaginated<GithubStatusEntry>(statusUrl, ctx.token, ctx.fetchImpl, 5)
+  if (!resp.ok) {
+    return { result: { valid: false, source, reason: resp.reason }, statusMissing: false }
+  }
+  const matching = sortStatusesNewestFirst(
+    resp.items.filter((s) => {
+      if (s.context !== STEWARD_GITHUB_STATUS_CONTEXT) return false
+      const creator = s.creator?.login?.trim().toLowerCase()
+      return Boolean(creator && ctx.trusted.has(creator))
+    }),
+  )
+  if (matching.length === 0) {
+    return {
+      result: {
+        valid: false,
+        source,
+        reason: `no trusted ${STEWARD_GITHUB_STATUS_CONTEXT} commit status found for ${targetSha.slice(0, 12)}`,
+      },
+      statusMissing: true,
+    }
+  }
+  const vetoHit = findStewardVetoStatus(matching, source)
+  if (vetoHit) return { result: vetoHit, statusMissing: false }
+  return {
+    result: parseApprovedStewardStatusEntry(matching[0]!, targetSha, source),
+    statusMissing: false,
+  }
+}
+
+/**
+ * Verify out-of-commit Architecture Steward approval via GitHub Commit Status `oc-v5/arch-steward`.
+ * When `headSha` itself has no trusted status (and no veto/malformed status) and
+ * `allowMergedPrCarryOver !== false`, carries over from a cryptographically proven
+ * equivalent merged PR head (`exact-tree` or single-parent `exact-squash-diff`).
+ */
+export async function verifyGithubStewardStatus(
+  opts: GithubStewardStatusOptions,
+): Promise<GithubStewardStatusResult> {
+  const headSha = opts.headSha.trim().toLowerCase()
+  const source = `github:${opts.repo}:status:${STEWARD_GITHUB_STATUS_CONTEXT}@${headSha.slice(0, 12)}`
+  if (!REPO_SLUG_RE.test(opts.repo)) {
+    return { valid: false, source, reason: `invalid github repo slug "${opts.repo}"` }
+  }
+  if (!SHA40_RE.test(headSha)) {
+    return { valid: false, source, reason: `invalid headSha "${opts.headSha}"` }
+  }
+  if (!opts.token.trim()) {
+    return { valid: false, source, reason: 'missing GitHub API token' }
+  }
+
+  const ctx: GithubCheckContext = {
+    repo: opts.repo,
+    token: opts.token,
+    apiBase: resolveGithubApiBase(opts.apiBaseUrl),
+    trusted: normalizeTrustedLogins(opts.trustedPublishers),
+    fetchImpl: opts.fetchImpl ?? (globalThis.fetch as unknown as FetchLike),
+  }
+
+  const direct = await verifyGithubStewardStatusExactSha(ctx, headSha)
+  if (direct.result.valid || direct.result.verdict === 'veto' || !direct.statusMissing) {
+    return direct.result
+  }
+  if (opts.allowMergedPrCarryOver === false) {
+    return direct.result
+  }
+
+  const eqRes = await resolveMergedPrEquivalence({
+    repo: ctx.repo,
+    token: ctx.token,
+    targetSha: headSha,
+    expectedBaseRef: opts.expectedBaseRef,
+    apiBaseUrl: ctx.apiBase,
+    fetchImpl: ctx.fetchImpl,
+  })
+  const carryNotes: string[] = []
+  for (const cand of eqRes.candidates) {
+    const candCheck = await verifyGithubStewardStatusExactSha(ctx, cand.prHeadSha)
+    if (candCheck.result.verdict === 'veto') return candCheck.result
+    if (candCheck.result.valid) {
+      const tag = `PR#${cand.prNumber}@${cand.prHeadSha.slice(0, 12)} via ${cand.equivalenceProof}`
+      return {
+        ...candCheck.result,
+        source: `${candCheck.result.source} (carried-over from ${tag})`,
+        reason: `${candCheck.result.reason} [carried-over from ${tag}]`,
+        carriedOverFromPr: cand.prNumber,
+        carriedOverFromSha: cand.prHeadSha,
+        equivalenceProof: cand.equivalenceProof,
+      }
+    }
+    carryNotes.push(`PR#${cand.prNumber}: ${candCheck.result.reason}`)
+  }
+
+  const extra = carryNotes.length > 0 ? carryNotes.join('; ') : eqRes.notes.join('; ')
+  return {
+    ...direct.result,
+    reason: extra ? `${direct.result.reason} (${extra})` : direct.result.reason,
+    ...(eqRes.candidates.length > 0 ? { equivalenceCandidates: eqRes.candidates } : {}),
   }
 }

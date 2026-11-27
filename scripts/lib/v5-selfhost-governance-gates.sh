@@ -1044,7 +1044,26 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   fi
 
   # ── Phase 4: OCV5-904/905/906 治理棘轮门(全部显式 --root "$staging"；check-debt-ttl 传 --base/--head)──
-  _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-a0-monotonic.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --base "$base_ref" --head "$full_sha" || return 1
+  local gov_gh_repo="${GITHUB_REPOSITORY:-${GH_REPO:-}}"
+  local gov_gh_token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  local a0_script="" origin_url=""
+  local -a a0_args=(--root "$staging" --base "$base_ref" --head "$full_sha")
+  if [[ -z "$gov_gh_repo" && "${OC_V5_DISABLE_GH_APPROVAL_LOOKUP:-0}" != 1 && -z "${OC_A0_APPROVAL_DIR:-}" && -z "${OC_STEWARD_RECEIPT_DIR:-}" ]]; then
+    origin_url="$("${g[@]}" remote get-url origin 2>/dev/null || true)"
+    if [[ "$origin_url" =~ github\.com[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)$ ]]; then
+      gov_gh_repo="${BASH_REMATCH[1]%.git}"
+    fi
+  fi
+  if [[ -z "$gov_gh_token" && -n "$gov_gh_repo" && "${OC_V5_DISABLE_GH_APPROVAL_LOOKUP:-0}" != 1 ]] && command -v gh >/dev/null 2>&1; then
+    gov_gh_token="$(gh auth token 2>/dev/null || true)"
+  fi
+
+  a0_script="${ref_root:+$ref_view/scripts/check-a0-monotonic.ts}"
+  [[ -n "$a0_script" ]] || a0_script="$staging/scripts/check-a0-monotonic.ts"
+  if [[ -n "$gov_gh_repo" && -n "$gov_gh_token" && -f "$a0_script" ]] && grep -qF -- '--github-repo' "$a0_script" 2>/dev/null; then
+    a0_args+=(--github-repo "$gov_gh_repo")
+  fi
+  GITHUB_TOKEN="$gov_gh_token" _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-a0-monotonic.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- "${a0_args[@]}" || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-ai-smells-ratchet.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --enforce --base "$base_ref" || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-complexity-ratchet.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --enforce --base "$base_ref" || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-clones-ratchet.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --enforce --base "$base_ref" || return 1
@@ -1058,7 +1077,10 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
     && grep -qF -- '--hmac-key-file' "$steward_script" 2>/dev/null; then
     steward_args+=(--hmac-key-file "$steward_hmac_key")
   fi
-  _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-cross-family-audit.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "--enforce-commit" 1 -- "${steward_args[@]}" || return 1
+  if [[ -n "$gov_gh_repo" && -n "$gov_gh_token" && -f "$steward_script" ]] && grep -qF -- '--github-repo' "$steward_script" 2>/dev/null; then
+    steward_args+=(--github-repo "$gov_gh_repo")
+  fi
+  GITHUB_TOKEN="$gov_gh_token" _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-cross-family-audit.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "--enforce-commit" 1 -- "${steward_args[@]}" || return 1
 
   debt_script="${ref_root:+$ref_view/scripts/check-debt-ttl.ts}"
   [[ -n "$debt_script" ]] || debt_script="$staging/scripts/check-debt-ttl.ts"

@@ -50,6 +50,7 @@ import {
   verifyA0ApprovalReceipt,
   verifyA0ApprovalUnified,
 } from './lib/a0MonotonicRules.js'
+import { verifyA0CommitRangeFallback } from './lib/commitRangeCarryOver.js'
 import { type FetchLike, resolveGithubToken } from './lib/githubTrustedApproval.js'
 
 export {
@@ -93,6 +94,8 @@ export interface CheckA0Options {
     prNumber?: number
     trustedApprovers?: readonly string[]
     apiBaseUrl?: string
+    allowMergedPrCarryOver?: boolean
+    expectedBaseRef?: string
     fetchImpl?: FetchLike
   }
 }
@@ -326,11 +329,15 @@ function prepareA0Diff(opts: CheckA0Options): PreparedDiff {
   // Always prefer base's policy when present so a candidate cannot weaken arch/a0-protected-paths.json
   // to hide its own A0 changes. Fall back to head/working tree only on initial introduction.
   const baseRefForPolicy = opts.staged ? 'HEAD' : opts.base
-  const basePolicyText = baseRefForPolicy ? gitFileAt(opts.root, baseRefForPolicy, POLICY_PATH) : null
+  const basePolicyText = baseRefForPolicy
+    ? gitFileAt(opts.root, baseRefForPolicy, POLICY_PATH)
+    : null
   const localPolicyAbs = path.join(opts.root, POLICY_PATH)
   const policyText =
     basePolicyText ??
-    (opts.staged ? gitStagedFile(opts.root, POLICY_PATH) : gitFileAt(opts.root, headRef, POLICY_PATH)) ??
+    (opts.staged
+      ? gitStagedFile(opts.root, POLICY_PATH)
+      : gitFileAt(opts.root, headRef, POLICY_PATH)) ??
     (existsSync(localPolicyAbs) ? readFileSync(localPolicyAbs, 'utf8') : null)
   if (!policyText) {
     throw new Error(`missing ${POLICY_PATH}`)
@@ -383,7 +390,10 @@ function prepareA0Diff(opts: CheckA0Options): PreparedDiff {
   }
 }
 
-function resolveApprovalConfig(policy: A0Policy, opts: CheckA0Options): {
+function resolveApprovalConfig(
+  policy: A0Policy,
+  opts: CheckA0Options,
+): {
   approvalDir: string
   requireRootOwner: boolean
 } {
@@ -487,16 +497,64 @@ export async function runCheckA0MonotonicAsync(opts: CheckA0Options): Promise<Ch
   }
 
   const { approvalDir, requireRootOwner } = resolveApprovalConfig(prep.policy, opts)
-  const approval = await verifyA0ApprovalUnified({
+  const a0Paths = [...new Set(prep.a0Blocks.map((b) => b.path))]
+  let approval = await verifyA0ApprovalUnified({
     approvalDir,
     targetSha: prep.targetSha,
-    a0Paths: [...new Set(prep.a0Blocks.map((b) => b.path))],
+    a0Paths,
     requireRootOwner,
     hmacKeyFile: opts.hmacKeyFile,
     hmacKey: opts.hmacKey,
     nowMs: opts.nowMs,
     github: prep.mode === 'staged' ? undefined : opts.github,
   })
+
+  if (
+    !approval.valid &&
+    !approval.revoked &&
+    prep.mode === 'base' &&
+    opts.base &&
+    opts.github?.prNumber === undefined &&
+    opts.github?.allowMergedPrCarryOver !== false
+  ) {
+    const baseSha = git(opts.root, ['rev-parse', '--verify', `${opts.base}^{commit}`]).trim()
+    const rangeApproval = await verifyA0CommitRangeFallback({
+      root: opts.root,
+      baseSha,
+      headSha: prep.targetSha,
+      aggregateA0Paths: a0Paths,
+      classifyCommitA0Paths: (parentSha, commitSha) => {
+        const raw = git(opts.root, [
+          'diff',
+          '--name-status',
+          '-z',
+          '-M',
+          `${parentSha}...${commitSha}`,
+        ])
+        const entries = parseNameStatusZ(raw)
+        const paths = new Set<string>()
+        for (const e of entries) {
+          const fs = classifyDiffEntry(
+            e,
+            prep.policy,
+            (p) => gitFileAt(opts.root, parentSha, p),
+            (p) => gitFileAt(opts.root, commitSha, p),
+          )
+          for (const f of fs) {
+            if (f.tier === 'A0') paths.add(f.path)
+          }
+        }
+        return [...paths]
+      },
+      approvalDir,
+      requireRootOwner,
+      hmacKeyFile: opts.hmacKeyFile,
+      hmacKey: opts.hmacKey,
+      nowMs: opts.nowMs,
+      github: opts.github,
+    })
+    if (rangeApproval) approval = rangeApproval
+  }
 
   return {
     ok: approval.valid,
@@ -597,9 +655,13 @@ async function main(argv: string[]): Promise<number> {
   }
 
   if (!staged && !base) {
-    const r = spawnSync('git', ['-C', repoRoot, 'rev-parse', '--verify', 'origin/feat/v5-selfhost^{commit}'], {
-      encoding: 'utf8',
-    })
+    const r = spawnSync(
+      'git',
+      ['-C', repoRoot, 'rev-parse', '--verify', 'origin/feat/v5-selfhost^{commit}'],
+      {
+        encoding: 'utf8',
+      },
+    )
     if (r.status === 0) base = 'origin/feat/v5-selfhost'
     else base = 'HEAD'
   }
@@ -622,6 +684,11 @@ async function main(argv: string[]): Promise<number> {
         .filter(Boolean)
     : undefined
 
+  const expectedBaseRef =
+    process.env.GITHUB_REF_TYPE === 'branch' && process.env.GITHUB_REF_NAME?.trim()
+      ? process.env.GITHUB_REF_NAME.trim()
+      : process.env.OC_V5_EXPECTED_BASE_BRANCH?.trim() || undefined
+
   let result: CheckA0Result
   try {
     result = await runCheckA0MonotonicAsync({
@@ -640,6 +707,7 @@ async function main(argv: string[]): Promise<number> {
               prNumber,
               trustedApprovers,
               apiBaseUrl: githubApiUrl,
+              expectedBaseRef,
             }
           : undefined,
     })
@@ -679,7 +747,7 @@ async function main(argv: string[]): Promise<number> {
         `  Violation : ${blk.detail}`,
         '  Why       : A0 meta-layer guardrails and baseline ceilings cannot be loosened or tampered with autonomously.',
         `  How to Fix: Keep changes strictly A1 (monotonic tighten-only), or obtain an out-of-commit A0 approval bound to exact ${result.targetSha}: host \`oc-governor approve-a0 --sha ${result.targetSha} --reason "..." [--publish-github-status]\` or CODEOWNER PR APPROVED review.`,
-        `  Approval  : ${result.approval ? `${result.approval.receiptPath} (${result.approval.reason})` : 'none'}`,
+        `  Approval  : ${result.approval ? `${result.approval.receiptPath} (${result.approval.valid ? result.approval.receipt.reason : result.approval.reason})` : 'none'}`,
       ].join('\n'),
     )
   }
