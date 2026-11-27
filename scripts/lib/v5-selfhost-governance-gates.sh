@@ -870,10 +870,21 @@ _master_governance_run_gate() {
   else
     cmd=("${MASTER_GOV_TSX_CMD[@]}" "$script_exec" "$@")
   fi
+  local _was_xtrace=0 _rc=0 _inject_gh_tok=0
   local -a unset_args=(-u NODE_OPTIONS -u NODE_PATH -u TSX_TSCONFIG_PATH -u npm_config_node_options)
-  # B7: 仅可信外置裁判且显式开启 MASTER_GOV_ALLOW_GH_TOKEN=1 且未禁用时允许凭据进入子进程；
-  # bootstrap 候选脚本、其他门禁以及禁用/离线模式一律物理清除 GITHUB_TOKEN / GH_TOKEN。
-  if [[ "$mode" != referee || "${MASTER_GOV_ALLOW_GH_TOKEN:-0}" != 1 || "${OC_V5_DISABLE_GH_APPROVAL_LOOKUP:-0}" == 1 ]]; then
+  # B7: 仅可信外置裁判且显式开启 MASTER_GOV_ALLOW_GH_TOKEN=1 且未禁用时允许凭据进入子进程，
+  # 并全程关闭 xtrace 防止令牌展开到 bash -x 跟踪日志；bootstrap 候选脚本与其他门禁一律物理清除。
+  if [[ "$mode" == referee && "${MASTER_GOV_ALLOW_GH_TOKEN:-0}" == 1 && "${OC_V5_DISABLE_GH_APPROVAL_LOOKUP:-0}" != 1 ]]; then
+    if [[ $- == *x* ]]; then
+      _was_xtrace=1
+      set +x
+    fi
+    if [[ -n "${MASTER_GOV_GH_TOKEN:-}" ]]; then
+      _inject_gh_tok=1
+    else
+      unset_args+=(-u GITHUB_TOKEN -u GH_TOKEN)
+    fi
+  else
     unset_args+=(-u GITHUB_TOKEN -u GH_TOKEN)
   fi
   if ! (
@@ -883,10 +894,17 @@ _master_governance_run_gate() {
     export OC_TEST_RETRY_ENFORCE=1
     export OC_PG_MIGRATION_BOSS_APPROVED=0
     export BOSS_APPROVED_CHANGELOG=0
+    if (( _inject_gh_tok )); then
+      export GITHUB_TOKEN="$MASTER_GOV_GH_TOKEN"
+    fi
     if [[ -n "$env_git_dir" ]]; then export GIT_DIR="$env_git_dir"; fi
     if [[ -n "$env_work_tree" ]]; then export GIT_WORK_TREE="$env_work_tree"; fi
     env "${unset_args[@]}" "${cmd[@]}"
   ); then
+    _rc=1
+  fi
+  if (( _was_xtrace )); then set -x; fi
+  if (( _rc != 0 )); then
     mlog "✗ pinned governance gate 失败 ($mode): $rel"
     return 1
   fi
@@ -902,23 +920,6 @@ _master_governance_parse_github_origin_repo() { # <url>
   elif [[ "$url" =~ ^ssh://git@github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)$ ]]; then
     printf '%s\n' "${BASH_REMATCH[1]%.git}"
   fi
-}
-
-# B7: 在关闭 xtrace 保护下安全调用可信裁判并仅向单条门禁传入只读凭据，绝不把令牌展开到 bash -x 跟踪日志。
-_master_governance_run_gate_with_gh_auth() { # <allow_tok:0|1> <gate_args...>
-  local allow_tok="$1" rc=0 _was_xtrace=0
-  shift
-  if [[ $- == *x* ]]; then
-    _was_xtrace=1
-    set +x
-  fi
-  if [[ "$allow_tok" == 1 && -n "${MASTER_GOV_GH_TOKEN:-}" ]]; then
-    MASTER_GOV_ALLOW_GH_TOKEN=1 GITHUB_TOKEN="$MASTER_GOV_GH_TOKEN" _master_governance_run_gate "$@" || rc=$?
-  else
-    _master_governance_run_gate "$@" || rc=$?
-  fi
-  if (( _was_xtrace )); then set -x; fi
-  return "$rc"
 }
 
 # 在不可变 pinned staging archive 内执行 Wave 1/2 + OCV5-903/904 全量只读治理硬门：
@@ -1123,10 +1124,14 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   if [[ -n "$gov_expected_branch" && -f "$a0_script" ]] && grep -qF -- '--expected-base-branch' "$a0_script" 2>/dev/null; then
     a0_args+=(--expected-base-branch "$gov_expected_branch")
   fi
-  _master_governance_run_gate_with_gh_auth "$gov_gh_enabled" "$ref_root" "$ref_view" "$staging" scripts/check-a0-monotonic.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- "${a0_args[@]}" || {
+  local MASTER_GOV_ALLOW_GH_TOKEN=0
+  MASTER_GOV_ALLOW_GH_TOKEN="$gov_gh_enabled"
+  _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-a0-monotonic.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- "${a0_args[@]}" || {
+    MASTER_GOV_ALLOW_GH_TOKEN=0
     MASTER_GOV_GH_TOKEN=""
     return 1
   }
+  MASTER_GOV_ALLOW_GH_TOKEN=0
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-ai-smells-ratchet.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --enforce --base "$base_ref" || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-complexity-ratchet.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --enforce --base "$base_ref" || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-clones-ratchet.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --enforce --base "$base_ref" || return 1
@@ -1146,10 +1151,13 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   if [[ -n "$gov_expected_branch" && -f "$steward_script" ]] && grep -qF -- '--expected-base-branch' "$steward_script" 2>/dev/null; then
     steward_args+=(--expected-base-branch "$gov_expected_branch")
   fi
-  _master_governance_run_gate_with_gh_auth "$gov_gh_enabled" "$ref_root" "$ref_view" "$staging" scripts/check-cross-family-audit.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "--enforce-commit" 1 -- "${steward_args[@]}" || {
+  MASTER_GOV_ALLOW_GH_TOKEN="$gov_gh_enabled"
+  _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-cross-family-audit.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "--enforce-commit" 1 -- "${steward_args[@]}" || {
+    MASTER_GOV_ALLOW_GH_TOKEN=0
     MASTER_GOV_GH_TOKEN=""
     return 1
   }
+  MASTER_GOV_ALLOW_GH_TOKEN=0
   MASTER_GOV_GH_TOKEN=""
 
   debt_script="${ref_root:+$ref_view/scripts/check-debt-ttl.ts}"
