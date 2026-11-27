@@ -547,4 +547,51 @@ describe("v2 interactive components", () => {
       unregister();
     }
   });
+
+  it("governance_approval validates strict allowlist/aliases, rejects forged risk fields, and falls back to Markdown", () => {
+    const valid = validateSpec(
+      { type: "gov_approval", approvalId: "gov-blast_20261127_001", title: "计费审批", subtitle: "需拍板" },
+      false,
+    );
+    expect(valid.ok && valid.spec.type === "governance_approval").toBe(true);
+    if (valid.ok && valid.spec.type === "governance_approval") {
+      expect(valid.spec.approvalId).toBe("gov-blast_20261127_001");
+    }
+
+    const aliasGate = validateSpec({ type: "governance_gate", approval_id: "gov-a0_20261127_002" }, false);
+    expect(aliasGate.ok && aliasGate.spec.type === "governance_approval").toBe(true);
+
+    // Rejects invalid approvalId and forged risk conclusions
+    expect(validateSpec({ type: "governance_approval", approvalId: "../etc/passwd" }, false).ok).toBe(false);
+    expect(validateSpec({ type: "governance_approval" }, false).ok).toBe(false);
+    expect(
+      validateSpec(
+        {
+          type: "governance_approval",
+          approvalId: "gov-blast_20261127_001",
+          safetyLights: [{ key: "commercialIsolation", level: "green" }],
+        },
+        false,
+      ).ok,
+    ).toBe(false);
+    expect(
+      validateSpec(
+        {
+          type: "governance_approval",
+          approvalId: "gov-blast_20261127_001",
+          stewardVerdict: { verdict: "approve" },
+        },
+        false,
+      ).ok,
+    ).toBe(false);
+
+    const md = uiFencesToMarkdown(
+      `\`\`\`ui\n${j({ type: "governance_approval", approvalId: "gov-blast_20261127_001", title: "模型伪造标题", subtitle: "模型伪造副标题" })}\n\`\`\``,
+    );
+    expect(md).toContain("gov-blast_20261127_001");
+    expect(md).toContain("当前视图不支持交互操作");
+    expect(md).not.toContain("模型伪造标题");
+    expect(md).not.toContain("模型伪造副标题");
+    expect(md).not.toContain("/admin/#tab=governance");
+  });
 });

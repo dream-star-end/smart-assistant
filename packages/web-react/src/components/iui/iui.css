@@ -91,7 +91,7 @@ figure.oc-iui, .oc-iui { margin: 14px 0 22px; font-size: 14.5px; line-height: 1.
 }
 .oc-iui-nested { margin: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; overflow: visible; }
 /* 操作类与交互工作台卡: 微暖羊皮/炭墨工作面 + 内浮白卡层次 */
-.oc-iui-card:is([data-iui="calculator"], [data-iui="form"], [data-iui="quiz"], [data-iui="draft"], [data-iui="recipe"], [data-iui="route"], [data-iui="quote"], [data-iui="kline"], [data-iui="intraday"], [data-iui="stocklist"], [data-iui="blog_draft"], [data-iui="blog_status"], [data-iui="blog_published"], [data-iui="deliverables"], [data-iui="runbook"], [data-iui="prompt_template"], [data-iui="flashcards"], [data-iui="browser_handoff"]) {
+.oc-iui-card:is([data-iui="calculator"], [data-iui="form"], [data-iui="quiz"], [data-iui="draft"], [data-iui="recipe"], [data-iui="route"], [data-iui="quote"], [data-iui="kline"], [data-iui="intraday"], [data-iui="stocklist"], [data-iui="blog_draft"], [data-iui="blog_status"], [data-iui="blog_published"], [data-iui="deliverables"], [data-iui="runbook"], [data-iui="prompt_template"], [data-iui="flashcards"], [data-iui="browser_handoff"], [data-iui="governance_approval"]) {
   --iui-surface: var(--iui-panel-in);
   --iui-sunken: color-mix(in srgb, var(--fg) 4.5%, var(--iui-panel-in));
   border-radius: 18px;

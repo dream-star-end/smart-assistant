@@ -1,5 +1,5 @@
 import { useMemo, useSyncExternalStore } from "react";
-import { ADMIN_TAB_ALIASES, adminTabKeys } from "./registry";
+import { ADMIN_TAB_ALIASES, type AdminVisibilityOptions, SELFHOST_GOVERNANCE_PAGE, adminTabKeys } from "./registry";
 
 /**
  * 管理后台 hash 路由（与旧 vanilla admin 深链兼容）。
@@ -19,10 +19,11 @@ export type AdminRouteParamsInput = Record<string, string | number | boolean | n
 const DEFAULT_TAB = "dashboard";
 
 /** 解析 hash → { tab, params }。纯函数，供路由与测试直接消费。 */
-export function parseAdminHash(hash: string): { tab: string; params: AdminRouteParams } {
+export function parseAdminHash(hash: string, opts?: AdminVisibilityOptions): { tab: string; params: AdminRouteParams } {
   const m = /#tab=([A-Za-z0-9_]+)(?:&(.+))?$/.exec(hash);
   const raw = m?.[1] ? (ADMIN_TAB_ALIASES[m[1]] ?? m[1]) : undefined;
-  const tab = raw && adminTabKeys.has(raw) ? raw : DEFAULT_TAB;
+  const allowed = Boolean(raw && (adminTabKeys.has(raw) || (opts?.selfhostGovernance && raw === SELFHOST_GOVERNANCE_PAGE.key)));
+  const tab = allowed && raw ? raw : DEFAULT_TAB;
   const params: AdminRouteParams = {};
   if (m?.[2]) {
     for (const [k, v] of new URLSearchParams(m[2]).entries()) params[k] = v;
@@ -67,9 +68,10 @@ export type UseAdminRoute = {
 };
 
 /** 当前路由 + 稳定的 navigate。非法 tab 已在 parse 阶段回落 dashboard。 */
-export function useAdminRoute(): UseAdminRoute {
+export function useAdminRoute(opts?: AdminVisibilityOptions): UseAdminRoute {
   // SSR 快照给空串（parse 后回落 dashboard）；客户端读真实 hash。
   const hash = useSyncExternalStore(subscribe, getSnapshot, () => "");
-  const { tab, params } = useMemo(() => parseAdminHash(hash), [hash]);
+  const selfhostGovernance = Boolean(opts?.selfhostGovernance);
+  const { tab, params } = useMemo(() => parseAdminHash(hash, { selfhostGovernance }), [hash, selfhostGovernance]);
   return { tab, params, navigate: navigateAdmin };
 }

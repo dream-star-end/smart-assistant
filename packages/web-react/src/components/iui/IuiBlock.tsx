@@ -22,7 +22,7 @@ import { BiliCommentsBlock, BiliDanmakuBlock, BiliRankBlock, BiliSubtitleBlock, 
 import { FeishuDocBlock, FeishuEventsBlock, WeiboHotBlock, WeiboPostsBlock, ZhihuAnswersBlock, ZhihuHotBlock } from "./PluginBlocks";
 import { TableBlock } from "./TableBlock";
 import { DraftBlock, OutlineBlock, SourcesBlock } from "./TextBlocks";
-import { BrowserHandoffBlock, CitationsBlock, DeliverablesBlock, RunbookBlock } from "./WorkBlocks";
+import { BrowserHandoffBlock, CitationsBlock, DeliverablesBlock, GovernanceApprovalSlot, RunbookBlock } from "./WorkBlocks";
 import { FlashcardsBlock, PromptTemplateBlock, StoryboardBlock } from "./StudioBlocks";
 import {
   CalloutBlock,
@@ -35,12 +35,37 @@ import {
   TimelineBlock,
 } from "./blocks";
 import { parseUiBlock } from "./parse";
-import { type IuiSpec, resolveType, validateSpec } from "./schema";
+import { type IuiSpec, type V2Spec, resolveType, validateSpec } from "./schema";
 import { BodyMarkdown, CopyButton, Skeleton } from "./shell";
 import { specToMarkdown } from "./toMarkdown";
 
 /** 这些组件要等内容完整才渲染(交互依赖完整数据);流式期间显示骨架。 */
-const WAIT_FOR_COMPLETE = new Set(["calculator", "choice", "suggestions", "callout", "quiz", "form", "recipe", "runbook", "prompt_template", "storyboard", "flashcards", "browser_handoff", "kline", "intraday", "blog_draft", "blog_status", "blog_published"]);
+const WAIT_FOR_COMPLETE = new Set(["calculator", "choice", "suggestions", "callout", "quiz", "form", "recipe", "runbook", "prompt_template", "storyboard", "flashcards", "browser_handoff", "governance_approval", "kline", "intraday", "blog_draft", "blog_status", "blog_published"]);
+
+function renderV2Spec(spec: V2Spec, p: { notes: string[]; streaming: boolean; nested?: boolean }, readOnly?: boolean): ReactNode {
+  switch (spec.type) {
+    case "deliverables": return <DeliverablesBlock spec={spec} {...p} />;
+    case "citations": return <CitationsBlock spec={spec} {...p} readOnly={readOnly} />;
+    case "runbook": return <RunbookBlock spec={spec} {...p} readOnly={readOnly} />;
+    case "prompt_template": return <PromptTemplateBlock spec={spec} {...p} readOnly={readOnly} />;
+    case "storyboard": return <StoryboardBlock spec={spec} {...p} readOnly={readOnly} />;
+    case "flashcards": return <FlashcardsBlock spec={spec} {...p} />;
+    case "browser_handoff": return <BrowserHandoffBlock spec={spec} {...p} readOnly={readOnly} />;
+    case "governance_approval": return <GovernanceApprovalSlot spec={spec} {...p} readOnly={readOnly} />;
+  }
+}
+
+function hasV2Content(spec: V2Spec): boolean {
+  switch (spec.type) {
+    case "deliverables": case "citations": return spec.items.length > 0;
+    case "runbook": return spec.steps.length > 0;
+    case "prompt_template": return spec.template.length > 0;
+    case "storyboard": return spec.shots.length > 0;
+    case "flashcards": return spec.cards.length > 0;
+    case "browser_handoff": return true;
+    case "governance_approval": return spec.approvalId.length > 0;
+  }
+}
 
 export class BlockBoundary extends Component<{ fallback: ReactNode; children: ReactNode; resetKey: string }, { failed: boolean; key: string }> {
   state = { failed: false, key: this.props.resetKey };
@@ -124,20 +149,6 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
       return <OutlineBlock spec={spec} {...p} />;
     case "draft":
       return <DraftBlock spec={spec} {...p} />;
-    case "deliverables":
-      return <DeliverablesBlock spec={spec} {...p} />;
-    case "citations":
-      return <CitationsBlock spec={spec} {...p} readOnly={readOnly} />;
-    case "runbook":
-      return <RunbookBlock spec={spec} {...p} readOnly={readOnly} />;
-    case "prompt_template":
-      return <PromptTemplateBlock spec={spec} {...p} readOnly={readOnly} />;
-    case "storyboard":
-      return <StoryboardBlock spec={spec} {...p} readOnly={readOnly} />;
-    case "flashcards":
-      return <FlashcardsBlock spec={spec} {...p} />;
-    case "browser_handoff":
-      return <BrowserHandoffBlock spec={spec} {...p} readOnly={readOnly} />;
     case "quote":
       return <QuoteBlock spec={spec} {...p} />;
     case "kline":
@@ -176,6 +187,8 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
       return <BlogStatusBlock spec={spec} {...p} readOnly={readOnly} />;
     case "blog_published":
       return <BlogPublishedBlock spec={spec} {...p} readOnly={readOnly} />;
+    default:
+      return renderV2Spec(spec, p, readOnly);
   }
 }
 
@@ -224,19 +237,6 @@ function hasContent(spec: IuiSpec): boolean {
       return spec.items.length > 0;
     case "draft":
       return spec.variants.length > 0;
-    case "deliverables":
-    case "citations":
-      return spec.items.length > 0;
-    case "runbook":
-      return spec.steps.length > 0;
-    case "prompt_template":
-      return spec.template.length > 0;
-    case "storyboard":
-      return spec.shots.length > 0;
-    case "flashcards":
-      return spec.cards.length > 0;
-    case "browser_handoff":
-      return true;
     case "quote":
     case "stocklist":
       return spec.items.length > 0;
@@ -268,6 +268,8 @@ function hasContent(spec: IuiSpec): boolean {
     case "blog_status":
     case "blog_published":
       return spec.id.length > 0;
+    default:
+      return hasV2Content(spec);
   }
 }
 

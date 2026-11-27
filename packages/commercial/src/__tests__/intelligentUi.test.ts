@@ -129,8 +129,9 @@ describe("协议文案", () => {
     for (const t of ["quote", "kline", "intraday", "stocklist"]) assert.ok(cliOnly.has(t), t);
     const types = all.filter((t) => !cliOnly.has(t));
     assert.ok(types.length >= 10, `parsed types: ${types.join(",")}`);
-    // sources 只在前端兼容旧消息和同花顺插件输出,不对模型宣传(OCV5-389)。
-    const frontendOnly = new Set(["sources"]);
+    // sources 只在前端兼容旧消息和同花顺插件输出,不对模型宣传(OCV5-389);
+    // governance_approval 仅个人版自托管控制面使用,绝不写入商业版通用系统提示词 ui.md(OCV5-914)。
+    const frontendOnly = new Set(["sources", "governance_approval"]);
     for (const t of types) {
       if (frontendOnly.has(t)) continue;
       assert.match(CORE_UI_PROTOCOL, new RegExp(`"type":"${t}"`), t);

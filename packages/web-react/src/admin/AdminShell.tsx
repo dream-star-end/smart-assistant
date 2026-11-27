@@ -8,14 +8,17 @@ import {
   Shield,
   X,
 } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { LazyBoundary } from "../components/ChunkErrorBoundary";
 import { ThemeToggle } from "../components/ThemeToggle";
-import { Avatar, IconButton, Sheet, Skeleton } from "../components/ui";
+import { Avatar, Badge, IconButton, Sheet, Skeleton } from "../components/ui";
 import { type Theme, useTheme } from "../hooks/useTheme";
+import { getGovernanceOverview } from "../lib/api/governanceApi";
+import { ApiError } from "../lib/api/http";
 import { cn } from "../lib/utils";
 import type { User } from "../lib/types";
-import { adminGroups, getAdminPage } from "./registry";
+import { adminSession } from "./auth";
+import { getVisibleAdminGroups, getVisibleAdminPage } from "./registry";
 import { useAdminRoute } from "./router";
 
 /** 懒块下载期的页面骨架（LazyBoundary fallback）。 */
@@ -83,68 +86,129 @@ function BrandMarkHeader({
   );
 }
 
+function useGovernanceNavProbe(user: User | null): { enabled: boolean; pendingCount: number } {
+  const [enabled, setEnabled] = useState(false);
+  const [pendingCount, setPendingCount] = useState(0);
+  const userId = user?.id != null ? String(user.id) : "";
+  useEffect(() => {
+    // B8: 仅对个人版管理员 uid=3 在会话挂载后探测一次，非 uid3 零探测请求；切 tab 不重复探测。
+    if (userId !== "3") {
+      setEnabled(false);
+      setPendingCount(0);
+      return undefined;
+    }
+    const controller = new AbortController();
+    void getGovernanceOverview(adminSession, controller.signal)
+      .then((overview) => {
+        if (controller.signal.aborted) return;
+        const ok = Boolean(overview?.enabled);
+        setEnabled(ok);
+        setPendingCount(ok && Array.isArray(overview?.pendingApprovals) ? overview.pendingApprovals.length : 0);
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return;
+        if (err instanceof ApiError && (err.status === 404 || err.status === 403)) {
+          setEnabled(false);
+          setPendingCount(0);
+        }
+      });
+    return () => controller.abort();
+  }, [userId]);
+  return { enabled, pendingCount };
+}
+
+function NavItem({
+  page: p,
+  active,
+  collapsed,
+  pendingBadge,
+  onNavigate,
+}: {
+  page: ReturnType<typeof getVisibleAdminGroups>[number]["pages"][number];
+  active: boolean;
+  collapsed: boolean;
+  pendingBadge: number;
+  onNavigate: (tab: string) => void;
+}) {
+  const Icon = p.icon;
+  const badgeText = pendingBadge > 99 ? "99+" : String(pendingBadge);
+  const tooltip = pendingBadge > 0
+    ? `${p.title}（${pendingBadge} 项待拍板）${p.desc ? ` · ${p.desc}` : ""}`
+    : collapsed
+      ? `${p.title}${p.desc ? ` · ${p.desc}` : ""}`
+      : p.desc;
+  return (
+    <button
+      type="button"
+      onClick={() => onNavigate(p.key)}
+      aria-current={active ? "page" : undefined}
+      title={tooltip}
+      className={cn(
+        "oc-btn-tactile group relative flex items-center rounded-lg text-left text-body outline-none transition-all focus-visible:ring-2 focus-visible:ring-ring",
+        collapsed ? "justify-center p-1.5" : "gap-2.5 px-2 py-1.5",
+        active ? "bg-sidebar-active font-semibold text-fg shadow-sidebar-active" : "font-medium text-muted hover:bg-hover hover:text-fg",
+      )}
+    >
+      {active && !collapsed && (
+        <span aria-hidden="true" className="absolute inset-y-1.5 left-0 w-[3px] rounded-r-full bg-accent" />
+      )}
+      <span
+        className={cn(
+          "flex size-7 shrink-0 items-center justify-center rounded-md transition-colors",
+          active ? "oc-icon-badge oc-icon-badge-accent" : "text-muted group-hover:bg-hover/80 group-hover:text-fg",
+        )}
+      >
+        <Icon size={15} strokeWidth={active ? 2.1 : 1.85} className="shrink-0" />
+      </span>
+      {!collapsed && <span className="min-w-0 flex-1 truncate">{p.title}</span>}
+      {pendingBadge > 0 &&
+        (collapsed ? (
+          <span aria-label={`${pendingBadge} 项待拍板`} className="absolute right-1 top-1 size-2 rounded-full bg-danger" />
+        ) : (
+          <Badge tone="danger" size="sm" aria-label={`${pendingBadge} 项待拍板`} className="ml-auto shrink-0 tabular-nums">
+            {badgeText}
+          </Badge>
+        ))}
+    </button>
+  );
+}
+
 /** 分组导航列表（桌面 sidebar 与移动 Sheet 抽屉共用）。 */
 function NavList({
   activeTab,
   onNavigate,
   collapsed = false,
+  governanceEnabled = false,
+  governancePendingCount = 0,
 }: {
   activeTab: string;
   onNavigate: (tab: string) => void;
   collapsed?: boolean;
+  governanceEnabled?: boolean;
+  governancePendingCount?: number;
 }) {
+  const visibleGroups = getVisibleAdminGroups({ selfhostGovernance: governanceEnabled })
+    .filter(({ pages }) => pages.length > 0);
+
   return (
-    <nav
-      aria-label="管理导航"
-      className={cn("flex flex-col", collapsed ? "gap-3 px-2 py-3" : "gap-4 px-2.5 py-3.5")}
-    >
-      {adminGroups.map(({ group, pages }, groupIndex) => (
+    <nav aria-label="管理导航" className={cn("flex flex-col", collapsed ? "gap-3 px-2 py-3" : "gap-4 px-2.5 py-3.5")}>
+      {visibleGroups.map(({ group, pages }, groupIndex) => (
         <div key={group} className="flex flex-col gap-0.5">
           {collapsed ? (
             groupIndex > 0 && <div className="mx-2 my-1 h-px bg-border/80" aria-hidden="true" />
           ) : (
-            <p className="px-2.5 pb-1 pt-0.5 text-caption font-semibold uppercase tracking-wider text-faint">
-              {group}
-            </p>
+            <p className="px-2.5 pb-1 pt-0.5 text-caption font-semibold uppercase tracking-wider text-faint">{group}</p>
           )}
-          {pages.map((p) => {
-            const Icon = p.icon;
-            const active = p.key === activeTab;
-            return (
-              <button
-                key={p.key}
-                type="button"
-                onClick={() => onNavigate(p.key)}
-                aria-current={active ? "page" : undefined}
-                title={collapsed ? `${p.title}${p.desc ? ` · ${p.desc}` : ""}` : p.desc}
-                className={cn(
-                  "oc-btn-tactile group relative flex items-center rounded-lg text-left text-body outline-none transition-all focus-visible:ring-2 focus-visible:ring-ring",
-                  collapsed ? "justify-center p-1.5" : "gap-2.5 px-2 py-1.5",
-                  active
-                    ? "bg-sidebar-active font-semibold text-fg shadow-sidebar-active"
-                    : "font-medium text-muted hover:bg-hover hover:text-fg",
-                )}
-              >
-                {active && !collapsed && (
-                  <span
-                    aria-hidden="true"
-                    className="absolute inset-y-1.5 left-0 w-[3px] rounded-r-full bg-accent"
-                  />
-                )}
-                <span
-                  className={cn(
-                    "flex size-7 shrink-0 items-center justify-center rounded-md transition-colors",
-                    active
-                      ? "oc-icon-badge oc-icon-badge-accent"
-                      : "text-muted group-hover:bg-hover/80 group-hover:text-fg",
-                  )}
-                >
-                  <Icon size={15} strokeWidth={active ? 2.1 : 1.85} className="shrink-0" />
-                </span>
-                {!collapsed && <span className="truncate">{p.title}</span>}
-              </button>
-            );
-          })}
+          {pages.map((p) => (
+            <NavItem
+              key={p.key}
+              page={p}
+              active={p.key === activeTab}
+              collapsed={collapsed}
+              pendingBadge={p.key === "governance" ? governancePendingCount : 0}
+              onNavigate={onNavigate}
+            />
+          ))}
         </div>
       ))}
     </nav>
@@ -234,19 +298,17 @@ function SidebarFooter({
  * 内容区 max-w 约束 + 独立纵向滚动；页面懒块经 LazyBoundary（Suspense + chunk 失败兜底）。
  */
 export function AdminShell({ user, onLogout }: { user: User | null; onLogout: () => void }) {
-  const { tab, navigate } = useAdminRoute();
+  const gov = useGovernanceNavProbe(user);
+  const { tab, navigate } = useAdminRoute({ selfhostGovernance: gov.enabled });
   // 主题唯一权威源:本处调一次 useTheme,下传给桌面/移动两处 footer,避免两套并行镜像。
   const { theme, cycle } = useTheme();
   const [navOpen, setNavOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
-  const page = getAdminPage(tab);
+  const page = getVisibleAdminPage(tab, { selfhostGovernance: gov.enabled });
   const PageComponent = page.Component;
   const PageIcon = page.icon;
 
-  const go = (next: string) => {
-    navigate(next);
-    setNavOpen(false);
-  };
+  const go = (next: string) => { navigate(next); setNavOpen(false); };
 
   return (
     <div className="flex h-dvh overflow-hidden bg-bg text-fg">
@@ -287,7 +349,7 @@ export function AdminShell({ user, onLogout }: { user: User | null; onLogout: ()
           </div>
         )}
         <div className="sidebar-scroll-fade min-h-0 flex-1 overflow-y-auto">
-          <NavList activeTab={tab} onNavigate={go} collapsed={collapsed} />
+          <NavList activeTab={tab} onNavigate={go} collapsed={collapsed} governanceEnabled={gov.enabled} governancePendingCount={gov.pendingCount} />
         </div>
         <SidebarFooter
           user={user}
@@ -314,7 +376,7 @@ export function AdminShell({ user, onLogout }: { user: User | null; onLogout: ()
           }
         />
         <div className="sidebar-scroll-fade min-h-0 flex-1 overflow-y-auto">
-          <NavList activeTab={tab} onNavigate={go} />
+          <NavList activeTab={tab} onNavigate={go} governanceEnabled={gov.enabled} governancePendingCount={gov.pendingCount} />
         </div>
         <SidebarFooter user={user} onLogout={onLogout} theme={theme} onCycleTheme={cycle} />
       </Sheet>

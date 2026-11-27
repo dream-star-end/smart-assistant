@@ -45,6 +45,7 @@ import { setContentReviewAlerter, setContentReviewPrefilter } from '@openclaude/
 import { omniHardHit } from './openai/omniModeration.js';
 import { selectOpenAiPlatformKey } from './openai/openAiPlatformKey.js';
 import { alertContentReview } from './admin/contentReviewAlert.js';
+import { createOptionalSelfhostGovernance } from './bootstrap/selfhostGovernanceBootstrap.js';
 /**
  * @openclaude/commercial — OpenClaude 商业化模块入口
  *
@@ -1459,9 +1460,7 @@ export async function registerCommercial(
         signer: modelAuthoritySigner, loadUserModelAuthz, log: rootLogger.child({ subsys: "remoteDriverV4" }),
         containerSource: makeAdminCommissionContainerSource(v3Deps) }
     : undefined;
-  const remoteDriverV4 = v4ExecutorDeps
-    ? new RemoteDriverV4CommissioningService({ executorDeps: v4ExecutorDeps, legacyRetirementGate })
-    : undefined;
+  const remoteDriverV4 = v4ExecutorDeps ? new RemoteDriverV4CommissioningService({ executorDeps: v4ExecutorDeps, legacyRetirementGate }) : undefined;
   const qqBotServiceRef: { current: QqBotService | undefined } = { current: undefined };
   const pendingDecisionsRuntime = createCommercialPendingDecisionsRuntime({
     pool: getPool(),
@@ -1474,6 +1473,7 @@ export async function registerCommercial(
   const handler = createCommercialHandler({
     codexCommissioning,
     remoteDriverV4,
+    selfhostGovernance: createOptionalSelfhostGovernance(runtimeChannel, flavorIdentity),
     modelSwitchCost,
     jwtSecret,
     ...systemActions?.http,

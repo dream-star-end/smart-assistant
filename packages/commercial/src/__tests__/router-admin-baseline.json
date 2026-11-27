@@ -577,6 +577,18 @@
   },
   {
     "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/governance",
+    "handler": "handleAdminGovernance"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/governance",
+    "handler": "handleAdminGovernance"
+  },
+  {
+    "method": "GET",
     "pathKind": "path",
     "pathValue": "/api/admin/remote-pool",
     "handler": "handleAdminRemotePoolGet"
