@@ -22,7 +22,7 @@ import {
 } from "lucide-react";
 import type { SidebarDotKind } from "../sessionStatus";
 
-/** 状态色调。running = 进行中 / 未读;attention = 需要处理;done = 完成的勾;failed = 失败;idle = 中性。 */
+/** 状态色调。running = 进行中;attention = 需要处理;done = 完成 / 完成未读;failed = 失败;idle = 中性。 */
 export type SemanticTone = "running" | "attention" | "done" | "failed" | "idle";
 
 export type StatusKind =
@@ -62,7 +62,7 @@ export const STATUS: Record<StatusKind, StatusSpec> = {
   stopped: { label: "已停止", tone: "idle", icon: Square, filled: true },
   failed: { label: "没完成", tone: "failed", icon: TriangleAlert },
   disconnected: { label: "连接已断开，回合可能仍在后台运行", tone: "attention", icon: Unplug },
-  unread: { label: "未读", tone: "running", icon: null },
+  unread: { label: "未读", tone: "done", icon: null },
   service_restart: { label: "服务重启中断，可继续", tone: "attention", icon: null },
 };
 

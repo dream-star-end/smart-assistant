@@ -4,6 +4,7 @@ import {
   deriveLiveTerminalEndedAt,
   deriveLiveTerminalFromMessages,
   deriveSessionNeedsYou,
+  hasUnansweredOptionsFence,
   isSidebarSessionRunning,
   recordTicketApprovalPending,
   syncTicketApprovalFromTicket,
@@ -314,5 +315,173 @@ describe("needs_you 与 Q 版问号待接入判定 (OCV5-739)", () => {
         ],
       }),
     ).toBeNull();
+  });
+
+  it("OCV5-920: oc_grep / Read / Bash 输出含 \"kind\":\"task_approval\" 源码片段不误判为 approval", () => {
+    clearTicketApprovalPendingCacheForTest();
+    for (const toolName of ["oc_grep", "mcp__openclaude-memory__oc_grep", "Read", "read_file", "Bash"]) {
+      expect(
+        deriveSessionNeedsYou({
+          messages: [
+            { role: "user", text: "排查侧栏问号自指误判" },
+            {
+              role: "tool",
+              toolName,
+              inputJson: { query: "task_approval" },
+              output:
+                'src/lib/sessionStatus.ts:374: m.output.includes(\'"kind":"task_approval"\')\n{"kind":"task_approval","id":"OCV5-920"}',
+            },
+            { role: "assistant", text: "已定位到源码中的裸子串匹配逻辑。" },
+          ],
+        }),
+      ).toBeNull();
+    }
+  });
+
+  it("OCV5-920: codex:dynamicToolCall 包装的 present_task_approval 识别为 approval，缺单号或 ok:false 报错返回 null", () => {
+    clearTicketApprovalPendingCacheForTest();
+    expect(
+      deriveSessionNeedsYou({
+        messages: [
+          { role: "user", text: "提交审批" },
+          {
+            role: "tool",
+            toolName: "codex:dynamicToolCall",
+            inputJson: {
+              type: "dynamicToolCall",
+              id: "dyn_call_1",
+              tool: "mcp__openclaude-memory__present_task_approval",
+              arguments: { id: "OCV5-920" },
+            },
+            output: JSON.stringify({ ok: true, kind: "task_approval", status: "presented" }),
+          },
+        ],
+      }),
+    ).toBe("approval");
+
+    // 缺单号时（即使外层 Codex item 自带 call id）不误判为 approval
+    expect(
+      deriveSessionNeedsYou({
+        messages: [
+          { role: "user", text: "提交审批" },
+          {
+            role: "tool",
+            toolName: "codex:dynamicToolCall",
+            inputJson: {
+              type: "dynamicToolCall",
+              id: "dyn_call_no_ticket",
+              tool: "present_task_approval",
+              arguments: {},
+            },
+            output: JSON.stringify({ ok: true, kind: "task_approval" }),
+          },
+        ],
+      }),
+    ).toBeNull();
+
+    // output 为 {"ok":false,"error":"..."}（直接或包在 Codex result.content 内）均返回 null
+    expect(
+      deriveSessionNeedsYou({
+        messages: [
+          { role: "user", text: "提交审批" },
+          {
+            role: "tool",
+            toolName: "codex:dynamicToolCall",
+            inputJson: {
+              tool: "present_task_approval",
+              arguments: { id: "OCV5-920" },
+            },
+            output: JSON.stringify({ ok: false, error: "Ticket not found" }),
+          },
+        ],
+      }),
+    ).toBeNull();
+
+    expect(
+      deriveSessionNeedsYou({
+        messages: [
+          { role: "user", text: "提交审批" },
+          {
+            role: "tool",
+            toolName: "codex:dynamicToolCall",
+            inputJson: {
+              type: "dynamicToolCall",
+              id: "dyn_call_err",
+              tool: "present_task_approval",
+              arguments: { id: "OCV5-920" },
+            },
+            output: JSON.stringify({
+              type: "dynamicToolCall",
+              id: "dyn_call_err",
+              status: "completed",
+              result: {
+                content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Ticket not found" }) }],
+              },
+            }),
+          },
+        ],
+      }),
+    ).toBeNull();
+  });
+
+  it("OCV5-920: 四反引号包裹的 ```options 示例、非法 JSON 与流式未闭合围栏不误报，allowTruncated 仅兼容截断预览", () => {
+    const nestedInFourBackticks = [
+      "下面是 `options` 代码块写法示例：",
+      "````markdown",
+      "```options",
+      '{"question":"选哪个？","options":[{"label":"方案 A"}]}',
+      "```",
+      "````",
+    ].join("\n");
+    expect(hasUnansweredOptionsFence(nestedInFourBackticks)).toBe(false);
+    expect(hasUnansweredOptionsFence(nestedInFourBackticks, { allowTruncated: true })).toBe(false);
+    expect(
+      deriveSessionNeedsYou({
+        messages: [
+          { role: "user", text: "怎么写 options 块？" },
+          { role: "assistant", text: nestedInFourBackticks },
+        ],
+      }),
+    ).toBeNull();
+
+    for (const invalidBlock of [
+      "```options\nnot valid json\n```",
+      '```options\n{"question":"空选项","options":[]}\n```',
+      '```options\n{"options":[""]}\n```',
+      '```options\n{"options":[{"label":"   "}]}\n```',
+      '```options\n{"foo":"bar"}\n```',
+    ]) {
+      expect(hasUnansweredOptionsFence(invalidBlock)).toBe(false);
+      expect(
+        deriveSessionNeedsYou({
+          messages: [
+            { role: "user", text: "测试" },
+            { role: "assistant", text: invalidBlock },
+          ],
+        }),
+      ).toBeNull();
+    }
+
+    // 流式未闭合的 ```options 默认不提前闪问号，仅 allowTruncated: true（lastMessagePreview 截断兜底）返回 true
+    const truncatedFence = '请选择部署环境：\n```options\n{"question":"环境","options":[{"label":"生产';
+    expect(hasUnansweredOptionsFence(truncatedFence)).toBe(false);
+    expect(
+      deriveSessionNeedsYou({
+        messages: [
+          { role: "user", text: "部署" },
+          { role: "assistant", text: truncatedFence },
+        ],
+      }),
+    ).toBeNull();
+    expect(hasUnansweredOptionsFence(truncatedFence, { allowTruncated: true })).toBe(true);
+    expect(hasUnansweredOptionsFence("```options\n非 JSON 截断", { allowTruncated: true })).toBe(false);
+
+    // 有效单对象与多题对象数组闭合后正常返回 true
+    expect(hasUnansweredOptionsFence('```options\n{"options":["方案 A","方案 B"]}\n```')).toBe(true);
+    expect(
+      hasUnansweredOptionsFence(
+        '```options\n[{"question":"Q1","options":["A"]},{"question":"Q2","options":[{"label":"B"}]}]\n```',
+      ),
+    ).toBe(true);
   });
 });

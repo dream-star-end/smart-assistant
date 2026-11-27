@@ -159,8 +159,7 @@ export function resolveToolStatus(display: { name: string; tool: ToolLike }): To
       outputText.includes('"confirmation_required"') ||
       (!hasError &&
         !isCancelled &&
-        (outputText.includes('"kind":"task_approval"') ||
-          /(?:^|__|:)(?:present_task_approval|present_options)$/i.test(name))),
+        /(?:^|__|:)(?:present_task_approval|present_options)$/i.test(name)),
     outputText,
     errorFirstLine: hasError ? errorSummaryLine(outputText) : '',
   }
