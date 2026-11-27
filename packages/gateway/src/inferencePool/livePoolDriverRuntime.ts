@@ -626,7 +626,7 @@ export function wrapEngineWithUnifiedPoolDriver(
 
   let latestTurnId: string | null = null
   let lastTurnReceiptV5: TurnReceiptV5 | null = null
-  let shuttingDown = false
+  let shutdownInFlight = 0
   let activeOperationId = remoteBackend ? remoteBackend.operationId : randomUUID()
 
   const setup = createUnifiedDriverSetup({
@@ -649,7 +649,7 @@ export function wrapEngineWithUnifiedPoolDriver(
       turnId, requestId, turnKey, params, rawModel, serviceTier, baseAdapter, ctx, options,
       composeAgentMul, poolKind, router, activeTurns,
       isLatestTurn: (id) => latestTurnId === id,
-      shuttingDown,
+      shuttingDown: shutdownInFlight > 0,
     })
     activeTurns.set(turnId, turnCtx)
     if (poolKind === 'local_pool') pendingLocalByReqId.set(requestId, turnCtx)
@@ -658,7 +658,7 @@ export function wrapEngineWithUnifiedPoolDriver(
     void executeUnifiedTurnLifecycle({
       poolKind, authEngine, serviceTier, placementEpoch, rawModel, driverRequest, turnCtx,
       router, baseAdapter, clock: options.clock, ensureReady: setup.ensureReady,
-      isShuttingDown: () => shuttingDown,
+      isShuttingDown: () => shutdownInFlight > 0,
       onOperationId: (opId) => { activeOperationId = opId },
       onReceipt: (rec) => { lastTurnReceiptV5 = rec },
       onCleanup: () => {
@@ -675,8 +675,12 @@ export function wrapEngineWithUnifiedPoolDriver(
     interrupt: (reason) =>
       interruptUnifiedActiveTurns({ activeTurns, poolKind, router, baseAdapter, localBridgeState, reason }),
     shutdown: async () => {
-      shuttingDown = true
-      await shutdownUnifiedActiveTurns({ activeTurns, pendingLocalByReqId, poolKind, router, activeOperationId })
+      shutdownInFlight += 1
+      try {
+        await shutdownUnifiedActiveTurns({ activeTurns, pendingLocalByReqId, poolKind, router, activeOperationId })
+      } finally {
+        shutdownInFlight -= 1
+      }
     },
     poolKind,
     router,
