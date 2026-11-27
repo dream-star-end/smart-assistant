@@ -5,7 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
@@ -44,23 +44,76 @@ function fixture(t: { after(f: () => void): void }): Fx {
   return fx;
 }
 const setLoad = (fx: Fx, load1: string) => writeFileSync(fx.loadavg, `${load1} 1.00 1.00 1/100 1234\n`);
-function proc(fx: Fx, pid: number, argv: string[]): void {
+type ProcStatOpts = {
+  state?: string;
+  ppid?: number;
+  utime?: number;
+  stime?: number;
+  cutime?: number;
+  cstime?: number;
+  numThreads?: number;
+  starttime?: number;
+  comm?: string;
+};
+function writeProcStat(fx: Fx, pid: number, opts: ProcStatOpts = {}): void {
+  const {
+    state = "R",
+    ppid = 1,
+    utime = 12,
+    stime = 3,
+    cutime = 0,
+    cstime = 0,
+    numThreads = 1,
+    starttime = 10_000 + pid,
+    comm = "node",
+  } = opts;
+  const tail = [
+    state, ppid, pid, pid, 0, -1, 0,
+    0, 0, 0, 0, utime, stime, cutime, cstime, 20, 0, numThreads, 0, starttime,
+    0, 0,
+  ].join(" ");
+  const dir = path.join(fx.proc, String(pid));
+  mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `.stat.${process.pid}.tmp`);
+  writeFileSync(tmp, `${pid} (${comm}) ${tail}\n`);
+  renameSync(tmp, path.join(dir, "stat"));
+}
+function proc(fx: Fx, pid: number, argv: string[], opts: ProcStatOpts = {}): void {
   mkdirSync(path.join(fx.proc, String(pid)), { recursive: true });
   writeFileSync(path.join(fx.proc, String(pid), "cmdline"), `${argv.join("\0")}\0`);
+  writeProcStat(fx, pid, { comm: path.basename(argv[0] ?? "proc"), ...opts });
 }
 
-function run(fx: Fx, body: string, env: Record<string, string> = {}) {
-  const script = [
+function buildScript(fx: Fx, body: string): string {
+  return [
     'mlog() { echo "$*" >&2; }',
     `MASTER_GATE_LOADAVG=${JSON.stringify(fx.loadavg)}`,
     `MASTER_GATE_TEST_LOCK_DIR=${JSON.stringify(fx.locks)}`,
     `MASTER_GATE_PROC_ROOT=${JSON.stringify(fx.proc)}`,
     vars, summaryLib, fns, body,
   ].join("\n");
-  return spawnSync("bash", ["-eu", "-o", "pipefail", "-c", script], {
+}
+function run(fx: Fx, body: string, env: Record<string, string> = {}) {
+  return spawnSync("bash", ["-eu", "-o", "pipefail", "-c", buildScript(fx, body)], {
     encoding: "utf8", timeout: 30_000,
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin", TMPDIR: fx.dir, OC_V5_TRAIN_SUMMARY_DIR: fx.trains,
       MASTER_GATE_IDLE_POLL_S: "1", ...env },
+  });
+}
+function runAsync(fx: Fx, body: string, env: Record<string, string> = {}) {
+  return new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn("bash", ["-eu", "-o", "pipefail", "-c", buildScript(fx, body)], {
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", TMPDIR: fx.dir, OC_V5_TRAIN_SUMMARY_DIR: fx.trains,
+        MASTER_GATE_IDLE_POLL_S: "1", ...env },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
   });
 }
 const TID = "tr-20261021T000000Z-0123456789ab";
@@ -116,16 +169,293 @@ describe("host idle before the Box gates (OCV5-557 item 3)", () => {
     release();
     for (let i = 0; i < 50 && spawnSync("flock", ["-n", lock, "true"]).status !== 0; i++) await new Promise((r) => setTimeout(r, 50));
     assert.equal(run(fx, "master_gate_busy_reason").stdout, "");
-    proc(fx, 5150, ["npm", "run", "test:gateway"]);
+    // pid5150: npm parent sleeping while its descendant test runner actively executes
+    proc(fx, 5150, ["npm", "run", "test:gateway"], { state: "S", utime: 0, stime: 0 });
+    proc(fx, 51501, ["node", "vitest"], { ppid: 5150, state: "R", utime: 45, stime: 8 });
     assert.match(run(fx, "master_gate_busy_reason").stdout, /pid5150: npm run test:gateway/);
     rmSync(path.join(fx.proc, "5150"), { recursive: true });
-    proc(fx, 5151, ["node", "/usr/lib/node_modules/npm/bin/npm-cli.js", "run", "check:v5"]);
+    rmSync(path.join(fx.proc, "51501"), { recursive: true });
+    proc(fx, 5151, ["node", "/usr/lib/node_modules/npm/bin/npm-cli.js", "run", "check:v5"], { state: "R" });
     assert.match(run(fx, "master_gate_busy_reason").stdout, /pid5151:/);
     rmSync(path.join(fx.proc, "5151"), { recursive: true });
-    proc(fx, 5152, ["npm", "test"]);
+    proc(fx, 5152, ["npm", "test"], { state: "D" });
     assert.match(run(fx, "master_gate_busy_reason").stdout, /pid5152:/);
     // no lock file is created by looking
     assert.deepEqual(readdirSync(fx.locks), ["oc-test-gateway.lock"]);
+  });
+
+  test("cmdline candidate blocked in wait-for-trains/sleep is idle; subtree CPU tick growth is busy", async (t) => {
+    const fx = fixture(t);
+    // Incident shape (tr-20261029T195927Z): rf-heavy wrapper carries `npm run test` in argv while sleeping on train
+    proc(fx, 924355, ["bash", "/opt/rf-heavy.sh", "npm", "run", "test"], { state: "S", utime: 2, stime: 1 });
+    proc(fx, 924356, ["bash", "/opt/wait-for-trains.sh", "--no-lock", "--every", "30"],
+      { ppid: 924355, state: "S", utime: 4, stime: 2, comm: "wait (trains)" });
+    proc(fx, 924357, ["sleep", "30"], { ppid: 924356, state: "S", utime: 0, stime: 0 });
+    const idle = run(fx, 'fn_err="$(master_gate_busy_reason 2>&1 >/dev/null)"; printf "[%s][%s]" "$(master_gate_busy_reason)" "$fn_err"');
+    assert.equal(idle.status, 0, idle.stderr);
+    assert.equal(idle.stdout, "[][]");
+
+    // Subtree all in state S at snapshots (async IO gap), but child utime+stime advances within sampling window -> busy
+    proc(fx, 924360, ["node", "vitest"], { ppid: 924355, state: "S", utime: 10, stime: 3, starttime: 77_777 });
+    let utime = 10;
+    const ticker = setInterval(() => {
+      utime += 2;
+      writeProcStat(fx, 924360, { ppid: 924355, state: "S", utime, stime: 3, starttime: 77_777, comm: "node" });
+    }, 25);
+    t.after(() => clearInterval(ticker));
+    const busy = await runAsync(fx, "master_gate_busy_reason");
+    clearInterval(ticker);
+    assert.equal(busy.status, 0, busy.stderr);
+    assert.match(busy.stdout, /pid924355: npm run test/);
+
+    // Mixed: sleeping pid924355 is omitted while active pid5150 is reported
+    rmSync(path.join(fx.proc, "924360"), { recursive: true });
+    proc(fx, 5150, ["npm", "run", "test:gateway"], { state: "S", utime: 0, stime: 0 });
+    proc(fx, 51501, ["node", "vitest"], { ppid: 5150, state: "R", utime: 20, stime: 4 });
+    const mixed = run(fx, "master_gate_busy_reason");
+    assert.equal(mixed.status, 0, mixed.stderr);
+    assert.equal(mixed.stdout.trim(), "pid5150: npm run test:gateway");
+
+    // Self-process exclusion ($$ / BASHPID) remains intact
+    for (const entry of readdirSync(fx.proc)) rmSync(path.join(fx.proc, entry), { recursive: true, force: true });
+    const selfCheck = run(fx, [
+      'mkdir -p "$MASTER_GATE_PROC_ROOT/$$"',
+      'printf "%s\\0" npm run test > "$MASTER_GATE_PROC_ROOT/$$/cmdline"',
+      'printf "%s (bash) R 1 %s %s 0 -1 0 0 0 0 0 50 10 0 0 20 0 1 0 99999 0 0\\n" "$$" "$$" "$$" > "$MASTER_GATE_PROC_ROOT/$$/stat"',
+      'master_gate_busy_reason',
+    ].join("\n"));
+    assert.equal(selfCheck.status, 0, selfCheck.stderr);
+    assert.equal(selfCheck.stdout, "");
+  });
+
+  test("real /proc process trees: flock-blocked wrapper is idle; CPU-active descendant is busy", async (t) => {
+    const fx = fixture(t);
+    const killGroup = (pid: number | undefined) => {
+      if (pid) {
+        try { process.kill(-pid, "SIGKILL"); } catch { /* gone */ }
+      }
+    };
+    const readKernelStat = (pid: number): { state: string; ppid: number } | null => {
+      try {
+        const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const rparen = raw.lastIndexOf(") ");
+        if (rparen < 0) return null;
+        const fields = raw.slice(rparen + 2).trim().split(/\s+/);
+        return { state: fields[0] ?? "", ppid: Number(fields[1] ?? 0) };
+      } catch {
+        return null;
+      }
+    };
+    const kernelChildrenOf = (ppid: number): number[] => {
+      const out: number[] = [];
+      for (const name of readdirSync("/proc")) {
+        if (!/^\d+$/.test(name)) continue;
+        const pid = Number(name);
+        const st = readKernelStat(pid);
+        if (st && st.ppid === ppid) out.push(pid);
+      }
+      return out;
+    };
+
+    // 1. Real wrapper with `npm run test:gateway` in argv, blocked waiting on flock -> not busy
+    const rfLock = path.join(fx.dir, "rf-heavy.lock");
+    writeFileSync(rfLock, "");
+    const holder = spawn("flock", [rfLock, "sleep", "30"], { stdio: "ignore", detached: true });
+    t.after(() => killGroup(holder.pid));
+    for (let i = 0; i < 50 && spawnSync("flock", ["-n", rfLock, "true"]).status === 0; i++) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    const waiterReady = path.join(fx.dir, "waiter.ready");
+    const waiter = spawn(
+      "bash",
+      ["-c", 'echo "$$" > "$2"; flock "$1" sleep 30; :', "rf-heavy.sh", rfLock, waiterReady, "npm", "run", "test:gateway"],
+      { stdio: "ignore", detached: true },
+    );
+    t.after(() => killGroup(waiter.pid));
+    let waiterTree: number[] = [];
+    for (let i = 0; i < 60; i++) {
+      if (existsSync(waiterReady) && waiter.pid) {
+        const kids = kernelChildrenOf(waiter.pid);
+        const tree = [waiter.pid, ...kids];
+        if (kids.length > 0 && tree.every((p) => readKernelStat(p)?.state === "S")) {
+          waiterTree = tree;
+          break;
+        }
+      }
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    assert.ok(waiterTree.length >= 2, "expected bash wrapper and blocked flock child in state S");
+    for (const p of waiterTree) symlinkSync(`/proc/${p}`, path.join(fx.proc, String(p)));
+    const waitingRes = run(fx, "master_gate_busy_reason");
+    for (const p of waiterTree) unlinkSync(path.join(fx.proc, String(p)));
+    killGroup(waiter.pid);
+    killGroup(holder.pid);
+    assert.equal(waitingRes.status, 0, waitingRes.stderr);
+    assert.equal(waitingRes.stdout, "");
+
+    // 2. Real wrapper with `npm run test:gateway` in argv, parent bash sleeping while child node burns CPU -> busy
+    const runnerReady = path.join(fx.dir, "runner.ready");
+    const cpuScript = [
+      'const fs = require("node:fs");',
+      'const out = process.argv[1];',
+      'fs.writeFileSync(out + ".tmp", String(process.pid));',
+      'fs.renameSync(out + ".tmp", out);',
+      'const end = Date.now() + 10000;',
+      'let acc = 0;',
+      'while (Date.now() < end) { for (let i = 0; i < 100000; i++) acc = (acc + i) | 0; }',
+      'if (acc === 42) process.stderr.write("");',
+    ].join(" ");
+    const runner = spawn(
+      "bash",
+      ["-c", 'node -e "$1" "$2"; :', "rf-heavy.sh", cpuScript, runnerReady, "npm", "run", "test:gateway"],
+      { stdio: "ignore", detached: true },
+    );
+    t.after(() => killGroup(runner.pid));
+    for (let i = 0; i < 60 && !existsSync(runnerReady); i++) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    assert.ok(runner.pid && existsSync(runnerReady), "expected active CPU child to signal readiness");
+    const workerPid = Number(readFileSync(runnerReady, "utf8").trim());
+    assert.ok(Number.isInteger(workerPid) && workerPid > 0);
+    symlinkSync(`/proc/${runner.pid}`, path.join(fx.proc, String(runner.pid)));
+    symlinkSync(`/proc/${workerPid}`, path.join(fx.proc, String(workerPid)));
+    const activeRes = run(fx, "master_gate_busy_reason");
+    unlinkSync(path.join(fx.proc, String(runner.pid)));
+    unlinkSync(path.join(fx.proc, String(workerPid)));
+    killGroup(runner.pid);
+    assert.equal(activeRes.status, 0, activeRes.stderr);
+    assert.match(activeRes.stdout, new RegExp(`pid${runner.pid}: npm run test:gateway`));
+  });
+
+  test("bash -c heredoc that writes web-checks.sh then blocks is idle", async (t) => {
+    const fx = fixture(t);
+    const killGroup = (pid: number | undefined) => {
+      if (!pid) return;
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ESRCH") throw err;
+      }
+    };
+    const readKernelStat = (pid: number): { state: string; ppid: number } | null => {
+      try {
+        const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const rparen = raw.lastIndexOf(") ");
+        if (rparen < 0) return null;
+        const fields = raw.slice(rparen + 2).trim().split(/\s+/);
+        return { state: fields[0] ?? "", ppid: Number(fields[1] ?? 0) };
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") return null;
+        throw err;
+      }
+    };
+    const kernelChildrenOf = (ppid: number): number[] => {
+      const out: number[] = [];
+      for (const name of readdirSync("/proc")) {
+        if (!/^\d+$/.test(name)) continue;
+        const pid = Number(name);
+        const st = readKernelStat(pid);
+        if (st && st.ppid === ppid) out.push(pid);
+      }
+      return out;
+    };
+    const unlinkProc = (link: string) => {
+      try {
+        unlinkSync(link);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT") throw err;
+      }
+    };
+
+    // Incident shape (tr-20261030T013148Z pid510429): bash -c carries
+    // `cat > web-checks.sh <<'EOF' … npm run test … EOF` and then blocks.
+    // The same argv is a candidate, so a running descendant must still count as busy.
+    const heredocArgv = [
+      "bash", "-c",
+      "cat > web-checks.sh <<'EOF'\n#!/usr/bin/env bash\nnpm run test\nEOF\nflock web-checks.lock sleep 30\n",
+    ];
+    proc(fx, 510429, heredocArgv, { state: "S", utime: 2, stime: 1, comm: "bash" });
+    proc(fx, 510430, ["sleep", "30"], { ppid: 510429, state: "S", utime: 0, stime: 0, comm: "sleep" });
+    const idle = run(fx, "master_gate_busy_reason");
+    assert.equal(idle.status, 0, idle.stderr);
+    assert.equal(idle.stdout, "");
+
+    rmSync(path.join(fx.proc, "510430"), { recursive: true });
+    proc(fx, 510431, ["node", "vitest"], { ppid: 510429, state: "R", utime: 4, stime: 1 });
+    const active = run(fx, "master_gate_busy_reason");
+    assert.equal(active.status, 0, active.stderr);
+    assert.match(active.stdout, /pid510429: npm run test/);
+
+    for (const entry of readdirSync(fx.proc)) rmSync(path.join(fx.proc, entry), { recursive: true, force: true });
+
+    const blockLock = path.join(fx.dir, "heredoc.lock");
+    writeFileSync(blockLock, "");
+    const holder = spawn("flock", [blockLock, "sleep", "40"], { stdio: "ignore", detached: true });
+    t.after(() => killGroup(holder.pid));
+    for (let i = 0; i < 50 && spawnSync("flock", ["-n", blockLock, "true"]).status === 0; i++) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    const ready = path.join(fx.dir, "heredoc.ready");
+    const body = [
+      "cat > web-checks.sh <<'EOF'",
+      "#!/usr/bin/env bash",
+      "npm run test",
+      "EOF",
+      "echo $$ > \"$1\"",
+      "flock \"$2\" sleep 30",
+      // Trailing builtin keeps bash from exec'ing flock, so the heredoc stays in cmdline.
+      ":",
+    ].join("\n");
+    const writer = spawn("bash", ["-c", body, "bash", ready, blockLock], {
+      cwd: fx.dir, stdio: "ignore", detached: true,
+    });
+    t.after(() => killGroup(writer.pid));
+    const linked: string[] = [];
+    t.after(() => {
+      for (const link of linked) unlinkProc(link);
+    });
+    let writerTree: number[] = [];
+    for (let i = 0; i < 100; i++) {
+      if (writer.pid && existsSync(ready)) {
+        const walk = (pid: number): number[] => [pid, ...kernelChildrenOf(pid).flatMap(walk)];
+        const tree = walk(writer.pid);
+        if (tree.length >= 2 && tree.every((pid) => readKernelStat(pid)?.state === "S")) {
+          writerTree = tree;
+          break;
+        }
+      }
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    assert.ok(writer.pid, "heredoc bash did not start");
+    const cmdline = existsSync(`/proc/${writer.pid}/cmdline`)
+      ? readFileSync(`/proc/${writer.pid}/cmdline`, "utf8").split("\0").join(" ")
+      : "";
+    assert.ok(
+      writerTree.length >= 2,
+      `expected blocked flock child in state S, tree=${writerTree.join(",")} cmdline=${JSON.stringify(cmdline)}`,
+    );
+    assert.match(cmdline, /cat > web-checks\.sh <<'EOF'/);
+    assert.match(cmdline, /npm run test/);
+    assert.match(readFileSync(path.join(fx.dir, "web-checks.sh"), "utf8"), /^npm run test$/m);
+    for (const pid of writerTree) {
+      const link = path.join(fx.proc, String(pid));
+      symlinkSync(`/proc/${pid}`, link);
+      linked.push(link);
+    }
+    const waitingRes = run(fx, "master_gate_busy_reason");
+    for (const link of linked) unlinkProc(link);
+    linked.length = 0;
+    killGroup(writer.pid);
+    killGroup(holder.pid);
+    assert.equal(waitingRes.status, 0, waitingRes.stderr);
+    assert.equal(
+      waitingRes.stdout,
+      "",
+      `blocked heredoc writer was reported busy: [${waitingRes.stdout}]`,
+    );
   });
 
   test("waits while busy, then goes; gives up after the limit with the reason", (t) => {
