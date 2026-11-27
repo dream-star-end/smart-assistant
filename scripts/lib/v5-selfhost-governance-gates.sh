@@ -677,11 +677,57 @@ for root_str, dirs, files in os.walk(view, followlinks=False):
 PY
 }
 
+# OCV5-918: 外置裁判共享锁（与 sync-referee.sh 的排他锁 .referee.lock 协同），
+# 确保并发读者在持共享锁期间完成裁判校验与隔离快照拷贝，绝不与 swap 半途撞车。
+_master_referee_acquire_shared_lock() { # <out-fd-var> [ref-cand]
+  local out_var="$1"
+  local ref_cand="${2:-${OC_V5_REFEREE_ROOT:-${MASTER_REFEREE_ROOT:-/opt/openclaude/harness-gate/referee}}}"
+  ref_cand="${ref_cand%/}"
+  printf -v "$out_var" ''
+  [[ -n "$ref_cand" ]] || return 0
+  command -v flock >/dev/null 2>&1 || return 0
+  local lock_dir="" lock_file="" _fd=""
+  lock_dir="$(dirname -- "$ref_cand")"
+  lock_file="${lock_dir}/.referee.lock"
+  if [[ -L "$lock_file" ]]; then
+    mlog "✗ [referee] 拒绝符号链接裁判锁: $lock_file"
+    return 1
+  fi
+  if [[ -e "$lock_file" && ! -f "$lock_file" ]]; then
+    mlog "✗ [referee] 裁判锁必须为普通文件: $lock_file"
+    return 1
+  fi
+  if [[ -f "$lock_file" && -r "$lock_file" ]]; then
+    exec {_fd}<"$lock_file" || return 1
+  elif [[ ! -e "$lock_file" && -d "$lock_dir" && -w "$lock_dir" ]]; then
+    exec {_fd}>>"$lock_file" || return 1
+    chmod 0644 "$lock_file" 2>/dev/null || true
+  else
+    return 0
+  fi
+  if ! flock -w 60 -s "$_fd"; then
+    exec {_fd}<&- || true
+    mlog "✗ [referee] 等待外置裁判共享锁超时: $lock_file"
+    return 1
+  fi
+  printf -v "$out_var" '%s' "$_fd"
+  return 0
+}
+
+_master_referee_release_shared_lock() { # <fd-or-empty>
+  local _fd="${1:-}"
+  if [[ "$_fd" =~ ^[0-9]+$ ]] && (( _fd >= 3 )); then
+    flock -u "$_fd" 2>/dev/null || true
+    exec {_fd}<&- || true
+  fi
+}
+
 # B4 在最小无凭据环境 (env -i) + 非特权 nobody (65534:65534) 下隔离执行行为评测 check-context-static.ts！
 _master_governance_run_context_eval_isolated() { # <ref-root> <ctx-view> <staging> <ref-nm> [rel-script]
   local ref_root="$1" ctx_view="$2" staging="$3" ref_nm="$4" rel="${5:-scripts/check-context-static.ts}"
   local resolved="" rc=0 mode="" script_exec="" ctx_tmp="" nm_exec="" node_bin="" node_dir="" safe_path=""
-  resolved="$(master_referee_resolve_script "$ref_root" "$staging" "$rel")" || rc=$?
+  local ref_src="${ref_root:+$ctx_view}"
+  resolved="$(master_referee_resolve_script "$ref_src" "$staging" "$rel")" || rc=$?
   if (( rc != 0 )); then
     mlog "✗ governance fast gate: ${ref_root:+外置裁判($ref_root)}${ref_root:-候选}缺必需门禁 $rel"
     return 1
@@ -778,22 +824,35 @@ _master_governance_run_context_eval_isolated() { # <ref-root> <ctx-view> <stagin
 # 保持调用方字面命令 `env -u ... npx --no-install tsx scripts/check-architecture.ts` 满足 parity 检查，
 # 同时物理保证解释器与脚本 100% 源自外置裁判及其可信 node_modules(零借用 $staging)。
 master_referee_prepare_exec_root() { # <staging> <rel-script> [full-sha] → stdout exec_root
-  local staging="$1" rel="$2" full_sha="${3:-}" ref_root="" ref_nm="" resolved="" mode="" view_dir="" tag=""
-  ref_root="$(master_resolve_referee_root "$staging" "$full_sha")" || return 1
+  local staging="$1" rel="$2" full_sha="${3:-}" ref_root="" ref_nm="" resolved="" mode="" view_dir="" tag="" lock_fd=""
+  _master_referee_acquire_shared_lock lock_fd || return 1
+  if ! ref_root="$(master_resolve_referee_root "$staging" "$full_sha")"; then
+    _master_referee_release_shared_lock "$lock_fd"
+    return 1
+  fi
   if ! resolved="$(master_referee_resolve_script "$ref_root" "$staging" "$rel")"; then
+    _master_referee_release_shared_lock "$lock_fd"
     mlog "✗ [referee] 裁判(${ref_root:-bootstrap})缺 $rel"
     return 1
   fi
   mode="${resolved%%$'\t'*}"
   if [[ "$mode" == referee ]]; then
-    ref_nm="$(master_resolve_referee_node_modules "$ref_root" "$staging")" || return 1
+    if ! ref_nm="$(master_resolve_referee_node_modules "$ref_root" "$staging")"; then
+      _master_referee_release_shared_lock "$lock_fd"
+      return 1
+    fi
     tag="$(printf '%s' "$rel" | tr '/.' '__')"
     view_dir="${MASTER_GATE_TMPDIR:-/tmp}/referee-job-${tag}-$$"
-    master_referee_build_exec_view "$ref_root" "$view_dir" "$ref_nm" || return 1
+    if ! master_referee_build_exec_view "$ref_root" "$view_dir" "$ref_nm"; then
+      _master_referee_release_shared_lock "$lock_fd"
+      return 1
+    fi
+    _master_referee_release_shared_lock "$lock_fd"
     mlog "  [referee] $rel -> isolated referee ($ref_root, nm=$ref_nm)"
     printf '%s\n' "$view_dir"
     return 0
   fi
+  _master_referee_release_shared_lock "$lock_fd"
   mlog "  [referee-bootstrap] $rel absent in referee (${ref_root:-none}); running candidate staging copy"
   printf '%s\n' "$staging"
 }
@@ -834,8 +893,8 @@ _master_governance_run_gate() {
     _master_governance_run_context_eval_isolated "$ref_root" "$ref_view" "$staging" "${MASTER_GOV_REF_NM:-}" "$rel" "$@"
     return $?
   fi
-  local resolved="" rc=0 mode="" script_exec=""
-  resolved="$(master_referee_resolve_script "$ref_root" "$staging" "$rel" "$req_pat")" || rc=$?
+  local resolved="" rc=0 mode="" script_exec="" ref_src="${ref_root:+$ref_view}"
+  resolved="$(master_referee_resolve_script "$ref_src" "$staging" "$rel" "$req_pat")" || rc=$?
   if (( rc == 3 )); then
     if [[ "$optional" == 1 ]]; then
       mlog "  [governance-compat] $rel 在裁判(${ref_root:-bootstrap})中尚未支持 $req_pat，跳过可选门(禁止回落候选)"
@@ -935,20 +994,25 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   local -a pg_file_args=() fs_args=() debt_args=() steward_args=() biome_args=()
 
   mlog "── Wave 1/2 治理快门(只读/隔离外置裁判, pinned staging @ ${full_sha:0:12}) ──"
-  ref_root="$(master_resolve_referee_root "$staging" "$full_sha")" || {
+  local ref_lock_fd=""
+  _master_referee_acquire_shared_lock ref_lock_fd || return 1
+  if ! ref_root="$(master_resolve_referee_root "$staging" "$full_sha")"; then
+    _master_referee_release_shared_lock "$ref_lock_fd"
     mlog "✗ governance fast gate: 外置裁判解析或完整性/过渡批准校验失败(fail-closed)"
     return 1
-  }
-  ref_nm="$(master_resolve_referee_node_modules "$ref_root" "$staging")" || {
+  fi
+  if ! ref_nm="$(master_resolve_referee_node_modules "$ref_root" "$staging")"; then
+    _master_referee_release_shared_lock "$ref_lock_fd"
     mlog "✗ governance fast gate: 无法解析可信裁判 node_modules(fail-closed)"
     return 1
-  }
+  fi
   local MASTER_GOV_REF_NM="$ref_nm"
   if [[ -f "$ref_nm/tsx/dist/cli.mjs" ]]; then
     MASTER_GOV_TSX_CMD=(node "$ref_nm/tsx/dist/cli.mjs")
   elif [[ -x "$ref_nm/.bin/tsx" ]]; then
     MASTER_GOV_TSX_CMD=("$ref_nm/.bin/tsx")
   else
+    _master_referee_release_shared_lock "$ref_lock_fd"
     mlog "✗ governance fast gate: 可信裁判 node_modules 缺少 tsx ($ref_nm)"
     return 1
   fi
@@ -963,11 +1027,15 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
       mlog "  [referee] authoritative isolated root=$ref_root (nm=$ref_nm)"
     fi
     ref_view="$MASTER_GATE_TMPDIR/referee-view-$$"
-    master_referee_build_exec_view "$ref_root" "$ref_view" "$ref_nm" || return 1
+    if ! master_referee_build_exec_view "$ref_root" "$ref_view" "$ref_nm"; then
+      _master_referee_release_shared_lock "$ref_lock_fd"
+      return 1
+    fi
   else
     mlog "  [referee-bootstrap] no external referee or live release; bootstrap mode (nm=$ref_nm)"
     ref_view="$staging"
   fi
+  _master_referee_release_shared_lock "$ref_lock_fd"
 
   # ── Phase 1: 纯文件系统/静态快门(全部显式传 --root "$staging" 只读数据根) ──
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-docs-links.ts tsx "$ref_view" "" "" "" 0 -- --root "$staging" || return 1
@@ -988,7 +1056,7 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   chmod 0755 "$ctx_base"
   ctx_view="$ctx_base/view"
   if [[ -n "$ref_root" ]]; then
-    _master_referee_build_context_eval_view "$ref_root" "$staging" "$ctx_view" "$ref_nm" || ctx_rc=$?
+    _master_referee_build_context_eval_view "$ref_view" "$staging" "$ctx_view" "$ref_nm" || ctx_rc=$?
   else
     _master_referee_build_context_eval_view "$staging" "$staging" "$ctx_view" "$ref_nm" || ctx_rc=$?
   fi
@@ -1051,7 +1119,7 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   if (( ${#pg_file_args[@]} > 0 )); then
     _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-pg-migration-safety.ts tsx "$ref_view" "" "" "" 0 -- --root "$staging" --no-squawk "${pg_file_args[@]}" || return 1
   else
-    if ! master_referee_resolve_script "$ref_root" "$staging" scripts/check-pg-migration-safety.ts >/dev/null; then
+    if ! master_referee_resolve_script "${ref_root:+$ref_view}" "$staging" scripts/check-pg-migration-safety.ts >/dev/null; then
       mlog "✗ governance fast gate: ${ref_root:+外置裁判}${ref_root:-候选}缺 scripts/check-pg-migration-safety.ts"
       return 1
     fi
@@ -1059,7 +1127,7 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   fi
 
   # Changelog guard (防线 3: 强制 BOSS_APPROVED_CHANGELOG=0)
-  if ! master_referee_resolve_script "$ref_root" "$staging" scripts/check-changelog-guard.ts >/dev/null; then
+  if ! master_referee_resolve_script "${ref_root:+$ref_view}" "$staging" scripts/check-changelog-guard.ts >/dev/null; then
     mlog "✗ governance fast gate: ${ref_root:+外置裁判}${ref_root:-候选}缺 scripts/check-changelog-guard.ts"
     return 1
   fi

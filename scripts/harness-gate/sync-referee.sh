@@ -22,6 +22,8 @@ APPROVAL_FILE=""
 NODE_MODULES_FROM=""
 COPY_NODE_MODULES=0
 HMAC_KEY_FILE=""
+PRESERVE_OTHER_TRANSITION="${OC_V5_SYNC_REFEREE_PRESERVE_OTHER_TRANSITION:-}"
+EXPECTED_LIVE_SHA="${OC_V5_SYNC_REFEREE_EXPECTED_LIVE_SHA:-}"
 REQUIRE_ROOT_OWNER=1
 [[ "${OC_INSTALL_SKIP_CHOWN:-0}" == "1" || "${OC_GOVERNOR_UNSAFE_TEST_SKIP_OWNER:-0}" == "1" ]] && REQUIRE_ROOT_OWNER=0
 
@@ -35,12 +37,15 @@ while [[ $# -gt 0 ]]; do
     --node-modules-from) NODE_MODULES_FROM="${2:-}"; shift 2 ;;
     --copy-node-modules) COPY_NODE_MODULES=1; shift ;;
     --hmac-key-file) HMAC_KEY_FILE="${2:-}"; shift 2 ;;
+    --preserve-other-transition) PRESERVE_OTHER_TRANSITION="${2:-}"; shift 2 ;;
+    --expected-live-sha) EXPECTED_LIVE_SHA="${2:-}"; shift 2 ;;
     --no-readonly) LOCK_READONLY=0; shift ;;
     --unsafe-test-skip-owner) REQUIRE_ROOT_OWNER=0; shift ;;
     -h|--help)
       cat <<'EOF'
 Usage:
-  sync-referee.sh [--live-link PATH] [--dest DIR] [--node-modules-from DIR] [--no-readonly]
+  sync-referee.sh [--live-link PATH] [--dest DIR] [--node-modules-from DIR]
+                  [--preserve-other-transition <40hex>] [--expected-live-sha <40hex>] [--no-readonly]
   sync-referee.sh --stage-audited <src_dir> --target-sha <40hex> --approval-file <a0_approval_json>
                   [--dest DIR] [--node-modules-from DIR] [--copy-node-modules]
                   [--hmac-key-file PATH] [--no-readonly] [--unsafe-test-skip-owner]
@@ -53,6 +58,8 @@ EOF
       ;;
   esac
 done
+
+REFEREE_DEST="${REFEREE_DEST%/}"
 
 die() {
   echo "✗ [sync-referee] $*" >&2
@@ -70,6 +77,17 @@ SOURCE_COMMIT=""
 TREE_SHA=""
 APPROVAL_META_JSON=""
 
+PARENT_DIR="$(dirname "$REFEREE_DEST")"
+mkdir -p "$PARENT_DIR"
+REFEREE_LOCK="${PARENT_DIR}/.referee.lock"
+[[ ! -L "$REFEREE_LOCK" ]] || die "referee lock must not be a symlink: $REFEREE_LOCK"
+if [[ -e "$REFEREE_LOCK" && ! -f "$REFEREE_LOCK" ]]; then
+  die "referee lock must be a regular file: $REFEREE_LOCK"
+fi
+exec {REFEREE_LOCK_FD}>>"$REFEREE_LOCK"
+chmod 0644 "$REFEREE_LOCK" 2>/dev/null || true
+flock -w 60 -x "$REFEREE_LOCK_FD" || die "referee lock timeout: $REFEREE_LOCK"
+
 if [[ -n "$STAGE_AUDITED_SRC" ]]; then
   MODE="transition-audited"
   if [[ "$(id -u)" != "0" && "$REQUIRE_ROOT_OWNER" == "1" ]]; then
@@ -81,9 +99,9 @@ if [[ -n "$STAGE_AUDITED_SRC" ]]; then
 
   SOURCE_DIR="$(readlink -f -- "$STAGE_AUDITED_SRC" 2>/dev/null || true)"
   [[ -n "$SOURCE_DIR" ]] || die "--stage-audited source directory does not exist: $STAGE_AUDITED_SRC"
-  git -C "$SOURCE_DIR" cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null \
+  git -c safe.directory='*' -C "$SOURCE_DIR" cat-file -e "${TARGET_SHA}^{commit}" 2>/dev/null \
     || die "--stage-audited requires a Git repo containing exact commit object --target-sha $TARGET_SHA (never copies unverified dirty worktree!)"
-  TREE_SHA="$(git -C "$SOURCE_DIR" rev-parse "${TARGET_SHA}^{tree}" 2>/dev/null || true)"
+  TREE_SHA="$(git -c safe.directory='*' -C "$SOURCE_DIR" rev-parse "${TARGET_SHA}^{tree}" 2>/dev/null || true)"
   [[ "$TREE_SHA" =~ ^[0-9a-f]{40}$ ]] || die "failed to resolve tree SHA for $TARGET_SHA"
   SOURCE_COMMIT="$TARGET_SHA"
 
@@ -208,6 +226,38 @@ print(json.dumps(summary, ensure_ascii=False))
 PY
 )" || die "invalid or untrusted --approval-file for targetSha $TARGET_SHA"
 else
+  if [[ -n "$PRESERVE_OTHER_TRANSITION" ]]; then
+    [[ "$PRESERVE_OTHER_TRANSITION" =~ ^[0-9a-f]{40}$ ]] \
+      || die "invalid --preserve-other-transition (expected 40-char lowercase hex): $PRESERVE_OTHER_TRANSITION"
+    if [[ -e "${REFEREE_DEST}/TRANSITION_APPROVAL.json" || -L "${REFEREE_DEST}/TRANSITION_APPROVAL.json" ]]; then
+      EXISTING_TRANS_SHA="$(python3 - "${REFEREE_DEST}/TRANSITION_APPROVAL.json" <<'PY' 2>/dev/null || true
+import json, re, sys
+try:
+    doc = json.load(open(sys.argv[1], encoding="utf-8"))
+    s = doc.get("targetSha") if isinstance(doc, dict) else ""
+    if isinstance(s, str) and re.fullmatch(r"[0-9a-f]{40}", s):
+        print(s)
+except Exception:
+    pass
+PY
+)"
+      if [[ -z "$EXISTING_TRANS_SHA" || "$EXISTING_TRANS_SHA" != "$PRESERVE_OTHER_TRANSITION" ]]; then
+        python3 - "$PRESERVE_OTHER_TRANSITION" "$EXISTING_TRANS_SHA" <<'PY'
+import json, sys
+committed_sha, trans_sha = sys.argv[1:3]
+print(json.dumps({
+    "ok": True,
+    "skipped": True,
+    "reason": "other_transition_preserved",
+    "committedSha": committed_sha,
+    "transitionTargetSha": trans_sha,
+}))
+PY
+        exit 0
+      fi
+    fi
+  fi
+
   [[ -e "$LIVE_LINK" ]] || die "MASTER_LIVE_LINK does not exist: $LIVE_LINK"
   SOURCE_DIR="$(readlink -f -- "$LIVE_LINK" 2>/dev/null || true)"
   [[ -n "$SOURCE_DIR" && -d "$SOURCE_DIR" ]] || die "cannot resolve live directory from $LIVE_LINK"
@@ -222,10 +272,27 @@ if not re.fullmatch(r"[0-9a-f]{40}", sha):
 print(sha)
 PY
 )" || die "invalid or missing 40-hex sourceCommit in $SOURCE_DIR/.complete"
+
+  if [[ -n "$EXPECTED_LIVE_SHA" ]]; then
+    [[ "$EXPECTED_LIVE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+      || die "invalid --expected-live-sha (expected 40-char lowercase hex): $EXPECTED_LIVE_SHA"
+    if [[ "$SOURCE_COMMIT" != "$EXPECTED_LIVE_SHA" ]]; then
+      python3 - "$EXPECTED_LIVE_SHA" "$SOURCE_COMMIT" <<'PY'
+import json, sys
+exp_sha, act_sha = sys.argv[1:3]
+print(json.dumps({
+    "ok": True,
+    "skipped": True,
+    "reason": "live_sha_moved",
+    "expectedLiveSha": exp_sha,
+    "actualLiveSha": act_sha,
+}))
+PY
+      exit 0
+    fi
+  fi
 fi
 
-PARENT_DIR="$(dirname "$REFEREE_DEST")"
-mkdir -p "$PARENT_DIR"
 STAGING_DIR="$(mktemp -d "${PARENT_DIR}/.referee-staging.$$.XXXXXX")"
 
 cleanup_staging() {

@@ -552,17 +552,166 @@ selfhost_prepare_candidate "$SHA"
         self.assertTrue((self.t / 'gc').exists())
         self.assertFalse(self.receipt.exists())
 
-    def test_tip_changes_during_build_no_receipt(self):
-        self.bash('''
-original=$(declare -f build_platform_bundle); eval "${original/build_platform_bundle/old_platform}"
-build_platform_bundle() {
+    def clone_and_push_linear(self, name='peer', content='B'):
+        peer = self.t / name
+        self.run_cmd('git', 'clone', '-q', '-b', 'feat/v5-selfhost', str(self.t / 'origin'), str(peer))
+        self.run_cmd('git', '-C', str(peer), 'config', 'user.name', 'p4-peer')
+        self.run_cmd('git', '-C', str(peer), 'config', 'user.email', 'peer@example.invalid')
+        (peer / 'source').write_text(content)
+        self.run_cmd('git', '-C', str(peer), 'commit', '-qam', f'linear-{content}')
+        self.run_cmd('git', '-C', str(peer), 'push', '-q', 'origin', 'HEAD:refs/heads/feat/v5-selfhost')
+        return self.run_cmd('git', '-C', str(peer), 'rev-parse', 'HEAD')
+
+    def clone_and_force_diverge(self, name='diverge', content='DIVERGED'):
+        peer = self.t / name
+        self.run_cmd('git', 'clone', '-q', '-b', 'feat/v5-selfhost', str(self.t / 'origin'), str(peer))
+        self.run_cmd('git', '-C', str(peer), 'config', 'user.name', 'p4-peer')
+        self.run_cmd('git', '-C', str(peer), 'config', 'user.email', 'peer@example.invalid')
+        (peer / 'source').write_text(content)
+        self.run_cmd('git', '-C', str(peer), 'commit', '--amend', '-qam', f'diverge-{content}')
+        self.run_cmd('git', '-C', str(peer), 'push', '-q', '--force', 'origin', 'HEAD:refs/heads/feat/v5-selfhost')
+        return self.run_cmd('git', '-C', str(peer), 'rev-parse', 'HEAD')
+
+    def test_diverged_tip_during_build_no_receipt(self):
+        peer = self.t / 'peer-diverge'
+        self.run_cmd('git', 'clone', '-q', '-b', 'feat/v5-selfhost', str(self.t / 'origin'), str(peer))
+        self.run_cmd('git', '-C', str(peer), 'config', 'user.name', 'p4-peer')
+        self.run_cmd('git', '-C', str(peer), 'config', 'user.email', 'peer@example.invalid')
+        result = self.bash(f'''
+PEER={str(peer)!r}
+original=$(declare -f build_platform_bundle); eval "${{original/build_platform_bundle/old_platform}}"
+build_platform_bundle() {{
   old_platform "$1"
-  echo B >"$REPO_ROOT/source"; git -C "$REPO_ROOT" commit -qam B
-  git -C "$REPO_ROOT" push -q origin HEAD
-}
+  echo DIVERGED >"$PEER/source"
+  git -C "$PEER" commit --amend -qam diverged
+  git -C "$PEER" push -q --force origin HEAD:refs/heads/feat/v5-selfhost
+}}
 selfhost_prepare_candidate "$SHA"
 ''', ok=False)
+        self.assertIn('selfhost tip diverged or reverted', result.stderr)
         self.assertFalse(self.receipt.exists())
+        self.assert_artifact_lock()
+
+    def test_linear_tip_advance_during_build_preserves_receipt_and_flips(self):
+        # Set up an older live commit C0 so live is strictly behind $SHA (C1),
+        # while a separate clone linearly pushes C2 during build (unfetched in REPO_ROOT).
+        c0 = self.sha
+        self.advance()
+        self.sha = self.git('rev-parse', 'HEAD')
+        live_dir = self.t / 'master' / 'rel-old-live'
+        live_dir.mkdir(parents=True, exist_ok=True)
+        (live_dir / '.complete').write_text(json.dumps({'sourceCommit': c0}))
+        (self.t / 'live').symlink_to(live_dir)
+
+        peer = self.t / 'peer-linear'
+        self.run_cmd('git', 'clone', '-q', '-b', 'feat/v5-selfhost', str(self.t / 'origin'), str(peer))
+        self.run_cmd('git', '-C', str(peer), 'config', 'user.name', 'p4-peer')
+        self.run_cmd('git', '-C', str(peer), 'config', 'user.email', 'peer@example.invalid')
+        refs_before = self.git('for-each-ref')
+
+        res = self.bash(f'''
+SHA={self.sha}
+MASTER_LIVE_LINK="$T/live"
+PEER={str(peer)!r}
+original=$(declare -f build_platform_bundle); eval "${{original/build_platform_bundle/old_platform}}"
+build_platform_bundle() {{
+  old_platform "$1"
+  echo C2 >"$PEER/source"
+  git -C "$PEER" commit -qam C2
+  git -C "$PEER" push -q origin HEAD:refs/heads/feat/v5-selfhost
+  git -C "$PEER" rev-parse HEAD >"$T/c2-sha"
+  ! git -C "$REPO_ROOT" cat-file -e "$(cat "$T/c2-sha")^{{commit}}" 2>/dev/null
+}}
+selfhost_prepare_candidate "$SHA"
+selfhost_prepared_enter_flip "$SHA"
+[[ "$SELFHOST_SPLIT_PREPARED" == 1 ]]
+''')
+        c2 = (self.t / 'c2-sha').read_text().strip()
+        self.assertNotEqual(c2, self.sha)
+        self.assertTrue(self.receipt.is_file())
+        self.assertEqual(json.loads(self.receipt.read_text())['sourceCommit'], self.sha)
+        # Canonical HEAD and all local/remote refs must remain untouched by the object-only fetch.
+        self.assertEqual(self.git('rev-parse', 'HEAD'), self.sha)
+        self.assertEqual(self.git('for-each-ref'), refs_before)
+        self.assertIn('selfhost tip 线性前进', res.stdout)
+        self.assertIn(f'tipAdvancedAncestor={self.sha[:12]}->{c2[:12]}', (self.t / 'notes').read_text())
+
+    def test_linear_tip_advance_refuses_live_downgrade(self):
+        c0 = self.sha
+        self.advance()
+        self.sha = self.git('rev-parse', 'HEAD')
+        self.bash(f'SHA={self.sha}; selfhost_prepare_candidate "$SHA"')
+        c2 = self.clone_and_push_linear(name='peer-downgrade', content='C2')
+        live_link = self.t / 'live'
+
+        # Case 1: live already equals prepared $SHA -> refuse redundant advanced-tip cutover
+        live_eq = self.t / 'master' / 'rel-live-eq'
+        live_eq.mkdir(parents=True, exist_ok=True)
+        (live_eq / '.complete').write_text(json.dumps({'sourceCommit': self.sha}))
+        live_link.symlink_to(live_eq)
+        r1 = self.bash(f'SHA={self.sha}; MASTER_LIVE_LINK="$T/live"; selfhost_prepared_enter_flip "$SHA"', ok=False)
+        self.assertIn('already equals prepared', r1.stderr)
+
+        # Case 2: live is already ahead of prepared $SHA (at C2) -> fail-closed
+        live_ahead = self.t / 'master' / 'rel-live-ahead'
+        live_ahead.mkdir(parents=True, exist_ok=True)
+        (live_ahead / '.complete').write_text(json.dumps({'sourceCommit': c2}))
+        live_link.unlink()
+        live_link.symlink_to(live_ahead)
+        r2 = self.bash(f'SHA={self.sha}; MASTER_LIVE_LINK="$T/live"; selfhost_prepared_enter_flip "$SHA"', ok=False)
+        self.assertIn('strict ancestor', r2.stderr)
+
+        # Case 3: live is on a diverged side branch (neither ancestor nor descendant of $SHA) -> fail-closed
+        self.git('checkout', '-q', '-b', 'side-live', c0)
+        (self.repo / 'side').write_text('SIDE')
+        self.git('add', 'side')
+        self.git('commit', '-qm', 'side-branch-live')
+        side_sha = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-q', 'feat/v5-selfhost')
+        self.git('branch', '-q', '-D', 'side-live')
+        live_div = self.t / 'master' / 'rel-live-diverged'
+        live_div.mkdir(parents=True, exist_ok=True)
+        (live_div / '.complete').write_text(json.dumps({'sourceCommit': side_sha}))
+        live_link.unlink()
+        live_link.symlink_to(live_div)
+        r3 = self.bash(f'SHA={self.sha}; MASTER_LIVE_LINK="$T/live"; selfhost_prepared_enter_flip "$SHA"', ok=False)
+        self.assertIn('strict ancestor', r3.stderr)
+
+        # Case 4: MASTER_LIVE_LINK exists with missing .complete, dangling symlink, bad JSON, or unknown commit -> fail-closed
+        live_no_complete = self.t / 'master' / 'rel-live-no-complete'
+        live_no_complete.mkdir(parents=True, exist_ok=True)
+        live_link.unlink()
+        live_link.symlink_to(live_no_complete)
+        r4a = self.bash(f'SHA={self.sha}; MASTER_LIVE_LINK="$T/live"; selfhost_prepared_enter_flip "$SHA"', ok=False)
+        self.assertIn('.complete missing', r4a.stderr)
+
+        live_link.unlink()
+        live_link.symlink_to(self.t / 'master' / 'rel-nonexistent')
+        r4b = self.bash(f'SHA={self.sha}; MASTER_LIVE_LINK="$T/live"; selfhost_prepared_enter_flip "$SHA"', ok=False)
+        self.assertIn('.complete missing', r4b.stderr)
+
+        live_bad_json = self.t / 'master' / 'rel-live-bad-json'
+        live_bad_json.mkdir(parents=True, exist_ok=True)
+        (live_bad_json / '.complete').write_text('{not-json')
+        live_link.unlink()
+        live_link.symlink_to(live_bad_json)
+        r4c = self.bash(f'SHA={self.sha}; MASTER_LIVE_LINK="$T/live"; selfhost_prepared_enter_flip "$SHA"', ok=False)
+        self.assertIn('cannot verify current live sourceCommit', r4c.stderr)
+
+        live_unknown = self.t / 'master' / 'rel-live-unknown'
+        live_unknown.mkdir(parents=True, exist_ok=True)
+        (live_unknown / '.complete').write_text(json.dumps({'sourceCommit': 'deadbeef' * 5}))
+        live_link.unlink()
+        live_link.symlink_to(live_unknown)
+        r4d = self.bash(f'SHA={self.sha}; MASTER_LIVE_LINK="$T/live"; selfhost_prepared_enter_flip "$SHA"', ok=False)
+        self.assertIn('strict ancestor', r4d.stderr)
+
+    def test_diverged_tip_at_flip_rejected(self):
+        self.prepare()
+        self.clone_and_force_diverge(name='peer-flip-diverge', content='REVERTED')
+        res = self.bash('selfhost_prepared_enter_flip "$SHA"; touch "$T/live-write"', ok=False)
+        self.assertIn('selfhost tip diverged or reverted', res.stderr)
+        self.assertFalse((self.t / 'live-write').exists())
 
     def test_local_head_changes_reject(self):
         self.prepare()

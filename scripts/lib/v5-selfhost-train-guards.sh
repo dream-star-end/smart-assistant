@@ -1052,3 +1052,114 @@ v5_selfhost_post_cutover_retention_gate() { # <release-path> <40-hex-sha>
   _v5_tg_log "✗ 切流后置行为保留集 FAIL 且回滚失败/旧 live 不健康 (ret_rc=$rc rb_rc=$rb_rc verify_rc=$verify_rc): 已转入 recovery_required"
   return 79
 }
+
+# ── 10. OCV5-918 正向切流 committed 后自动刷新外置裁判（清掉已消费 transition-audited 切回 live-sync）──
+# Fail-safe：绝不触发已 committed 发布回滚，失败/缺失/不可信仅告警并返回非 0，由调用方 || cutover_clog 吸收。
+v5_selfhost_post_committed_sync_referee() { # <committed-rel> [head-sha]
+  local rel="${1:-}" sha="${2:-}"
+  if [[ "${CUTOVER_ROLLBACK:-0}" == 1 || "${DRY:-0}" == 1 ]]; then
+    return 0
+  fi
+  if [[ "${OC_V5_POST_COMMITTED_SYNC_REFEREE_ENABLED:-1}" == 0 ]]; then
+    _v5_tg_log "  · [post-committed-referee] OC_V5_POST_COMMITTED_SYNC_REFEREE_ENABLED=0，跳过切流后外置裁判刷新"
+    return 0
+  fi
+  local gov_root="" sync_bin="" live_link="${MASTER_LIVE_LINK:-/opt/openclaude/openclaude-v5-selfhost-live}"
+  local ref_root="" committed_sha="" live_canon="" rel_canon="" trans_file="" trans_sha=""
+  gov_root="$(v5_selfhost_governor_root)"
+  sync_bin="${OC_V5_SYNC_REFEREE_BIN:-${gov_root}/bin/sync-referee}"
+  ref_root="${OC_V5_REFEREE_ROOT:-${gov_root}/referee}"
+
+  live_canon="$(readlink -f -- "$live_link" 2>/dev/null || true)"
+  if [[ -n "$rel" ]]; then
+    rel_canon="$(readlink -f -- "$rel" 2>/dev/null || true)"
+    if [[ "$live_canon" != "$rel_canon" ]]; then
+      _v5_tg_log "  ⚠ [post-committed-referee] live 已指向其他版本 (live=${live_canon:-<empty>} ≠ rel=${rel_canon:-$rel})，跳过延迟的外置裁判刷新"
+      tsum_note postCommittedSyncReferee "skipped:live-moved" 2>/dev/null || :
+      return 0
+    fi
+  fi
+
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    committed_sha="$sha"
+  else
+    local complete_src=""
+    if [[ -n "$rel" && -f "$rel/.complete" && ! -L "$rel/.complete" ]]; then
+      complete_src="$rel/.complete"
+    elif [[ -n "$live_canon" && -f "$live_canon/.complete" && ! -L "$live_canon/.complete" ]]; then
+      complete_src="$live_canon/.complete"
+    fi
+    if [[ -n "$complete_src" ]]; then
+      committed_sha="$(python3 - "$complete_src" <<'PY' 2>/dev/null || true
+import json, re, sys
+try:
+    doc = json.load(open(sys.argv[1], encoding="utf-8"))
+    s = str(doc.get("sourceCommit") or "").strip() if isinstance(doc, dict) else ""
+    if re.fullmatch(r"[0-9a-f]{40}", s):
+        print(s)
+except Exception:
+    pass
+PY
+)"
+    fi
+  fi
+
+  trans_file="${ref_root%/}/TRANSITION_APPROVAL.json"
+  if [[ -e "$trans_file" || -L "$trans_file" ]]; then
+    trans_sha="$(python3 - "$trans_file" <<'PY' 2>/dev/null || true
+import json, re, sys
+try:
+    doc = json.load(open(sys.argv[1], encoding="utf-8"))
+    s = doc.get("targetSha") if isinstance(doc, dict) else ""
+    if isinstance(s, str) and re.fullmatch(r"[0-9a-f]{40}", s):
+        print(s)
+except Exception:
+    pass
+PY
+)"
+    if [[ -z "$committed_sha" || -z "$trans_sha" || "$trans_sha" != "$committed_sha" ]]; then
+      _v5_tg_log "  ⚠ [post-committed-referee] 外置裁判当前持有其他提交的过渡审批 (transition=${trans_sha:-<invalid>}, committed=${committed_sha:-<empty>})，保留不覆盖"
+      tsum_note postCommittedSyncReferee "skipped:other-transition" 2>/dev/null || :
+      return 0
+    fi
+  fi
+
+  if [[ -L "$sync_bin" || ! -f "$sync_bin" || ! -x "$sync_bin" ]]; then
+    _v5_tg_log "  ⚠ [post-committed-referee] 跳过外置裁判刷新: 缺少可执行普通文件 $sync_bin（已 committed 发布不受影响）"
+    tsum_note postCommittedSyncReferee "warn:missing-bin" 2>/dev/null || :
+    return 1
+  fi
+  if [[ "$(id -u)" == 0 && "$sync_bin" == /opt/openclaude/* ]] || [[ "${OC_V5_SYNC_REFEREE_REQUIRE_ROOT:-0}" == 1 ]]; then
+    local uid="" mode=""
+    read -r uid mode < <(stat -Lc '%u %a' -- "$sync_bin" 2>/dev/null || echo '999999 777')
+    if [[ "$uid" != 0 ]] || [[ ! "$mode" =~ ^[0-7]+$ ]] || (( (8#$mode & 8#022) != 0 )); then
+      _v5_tg_log "  ⚠ [post-committed-referee] 跳过外置裁判刷新: 属主/权限不可信(uid=$uid mode=$mode): $sync_bin（已 committed 发布不受影响）"
+      tsum_note postCommittedSyncReferee "warn:untrusted-bin" 2>/dev/null || :
+      return 1
+    fi
+  fi
+
+  local -a sync_args=(--live-link "$live_link")
+  if [[ "$committed_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    sync_args+=(--preserve-other-transition "$committed_sha" --expected-live-sha "$committed_sha")
+  fi
+  local out="" rc=0
+  out="$(
+    OC_GOVERNOR_ROOT="$gov_root" \
+    MASTER_LIVE_LINK="$live_link" \
+    "$sync_bin" "${sync_args[@]}" 2>&1
+  )" || rc=$?
+  if (( rc == 0 )); then
+    if grep -qE '"skipped"[[:space:]]*:[[:space:]]*true' <<<"$out"; then
+      tsum_note postCommittedSyncReferee "skipped" 2>/dev/null || :
+      _v5_tg_log "  ⚠ [post-committed-referee] 外置裁判同步已按原子锁复核跳过 (live=$live_link${rel:+, rel=$rel}${committed_sha:+, sha=${committed_sha:0:12}}, detail=$out)"
+      return 0
+    fi
+    tsum_note postCommittedSyncReferee "ok" 2>/dev/null || :
+    _v5_tg_log "  ✓ [post-committed-referee] 外置裁判已自动同步为 live-sync (live=$live_link${rel:+, rel=$rel}${committed_sha:+, sha=${committed_sha:0:12}}${out:+, summary=$out})"
+    return 0
+  fi
+  tsum_note postCommittedSyncReferee "warn:rc=$rc" 2>/dev/null || :
+  _v5_tg_log "  ⚠ [post-committed-referee] 外置裁判刷新失败 (rc=$rc, bin=$sync_bin, live=$live_link${rel:+, rel=$rel}${committed_sha:+, sha=${committed_sha:0:12}}；已 committed 发布不回滚): ${out:-<no output>}"
+  return "$rc"
+}

@@ -19,14 +19,22 @@ const MAX_TREE_PROOF_FILES = 100
 
 export type FetchLike = (
   input: string,
-  init?: { headers?: Record<string, string> },
+  init?: { headers?: Record<string, string>; signal?: AbortSignal },
 ) => Promise<{
   ok: boolean
   status: number
   headers?: { get(name: string): string | null }
+  body?: { cancel?(): unknown } | null
   json(): Promise<unknown>
   text?(): Promise<string>
 }>
+
+export interface GithubFetchRetryOptions {
+  maxRetries?: number
+  timeoutMs?: number
+  baseDelayMs?: number
+  sleepImpl?: (ms: number) => Promise<void>
+}
 
 export interface GithubStatusEntry {
   id?: number
@@ -172,29 +180,107 @@ function normalizeApiBase(apiBaseUrl?: string): string {
   return raw.replace(/\/+$/, '') || 'https://api.github.com'
 }
 
+const GITHUB_FETCH_DEFAULT_RETRIES = 3
+const GITHUB_FETCH_DEFAULT_TIMEOUT_MS = 15_000
+const GITHUB_FETCH_DEFAULT_BASE_DELAY_MS = 500
+const GITHUB_FETCH_MAX_DELAY_MS = 5_000
+
+function resolveRetryBaseDelayMs(override?: number): number {
+  if (typeof override === 'number' && Number.isFinite(override) && override >= 0) return override
+  const raw = process.env.OC_GITHUB_API_RETRY_BASE_DELAY_MS?.trim()
+  if (raw && /^\d+$/.test(raw) && Number.isSafeInteger(Number(raw))) return Number(raw)
+  return GITHUB_FETCH_DEFAULT_BASE_DELAY_MS
+}
+
+function isRetryableGithubStatus(status: number): boolean {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599)
+}
+
+function computeRetryDelayMs(
+  attempt: number,
+  baseDelayMs: number,
+  status?: number,
+  retryAfter?: string | null,
+): number {
+  if (status === 429 && retryAfter && /^\d+$/.test(retryAfter.trim())) {
+    return Math.min(Number(retryAfter.trim()) * 1_000, GITHUB_FETCH_MAX_DELAY_MS)
+  }
+  return Math.min(baseDelayMs * 2 ** attempt, GITHUB_FETCH_MAX_DELAY_MS)
+}
+
+const defaultSleep = (ms: number): Promise<void> =>
+  ms <= 0 ? Promise.resolve() : new Promise((resolve) => setTimeout(resolve, ms))
+
+async function fetchGithubJsonWithRetry(
+  url: string,
+  token: string,
+  fetchImpl: FetchLike,
+  retryOpts?: GithubFetchRetryOptions,
+): Promise<{ ok: true; body: unknown; linkHeader: string | null } | { ok: false; reason: string }> {
+  const maxRetries = Math.max(0, Math.floor(retryOpts?.maxRetries ?? GITHUB_FETCH_DEFAULT_RETRIES))
+  const timeoutMs =
+    typeof retryOpts?.timeoutMs === 'number' && Number.isFinite(retryOpts.timeoutMs) && retryOpts.timeoutMs > 0
+      ? retryOpts.timeoutMs
+      : GITHUB_FETCH_DEFAULT_TIMEOUT_MS
+  const baseDelayMs = resolveRetryBaseDelayMs(retryOpts?.baseDelayMs)
+  const sleep = retryOpts?.sleepImpl ?? defaultSleep
+  let lastReason = `GitHub API request error for ${url}`
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const controller = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let timedOut = false
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true
+        controller.abort()
+        reject(new Error(`timeout after ${timeoutMs}ms`))
+      }, timeoutMs)
+    })
+    timeoutPromise.catch(() => {})
+    const workPromise = (async () => {
+      const resp = await fetchImpl(url, { headers: githubHeaders(token), signal: controller.signal })
+      if (!resp.ok) {
+        const retryAfter = resp.headers?.get('retry-after') ?? resp.headers?.get('Retry-After') ?? null
+        try { await resp.body?.cancel?.() } catch {}
+        return { kind: 'http' as const, status: resp.status, retryAfter }
+      }
+      return { kind: 'ok' as const, body: await resp.json(), linkHeader: resp.headers?.get('link') ?? null }
+    })()
+    workPromise.catch(() => {})
+
+    let retryDelayMs: number | null = null
+    try {
+      const outcome = await Promise.race([workPromise, timeoutPromise])
+      if (outcome.kind === 'ok') return { ok: true, body: outcome.body, linkHeader: outcome.linkHeader }
+      lastReason = `GitHub API HTTP ${outcome.status} for ${url}`
+      if (!isRetryableGithubStatus(outcome.status) || attempt >= maxRetries) return { ok: false, reason: lastReason }
+      retryDelayMs = computeRetryDelayMs(attempt, baseDelayMs, outcome.status, outcome.retryAfter)
+    } catch (err) {
+      const msg = timedOut ? `timeout after ${timeoutMs}ms` : err instanceof Error ? err.message : String(err)
+      lastReason = `GitHub API request error: ${msg}`
+      if (attempt >= maxRetries) return { ok: false, reason: lastReason }
+      retryDelayMs = computeRetryDelayMs(attempt, baseDelayMs)
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+    await sleep(retryDelayMs)
+  }
+  return { ok: false, reason: lastReason }
+}
+
 export async function githubGetJsonObject<T>(
   url: string,
   token: string,
   fetchImpl: FetchLike,
+  retryOpts?: GithubFetchRetryOptions,
 ): Promise<{ ok: true; data: T; hasNextPage: boolean } | { ok: false; reason: string }> {
-  let resp: Awaited<ReturnType<FetchLike>>
-  try {
-    resp = await fetchImpl(url, { headers: githubHeaders(token) })
-  } catch (err) {
-    return { ok: false, reason: `GitHub API request error: ${(err as Error).message}` }
-  }
-  if (!resp.ok) {
-    return { ok: false, reason: `GitHub API HTTP ${resp.status} for ${url}` }
-  }
-  const body = await resp.json()
-  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+  const res = await fetchGithubJsonWithRetry(url, token, fetchImpl, retryOpts)
+  if (!res.ok) return res
+  if (!res.body || typeof res.body !== 'object' || Array.isArray(res.body)) {
     return { ok: false, reason: `GitHub API returned non-object payload for ${url}` }
   }
-  return {
-    ok: true,
-    data: body as T,
-    hasNextPage: parseNextLink(resp.headers?.get('link')) !== null,
-  }
+  return { ok: true, data: res.body as T, hasNextPage: parseNextLink(res.linkHeader) !== null }
 }
 
 export async function githubGetPaginatedList<T>(
@@ -202,25 +288,18 @@ export async function githubGetPaginatedList<T>(
   token: string,
   fetchImpl: FetchLike,
   maxPages = 5,
+  retryOpts?: GithubFetchRetryOptions,
 ): Promise<{ ok: true; items: T[]; truncated: boolean } | { ok: false; reason: string }> {
   const items: T[] = []
   let nextUrl: string | null = initialUrl
   for (let page = 0; page < maxPages && nextUrl; page++) {
-    let resp: Awaited<ReturnType<FetchLike>>
-    try {
-      resp = await fetchImpl(nextUrl, { headers: githubHeaders(token) })
-    } catch (err) {
-      return { ok: false, reason: `GitHub API request error: ${(err as Error).message}` }
-    }
-    if (!resp.ok) {
-      return { ok: false, reason: `GitHub API HTTP ${resp.status} for ${nextUrl}` }
-    }
-    const body = await resp.json()
-    if (!Array.isArray(body)) {
+    const res = await fetchGithubJsonWithRetry(nextUrl, token, fetchImpl, retryOpts)
+    if (!res.ok) return res
+    if (!Array.isArray(res.body)) {
       return { ok: false, reason: `GitHub API returned non-array payload for ${nextUrl}` }
     }
-    items.push(...(body as T[]))
-    nextUrl = parseNextLink(resp.headers?.get('link'))
+    items.push(...(res.body as T[]))
+    nextUrl = parseNextLink(res.linkHeader)
   }
   return { ok: true, items, truncated: nextUrl !== null }
 }
