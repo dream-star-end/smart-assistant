@@ -14,7 +14,12 @@
         "scripts/check-a0-monotonic.ts",
         "scripts/lib/a0MonotonicRules.ts",
         "scripts/lib/a0ApprovalReceipt.ts",
+        "scripts/lib/a0RangeCarryOver.ts",
+        "scripts/lib/globMatch.ts",
+        "scripts/lib/githubApprovalParsers.ts",
         "scripts/lib/githubTrustedApproval.ts",
+        "scripts/lib/githubMergedPrEquivalence.ts",
+        "scripts/lib/commitRangeCarryOver.ts",
         "arch/a0-protected-paths.json",
         ".github/CODEOWNERS"
       ]

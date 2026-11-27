@@ -16,6 +16,9 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { lstatSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { type FetchLike, verifyGithubA0Approval } from './githubTrustedApproval.js'
+import { globToRegExp, matchesAnyGlob } from './globMatch.js'
+
+export { globToRegExp, matchesAnyGlob }
 
 export interface A0ApprovalReceipt {
   schemaVersion: 1
@@ -37,7 +40,7 @@ export type ApprovalVerification =
       source: 'host-file' | 'github-status' | 'github-pr-review'
       receipt: A0ApprovalReceipt
     }
-  | { valid: false; receiptPath: string; reason: string; revoked?: boolean }
+  | { valid: false; receiptPath: string; reason: string; revoked?: boolean; incomplete?: boolean }
 
 export const SHA40_RE = /^[0-9a-f]{40}$/
 export const SHA64_RE = /^[0-9a-f]{64}$/
@@ -46,35 +49,6 @@ export const STRICT_ISO_TIMESTAMP_RE =
 
 export function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
-}
-
-export function globToRegExp(glob: string): RegExp {
-  let re = ''
-  for (let i = 0; i < glob.length; i++) {
-    const ch = glob[i]!
-    if (ch === '*') {
-      if (glob[i + 1] === '*') {
-        if (glob[i + 2] === '/') {
-          re += '(?:.+/)?'
-          i += 2
-        } else {
-          re += '.*'
-          i += 1
-        }
-      } else {
-        re += '[^/]*'
-      }
-    } else if ('+?^${}()|[]\\.'.includes(ch)) {
-      re += `\\${ch}`
-    } else {
-      re += ch
-    }
-  }
-  return new RegExp(`^${re}$`)
-}
-
-export function matchesAnyGlob(filePath: string, globs: readonly string[]): boolean {
-  return globs.some((g) => globToRegExp(g).test(filePath))
 }
 
 /** Normalize and sort allowedPaths by UTF-8 byte order for canonical payload binding (undefined -> '*'). */
@@ -445,8 +419,36 @@ export function verifyA0ApprovalReceipt(opts: {
   })
 }
 
+function buildGithubA0ApprovalResult(
+  targetSha: string,
+  ghRes: Awaited<ReturnType<typeof verifyGithubA0Approval>>,
+  nowMs?: number,
+): ApprovalVerification {
+  const effectiveNow = nowMs ?? Date.now()
+  const issuedAt = ghRes.issuedAt ?? new Date(effectiveNow).toISOString()
+  const expiresAt = ghRes.expiresAt ?? new Date(effectiveNow + 24 * 3600_000).toISOString()
+  const channel = ghRes.channel ?? 'github-status'
+  return {
+    valid: true,
+    receiptPath: ghRes.source,
+    source: channel,
+    receipt: {
+      schemaVersion: 1,
+      sha: targetSha,
+      reason: ghRes.reason,
+      approvedBy: ghRes.approvedBy,
+      issuedAt,
+      expiresAt,
+      sha256: computeA0ReceiptDigest({ sha: targetSha, issuedAt, expiresAt, reason: ghRes.reason }),
+      source: channel,
+    },
+  }
+}
+
 /**
- * Unified out-of-commit A0 approval verification (host root-only receipt OR GitHub trusted approval).
+ * Unified out-of-commit A0 approval verification (host root-only receipt + GitHub trusted approval).
+ * B3/B4: In online mode (`github.repo` + `github.token`), ALWAYS checks GitHub revocation/denial/
+ * incompleteness BEFORE accepting any local host receipt so revocations are never short-circuited.
  */
 export async function verifyA0ApprovalUnified(opts: {
   approvalDir: string
@@ -476,77 +478,64 @@ export async function verifyA0ApprovalUnified(opts: {
     hmacKey: opts.hmacKey,
     nowMs: opts.nowMs,
   })
-  if (hostRes.valid) return hostRes
 
   const ghRepo = opts.github?.repo?.trim()
   const ghToken = opts.github?.token?.trim()
-  if (ghRepo && ghToken) {
-    const ghRes = await verifyGithubA0Approval({
-      repo: ghRepo,
-      token: ghToken,
-      headSha: opts.targetSha,
-      a0Paths: opts.a0Paths,
-      prNumber: opts.github?.prNumber,
-      trustedApprovers: opts.github?.trustedApprovers,
-      apiBaseUrl: opts.github?.apiBaseUrl,
-      allowMergedPrCarryOver: opts.github?.allowMergedPrCarryOver,
-      expectedBaseRef: opts.github?.expectedBaseRef,
-      nowMs: opts.nowMs,
-      fetchImpl: opts.github?.fetchImpl,
-    })
-    if (ghRes.valid && ghRes.channel) {
-      const issuedAt = ghRes.issuedAt ?? new Date(opts.nowMs ?? Date.now()).toISOString()
-      const expiresAt =
-        ghRes.expiresAt ?? new Date((opts.nowMs ?? Date.now()) + 24 * 3600_000).toISOString()
-      return {
-        valid: true,
-        receiptPath: ghRes.source,
-        source: ghRes.channel,
-        receipt: {
-          schemaVersion: 1,
-          sha: opts.targetSha,
-          reason: ghRes.reason,
-          approvedBy: ghRes.approvedBy,
-          issuedAt,
-          expiresAt,
-          sha256: computeA0ReceiptDigest({
-            sha: opts.targetSha,
-            issuedAt,
-            expiresAt,
-            reason: ghRes.reason,
-          }),
-          source: ghRes.channel,
-        },
-      }
-    }
-    if (!ghRes.revoked && ghRes.equivalenceCandidates && ghRes.equivalenceCandidates.length > 0) {
-      for (const cand of ghRes.equivalenceCandidates) {
-        const carriedHost = verifyA0ApprovalReceipt({
-          approvalDir: opts.approvalDir,
-          targetSha: cand.prHeadSha,
-          a0Paths: opts.a0Paths,
-          requireRootOwner: opts.requireRootOwner ?? true,
-          hmacKeyFile: opts.hmacKeyFile,
-          hmacKey: opts.hmacKey,
-          nowMs: opts.nowMs,
-        })
-        if (carriedHost.valid) {
-          return {
-            valid: true,
-            receiptPath: `${carriedHost.receiptPath} (carried-over from PR#${cand.prNumber}@${cand.prHeadSha.slice(0, 12)} via ${cand.equivalenceProof})`,
-            source: 'host-file',
-            receipt: { ...carriedHost.receipt, sha: opts.targetSha },
-          }
-        }
-      }
-    }
+  if (!ghRepo || !ghToken) return hostRes
+
+  const ghRes = await verifyGithubA0Approval({
+    repo: ghRepo,
+    token: ghToken,
+    headSha: opts.targetSha,
+    a0Paths: opts.a0Paths,
+    prNumber: opts.github?.prNumber,
+    trustedApprovers: opts.github?.trustedApprovers,
+    apiBaseUrl: opts.github?.apiBaseUrl,
+    allowMergedPrCarryOver: opts.github?.allowMergedPrCarryOver,
+    expectedBaseRef: opts.github?.expectedBaseRef,
+    nowMs: opts.nowMs,
+    fetchImpl: opts.github?.fetchImpl,
+  })
+
+  // B3/B4: Online revocation, denial, or incomplete/truncated history supersedes ANY local receipt!
+  if (ghRes.revoked || ghRes.denied || ghRes.incomplete) {
     return {
       valid: false,
       receiptPath: `${hostRes.receiptPath} | ${ghRes.source}`,
-      reason: `host: ${hostRes.reason}; github: ${ghRes.reason}`,
-      ...(ghRes.revoked ? { revoked: true } : {}),
+      reason: `github: ${ghRes.reason}`,
+      ...(ghRes.revoked || ghRes.denied ? { revoked: true } : {}),
+      ...(ghRes.incomplete ? { incomplete: true } : {}),
+    }
+  }
+  if (hostRes.valid) return hostRes
+  if (ghRes.valid && ghRes.channel)
+    return buildGithubA0ApprovalResult(opts.targetSha, ghRes, opts.nowMs)
+
+  if (ghRes.equivalenceCandidates && ghRes.equivalenceCandidates.length > 0) {
+    for (const cand of ghRes.equivalenceCandidates) {
+      const carriedHost = verifyA0ApprovalReceipt({
+        approvalDir: opts.approvalDir,
+        targetSha: cand.prHeadSha,
+        a0Paths: opts.a0Paths,
+        requireRootOwner: opts.requireRootOwner ?? true,
+        hmacKeyFile: opts.hmacKeyFile,
+        hmacKey: opts.hmacKey,
+        nowMs: opts.nowMs,
+      })
+      if (carriedHost.valid) {
+        return {
+          valid: true,
+          receiptPath: `${carriedHost.receiptPath} (carried-over from PR#${cand.prNumber}@${cand.prHeadSha.slice(0, 12)} via ${cand.equivalenceProof})`,
+          source: 'host-file',
+          receipt: carriedHost.receipt,
+        }
+      }
     }
   }
 
-  return hostRes
+  return {
+    valid: false,
+    receiptPath: `${hostRes.receiptPath} | ${ghRes.source}`,
+    reason: `host: ${hostRes.reason}; github: ${ghRes.reason}`,
+  }
 }

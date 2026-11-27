@@ -27,7 +27,12 @@ arch/a0-protected-paths.json                            @dream-star-end
 scripts/check-a0-monotonic.ts                           @dream-star-end
 scripts/lib/a0MonotonicRules.ts                         @dream-star-end
 scripts/lib/a0ApprovalReceipt.ts                        @dream-star-end
+scripts/lib/a0RangeCarryOver.ts                         @dream-star-end
+scripts/lib/globMatch.ts                                @dream-star-end
+scripts/lib/githubApprovalParsers.ts                    @dream-star-end
 scripts/lib/githubTrustedApproval.ts                    @dream-star-end
+scripts/lib/githubMergedPrEquivalence.ts                @dream-star-end
+scripts/lib/commitRangeCarryOver.ts                     @dream-star-end
 
 # === A0-2. Core Monotonic, Ratchet, Architecture & Parity Checkers ===
 scripts/check-monotonic-baselines.ts                    @dream-star-end

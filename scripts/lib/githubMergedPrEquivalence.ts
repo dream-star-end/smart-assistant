@@ -1,23 +1,21 @@
 /**
  * Fail-closed GitHub Merged-PR Equivalence Proof for Squash/Rebase Carry-Over (OCV5-912).
  *
- * When a GitHub Ruleset merges an approved PR #N (head=H) via squash or rebase, GitHub mints
- * a new commit SHA S (`pr.merge_commit_sha === S`, `S !== H`). Out-of-commit approvals
- * (`oc-v5/arch-steward`, `oc-v5/a0-approval`, CODEOWNER PR reviews, and host root receipts)
- * bound to H must carry over to S ONLY when we cryptographically prove that S introduces zero
- * unreviewed bytes beyond PR #N:
- *
- *   - Proof A (`exact-tree`): `commit(S).tree.sha === commit(H).tree.sha` (100% repo-wide byte
- *     identity; covers clean squash/rebase when base branch did not move).
- *   - Proof B (`exact-squash-diff`): When base moved by unrelated PRs (`strict_required_status_checks_policy=false`),
- *     `S` is a single-parent commit (`parents.length === 1`), neither `commit(S).files` nor
- *     `pulls/#N/files` is empty or truncated (< 300 files), and every file's `{filename, status,
- *     previous_filename, blob sha, additions, deletions, changes, patch}` matches byte-for-byte
- *     (fail-closed on any 3-way auto-merge blob drift, missing patch on modified files, or extra file).
+ * Security invariants (B4 / B5 / B6):
+ *   - Mandatory target branch binding (`expectedBaseRef`) and repo binding (`base.repo.full_name`
+ *     when present) + exact `pr.merged_at != null && pr.merge_commit_sha === targetSha`.
+ *   - Proof A (`exact-tree`): `commit(S).tree.sha === commit(H).tree.sha` (repo-wide byte identity).
+ *   - Proof B (`exact-squash-diff`): Single-parent squash commit `S` with non-truncated file list
+ *     (< 300 files and no `Link: rel="next"`), non-truncated PR file list, exact per-file metadata
+ *     + patch equality, AND full Git tree-entry verification (`{mode, type, sha}`) comparing
+ *     `(pre(S), post(S))` vs `(mergeBase(prBase, H), post(H))` for EVERY changed path and
+ *     rename source — catching executable-bit flips, symlinks, submodules, 0-line binary diffs,
+ *     and 3-way auto-merge drift. Fails closed on any missing tree, truncation, or API error.
  */
 const SHA40_RE = /^[0-9a-f]{40}$/i
 const REPO_SLUG_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/
 const GITHUB_COMMIT_FILES_CAP = 300
+const MAX_TREE_PROOF_FILES = 100
 
 export type FetchLike = (
   input: string,
@@ -50,13 +48,75 @@ export interface GithubPrReviewEntry {
   user?: { login?: string } | null
 }
 
-export function globToRegExpLocal(glob: string): RegExp {
-  const escaped = glob
-    .replace(/[+?^${}()|[\]\\\.]/g, '\\$&')
-    .replace(/\*\*\//g, '(?:.+/)?')
-    .replace(/\*\*/g, '.*')
-    .replace(/\*/g, '[^/]*')
-  return new RegExp(`^${escaped}$`)
+export interface GithubCommitPullEntry {
+  number?: number
+  state?: string
+  merged_at?: string | null
+  merge_commit_sha?: string | null
+  base?: { ref?: string; sha?: string; repo?: { full_name?: string } | null } | null
+  head?: { sha?: string } | null
+}
+
+export interface GithubDiffFileEntry {
+  filename?: string
+  status?: string
+  previous_filename?: string
+  sha?: string | null
+  additions?: number
+  deletions?: number
+  changes?: number
+  patch?: string
+}
+
+export interface GithubCommitDetail {
+  sha?: string
+  commit?: { tree?: { sha?: string } | null } | null
+  parents?: Array<{ sha?: string }>
+  files?: GithubDiffFileEntry[]
+}
+
+interface GithubGitTreeEntry {
+  path?: string
+  mode?: string
+  type?: string
+  sha?: string
+}
+
+interface GithubGitTreeResponse {
+  sha?: string
+  truncated?: boolean
+  tree?: GithubGitTreeEntry[]
+}
+
+interface GithubCompareResponse {
+  merge_base_commit?: { sha?: string; commit?: { tree?: { sha?: string } | null } | null } | null
+}
+
+export type MergedPrEquivalenceProof = 'exact-tree' | 'exact-squash-diff'
+
+export interface MergedPrEquivalenceCandidate {
+  prNumber: number
+  prHeadSha: string
+  prBaseRef: string
+  prBaseSha?: string
+  mergeCommitSha: string
+  equivalenceProof: MergedPrEquivalenceProof
+}
+
+export interface MergedPrEquivalenceResult {
+  candidates: MergedPrEquivalenceCandidate[]
+  mergedPrNumbers: number[]
+  incomplete: boolean
+  notes: string[]
+}
+
+export interface MergedPrLookupOptions {
+  repo: string
+  token: string
+  targetSha: string
+  expectedBaseRef?: string
+  apiBaseUrl?: string
+  fetchImpl?: FetchLike
 }
 
 export function sortStatusesNewestFirst(
@@ -89,59 +149,6 @@ export function extractA0StatusReason(description: string): string {
     .trim()
 }
 
-export interface GithubCommitPullEntry {
-  number?: number
-  state?: string
-  merged_at?: string | null
-  merge_commit_sha?: string | null
-  base?: { ref?: string; sha?: string } | null
-  head?: { sha?: string } | null
-}
-
-export interface GithubDiffFileEntry {
-  filename?: string
-  status?: string
-  previous_filename?: string
-  sha?: string | null
-  additions?: number
-  deletions?: number
-  changes?: number
-  patch?: string
-}
-
-export interface GithubCommitDetail {
-  sha?: string
-  commit?: { tree?: { sha?: string } | null } | null
-  parents?: Array<{ sha?: string }>
-  files?: GithubDiffFileEntry[]
-}
-
-export type MergedPrEquivalenceProof = 'exact-tree' | 'exact-squash-diff'
-
-export interface MergedPrEquivalenceCandidate {
-  prNumber: number
-  prHeadSha: string
-  prBaseRef?: string
-  prBaseSha?: string
-  mergeCommitSha: string
-  equivalenceProof: MergedPrEquivalenceProof
-}
-
-export interface MergedPrEquivalenceResult {
-  candidates: MergedPrEquivalenceCandidate[]
-  mergedPrNumbers: number[]
-  notes: string[]
-}
-
-export interface MergedPrLookupOptions {
-  repo: string
-  token: string
-  targetSha: string
-  expectedBaseRef?: string
-  apiBaseUrl?: string
-  fetchImpl?: FetchLike
-}
-
 function githubHeaders(token: string): Record<string, string> {
   return {
     Authorization: `Bearer ${token}`,
@@ -169,7 +176,7 @@ export async function githubGetJsonObject<T>(
   url: string,
   token: string,
   fetchImpl: FetchLike,
-): Promise<{ ok: true; data: T } | { ok: false; reason: string }> {
+): Promise<{ ok: true; data: T; hasNextPage: boolean } | { ok: false; reason: string }> {
   let resp: Awaited<ReturnType<FetchLike>>
   try {
     resp = await fetchImpl(url, { headers: githubHeaders(token) })
@@ -183,7 +190,11 @@ export async function githubGetJsonObject<T>(
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { ok: false, reason: `GitHub API returned non-object payload for ${url}` }
   }
-  return { ok: true, data: body as T }
+  return {
+    ok: true,
+    data: body as T,
+    hasNextPage: parseNextLink(resp.headers?.get('link')) !== null,
+  }
 }
 
 export async function githubGetPaginatedList<T>(
@@ -238,8 +249,9 @@ function areFileStatsEqual(c: GithubDiffFileEntry, p: GithubDiffFileEntry): bool
 }
 
 function isFilePatchEquivalent(c: GithubDiffFileEntry, p: GithubDiffFileEntry): boolean {
-  const needsPatch = c.status !== 'added' && c.status !== 'removed' && (c.changes ?? 0) > 0
-  if (c.patch === undefined && p.patch === undefined && !needsPatch) return true
+  if (c.patch === undefined && p.patch === undefined) {
+    return c.status === 'added' || c.status === 'removed'
+  }
   return typeof c.patch === 'string' && typeof p.patch === 'string' && c.patch === p.patch
 }
 
@@ -259,14 +271,14 @@ function diffSingleFileMismatch(c: GithubDiffFileEntry, p: GithubDiffFileEntry):
     return `${cName}: blob sha mismatch (${cSha || 'missing'} vs ${pSha || 'missing'})`
   }
   if (!areFileStatsEqual(c, p)) return `${cName}: line count stats mismatch`
-  if (!isFilePatchEquivalent(c, p)) return `${cName}: patch content missing or differs`
+  if (!isFilePatchEquivalent(c, p)) return `${cName}: patch missing or differs`
   return null
 }
 
 /**
- * Verify byte-level diff equivalence between a single-parent squash commit's file list
- * and its merged PR's file list. Fails closed on truncation (>= 300 files), missing patches
- * on modified files, blob SHA drift (e.g. 3-way auto-merge), or any added/omitted file.
+ * Verify file-list & patch equality between a single-parent squash commit and its merged PR.
+ * Rejects empty lists, >= 300 file truncation, blob/stat drift, and ANY modified/renamed file
+ * lacking a matching patch (even 0-line binary/mode-only edits — B6).
  */
 export function verifyFileDiffListsByteEquivalent(
   commitFiles: readonly GithubDiffFileEntry[],
@@ -278,7 +290,7 @@ export function verifyFileDiffListsByteEquivalent(
   if (commitFiles.length >= GITHUB_COMMIT_FILES_CAP || prFiles.length >= GITHUB_COMMIT_FILES_CAP) {
     return {
       equivalent: false,
-      reason: `file count reached GitHub ${GITHUB_COMMIT_FILES_CAP}-file truncation ceiling (fail-closed; require exact-tree or fresh review)`,
+      reason: `file count reached GitHub ${GITHUB_COMMIT_FILES_CAP}-file truncation ceiling (fail-closed)`,
     }
   }
   if (commitFiles.length !== prFiles.length) {
@@ -296,6 +308,137 @@ export function verifyFileDiffListsByteEquivalent(
   return { equivalent: true }
 }
 
+interface TreeEntrySignature {
+  mode: string
+  type: string
+  sha: string
+}
+
+async function resolvePathTreeEntry(
+  rootTreeSha: string,
+  relPath: string,
+  treeCache: Map<string, Map<string, TreeEntrySignature>>,
+  api: { repo: string; token: string; apiBase: string; fetchImpl: FetchLike },
+): Promise<
+  | { ok: true; entry: TreeEntrySignature | null }
+  | { ok: false; reason: string; incomplete?: boolean }
+> {
+  const parts = relPath.split('/').filter(Boolean)
+  if (parts.length === 0) return { ok: false, reason: `empty path ${JSON.stringify(relPath)}` }
+  let curTreeSha = rootTreeSha
+  for (let i = 0; i < parts.length; i++) {
+    let dirMap = treeCache.get(curTreeSha)
+    if (!dirMap) {
+      const res = await githubGetJsonObject<GithubGitTreeResponse>(
+        `${api.apiBase}/repos/${api.repo}/git/trees/${curTreeSha}`,
+        api.token,
+        api.fetchImpl,
+      )
+      if (!res.ok) {
+        return {
+          ok: false,
+          incomplete: true,
+          reason: `tree ${curTreeSha.slice(0, 12)}: ${res.reason}`,
+        }
+      }
+      if (res.data.truncated === true || !Array.isArray(res.data.tree)) {
+        return {
+          ok: false,
+          incomplete: true,
+          reason: `tree ${curTreeSha.slice(0, 12)} truncated or invalid`,
+        }
+      }
+      dirMap = new Map<string, TreeEntrySignature>()
+      for (const ent of res.data.tree) {
+        if (ent.path && ent.mode && ent.type && ent.sha && SHA40_RE.test(ent.sha)) {
+          dirMap.set(ent.path, { mode: ent.mode, type: ent.type, sha: ent.sha.toLowerCase() })
+        }
+      }
+      treeCache.set(curTreeSha, dirMap)
+    }
+    const found = dirMap.get(parts[i]!)
+    if (!found) return { ok: true, entry: null }
+    if (i === parts.length - 1) return { ok: true, entry: found }
+    if (found.type !== 'tree') return { ok: true, entry: null }
+    curTreeSha = found.sha
+  }
+  return { ok: true, entry: null }
+}
+
+function sameTreeEntry(a: TreeEntrySignature | null, b: TreeEntrySignature | null): boolean {
+  if (a === null && b === null) return true
+  if (a === null || b === null) return false
+  return a.mode === b.mode && a.type === b.type && a.sha === b.sha
+}
+
+async function verifyTreeEntriesEquivalent(opts: {
+  api: { repo: string; token: string; apiBase: string; fetchImpl: FetchLike }
+  files: readonly GithubDiffFileEntry[]
+  sParentSha: string
+  sPostTreeSha: string
+  prBaseSha: string
+  prHeadSha: string
+  hPostTreeSha: string
+}): Promise<{ ok: true } | { ok: false; reason: string; incomplete?: boolean }> {
+  const paths = new Set<string>()
+  for (const f of opts.files) {
+    if (f.filename) paths.add(f.filename)
+    if (f.previous_filename) paths.add(f.previous_filename)
+  }
+  if (paths.size === 0 || paths.size > MAX_TREE_PROOF_FILES) {
+    return {
+      ok: false,
+      reason: `Proof B path count ${paths.size} outside [1..${MAX_TREE_PROOF_FILES}] (fail-closed)`,
+    }
+  }
+  const sParentRes = await githubGetJsonObject<GithubCommitDetail>(
+    `${opts.api.apiBase}/repos/${opts.api.repo}/commits/${opts.sParentSha}`,
+    opts.api.token,
+    opts.api.fetchImpl,
+  )
+  if (!sParentRes.ok) {
+    return {
+      ok: false,
+      incomplete: true,
+      reason: `target parent fetch failed: ${sParentRes.reason}`,
+    }
+  }
+  const sPreTree = sParentRes.data.commit?.tree?.sha?.trim().toLowerCase() ?? ''
+  if (!SHA40_RE.test(sPreTree)) return { ok: false, reason: 'missing target parent tree SHA' }
+
+  const cmpRes = await githubGetJsonObject<GithubCompareResponse>(
+    `${opts.api.apiBase}/repos/${opts.api.repo}/compare/${opts.prBaseSha}...${opts.prHeadSha}`,
+    opts.api.token,
+    opts.api.fetchImpl,
+  )
+  if (!cmpRes.ok) {
+    return { ok: false, incomplete: true, reason: `PR merge-base compare failed: ${cmpRes.reason}` }
+  }
+  const hPreTree = cmpRes.data.merge_base_commit?.commit?.tree?.sha?.trim().toLowerCase() ?? ''
+  if (!SHA40_RE.test(hPreTree)) return { ok: false, reason: 'missing PR merge-base tree SHA' }
+
+  const cache = new Map<string, Map<string, TreeEntrySignature>>()
+  for (const relPath of paths) {
+    const [sPre, sPost, hPre, hPost] = await Promise.all([
+      resolvePathTreeEntry(sPreTree, relPath, cache, opts.api),
+      resolvePathTreeEntry(opts.sPostTreeSha, relPath, cache, opts.api),
+      resolvePathTreeEntry(hPreTree, relPath, cache, opts.api),
+      resolvePathTreeEntry(opts.hPostTreeSha, relPath, cache, opts.api),
+    ])
+    if (!sPre.ok) return sPre
+    if (!sPost.ok) return sPost
+    if (!hPre.ok) return hPre
+    if (!hPost.ok) return hPost
+    if (!sameTreeEntry(sPre.entry, hPre.entry)) {
+      return { ok: false, reason: `${relPath}: pre-image tree entry (mode/type/oid) differs` }
+    }
+    if (!sameTreeEntry(sPost.entry, hPost.entry)) {
+      return { ok: false, reason: `${relPath}: post-image tree entry (mode/type/oid) differs` }
+    }
+  }
+  return { ok: true }
+}
+
 async function proveSingleMergedPrEquivalence(opts: {
   repo: string
   token: string
@@ -303,18 +446,22 @@ async function proveSingleMergedPrEquivalence(opts: {
   fetchImpl: FetchLike
   prNumber: number
   prHeadSha: string
-  prBaseRef?: string
+  prBaseRef: string
   prBaseSha?: string
   targetSha: string
   targetCommit: GithubCommitDetail
-}): Promise<{ candidate?: MergedPrEquivalenceCandidate; note: string }> {
+  targetCommitHasNextPage: boolean
+}): Promise<{ candidate?: MergedPrEquivalenceCandidate; note: string; incomplete?: boolean }> {
   const headCommitRes = await githubGetJsonObject<GithubCommitDetail>(
     `${opts.apiBase}/repos/${opts.repo}/commits/${opts.prHeadSha}`,
     opts.token,
     opts.fetchImpl,
   )
   if (!headCommitRes.ok) {
-    return { note: `PR#${opts.prNumber}@${opts.prHeadSha.slice(0, 12)}: ${headCommitRes.reason}` }
+    return {
+      note: `PR#${opts.prNumber}@${opts.prHeadSha.slice(0, 12)}: ${headCommitRes.reason}`,
+      incomplete: true,
+    }
   }
   const targetTree = opts.targetCommit.commit?.tree?.sha?.trim().toLowerCase() ?? ''
   const headTree = headCommitRes.data.commit?.tree?.sha?.trim().toLowerCase() ?? ''
@@ -334,32 +481,62 @@ async function proveSingleMergedPrEquivalence(opts: {
 
   const parents = opts.targetCommit.parents ?? []
   const commitFiles = opts.targetCommit.files ?? []
-  if (parents.length !== 1) {
+  if (parents.length !== 1 || !parents[0]?.sha || !SHA40_RE.test(parents[0].sha)) {
     return {
-      note: `PR#${opts.prNumber}@${opts.prHeadSha.slice(0, 12)} tree mismatch and target has ${parents.length} parent(s) (not single-parent squash)`,
+      note: `PR#${opts.prNumber}@${opts.prHeadSha.slice(0, 12)} tree mismatch and target is not a single-parent squash`,
     }
   }
-  if (commitFiles.length === 0 || commitFiles.length >= GITHUB_COMMIT_FILES_CAP) {
+  if (
+    opts.targetCommitHasNextPage ||
+    commitFiles.length === 0 ||
+    commitFiles.length >= GITHUB_COMMIT_FILES_CAP
+  ) {
     return {
-      note: `PR#${opts.prNumber}@${opts.prHeadSha.slice(0, 12)} tree mismatch and commit file list unavailable or truncated (count=${commitFiles.length})`,
+      note: `PR#${opts.prNumber}@${opts.prHeadSha.slice(0, 12)} commit files missing or paginated/truncated (fail-closed)`,
     }
   }
+  if (
+    !opts.prBaseSha ||
+    !SHA40_RE.test(opts.prBaseSha) ||
+    !SHA40_RE.test(targetTree) ||
+    !SHA40_RE.test(headTree)
+  ) {
+    return {
+      note: `PR#${opts.prNumber}@${opts.prHeadSha.slice(0, 12)} missing base/tree SHA required for Proof B tree-entry verification`,
+    }
+  }
+
   const prFilesRes = await githubGetPaginatedList<GithubDiffFileEntry>(
     `${opts.apiBase}/repos/${opts.repo}/pulls/${opts.prNumber}/files?per_page=100`,
     opts.token,
     opts.fetchImpl,
     3,
   )
-  if (!prFilesRes.ok) {
-    return { note: `PR#${opts.prNumber} files fetch failed: ${prFilesRes.reason}` }
-  }
-  if (prFilesRes.truncated) {
-    return { note: `PR#${opts.prNumber} files list truncated beyond 300 files (fail-closed)` }
+  if (!prFilesRes.ok || prFilesRes.truncated) {
+    return {
+      note: `PR#${opts.prNumber} files fetch failed or truncated beyond 300 files (fail-closed)`,
+      incomplete: !prFilesRes.ok,
+    }
   }
   const eq = verifyFileDiffListsByteEquivalent(commitFiles, prFilesRes.items)
   if (!eq.equivalent) {
     return {
-      note: `PR#${opts.prNumber}@${opts.prHeadSha.slice(0, 12)} diff equivalence rejected: ${eq.reason}`,
+      note: `PR#${opts.prNumber}@${opts.prHeadSha.slice(0, 12)} diff rejected: ${eq.reason}`,
+    }
+  }
+  const treeEq = await verifyTreeEntriesEquivalent({
+    api: { repo: opts.repo, token: opts.token, apiBase: opts.apiBase, fetchImpl: opts.fetchImpl },
+    files: commitFiles,
+    sParentSha: parents[0].sha.trim().toLowerCase(),
+    sPostTreeSha: targetTree,
+    prBaseSha: opts.prBaseSha,
+    prHeadSha: opts.prHeadSha,
+    hPostTreeSha: headTree,
+  })
+  if (!treeEq.ok) {
+    return {
+      note: `PR#${opts.prNumber}@${opts.prHeadSha.slice(0, 12)} tree-entry proof rejected: ${treeEq.reason}`,
+      ...(treeEq.incomplete ? { incomplete: true } : {}),
     }
   }
   return {
@@ -371,23 +548,50 @@ async function proveSingleMergedPrEquivalence(opts: {
       mergeCommitSha: opts.targetSha,
       equivalenceProof: 'exact-squash-diff',
     },
-    note: `PR#${opts.prNumber}@${opts.prHeadSha.slice(0, 12)} matched via exact-squash-diff (${commitFiles.length} file(s))`,
+    note: `PR#${opts.prNumber}@${opts.prHeadSha.slice(0, 12)} matched via exact-squash-diff + tree-entry (${commitFiles.length} file(s))`,
   }
 }
 
+function matchesTrustedMergedPr(
+  pr: GithubCommitPullEntry,
+  targetSha: string,
+  expectedBaseRef: string,
+  expectedRepo: string,
+): boolean {
+  if (typeof pr.number !== 'number' || pr.number <= 0 || !pr.merged_at) return false
+  if (pr.base?.ref?.trim() !== expectedBaseRef) return false
+  const baseRepo = pr.base?.repo?.full_name?.trim().toLowerCase()
+  if (baseRepo && baseRepo !== expectedRepo.toLowerCase()) return false
+  return pr.merge_commit_sha?.trim().toLowerCase() === targetSha
+}
+
 /**
- * Resolve cryptographically proven merged-PR carry-over candidates for a merge/squash commit.
+ * Resolve cryptographically proven merged-PR carry-over candidates for a landed commit.
+ * Fails closed if `expectedBaseRef` is missing, API is unavailable, or PR list is truncated.
  */
 export async function resolveMergedPrEquivalence(
   opts: MergedPrLookupOptions,
 ): Promise<MergedPrEquivalenceResult> {
   const targetSha = opts.targetSha.trim().toLowerCase()
+  const expectedBase = opts.expectedBaseRef?.trim() ?? ''
   if (!REPO_SLUG_RE.test(opts.repo) || !SHA40_RE.test(targetSha) || !opts.token.trim()) {
-    return { candidates: [], mergedPrNumbers: [], notes: ['invalid GitHub lookup arguments'] }
+    return {
+      candidates: [],
+      mergedPrNumbers: [],
+      incomplete: false,
+      notes: ['invalid GitHub lookup arguments'],
+    }
+  }
+  if (!expectedBase) {
+    return {
+      candidates: [],
+      mergedPrNumbers: [],
+      incomplete: false,
+      notes: ['expectedBaseRef is required to anchor merged-PR carry-over (fail-closed)'],
+    }
   }
   const fetchImpl: FetchLike = opts.fetchImpl ?? (globalThis.fetch as unknown as FetchLike)
   const apiBase = normalizeApiBase(opts.apiBaseUrl)
-  const expectedBase = opts.expectedBaseRef?.trim()
 
   const pullsRes = await githubGetPaginatedList<GithubCommitPullEntry>(
     `${apiBase}/repos/${opts.repo}/commits/${targetSha}/pulls?per_page=30`,
@@ -396,16 +600,20 @@ export async function resolveMergedPrEquivalence(
     2,
   )
   if (!pullsRes.ok) {
-    return { candidates: [], mergedPrNumbers: [], notes: [pullsRes.reason] }
+    return { candidates: [], mergedPrNumbers: [], incomplete: true, notes: [pullsRes.reason] }
+  }
+  if (pullsRes.truncated) {
+    return {
+      candidates: [],
+      mergedPrNumbers: [],
+      incomplete: true,
+      notes: [`commits/${targetSha.slice(0, 12)}/pulls response truncated (fail-closed)`],
+    }
   }
 
-  const matchedMerged = pullsRes.items.filter((pr) => {
-    if (typeof pr.number !== 'number' || pr.number <= 0) return false
-    if (!pr.merged_at) return false
-    if (expectedBase && pr.base?.ref?.trim() !== expectedBase) return false
-    const mergeSha = pr.merge_commit_sha?.trim().toLowerCase()
-    return mergeSha === targetSha
-  })
+  const matchedMerged = pullsRes.items.filter((pr) =>
+    matchesTrustedMergedPr(pr, targetSha, expectedBase, opts.repo),
+  )
   const mergedPrNumbers = matchedMerged.map((pr) => pr.number!)
   const carryTargets = matchedMerged.filter((pr) => {
     const head = pr.head?.sha?.trim().toLowerCase() ?? ''
@@ -415,7 +623,10 @@ export async function resolveMergedPrEquivalence(
     return {
       candidates: [],
       mergedPrNumbers,
-      notes: [`no squash/rebase merged PR found with merge_commit_sha=${targetSha.slice(0, 12)}`],
+      incomplete: false,
+      notes: [
+        `no squash/rebase merged PR targeting ${expectedBase} with merge_commit_sha=${targetSha.slice(0, 12)}`,
+      ],
     }
   }
 
@@ -425,11 +636,12 @@ export async function resolveMergedPrEquivalence(
     fetchImpl,
   )
   if (!targetCommitRes.ok) {
-    return { candidates: [], mergedPrNumbers, notes: [targetCommitRes.reason] }
+    return { candidates: [], mergedPrNumbers, incomplete: true, notes: [targetCommitRes.reason] }
   }
 
   const candidates: MergedPrEquivalenceCandidate[] = []
   const notes: string[] = []
+  let incomplete = false
   for (const pr of carryTargets) {
     const prHeadSha = pr.head!.sha!.trim().toLowerCase()
     const res = await proveSingleMergedPrEquivalence({
@@ -439,32 +651,39 @@ export async function resolveMergedPrEquivalence(
       fetchImpl,
       prNumber: pr.number!,
       prHeadSha,
-      prBaseRef: pr.base?.ref?.trim() || undefined,
+      prBaseRef: expectedBase,
       prBaseSha: pr.base?.sha?.trim().toLowerCase() || undefined,
       targetSha,
       targetCommit: targetCommitRes.data,
+      targetCommitHasNextPage: targetCommitRes.hasNextPage,
     })
     notes.push(res.note)
+    if (res.incomplete) incomplete = true
     if (res.candidate) candidates.push(res.candidate)
   }
-  return { candidates, mergedPrNumbers, notes }
+  return { candidates, mergedPrNumbers, incomplete, notes }
 }
 
 /**
- * Prove that a commit SHA landed via a merged GitHub PR (`merged_at != null` and either
- * `merge_commit_sha === targetSha` or `head.sha === targetSha`). Used by multi-PR release train
- * range checks so unreviewed direct pushes cannot split changes below Steward thresholds.
+ * Prove that a commit SHA actually landed on `expectedBaseRef` via a merged GitHub PR
+ * (`merged_at != null`, `base.ref === expectedBaseRef`, and `merge_commit_sha === targetSha`).
  */
 export async function verifyCommitIsMergedPr(
   opts: MergedPrLookupOptions,
-): Promise<{ merged: boolean; prNumber?: number; reason: string }> {
+): Promise<{ merged: boolean; incomplete?: boolean; prNumber?: number; reason: string }> {
   const targetSha = opts.targetSha.trim().toLowerCase()
+  const expectedBase = opts.expectedBaseRef?.trim() ?? ''
   if (!REPO_SLUG_RE.test(opts.repo) || !SHA40_RE.test(targetSha) || !opts.token.trim()) {
     return { merged: false, reason: 'missing GitHub repo/token or invalid commit SHA' }
   }
+  if (!expectedBase) {
+    return {
+      merged: false,
+      reason: 'expectedBaseRef is required to verify merged-PR landing (fail-closed)',
+    }
+  }
   const fetchImpl: FetchLike = opts.fetchImpl ?? (globalThis.fetch as unknown as FetchLike)
   const apiBase = normalizeApiBase(opts.apiBaseUrl)
-  const expectedBase = opts.expectedBaseRef?.trim()
 
   const pullsRes = await githubGetPaginatedList<GithubCommitPullEntry>(
     `${apiBase}/repos/${opts.repo}/commits/${targetSha}/pulls?per_page=30`,
@@ -473,23 +692,26 @@ export async function verifyCommitIsMergedPr(
     2,
   )
   if (!pullsRes.ok) {
-    return { merged: false, reason: pullsRes.reason }
+    return { merged: false, incomplete: true, reason: pullsRes.reason }
+  }
+  if (pullsRes.truncated) {
+    return {
+      merged: false,
+      incomplete: true,
+      reason: `commits/${targetSha.slice(0, 12)}/pulls response truncated (fail-closed)`,
+    }
   }
   for (const pr of pullsRes.items) {
-    if (typeof pr.number !== 'number' || !pr.merged_at) continue
-    if (expectedBase && pr.base?.ref?.trim() !== expectedBase) continue
-    const mergeSha = pr.merge_commit_sha?.trim().toLowerCase()
-    const headSha = pr.head?.sha?.trim().toLowerCase()
-    if (mergeSha === targetSha || headSha === targetSha) {
+    if (matchesTrustedMergedPr(pr, targetSha, expectedBase, opts.repo)) {
       return {
         merged: true,
         prNumber: pr.number,
-        reason: `commit ${targetSha.slice(0, 12)} landed via merged PR#${pr.number}`,
+        reason: `commit ${targetSha.slice(0, 12)} landed on ${expectedBase} via merged PR#${pr.number}`,
       }
     }
   }
   return {
     merged: false,
-    reason: `commit ${targetSha.slice(0, 12)} has no merged PR record on ${opts.repo}`,
+    reason: `commit ${targetSha.slice(0, 12)} has no merged PR landing on ${expectedBase} in ${opts.repo}`,
   }
 }

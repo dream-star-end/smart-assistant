@@ -53,15 +53,11 @@ import {
   signArchStewardReceipt,
   verifyArchStewardReceipt,
 } from './lib/archStewardContract.js'
-import {
-  mergeGithubStewardOutcome,
-  resolvePostMergeStewardFallback,
-} from './lib/commitRangeCarryOver.js'
+import { resolveStewardGateOnlineAsync } from './lib/commitRangeCarryOver.js'
 import {
   type FetchLike,
   type GithubStewardStatusResult,
   resolveGithubToken,
-  verifyGithubStewardStatus,
 } from './lib/githubTrustedApproval.js'
 import {
   type CrossFamilyAuditResult,
@@ -233,9 +229,10 @@ export function runStewardGate(opts: StewardGateRunOptions): StewardGateRunResul
 }
 
 /**
- * Asynchronous Architecture Steward check supporting host root-only receipts,
- * out-of-commit GitHub Commit Status `oc-v5/arch-steward`, squash/rebase merged-PR
- * carry-over (enforce-commit only), and coalesced multi-PR release-train decomposition.
+ * Asynchronous Architecture Steward check (B2/B3/B4/B5):
+ *   - Distinguishes single-commit vs multi-commit ranges BEFORE any tip-only carry-over so a
+ *     later PR's approval can never skip an earlier unapproved or vetoed commit in a train.
+ *   - Enforces symmetric cross-channel VETO & incomplete-history precedence across S and H.
  */
 export async function runStewardGateAsync(
   opts: StewardGateRunOptions,
@@ -254,80 +251,40 @@ export async function runStewardGateAsync(
     }
   }
 
+  const env = opts.env ?? process.env
+  const gitDir = opts.gitDir ?? (env.GIT_DIR?.trim() || undefined)
+  const requireHmac = opts.requireHmac ?? env.OC_STEWARD_REQUIRE_HMAC === '1'
   const ghRepo = opts.github?.repo?.trim()
   const ghToken = opts.github?.token?.trim()
-  const env = opts.env ?? process.env
-  const requireHmac = opts.requireHmac ?? env.OC_STEWARD_REQUIRE_HMAC === '1'
-  const allowCarryOver = opts.mode === 'enforce-commit'
-  const ghCfg =
-    ghRepo && ghToken
-      ? {
-          repo: ghRepo,
-          token: ghToken,
-          trustedPublishers: opts.github?.trustedPublishers,
-          apiBaseUrl: opts.github?.apiBaseUrl,
-          expectedBaseRef: opts.github?.expectedBaseRef,
-          fetchImpl: opts.github?.fetchImpl,
-        }
-      : undefined
-  let githubStatus: GithubStewardStatusResult | undefined
-
-  if (ghCfg && !opts.explicitReceiptPath) {
-    githubStatus = await verifyGithubStewardStatus({
-      ...ghCfg,
-      headSha: local.headSha,
-      allowMergedPrCarryOver: allowCarryOver,
-    })
-    const merged = mergeGithubStewardOutcome({ mode: opts.mode, ...local }, githubStatus)
-    if (merged.ok || githubStatus.verdict === 'veto') return merged
-  } else if (local.passed) {
-    return {
-      ...base,
-      ok: true,
-      exitCode: 0,
-      receiptLookup: local.receiptLookup,
-      receiptVerification: local.receiptVerification,
-    }
-  }
-
-  if (allowCarryOver && !opts.explicitReceiptPath) {
-    const fb = await resolvePostMergeStewardFallback({
-      root: opts.root,
-      baseSha: local.baseSha,
-      headSha: local.headSha,
-      gitDir: opts.gitDir ?? (env.GIT_DIR?.trim() || undefined),
-      requiredTriggers: local.risk.triggers,
-      receiptDirs: opts.receiptDirs,
-      requireRootOwner: opts.requireRootOwner ?? true,
-      hmacKey: opts.hmacKey,
-      requireHmac,
-      allowUntrustedRepoReceipt: opts.allowUntrustedRepoReceipt ?? false,
-      env,
-      localSearchedLocations: local.receiptLookup?.searchedLocations,
-      githubStatus,
-      github: ghCfg,
-    })
-    if (fb) {
-      return {
-        ...base,
-        ok: fb.ok,
-        exitCode: fb.ok ? 0 : failExit,
-        receiptLookup: fb.receiptLookup ?? local.receiptLookup,
-        receiptVerification: fb.receiptVerification,
-        githubStatus: fb.githubStatus ?? githubStatus,
-      }
-    }
-  }
-
-  return githubStatus
-    ? mergeGithubStewardOutcome({ mode: opts.mode, ...local }, githubStatus)
-    : {
-        ...base,
-        ok: false,
-        exitCode: failExit,
-        receiptLookup: local.receiptLookup,
-        receiptVerification: local.receiptVerification,
-      }
+  return resolveStewardGateOnlineAsync({
+    root: opts.root,
+    mode: opts.mode,
+    gitDir,
+    explicitReceiptPath: opts.explicitReceiptPath,
+    receiptDirs: opts.receiptDirs,
+    requireRootOwner: opts.requireRootOwner ?? true,
+    hmacKey: opts.hmacKey,
+    requireHmac,
+    allowUntrustedRepoReceipt: opts.allowUntrustedRepoReceipt ?? false,
+    env,
+    headSha: local.headSha,
+    baseSha: local.baseSha,
+    risk: local.risk,
+    passed: local.passed,
+    receiptLookup: local.receiptLookup,
+    receiptVerification: local.receiptVerification,
+    github:
+      ghRepo && ghToken
+        ? {
+            repo: ghRepo,
+            token: ghToken,
+            trustedPublishers: opts.github?.trustedPublishers,
+            apiBaseUrl: opts.github?.apiBaseUrl,
+            expectedBaseRef: opts.github?.expectedBaseRef,
+            fetchImpl: opts.github?.fetchImpl,
+          }
+        : undefined,
+  })
 }
 
 function printUsage(): void {
@@ -369,6 +326,7 @@ async function main(argv: string[]): Promise<number> {
   let githubTokenEnv: string | undefined
   let trustedPublishersRaw = process.env.OC_TRUSTED_APPROVERS?.trim() || ''
   let githubApiUrl = process.env.GITHUB_API_URL?.trim() || undefined
+  let expectedBaseBranchArg: string | undefined
   let recommendAuthorSlug: string | undefined
   let signReceiptPath: string | undefined
   let outPath: string | undefined
@@ -473,6 +431,10 @@ async function main(argv: string[]): Promise<number> {
       const v = takeValue(arg, ++i)
       if (!v) return 2
       githubApiUrl = v
+    } else if (arg === '--expected-base-branch') {
+      const v = takeValue(arg, ++i)
+      if (!v) return 2
+      expectedBaseBranchArg = v
     } else if (arg === '--json') {
       jsonOut = true
     } else if (arg === '--recommend-model') {
@@ -630,9 +592,10 @@ async function main(argv: string[]): Promise<number> {
             .filter(Boolean)
         : undefined
       const expectedBaseRef =
-        process.env.GITHUB_REF_TYPE === 'branch' && process.env.GITHUB_REF_NAME?.trim()
+        expectedBaseBranchArg?.trim() ||
+        (process.env.GITHUB_REF_TYPE === 'branch' && process.env.GITHUB_REF_NAME?.trim()
           ? process.env.GITHUB_REF_NAME.trim()
-          : process.env.OC_V5_EXPECTED_BASE_BRANCH?.trim() || undefined
+          : process.env.OC_V5_EXPECTED_BASE_BRANCH?.trim() || undefined)
       const result = await runStewardGateAsync({
         root,
         mode: gateMode,

@@ -50,7 +50,8 @@ import {
   verifyA0ApprovalReceipt,
   verifyA0ApprovalUnified,
 } from './lib/a0MonotonicRules.js'
-import { verifyA0CommitRangeFallback } from './lib/commitRangeCarryOver.js'
+import { resolveA0ApprovalForMultiCommitRange } from './lib/a0RangeCarryOver.js'
+import { inspectFirstParentRange } from './lib/commitRangeCarryOver.js'
 import { type FetchLike, resolveGithubToken } from './lib/githubTrustedApproval.js'
 
 export {
@@ -83,6 +84,7 @@ export interface CheckA0Options {
   base?: string
   head?: string
   staged?: boolean
+  prNumber?: number
   approvalDir?: string
   hmacKeyFile?: string
   hmacKey?: string
@@ -464,7 +466,30 @@ export function runCheckA0Monotonic(opts: CheckA0Options): CheckA0Result {
   }
 }
 
-/** Asynchronous A0 evaluation supporting both host root-only receipts and GitHub out-of-commit approvals. */
+function classifyCommitRangeA0Paths(
+  root: string,
+  policy: A0Policy,
+  parentSha: string,
+  commitSha: string,
+): string[] {
+  const raw = git(root, ['diff', '--name-status', '-z', '-M', `${parentSha}...${commitSha}`])
+  const entries = parseNameStatusZ(raw)
+  const paths = new Set<string>()
+  for (const e of entries) {
+    const fs = classifyDiffEntry(
+      e,
+      policy,
+      (p) => gitFileAt(root, parentSha, p),
+      (p) => gitFileAt(root, commitSha, p),
+    )
+    for (const f of fs) {
+      if (f.tier === 'A0') paths.add(f.path)
+    }
+  }
+  return [...paths]
+}
+
+/** Asynchronous A0 evaluation supporting host root-only receipts, GitHub approvals & multi-commit ranges. */
 export async function runCheckA0MonotonicAsync(opts: CheckA0Options): Promise<CheckA0Result> {
   const prep = prepareA0Diff(opts)
   if (prep.a0Blocks.length === 0) {
@@ -498,62 +523,62 @@ export async function runCheckA0MonotonicAsync(opts: CheckA0Options): Promise<Ch
 
   const { approvalDir, requireRootOwner } = resolveApprovalConfig(prep.policy, opts)
   const a0Paths = [...new Set(prep.a0Blocks.map((b) => b.path))]
-  let approval = await verifyA0ApprovalUnified({
-    approvalDir,
-    targetSha: prep.targetSha,
-    a0Paths,
-    requireRootOwner,
-    hmacKeyFile: opts.hmacKeyFile,
-    hmacKey: opts.hmacKey,
-    nowMs: opts.nowMs,
-    github: prep.mode === 'staged' ? undefined : opts.github,
-  })
+  const effectivePrNum = opts.prNumber ?? opts.github?.prNumber
+  const isOpenPr = effectivePrNum !== undefined
+  const ghOpts =
+    prep.mode === 'staged' || !opts.github
+      ? undefined
+      : { ...opts.github, prNumber: effectivePrNum }
 
-  if (
-    !approval.valid &&
-    !approval.revoked &&
-    prep.mode === 'base' &&
-    opts.base &&
-    opts.github?.prNumber === undefined &&
-    opts.github?.allowMergedPrCarryOver !== false
-  ) {
+  let approval: ApprovalVerification
+  if (prep.mode === 'base' && !isOpenPr && opts.base) {
     const baseSha = git(opts.root, ['rev-parse', '--verify', `${opts.base}^{commit}`]).trim()
-    const rangeApproval = await verifyA0CommitRangeFallback({
-      root: opts.root,
-      baseSha,
-      headSha: prep.targetSha,
-      aggregateA0Paths: a0Paths,
-      classifyCommitA0Paths: (parentSha, commitSha) => {
-        const raw = git(opts.root, [
-          'diff',
-          '--name-status',
-          '-z',
-          '-M',
-          `${parentSha}...${commitSha}`,
-        ])
-        const entries = parseNameStatusZ(raw)
-        const paths = new Set<string>()
-        for (const e of entries) {
-          const fs = classifyDiffEntry(
-            e,
-            prep.policy,
-            (p) => gitFileAt(opts.root, parentSha, p),
-            (p) => gitFileAt(opts.root, commitSha, p),
-          )
-          for (const f of fs) {
-            if (f.tier === 'A0') paths.add(f.path)
-          }
-        }
-        return [...paths]
-      },
+    const rangeInfo = inspectFirstParentRange(opts.root, baseSha, prep.targetSha)
+    if (rangeInfo.kind === 'multi') {
+      approval = await resolveA0ApprovalForMultiCommitRange({
+        root: opts.root,
+        baseSha,
+        headSha: prep.targetSha,
+        commits: rangeInfo.commits,
+        aggregateA0Paths: a0Paths,
+        classifyCommitA0Paths: (pSha, cSha) =>
+          classifyCommitRangeA0Paths(opts.root, prep.policy, pSha, cSha),
+        approvalDir,
+        requireRootOwner,
+        hmacKeyFile: opts.hmacKeyFile,
+        hmacKey: opts.hmacKey,
+        nowMs: opts.nowMs,
+        github: ghOpts,
+      })
+    } else {
+      approval = await verifyA0ApprovalUnified({
+        approvalDir,
+        targetSha: prep.targetSha,
+        a0Paths,
+        requireRootOwner,
+        hmacKeyFile: opts.hmacKeyFile,
+        hmacKey: opts.hmacKey,
+        nowMs: opts.nowMs,
+        github: ghOpts
+          ? {
+              ...ghOpts,
+              allowMergedPrCarryOver:
+                rangeInfo.kind === 'single' ? ghOpts.allowMergedPrCarryOver : false,
+            }
+          : undefined,
+      })
+    }
+  } else {
+    approval = await verifyA0ApprovalUnified({
       approvalDir,
+      targetSha: prep.targetSha,
+      a0Paths,
       requireRootOwner,
       hmacKeyFile: opts.hmacKeyFile,
       hmacKey: opts.hmacKey,
       nowMs: opts.nowMs,
-      github: opts.github,
+      github: ghOpts ? { ...ghOpts, allowMergedPrCarryOver: false } : undefined,
     })
-    if (rangeApproval) approval = rangeApproval
   }
 
   return {
@@ -582,6 +607,7 @@ async function main(argv: string[]): Promise<number> {
   let prNumberRaw = process.env.PR_NUMBER?.trim() || process.env.GITHUB_PR_NUMBER?.trim() || ''
   let trustedApproversRaw = process.env.OC_TRUSTED_APPROVERS?.trim() || ''
   let githubApiUrl = process.env.GITHUB_API_URL?.trim() || undefined
+  let expectedBaseBranchArg: string | undefined
 
   const takeValue = (flag: string, idx: number): string | null => {
     const v = argv[idx]
@@ -638,6 +664,10 @@ async function main(argv: string[]): Promise<number> {
       const v = takeValue(arg, ++i)
       if (!v) return 2
       githubApiUrl = v
+    } else if (arg === '--expected-base-branch') {
+      const v = takeValue(arg, ++i)
+      if (!v) return 2
+      expectedBaseBranchArg = v
     } else {
       console.error(`unknown arg: ${arg}`)
       return 2
@@ -685,9 +715,10 @@ async function main(argv: string[]): Promise<number> {
     : undefined
 
   const expectedBaseRef =
-    process.env.GITHUB_REF_TYPE === 'branch' && process.env.GITHUB_REF_NAME?.trim()
+    expectedBaseBranchArg?.trim() ||
+    (process.env.GITHUB_REF_TYPE === 'branch' && process.env.GITHUB_REF_NAME?.trim()
       ? process.env.GITHUB_REF_NAME.trim()
-      : process.env.OC_V5_EXPECTED_BASE_BRANCH?.trim() || undefined
+      : process.env.OC_V5_EXPECTED_BASE_BRANCH?.trim() || undefined)
 
   let result: CheckA0Result
   try {
@@ -696,6 +727,7 @@ async function main(argv: string[]): Promise<number> {
       base: staged ? undefined : base,
       head,
       staged,
+      prNumber,
       approvalDir,
       hmacKeyFile,
       requireRootOwner,
