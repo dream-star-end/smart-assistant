@@ -13,9 +13,6 @@ import { dirname, join } from 'node:path'
 import {
   TURN_LEASE_RENEW_AFTER_MS,
   assertLeaseMatchesAuthority,
-  computeSchemaFilteredArgsSha256,
-  computeToolIdempotencyKey,
-  isAdvisorReadOnlyMcpTool,
   parseRemoteDriverExecutionBackend,
   remoteCanonicalSha256,
   sameRemoteExecutionBackend,
@@ -32,11 +29,7 @@ import {
   type RemoteReceiptV4,
   type RemoteSecurityEvent,
 } from '@openclaude/protocol'
-import type {
-  ToolBrokerTransport,
-  ToolCallEnvelope,
-  ToolResultEnvelope,
-} from '@openclaude/protocol/exec-env'
+import type { ToolBrokerTransport } from '@openclaude/protocol/exec-env'
 import { CC5_MOUNT, readCc5AuthorityKeyring } from '../cc5BridgePort.js'
 import type { Cc5FinanceTerminalOutcome } from '../cc5Finance.js'
 import { privateDir, syncDir } from '../cc5FixedTool.js'
@@ -74,6 +67,15 @@ import { lookupRemoteSwarmMcpContext } from '../remoteSwarmRuntime.js'
 import { SubprocessRunner } from '../subprocessRunner.js'
 import { RemoteObservationGate } from './observationGate.js'
 import {
+  createDefaultLaneBroker,
+  invokeExternalBrokerTransport,
+  isAllowedInReadOnlyTurn,
+  resolveSelfhostRemoteLaneBroker,
+  type ExternalCapabilityTokenSupplier,
+  type RemoteLaneToolBroker,
+  type SelfhostRemoteLaneBrokerBinding,
+} from './containerLaneBroker.js'
+import {
   DEFAULT_MAX_IMAGE_BYTES,
   inferImageMimeFromPath,
   materializeRemoteTurnContentBlocks,
@@ -90,36 +92,10 @@ import {
 const log = createLogger({ module: 'remoteContainerLane' })
 const LANE_UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
 const MAX_FRAME_BYTES = 32 * 1024 * 1024
-const READ_ONLY_BUILTIN_TOOLS = new Set([
-  'Read',
-  'Glob',
-  'Grep',
-  'AskUserQuestion',
-  'SearchExtraTools',
-])
-
-function isAllowedInReadOnlyTurn(
-  clientToolName: string,
-  args: Readonly<Record<string, unknown>>,
-): boolean {
-  if (READ_ONLY_BUILTIN_TOOLS.has(clientToolName)) return true
-  if (clientToolName.startsWith('mcp__openclaude-memory__')) {
-    return isAdvisorReadOnlyMcpTool(clientToolName.slice('mcp__openclaude-memory__'.length))
-  }
-  if (clientToolName === 'ExecuteExtraTool') {
-    const target = typeof args.tool_name === 'string' ? args.tool_name : ''
-    return (
-      target.startsWith('mcp__openclaude-memory__') &&
-      isAdvisorReadOnlyMcpTool(target.slice('mcp__openclaude-memory__'.length))
-    )
-  }
-  return false
-}
 const POLL_IDLE_MS = 15
 const TOOL_IDLE_MS = 20
 const DEFAULT_EXECUTION_ROOT = '/home/agent/.openclaude/.cc5-native-tools'
 const LEASE_RENEW_RETRY_MS = 60_000
-const EXEC_ENV_IDENT_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const TEXT_ONLY_REMOTE_DRIVERS = new Set<string>()
 const inferredMimeBlocks = new WeakSet<RemoteDriverTurnContentBlock>()
 
@@ -191,54 +167,6 @@ function extractRemoteTurnContent(
     }
   }
   return blocks.some((b) => b.type === 'image') ? blocks : undefined
-}
-
-function toolResultEnvelopeToCc5Result(
-  envelope: ToolResultEnvelope,
-  toolName: string,
-): Cc5ToolResult {
-  const isError = envelope.status !== 'ok'
-  const out = envelope.output
-  if (out && typeof out === 'object' && !Array.isArray(out)) {
-    const rec = out as { content?: unknown; isError?: unknown }
-    if (
-      Array.isArray(rec.content) &&
-      rec.content.every(
-        (b) => b && typeof b === 'object' && !Array.isArray(b) && typeof (b as { type?: unknown }).type === 'string',
-      )
-    ) {
-      return {
-        content: rec.content as Array<Record<string, unknown> & { type: string }>,
-        isError: isError || rec.isError === true,
-      }
-    }
-  }
-  if (
-    Array.isArray(out) &&
-    out.every(
-      (b) => b && typeof b === 'object' && !Array.isArray(b) && typeof (b as { type?: unknown }).type === 'string',
-    )
-  ) {
-    return { content: out as Array<Record<string, unknown> & { type: string }>, isError }
-  }
-  if (typeof out === 'string') {
-    return { content: [{ type: 'text', text: out }], isError }
-  }
-  if (out !== undefined) {
-    return { content: [{ type: 'text', text: JSON.stringify(out) }], isError }
-  }
-  if (isError) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: envelope.errorMessage ?? envelope.errorCode ?? `Tool ${toolName} failed (${envelope.status})`,
-        },
-      ],
-      isError: true,
-    }
-  }
-  return { content: [{ type: 'text', text: '' }], isError: false }
 }
 
 function pause(ms: number): Promise<void> {
@@ -684,8 +612,10 @@ export interface RemoteContainerLaneOptions {
   readonly toolAuthorizeTimeoutMs?: number
   readonly platformPrompt?: string
   readonly brokerTransport?: ToolBrokerTransport
+  readonly enableDefaultBroker?: boolean
   readonly execEnvLeaseId?: string
   readonly fencingTokenProvider?: () => { fencingToken: string; brainGen: number }
+  readonly issueCapabilityToken?: ExternalCapabilityTokenSupplier
   readonly blobResolver?: (
     blobId: string,
   ) => Promise<{ readonly mimeType: string; readonly data: string }>
@@ -763,6 +693,8 @@ export class RemoteContainerLane {
   private readonly observation: RemoteObservationGate
   private readonly seenAuthorityTurnIds = new Set<string>()
   private activeBrokerCallId?: string
+  private defaultBroker?: RemoteLaneToolBroker
+  private selfhostBrokerBinding?: SelfhostRemoteLaneBrokerBinding
 
   private host?: LaneToolHost
   private cleanupContext?: () => void
@@ -1029,6 +961,8 @@ export class RemoteContainerLane {
   private async resetToolsInternal(): Promise<void> {
     await this.toolsInit?.catch(() => {})
     this.toolsInit = undefined
+    this.defaultBroker?.dispose('tools_reset')
+    this.defaultBroker = undefined
     await this.host?.close().catch(() => {})
     this.host = undefined
     this.cleanupContext?.()
@@ -1076,6 +1010,15 @@ export class RemoteContainerLane {
             },
           )
         this.host = host
+        const onHostResetNeeded = (abortedHost: LaneToolHost) => { if (this.host === abortedHost) { this.host = undefined; this.toolsInit = undefined } }
+        const laneBrokerReq = { operationId: this.binding.operationId, sessionKey: this.opts.sessionKey, laneRoot: root, leaseId: this.laneOptions.execEnvLeaseId, onHostResetNeeded, getPermissionHandler: () => this.activeTurn?.onPermission }
+        if (!this.selfhostBrokerBinding) this.selfhostBrokerBinding = resolveSelfhostRemoteLaneBroker(laneBrokerReq) ?? undefined
+        // B05/B10: Instantiate default lane ToolBroker (and its WAL dir) ONLY when selfhost broker
+        // is enabled or explicitly opted in — non-selfhost without external transport stays baseline.
+        if (!this.laneOptions.brokerTransport && !this.defaultBroker) {
+          if (this.selfhostBrokerBinding?.broker) this.defaultBroker = this.selfhostBrokerBinding.broker
+          else if (this.laneOptions.enableDefaultBroker === true) this.defaultBroker = createDefaultLaneBroker(laneBrokerReq)
+        }
         const compiled = compileCc5ToolCatalog(await host.tools())
         this.catalog = compiled
         this.clientNameByRemoteName = compiled.clientNameByRemoteName
@@ -1564,7 +1507,13 @@ export class RemoteContainerLane {
       this.laneOptions.toolAuthorizeTimeoutMs ?? 5_000,
     )
 
-    const broker = this.laneOptions.brokerTransport
+    const broker = this.laneOptions.brokerTransport ?? this.selfhostBrokerBinding?.externalTransport
+    if (!broker && this.defaultBroker) {
+      await this.defaultBroker.waitForHostIsolation()
+      if (!this.host && this.stopRun === undefined) {
+        await this.ensureTools(turn.payload.executionDescriptor.supportsVision, this.stagedPromptPrivacy)
+      }
+    }
     const host = this.host
     remotePoolNeed(
       (broker !== undefined || host !== undefined) && this.stopRun === undefined,
@@ -1603,48 +1552,20 @@ export class RemoteContainerLane {
     let result: Cc5ToolResult
     if (broker) {
       const leaseId = this.laneOptions.execEnvLeaseId ?? this.binding.operationId
-      const idempotencyKey = computeToolIdempotencyKey(leaseId, admitted.authorityTurnId, req.callId)
-      const schema = this.toolInputSchemas.get(req.name)
-      const schemaProps =
-        schema &&
-        typeof schema.properties === 'object' &&
-        schema.properties !== null &&
-        !Array.isArray(schema.properties)
-          ? Object.keys(schema.properties as Record<string, unknown>)
-          : []
-      const argsSha256 =
-        schemaProps.length > 0
-          ? computeSchemaFilteredArgsSha256(req.arguments, schema)
-          : remoteCanonicalSha256(req.arguments)
-      const fencing = this.laneOptions.fencingTokenProvider?.()
-      const candidateGrant = fencing ? `${fencing.fencingToken}:${fencing.brainGen}` : undefined
-      const grantId =
-        candidateGrant && EXEC_ENV_IDENT_RE.test(candidateGrant) ? candidateGrant : undefined
-      const envelope: ToolCallEnvelope = {
-        schemaVersion: 1,
-        leaseId,
-        turnId: admitted.authorityTurnId,
-        callId: req.callId,
-        idempotencyKey,
-        canonicalName: clientToolName,
-        arguments: req.arguments,
-        argsSha256,
-        attestation: {
-          kind: schemaProps.length > 0 ? 'schema_filtered_hook' : 'dual_channel_observed',
-          argsSha256,
-          observedAt: new Date().toISOString(),
-          ...(grantId ? { grantId } : {}),
-          ...(schemaProps.length > 0 ? { filteredKeys: schemaProps } : {}),
-        },
-      }
       this.activeBrokerCallId = req.callId
       try {
-        const brokerResult = await broker.invoke(envelope)
-        remotePoolNeed(
-          brokerResult.callId === req.callId && brokerResult.idempotencyKey === idempotencyKey,
-          'REMOTE_TOOL_EFFECT_UNKNOWN',
-        )
-        result = toolResultEnvelopeToCc5Result(brokerResult, clientToolName)
+        result = await invokeExternalBrokerTransport({
+          broker,
+          leaseId,
+          turnId: admitted.authorityTurnId,
+          callId: req.callId,
+          clientToolName,
+          sessionKey: this.opts.sessionKey,
+          arguments: req.arguments,
+          schema: this.toolInputSchemas.get(req.name),
+          fencing: this.laneOptions.fencingTokenProvider?.() ?? this.selfhostBrokerBinding?.fencingTokenProvider?.(),
+          issueCapabilityToken: this.laneOptions.issueCapabilityToken ?? this.selfhostBrokerBinding?.issueCapabilityToken,
+        })
       } catch (err) {
         throw err instanceof Error && /^(CC5|REMOTE)_[A-Z0-9_]+$/.test(err.message)
           ? err
@@ -1655,16 +1576,34 @@ export class RemoteContainerLane {
         }
       }
     } else {
+      const laneBroker = this.defaultBroker
+      this.activeBrokerCallId = req.callId
       try {
-        result = await host!.execute(clientToolName, req.arguments, {
-          nativeSessionId: toHostSessionUuid(this.binding.operationId, req.nativeSessionId),
-          turnKey: admitted.turnKey,
-          toolUseId: req.callId,
-        })
+        result = laneBroker
+          ? await laneBroker.executeHostTool({
+              host: host!,
+              clientToolName,
+              arguments: req.arguments,
+              schema: this.toolInputSchemas.get(req.name),
+              callId: req.callId,
+              authorityTurnId: admitted.authorityTurnId,
+              turnKey: admitted.turnKey,
+              nativeSessionUuid: toHostSessionUuid(this.binding.operationId, req.nativeSessionId),
+              readOnly: turn.readOnly,
+            })
+          : await host!.execute(clientToolName, req.arguments, {
+              nativeSessionId: toHostSessionUuid(this.binding.operationId, req.nativeSessionId),
+              turnKey: admitted.turnKey,
+              toolUseId: req.callId,
+            })
       } catch (err) {
-        throw err instanceof Error && /^CC5_[A-Z0-9_]+$/.test(err.message)
+        throw err instanceof Error && /^(CC5|REMOTE)_[A-Z0-9_]+$/.test(err.message)
           ? err
           : new Error('REMOTE_TOOL_EFFECT_UNKNOWN')
+      } finally {
+        if (this.activeBrokerCallId === req.callId) {
+          this.activeBrokerCallId = undefined
+        }
       }
     }
 
@@ -1752,6 +1691,9 @@ export class RemoteContainerLane {
     if (this.activeBrokerCallId && this.laneOptions.brokerTransport) {
       void this.laneOptions.brokerTransport.cancel(this.activeBrokerCallId, 'TURN_INTERRUPTED').catch(() => {})
     }
+    if (this.defaultBroker) {
+      void this.defaultBroker.cancelActive('TURN_INTERRUPTED').catch(() => {})
+    }
     for (const pending of this.pendingTurns) {
       if (!pending.cancelRequested) {
         pending.cancelRequested = true
@@ -1776,9 +1718,15 @@ export class RemoteContainerLane {
   }
 
   stopLane(): Promise<void> {
-    if (this.activeBrokerCallId && this.laneOptions.brokerTransport) {
-      void this.laneOptions.brokerTransport.cancel(this.activeBrokerCallId, 'REMOTE_LANE_STOPPING').catch(() => {})
+    const activeExtBroker = this.laneOptions.brokerTransport ?? this.selfhostBrokerBinding?.externalTransport
+    if (this.activeBrokerCallId && activeExtBroker) {
+      void activeExtBroker.cancel(this.activeBrokerCallId, 'REMOTE_LANE_STOPPING').catch(() => {})
     }
+    if (this.defaultBroker) {
+      void this.defaultBroker.cancelActive('REMOTE_LANE_STOPPING').catch(() => {})
+      this.defaultBroker.dispose('REMOTE_LANE_STOPPING')
+    }
+    this.selfhostBrokerBinding = undefined
     for (const pending of this.pendingTurns) {
       pending.cancelRequested = true
       pending.abort.abort(new Error('REMOTE_LANE_STOPPING'))

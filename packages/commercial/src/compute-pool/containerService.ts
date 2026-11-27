@@ -52,6 +52,23 @@ import type {
   AgentRunContainerRequest,
   ComputeHostRow,
 } from "./types.js";
+import {
+  attachComputePoolExecEnvHandle,
+  defaultCapabilitiesForHostKind,
+  type AttachComputePoolExecEnvHandleInput,
+  type ComputePoolContainerDescriptor,
+  type ComputePoolExecEnvHandle,
+  type ComputePoolFrameLinkOpener,
+} from "./execEnvHandle.js";
+
+export {
+  attachComputePoolExecEnvHandle,
+  defaultCapabilitiesForHostKind,
+  type AttachComputePoolExecEnvHandleInput,
+  type ComputePoolContainerDescriptor,
+  type ComputePoolExecEnvHandle,
+  type ComputePoolFrameLinkOpener,
+};
 
 const log = rootLogger.child({ subsys: "container-service" });
 
@@ -185,6 +202,10 @@ export interface ContainerService {
   isRemote(hostId: string): Promise<boolean>;
   /** host 上 baseline 挂载源路径;self=repo,remote=/var/lib/openclaude/baseline。 */
   resolveBaselinePaths(hostId: string): Promise<BaselineSourcePaths>;
+  /** 可选:为运行中容器附着 Layer 3 `ExecEnvHandle` (`openChannel('tool-broker')`)。 */
+  attachExecEnvHandle?(input: AttachComputePoolExecEnvHandleInput): ComputePoolExecEnvHandle;
+  /** 可选:绑定 selfhost v5 `ContainerLinkRegistry` 的 ToolBroker frame-link opener。 */
+  bindBrokerFrameLinkOpener?(opener: ComputePoolFrameLinkOpener | null): void;
 }
 
 // ─── LocalDockerBackend ───────────────────────────────────────────────
@@ -679,6 +700,27 @@ export class HostAwareContainerService implements ContainerService {
     }
     return this.local.inspectImage(tag);
   }
+
+  private brokerFrameLinkOpener: ComputePoolFrameLinkOpener | null = null;
+
+  bindBrokerFrameLinkOpener(opener: ComputePoolFrameLinkOpener | null): void {
+    this.brokerFrameLinkOpener = opener;
+  }
+
+  attachExecEnvHandle(
+    input: Omit<AttachComputePoolExecEnvHandleInput, "openFrameLink"> & {
+      readonly openFrameLink?: ComputePoolFrameLinkOpener;
+    },
+  ): ComputePoolExecEnvHandle {
+    const openFrameLink = input.openFrameLink ?? this.brokerFrameLinkOpener;
+    if (!openFrameLink) {
+      throw new SupervisorError(
+        "InvalidArgument",
+        "ContainerService requires a bound BrokerFrameLinkOpener or explicit openFrameLink to attach ExecEnvHandle",
+      );
+    }
+    return attachComputePoolExecEnvHandle({ ...input, openFrameLink });
+  }
 }
 
 // ─── 工厂 ─────────────────────────────────────────────────────────────
@@ -689,7 +731,10 @@ export class HostAwareContainerService implements ContainerService {
  * 参数 `docker` 是 dockerode 本机 client(同 v3supervisor index.ts 持的那个单例)。
  * remote backend 行读取走 `queries.getHostById`,caller 无需额外注入 DB。
  */
-export function createContainerService(docker: Docker): HostAwareContainerService {
+export function createContainerService(
+  docker: Docker,
+  opts?: { readonly brokerFrameLinkOpener?: ComputePoolFrameLinkOpener | null },
+): HostAwareContainerService {
   const local = new LocalDockerBackend(docker);
   const remote = new RemoteNodeAgentBackend(async (hostId) => {
     const row = await queries.getHostById(hostId);
@@ -699,5 +744,9 @@ export function createContainerService(docker: Docker): HostAwareContainerServic
     return row;
   });
   log.info("ContainerService initialized");
-  return new HostAwareContainerService(local, remote);
+  const service = new HostAwareContainerService(local, remote);
+  if (opts?.brokerFrameLinkOpener) {
+    service.bindBrokerFrameLinkOpener(opts.brokerFrameLinkOpener);
+  }
+  return service;
 }

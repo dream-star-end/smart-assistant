@@ -28,6 +28,7 @@ export type {
   JobOutputDelta,
   JobStartResult,
   ManagedJobSummary,
+  OpenToolBrokerChannelRequest,
   ProcessJobSeam,
   SandboxRedControlId,
   ScopedCapabilityTokenClaims,
@@ -56,3 +57,24 @@ export {
 } from './validators.js'
 
 export type { SchemaFilteredHashGoldenVector } from './validators.js'
+
+export {
+  ContainerLinkToolBrokerClient,
+  TOOL_BROKER_LOCAL_PREFIX,
+  ToolBrokerTransportError,
+  createInMemoryFrameLinkPair,
+  isLoopbackBrokerUrl,
+  isReservedToolBrokerFrame,
+  isToolBrokerWireFrame,
+  openExecEnvToolBrokerChannel,
+  parseToolBrokerWireFrame,
+  scrubToolBrokerEnv,
+} from './brokerChannel.js'
+
+export type {
+  ContainerLinkToolBrokerClientOptions,
+  FrameLinkLike,
+  OpenToolBrokerChannelOptions,
+  ToolBrokerRebindAck,
+  ToolBrokerWireFrame,
+} from './brokerChannel.js'

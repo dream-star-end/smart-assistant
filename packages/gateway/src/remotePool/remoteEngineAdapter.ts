@@ -72,10 +72,7 @@ import {
 } from './resumeId.js'
 import { remotePoolNeed } from './types.js'
 
-const DEFAULT_PHANTOM_SIGNALS: PhantomSignals = {
-  apiState: 'called',
-  skipReason: null,
-}
+const DEFAULT_PHANTOM_SIGNALS: PhantomSignals = { apiState: 'called', skipReason: null }
 
 const REMOTE_SWARM_TOOL_NAMES = new Set(['swarm', 'post_message', 'read_board', 'swarm_wait'])
 
@@ -294,6 +291,7 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
   get fenceReason(): string | undefined {
     return this.lane.fenceError?.message
   }
+  get remoteBindingUid(): string { return this.lane.binding.uid }
 
   /** Expose active container-side Remote Swarm board location for `POST /internal/swarm/command`. */
   getActiveSwarmTarget(): { brainDir: string; conversationId: string } | null {
@@ -852,6 +850,7 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
 
     const settleWithReceipt = (receipt: RemoteReceiptV4, durationMs: number): void => {
       if (finalized) return
+      this.emit('remote_receipt_v4', receipt)
       if (receipt.usageMode === 'cumulative' || this.capabilities.billingMode === 'engine-reported') {
         const finalRaw = rawUsageFromCounters(receipt.countersFinal)
         this._threadCumulativeBaseline = {
@@ -877,16 +876,13 @@ export class RemoteEngineAdapter extends EventEmitter implements EngineAdapter {
           ),
         }
       }
-      const totalTokens =
-        receipt.usage.inputTokens +
-        receipt.usage.outputTokens +
-        receipt.usage.cacheReadTokens +
-        receipt.usage.cacheWriteTokens
+      const u = receipt.usage
+      const totalTokens = u.inputTokens + u.outputTokens + u.cacheReadTokens + u.cacheWriteTokens
       const usageSnapshot: TurnTokenUsageSnapshot = {
-        inputTokens: receipt.usage.inputTokens,
-        outputTokens: receipt.usage.outputTokens,
-        cacheReadTokens: receipt.usage.cacheReadTokens,
-        cacheCreationTokens: receipt.usage.cacheWriteTokens,
+        inputTokens: u.inputTokens,
+        outputTokens: u.outputTokens,
+        cacheReadTokens: u.cacheReadTokens,
+        cacheCreationTokens: u.cacheWriteTokens,
         totalTokens,
       }
       params.onEvent({ kind: 'usage', usage: usageSnapshot })

@@ -411,6 +411,24 @@ export function createCodexBindingHandle(deps: {
   };
 }
 
+function isSelfhostV5Flavor(flavorIdentity: ReturnType<typeof assertFlavorIdentity>): boolean {
+  return (
+    getRuntimeChannel() === "v5" &&
+    flavorIdentity.status === "ok" &&
+    flavorIdentity.flavor === "selfhost"
+  );
+}
+
+function bindSelfhostToolBrokerOpener(
+  isSelfhostV5: boolean,
+  v3Deps: V3SupervisorDeps | undefined,
+  userChatBridge: UserChatBridgeHandler,
+): void {
+  if (!isSelfhostV5 || !v3Deps?.containerService) return;
+  const brokerOpener = userChatBridge.createBrokerFrameLinkOpener?.();
+  if (brokerOpener) v3Deps.containerService.bindBrokerFrameLinkOpener?.(brokerOpener);
+}
+
 export function createCommercialUserChatBridge(deps: {
   env: NodeJS.ProcessEnv;
   cfg: CommercialConfig;
@@ -458,10 +476,7 @@ export function createCommercialUserChatBridge(deps: {
     : undefined;
   const recycleUnattestedContainer = createUnattestedContainerRecycler(() => deps.v3Deps);
 
-  const isSelfhostV5 =
-    getRuntimeChannel() === "v5" &&
-    deps.flavorIdentity.status === "ok" &&
-    deps.flavorIdentity.flavor === "selfhost";
+  const isSelfhostV5 = isSelfhostV5Flavor(deps.flavorIdentity);
 
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     cc5BackendSelector: (input) =>
@@ -472,6 +487,7 @@ export function createCommercialUserChatBridge(deps: {
       modelCatalogCache: deps.modelCatalogCache,
     }),
     containerLinkEnabled: deps.containerLinkOn,
+    containerLinkToolBrokerEnabled: isSelfhostV5,
     resolveContainerLinkEndpoint: async (uid, cid) => {
       const ep = await resolveContainerLinkEndpoint(getPool(), deps.runtimeChannel, uid, cid);
       if (!ep || ep === "pending" || ep.desktop || ep.bundleRev || !deps.v3Deps) return ep;
@@ -597,6 +613,8 @@ export function createCommercialUserChatBridge(deps: {
     selfHostId: deps.selfHostUuid ?? null,
     appendCostCredits: deps.appendCostCreditsForUser,
   });
+
+  bindSelfhostToolBrokerOpener(isSelfhostV5, deps.v3Deps, userChatBridge);
 
   const recoveryDecisionBroadcast = (
     userId: string,

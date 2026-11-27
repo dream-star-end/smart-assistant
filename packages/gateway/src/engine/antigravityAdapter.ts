@@ -536,7 +536,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private async spawnTurn(ctx: TurnContext): Promise<void> {
-    const readOnly = ctx.params.readOnly === true
+    const hermeticNoTools = this.opts.hermeticNoTools === true
+    const readOnly = ctx.params.readOnly === true || hermeticNoTools
     const route = validateAntigravityRoute(this.route)
     const cliModel = antigravityCliModelId(this.currentModel, this.currentEffort)
     if (!cliModel) {
@@ -584,6 +585,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       skillTrainRunId: this.opts.skillTrainRunId,
       hostBin: readOnly ? null : probeEnvFacts().hostBin,
       readOnly,
+      hermeticNoTools,
+      workspaceCwd: cwdDecision.cwd,
     })
     ctx.projection = projection
     log.info('antigravity CLI credential projected', {
@@ -692,41 +695,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       return
     }
 
-    const isolatedEnv = buildCodexEnv()
-    for (const key of Object.keys(isolatedEnv)) {
-      if (key.startsWith('GEMINI_') || key.startsWith('GOOGLE_') || key.startsWith('AGY_') || key.startsWith('CODEX_')) {
-        delete isolatedEnv[key]
-      }
-    }
-    const env: NodeJS.ProcessEnv = {
-      ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway.port),
-      ...isolatedEnv,
-      PATH: antigravitySpawnPath(projection.hostPathDir),
-      HOME: projection.launchHome,
-      XDG_CACHE_HOME: projection.cacheDir,
-      OC_AGENT_ID: this.opts.agentId,
-      OPENCLAUDE_AGENT_ID: this.opts.agentId,
-      ...identityCompatEnvironment(this.opts.identityCompat),
-      OC_SESSION_KEY: this.opts.sessionKey,
-      OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
-      OPENCLAUDE_ENGINE: 'antigravity',
-      OPENCLAUDE_DELEGATION_DEPTH: String(this.opts.delegationDepth ?? 0),
-      ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),
-      OPENCLAUDE_HOME: projection.openClaudeHome,
-      ...(projection.baselineSkillsDir ? { OPENCLAUDE_BASELINE_SKILLS_DIR: projection.baselineSkillsDir } : {}),
-      ...(this.opts.skillEvalExclude ? { OPENCLAUDE_SKILL_EVAL_EXCLUDE: this.opts.skillEvalExclude } : {}),
-      ...(this.opts.skillEvalDraft ? { OPENCLAUDE_SKILL_EVAL_DRAFT_NAME: this.opts.skillEvalDraft.name, OPENCLAUDE_SKILL_EVAL_DRAFT_DIR: this.opts.skillEvalDraft.dir } : {}),
-      ...(projection.delegateContextFile
-        ? {
-            OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port),
-            OPENCLAUDE_DELEGATE_CONTEXT_FILE: projection.delegateContextFile,
-          }
-        : {}),
-      CLOUD_CODE_URL: route.baseUrl,
-      AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
-      ...(readOnly ? { OC_READ_ONLY_TURN: '1' } : {}),
-      ...(this.traceId ? { OPENCLAUDE_TRACE_ID: this.traceId } : {}),
-    }
+    const env = this.buildTurnSpawnEnv(projection, route.baseUrl, readOnly, hermeticNoTools)
     const args = [
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
@@ -791,6 +760,36 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       backfiller?.captureStartOffset()
     }
     this.spawnChild(ctx, { bin, args, env, cwd: cwdDecision.cwd, line })
+  }
+
+  private buildTurnSpawnEnv(
+    projection: AntigravityPlatformProjection,
+    cloudCodeUrl: string,
+    readOnly: boolean,
+    hermeticNoTools: boolean,
+  ): NodeJS.ProcessEnv {
+    const isolatedEnv = buildCodexEnv()
+    const stripPrefixes = ['GEMINI_', 'GOOGLE_', 'AGY_', 'CODEX_', 'OPENCLAUDE_TOOL_BROKER_', 'OC_TOOL_BROKER_']
+    for (const key of Object.keys(isolatedEnv)) {
+      if (stripPrefixes.some((p) => key.startsWith(p))) delete isolatedEnv[key]
+    }
+    return {
+      ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway.port),
+      ...isolatedEnv,
+      PATH: antigravitySpawnPath(projection.hostPathDir), HOME: projection.launchHome, XDG_CACHE_HOME: projection.cacheDir,
+      OC_AGENT_ID: this.opts.agentId, OPENCLAUDE_AGENT_ID: this.opts.agentId, ...identityCompatEnvironment(this.opts.identityCompat),
+      OC_SESSION_KEY: this.opts.sessionKey, OPENCLAUDE_SESSION_KEY: this.opts.sessionKey, OPENCLAUDE_ENGINE: 'antigravity',
+      OPENCLAUDE_DELEGATION_DEPTH: String(this.opts.delegationDepth ?? 0), OPENCLAUDE_HOME: projection.openClaudeHome,
+      ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),
+      ...(projection.baselineSkillsDir ? { OPENCLAUDE_BASELINE_SKILLS_DIR: projection.baselineSkillsDir } : {}),
+      ...(this.opts.skillEvalExclude ? { OPENCLAUDE_SKILL_EVAL_EXCLUDE: this.opts.skillEvalExclude } : {}),
+      ...(this.opts.skillEvalDraft ? { OPENCLAUDE_SKILL_EVAL_DRAFT_NAME: this.opts.skillEvalDraft.name, OPENCLAUDE_SKILL_EVAL_DRAFT_DIR: this.opts.skillEvalDraft.dir } : {}),
+      ...(projection.delegateContextFile ? { OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port), OPENCLAUDE_DELEGATE_CONTEXT_FILE: projection.delegateContextFile } : {}),
+      CLOUD_CODE_URL: cloudCodeUrl, AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+      ...(readOnly ? { OC_READ_ONLY_TURN: '1' } : {}),
+      ...(hermeticNoTools ? { OC_HERMETIC_NO_TOOLS: '1' } : {}),
+      ...(this.traceId ? { OPENCLAUDE_TRACE_ID: this.traceId } : {}),
+    }
   }
 
   private ensureSwarmWatcher(ctx: TurnContext, conversationId: string): void {
@@ -1785,15 +1784,12 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         ctx.workspaceCwd,
       )
     }
+    projection.revokeTurnTokens?.()
     cleanupAntigravityLaunch(projection, opts)
   }
 
-  /** Per-turn timer: an earlier turn's late `close` must not stop the
-   * liveness signal of the turn that replaced it. */
   private ensureKeepalive(ctx: TurnContext): void {
     if (ctx.keepalive) return
-    // The CLI can think for minutes with no stdout; a live process keeps the
-    // session's idle watchdog from killing it.
     ctx.keepalive = setInterval(() => {
       if (this.active !== ctx || ctx.terminal || ctx.abandoned || !ctx.proc || ctx.proc.exitCode !== null) {
         this.stopKeepalive(ctx)
@@ -1801,16 +1797,12 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       }
       this.lastActivityAt = Date.now()
       this.emit('activity')
-      // CLI stdout and browser WS may both be idle during a long native tool.
-      // Renew only this live execution; metadata is not our liveness proof.
       if (!ctx.interrupted && !ctx.procClosed && ctx.routeToken && !ctx.routeRenewBusy &&
           Date.now() - ctx.routeRenewAt >= (timingTestHooks?.routeRenewMs ?? 60_000)) {
         ctx.routeRenewAt = Date.now()
         ctx.routeRenewBusy = true
         void (timingTestHooks?.renewRoute ?? renewAntigravityRouteLease)(ctx.routeToken)
-          .catch(() => log.warn('antigravity route heartbeat unavailable', {
-            sessionKey: this.opts.sessionKey, traceId: ctx.params.traceId,
-          }))
+          .catch(() => log.warn('antigravity route heartbeat unavailable', { sessionKey: this.opts.sessionKey, traceId: ctx.params.traceId }))
           .finally(() => { ctx.routeRenewBusy = false })
       }
     }, timingTestHooks?.keepaliveMs ?? KEEPALIVE_INTERVAL_MS)

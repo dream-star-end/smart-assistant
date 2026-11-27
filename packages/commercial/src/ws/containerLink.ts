@@ -1,14 +1,8 @@
 import { recordContainerLinkGap, type LinkDispatch } from "./containerLinkRecoveryStore.js";
 import { containerLinkGap, containerLinkSendEvents } from "../admin/metrics.js";
 import { ContainerLinkHello, extractHelloPeerTargets } from "./containerLinkHello.js";
-/**
- * Master owns one physical WS per (uid, containerId). Bridge handles retain
- * their existing authorization and billing closures; each incoming frame has
- * exactly one handler. Browser detach does not dispose an open turn's handler.
- * This adapter is deliberately temporary until browser ingress moves out of
- * userChatBridge. No billing journal or container protocol is migrated here.
- */
 import { ContainerLinkExecutors } from "./bridgeExecutorRegistration.js";
+import { ContainerLinkBrokerTap, attachContainerLinkExecEnvHandle, createContainerLinkFrameLinkOpener, isToolBrokerBridgeEnabled, type AttachContainerLinkExecEnvHandleDeps, type ContainerLinkBrokerLinkLike, type ContainerLinkExecEnvHandle, type ToolBrokerFlavorIdentityLike } from "./containerLinkToolBroker.js";
 import { EventEmitter } from "node:events";
 import { WebSocket, type RawData } from "ws";
 import { getDispatchByLogicalKey, type Queryable } from "../dispatch/turnDispatchStore.js";
@@ -186,12 +180,13 @@ export class ContainerLinkHandle extends EventEmitter {
   }
 }
 
-class ContainerLink {
+class ContainerLink implements ContainerLinkBrokerLinkLike {
   ws: WebSocket | null = null;
   stopping = false;
   readonly ready: Promise<void>;
   readonly consumers = new Set<ContainerLinkHandle>();
   readonly executors = new ContainerLinkExecutors();
+  readonly brokerTap = new ContainerLinkBrokerTap();
   transportAliveAt = 0;
   private readonly abort = new AbortController();
   private readonly routes = new Map<string, ContainerLinkHandle>();
@@ -490,40 +485,21 @@ class ContainerLink {
       settled = true;
       clearQueueTimer();
       releaseBytesOnce();
-      const waitedMs = Date.now() - enqueuedAt;
       containerLinkSendEvents.inc({ outcome: "queue_timeout" });
       this.registry.log?.warn?.("container-link: queued frame expired before wire send", {
-        uid: String(this.uid),
-        containerId: this.containerId,
-        session: frameSession,
-        frameType: frame?.type,
-        waitedMs,
+        uid: String(this.uid), containerId: this.containerId, session: frameSession, frameType: frame?.type, waitedMs: Date.now() - enqueuedAt,
       });
       cb?.(new Error("container link send queue timeout"));
     };
-    queueTimer = setTimeout(() => {
-      queueTimer = null;
-      failExpiredOnce();
-    }, this.registry.sendQueueTimeoutMs);
-
+    queueTimer = setTimeout(() => { queueTimer = null; failExpiredOnce(); }, this.registry.sendQueueTimeoutMs);
     const work = prior.then(async () => {
       if (settled) return;
-      if (Date.now() >= queueDeadlineAt) {
-        failExpiredOnce();
-        return;
-      }
+      if (Date.now() >= queueDeadlineAt) { failExpiredOnce(); return; }
       clearQueueTimer();
-      if (this.stopping || handle.disposed) {
-        settled = true;
-        cb?.(new Error("container link closed"));
-        return;
-      }
+      if (this.stopping || handle.disposed) { settled = true; cb?.(new Error("container link closed")); return; }
       if (frameSession !== null && handle.failedHelloSessions.has(frameSession)) {
-        settled = true;
-        cb?.(new Error("container link hello failed"));
-        return;
+        settled = true; cb?.(new Error("container link hello failed")); return;
       }
-      // Mark settled before invoking physical ws.send so queue timeout can never race wire write.
       settled = true;
       await new Promise<void>((resolve, reject) => {
         this.ws!.send(data, opts ?? {}, (error) => error ? reject(error) : resolve());
@@ -531,12 +507,9 @@ class ContainerLink {
       finishWireSend();
     }).catch((error: Error) => {
       if (!settled) settled = true;
-      clearQueueTimer();
-      cb?.(error);
-      this.transportFailed(error);
+      clearQueueTimer(); cb?.(error); this.transportFailed(error);
     }).finally(() => {
-      clearQueueTimer();
-      releaseBytesOnce();
+      clearQueueTimer(); releaseBytesOnce();
       if (this.sessionSending.get(queueKey) === work) this.sessionSending.delete(queueKey);
     });
     this.sessionSending.set(queueKey, work);
@@ -563,44 +536,47 @@ class ContainerLink {
     });
     this.receiving = work;
   }
+  isOpen(): boolean { return !this.stopping && this.ws?.readyState === WebSocket.OPEN; }
+  sendBrokerRaw(raw: string): void {
+    if (this.stopping || this.ws?.readyState !== WebSocket.OPEN) throw new Error("container link closed");
+    this.ws.send(raw);
+  }
+  private interceptBrokerFrame(data: RawData, frame: Record<string, unknown> | null): boolean {
+    if (!this.registry.toolBrokerEnabled || !frame) return false;
+    return this.brokerTap.interceptInboundData(Buffer.isBuffer(data) ? data.toString("utf8") : String(data), frame);
+  }
+  private resolveDeliveryOwner(frame: ReturnType<typeof parse>): ContainerLinkHandle | undefined {
+    const session = frame?.peer?.id ?? frame?.sessionId ?? frame?.owner?.clientSessionId ?? frame?.owner?.peer?.id ?? frame?.sessionKey;
+    const cmid = frame?.clientMessageId;
+    let owner = typeof frame?.grantId === "string" ? this.routes.get(`grant:${frame.grantId}`) : undefined;
+    owner ??= typeof frame?.dispatchId === "string" ? this.routes.get(`dispatch:${frame.dispatchId}:${frame.attemptNo}`) : undefined;
+    owner ??= typeof frame?.requestId === "string" ? this.routes.get(`request:${frame.requestId}`) : undefined;
+    if (!owner && typeof session === "string" && typeof cmid === "string") owner = this.routes.get(`stream:${streamKey(session, cmid)}`);
+    owner ??= typeof session === "string" ? this.sessions.get(session) : undefined;
+    return owner ?? [...this.consumers].find((h) => h.active && !h.detached) ?? [...this.consumers].find((h) => h.active);
+  }
   private deliver(data: RawData, binary: boolean): void {
     if (this.stopping) return;
     this.transportAliveAt = Date.now();
     const frame = parse(data, binary);
+    if (this.interceptBrokerFrame(data, frame)) return;
     if (frame?.type === CONTAINER_ATTEST_FRAME_TYPE) {
       this.attest = data;
-      for (const handle of this.consumers) {
-        if (handle.active && handle.opened) handle.emit("message", data, binary);
-      }
+      for (const handle of this.consumers) if (handle.active && handle.opened) handle.emit("message", data, binary);
       return;
     }
     if (frame?.type === "pong") {
       for (const handle of this.consumers) {
         const pending = handle.pendingPing;
         if (!pending || pending.wireId !== frame.id) continue;
-        const { originalId } = pending;
         handle.pendingPing = null;
-        const restored = { ...frame, id: originalId };
-        handle.emit("message", Buffer.from(JSON.stringify(restored)), false);
+        handle.emit("message", Buffer.from(JSON.stringify({ ...frame, id: pending.originalId })), false);
         return;
       }
       return;
     }
-    const session = frame?.peer?.id ?? frame?.sessionId ?? frame?.owner?.clientSessionId ?? frame?.owner?.peer?.id ?? frame?.sessionKey;
-    const cmid = frame?.clientMessageId;
-    let owner = typeof frame?.grantId === "string" ? this.routes.get(`grant:${frame.grantId}`) : undefined;
-    owner ??= typeof frame?.dispatchId === "string" ? this.routes.get(`dispatch:${frame.dispatchId}:${frame.attemptNo}`) : undefined;
-    owner ??= typeof frame?.requestId === "string" ? this.routes.get(`request:${frame.requestId}`) : undefined;
-    if (!owner && typeof session === "string" && typeof cmid === "string") {
-      owner = this.routes.get(`stream:${streamKey(session, cmid)}`);
-    }
-    owner ??= typeof session === "string" ? this.sessions.get(session) : undefined;
-    owner ??= [...this.consumers].find((h) => h.active && !h.detached);
-    owner ??= [...this.consumers].find((h) => h.active);
-    if (owner?.active && !owner.disposed) {
-      owner.emit("message", data, binary);
-      return;
-    }
+    const owner = this.resolveDeliveryOwner(frame);
+    if (owner?.active && !owner.disposed) { owner.emit("message", data, binary); return; }
     this.queuedBytes += Buffer.byteLength(Buffer.isBuffer(data) ? data : String(data));
     if (this.queuedBytes > this.registry.maxBufferedBytes) { this.stop(); return; }
     this.queued.push({ data, binary });
@@ -694,13 +670,12 @@ class ContainerLink {
   stop(error?: Error): void {
     if (this.stopping) return;
     this.stopping = true;
+    this.brokerTap.dispose(error ? error.message : "container_link_stopped");
     this.executors.close();
     this.unmountTransport?.();
     this.unmountTransport = null;
     if (this.timer) clearInterval(this.timer);
     this.abort.abort();
-    // Preserve error-before-close: bridge cleanup keeps live Grok route leases
-    // on transport errors, whereas an explicit container close is terminal.
     if (error) {
       for (const handle of [...this.consumers]) {
         if (handle.listenerCount("error") > 0) handle.emit("error", error);
@@ -738,16 +713,15 @@ export class ContainerLinkRegistry {
   readonly helloPrepareTimeoutMs: number;
   readonly sendQueueTimeoutMs: number;
   readonly admittedRenewMaxAgeMs: number;
+  readonly toolBrokerEnabled: boolean;
+  private readonly brokerRuntimeChannel?: string;
   constructor(
     readonly pool: Queryable,
     readonly log?: Log | null,
     opts?: {
-      heartbeatMs?: number;
-      maxBufferedBytes?: number;
-      dialTimeoutMs?: number;
-      helloPrepareTimeoutMs?: number;
-      sendQueueTimeoutMs?: number;
-      admittedRenewMaxAgeMs?: number;
+      heartbeatMs?: number; maxBufferedBytes?: number; dialTimeoutMs?: number;
+      helloPrepareTimeoutMs?: number; sendQueueTimeoutMs?: number; admittedRenewMaxAgeMs?: number;
+      toolBrokerEnabled?: boolean; flavorIdentity?: ToolBrokerFlavorIdentityLike | null; runtimeChannel?: string;
     },
   ) {
     this.dialTimeoutMs = opts?.dialTimeoutMs ?? 5000;
@@ -756,6 +730,8 @@ export class ContainerLinkRegistry {
     this.helloPrepareTimeoutMs = opts?.helloPrepareTimeoutMs ?? CONTAINER_LINK_HELLO_PREPARE_TIMEOUT_MS;
     this.sendQueueTimeoutMs = opts?.sendQueueTimeoutMs ?? CONTAINER_LINK_SEND_QUEUE_TIMEOUT_MS;
     this.admittedRenewMaxAgeMs = opts?.admittedRenewMaxAgeMs ?? CONTAINER_LINK_ADMITTED_RENEW_MAX_AGE_MS;
+    this.brokerRuntimeChannel = opts?.runtimeChannel ?? (opts?.toolBrokerEnabled === true ? "v5" : undefined);
+    this.toolBrokerEnabled = opts?.toolBrokerEnabled ?? isToolBrokerBridgeEnabled({ flavorIdentity: opts?.flavorIdentity, runtimeChannel: this.brokerRuntimeChannel });
   }
   connect(uid: bigint, cid: number, create: (signal: AbortSignal) => WebSocket | Promise<WebSocket>): Promise<WebSocket> {
     return this.attach(uid, cid, create);
@@ -798,26 +774,27 @@ export class ContainerLinkRegistry {
     const transport = this.links.get(`${uid}:${containerId}`)?.transport;
     return transport?.readyState === WebSocket.OPEN ? transport : null;
   }
+  getActiveBrokerLink(uid: bigint, containerId: number): ContainerLinkBrokerLinkLike | null {
+    if (!this.toolBrokerEnabled) return null;
+    const link = this.links.get(`${uid}:${containerId}`);
+    return link?.isOpen() ? link : null;
+  }
+  createBrokerFrameLinkOpener() { return createContainerLinkFrameLinkOpener(this, { selfhostEnabled: this.toolBrokerEnabled, ...(this.brokerRuntimeChannel ? { runtimeChannel: this.brokerRuntimeChannel } : {}) }); }
+  attachExecEnvHandle(input: Omit<AttachContainerLinkExecEnvHandleDeps, "registry">): ContainerLinkExecEnvHandle {
+    return attachContainerLinkExecEnvHandle({ ...input, registry: this, selfhostEnabled: input.selfhostEnabled ?? this.toolBrokerEnabled, ...(this.brokerRuntimeChannel && !input.runtimeChannel ? { runtimeChannel: this.brokerRuntimeChannel } : {}) });
+  }
   retainKeepAliveConsumer(uid: bigint, containerId: number): boolean {
     const link = this.links.get(`${uid}:${containerId}`);
-    if (!link || link.stopping || link.ws?.readyState !== WebSocket.OPEN) return false;
+    if (!link || !link.isOpen()) return false;
     for (const handle of link.consumers) {
-      if (handle.active && !handle.disposed) {
-        handle.keepAlive = true;
-        return true;
-      }
+      if (handle.active && !handle.disposed) { handle.keepAlive = true; return true; }
     }
     return false;
   }
-  /** Release recovery/detached handles on leader step-down via handoff semantics (linkShutdown),
-   * never synthesizing container_close / transport death that would revoke surviving Grok leases. */
   releaseInactiveLinks(): void {
     for (const link of [...this.links.values()]) {
       for (const handle of [...link.consumers]) {
-        if (handle.recoveryOnly || handle.detached) {
-          handle.emit("linkShutdown");
-          link.release(handle);
-        }
+        if (handle.recoveryOnly || handle.detached) { handle.emit("linkShutdown"); link.release(handle); }
       }
     }
   }

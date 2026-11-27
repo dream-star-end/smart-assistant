@@ -12,20 +12,17 @@ import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import type { Pool } from 'pg'
 import {
-  REMOTE_DRIVER_BACKEND,
-  REMOTE_DRIVER_PROTOCOL_VERSION,
   assertLeaseMatchesAuthority,
   normalizeUsageWithPolicy,
   sameRemoteExecutionBackend,
-  validateRemoteReceiptV4,
   validateUsagePolicy,
   verifyAuthority,
   verifyTurnLease,
   zeroCountersForUsagePolicy,
   type AuthorityKeyring,
-  type RemoteDriverAuthorityEngine,
   type RemoteDriverUsagePolicy,
   type RemoteReceiptV4,
+  type TurnReceiptV5,
 } from '@openclaude/protocol'
 import {
   assertRemotePoolBinding,
@@ -35,7 +32,6 @@ import {
   type RemotePoolFinanceTurn,
 } from '@openclaude/gateway/remote-pool'
 import type { Cc5FinanceTerminalOutcome } from '@openclaude/gateway/cc5-finance'
-import { loadRemoteDriverRegistry } from '../account-pool/remotePool/registry.js'
 import type { UserModelAuthzLoader } from '../auth/userModelAuthz.js'
 import { loadSettledUsageAttribution } from '../db/pgSessionsBackend.js'
 import {
@@ -65,12 +61,27 @@ import {
   type BillingAuthorityStamp,
 } from './proxyBilling.js'
 import {
+  buildRemoteDriverTurnReceiptV5,
+  driverReceiptStamp,
+  isOptionalRemoteDriverServiceTier,
+  matchesDriverSnapshotStamps,
+  persistJournalReceiptV4AndV5,
+  prepareRemoteDriverDispatchInput,
+  resolveRemoteDriverServiceTier,
+  scopeFromBinding,
+  validateContextV4Input,
+  validateContextV4TurnReceiptV5,
+  validateDriverReceiptForScope,
+  type RemoteDriverScopeV4,
+} from './remoteDriverReceiptV5.js'
+import {
   CODEX_REMOTE_BILLING_RECOVERY_VERSION,
   REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION,
   REMOTE_NATIVE_BILLING_RECOVERY_VERSION,
 } from './remoteNativeBillingIdentity.js'
 
 export { REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION } from './remoteNativeBillingIdentity.js'
+export type { RemoteDriverScopeV4 } from './remoteDriverReceiptV5.js'
 
 const REMOTE_DRIVER_RESERVATION_CREDITS = 100n
 const UUID_RE = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/
@@ -87,31 +98,6 @@ function need(condition: unknown, code = 'REMOTE_DRIVER_BILLING_REJECTED'): asse
 function asObject(value: unknown, code = 'REMOTE_DRIVER_BILLING_REJECTED'): Record<string, unknown> {
   need(value && typeof value === 'object' && !Array.isArray(value), code)
   return value as Record<string, unknown>
-}
-
-export interface RemoteDriverScopeV4 {
-  readonly version: 4
-  readonly backendKind: typeof REMOTE_DRIVER_BACKEND
-  readonly operationId: string
-  readonly runId: string
-  readonly uid: string
-  readonly containerDbId: string
-  readonly dockerId: string
-  readonly sessionKey: string
-  readonly canonicalModel: string
-  readonly upstreamModel: string
-  readonly driverId: string
-  readonly engineId: string
-  readonly authorityEngine: RemoteDriverAuthorityEngine
-  readonly driverVersion: string
-  readonly driverDigest: string
-  readonly coreDigest: string
-  readonly probeFingerprint: string
-  readonly manifestSha256: string
-  readonly generation: string
-  readonly profileId: string
-  readonly authEpoch: string
-  readonly expiresAt: number
 }
 
 interface RemoteDriverJournalContextV4 {
@@ -136,13 +122,15 @@ interface RemoteDriverJournalContextV4 {
     securityEpoch: string
   }
   usagePolicy: RemoteDriverUsagePolicy
+  serviceTier?: 'standard' | 'fast' | 'ultrafast'
   hostStartAttempted: boolean
-  input: { sequence: number; inputSha256: string } | null
+  input: { sequence: number; inputSha256: string; serviceTier?: 'standard' | 'fast' | 'ultrafast' } | null
   native?: {
     sessionId: string
     baseline: Record<string, number> | null
   }
   receipt: RemoteReceiptV4 | null
+  turnReceiptV5?: TurnReceiptV5
   reserved: boolean
   reservedCredits: string
 }
@@ -162,83 +150,6 @@ export interface RemoteDriverFinanceFixtures {
   reserve?: typeof preCheckWithCost
   release?: typeof releasePreCheck
   settle?: typeof settleUsageAndLedger
-}
-
-function scopeFromBinding(
-  binding: Readonly<RemotePoolBinding>,
-  registryPath?: string,
-  verifyCurrentRegistry = true,
-): RemoteDriverScopeV4 {
-  assertRemotePoolBinding(binding)
-  if (verifyCurrentRegistry) {
-    const regMap = loadRemoteDriverRegistry(registryPath)
-    const reg = regMap.get(binding.driverId)
-    need(
-      reg &&
-        reg.engineId === binding.engineId &&
-        reg.authorityEngine === binding.authorityEngine &&
-        reg.driverVersion === binding.driverVersion &&
-        reg.driverDigest === binding.driverDigest &&
-        reg.coreDigest === binding.coreDigest,
-      'REMOTE_DRIVER_REGISTRY_DIGEST_MISMATCH',
-    )
-  }
-  return {
-    version: REMOTE_DRIVER_PROTOCOL_VERSION,
-    backendKind: REMOTE_DRIVER_BACKEND,
-    operationId: binding.operationId,
-    runId: binding.runId,
-    uid: binding.uid,
-    containerDbId: binding.containerDbId,
-    dockerId: binding.dockerId,
-    sessionKey: binding.sessionKey,
-    canonicalModel: binding.canonicalModel,
-    upstreamModel: binding.upstreamModel,
-    driverId: binding.driverId,
-    engineId: binding.engineId,
-    authorityEngine: binding.authorityEngine,
-    driverVersion: binding.driverVersion,
-    driverDigest: binding.driverDigest,
-    coreDigest: binding.coreDigest,
-    probeFingerprint: binding.probeFingerprint,
-    manifestSha256: binding.manifestSha256,
-    generation: binding.generation,
-    profileId: binding.profileId,
-    authEpoch: binding.authEpoch,
-    expiresAt: binding.expiresAt,
-  }
-}
-
-function validateDriverReceiptForScope(
-  raw: unknown,
-  scope: RemoteDriverScopeV4,
-  policy: RemoteDriverUsagePolicy,
-): RemoteReceiptV4 {
-  const r = validateRemoteReceiptV4(raw, policy)
-  need(
-    r.engineId === scope.engineId &&
-      r.driverId === scope.driverId &&
-      r.driverVersion === scope.driverVersion &&
-      r.driverDigest === scope.driverDigest &&
-      r.uid === scope.uid &&
-      r.containerDbId === scope.containerDbId &&
-      r.dockerId === scope.dockerId &&
-      r.operationId === scope.operationId &&
-      r.runId === scope.runId &&
-      r.sessionKey === scope.sessionKey &&
-      r.canonicalModel === scope.canonicalModel &&
-      r.upstreamModel === scope.upstreamModel &&
-      r.profileId === scope.profileId &&
-      r.authEpoch === scope.authEpoch &&
-      r.usageSemantics === policy.semanticsId &&
-      r.usageMode === policy.mode &&
-      r.provenance.generation === scope.generation &&
-      r.provenance.manifestHash === scope.manifestSha256 &&
-      r.provenance.coreDigest === scope.coreDigest &&
-      r.provenance.probeFingerprint === scope.probeFingerprint,
-    'REMOTE_RECEIPT_V4_SCOPE_MISMATCH',
-  )
-  return r
 }
 
 function parseContextV4(raw: unknown): RemoteDriverJournalContextV4 {
@@ -271,6 +182,7 @@ function parseContextV4(raw: unknown): RemoteDriverJournalContextV4 {
         (typeof c.delegateAgentId === 'string' && c.delegateAgentId.length <= 128)) &&
       typeof c.billingRevision === 'string' &&
       c.billingRevision.length > 0 &&
+      isOptionalRemoteDriverServiceTier(c.serviceTier) &&
       typeof c.hostStartAttempted === 'boolean' &&
       typeof c.reserved === 'boolean' &&
       typeof c.reservedCredits === 'string' &&
@@ -278,11 +190,9 @@ function parseContextV4(raw: unknown): RemoteDriverJournalContextV4 {
       BigInt(c.reservedCredits) <= REMOTE_DRIVER_RESERVATION_CREDITS,
   )
   const s = asObject(c.scope)
-  const scope = scopeFromBinding(
-    { ...(s as unknown as RemotePoolBinding), capability: '0'.repeat(64) },
-    undefined,
-    false,
-  )
+  const bindingCandidate = { ...(s as unknown as RemotePoolBinding), capability: '0'.repeat(64) }
+  assertRemotePoolBinding(bindingCandidate)
+  const scope = scopeFromBinding(bindingCandidate, undefined, false)
   const usagePolicy = validateUsagePolicy(c.usagePolicy)
   need(parseBillingPricing(c.pricing, scope.canonicalModel))
   const a = asObject(c.authority)
@@ -294,16 +204,7 @@ function parseContextV4(raw: unknown): RemoteDriverJournalContextV4 {
       typeof a.securityEpoch === 'string' &&
       /^\d+$/.test(a.securityEpoch),
   )
-  if (c.input !== null) {
-    const i = asObject(c.input)
-    need(
-      typeof i.sequence === 'number' &&
-        Number.isSafeInteger(i.sequence) &&
-        i.sequence > 0 &&
-        typeof i.inputSha256 === 'string' &&
-        HASH_RE.test(i.inputSha256),
-    )
-  }
+  if (c.input !== null) validateContextV4Input(c.input)
   if (c.native !== undefined) {
     const n = asObject(c.native)
     need(typeof n.sessionId === 'string' && IDENT_RE.test(n.sessionId))
@@ -318,21 +219,36 @@ function parseContextV4(raw: unknown): RemoteDriverJournalContextV4 {
       need(n.baseline === null)
     }
   }
+  let validatedReceipt: RemoteReceiptV4 | null = null
   if (c.receipt !== null) {
-    const r = validateDriverReceiptForScope(c.receipt, scope, usagePolicy)
+    validatedReceipt = validateDriverReceiptForScope(c.receipt, scope, usagePolicy)
     need(
-      r.authorityTurnId === c.authorityTurnId &&
-        r.turnKey === c.turnKey &&
-        r.requestId === c.requestId &&
+      validatedReceipt.authorityTurnId === c.authorityTurnId &&
+        validatedReceipt.turnKey === c.turnKey &&
+        validatedReceipt.requestId === c.requestId &&
         c.native !== undefined &&
-        r.nativeSessionId === (c.native as RemoteDriverJournalContextV4['native'])!.sessionId &&
+        validatedReceipt.nativeSessionId === (c.native as RemoteDriverJournalContextV4['native'])!.sessionId &&
         isDeepStrictEqual(
-          r.countersBaseline,
+          validatedReceipt.countersBaseline,
           (c.native as RemoteDriverJournalContextV4['native'])!.baseline,
         ),
     )
   }
+  validateContextV4TurnReceiptV5(c.turnReceiptV5, scope, validatedReceipt)
   return structuredClone(raw) as RemoteDriverJournalContextV4
+}
+
+function durableServiceTierOf(
+  c: RemoteDriverJournalContextV4,
+  receipt?: RemoteReceiptV4 | null,
+): 'standard' | 'fast' | 'ultrafast' {
+  return resolveRemoteDriverServiceTier({
+    inputTier: c.input?.serviceTier,
+    contextTier: c.serviceTier,
+    pricingTier: Reflect.get(c.pricing, 'serviceTier'),
+    scopeTier: Reflect.get(c.scope, 'serviceTier'),
+    receiptTier: receipt ? Reflect.get(receipt, 'serviceTier') : undefined,
+  })
 }
 
 function reservationHandle(c: RemoteDriverJournalContextV4): ReservationHandle {
@@ -351,32 +267,6 @@ async function releaseSoftReservation(
     try {
       log.warn('remote_driver_v4_precheck_release_failed', { requestId: c.requestId })
     } catch {}
-  }
-}
-
-function driverReceiptStamp(c: RemoteDriverJournalContextV4) {
-  const r = c.receipt!
-  return {
-    version: 4,
-    backendKind: r.backendKind,
-    engineId: r.engineId,
-    driverId: r.driverId,
-    driverVersion: r.driverVersion,
-    driverDigest: r.driverDigest,
-    operationId: r.operationId,
-    runId: r.runId,
-    nativeSessionId: r.nativeSessionId,
-    terminalId: r.terminalId,
-    authorityTurnId: r.authorityTurnId,
-    turnKey: r.turnKey,
-    usageSemantics: r.usageSemantics,
-    usageMode: r.usageMode,
-    countersBaseline: r.countersBaseline,
-    countersFinal: r.countersFinal,
-    rawEvidenceDigest: r.rawEvidenceDigest,
-    semanticDigest: r.semanticDigest,
-    receiptDigest: r.receiptDigest,
-    provenance: r.provenance,
   }
 }
 
@@ -459,7 +349,7 @@ async function readProofV4(pool: Pool, c: RemoteDriverJournalContextV4): Promise
       row.output_tokens === String(u.outputTokens) &&
       row.cache_read_tokens === String(u.cacheReadTokens) &&
       row.cache_write_tokens === String(u.cacheWriteTokens) &&
-      isDeepStrictEqual(row.price_snapshot.remote_native, driverReceiptStamp(c)),
+      matchesDriverSnapshotStamps(row.price_snapshot, c.receipt, c.turnReceiptV5),
   )
   const p = c.pricing
   for (const [key, value] of Object.entries({
@@ -708,7 +598,8 @@ async function persistDriverReceiptV4(
   pool: Pool,
   c: RemoteDriverJournalContextV4,
   r: RemoteReceiptV4,
-): Promise<void> {
+  turnReceiptV5?: TurnReceiptV5,
+): Promise<TurnReceiptV5 | undefined> {
   need(
     c.native &&
       c.native.sessionId === r.nativeSessionId &&
@@ -802,21 +693,16 @@ async function persistDriverReceiptV4(
       )
     }
 
-    const saved = await client.query(
-      `UPDATE request_finalize_journal
-          SET ctx = jsonb_set(ctx, '{remoteDriverV4,receipt}', $4::jsonb),
-              updated_at = NOW()
-        WHERE request_id = $1
-          AND user_id = $2
-          AND ctx->>'remoteNativeBillingRecovery' = $3
-          AND state = 'inflight'
-          AND ctx#>>'{remoteDriverV4,hostStartAttempted}' = 'true'
-          AND ctx#>'{remoteDriverV4,input}' <> 'null'::jsonb
-          AND (ctx#>'{remoteDriverV4,receipt}' = 'null'::jsonb OR ctx#>'{remoteDriverV4,receipt}' = $4::jsonb)`,
-      [c.requestId, c.scope.uid, REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION, JSON.stringify(r)],
-    )
-    need(saved.rowCount === 1, 'REMOTE_RECEIPT_CONFLICT')
+    const authoritativeV5 = await persistJournalReceiptV4AndV5(client, {
+      requestId: c.requestId,
+      scope: c.scope,
+      recoveryVersion: REMOTE_DRIVER_V4_BILLING_RECOVERY_VERSION,
+      receipt: r,
+      serviceTier: durableServiceTierOf(c, r),
+      turnReceiptV5,
+    })
     await client.query('COMMIT')
+    return authoritativeV5
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {})
     throw err
@@ -851,7 +737,8 @@ async function settleDriverReceiptV4(
     usage,
     snapshotJson: JSON.stringify({
       ...calculated.snapshot,
-      remote_native: driverReceiptStamp(c),
+      remote_native: driverReceiptStamp(c.receipt),
+      ...(c.turnReceiptV5 ? { turn_receipt_v5: c.turnReceiptV5 } : {}),
       ...(noOutput ? { waived: 'no_output', wouldHaveCharged: calculated.cost_credits.toString() } : {}),
     }),
     costCredits: cost,
@@ -890,6 +777,39 @@ function rememberBounded(set: Set<string>, key: string): void {
   set.add(key)
 }
 
+async function runTerminalReceiptSettlement(params: {
+  readonly deps: RemoteDriverTurnFinanceDeps
+  readonly c: RemoteDriverJournalContextV4
+  readonly receipt: RemoteReceiptV4
+  readonly receiptV5: TurnReceiptV5
+  readonly settle: typeof settleUsageAndLedger
+  readonly release: typeof releasePreCheck
+  readonly releaseActive: () => void
+}): Promise<Cc5FinanceTerminalOutcome> {
+  const { deps, c, receipt, receiptV5, settle, release, releaseActive } = params
+  try {
+    const authoritativeV5 = await persistDriverReceiptV4(deps.pool, c, receipt, receiptV5)
+    if (authoritativeV5) c.turnReceiptV5 = authoritativeV5
+    if (await settleDriverReceiptV4(deps.pool, c, settle)) {
+      await releaseSoftReservation(deps.preCheckRedis, c, deps.log, release)
+      releaseActive()
+      return { state: 'proven' as const, requestId: c.requestId }
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message === 'REMOTE_RECEIPT_CONFLICT') {
+      throw err
+    }
+    try {
+      if (await proveAndRepairV4(deps.pool, c)) {
+        await releaseSoftReservation(deps.preCheckRedis, c, deps.log, release)
+        releaseActive()
+        return { state: 'proven' as const, requestId: c.requestId }
+      }
+    } catch {}
+  }
+  return { state: 'pending' as const }
+}
+
 export function createRemoteDriverTurnFinance(
   deps: RemoteDriverTurnFinanceDeps,
   fixtures: RemoteDriverFinanceFixtures = {},
@@ -905,6 +825,7 @@ export function createRemoteDriverTurnFinance(
 
   return {
     async admit(input): Promise<RemotePoolFinanceTurn> {
+      assertRemotePoolBinding(input.binding)
       const scope = scopeFromBinding(input.binding, deps.registryPath, true)
       const usagePolicy = validateUsagePolicy(input.usagePolicy)
       need(
@@ -1252,21 +1173,19 @@ export function createRemoteDriverTurnFinance(
                 hostAttempted &&
                 c.hostStartAttempted &&
                 c.native !== undefined &&
-                !inputAttempted &&
-                Number.isSafeInteger(value.sequence) &&
-                value.sequence > 0 &&
-                HASH_RE.test(value.inputSha256),
+                !inputAttempted,
             )
+            const persistedInput = prepareRemoteDriverDispatchInput(value)
             inputAttempted = true
             await fence()
             const row = await scopedUpdate(
               'dispatch-input',
               'input',
-              value,
+              persistedInput,
               "AND ctx#>>'{remoteDriverV4,hostStartAttempted}' = 'true' AND ctx#>'{remoteDriverV4,input}' = 'null'::jsonb",
             )
             need(row.rowCount === 1)
-            c.input = structuredClone(value)
+            c.input = structuredClone(persistedInput)
           },
           terminal(rawReceipt) {
             const receipt = validateDriverReceiptForScope(rawReceipt, scope, usagePolicy)
@@ -1277,33 +1196,25 @@ export function createRemoteDriverTurnFinance(
               'REMOTE_RECEIPT_TURN_IDENTITY_MISMATCH',
             )
             need(hostAttempted && inputAttempted && c.input && c.native)
-            if (c.receipt) {
-              need(isDeepStrictEqual(c.receipt, receipt), 'REMOTE_RECEIPT_CONFLICT')
-            }
+            if (c.receipt) need(isDeepStrictEqual(c.receipt, receipt), 'REMOTE_RECEIPT_CONFLICT')
             if (finish) return finish
             c.receipt = receipt
-            finish = (async () => {
-              try {
-                await persistDriverReceiptV4(deps.pool, c, receipt)
-                if (await settleDriverReceiptV4(deps.pool, c, settle)) {
-                  await releaseSoftReservation(deps.preCheckRedis, c, deps.log, release)
-                  releaseActive()
-                  return { state: 'proven' as const, requestId: c.requestId }
-                }
-              } catch (err) {
-                if (err instanceof Error && err.message === 'REMOTE_RECEIPT_CONFLICT') {
-                  throw err
-                }
-                try {
-                  if (await proveAndRepairV4(deps.pool, c)) {
-                    await releaseSoftReservation(deps.preCheckRedis, c, deps.log, release)
-                    releaseActive()
-                    return { state: 'proven' as const, requestId: c.requestId }
-                  }
-                } catch {}
-              }
-              return { state: 'pending' as const }
-            })()
+            const receiptV5 = buildRemoteDriverTurnReceiptV5({
+              scope,
+              receiptV4: receipt,
+              serviceTier: durableServiceTierOf(c, receipt),
+              finalizedAt: new Date(now()).toISOString(),
+            })
+            c.turnReceiptV5 = receiptV5
+            finish = runTerminalReceiptSettlement({
+              deps,
+              c,
+              receipt,
+              receiptV5,
+              settle,
+              release,
+              releaseActive,
+            })
             return finish
           },
           async abandonUndispatched(cause?: { failureCode: 'INTERNAL_ERROR'; diagnostic: string }) {
@@ -1422,6 +1333,7 @@ async function importDriverV4Spool(
   pool: Pool,
   c: RemoteDriverJournalContextV4,
   root: string,
+  now: () => number = Date.now,
 ): Promise<void> {
   if (c.receipt || !c.native || !c.input || !c.hostStartAttempted) return
   need(UUID_RE.test(c.scope.operationId) && /^[1-9][0-9]{0,15}$/.test(c.scope.generation))
@@ -1462,8 +1374,15 @@ async function importDriverV4Spool(
     ) {
       continue
     }
-    await persistDriverReceiptV4(pool, c, r)
+    const v5 = buildRemoteDriverTurnReceiptV5({
+      scope: c.scope,
+      receiptV4: r,
+      serviceTier: durableServiceTierOf(c, r),
+      finalizedAt: new Date(now()).toISOString(),
+    })
+    const authoritativeV5 = await persistDriverReceiptV4(pool, c, r, v5)
     c.receipt = r
+    c.turnReceiptV5 = authoritativeV5 ?? v5
     return
   }
 }
@@ -1638,19 +1557,22 @@ async function abortDeadNullReceiptDriverV4Turn(
   return Number(res.rows[0]?.aborted_count ?? 0) === 1
 }
 
+interface RecoverRemoteDriverTurnBillingOptions {
+  limit?: number
+  settle?: typeof settleUsageAndLedger
+  evidenceRoot?: string
+  nullReceiptGraceMs?: number
+  now?: () => number
+  preloadedRows?: Array<JournalRow & { request_id: string; user_id: string }>
+}
+
 /**
  * Durable-receipt-only crash recovery for `remote-driver-v4` journals.
  * Never opens an SSH/model port or re-executes a turn.
  */
 export async function recoverRemoteDriverTurnBilling(
   deps: Pick<RemoteDriverTurnFinanceDeps, 'pool' | 'preCheckRedis' | 'log'>,
-  options: {
-    limit?: number
-    settle?: typeof settleUsageAndLedger
-    evidenceRoot?: string
-    nullReceiptGraceMs?: number
-    preloadedRows?: Array<JournalRow & { request_id: string; user_id: string }>
-  } = {},
+  options: RecoverRemoteDriverTurnBillingOptions = {},
 ): Promise<{ proven: number; pending: number }> {
   const limit = Math.min(100, Math.max(1, Math.floor(options.limit ?? 25)))
   const evidenceRoot = options.evidenceRoot ?? '/var/lib/openclaude/remote-native'
@@ -1685,7 +1607,7 @@ export async function recoverRemoteDriverTurnBilling(
     try {
       const c = parseContextV4(row.ctx.remoteDriverV4)
       need(c.requestId === row.request_id && c.scope.uid === row.user_id)
-      await importDriverV4Spool(deps.pool, c, evidenceRoot)
+      await importDriverV4Spool(deps.pool, c, evidenceRoot, options.now)
       if (
         !c.receipt &&
         (await abortDeadNullReceiptDriverV4Turn(

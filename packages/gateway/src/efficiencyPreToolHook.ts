@@ -16,6 +16,7 @@
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ActionPolicyEvaluation } from '@openclaude/protocol'
+import { scrubToolBrokerEnv } from '@openclaude/protocol/exec-env'
 import {
   auditEfficiencyEscape,
   evaluateShellForHook,
@@ -124,6 +125,65 @@ export function formatCursorHookResponse(decision: HookDecision): Record<string,
   return formatCursorAllow()
 }
 
+export interface ToolBrokerHookEvalRequest {
+  readonly toolName: string
+  readonly arguments: Readonly<Record<string, unknown>>
+  readonly command?: string
+  readonly target?: string
+  readonly mainModel?: string
+  readonly guardMode: GuardMode
+}
+
+export interface ToolBrokerHookEvalResponse {
+  readonly decision: 'allow' | 'deny'
+  readonly code?: string
+  readonly reason?: string
+  readonly message?: string
+  readonly approvalStatus?: 'not_required' | 'approved' | 'denied' | 'detached_pending'
+}
+
+export { scrubToolBrokerEnv }
+
+export function formatBrokerHookDecision(
+  protocol: HookProtocol,
+  result: ToolBrokerHookEvalResponse,
+): Record<string, unknown> {
+  if (result.decision === 'allow') {
+    if (protocol === 'cursor') {
+      return result.message ? { permission: 'allow', agent_message: result.message } : formatCursorAllow()
+    }
+    if (result.message) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'allow',
+          additionalContext: result.message,
+        },
+      }
+    }
+    return formatCcbAllow()
+  }
+  const reason = result.reason || result.code || 'Blocked by ToolBroker policy'
+  if (protocol === 'cursor') {
+    return {
+      permission: 'deny',
+      ...(result.approvalStatus === 'detached_pending' || result.code === 'APPROVAL_DEFERRED_DETACHED'
+        ? { requiresHumanApproval: true }
+        : {}),
+      agent_message: reason,
+      user_message: reason,
+    }
+  }
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: reason,
+    },
+    reason,
+  }
+}
+
 export interface PreToolHookActionPolicyOptions {
   /** Override whether action-policy evaluation runs (defaults to OPENCLAUDE_ACTION_POLICY env). */
   actionPolicyEnabled?: boolean
@@ -134,6 +194,8 @@ export interface PreToolHookActionPolicyOptions {
   mainModel?: string
   /** Strong-model read-only pre-review hook. */
   aiReviewHook?: AiReviewHook
+  /** Optional live ToolBroker evaluator; when provided, delegates before offline fallback. */
+  brokerEvaluate?: (req: ToolBrokerHookEvalRequest) => Promise<ToolBrokerHookEvalResponse>
 }
 
 function extractToolName(input: Record<string, unknown>): string {
@@ -243,6 +305,127 @@ export function formatActionPolicyFailClosed(
   )
 }
 
+async function tryEvaluatePreToolViaBroker(
+  input: Record<string, unknown>,
+  command: string,
+  toolName: string,
+  protocol: HookProtocol,
+  mode: GuardMode,
+  policyEnabled: boolean,
+  options: PreToolHookActionPolicyOptions,
+): Promise<Record<string, unknown> | null> {
+  if (!options.brokerEvaluate) return null
+  const toolInputObj =
+    input.tool_input && typeof input.tool_input === 'object' && !Array.isArray(input.tool_input)
+      ? (input.tool_input as Record<string, unknown>)
+      : command
+        ? { command }
+        : {}
+  const target = extractTarget(input)
+  try {
+    const brokerResult = await options.brokerEvaluate({
+      toolName,
+      arguments: toolInputObj,
+      ...(command ? { command } : {}),
+      ...(target ? { target } : {}),
+      ...(options.mainModel
+        ? { mainModel: options.mainModel }
+        : typeof input.model === 'string'
+          ? { mainModel: input.model }
+          : {}),
+      guardMode: mode,
+    })
+    return formatBrokerHookDecision(protocol, brokerResult)
+  } catch (err) {
+    if (policyEnabled) {
+      const msg = err instanceof Error ? err.message : String(err)
+      return formatActionPolicyFailClosed(
+        protocol,
+        `ToolBroker hook evaluation failed (fail-closed): ${msg}`,
+      )
+    }
+    return null
+  }
+}
+
+async function evaluateHookActionPolicySafe(
+  input: Record<string, unknown>,
+  toolName: string,
+  command: string,
+  options: PreToolHookActionPolicyOptions,
+): Promise<{ readonly evaluation: ActionPolicyEvaluation; readonly clean: boolean }> {
+  const toolInputObj =
+    input.tool_input && typeof input.tool_input === 'object' && !Array.isArray(input.tool_input)
+      ? (input.tool_input as Record<string, unknown>)
+      : undefined
+  try {
+    const evaluation = await evaluateActionPolicy(
+      {
+        toolName,
+        command: command || undefined,
+        target: extractTarget(input),
+        args: toolInputObj,
+        mainModel:
+          options.mainModel ??
+          (typeof input.model === 'string' ? input.model : process.env.OPENCLAUDE_MAIN_MODEL),
+        sessionKey: typeof input.session_key === 'string' ? input.session_key : undefined,
+      },
+      {
+        loaded: options.loadedPolicy,
+        policyPath: options.policyPath,
+        mainModel: options.mainModel,
+        aiReviewHook: options.aiReviewHook,
+      },
+    )
+    return { evaluation, clean: true }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return {
+      clean: false,
+      evaluation: {
+        tier: 'human_approval',
+        initialTier: 'human_approval',
+        matchedRuleId: null,
+        category: null,
+        reason: `Action policy evaluation failed (fail-closed): ${msg}`,
+      },
+    }
+  }
+}
+
+async function resolveCombinedPreToolDecision(
+  protocol: HookProtocol,
+  mode: GuardMode,
+  command: string,
+  shellTool: boolean,
+  policyEvaluation: ActionPolicyEvaluation | null,
+  effDecision: HookDecision | null,
+): Promise<Record<string, unknown>> {
+  // 1. Hard deny from either guard wins immediately (combine reasons if both flagged).
+  if (policyEvaluation?.tier === 'deny') {
+    return formatActionPolicyHookResponse(protocol, policyEvaluation, effDecision?.message) ?? formatAllow(protocol)
+  }
+  if (effDecision?.decision === 'deny') {
+    const combinedMessage =
+      policyEvaluation && policyEvaluation.tier !== 'allow'
+        ? `${effDecision.message ?? 'Blocked by efficiency guard'}\n[action-policy] ${policyEvaluation.reason}`
+        : effDecision.message
+    const merged: HookDecision = { ...effDecision, message: combinedMessage ?? null }
+    return protocol === 'cursor' ? formatCursorHookResponse(merged) : formatCcbHookResponse(merged)
+  }
+  // 2. Non-allow action-policy (`human_approval` / escalated `ai_review`) wins over warn/allow.
+  if (policyEvaluation && policyEvaluation.tier !== 'allow') {
+    return (
+      formatActionPolicyHookResponse(protocol, policyEvaluation, effDecision?.message) ??
+      formatActionPolicyFailClosed(protocol, policyEvaluation.reason)
+    )
+  }
+  // 3. Action-policy allowed: fall through to efficiency guard (or allow for non-shell tools).
+  if (!shellTool || !effDecision) return formatAllow(protocol)
+  if (effDecision.escaped) await auditEfficiencyEscape(command, { protocol, mode })
+  return protocol === 'cursor' ? formatCursorHookResponse(effDecision) : formatCcbHookResponse(effDecision)
+}
+
 export async function handlePreToolHookInput(
   raw: unknown,
   protocol: HookProtocol,
@@ -266,9 +449,7 @@ export async function handlePreToolHookInput(
     const command = extractShellCommand(input)
     const toolName = extractToolName(input)
     const hasActionablePayload =
-      typeof input.tool_name === 'string' ||
-      typeof input.tool === 'string' ||
-      command.length > 0
+      typeof input.tool_name === 'string' || typeof input.tool === 'string' || command.length > 0
 
     if (policyEnabled && !hasActionablePayload) {
       return formatActionPolicyFailClosed(
@@ -277,46 +458,17 @@ export async function handlePreToolHookInput(
       )
     }
 
-    // Evaluate both action-policy and efficiency guard, then take the STRICTER decision:
-    //   deny > ask (human_approval) > allow+warn > allow
-    // This ensures an existing efficiency `deny` is NEVER downgraded/masked by a policy `ask`.
+    const brokerOut = hasActionablePayload
+      ? await tryEvaluatePreToolViaBroker(input, command, toolName, protocol, mode, policyEnabled, options)
+      : null
+    if (brokerOut) return brokerOut
+
     let policyEvaluation: ActionPolicyEvaluation | null = null
     if (policyEnabled && hasActionablePayload) {
-      const toolInputObj =
-        input.tool_input && typeof input.tool_input === 'object' && !Array.isArray(input.tool_input)
-          ? (input.tool_input as Record<string, unknown>)
-          : undefined
-      try {
-        policyEvaluation = await evaluateActionPolicy(
-          {
-            toolName,
-            command: command || undefined,
-            target: extractTarget(input),
-            args: toolInputObj,
-            mainModel:
-              options.mainModel ??
-              (typeof input.model === 'string' ? input.model : process.env.OPENCLAUDE_MAIN_MODEL),
-            sessionKey: typeof input.session_key === 'string' ? input.session_key : undefined,
-          },
-          {
-            loaded: options.loadedPolicy,
-            policyPath: options.policyPath,
-            mainModel: options.mainModel,
-            aiReviewHook: options.aiReviewHook,
-          },
-        )
-        policyEvaluatedCleanly = true
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        policyEvaluation = {
-          tier: 'human_approval',
-          initialTier: 'human_approval',
-          matchedRuleId: null,
-          category: null,
-          reason: `Action policy evaluation failed (fail-closed): ${msg}`,
-        }
-      }
-    } else if (!policyEnabled || !hasActionablePayload) {
+      const evaluated = await evaluateHookActionPolicySafe(input, toolName, command, options)
+      policyEvaluation = evaluated.evaluation
+      policyEvaluatedCleanly = evaluated.clean
+    } else {
       policyEvaluatedCleanly = true
     }
 
@@ -326,42 +478,18 @@ export async function handlePreToolHookInput(
       try {
         effDecision = evaluateShellForHook(command, mode)
       } catch {
-        // Efficiency guard stays fail-open on its own internal errors without weakening policy.
         effDecision = null
       }
     }
 
-    // 1. Hard deny from either guard wins immediately (combine reasons if both flagged).
-    if (policyEvaluation?.tier === 'deny') {
-      return formatActionPolicyHookResponse(protocol, policyEvaluation, effDecision?.message) ?? formatAllow(protocol)
-    }
-    if (effDecision?.decision === 'deny') {
-      const combinedMessage =
-        policyEvaluation && policyEvaluation.tier !== 'allow'
-          ? `${effDecision.message ?? 'Blocked by efficiency guard'}\n[action-policy] ${policyEvaluation.reason}`
-          : effDecision.message
-      const merged: HookDecision = { ...effDecision, message: combinedMessage ?? null }
-      return protocol === 'cursor' ? formatCursorHookResponse(merged) : formatCcbHookResponse(merged)
-    }
-
-    // 2. Non-allow action-policy (`human_approval` / escalated `ai_review`) wins over warn/allow.
-    if (policyEvaluation && policyEvaluation.tier !== 'allow') {
-      return (
-        formatActionPolicyHookResponse(protocol, policyEvaluation, effDecision?.message) ??
-        formatActionPolicyFailClosed(protocol, policyEvaluation.reason)
-      )
-    }
-
-    // 3. Action-policy allowed: fall through to efficiency guard (or allow for non-shell tools).
-    if (!shellTool || !effDecision) {
-      return formatAllow(protocol)
-    }
-    if (effDecision.escaped) {
-      await auditEfficiencyEscape(command, { protocol, mode })
-    }
-    return protocol === 'cursor'
-      ? formatCursorHookResponse(effDecision)
-      : formatCcbHookResponse(effDecision)
+    return await resolveCombinedPreToolDecision(
+      protocol,
+      mode,
+      command,
+      shellTool,
+      policyEvaluation,
+      effDecision,
+    )
   } catch (err) {
     if (policyEnabled && !policyEvaluatedCleanly) {
       const msg = err instanceof Error ? err.message : String(err)

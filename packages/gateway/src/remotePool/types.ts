@@ -179,7 +179,11 @@ export interface RemotePoolHostPort {
 export interface RemotePoolFinanceTurn {
   readonly requestId: string
   beforeHostStart(): Promise<void>
-  beforeDispatch(input: { readonly sequence: number; readonly inputSha256: string }): Promise<void>
+  beforeDispatch(input: {
+    readonly sequence: number
+    readonly inputSha256: string
+    readonly serviceTier?: 'standard' | 'fast' | 'ultrafast'
+  }): Promise<void>
   bindNativeThread(
     nativeSessionId: string,
     newlyCreated: boolean,
