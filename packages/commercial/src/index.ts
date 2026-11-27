@@ -79,7 +79,7 @@ import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
 import { assertFlavorIdentity } from "./flavor/assertFlavor.js";
-import { shouldStartCommercialScheduler } from "./flavor/commercialSchedulerPolicy.js";
+import { isSelfhostFlavor, shouldStartCommercialScheduler } from "./flavor/commercialSchedulerPolicy.js";
 import { createMasterCc5Runtime } from "./agent-sandbox/cc5Runtime.js";
 import { recoverRemoteNativeTurnBilling } from "./billing/remoteNativeTurnBilling.js";
 import { cursorExternalApiOutboxDirForFlavor } from "./billing/cursorExternalApiOutbox.js";
@@ -2049,7 +2049,7 @@ export async function registerCommercial(
     ratePerMin: (await getSystemSetting("pool_affinity_rate_per_min")).value,
     antigravityInflight: (await getSystemSetting("pool_affinity_antigravity_inflight")).value,
     antigravityRatePerMin: (await getSystemSetting("pool_affinity_antigravity_rate_per_min")).value,
-  }));
+  }), isSelfhostFlavor(flavorIdentity));
   registerPoolAdapter(createGeminiPoolAdapter({
     clientSecret: () => process.env.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET?.trim() ?? "",
   }));
