@@ -1312,23 +1312,55 @@ async function interruptRemoteSwarmForSession(
   }
 }
 
-async function interruptSessionForUserStop(host: WsConnectionHost, sessionKey: string): Promise<boolean> {
-  const selfInterrupted = host.sessions.interrupt(sessionKey, 'user')
-  if (selfInterrupted) host._cancelToolBrokerSession?.(sessionKey, 'user_stop')
-  const delegateInterrupted = host._interruptDelegationsForParent(sessionKey)
-  const swarmInterrupted = await interruptRemoteSwarmForSession(host, sessionKey, 'user_stop')
-  if (selfInterrupted) host._settlePendingPermissionsForStop(sessionKey)
-  return selfInterrupted || delegateInterrupted || swarmInterrupted
+function cancelBrokerIfInterrupted(host: WsConnectionHost, sessionKey: string, hit: boolean): void {
+  if (hit) host._cancelToolBrokerSession?.(sessionKey, 'user_stop')
 }
 
-async function interruptPeerSessionsForUserStop(host: WsConnectionHost, suffix: string): Promise<boolean> {
-  let interrupted = false
+function settlePermissionsIfInterrupted(host: WsConnectionHost, sessionKey: string, hit: boolean): void {
+  if (hit) host._settlePendingPermissionsForStop(sessionKey)
+}
+
+async function handleUnmatchedClientMessageIdStop(
+  host: WsConnectionHost,
+  frame: HandleStopFrame,
+  clientMessageId: string,
+  safePeerId: string,
+  suffix: string,
+): Promise<boolean> {
+  const admittedKey = preStartStopKey(frame.peer.id, clientMessageId)
+  if (host._admittedClientTurns?.has(admittedKey)) {
+    return handlePreStartStop(host, frame, clientMessageId, admittedKey, safePeerId, suffix, {
+      preStartStopKey,
+      isHiddenSystemAgentId,
+      interruptRemoteSwarm: interruptRemoteSwarmForSession,
+    })
+  }
+  host.sessions.fencePreStartStop(
+    frame.peer.id,
+    clientMessageId,
+    PRE_ADMISSION_STOP_TTL_MS,
+    stopControlSendAttempt((frame as { controlId?: unknown }).controlId, clientMessageId),
+  )
+  host.log.info('interrupt', {
+    sessionKey: `*${suffix}`,
+    clientMessageId,
+    ok: false,
+  })
+  return false
+}
+
+async function interruptFallbackPeerSessions(host: WsConnectionHost, suffix: string): Promise<boolean> {
+  let ok = false
   for (const live of host.sessions.list()) {
     if (!live.sessionKey.endsWith(suffix)) continue
-    const hit = await interruptSessionForUserStop(host, live.sessionKey)
-    interrupted = hit || interrupted
+    const fallbackSelf = host.sessions.interrupt(live.sessionKey, 'user')
+    cancelBrokerIfInterrupted(host, live.sessionKey, fallbackSelf)
+    const fallbackDelegates = host._interruptDelegationsForParent(live.sessionKey)
+    const fallbackSwarm = await interruptRemoteSwarmForSession(host, live.sessionKey, 'user_stop')
+    settlePermissionsIfInterrupted(host, live.sessionKey, fallbackSelf)
+    ok = fallbackSelf || fallbackDelegates || fallbackSwarm || ok
   }
-  return interrupted
+  return ok
 }
 
 export async function handleStop(
@@ -1355,48 +1387,31 @@ export async function handleStop(
       if (!live.sessionKey.endsWith(suffix)) continue
       const selfInterrupted = this.sessions.interruptClientTurn(live.sessionKey, clientMessageId)
       if (!selfInterrupted) continue
-      this._cancelToolBrokerSession?.(live.sessionKey, 'user_stop')
+      cancelBrokerIfInterrupted(this, live.sessionKey, true)
       const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
       const swarmInterrupted = await interruptRemoteSwarmForSession(this, live.sessionKey, 'user_stop')
       const ok = selfInterrupted || delegateInterrupted || swarmInterrupted
-      // The turn is gone; any permission it was blocked on must not
-      // outlive it as a dead card (browser) / pending row (master).
       this._settlePendingPermissionsForStop(live.sessionKey, clientMessageId)
       this.log.info('interrupt', { sessionKey: live.sessionKey, clientMessageId, ok })
       return ok
     }
-    // OCV5-435 / OCV5-923: admitted pre-start turn stop (fences queued turn(s) & interrupts older blocking turn on same session).
-    const admittedKey = preStartStopKey(frame.peer.id, clientMessageId)
-    if (this._admittedClientTurns?.has(admittedKey)) {
-      return handlePreStartStop(this, frame, clientMessageId, admittedKey, safePeerId, suffix, {
-        preStartStopKey,
-        isHiddenSystemAgentId,
-        interruptRemoteSwarm: interruptRemoteSwarmForSession,
-      })
-    }
-    // Not admitted here yet: the Stop may have overtaken its own message
-    // (Master acks admission before forwarding it). Arm a short fence for
-    // that send attempt; admission of the same attempt extends it, another
-    // attempt drops it. Nothing is active now, so the receipt stays
-    // TURN_NOT_ACTIVE.
-    this.sessions.fencePreStartStop(
-      frame.peer.id,
-      clientMessageId,
-      PRE_ADMISSION_STOP_TTL_MS,
-      stopControlSendAttempt((frame as { controlId?: unknown }).controlId, clientMessageId),
-    )
-    this.log.info('interrupt', {
-      sessionKey: `*${suffix}`,
-      clientMessageId,
-      ok: false,
-    })
-    return false
+    return handleUnmatchedClientMessageIdStop(this, frame, clientMessageId, safePeerId, suffix)
   }
   if (!sessionKey) {
     if (frame.agentId) {
       sessionKey = `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
     } else {
-      if (await interruptPeerSessionsForUserStop(this, suffix)) {
+      let interrupted = false
+      for (const live of this.sessions.list()) {
+        if (!live.sessionKey.endsWith(suffix)) continue
+        const selfInterrupted = this.sessions.interrupt(live.sessionKey, 'user')
+        cancelBrokerIfInterrupted(this, live.sessionKey, selfInterrupted)
+        const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
+        const swarmInterrupted = await interruptRemoteSwarmForSession(this, live.sessionKey, 'user_stop')
+        settlePermissionsIfInterrupted(this, live.sessionKey, selfInterrupted)
+        interrupted = selfInterrupted || delegateInterrupted || swarmInterrupted || interrupted
+      }
+      if (interrupted) {
         this.log.info('interrupt', { sessionKey: `*${suffix}`, ok: true })
         return true
       }
@@ -1411,12 +1426,14 @@ export async function handleStop(
       sessionKey = routed.sessionKey
     }
   }
-  let ok = await interruptSessionForUserStop(this, sessionKey)
-  // Compatibility containment for already-open clients: if their selector
-  // changed before Stop, the legacy frame names the new agent. Only on a
-  // direct miss do we fall back to the existing peer-wide stop behavior.
+  const selfInterrupted = this.sessions.interrupt(sessionKey, 'user')
+  cancelBrokerIfInterrupted(this, sessionKey, selfInterrupted)
+  const delegateInterrupted = this._interruptDelegationsForParent(sessionKey)
+  const swarmInterrupted = await interruptRemoteSwarmForSession(this, sessionKey, 'user_stop')
+  settlePermissionsIfInterrupted(this, sessionKey, selfInterrupted)
+  let ok = selfInterrupted || delegateInterrupted || swarmInterrupted
   if (!ok && frame.agentId) {
-    ok = (await interruptPeerSessionsForUserStop(this, suffix)) || ok
+    ok = (await interruptFallbackPeerSessions(this, suffix)) || ok
   }
   this.log.info('interrupt', { sessionKey, ok })
   return ok
