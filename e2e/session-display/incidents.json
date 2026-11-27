@@ -2760,7 +2760,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateEngineBillingAdmit.test.ts",
-          "assertion": "(c) glm 委派仍不签 requestId、不调 admit"
+          "assertion": "(c) CCB(deepseek) 委派仍不签 requestId、不调 admit"
         },
         {
           "layer": "unit",
@@ -5429,17 +5429,17 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-grok-cli-compatibility.ts",
-          "assertion": "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.77"
+          "assertion": "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.92"
         },
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-grok-cli-compatibility.ts",
-          "assertion": "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.77"
+          "assertion": "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.92"
         },
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-grok-cli-compatibility.ts",
-          "assertion": "[grok-426-staged-activation] PASS — the staged unit is checked against Grok CLI 1.0.77 before it may start"
+          "assertion": "[grok-426-staged-activation] PASS — the staged unit is checked against Grok CLI 1.0.92 before it may start"
         },
         {
           "layer": "deploy-gate",
@@ -9597,7 +9597,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-delegate-billing-requestid.ts",
-          "assertion": "[delegate-catalog-route] PASS — commercial slugs execute under billed_delegate and selfhost retains every engine"
+          "assertion": "[delegate-catalog-route] PASS — commercial 4-family slugs (incl. Antigravity Gemini) execute under billed_delegate and non-4-family models are rejected"
         }
       ]
     },

@@ -16,14 +16,16 @@ import { describe, it } from 'node:test'
 import { Gateway } from '../server.js'
 import {
   DELEGATE_MAX_CONCURRENT_DELEGATIONS,
+  DELEGATE_MAX_PER_PARENT_DEFAULT,
   delegateConcurrencyCap,
 } from '../delegateCapacity.js'
 
 // 全局上限/保留槽唯一定义: packages/gateway/src/delegateCapacity.ts
-// 非 review 全局上限 = MAX − reserved;review 全局上限 = MAX。per-parent 默认 3(env 可配)。
+// 非 review 全局上限 = MAX − reserved (5);review 全局上限 = MAX (6)。
+// per-parent 默认 DELEGATE_MAX_PER_PARENT_DEFAULT (4,OCV5-895 与 MAX_FANOUT_TASKS=4 对齐,env 可配)。
 const NONREVIEW_GLOBAL_CAP = delegateConcurrencyCap(false)
 const GLOBAL_CAP = DELEGATE_MAX_CONCURRENT_DELEGATIONS
-const PER_PARENT_CAP = 3
+const PER_PARENT_CAP = DELEGATE_MAX_PER_PARENT_DEFAULT
 
 function makeGate(): any {
   const gw = Object.create(Gateway.prototype) as any
@@ -37,11 +39,11 @@ function makeGate(): any {
 describe('delegate 资源闸 — review 保留槽(全局)', () => {
   it('非 review 委派在 (MAX−保留槽) 处被拦,review 委派此时仍可过', () => {
     const gw = makeGate()
-    gw._activeDelegations = NONREVIEW_GLOBAL_CAP // = 4
+    gw._activeDelegations = NONREVIEW_GLOBAL_CAP // = 5
     assert.deepEqual(
       gw._checkDelegateResourceGate({ isReview: false }),
       { kind: 'concurrency' },
-      '非 review 到 4 就该被拦(给 review 留第 5 槽)',
+      '非 review 到 5 就该被拦(给 review 留第 6 槽)',
     )
     assert.equal(
       gw._checkDelegateResourceGate({ isReview: true }),
@@ -52,7 +54,7 @@ describe('delegate 资源闸 — review 保留槽(全局)', () => {
 
   it('review 委派在 MAX 处也被拦', () => {
     const gw = makeGate()
-    gw._activeDelegations = GLOBAL_CAP // = 5
+    gw._activeDelegations = GLOBAL_CAP // = 6
     assert.deepEqual(gw._checkDelegateResourceGate({ isReview: true }), { kind: 'concurrency' })
   })
 })
@@ -60,7 +62,7 @@ describe('delegate 资源闸 — review 保留槽(全局)', () => {
 describe('delegate 资源闸 — per-parent 分桶', () => {
   it('单父非 review 达 per-parent 上限即被拦;review 豁免;他父不受影响', () => {
     const gw = makeGate()
-    gw._activeDelegations = PER_PARENT_CAP // 3,未达非 review 全局 4
+    gw._activeDelegations = PER_PARENT_CAP // 4,未达非 review 全局 5
     gw._runningDelegationsByParent = new Map([['p1', PER_PARENT_CAP]])
     assert.deepEqual(
       gw._checkDelegateResourceGate({ parentBucketKey: 'p1', isReview: false }),

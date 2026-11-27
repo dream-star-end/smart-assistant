@@ -128,20 +128,20 @@ function taskBody(goal: string): Record<string, unknown> {
 }
 
 describe('fan-out 并行委派 — per-parent 分桶消化并发,超桶排队而非拒绝', () => {
-  it('同父 4 路并发:3 个占满桶、第 4 个排队,释放后全部 200(无 429)', async () => {
+  it('同父 5 路并发:4 个占满桶(匹配 MAX_FANOUT_TASKS=4)、第 5 个排队,释放后全部 200(无 429)', async () => {
     process.env.OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS = '5000'
     const gw = makeGateway()
-    // 一次并行派发 4 个独立子任务(模拟 delegate_tasks 的 Promise.all)。
-    const pending = [0, 1, 2, 3].map((i) => delegate(gw, taskBody(`子任务 ${i}`)))
-    // 让前 3 个过闸占满 per-parent 桶(3),第 4 个进排队。
+    // 一次并行派发 5 个独立子任务:前 4 个并发运行(不饿死 4 路扇出),第 5 个进排队。
+    const pending = [0, 1, 2, 3, 4].map((i) => delegate(gw, taskBody(`子任务 ${i}`)))
+    // 让前 4 个过闸占满 per-parent 桶(4),第 5 个进排队。
     await sleep(80)
     assert.equal(
       gw._runningDelegationsByParent.get(PARENT_KEY),
-      3,
-      'per-parent 桶应恰好占满 3(不超发)',
+      4,
+      'per-parent 桶应恰好占满 4(不超发且放行完整 4 路扇出)',
     )
-    assert.equal(gw._delegateQueueWaiters?.size, 1, '第 4 个应在排队,而不是被拒绝')
-    // 放行:前 3 个收尾释放槽 → 第 4 个被唤醒过闸执行。
+    assert.equal(gw._delegateQueueWaiters?.size, 1, '第 5 个应在排队,而不是被拒绝')
+    // 放行:前 4 个收尾释放槽 → 第 5 个被唤醒过闸执行。
     gw._releaseHold()
     const results = await Promise.all(pending)
     for (const [i, r] of results.entries()) {

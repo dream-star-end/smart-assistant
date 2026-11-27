@@ -22,6 +22,7 @@ import {
   type RemoteCcTarget,
 } from '@openclaude/gateway/cc5-container-runtime'
 import { codexExecutionReady, projectCodexRemoteCapabilities, parseCodexExecutionSnapshot, codexManifestHash } from './codexRemoteProfile.js'
+import { assertLegacyTrackNotRetiredTx } from './remotePool/legacyRetirementRuntime.js'
 import type { CodexLaneSpec } from '@openclaude/gateway/cc5-container-runtime'
 import { getPool } from '../db/index.js'
 import { query, type QueryRunner } from '../db/queries.js'
@@ -905,9 +906,8 @@ export async function placeRemoteLane(
   const engine = input.engine === 'codex' ? 'codex' : 'cc'
   const client = await pool.connect()
   try {
-    await client.query('BEGIN')
+    await client.query('BEGIN'); await assertLegacyTrackNotRetiredTx(client, 'placement')
     await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, [`remote-chat:${input.uid}:${input.sessionKey}`])
-    // Unknown is occupied. Neither timeout nor a lost process PID proves release.
     const busy = await client.query(`SELECT operation_id FROM remote_agent_bindings
       WHERE uid=$1 AND session_key=$2 AND state<>'released' LIMIT 1`, [input.uid,input.sessionKey])
     if (busy.rows.length) throw new Error('REMOTE_LANE_STOP_UNPROVEN')
@@ -1894,31 +1894,9 @@ export async function publishRemoteModelOffers(
           : engine === 'antigravity'
             ? 1048576
             : 200000
-      const baseSupportedEfforts = Array.isArray(baseCatRow?.capability_profile?.reasoning?.supported)
-        ? (baseCatRow!.capability_profile!.reasoning.supported as string[])
-        : Array.isArray(probedModel?.supportedEfforts)
-          ? (probedModel!.supportedEfforts as string[])
-          : null
-
-      // A remote cc chat is a text-only interactive session on the node: no image input and no
-      // effort control reach its CLI; its native context lives there (box-native-v1).
-      const capabilityProfile = engine === 'codex' ? projectCodexRemoteCapabilities(profile, upstreamModelId) : {
-        supports_vision: catalogEngine !== 'grok' && catalogEngine !== 'ccb' && catalogEngine !== 'antigravity',
-        reasoning: {
-          supported:
-            catalogEngine === 'codex'
-              ? ['low', 'medium', 'high']
-              : catalogEngine === 'antigravity'
-                ? (baseSupportedEfforts ?? ['low', 'medium', 'high'])
-                : [],
-          codex_model_default: catalogEngine === 'codex' ? 'medium' : null,
-        },
-        ccb: {
-          capability_zero: catalogEngine === 'ccb',
-          supports_thinking: catalogEngine !== 'ccb' && catalogEngine !== 'antigravity',
-          ...(catalogEngine === 'ccb' ? { context_owner: 'box-native-v1' } : {}),
-        },
-      }
+      const capabilityProfile = engine === 'codex'
+        ? projectCodexRemoteCapabilities(profile, upstreamModelId)
+        : computeRemoteCapabilityProfileFromProbe({ catalogEngine, baseCapabilityProfile: baseCatRow?.capability_profile, probedModel })
 
       await client.query(`SELECT set_config('openclaude.catalog_sync', '1', true)`)
       await client.query(
@@ -2401,4 +2379,23 @@ export function createRemoteBrainPoolAdapter(): PoolAdapter {
 
 export function registerRemoteBrainPoolAdapter(): void {
   registerPoolAdapter(createRemoteBrainPoolAdapter())
+}
+
+const NO_DEFAULT_VISION_CATALOG_ENGINES = new Set(['grok', 'ccb', 'antigravity'])
+const NO_DEFAULT_THINKING_CATALOG_ENGINES = new Set(['ccb', 'antigravity'])
+export function computeRemoteCapabilityProfileFromProbe(input: {
+  readonly catalogEngine: string; readonly baseCapabilityProfile?: Record<string, any> | null; readonly probedModel?: Record<string, any> | null
+}) {
+  const { catalogEngine, baseCapabilityProfile, probedModel } = input
+  const baseEfforts = Array.isArray(baseCapabilityProfile?.reasoning?.supported) ? (baseCapabilityProfile!.reasoning.supported as string[]) : null
+  const probedEfforts = Array.isArray(probedModel?.supportedEfforts) ? (probedModel!.supportedEfforts as string[]) : null
+  const resolvedEfforts = baseEfforts && probedEfforts ? baseEfforts.filter((e) => probedEfforts.includes(e)) : (baseEfforts ?? probedEfforts)
+  const isCcb = catalogEngine === 'ccb', isCodex = catalogEngine === 'codex'
+  const supportsVision = probedModel?.supportsVision === true ? baseCapabilityProfile?.supports_vision !== false : !NO_DEFAULT_VISION_CATALOG_ENGINES.has(catalogEngine)
+  const supportsThinking = probedModel?.supportsAdaptiveThinking === true ? baseCapabilityProfile?.ccb?.supports_thinking !== false : !NO_DEFAULT_THINKING_CATALOG_ENGINES.has(catalogEngine)
+  return {
+    supports_vision: supportsVision,
+    reasoning: { supported: isCodex ? ['low', 'medium', 'high'] : catalogEngine === 'antigravity' ? (resolvedEfforts ?? ['low', 'medium', 'high']) : (resolvedEfforts ?? []), codex_model_default: isCodex ? 'medium' : null },
+    ccb: { capability_zero: isCcb, supports_thinking: supportsThinking, ...(isCcb ? { context_owner: 'box-native-v1' } : {}) },
+  }
 }

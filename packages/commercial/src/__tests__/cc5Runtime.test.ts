@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -11,7 +11,16 @@ import {
   RemoteReleaseDrainCoordinator,
   startRemoteReleaseDrainSocketServer,
 } from '../account-pool/remotePool/index.js'
-import { createMasterCc5Runtime, selectMasterCc5Backend } from '../agent-sandbox/cc5Runtime.js'
+import {
+  createMasterCc5Runtime,
+  probeMasterCc5RemoteRelayReadiness,
+  readMigratedRemoteRelayState,
+  selectMasterCc5Backend,
+} from '../agent-sandbox/cc5Runtime.js'
+import type {
+  ExternalRemoteLaneRuntimePort,
+  RemoteRelayHealthStatus,
+} from '../agent-sandbox/remoteRelayClient.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -363,4 +372,524 @@ cleanup_cutover_unit_snap
     await sockHandle.close()
     rmSync(sockDir, { recursive: true, force: true })
   }
+})
+
+test('createMasterCc5Runtime external mode uses external client without financeFactory or in-process drain socket', () => {
+  const sockDir = mkdtempSync('/tmp/oc-v4ext-nodrain-')
+  const drainSockPath = join(sockDir, 'should-not-exist.sock')
+  try {
+    let seenOpts: { socketPath: string; secret: string } | undefined
+    let inProcessCreates = 0
+    const fakeExternal = {
+      remoteRelayMode: 'external' as const,
+      socketPath: '/tmp/custom-relay.sock',
+      probeHealth: async () => null,
+    } as unknown as ExternalRemoteLaneRuntimePort
+
+    const rt = createMasterCc5Runtime(
+      {
+        selfhost: true,
+        authorityReady: true,
+        env: {
+          ...env,
+          OC_REMOTE_RELAY_MODE: 'external',
+          OC_REMOTE_RELAY_SOCKET: '/tmp/custom-relay.sock',
+          OC_REMOTE_V4_DRAIN_SOCKET: drainSockPath,
+        },
+        egressSecret: 'external-secret-1',
+      },
+      {
+        create: () => {
+          inProcessCreates++
+          throw new Error('must not create in-process runtime in external mode')
+        },
+        createExternalClient: (opts) => {
+          seenOpts = opts
+          return fakeExternal
+        },
+      },
+    )
+
+    assert.equal(rt, fakeExternal)
+    assert.deepEqual(seenOpts, {
+      socketPath: '/tmp/custom-relay.sock',
+      secret: 'external-secret-1',
+    })
+    assert.equal(inProcessCreates, 0)
+    assert.equal(existsSync(drainSockPath), false)
+  } finally {
+    rmSync(sockDir, { recursive: true, force: true })
+  }
+})
+
+test('createMasterCc5Runtime external mode fails closed without secret and never falls back to in-process', () => {
+  let inProcessCreates = 0
+  let externalCreates = 0
+  let rejected = 0
+
+  const rt = createMasterCc5Runtime(
+    {
+      selfhost: true,
+      authorityReady: true,
+      env: { ...env, OC_REMOTE_RELAY_MODE: 'external' },
+      financeFactory,
+    },
+    {
+      create: () => {
+        inProcessCreates++
+        throw new Error('must not fall back to in-process')
+      },
+      createExternalClient: () => {
+        externalCreates++
+        throw new Error('must not construct client without secret')
+      },
+      rejected: () => {
+        rejected++
+      },
+    },
+  )
+
+  assert.equal(rt, undefined)
+  assert.equal(rejected, 1)
+  assert.equal(inProcessCreates, 0)
+  assert.equal(externalCreates, 0)
+
+  // selfhost/authority gate still applies in external mode
+  for (const gated of [
+    { selfhost: false, authorityReady: true, env: { ...env, OC_REMOTE_RELAY_MODE: 'external' }, egressSecret: 's' },
+    { selfhost: true, authorityReady: false, env: { ...env, OC_REMOTE_RELAY_MODE: 'external' }, egressSecret: 's' },
+  ]) {
+    assert.equal(
+      createMasterCc5Runtime(gated, {
+        createExternalClient: () => {
+          externalCreates++
+          throw new Error('must not create when gated off')
+        },
+      }),
+      undefined,
+    )
+  }
+  assert.equal(externalCreates, 0)
+})
+
+test('createMasterCc5Runtime auto mode selects external when available and falls back to in-process otherwise', () => {
+  const sockDir = mkdtempSync('/tmp/oc-v4auto-mode-')
+  const absentRelaySock = join(sockDir, 'absent-relay.sock')
+  const absentStateFile = join(sockDir, 'absent-state.json')
+  const drainSockPath = join(sockDir, 'no-drain-in-auto-ext.sock')
+  try {
+    const fakeExternal = {
+      remoteRelayMode: 'external' as const,
+      socketPath: '/run/openclaude-v5-selfhost/remote-relay-active.sock',
+      probeHealth: async () => null,
+    } as unknown as ExternalRemoteLaneRuntimePort
+    const fakeInProcess = {} as RemoteLaneRuntimePort
+
+    // 1. auto + secret + external client available -> external (no financeFactory needed, no drain socket)
+    let inProcessCalls = 0
+    let externalCalls = 0
+    const extRt = createMasterCc5Runtime(
+      {
+        selfhost: true,
+        authorityReady: true,
+        env: {
+          ...env,
+          OC_REMOTE_RELAY_MODE: 'auto',
+          OC_REMOTE_RELAY_STATE_FILE: absentStateFile,
+          OC_EGRESS_SECRET: 'auto-secret',
+          OC_REMOTE_V4_DRAIN_SOCKET: drainSockPath,
+        },
+      },
+      {
+        create: () => {
+          inProcessCalls++
+          return fakeInProcess
+        },
+        createExternalClient: () => {
+          externalCalls++
+          return fakeExternal
+        },
+      },
+    )
+    assert.equal(extRt, fakeExternal)
+    assert.equal(externalCalls, 1)
+    assert.equal(inProcessCalls, 0)
+    assert.equal(existsSync(drainSockPath), false)
+
+    // 2. auto + secret + absent socket & absent state file (unmigrated legacy host) -> falls back to in-process
+    const fallbackNoSock = createMasterCc5Runtime(
+      {
+        selfhost: true,
+        authorityReady: true,
+        env: {
+          ...env,
+          OC_REMOTE_RELAY_MODE: 'auto',
+          OC_REMOTE_RELAY_SOCKET: absentRelaySock,
+          OC_REMOTE_RELAY_STATE_FILE: absentStateFile,
+          OC_EGRESS_SECRET: 'auto-secret',
+          OC_REMOTE_V4_DRAIN_SOCKET: 'none',
+        },
+        financeFactory,
+      },
+      {
+        create: () => {
+          inProcessCalls++
+          return fakeInProcess
+        },
+      },
+    )
+    assert.equal(fallbackNoSock, fakeInProcess)
+    assert.equal(inProcessCalls, 1)
+
+    // 3. auto + missing secret + absent state file -> falls back to in-process
+    const fallbackNoSecret = createMasterCc5Runtime(
+      {
+        selfhost: true,
+        authorityReady: true,
+        env: {
+          ...env,
+          OC_REMOTE_RELAY_MODE: 'auto',
+          OC_REMOTE_RELAY_SOCKET: absentRelaySock,
+          OC_REMOTE_RELAY_STATE_FILE: absentStateFile,
+          OC_REMOTE_V4_DRAIN_SOCKET: 'none',
+        },
+        financeFactory,
+      },
+      {
+        create: () => {
+          inProcessCalls++
+          return fakeInProcess
+        },
+        createExternalClient: () => {
+          externalCalls++
+          return fakeExternal
+        },
+      },
+    )
+    assert.equal(fallbackNoSecret, fakeInProcess)
+    assert.equal(inProcessCalls, 2)
+    assert.equal(externalCalls, 1)
+
+    // 4. explicit inprocess mode ignores external client even with secret
+    const explicitInProcess = createMasterCc5Runtime(
+      {
+        selfhost: true,
+        authorityReady: true,
+        env: {
+          ...env,
+          OC_REMOTE_RELAY_MODE: 'inprocess',
+          OC_REMOTE_RELAY_STATE_FILE: absentStateFile,
+          OC_REMOTE_V4_DRAIN_SOCKET: 'none',
+        },
+        egressSecret: 'secret-ignored-inprocess',
+        financeFactory,
+      },
+      {
+        create: () => {
+          inProcessCalls++
+          return fakeInProcess
+        },
+        createExternalClient: () => {
+          externalCalls++
+          return fakeExternal
+        },
+      },
+    )
+    assert.equal(explicitInProcess, fakeInProcess)
+    assert.equal(inProcessCalls, 3)
+    assert.equal(externalCalls, 1)
+  } finally {
+    rmSync(sockDir, { recursive: true, force: true })
+  }
+})
+
+test('B10: auto mode never falls back to in-process when remote-relay-state.json exists (valid or corrupted)', () => {
+  const dir = mkdtempSync('/tmp/oc-v4auto-b10-')
+  const absentSock = join(dir, 'cold-boot-missing-active.sock')
+  const drainSock = join(dir, 'must-not-spawn-drain.sock')
+  const validState = join(dir, 'valid-state.json')
+  const slotOnlyState = join(dir, 'slot-only-state.json')
+  const corruptState = join(dir, 'corrupt-state.json')
+  const absentState = join(dir, 'does-not-exist.json')
+
+  try {
+    writeFileSync(validState, JSON.stringify({ migrated: true, activeSlot: 'A' }), 'utf8')
+    writeFileSync(slotOnlyState, JSON.stringify({ activeSlot: 'B' }), 'utf8')
+    writeFileSync(corruptState, '{not-valid-json', 'utf8')
+
+    assert.deepEqual(readMigratedRemoteRelayState(absentState), {
+      migrated: false,
+      corrupted: false,
+    })
+    assert.deepEqual(readMigratedRemoteRelayState(validState), {
+      migrated: true,
+      corrupted: false,
+      activeSlot: 'A',
+    })
+    assert.deepEqual(readMigratedRemoteRelayState(slotOnlyState), {
+      migrated: true,
+      corrupted: false,
+      activeSlot: 'B',
+    })
+    assert.deepEqual(readMigratedRemoteRelayState(corruptState), {
+      migrated: true,
+      corrupted: true,
+    })
+
+    // 1. Valid migrated state + absent socket + secret -> returns real external client (no in-process fallback, no drain socket)
+    let inProcessCalls = 0
+    const rtValid = createMasterCc5Runtime(
+      {
+        selfhost: true,
+        authorityReady: true,
+        env: {
+          ...env,
+          OC_REMOTE_RELAY_MODE: 'auto',
+          OC_REMOTE_RELAY_SOCKET: absentSock,
+          OC_REMOTE_RELAY_STATE_FILE: validState,
+          OC_REMOTE_V4_DRAIN_SOCKET: drainSock,
+        },
+        egressSecret: 'b10-secret',
+        financeFactory,
+      },
+      {
+        create: () => {
+          inProcessCalls++
+          throw new Error('B10 violation: must never fall back to in-process')
+        },
+      },
+    )
+    assert.ok(rtValid)
+    assert.equal((rtValid as ExternalRemoteLaneRuntimePort).remoteRelayMode, 'external')
+    assert.equal((rtValid as ExternalRemoteLaneRuntimePort).socketPath, absentSock)
+    assert.equal(inProcessCalls, 0)
+    assert.equal(existsSync(drainSock), false)
+
+    // 2. Corrupted state file + absent socket + secret -> STILL fail-closed to external client (never dual-brain in-process!)
+    const rtCorrupt = createMasterCc5Runtime(
+      {
+        selfhost: true,
+        authorityReady: true,
+        env: {
+          ...env,
+          OC_REMOTE_RELAY_MODE: 'auto',
+          OC_REMOTE_RELAY_SOCKET: absentSock,
+          OC_REMOTE_RELAY_STATE_FILE: corruptState,
+          OC_REMOTE_V4_DRAIN_SOCKET: drainSock,
+        },
+        egressSecret: 'b10-secret',
+        financeFactory,
+      },
+      {
+        create: () => {
+          inProcessCalls++
+          throw new Error('B10 violation: corrupted state must never fall back to in-process')
+        },
+      },
+    )
+    assert.ok(rtCorrupt)
+    assert.equal((rtCorrupt as ExternalRemoteLaneRuntimePort).remoteRelayMode, 'external')
+    assert.equal(inProcessCalls, 0)
+    assert.equal(existsSync(drainSock), false)
+
+    // 3. Valid or corrupted state + absent socket + MISSING secret -> fail-closed undefined + rejected(), never in-process!
+    let rejectedCount = 0
+    for (const sf of [validState, corruptState]) {
+      const rtNoSecret = createMasterCc5Runtime(
+        {
+          selfhost: true,
+          authorityReady: true,
+          env: {
+            ...env,
+            OC_REMOTE_RELAY_MODE: 'auto',
+            OC_REMOTE_RELAY_SOCKET: absentSock,
+            OC_REMOTE_RELAY_STATE_FILE: sf,
+            OC_REMOTE_V4_DRAIN_SOCKET: drainSock,
+          },
+          financeFactory,
+        },
+        {
+          create: () => {
+            inProcessCalls++
+            throw new Error('B10 violation: missing secret on migrated host must fail closed')
+          },
+          rejected: () => {
+            rejectedCount++
+          },
+        },
+      )
+      assert.equal(rtNoSecret, undefined)
+    }
+    assert.equal(rejectedCount, 2)
+    assert.equal(inProcessCalls, 0)
+    assert.equal(existsSync(drainSock), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('probeMasterCc5RemoteRelayReadiness handles in-process, healthy external, disabled, error, draining, and errors fail-closed', async () => {
+  assert.deepEqual(await probeMasterCc5RemoteRelayReadiness(undefined), {
+    external: false,
+    healthy: false,
+    disabled: false,
+    slot: null,
+    instanceId: null,
+    activeCount: 0,
+  })
+  assert.deepEqual(await probeMasterCc5RemoteRelayReadiness({} as RemoteLaneRuntimePort), {
+    external: false,
+    healthy: false,
+    disabled: false,
+    slot: null,
+    instanceId: null,
+    activeCount: 0,
+  })
+
+  type HealthWithRuntimeState = RemoteRelayHealthStatus & {
+    readonly runtimeState?: 'ready' | 'disabled' | 'error'
+  }
+  const makeExt = (
+    probeHealth: (timeoutMs?: number) => Promise<HealthWithRuntimeState | null>,
+  ): ExternalRemoteLaneRuntimePort =>
+    ({
+      remoteRelayMode: 'external' as const,
+      socketPath: '/run/openclaude-v5-selfhost/remote-relay-active.sock',
+      probeHealth,
+    }) as unknown as ExternalRemoteLaneRuntimePort
+
+  assert.deepEqual(
+    await probeMasterCc5RemoteRelayReadiness(
+      makeExt(async () => ({
+        ok: true,
+        role: 'remote-relay',
+        slot: 'B',
+        instanceId: 'rr-b-42',
+        pid: 12345,
+        accepting: true,
+        draining: false,
+        activeRelayCount: 3,
+        registeredRelayCount: 4,
+        unsettledJournals: 0,
+        remoteRuntimeReady: true,
+        runtimeState: 'ready',
+      })),
+    ),
+    {
+      external: true,
+      healthy: true,
+      disabled: false,
+      slot: 'B',
+      instanceId: 'rr-b-42',
+      activeCount: 3,
+    },
+  )
+
+  // B6: intentionally disabled remote-relay must report healthy=false, disabled=true
+  assert.deepEqual(
+    await probeMasterCc5RemoteRelayReadiness(
+      makeExt(async () => ({
+        ok: true,
+        role: 'remote-relay',
+        slot: 'A',
+        instanceId: 'rr-a-disabled',
+        pid: 12345,
+        accepting: false,
+        draining: false,
+        activeRelayCount: 0,
+        registeredRelayCount: 0,
+        unsettledJournals: 0,
+        remoteRuntimeReady: false,
+        runtimeState: 'disabled',
+      })),
+    ),
+    {
+      external: true,
+      healthy: false,
+      disabled: true,
+      slot: 'A',
+      instanceId: 'rr-a-disabled',
+      activeCount: 0,
+    },
+  )
+
+  // B6: runtimeState='error' fails closed even if flags look ready
+  assert.deepEqual(
+    await probeMasterCc5RemoteRelayReadiness(
+      makeExt(async () => ({
+        ok: true,
+        role: 'remote-relay',
+        slot: 'A',
+        instanceId: 'rr-a-err',
+        pid: 12345,
+        accepting: true,
+        draining: false,
+        activeRelayCount: 0,
+        registeredRelayCount: 0,
+        unsettledJournals: 0,
+        remoteRuntimeReady: true,
+        runtimeState: 'error',
+      })),
+    ),
+    {
+      external: true,
+      healthy: false,
+      disabled: false,
+      slot: 'A',
+      instanceId: 'rr-a-err',
+      activeCount: 0,
+    },
+  )
+
+  assert.deepEqual(
+    await probeMasterCc5RemoteRelayReadiness(
+      makeExt(async () => ({
+        ok: true,
+        role: 'remote-relay',
+        slot: 'A',
+        instanceId: 'rr-a-9',
+        pid: 12345,
+        accepting: false,
+        draining: true,
+        activeRelayCount: 1,
+        registeredRelayCount: 1,
+        unsettledJournals: 0,
+        remoteRuntimeReady: true,
+        runtimeState: 'ready',
+      })),
+    ),
+    {
+      external: true,
+      healthy: false,
+      disabled: false,
+      slot: 'A',
+      instanceId: 'rr-a-9',
+      activeCount: 1,
+    },
+  )
+
+  assert.deepEqual(await probeMasterCc5RemoteRelayReadiness(makeExt(async () => null)), {
+    external: true,
+    healthy: false,
+    disabled: false,
+    slot: null,
+    instanceId: null,
+    activeCount: 0,
+  })
+
+  assert.deepEqual(
+    await probeMasterCc5RemoteRelayReadiness(
+      makeExt(async () => {
+        throw new Error('connect ECONNREFUSED')
+      }),
+    ),
+    {
+      external: true,
+      healthy: false,
+      disabled: false,
+      slot: null,
+      instanceId: null,
+      activeCount: 0,
+    },
+  )
 })

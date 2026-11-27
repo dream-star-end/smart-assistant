@@ -18,11 +18,13 @@ import type { OpenClaudeConfig } from '@openclaude/storage'
 import { AntigravityAdapter } from '../engine/antigravityAdapter.js'
 import { renewAntigravityRouteLeaseDetailed } from '../delegateAntigravityRoute.js'
 import {
+  DEFAULT_MAX_CONCURRENT_LOCAL_SWARMS,
   acquireLocalAntigravitySwarmSlot,
   awaitLocalAntigravitySwarmSlotIfActive,
   buildAntigravityDurableBillingEvent,
   cleanupKilledNativeSwarmWorktrees,
   getLocalSwarmConcurrencyStateForTests,
+  parseLocalSwarmConcurrencyCap,
   reapLingeringCliProcessGroup,
   releaseSwarmSlotAfterBoundedReap,
   setLocalSwarmConcurrencyLimitForTests,
@@ -675,6 +677,96 @@ process.stdin.on('end', () => process.exit(0))
         buildAntigravityDurableBillingEvent({ ...base, status: 'success', budgetStop: true, terminalCode: 'AUTH_UNAVAILABLE' }).terminalCode,
         undefined,
       )
+    }
+  })
+
+  test('OCV5-894: default local swarm concurrency is uncapped (0 -> Infinity), while explicit maxConcurrent/parseLocalSwarmConcurrencyCap allows opt-in cap', async () => {
+    const releases: Array<() => void> = []
+    setLocalSwarmConcurrencyLimitForTests(null)
+    try {
+      assert.equal(DEFAULT_MAX_CONCURRENT_LOCAL_SWARMS, 0)
+      assert.equal(parseLocalSwarmConcurrencyCap(undefined), Number.POSITIVE_INFINITY)
+      assert.equal(parseLocalSwarmConcurrencyCap('0'), Number.POSITIVE_INFINITY)
+      assert.equal(parseLocalSwarmConcurrencyCap('unlimited'), Number.POSITIVE_INFINITY)
+      assert.equal(parseLocalSwarmConcurrencyCap('4'), 4)
+
+      // Default uncapped: 6 concurrent swarms acquire immediately with zero queueing
+      assert.equal(getLocalSwarmConcurrencyStateForTests().limit, Number.POSITIVE_INFINITY)
+      for (let i = 0; i < 6; i += 1) {
+        const slot = acquireLocalAntigravitySwarmSlot()
+        assert.equal(slot.waited, false, `slot #${i + 1} must not queue when uncapped`)
+        releases.push(await slot.promise)
+      }
+      assert.deepEqual(getLocalSwarmConcurrencyStateForTests(), {
+        active: 6,
+        queued: 0,
+        limit: Number.POSITIVE_INFINITY,
+      })
+      while (releases.length > 0) releases.pop()!()
+      assert.equal(getLocalSwarmConcurrencyStateForTests().active, 0)
+
+      // Explicit per-call opt-in cap enforces strict FIFO without over-granting on drain
+      const r1 = await acquireLocalAntigravitySwarmSlot({ maxConcurrent: 2 }).promise
+      const r2 = await acquireLocalAntigravitySwarmSlot({ maxConcurrent: 2 }).promise
+      const wakeOrder: number[] = []
+      const q3 = acquireLocalAntigravitySwarmSlot({ maxConcurrent: 2 })
+      const q4 = acquireLocalAntigravitySwarmSlot({ maxConcurrent: 2 })
+      const q5 = acquireLocalAntigravitySwarmSlot({ maxConcurrent: 2 })
+      assert.equal(q3.waited, true)
+      assert.equal(q4.waited, true)
+      assert.equal(q5.waited, true)
+      assert.deepEqual(getLocalSwarmConcurrencyStateForTests(), {
+        active: 2,
+        queued: 3,
+        limit: Number.POSITIVE_INFINITY,
+      })
+
+      let r3: (() => void) | null = null
+      let r5: (() => void) | null = null
+      const p3 = q3.promise.then((rel) => { r3 = rel; wakeOrder.push(3) })
+      const p5 = q5.promise.then((rel) => { r5 = rel; wakeOrder.push(5) })
+
+      // Releasing 1 slot must grant ONLY #3 -> active stays 2, queued becomes 2 (NOT active=4!)
+      r1()
+      await p3
+      assert.deepEqual(wakeOrder, [3])
+      assert.deepEqual(getLocalSwarmConcurrencyStateForTests(), {
+        active: 2,
+        queued: 2,
+        limit: Number.POSITIVE_INFINITY,
+      })
+
+      // Mid-queue cancel of #4 rejects cleanly and leaves #5 next in FIFO
+      q4.cancel()
+      await assert.rejects(() => q4.promise, /ANTIGRAVITY_SWARM_SLOT_CANCELLED/)
+      assert.deepEqual(getLocalSwarmConcurrencyStateForTests(), {
+        active: 2,
+        queued: 1,
+        limit: Number.POSITIVE_INFINITY,
+      })
+
+      // Releasing 2nd slot wakes #5, keeping active=2, queued=0
+      r2()
+      await p5
+      assert.deepEqual(wakeOrder, [3, 5])
+      assert.deepEqual(getLocalSwarmConcurrencyStateForTests(), {
+        active: 2,
+        queued: 0,
+        limit: Number.POSITIVE_INFINITY,
+      })
+
+      ;(r3 as (() => void) | null)?.()
+      ;(r5 as (() => void) | null)?.()
+      assert.deepEqual(getLocalSwarmConcurrencyStateForTests(), {
+        active: 0,
+        queued: 0,
+        limit: Number.POSITIVE_INFINITY,
+      })
+    } finally {
+      while (releases.length > 0) {
+        try { releases.pop()!() } catch { /* ignore */ }
+      }
+      setLocalSwarmConcurrencyLimitForTests(null)
     }
   })
 })

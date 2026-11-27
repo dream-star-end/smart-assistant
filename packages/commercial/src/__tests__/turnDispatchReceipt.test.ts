@@ -3,6 +3,7 @@ import { setImmediate } from 'node:timers/promises'
 import { test } from 'node:test'
 import type { Pool } from 'pg'
 import type { ClaimedRecoveryJob } from '../dispatch/turnRecoveryStore.js'
+import { __resetOpenTurnKeyMemory } from '../billing/openTurnAttribution.js'
 import { handleTurnDispatchReceipt } from '../ws/turnDispatchReceipt.js'
 
 const record = {
@@ -26,7 +27,12 @@ function harness(query: (sql: string, values: unknown[]) => Promise<unknown>, cr
   const frames: unknown[] = []
   const admittedDispatches = new Map([[record.clientMessageId, record]])
   const context = {
-    pool: { query } as unknown as Pool, uid: 3n, admittedDispatches,
+    pool: {
+      query,
+      async connect() {
+        return { query, release() {} }
+      },
+    } as unknown as Pool, uid: 3n, admittedDispatches,
     enrichmentDispatches: new Map<string, { record: typeof record }>(),
     claimEnrichmentTerminalization: () => true,
     acceptEnrichmentReceipt: () => true,
@@ -159,4 +165,90 @@ test('ordinary or malformed frames remain on the normal bridge path', () => {
   for (const raw of [null, '{broken', '{"type":"outbound.message"}', '{"type":"outbound.control.turn_dispatch_receipt"']) {
     assert.equal(handleTurnDispatchReceipt(raw, h.context), false)
   }
+})
+
+test('OCV5-898 follow-up running receipt after queued eviction binds turn_key with verified containerId and skips when containerId is missing', async () => {
+  __resetOpenTurnKeyMemory()
+  const turnKey = 'e'.repeat(64)
+
+  // Missing agentContainerId must NEVER write to PG (BLOCKER 3)
+  const missingContainerQueries: Array<{ sql: string; values: unknown[] }> = []
+  const hMissing = harness(async (sql, values) => {
+    missingContainerQueries.push({ sql, values })
+    return { rows: [], rowCount: 1 }
+  })
+  hMissing.context.admittedDispatches.clear()
+  assert.equal(handleTurnDispatchReceipt(receipt({ state: 'running', turnKey }), hMissing.context), true)
+  await setImmediate()
+  assert.equal(missingContainerQueries.length, 0, 'follow-up receipt without agentContainerId must fail closed')
+
+  // Verified containerId binds under lockTurnBillingKeys with exact clientMessageId without re-emitting browser ack
+  const queries: Array<{ sql: string; values: unknown[] }> = []
+  const h = harness(async (sql, values) => {
+    queries.push({ sql, values })
+    return { rows: [], rowCount: 1 }
+  })
+  h.context.admittedDispatches.clear()
+  ;(h.context as { agentContainerId?: number }).agentContainerId = 7392
+  assert.equal(handleTurnDispatchReceipt(receipt({ state: 'running', turnKey }), h.context), true)
+  await setImmediate()
+  const bindQ = queries.find((q) => q.sql.includes('open-turn:bind-active-dispatch-turn-key'))
+  assert.ok(bindQ, 'verified containerId must run guarded turn_key bind')
+  assert.equal(queries.some((q) => q.sql.includes('pg_advisory_xact_lock')), true, 'bind must acquire lockTurnBillingKeys')
+  assert.deepEqual(bindQ.values, [
+    record.dispatchId,
+    '3',
+    turnKey,
+    '7392',
+    record.attemptNo,
+    record.sessionId,
+    record.clientMessageId,
+  ])
+  assert.deepEqual(h.broadcasts, [], 'follow-up running receipt must not re-broadcast outbound.ack')
+})
+
+test('OCV5-898 initial running receipt with turnKey commits accepted CAS and binds turn_key; missing containerId or rejected receipt never binds', async () => {
+  __resetOpenTurnKeyMemory()
+  const turnKey = 'd'.repeat(64)
+  const queries: Array<{ sql: string; values: unknown[] }> = []
+  const h = harness(async (sql, values) => {
+    queries.push({ sql, values })
+    if (sql.includes("SET status = 'accepted'")) return { rows: [acceptedRow], rowCount: 1 }
+    return { rows: [], rowCount: 1 }
+  })
+  ;(h.context as { agentContainerId?: number }).agentContainerId = 7392
+  assert.equal(handleTurnDispatchReceipt(receipt({ state: 'running', turnKey }), h.context), true)
+  await setImmediate()
+  assert.equal(queries.some((q) => q.sql.includes("SET status = 'accepted'")), true)
+  const bindQ = queries.find((q) => q.sql.includes('open-turn:bind-active-dispatch-turn-key'))
+  assert.ok(bindQ)
+  assert.equal(bindQ.values[2], turnKey)
+  assert.equal(bindQ.values[3], '7392')
+  assert.equal(bindQ.values[6], record.clientMessageId)
+  assert.equal(h.broadcasts.length, 1)
+
+  // Missing containerId on initial receipt still commits accepted CAS but never binds turn_key
+  const noCidQueries: string[] = []
+  const hNoCid = harness(async (sql) => {
+    noCidQueries.push(sql)
+    if (sql.includes("SET status = 'accepted'")) return { rows: [acceptedRow], rowCount: 1 }
+    return { rows: [], rowCount: 1 }
+  })
+  assert.equal(handleTurnDispatchReceipt(receipt({ state: 'running', turnKey: 'c'.repeat(64) }), hNoCid.context), true)
+  await setImmediate()
+  assert.equal(noCidQueries.some((sql) => sql.includes('open-turn:bind-active-dispatch-turn-key')), false)
+
+  // Rejected receipt carrying turnKey must NOT attempt turn_key binding
+  const rejQueries: string[] = []
+  const hRej = harness(async (sql) => {
+    rejQueries.push(sql)
+    return { rows: [acceptedRow], rowCount: 1 }
+  })
+  ;(hRej.context as { agentContainerId?: number }).agentContainerId = 7392
+  assert.equal(
+    handleTurnDispatchReceipt(receipt({ state: 'rejected', outcome: 'not_accepted', turnKey }), hRej.context),
+    true,
+  )
+  await setImmediate()
+  assert.equal(rejQueries.some((sql) => sql.includes('open-turn:bind-active-dispatch-turn-key')), false)
 })

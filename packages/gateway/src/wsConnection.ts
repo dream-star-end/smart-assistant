@@ -62,9 +62,11 @@ import {
   buildContainerAttestFrame,
 } from './modelAuthority.js'
 import {
+  attachDispatchReceiptSender,
   durableTurnDispatchCapabilities,
   getDispatchContext,
   runDurableDispatchAdmission,
+  selectBridgeReceiptSocket,
 } from './turnDispatchInbox.js'
 import { readUploadUserFailureCode } from './uploadTotalRejection.js'
 import { _pendingPermissionCatchupFrames } from './pendingPermissionSnapshot.js'
@@ -530,6 +532,18 @@ export function handleWsConnection(
         // 需清理;queue lifecycle 清理只挂在下方非 dctx 路径。
         const dctx = getDispatchContext(frame as object)
         if (dctx) {
+          const wsUserId = this.getWsUserId(ws)
+          attachDispatchReceiptSender(dctx, (row) => {
+            const targetWs = selectBridgeReceiptSocket(
+              ws,
+              this.clientsByPeer.get(peerKey),
+              (candidate) => this._bridgeConnections.has(candidate),
+              wsUserId,
+              (candidate) => this.getWsUserId(candidate),
+              WebSocket.OPEN,
+            )
+            if (targetWs) this._sendTurnDispatchReceipt(targetWs, dctx, row)
+          })
           // 单一生产 helper 锁住 mark→INSERT→首次 receipt→dispatch→finally unmark
           // 全顺序;周期 sweep 的压缩 tick 回归直接走同一条接线。
           await runDurableDispatchAdmission({

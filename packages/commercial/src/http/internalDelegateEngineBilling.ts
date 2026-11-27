@@ -108,6 +108,7 @@ export function makeDelegateEngineBillingHandler(deps: {
 function statusForCode(code: string): number {
   if (code.includes('INSUFFICIENT_CREDITS')) return 402
   if (code.startsWith('DELEGATE_ENGINE_BILLING_INVALID_')) return 400
+  if (code === 'DELEGATE_ANTIGRAVITY_ABANDON_HAS_USAGE') return 409
   if (code === 'DELEGATE_ENGINE_BILLING_RUNTIME_UNAVAILABLE') return 503
   if (code === 'DELEGATE_ENGINE_BILLING_ROUTE_UNAVAILABLE') return 503
   return 409

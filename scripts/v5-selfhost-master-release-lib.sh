@@ -1555,13 +1555,11 @@ build_master_release() {
   # OCV5-545 / OCV5-847: 架构护栏在 pinned staging 跑强制期(--enforce),计数写进 summary.json。
   # 新增/增长违规、未清理的 stale 基线、或检查器 fail-closed(退出 2)均让列车失败。
   master_job_architecture() {
-    mlog "  architecture guardrails (enforced) @ pinned staging"
-    if [[ ! -f "$staging/scripts/check-architecture.ts" ]]; then
-      mlog "新候选缺 scripts/check-architecture.ts"
-      return 1
-    fi
-    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-architecture.ts \
-        --enforce --json "$MASTER_GATE_TMPDIR/architecture.json" ); then
+    local exec_root
+    mlog "  architecture guardrails (enforced, host-pinned referee) @ pinned staging"
+    exec_root="$(master_referee_prepare_exec_root "$staging" scripts/check-architecture.ts "$full_sha")" || return 1
+    if ! ( cd "$exec_root" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u TSX_TSCONFIG_PATH npx --no-install tsx scripts/check-architecture.ts \
+        --root "$staging" --enforce --json "$MASTER_GATE_TMPDIR/architecture.json" ); then
       mlog "pinned architecture guardrails 失败(新增/增长/过期基线违规或检查器 fail-closed)"
       return 1
     fi
@@ -2292,12 +2290,12 @@ backup_installed_units_for_cutover() { # <out-var>
   mkdir -p -- "$dest" || return 1
   cp -a -- "${sysdir}/${V5_UNIT}" "$dest/" || return 1
   cp -a -- "${sysdir}/${V5_EGRESS_UNIT}" "$dest/" || return 1
-  # 双槽 egress 模板(已装才备;forensics 用,恢复脚本不依赖它们)。
+  # 双槽 egress + remote-relay 模板(已装才备;forensics 用,恢复脚本可按需消费)。
   local sf
-  for sf in "${V5_EGRESS_SLOT_SOCKET_TPL:-openclaude-v5-selfhost-egress@.socket}" \
-            "${V5_EGRESS_SLOT_SERVICE_TPL:-openclaude-v5-selfhost-egress@.service}"; do
+  for sf in "${V5_EGRESS_SLOT_SOCKET_TPL:-openclaude-v5-selfhost-egress@.socket}" "${V5_EGRESS_SLOT_SERVICE_TPL:-openclaude-v5-selfhost-egress@.service}" \
+            "${V5_REMOTE_RELAY_SLOT_TPL:-openclaude-v5-selfhost-remote-relay@.service}"; do
     if [[ -f "${sysdir}/$sf" ]]; then
-      cp -a -- "${sysdir}/$sf" "$dest/" || return 1
+      cp -a -- "${sysdir}/$sf" "$dest/" && fsync_path "$dest/$sf" || return 1
     fi
   done
   if [[ -n "${UNIT_DIR:-}" && -f "${UNIT_DIR}/${V5_UNIT}" ]]; then
@@ -2471,12 +2469,30 @@ COMMIT;")"; then
 REMOTE_V4_CUTOVER_DRAINED=0
 
 remote_v4_cutover_reopen() {
-  local sock
+  local sock rc=0
   if declare -F selfhost_master_active_drain_sock >/dev/null 2>&1; then sock="$(selfhost_master_active_drain_sock)"; else sock="${OC_REMOTE_V4_DRAIN_SOCKET:-/run/openclaude-v5-selfhost/remote-v4-drain.sock}"; fi
-  REMOTE_V4_CUTOVER_DRAINED=0
-  [[ "${DRY:-0}" != 1 ]] || return 0
-  [[ -S "$sock" ]] || return 0
-  bash "$SCRIPT_DIR/agent-remote/drain-remote-v4.sh" --reopen --socket "$sock" >/dev/null 2>&1 || true
+  if [[ "${DRY:-0}" == 1 ]]; then
+    REMOTE_V4_CUTOVER_DRAINED=0
+    return 0
+  fi
+  if [[ ! -S "$sock" ]]; then
+    if [[ "${REMOTE_V4_CUTOVER_DRAINED:-0}" == 1 ]]; then
+      cutover_clog "  ✗ remote-v4 reopen 失败: drain socket 缺失 ($sock)"
+      return 1
+    fi
+    REMOTE_V4_CUTOVER_DRAINED=0
+    return 0
+  fi
+  bash "$SCRIPT_DIR/agent-remote/drain-remote-v4.sh" --reopen --socket "$sock" >/dev/null 2>&1 || rc=$?
+  if (( rc == 0 )); then
+    REMOTE_V4_CUTOVER_DRAINED=0
+    return 0
+  fi
+  if (( rc == 75 && ${REMOTE_V4_CUTOVER_DRAINED:-0} == 0 )); then
+    return 0
+  fi
+  cutover_clog "  ✗ remote-v4 reopen 失败 (sock=$sock rc=$rc)"
+  return 1
 }
 
 # OCV5-749 AC-5 / OCV5-854: R1 generation cutover drain fence (slot-aware socket).
@@ -2529,6 +2545,9 @@ SELECT count(*)::text FROM public.remote_agent_bindings
     cutover_clog "  ✗ remote-v4 drain socket 缺失但存在活跃 v4 绑定 ($v4_active);拒绝切流"
     return 1
   fi
+  # Drain request was attempted against an existing socket and timed out or lost ACK:
+  # admissions may already be closed on old Master, so require explicit reopen success.
+  REMOTE_V4_CUTOVER_DRAINED=1
   cutover_clog "  ✗ remote-v4 排空超时或失败 (rc=$rc): $out;中止切流,不强杀在途回合"
   return 1
 }

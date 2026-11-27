@@ -486,8 +486,13 @@ release_policy_flip_live() { # saga extra_apply, after real prechecks/context ar
   release_policy_assert_no_service_jobs || return $?
   # A user may have begun a turn while the old reader was draining. Apply the
   # existing real idle gate again before runtime/egress/master are restarted.
-  if declare -F remote_v4_cutover_drain >/dev/null 2>&1; then remote_v4_cutover_drain || return 79; fi
-  cutover_wait_for_user_idle || return 79
+  # OCV5-855 (B5): In dual-slot mode, defer to selfhost_flip_egress_relay_and_master
+  # (which enforces fence+drain for first migration and candidate-preheat +
+  # bidirectional attestation + fenced tiered idle gate in steady-state blue-green).
+  if ! (declare -F selfhost_master_dual_slot_active >/dev/null 2>&1 && selfhost_master_dual_slot_active); then
+    if declare -F remote_v4_cutover_drain >/dev/null 2>&1; then remote_v4_cutover_drain || return 79; fi
+    cutover_wait_for_user_idle || return 79
+  fi
   release_policy_require_owner || return 86
 }
 
@@ -852,6 +857,17 @@ release_policy_recover_forward() {
     release_policy_keep_failed "$rel" recovery-gates "$rc"
     return $?
   fi
+  # B6: policy 恢复路径必须持有本版本的 retention PASS 证明，缺失时必须实跑 retention 门通过才允许 finalize committed！
+  if [[ "${OC_V5_RETENTION_ENABLED:-1}" != 0 ]]; then
+    if ! lease_train_has_retention_pass "$rel" "$LEASE_TARGET_SHA"; then
+      if declare -F v5_selfhost_post_cutover_retention_gate >/dev/null 2>&1; then
+        v5_selfhost_post_cutover_retention_gate "$rel" "$LEASE_TARGET_SHA" || return $?
+      else
+        cutover_clog "✗ [release-policy-recover] 缺少本版本 retention PASS 证明且无保留集门函数，拒绝 finalize committed"
+        return 79
+      fi
+    fi
+  fi
   CUTOVER_SURVIVOR_ARMED=1
   release_policy_finalize_forward "$rel" || return $?
   return 0
@@ -879,6 +895,51 @@ release_policy_restore_live_before() { # called only by the original guarded sag
   oc_hotcfg_fsync_path "$(dirname "$MASTER_LIVE_LINK")" || return 79
 }
 
+# 切流后置保留集验收期间把活跃列车标为不可结算的 cutover/verifying 中间态（绝不写 committed！）。
+lease_train_mark_verifying() { # <candidate-rel>
+  [[ "${LEASE_TRAIN_ACTIVE:-0}" == 1 && -n "${LEASE_TRAIN_ID:-}" ]] || return 0
+  release_policy_guard_owner || return 86
+  local rel="${1:-}" ev="" ev_merge="" now=""
+  ev="$(jq -cn --arg rel "$rel" '{retentionPhase:"verifying",verifyingRel:$rel}')" || return 1
+  ev_merge="$(lease_json_object_merge_sql evidence_json "$ev")" || return 1
+  now="$(lease_now)"
+  lease_tx <<SQL || return 1
+.bail on
+BEGIN IMMEDIATE;
+UPDATE train SET status='cutover', evidence_json=$ev_merge, updated_at='$now'
+ WHERE id='$(lease_q "$LEASE_TRAIN_ID")' AND status NOT IN ('committed','failed','recovery_required');
+$(lease_event_sql "$LEASE_TRAIN_ID" train-verifying "deploy:$$" "post-cutover retention verifying rel=$rel")
+COMMIT;
+SQL
+}
+
+# 持久化本版本 retention PASS 证明到 train.evidence_json，供 policy 恢复路径校验（B6）。
+lease_train_mark_retention_passed() { # <candidate-rel> <40-hex-sha>
+  [[ "${LEASE_TRAIN_ACTIVE:-0}" == 1 && -n "${LEASE_TRAIN_ID:-}" ]] || return 0
+  release_policy_guard_owner || return 86
+  local rel="${1:-}" sha="${2:-}" now="" ev="" ev_merge=""
+  now="$(lease_now)"
+  ev="$(jq -cn --arg rel "$rel" --arg sha "$sha" --arg at "$now" \
+    '{retentionPhase:"passed",retentionProof:{schema:1,rel:$rel,sha:$sha,passedAt:$at}}')" || return 1
+  ev_merge="$(lease_json_object_merge_sql evidence_json "$ev")" || return 1
+  lease_tx <<SQL || return 1
+.bail on
+BEGIN IMMEDIATE;
+UPDATE train SET evidence_json=$ev_merge, updated_at='$now'
+ WHERE id='$(lease_q "$LEASE_TRAIN_ID")' AND status NOT IN ('committed','failed','recovery_required');
+$(lease_event_sql "$LEASE_TRAIN_ID" train-retention-passed "deploy:$$" "post-cutover retention passed rel=$rel sha=$sha")
+COMMIT;
+SQL
+}
+
+# 核验当前 train 是否已持匹配 <rel> 与 <sha> 的持久化 retention PASS 证明。
+lease_train_has_retention_pass() { # <candidate-rel> <40-hex-sha>
+  [[ -n "${LEASE_TRAIN_ID:-}" ]] || return 1
+  local rel="${1:-}" sha="${2:-}" got=""
+  got="$(lease_sql "SELECT COALESCE(json_extract(evidence_json,'$.retentionPhase'),'')||'|'||COALESCE(json_extract(evidence_json,'$.retentionProof.rel'),'')||'|'||COALESCE(json_extract(evidence_json,'$.retentionProof.sha'),'') FROM train WHERE id='$(lease_q "$LEASE_TRAIN_ID")';")" || return 1
+  [[ "$got" == "passed|$rel|$sha" ]]
+}
+
 # 终态:成功由 cmd_deploy 末尾调 committed;失败由 EXIT trap 调(未 committed 即 failed/recovery_required)。
 lease_train_finish() { # <committed|failed> <reason>
   [[ "${LEASE_TRAIN_ACTIVE:-0}" == 1 && -n "$LEASE_TRAIN_ID" ]] || return 0
@@ -891,12 +952,12 @@ lease_train_finish() { # <committed|failed> <reason>
     local phase=""
     if [[ "${CUTOVER_MUTATED:-0}" == 1 ]]; then
       phase="$(survivor_state_phase)"
-      # kept-failed(OCV5-418)是有意留在新版的确定性失败,不是需人工恢复的半截 mutation。
-      case "${phase:-}" in armed|pre-install|pre-mutation|smoked|committed|kept-failed) ;; *) st=recovery_required ;; esac
+      # kept-failed(OCV5-418) / rolled-back(B6 已验证回滚恢复旧 live)不是需人工恢复的半截 mutation。
+      case "${phase:-}" in armed|pre-install|pre-mutation|smoked|committed|kept-failed|rolled-back) ;; *) st=recovery_required ;; esac
     fi
-    # 补偿本身失败:survivor --disarm 会把 phase 写成 committed,所以单独带标记(OCV5-420)。
-    [[ "${CUTOVER_RECOVERY_REQUIRED:-0}" == 1 ]] && st=recovery_required
     if release_policy_enabled && release_policy_context_present; then st=failed; fi
+    # 补偿/回滚本身失败:即使 policy hold 仍在或 survivor --disarm 改写了 phase，也必须进入 recovery_required(OCV5-420/B6)！
+    [[ "${CUTOVER_RECOVERY_REQUIRED:-0}" == 1 ]] && st=recovery_required
     rel="${CUTOVER_KEPT_FAILED_REL:-}"
   else
     rel="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
@@ -983,6 +1044,7 @@ lease_train_on_exit() {
 # after acquiring it: a failed publisher may have left an intent meanwhile.
 release_policy_mutation_barrier() {
   [[ "${RELEASE_POLICY_RESUME:-0}" == 1 ]] && return 0
+  [[ "${MODE:-}" == rollback && "${OC_V5_RETENTION_INTERNAL_ROLLBACK:-0}" == 1 && "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-0}" == 1 ]] && return 0
   release_policy_context_present && return 79
   return 0
 }

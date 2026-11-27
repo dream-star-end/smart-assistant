@@ -288,8 +288,8 @@ export function MermaidBlock({ code }: { code: string }) {
           {code}
         </pre>
       ) : (
-        // mermaid securityLevel:'strict' 已清洗 SVG
         <div
+          data-testid="mermaid-diagram"
           className="oc-surface-card flex justify-center overflow-x-auto rounded-xl p-4"
           // biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid strict-sanitized SVG
           dangerouslySetInnerHTML={{ __html: svg }}

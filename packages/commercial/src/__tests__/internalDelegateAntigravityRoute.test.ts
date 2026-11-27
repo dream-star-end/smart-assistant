@@ -14,6 +14,13 @@ import { fileURLToPath } from 'node:url'
 import type { AddressInfo } from 'node:net'
 import { describe, test } from 'node:test'
 
+import {
+  _resetAntigravityRelayRoutesForTests,
+  configureAntigravityRelayKv,
+  mintAntigravityRelayRoute,
+  resolveAntigravityRelayRoute,
+} from '../billing/antigravityRouteContext.js'
+import { AntigravityAdmissionError } from '../account-pool/antigravityAdmission.js'
 import { hashSecret, type ContainerIdentityRepo } from '../auth/containerIdentity.js'
 import {
   DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH,
@@ -83,7 +90,7 @@ function journalRow(over: Partial<JournalRow> = {}): JournalRow {
     state: 'inflight',
     ctx: {
       source: 'delegate_antigravity',
-      model: 'antigravity-claude-sonnet-5.5',
+      model: 'antigravity-gemini-4-neon',
       parentSessionId: 'agent:main:delegate:leader:1',
     },
     precheck_credits: '250',
@@ -93,6 +100,7 @@ function journalRow(over: Partial<JournalRow> = {}): JournalRow {
 
 function makePool(opts: {
   row?: JournalRow | JournalRow[]
+  claimRows?: number
   persistRows?: number
   persistError?: Error
   selectError?: Error
@@ -108,6 +116,16 @@ function makePool(opts: {
         const row = rows[selectIdx++] ?? undefined
         return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }
       }
+      if (
+        sql.includes('UPDATE request_finalize_journal') &&
+        sql.includes("jsonb_build_object('antigravityMintClaim'")
+      ) {
+        const count = opts.claimRows ?? 1
+        return {
+          rows: Array.from({ length: count }, () => ({ request_id: REQUEST_ID })),
+          rowCount: count,
+        }
+      }
       if (sql.includes('UPDATE request_finalize_journal') && sql.includes('antigravityRouteToken')) {
         if (opts.persistError) throw opts.persistError
         const count = opts.persistRows ?? 1
@@ -115,6 +133,12 @@ function makePool(opts: {
           rows: Array.from({ length: count }, () => ({ request_id: REQUEST_ID })),
           rowCount: count,
         }
+      }
+      if (
+        sql.includes('UPDATE request_finalize_journal') &&
+        sql.includes("ctx - 'antigravityMintClaim'")
+      ) {
+        return { rows: [], rowCount: 1 }
       }
       return { rows: [], rowCount: 0 }
     },
@@ -130,6 +154,7 @@ function makeHandler(deps: {
   expireRoute?: any
   resolveRoute?: any
   releaseInflightFn?: any
+  renewInflightFn?: any
   readBalance?: any
   clientSecret?: string
 }) {
@@ -144,6 +169,7 @@ function makeHandler(deps: {
     expireRoute: deps.expireRoute ?? (async () => {}),
     resolveRoute: deps.resolveRoute ?? (async () => null),
     releaseInflightFn: deps.releaseInflightFn ?? (() => {}),
+    ...(deps.renewInflightFn ? { renewInflightFn: deps.renewInflightFn } : {}),
     ...(deps.readBalance ? { readBalance: deps.readBalance } : {}),
   })
 }
@@ -241,23 +267,27 @@ describe('internalDelegateAntigravityRoute', () => {
       containerId: 11,
       userId: 42n,
       requestId: REQUEST_ID,
-      modelId: 'antigravity-claude-sonnet-5.5',
+      modelId: 'antigravity-gemini-4-neon',
       budgetCredits: 250n,
       relayPort: 18789,
+      strictCapacity: true,
     })
     assert.equal(admitCalls[0].o.clientSecret, 'client-secret')
     assert.deepEqual(recordCalls, [
       {
         requestId: REQUEST_ID,
         userId: 42n,
-        modelId: 'antigravity-claude-sonnet-5.5',
+        modelId: 'antigravity-gemini-4-neon',
         sessionId: 'agent:main:delegate:leader:1',
         traceId: null,
       },
     ])
-    const persist = queries.find((q) => q.sql.includes('antigravityRouteToken'))
+    const persist = queries.find((q) =>
+      q.sql.includes("jsonb_build_object('antigravityRouteToken'"),
+    )
     assert.ok(persist, 'journal must persist the opaque route token')
-    assert.deepEqual(persist!.params, [REQUEST_ID, ROUTE_TOKEN, 42, 11])
+    assert.deepEqual(persist!.params.slice(0, 4), [REQUEST_ID, ROUTE_TOKEN, 42, 11])
+    assert.equal(typeof persist!.params[4], 'string')
   })
 
   test('mint uses spendable balance (ctx.antigravityBudgetCredits / readBalance) instead of 64-credit precheck cap', async () => {
@@ -266,7 +296,7 @@ describe('internalDelegateAntigravityRoute', () => {
         precheck_credits: '64',
         ctx: {
           source: 'delegate_antigravity',
-          model: 'antigravity-claude-sonnet-5.5',
+          model: 'antigravity-gemini-4-neon',
           antigravityBudgetCredits: '2278962',
         },
       }),
@@ -289,34 +319,88 @@ describe('internalDelegateAntigravityRoute', () => {
     assert.equal(admitCalls[0].budgetCredits, 2278962n)
   })
 
-  test('mint caps the turn at the live spendable balance, never below the reserved precheck', async () => {
+  test('OCV5-897 B2: mint caps the turn at live spendable balance and rejects live=0n with 402 (never falls back to precheck)', async () => {
     const budgets: bigint[] = []
-    for (const live of [5000n, 0n]) {
-      const { pool } = makePool({
-        row: journalRow({ precheck_credits: '64', ctx: { source: 'delegate_antigravity',
-          model: 'antigravity-claude-sonnet-5.5', antigravityBudgetCredits: '2278962' } }),
-      })
-      const handler = makeHandler({ pool, readBalance: async () => live,
-        admit: async (args: any) => { budgets.push(args.budgetCredits); return mintedRoute() } })
-      await withServer(handler, async (port) => {
-        assert.equal((await call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, { requestId: REQUEST_ID })).status, 200)
-      })
-    }
-    // A balance spent down since admission does not fall back to the stale admission balance.
-    assert.deepEqual(budgets, [5000n, 64n])
-  })
-
-  test('mint falls back to ctx.antigravityBudgetCredits when readBalance throws, and caps at precheck_credits when readBalance returns 0n', async () => {
-    const admissionBudget = 2278962n
-    let thrownBudget: bigint | undefined
     {
       const { pool } = makePool({
         row: journalRow({
           precheck_credits: '64',
           ctx: {
             source: 'delegate_antigravity',
-            model: 'antigravity-claude-sonnet-5.5',
+            model: 'antigravity-gemini-4-neon',
+            antigravityBudgetCredits: '2278962',
+          },
+        }),
+      })
+      const handler = makeHandler({
+        pool,
+        readBalance: async () => 5000n,
+        admit: async (args: any) => {
+          budgets.push(args.budgetCredits)
+          return mintedRoute()
+        },
+      })
+      await withServer(handler, async (port) => {
+        assert.equal(
+          (await call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, { requestId: REQUEST_ID })).status,
+          200,
+        )
+      })
+    }
+    assert.deepEqual(budgets, [5000n])
+
+    let zeroAdmits = 0
+    {
+      const { pool } = makePool({
+        row: journalRow({
+          precheck_credits: '64',
+          ctx: {
+            source: 'delegate_antigravity',
+            model: 'antigravity-gemini-4-neon',
+            antigravityBudgetCredits: '2278962',
+          },
+        }),
+      })
+      const handler = makeHandler({
+        pool,
+        readBalance: async () => 0n,
+        admit: async () => {
+          zeroAdmits += 1
+          return mintedRoute()
+        },
+      })
+      await withServer(handler, async (port) => {
+        const res = await call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, {
+          requestId: REQUEST_ID,
+        })
+        assert.equal(res.status, 402)
+        assert.equal(res.json.error.code, 'ANTIGRAVITY_BUDGET_UNAVAILABLE')
+      })
+    }
+    assert.equal(zeroAdmits, 0, 'zero live spendable balance must fail closed before admit')
+  })
+
+  test('mint falls back to ctx.antigravityBudgetCredits when readBalance throws, and forwards frozen billingPricing override (OCV5-897 B2)', async () => {
+    const admissionBudget = 2278962n
+    let seenArgs: any
+    {
+      const { pool } = makePool({
+        row: journalRow({
+          precheck_credits: '64',
+          ctx: {
+            source: 'delegate_antigravity',
+            model: 'antigravity-gemini-4-neon',
             antigravityBudgetCredits: String(admissionBudget),
+            billingPricing: {
+              v: 1,
+              modelId: 'antigravity-gemini-4-neon',
+              displayName: 'Gemini 4 Neon',
+              inputPerMtok: '120',
+              outputPerMtok: '1500',
+              cacheReadPerMtok: '12',
+              cacheWritePerMtok: '0',
+              multiplier: '2.000',
+            },
           },
         }),
       })
@@ -326,7 +410,7 @@ describe('internalDelegateAntigravityRoute', () => {
           throw new Error('pg lookup timeout')
         },
         admit: async (args: any) => {
-          thrownBudget = args.budgetCredits
+          seenArgs = args
           return mintedRoute()
         },
       })
@@ -337,37 +421,17 @@ describe('internalDelegateAntigravityRoute', () => {
         assert.equal(res.status, 200)
       })
     }
-    assert.equal(thrownBudget, admissionBudget)
-
-    let zeroBudget: bigint | undefined
-    {
-      const { pool } = makePool({
-        row: journalRow({
-          precheck_credits: '64',
-          ctx: {
-            source: 'delegate_antigravity',
-            model: 'antigravity-claude-sonnet-5.5',
-            antigravityBudgetCredits: String(admissionBudget),
-          },
-        }),
-      })
-      const handler = makeHandler({
-        pool,
-        readBalance: async () => 0n,
-        admit: async (args: any) => {
-          zeroBudget = args.budgetCredits
-          return mintedRoute()
-        },
-      })
-      await withServer(handler, async (port) => {
-        const res = await call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, {
-          requestId: REQUEST_ID,
-        })
-        assert.equal(res.status, 200)
-      })
-    }
-    assert.equal(zeroBudget, 64n)
-    assert.notEqual(zeroBudget, admissionBudget)
+    assert.equal(seenArgs.budgetCredits, admissionBudget)
+    assert.equal(seenArgs.strictCapacity, true)
+    assert.deepEqual(seenArgs.pricingOverride, {
+      modelId: 'antigravity-gemini-4-neon',
+      displayName: 'Gemini 4 Neon',
+      inputPerMtok: '120',
+      outputPerMtok: '1500',
+      cacheReadPerMtok: '12',
+      cacheWritePerMtok: '0',
+      multiplier: '2.000',
+    })
   })
 
   test('migration 0344 idempotently drops legacy manual delegate_antigravity budget trigger and function (OCV5-752)', () => {
@@ -443,7 +507,7 @@ describe('internalDelegateAntigravityRoute', () => {
     const row = journalRow({
       ctx: {
         source: 'delegate_antigravity',
-        model: 'antigravity-claude-sonnet-5.5',
+        model: 'antigravity-gemini-4-neon',
         antigravityRouteToken: ROUTE_TOKEN,
       },
     })
@@ -564,14 +628,20 @@ describe('internalDelegateAntigravityRoute', () => {
     ])
   })
 
-  test('renew reports liveness scoped to the caller', async () => {
+  test('renew reports liveness scoped to the caller and renews account inflight slot (OCV5-897 B3)', async () => {
     const { pool } = makePool({})
     let live = true
+    const renewedTokens: string[] = []
     const handler = makeHandler({
       pool,
+      renewInflightFn: (tok: string) => {
+        renewedTokens.push(tok)
+        return true
+      },
       resolveRoute: async () =>
         live
           ? {
+              requestId: REQUEST_ID,
               baseUrl: BASE_URL,
               accessToken: 'A'.repeat(48),
               accessTokenExpiresAt: '2026-11-05T00:00:00.000Z',
@@ -591,6 +661,7 @@ describe('internalDelegateAntigravityRoute', () => {
       assert.equal(second.status, 200)
       assert.deepEqual(second.json, { ok: false, expired: true })
     })
+    assert.deepEqual(renewedTokens, [REQUEST_ID])
   })
 
   test('mint rejects a malformed requestId and a non-antigravity admission model', async () => {
@@ -660,7 +731,7 @@ describe('internalDelegateAntigravityRoute', () => {
       const winnerRow = journalRow({
         ctx: {
           source: 'delegate_antigravity',
-          model: 'antigravity-claude-sonnet-5.5',
+          model: 'antigravity-gemini-4-neon',
           antigravityRouteToken: 'ff'.repeat(32),
         },
       })
@@ -702,6 +773,9 @@ describe('internalDelegateAntigravityRoute', () => {
             throw new Error('verification query failed')
           }
           if (sql.includes('UPDATE request_finalize_journal')) {
+            if (sql.includes("jsonb_build_object('antigravityMintClaim'")) {
+              return { rows: [{ request_id: REQUEST_ID }], rowCount: 1 }
+            }
             return { rows: [], rowCount: 0 }
           }
           return { rows: [], rowCount: 0 }
@@ -732,6 +806,159 @@ describe('internalDelegateAntigravityRoute', () => {
       assert.deepEqual(expired, [ROUTE_TOKEN])
       assert.deepEqual(abandoned, [])
       assert.deepEqual(released, [])
+    }
+  })
+
+  test('OCV5-897 B5: mint rejects legacy non-4-family antigravity journals (claude / gpt-oss) before admit', async () => {
+    for (const model of ['antigravity-claude-sonnet-5.5', 'antigravity-gpt-oss-120b']) {
+      const { pool } = makePool({
+        row: journalRow({ ctx: { source: 'delegate_antigravity', model } }),
+      })
+      let admitted = 0
+      const handler = makeHandler({
+        pool,
+        admit: async () => {
+          admitted += 1
+          return mintedRoute()
+        },
+      })
+      await withServer(handler, async (port) => {
+        const res = await call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, {
+          requestId: REQUEST_ID,
+        })
+        assert.equal(res.status, 409, model)
+        assert.equal(res.json.error.code, 'DELEGATE_ANTIGRAVITY_ROUTE_MODEL_FAMILY_NOT_ALLOWED')
+      })
+      assert.equal(admitted, 0, `${model} must never reach admit`)
+    }
+  })
+
+  test('OCV5-897 B3: admit failure (ANTIGRAVITY_NO_ACCOUNT under strictCapacity) returns 503 and releases mint claim', async () => {
+    const { pool, queries } = makePool({ row: journalRow() })
+    const handler = makeHandler({
+      pool,
+      admit: async (args: any) => {
+        assert.equal(args.strictCapacity, true)
+        throw new AntigravityAdmissionError('ANTIGRAVITY_NO_ACCOUNT')
+      },
+    })
+    await withServer(handler, async (port) => {
+      const res = await call(port, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, {
+        requestId: REQUEST_ID,
+      })
+      assert.equal(res.status, 503)
+      assert.equal(res.json.error.code, 'ANTIGRAVITY_NO_ACCOUNT')
+    })
+    assert.equal(
+      queries.some((q) => q.sql.includes("ctx - 'antigravityMintClaim'")),
+      true,
+      'failed admit must release PG mint claim so retry is possible',
+    )
+  })
+
+  test('OCV5-897 B4: dual-instance concurrent mint race serializes in PG so loser never touches Redis or clobbers winner route', async () => {
+    _resetAntigravityRelayRoutesForTests()
+    const kvStore = new Map<string, string>()
+    configureAntigravityRelayKv({
+      get: async (k) => kvStore.get(k) ?? null,
+      set: async (k, v) => {
+        kvStore.set(k, v)
+      },
+      del: async (k) => {
+        kvStore.delete(k)
+      },
+    })
+    try {
+      // Stateful shared PG row simulating two separate master instances racing on one journal row.
+      const rowState: JournalRow = journalRow()
+      const sharedPool = {
+        async query(sql: string, params: unknown[] = []) {
+          if (sql.includes('FROM request_finalize_journal') && sql.includes('SELECT')) {
+            return { rows: [{ ...rowState, ctx: { ...rowState.ctx } }], rowCount: 1 }
+          }
+          if (
+            sql.includes('UPDATE request_finalize_journal') &&
+            sql.includes("jsonb_build_object('antigravityMintClaim'")
+          ) {
+            if (rowState.ctx.antigravityRouteToken || rowState.ctx.antigravityMintClaim) {
+              return { rows: [], rowCount: 0 }
+            }
+            rowState.ctx.antigravityMintClaim = params[1]
+            return { rows: [{ request_id: REQUEST_ID }], rowCount: 1 }
+          }
+          if (
+            sql.includes('UPDATE request_finalize_journal') &&
+            sql.includes('antigravityRouteToken')
+          ) {
+            if (
+              rowState.ctx.antigravityRouteToken ||
+              rowState.ctx.antigravityMintClaim !== params[4]
+            ) {
+              return { rows: [], rowCount: 0 }
+            }
+            delete rowState.ctx.antigravityMintClaim
+            rowState.ctx.antigravityRouteToken = params[1]
+            return { rows: [{ request_id: REQUEST_ID }], rowCount: 1 }
+          }
+          if (sql.includes("ctx - 'antigravityMintClaim'")) {
+            if (rowState.ctx.antigravityMintClaim === params[3]) {
+              delete rowState.ctx.antigravityMintClaim
+            }
+            return { rows: [], rowCount: 1 }
+          }
+          return { rows: [], rowCount: 0 }
+        },
+      }
+      let admitCount = 0
+      const realAdmit = async (args: any) => {
+        admitCount += 1
+        await new Promise((r) => setTimeout(r, 20))
+        const minted = await mintAntigravityRelayRoute({
+          containerId: args.containerId,
+          userId: args.userId,
+          requestId: args.requestId,
+          modelId: args.modelId,
+          accountId: 7n,
+          budgetCredits: args.budgetCredits,
+          relayPort: args.relayPort,
+        })
+        return {
+          token: minted.token,
+          baseUrl: minted.baseUrl,
+          accessToken: 'A'.repeat(48),
+          accessTokenExpiresAt: '2026-11-05T00:00:00.000Z',
+        }
+      }
+      // Two distinct handler instances (separate in-process mintInFlight sets)
+      const handlerA = makeHandler({ pool: sharedPool, admit: realAdmit })
+      const handlerB = makeHandler({ pool: sharedPool, admit: realAdmit })
+      const serverA = createServer((req, res) => void handlerA(req, res, CTX))
+      const serverB = createServer((req, res) => void handlerB(req, res, CTX))
+      const [portA, portB] = await Promise.all([listen(serverA), listen(serverB)])
+      try {
+        const [rA, rB] = await Promise.all([
+          call(portA, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, { requestId: REQUEST_ID }),
+          call(portB, DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH, { requestId: REQUEST_ID }),
+        ])
+        const winner = rA.status === 200 ? rA : rB
+        const loser = rA.status === 200 ? rB : rA
+        assert.equal(winner.status, 200)
+        assert.equal(loser.status, 409)
+        assert.equal(loser.json.error.code, 'DELEGATE_ANTIGRAVITY_ROUTE_ALREADY_MINTED')
+        assert.equal(admitCount, 1, 'loser replica must never call admit or overwrite Redis route key')
+        const winnerToken = winner.json.route.routeToken as string
+        const resolved = await resolveAntigravityRelayRoute({
+          token: winnerToken,
+          containerId: 11,
+          userId: 42n,
+        })
+        assert.ok(resolved, 'winner route must remain valid in shared KV after loser fails')
+        assert.equal(resolved!.requestId, REQUEST_ID)
+      } finally {
+        await Promise.all([close(serverA), close(serverB)])
+      }
+    } finally {
+      _resetAntigravityRelayRoutesForTests()
     }
   })
 })

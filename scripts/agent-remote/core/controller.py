@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -23,19 +24,25 @@ import selectors
 import shutil
 import signal
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from core import resources  # noqa: E402
-from core.canonical import remote_canonical_bytes, remote_canonical_sha256, strict_json  # noqa: E402
+from core.canonical import (  # noqa: E402
+    remote_canonical_bytes,
+    remote_canonical_sha256,
+    remote_schema_filtered_sha256,
+    strict_json,
+)
 from core.contract import (  # noqa: E402
     ENGINE_ID_RE,
     GENERATION_RE,
@@ -212,6 +219,11 @@ def read_manifest(root: Path) -> Dict[str, Any]:
             str(root).startswith("/tmp/oc-drvtest-") and isinstance(m["registryPath"], str),
             "REMOTE_REGISTRY_OVERRIDE_FORBIDDEN",
         )
+    if m.get("stickyHomeKey") is not None:
+        need(
+            isinstance(m["stickyHomeKey"], str) and bool(re.fullmatch(r"s-[a-f0-9]{16}", m["stickyHomeKey"])),
+            "REMOTE_MANIFEST_INVALID",
+        )
     return m
 
 
@@ -311,6 +323,8 @@ def provision(root: Path) -> None:
             "nativeSessionId": m.get("nativeSessionId"),
             "tools": packet["tools"],
         }
+        if m.get("stickyHomeKey") and "stickyHomeKey" not in driver_ctx:
+            driver_ctx["stickyHomeKey"] = m["stickyHomeKey"]
         spec = validate_launch_spec(driver_mod.launch_spec(driver_ctx, packet["verifiedProbe"]), root)
 
         for rel_dir in spec["dirs"]:
@@ -881,6 +895,8 @@ def reprovision_app(root: Path, m: Dict[str, Any]) -> None:
                 "nativeSessionId": resolved_native_session,
                 "tools": packet["tools"],
             }
+            if m.get("stickyHomeKey") and "stickyHomeKey" not in driver_ctx:
+                driver_ctx["stickyHomeKey"] = m["stickyHomeKey"]
             spec = validate_launch_spec(driver_mod.launch_spec(driver_ctx, packet["verifiedProbe"]), root)
             for rel_dir in spec["dirs"]:
                 target_dir = root / rel_dir
@@ -980,6 +996,16 @@ def launch_role(root: Path, m: Dict[str, Any]) -> None:
         )
 
         native_state: Dict[str, Any] = {"expectedModel": m["model"], "operationId": m["operationId"]}
+        tool_schemas_by_name: Dict[str, Dict[str, Any]] = {}
+        if (root / "tools.json").exists():
+            try:
+                catalog_doc = strict_json(read_private(root / "tools.json"))
+                if isinstance(catalog_doc, dict) and isinstance(catalog_doc.get("tools"), list):
+                    for t_entry in catalog_doc["tools"]:
+                        if isinstance(t_entry, dict) and isinstance(t_entry.get("name"), str) and isinstance(t_entry.get("inputSchema"), dict):
+                            tool_schemas_by_name[t_entry["name"]] = t_entry["inputSchema"]
+            except Exception:  # noqa: BLE001
+                tool_schemas_by_name = {}
         if m.get("nativeSessionId"):
             native_state["sessionId"] = m["nativeSessionId"]
         elif (root / "NATIVE-SESSION.json").exists():
@@ -1064,6 +1090,11 @@ def launch_role(root: Path, m: Dict[str, Any]) -> None:
                                         "name": ev["name"],
                                         "argsHash": ev["argsHash"],
                                     }
+                                    tool_schema = tool_schemas_by_name.get(ev["name"])
+                                    if isinstance(tool_schema, dict):
+                                        obs_doc["argsSchemaSha256"] = remote_schema_filtered_sha256(
+                                            ev["arguments"], tool_schema
+                                        )
                                     if native_state.get("activeTurnId"):
                                         obs_doc["nativeTurnId"] = native_state["activeTurnId"]
                                     obs_file = root / "observations" / (sha(ev["callId"].encode("utf-8")) + ".json")
@@ -1357,6 +1388,242 @@ def probe_role(root: Path) -> None:
             except OSError:
                 pass
             shutil.rmtree(root, ignore_errors=True)
+
+
+CAPSULE_REL_PATH_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\Z")
+CAPSULE_SQLITE_HEADER = b"SQLite format 3\x00"
+CAPSULE_SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
+CAPSULE_FORBIDDEN_BASENAMES = frozenset(
+    {
+        "auth.json",
+        ".credentials.json",
+        "antigravity-oauth-token",
+        "id_ed25519",
+        "id_rsa",
+    }
+)
+CAPSULE_FORBIDDEN_SUFFIXES = (".pem", ".key", "-wal", "-shm")
+
+
+def _validate_capsule_rel_path(
+    rel_path: Any,
+    allowed_patterns: Optional[Sequence[str]] = None,
+) -> str:
+    need(
+        isinstance(rel_path, str)
+        and 0 < len(rel_path) <= 256
+        and "\x00" not in rel_path
+        and "\\" not in rel_path
+        and not rel_path.startswith("/")
+        and bool(CAPSULE_REL_PATH_RE.fullmatch(rel_path)),
+        "REMOTE_CAPSULE_PATH_FORBIDDEN",
+    )
+    parts = rel_path.split("/")
+    need(all(part not in ("", ".", "..") for part in parts), "REMOTE_CAPSULE_PATH_FORBIDDEN")
+    basename = parts[-1].lower()
+    need(
+        basename not in CAPSULE_FORBIDDEN_BASENAMES
+        and not any(basename.endswith(sfx) for sfx in CAPSULE_FORBIDDEN_SUFFIXES),
+        "REMOTE_CAPSULE_PATH_FORBIDDEN",
+    )
+    if allowed_patterns is not None:
+        need(
+            len(allowed_patterns) > 0
+            and any(fnmatch.fnmatchcase(rel_path, pat) for pat in allowed_patterns),
+            "REMOTE_CAPSULE_PATH_NOT_ALLOWED",
+        )
+    return rel_path
+
+
+def _assert_no_symlink_components(base_dir: Path, rel_path: str, *, require_exists: bool) -> Path:
+    base_resolved = base_dir.resolve()
+    cur = base_dir
+    for part in rel_path.split("/"):
+        cur = cur / part
+        if cur.is_symlink():
+            raise ValueError("REMOTE_CAPSULE_SYMLINK_FORBIDDEN")
+        if require_exists:
+            need(cur.exists(), "REMOTE_CAPSULE_FILE_MISSING")
+    resolved = cur.resolve()
+    need(resolved.is_relative_to(base_resolved) and resolved != base_resolved, "REMOTE_CAPSULE_PATH_FORBIDDEN")
+    return cur
+
+
+def _is_sqlite_file(path: Path) -> bool:
+    if path.name.lower().endswith(CAPSULE_SQLITE_SUFFIXES):
+        return True
+    try:
+        with path.open("rb") as handle:
+            return handle.read(len(CAPSULE_SQLITE_HEADER)) == CAPSULE_SQLITE_HEADER
+    except OSError:
+        return False
+
+
+def _checkpoint_sqlite_file(path: Path) -> None:
+    conn = sqlite3.connect(str(path), timeout=5.0)
+    try:
+        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        need(row is not None and int(row[0]) == 0, "REMOTE_CAPSULE_SQLITE_CHECKPOINT_BUSY")
+    finally:
+        conn.close()
+
+
+def export_session_capsule_files(
+    source_dir: Union[str, Path],
+    rel_paths: Sequence[str],
+    *,
+    allowed_patterns: Optional[Sequence[str]] = None,
+    max_file_bytes: int = 64 * 1024 * 1024,
+    max_total_bytes: int = 128 * 1024 * 1024,
+) -> Dict[str, Any]:
+    """Export whitelisted session state files into a checksummed capsule payload.
+
+    Enforces strict path/symlink/credential filtering and executes
+    `PRAGMA wal_checkpoint(TRUNCATE)` on SQLite databases prior to snapshotting.
+    """
+    base = Path(source_dir)
+    need(base.exists() and base.is_dir() and not base.is_symlink(), "REMOTE_CAPSULE_SOURCE_INVALID")
+    need(isinstance(rel_paths, (list, tuple)) and len(rel_paths) > 0, "REMOTE_CAPSULE_EMPTY")
+
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for raw_rel in rel_paths:
+        rel = _validate_capsule_rel_path(raw_rel, allowed_patterns=allowed_patterns)
+        need(rel not in seen, "REMOTE_CAPSULE_DUPLICATE_PATH")
+        seen.add(rel)
+        normalized.append(rel)
+
+    entries: List[Dict[str, Any]] = []
+    manifest_items: List[Dict[str, Any]] = []
+    total_bytes = 0
+    for rel in sorted(normalized):
+        target = _assert_no_symlink_components(base, rel, require_exists=True)
+        st = target.lstat()
+        need(stat.S_ISREG(st.st_mode) and st.st_nlink == 1, "REMOTE_CAPSULE_FILE_UNSAFE")
+
+        is_sqlite = _is_sqlite_file(target)
+        if is_sqlite:
+            _checkpoint_sqlite_file(target)
+
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            fst = os.fstat(fd)
+            need(
+                stat.S_ISREG(fst.st_mode) and fst.st_nlink == 1 and fst.st_size <= max_file_bytes,
+                "REMOTE_CAPSULE_FILE_TOO_LARGE",
+            )
+            data = os.read(fd, max_file_bytes + 1)
+            need(len(data) == fst.st_size and len(data) <= max_file_bytes, "REMOTE_CAPSULE_FILE_CHANGED")
+        finally:
+            os.close(fd)
+
+        total_bytes += len(data)
+        need(total_bytes <= max_total_bytes, "REMOTE_CAPSULE_TOO_LARGE")
+        digest = sha(data)
+        entries.append(
+            {
+                "path": rel,
+                "size": len(data),
+                "sha256": digest,
+                "walCheckpointed": is_sqlite,
+                "contentB64": base64.b64encode(data).decode("ascii"),
+            }
+        )
+        manifest_items.append({"path": rel, "size": len(data), "sha256": digest})
+
+    manifest_sha = remote_canonical_sha256(manifest_items)
+    return {
+        "version": 1,
+        "files": entries,
+        "manifestSha256": manifest_sha,
+        "totalBytes": total_bytes,
+    }
+
+
+def import_session_capsule_files(
+    target_dir: Union[str, Path],
+    capsule: Dict[str, Any],
+    *,
+    allowed_patterns: Optional[Sequence[str]] = None,
+    max_file_bytes: int = 64 * 1024 * 1024,
+    max_total_bytes: int = 128 * 1024 * 1024,
+    file_mode: int = 0o600,
+) -> Dict[str, Any]:
+    """Verify checksums/whitelist and atomically materialize capsule files into `target_dir`."""
+    need(isinstance(capsule, dict) and capsule.get("version") == 1, "REMOTE_CAPSULE_INVALID")
+    raw_files = capsule.get("files")
+    expected_manifest_sha = capsule.get("manifestSha256")
+    need(
+        isinstance(raw_files, list)
+        and len(raw_files) > 0
+        and isinstance(expected_manifest_sha, str)
+        and bool(SHA256_RE.fullmatch(expected_manifest_sha)),
+        "REMOTE_CAPSULE_INVALID",
+    )
+    need(file_mode in (0o400, 0o600), "REMOTE_CAPSULE_MODE_INVALID")
+
+    dest_base = Path(target_dir)
+    need(not dest_base.is_symlink(), "REMOTE_CAPSULE_SYMLINK_FORBIDDEN")
+    if not dest_base.exists():
+        dest_base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    need(dest_base.is_dir() and not dest_base.is_symlink(), "REMOTE_CAPSULE_TARGET_INVALID")
+
+    validated_payloads: List[Tuple[str, bytes, bool]] = []
+    manifest_items: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    total_bytes = 0
+
+    for entry in raw_files:
+        need(isinstance(entry, dict), "REMOTE_CAPSULE_INVALID")
+        rel = _validate_capsule_rel_path(entry.get("path"), allowed_patterns=allowed_patterns)
+        need(rel not in seen, "REMOTE_CAPSULE_DUPLICATE_PATH")
+        seen.add(rel)
+        _assert_no_symlink_components(dest_base, rel, require_exists=False)
+
+        b64_val = entry.get("contentB64")
+        expected_sha = entry.get("sha256")
+        expected_size = entry.get("size")
+        need(
+            isinstance(b64_val, str)
+            and isinstance(expected_sha, str)
+            and bool(SHA256_RE.fullmatch(expected_sha))
+            and type(expected_size) is int
+            and 0 <= expected_size <= max_file_bytes,
+            "REMOTE_CAPSULE_INVALID",
+        )
+        try:
+            data = base64.b64decode(b64_val, validate=True)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("REMOTE_CAPSULE_INVALID") from exc
+        need(len(data) == expected_size and len(data) <= max_file_bytes, "REMOTE_CAPSULE_SIZE_MISMATCH")
+        need(sha(data) == expected_sha, "REMOTE_CAPSULE_CHECKSUM_MISMATCH")
+
+        total_bytes += len(data)
+        need(total_bytes <= max_total_bytes, "REMOTE_CAPSULE_TOO_LARGE")
+        is_sqlite = rel.lower().endswith(CAPSULE_SQLITE_SUFFIXES) or data.startswith(CAPSULE_SQLITE_HEADER)
+        validated_payloads.append((rel, data, is_sqlite))
+        manifest_items.append({"path": rel, "size": len(data), "sha256": expected_sha})
+
+    manifest_items.sort(key=lambda item: item["path"])
+    need(remote_canonical_sha256(manifest_items) == expected_manifest_sha, "REMOTE_CAPSULE_MANIFEST_MISMATCH")
+
+    imported_paths: List[str] = []
+    for rel, data, is_sqlite in sorted(validated_payloads, key=lambda item: item[0]):
+        dest_path = _assert_no_symlink_components(dest_base, rel, require_exists=False)
+        dest_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write(dest_path, data, mode=file_mode)
+        if is_sqlite:
+            for sidecar_sfx in ("-wal", "-shm"):
+                sidecar = dest_path.with_name(dest_path.name + sidecar_sfx)
+                if sidecar.exists() and not sidecar.is_symlink():
+                    sidecar.unlink()
+        imported_paths.append(rel)
+
+    return {
+        "importedPaths": imported_paths,
+        "manifestSha256": expected_manifest_sha,
+        "totalBytes": total_bytes,
+    }
 
 
 def main() -> int:

@@ -11,10 +11,11 @@ import { isCc5ResumeId, parseCc5ResumeId } from './engine/cc5ResumeId.js'
 import { isRemoteV4ResumeId, parseRemoteV4ResumeId } from './remotePool/resumeId.js'
 import { restartRunnerForConfigChange } from './runnerConfigRestart.js'
 import { BOX_IDLE_PRE_EXPIRY_MIN_TOKENS, boxIdlePreExpiryMs, cancelIdlePreExpiry } from './boxContextBudget.js'
-import { cc5SessionBackend, assertFreshCc5Session } from './cc5SessionBackend.js'
+import { cc5SessionBackend, assertFreshCc5Session, type CrossPoolMigrationGrant } from './cc5SessionBackend.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
 import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
+import { reapEphemeralBgCommandsSafe } from './sessionBgCommands.js'
 /**
  * Session submit path: submit, getOrCreate / exclusive create, idle finish, external turns, resume-id resolution
  *
@@ -143,7 +144,8 @@ import {
   activeGoalAttribution,
   RuntimeRecycleDrainingError,
 } from './sessionManager.js'
-import { ackPendingCheckpointIfTurnSucceeded, applyPendingCheckpointToSession, beginCheckpointTurnOutcome, isSessionCompacting, peekPendingCheckpoint, resetUnackedCheckpointSessionFlags, type PersistedCheckpointRecord } from './sessionCheckpointStore.js'
+import { ackPendingCheckpointIfTurnSucceeded, applyPendingCheckpointToSession, beginCheckpointTurnOutcome, isSessionCompacting, peekPendingCheckpoint, resetUnackedCheckpointSessionFlags, resolveMigrationAwareStoredResume, type PersistedCheckpointRecord } from './sessionCheckpointStore.js'
+import { notifyAuthorityCheckpointAck, prepareSessionAuthorityBeforeCreate } from './sessionAuthorityHook.js'
 import { beginTurnOverflowContext, clearTurnOverflowContext, getTurnActiveCheckpointGeneration, maybeAutoCompactBeforeTurn } from './sessionAutoCompact.js'
 import type {
   SessionManager,
@@ -185,6 +187,9 @@ export interface SessionSubmitHost {
   _sessionIdToKey: SessionManager['_sessionIdToKey']
   _trackPersistence: SessionManager['_trackPersistence']
   applyIdleResetIfRequested: SessionManager['applyIdleResetIfRequested']
+  authorityStateRuntime?: SessionManager['authorityStateRuntime']
+  capsuleRuntime?: SessionManager['capsuleRuntime']
+  getResumeStore?: SessionManager['getResumeStore']
   awaitResumeMapFlush: SessionManager['awaitResumeMapFlush']
   beginClientTurn: SessionManager['beginClientTurn']
   config: SessionManager['config']
@@ -1071,11 +1076,7 @@ export async function submit(
         : []
     if (opts?.resetNativeSession === true && session.providerTag === 'grok') {
       await session.runner.shutdown()
-      this._resumeMap.delete(session.sessionKey)
-      this._resumeMapTimestamps.delete(session.sessionKey)
-      this._resumeMapProvider.delete(session.sessionKey)
-      this._resumeMapLastCost.delete(session.sessionKey)
-      this._resumeMapHistory.delete(session.sessionKey)
+      this._forgetResumeEntry(session.sessionKey)
       session.ccbSessionId = null
       session.runner.clearSessionId()
       this._saveResumeMap()
@@ -1191,12 +1192,7 @@ export async function submit(
         injectionKey,
       })
       await session.runner.shutdown()
-      this._resumeMap.delete(session.sessionKey)
-      this._resumeMapTimestamps.delete(session.sessionKey)
-      this._resumeMapProvider.delete(session.sessionKey)
-      this._resumeMapLastCost.delete(session.sessionKey)
-      this._resumeMapCostImprecise.delete(session.sessionKey)
-      this._resumeMapHistory.delete(session.sessionKey)
+      this._forgetResumeEntry(session.sessionKey)
       session.ccbSessionId = null
       session.runner.clearSessionId?.()
       this._saveResumeMap()
@@ -1415,7 +1411,11 @@ export async function submit(
     try {
       await Promise.race([logicalTurnRun, livenessPromise])
       const activeCkptGen = getTurnActiveCheckpointGeneration(session) ?? pendingCheckpoint?.generation
-      if (activeCkptGen && ackPendingCheckpointIfTurnSucceeded(session, activeCkptGen)) checkpointAcked = true
+      const ckptTurnKey = opts?.dispatchContext?.dispatchId ?? opts?.replayLifecycle?.clientMessageId ?? requestId ?? 'turn-ack'
+      if (activeCkptGen && ackPendingCheckpointIfTurnSucceeded(session, activeCkptGen, undefined, () => this.authorityStateRuntime?.persistPendingCheckpointAckIntent?.(session.sessionKey, activeCkptGen, ckptTurnKey))) {
+        checkpointAcked = true
+        notifyAuthorityCheckpointAck({ authorityRuntime: this.authorityStateRuntime, sessionKey: session.sessionKey, checkpointGeneration: activeCkptGen, turnKey: ckptTurnKey })
+      }
     } finally {
       if (livenessTimer) clearInterval(livenessTimer)
     }
@@ -1577,7 +1577,7 @@ export async function submit(
 
 export async function _getOrCreateExclusive(
   this: SessionSubmitHost,
-  opts: Parameters<SessionManager['getOrCreate']>[0],
+  opts: Parameters<SessionManager['getOrCreate']>[0] & { poolMigration?: CrossPoolMigrationGrant },
 ): Promise<AgentSession> {
   const ownsDispatchFence = this._ownsPromptQueueExecutionFence(
     opts.sessionKey,
@@ -1591,12 +1591,7 @@ export async function _getOrCreateExclusive(
   }
   // Identity construction outlives an individual dispatch/switch. Never retain
   // their one-use admission credentials in the reusable session template.
-  const {
-    promptQueueExecutionFence: _fence,
-    modelSwitchId: _switchId,
-    preheatOnly: _preheatOnly,
-    ...identityCreationOpts
-  } = opts
+  const { promptQueueExecutionFence: _fence, modelSwitchId: _switchId, preheatOnly: _preheatOnly, poolMigration: _poolMigration, ...identityCreationOpts } = opts
   // Hermetic advisor/Auto-Dream sessions have no persona or identity overlay.
   // Fetching marketplace identity here would fail-closed the no-tools path
   // whenever master sync is briefly unavailable.
@@ -1640,14 +1635,20 @@ export async function _getOrCreateExclusive(
   // This runs under the creation gate. A late speculative lookup must not
   // overwrite a real first turn that created its runner while projection awaited.
   if (opts.preheatOnly && existing) return existing
+  const poolMigration = opts.poolMigration
+  const hasAuthorizedMigration = Boolean(
+    poolMigration?.allowBackendTransition && poolMigration.migrationId.trim().length >= 8 &&
+      Number.isSafeInteger(poolMigration.placementEpoch) && poolMigration.placementEpoch >= 1,
+  )
+  if (this.authorityStateRuntime && this.getResumeStore) await prepareSessionAuthorityBeforeCreate({ authorityRuntime: this.authorityStateRuntime, capsuleRuntime: this.capsuleRuntime, resumeStore: this.getResumeStore(), sessionKey: opts.sessionKey, engine: engineId as 'ccb' | 'codex' | 'antigravity' | 'grok' | 'cursor' | 'zcode', workspaceCwd: opts.workspaceCwd ?? opts.agent.cwd, placementEpoch: hasAuthorizedMigration ? poolMigration?.placementEpoch : undefined, existingSession: existing })
   const executionBackend = cc5SessionBackend({ ...opts, engineId, executionModel,
-    storedResumeId: this._resumeMap.get(opts.sessionKey) })
+    storedResumeId: this._resumeMap.get(opts.sessionKey), poolMigration })
   const backendChanged = !sameRemoteExecutionBackend(existing?.runner.executionBackend, executionBackend)
-  if (existing?.runner.executionBackend && backendChanged) throw new Error('CC5_BACKEND_SCOPE_CHANGED')
+  if (existing?.runner.executionBackend && backendChanged && !hasAuthorizedMigration) throw new Error('CC5_BACKEND_SCOPE_CHANGED')
   const assertFreshBackendTarget = (current: AgentSession | undefined) => assertFreshCc5Session({
     current, storedResumeId: this._resumeMap.get(opts.sessionKey),
     storedResumeProvider: normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)),
-    executionBackend,
+    executionBackend, poolMigration,
     sessionIds: [opts.sessionKey, ...(opts.peerId ? [opts.peerId] : [])], hasPersistedTurnActivity,
   })
   if (executionBackend && (!existing || backendChanged)) await assertFreshBackendTarget(existing)
@@ -1752,9 +1753,7 @@ export async function _getOrCreateExclusive(
           const canonical = this.sessions.get(opts.sessionKey)
           if (canonical && canonical !== existing) {
             await canonical.lock
-            if (canonical.runner.executionBackend && !sameRemoteExecutionBackend(canonical.runner.executionBackend, executionBackend)) {
-              throw new Error('CC5_BACKEND_SCOPE_CHANGED')
-            }
+            if (canonical.runner.executionBackend && !sameRemoteExecutionBackend(canonical.runner.executionBackend, executionBackend) && !hasAuthorizedMigration) throw new Error('CC5_BACKEND_SCOPE_CHANGED')
             const desiredEngineNow =
               opts.model !== undefined ||
               opts.executionAuthority !== undefined ||
@@ -1840,19 +1839,11 @@ export async function _getOrCreateExclusive(
             // current-input budgeting can legitimately select [] for old chats.
             contextRebuildNotice = hadPriorProviderState ? replacementNotice : undefined
           } catch (historyErr) {
-            // Failure to prove freshness must preserve the exceptional notice.
-            // Suppressing a real provider switch is worse than a best-effort
-            // notice; runner replacement itself must still continue.
-            log.warn(
-              'session-replacement prior-turn read failed; preserving rebuild notice',
-              {
-                sessionKey: opts.sessionKey,
-                replacementNotice,
-              },
-              historyErr,
-            )
+            // Preserve exceptional notice on history read failure; runner replacement still continues.
+            log.warn('session-replacement prior-turn read failed; preserving rebuild notice', { sessionKey: opts.sessionKey, replacementNotice }, historyErr)
           }
           await existing.runner.shutdown()
+          await reapEphemeralBgCommandsSafe(opts.sessionKey, identityRefreshSession, log)
         } catch (err) {
           if (executionBackend || existing.runner.executionBackend) {
             existing._replacing = false
@@ -1908,23 +1899,12 @@ export async function _getOrCreateExclusive(
     //     teardown 判定与构造用同一份解析结果,不会出现"比较用 A、spawn 用 B"。
     //   - createEngine 对未注册 engine fail-closed 抛错(原 v5 channel 硬闸的
     //     语义升级形态:任何 channel 都不会把未注册 engine 静默落到 CCB)。
-    const storedResumeForCreate = this._resumeMap.get(opts.sessionKey)
+    const { effectiveStoredResumeId: storedResumeForCreate, clearStaleResume } = resolveMigrationAwareStoredResume({
+      storedResumeId: this._resumeMap.get(opts.sessionKey), executionBackend, hasAuthorizedMigration,
+    })
+    if (clearStaleResume) { this._forgetResumeEntry(opts.sessionKey); this._saveResumeMap() }
     const cc5Backend = executionBackend?.kind === 'cc5-interactive-v1' ? executionBackend : undefined
     const v4Backend = executionBackend?.kind === 'remote-driver-v4' ? executionBackend : undefined
-    if (
-      cc5Backend &&
-      storedResumeForCreate &&
-      parseCc5ResumeId(storedResumeForCreate)?.bindingId !== cc5Backend.operationId
-    ) {
-      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
-    }
-    if (
-      v4Backend &&
-      storedResumeForCreate &&
-      parseRemoteV4ResumeId(storedResumeForCreate)?.bindingId !== v4Backend.operationId
-    ) {
-      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
-    }
     const hadSameProviderResume =
       Boolean(storedResumeForCreate) &&
       normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === engineId
@@ -2378,6 +2358,7 @@ export async function getOrCreate(
      *  usage_records.mode/parent_session_id/delegate_agent_id。
      *  Spawn-time attribute(delegate sessionKey 带时间戳一次性,不存在复用)。 */
     usageAttribution?: UsageAttributionTag
+    poolMigration?: CrossPoolMigrationGrant
   },
 ): Promise<AgentSession> {
   return this._enterSessionCreateGate(opts.sessionKey, () => this._getOrCreateExclusive(opts))
@@ -2890,12 +2871,7 @@ export async function recordExternalTurn(
     // The native provider thread did not execute this turn. Force a clean
     // resume so the next user message receives master history (including
     // the external assistant row) instead of continuing a stale thread.
-    this._resumeMap.delete(session.sessionKey)
-    this._resumeMapTimestamps.delete(session.sessionKey)
-    this._resumeMapProvider.delete(session.sessionKey)
-    this._resumeMapLastCost.delete(session.sessionKey)
-    this._resumeMapCostImprecise.delete(session.sessionKey)
-    this._resumeMapHistory.delete(session.sessionKey)
+    this._forgetResumeEntry(session.sessionKey)
     session.ccbSessionId = null
     session.runner.clearSessionId?.()
     this._saveResumeMap()

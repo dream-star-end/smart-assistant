@@ -1,41 +1,125 @@
 /**
- * Turn-scoped soft-yield job manager and bounded delta stream buffer for Antigravity `oc_bash` (OCV5-789).
+ * Turn-scoped & lifecycle-governed job manager for Antigravity `oc_bash` (OCV5-789 / OCV5-908 P2-1).
  *
- * When a foreground command outlives `timeout_ms` (default 60s, max 600s), the process group stays
- * alive by default so progress is never lost. Callers resume with `job_id` (`wait` / `status` / `kill`)
- * until completion or explicit stop. Idle unpolled jobs, max-lifetime jobs, and MCP disconnect
- * immediately reap the entire detached process group and destroy stdio streams.
+ * Powered by Layer 3 `ExecEnvJobRegistry` + `BoundedDeltaStreamBuffer` (`@openclaude/storage`):
+ * - `ephemeral_turn` (default): turn-scoped command subject to `idleJobTtlMs` & `maxJobLifetimeMs`,
+ *   reaped on turn handoff (`reapTurnJobs`) and graceful MCP disconnect (`shutdown({ preserveSurvivors: true })`).
+ * - `managed_job`: survives brain switches and graceful MCP disconnects with MCP-independent
+ *   file-backed stdio sinks (zero SIGPIPE/EPIPE); bounded by `maxJobLifetimeMs` (enforced by
+ *   Gateway sweeper after disconnect) and bounded closed-result retention (W03).
+ * - `daemon_service`: long-lived dev/preview service surviving brain switches & graceful MCP
+ *   disconnects with MCP-independent stdio sinks and no max-lifetime expiration.
  */
-import { spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import type { JobLifecycleClass, ManagedJobSummary } from '@openclaude/protocol'
+import {
+  ExecEnvJobRegistry,
+  hasAliveVerifiedProcessGroup,
+  leadingContinuationUtf8Count,
+  parseProcStatFull,
+  parseProcStatStartTimeTicks,
+  registerDefaultSyncProcOps,
+  sendVerifiedGroupSignal,
+  trailingIncompleteUtf8Count,
+  type ExecEnvJobClosedEvent,
+  type ExecEnvJobStartResult,
+  type ExecEnvJobStartedEvent,
+  type ExecEnvMigrationTombstoneResult,
+  type ExecEnvReapStopProof,
+  type ExecEnvShutdownResult,
+  type ParsedProcStat,
+  type VerifyProcessGroupOps,
+} from '@openclaude/storage'
+import {
+  CLOSE_DRAIN_SAFETY_MS,
+  DeltaStreamBuffer,
+  KILL_GRACE_MS,
+  OC_BASH_HEAD_BYTES,
+  OC_BASH_IDLE_JOB_TTL_MS,
+  OC_BASH_MAX_ACTIVE_JOBS,
+  OC_BASH_MAX_JOB_LIFETIME_MS,
+  OC_BASH_MAX_OUTPUT_BYTES,
+  OC_BASH_SNAPSHOT_PREVIEW_MAX_CHARS,
+  OC_BASH_TAIL_BYTES,
+  OC_BASH_TOMBSTONE_MAX,
+  isJobLifecycleClass,
+  killChildProcessGroup,
+  makeCommandPreview,
+  sanitizeEnvRecord,
+  sanitizeOcBashCommandPreview,
+  type JobTerminationReason,
+  type JobTombstone,
+  type JobTombstoneReason,
+  type OcBashAction,
+  type OcBashCallOutcome,
+  type OcBashJobManagerOptions,
+  type OcBashJobSnapshot,
+} from './ocBashTypes.js'
 
-export const OC_BASH_MAX_OUTPUT_BYTES = 200 * 1024
-export const OC_BASH_HEAD_BYTES = 64 * 1024
-export const OC_BASH_TAIL_BYTES = OC_BASH_MAX_OUTPUT_BYTES - OC_BASH_HEAD_BYTES
-export const OC_BASH_MAX_ACTIVE_JOBS = 4
-export const OC_BASH_IDLE_JOB_TTL_MS = 5 * 60_000
-export const OC_BASH_MAX_JOB_LIFETIME_MS = 2 * 60 * 60_000
-export const OC_BASH_TOMBSTONE_MAX = 64
-export const OC_BASH_SNAPSHOT_PREVIEW_MAX_CHARS = 240
-export const KILL_GRACE_MS = 400
-export const CLOSE_DRAIN_SAFETY_MS = 2_000
+export {
+  CLOSE_DRAIN_SAFETY_MS,
+  DeltaStreamBuffer,
+  KILL_GRACE_MS,
+  OC_BASH_HEAD_BYTES,
+  OC_BASH_IDLE_JOB_TTL_MS,
+  OC_BASH_MAX_ACTIVE_JOBS,
+  OC_BASH_MAX_JOB_LIFETIME_MS,
+  OC_BASH_MAX_OUTPUT_BYTES,
+  OC_BASH_SNAPSHOT_PREVIEW_MAX_CHARS,
+  OC_BASH_TAIL_BYTES,
+  OC_BASH_TOMBSTONE_MAX,
+  isJobLifecycleClass,
+  killChildProcessGroup,
+  leadingContinuationUtf8Count,
+  parseProcStatStartTimeTicks,
+  sanitizeOcBashCommandPreview,
+  trailingIncompleteUtf8Count,
+}
+export type {
+  JobTerminationReason,
+  JobTombstone,
+  JobTombstoneReason,
+  OcBashAction,
+  OcBashCallOutcome,
+  OcBashJobManagerOptions,
+  OcBashJobSnapshot,
+}
 
-export interface OcBashJobSnapshot {
-  id: string
-  jobId: string
-  pid: number
-  pgid: number
-  ownerPid: number
-  startTimeTicks: number | null
-  sessionKey: string
-  sessionId: string
-  commandPreview: string
-  cwd: string
-  startedAt: number
-  updatedAt: number
-  maxLifetimeAt: number
+const DAEMON_SNAPSHOT_HORIZON_MS = 365 * 24 * 60 * 60_000
+
+function readLocalLinuxProcStat(pid: number): ParsedProcStat | null {
+  if (process.platform !== 'linux' || !Number.isInteger(pid) || pid <= 1) return null
+  try {
+    return parseProcStatFull(readFileSync(`/proc/${pid}/stat`, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+function listLocalLinuxProcPids(): number[] {
+  if (process.platform !== 'linux') return []
+  try {
+    const pids: number[] = []
+    for (const name of readdirSync('/proc')) {
+      if (!/^[1-9][0-9]*$/.test(name)) continue
+      const pid = Number(name)
+      if (Number.isSafeInteger(pid) && pid > 1) pids.push(pid)
+    }
+    return pids
+  } catch {
+    return []
+  }
+}
+
+const LOCAL_PROC_OPS: VerifyProcessGroupOps = {
+  readProcStat: readLocalLinuxProcStat,
+  listProcPids: listLocalLinuxProcPids,
+}
+registerDefaultSyncProcOps(LOCAL_PROC_OPS)
+export function readProcStartTimeTicks(pid: number): number | null {
+  return readLocalLinuxProcStat(pid)?.startTimeTicks ?? null
 }
 
 export function resolveOcBashRegistryDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -65,461 +149,224 @@ export function resolveOcBashSessionIdentity(
 }
 
 /**
- * Parse field 22 (`starttime`, clock ticks since boot) from Linux `/proc/${pid}/stat`.
- * Handles process `comm` names containing spaces or parentheses by splitting after the last `)`.
- */
-export function readProcStartTimeTicks(pid: number): number | null {
-  if (!Number.isInteger(pid) || pid <= 1) return null
-  if (process.platform !== 'linux') return null
-  try {
-    const raw = readFileSync(`/proc/${pid}/stat`, 'utf8')
-    return parseProcStatStartTimeTicks(raw)
-  } catch {
-    return null
-  }
-}
-
-export function parseProcStatStartTimeTicks(statLine: string): number | null {
-  const rparen = statLine.lastIndexOf(')')
-  if (rparen < 0) return null
-  const rest = statLine.slice(rparen + 1).trim()
-  if (!rest) return null
-  const fields = rest.split(/\s+/)
-  // Field 1=pid, 2=(comm); after last ')', index 0 is field 3 (state), so field 22 is index 19.
-  const rawTicks = fields[19]
-  if (!rawTicks || !/^\d+$/.test(rawTicks)) return null
-  const ticks = Number(rawTicks)
-  return Number.isSafeInteger(ticks) && ticks >= 0 ? ticks : null
-}
-
-/**
  * Returns true if any live non-zombie process still belongs to verified process group `pgid`
- * with `starttime >= minStartTicks` (prevents deleting the control snapshot when the shell
- * leader exits while detached sub-children in the same process group are still running).
+ * with `starttime >= minStartTicks` (fails closed when `minStartTicks === null` or PID reused).
  */
 export function hasAliveVerifiedGroupMembers(pgid: number, minStartTicks: number | null): boolean {
   if (process.platform !== 'linux' || !Number.isInteger(pgid) || pgid <= 1 || minStartTicks === null) {
     return false
   }
-  // Fast short-circuit: ESRCH proves zero processes exist in process group `pgid`,
-  // avoiding a synchronous full scan of /proc/<pid>/stat on normal exits.
   try {
     process.kill(-pgid, 0)
   } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === 'ESRCH') {
-      return false
-    }
+    if ((err as NodeJS.ErrnoException)?.code === 'ESRCH') return false
   }
-  let entries: string[]
-  try {
-    entries = readdirSync('/proc')
-  } catch {
-    return false
-  }
-  for (const name of entries) {
-    if (!/^\d+$/.test(name)) continue
-    try {
-      const raw = readFileSync(`/proc/${name}/stat`, 'utf8')
-      const rparen = raw.lastIndexOf(')')
-      if (rparen < 0) continue
-      const fields = raw.slice(rparen + 1).trim().split(/\s+/)
-      const state = fields[0] ?? ''
-      if (state === 'Z' || state === 'X' || state === 'x') continue
-      const pgrp = Number(fields[2])
-      if (pgrp !== pgid) continue
-      const ticks = Number(fields[19])
-      if (Number.isSafeInteger(ticks) && ticks >= minStartTicks) {
-        return true
-      }
-    } catch {
-      /* exited during scan */
-    }
-  }
-  return false
+  return hasAliveVerifiedProcessGroup(pgid, minStartTicks, LOCAL_PROC_OPS)
 }
 
-/**
- * Single-line redacted command preview bounded to <= 240 chars for disk job snapshots.
- */
-export function sanitizeOcBashCommandPreview(
-  command: string,
-  maxChars = OC_BASH_SNAPSHOT_PREVIEW_MAX_CHARS,
-): string {
-  let text = command.replace(/\s+/g, ' ').trim()
-  // Redact URL credentials (scheme://user:pass@host)
-  text = text.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s:@]+:)([^@\s]+)(@)/g, '$1[REDACTED]$3')
-  // Redact Bearer / Basic authorization tokens
-  text = text.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [REDACTED]')
-  // Redact common secret key assignments (ENV=val or --flag=val / --flag val)
-  text = text.replace(
-    /\b([A-Za-z0-9_-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|AUTH)[A-Za-z0-9_-]*)(\s*[:=]\s*|\s+)("[^"]*"|'[^']*'|[^\s"'`;|&]+)/gi,
-    '$1$2[REDACTED]',
-  )
-  // Redact high-confidence provider secret prefixes
-  text = text.replace(
-    /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{12,}|AKIA[0-9A-Z]{16})\b/g,
-    '[REDACTED]',
-  )
-  if (text.length <= maxChars) return text
-  const cut = Math.max(0, maxChars - 3)
-  return `${text.slice(0, cut)}...`
-}
-
-export type OcBashAction = 'wait' | 'status' | 'kill'
-export type JobTerminationReason = 'killed' | 'hard_timeout' | 'idle_timeout' | 'max_lifetime'
-export type JobTombstoneReason = 'collected' | 'killed' | 'idle_timeout' | 'max_lifetime'
-
-export interface JobTombstone {
-  jobId: string
-  exitCode: number | null
-  signal: NodeJS.Signals | null
-  reason: JobTombstoneReason
-  elapsedMs: number
-  commandPreview: string
-}
-
-export type OcBashCallOutcome =
-  | {
-      kind: 'finished'
-      jobId: string
-      exitCode: number | null
-      signal: NodeJS.Signals | null
-      stdout: string
-      stderr: string
-      truncated: boolean
-      elapsedMs: number
-      spawnError?: string
-    }
-  | {
-      kind: 'running'
-      jobId: string
-      elapsedMs: number
-      stdout: string
-      stderr: string
-      truncated: boolean
-    }
-  | {
-      kind: 'hard_timeout'
-      timeoutMs: number
-      exitCode: number | null
-      signal: NodeJS.Signals | null
-      stdout: string
-      stderr: string
-      truncated: boolean
-    }
-  | {
-      kind: 'killed'
-      jobId: string
-      exitCode: number | null
-      signal: NodeJS.Signals | null
-      stdout: string
-      stderr: string
-      truncated: boolean
-      elapsedMs: number
-    }
-  | {
-      kind: 'terminated'
-      jobId: string
-      reason: 'idle_timeout' | 'max_lifetime'
-      exitCode: number | null
-      signal: NodeJS.Signals | null
-      stdout: string
-      stderr: string
-      truncated: boolean
-      elapsedMs: number
-    }
-  | { kind: 'tombstone'; tombstone: JobTombstone }
-  | { kind: 'not_found'; jobId: string }
-  | { kind: 'busy'; jobId: string }
-  | { kind: 'too_many_jobs'; maxActiveJobs: number; active: string[] }
-  | { kind: 'spawn_error'; error: string }
-
-/**
- * Count trailing bytes (1..3) belonging to an incomplete multi-byte UTF-8 sequence at the end of `buf`.
- */
-export function trailingIncompleteUtf8Count(buf: Buffer): number {
-  const len = buf.length
-  if (len === 0) return 0
-  let pos = len - 1
-  const minPos = Math.max(0, len - 3)
-  while (pos > minPos && (buf[pos]! & 0xc0) === 0x80) {
-    pos -= 1
-  }
-  const lead = buf[pos]!
-  if ((lead & 0x80) === 0) return 0
-  if ((lead & 0xc0) === 0x80) return 0
-  let expectedLen = 0
-  if ((lead & 0xe0) === 0xc0) expectedLen = 2
-  else if ((lead & 0xf0) === 0xe0) expectedLen = 3
-  else if ((lead & 0xf8) === 0xf0) expectedLen = 4
-  else return 0
-  const actualLen = len - pos
-  return actualLen < expectedLen ? actualLen : 0
-}
-
-/**
- * Count leading orphaned UTF-8 continuation bytes (`10xxxxxx`) at the start of a sliced tail buffer.
- */
-export function leadingContinuationUtf8Count(buf: Buffer): number {
-  let i = 0
-  const limit = Math.min(3, buf.length)
-  while (i < limit && (buf[i]! & 0xc0) === 0x80) {
-    i += 1
-  }
-  return i
-}
-
-/**
- * O(1) bounded per-segment stream buffer keeping `headCap` (32%) + rolling `tailCap` (68%) when truncated,
- * while holding incomplete multi-byte UTF-8 tails across `drain(false)` segments so characters never split.
- */
-export class DeltaStreamBuffer {
-  private readonly maxBytes: number
-  private readonly headCap: number
-  private readonly tailCap: number
-  private unreadChunks: Buffer[] = []
-  private unreadBytes = 0
-  private totalBytes = 0
-  private truncated = false
-  private headBuf = Buffer.alloc(0)
-  private tailBuf = Buffer.alloc(0)
-  private carry = Buffer.alloc(0)
-
-  constructor(maxBytes = OC_BASH_MAX_OUTPUT_BYTES) {
-    this.maxBytes = Math.max(0, Math.floor(maxBytes))
-    this.headCap = Math.max(0, Math.floor(this.maxBytes * 0.32))
-    this.tailCap = Math.max(0, this.maxBytes - this.headCap)
-  }
-
-  push(chunk: Buffer): void {
-    const data = this.carry.length > 0 ? Buffer.concat([this.carry, chunk]) : chunk
-    if (this.carry.length > 0) this.carry = Buffer.alloc(0)
-    if (data.length === 0) return
-
-    this.totalBytes += data.length
-    if (!this.truncated) {
-      if (this.unreadBytes + data.length <= this.maxBytes) {
-        this.unreadChunks.push(data)
-        this.unreadBytes += data.length
-        return
-      }
-      this.truncated = true
-      this.unreadChunks.push(data)
-      const combined = Buffer.concat(this.unreadChunks)
-      this.unreadChunks = []
-      this.unreadBytes = 0
-      this.headBuf = Buffer.from(combined.subarray(0, this.headCap))
-      this.tailBuf = this.tailCap > 0
-        ? Buffer.from(combined.subarray(Math.max(this.headCap, combined.length - this.tailCap)))
-        : Buffer.alloc(0)
-      return
-    }
-
-    if (this.tailCap === 0) return
-    if (data.length >= this.tailCap) {
-      this.tailBuf = Buffer.from(data.subarray(data.length - this.tailCap))
-    } else if (this.tailBuf.length + data.length <= this.tailCap) {
-      this.tailBuf = Buffer.concat([this.tailBuf, data])
-    } else {
-      const keepFromOld = this.tailCap - data.length
-      this.tailBuf = Buffer.concat([this.tailBuf.subarray(this.tailBuf.length - keepFromOld), data])
-    }
-  }
-
-  drain(isFinal: boolean): { text: string; truncated: boolean } {
-    if (this.totalBytes === 0) {
-      if (isFinal && this.carry.length > 0) {
-        const text = this.carry.toString('utf8')
-        this.carry = Buffer.alloc(0)
-        return { text, truncated: false }
-      }
-      return { text: '', truncated: false }
-    }
-
-    if (!this.truncated) {
-      let buf = Buffer.concat(this.unreadChunks)
-      this.unreadChunks = []
-      this.unreadBytes = 0
-      this.totalBytes = 0
-      if (!isFinal) {
-        const trail = trailingIncompleteUtf8Count(buf)
-        if (trail > 0) {
-          this.carry = Buffer.from(buf.subarray(buf.length - trail))
-          buf = buf.subarray(0, buf.length - trail)
-        }
-      }
-      return { text: buf.toString('utf8'), truncated: false }
-    }
-
-    const headCut = trailingIncompleteUtf8Count(this.headBuf)
-    const headClean = headCut > 0 ? this.headBuf.subarray(0, this.headBuf.length - headCut) : this.headBuf
-
-    const tailLeadSkip = leadingContinuationUtf8Count(this.tailBuf)
-    let tailClean = tailLeadSkip > 0 ? this.tailBuf.subarray(tailLeadSkip) : this.tailBuf
-    let tailTrail = 0
-    if (!isFinal) {
-      tailTrail = trailingIncompleteUtf8Count(tailClean)
-      if (tailTrail > 0) {
-        this.carry = Buffer.from(tailClean.subarray(tailClean.length - tailTrail))
-        tailClean = tailClean.subarray(0, tailClean.length - tailTrail)
-      }
-    }
-
-    const omitted = Math.max(0, this.totalBytes - headClean.length - tailClean.length - tailTrail)
-    const headText = headClean.toString('utf8')
-    const tailText = tailClean.toString('utf8')
-
-    this.headBuf = Buffer.alloc(0)
-    this.tailBuf = Buffer.alloc(0)
-    this.unreadChunks = []
-    this.unreadBytes = 0
-    this.totalBytes = 0
-    this.truncated = false
-
-    return {
-      text: `${headText}\n...[truncated ${omitted} bytes]...\n${tailText}`,
-      truncated: true,
-    }
-  }
-
-  clear(): void {
-    this.unreadChunks = []
-    this.unreadBytes = 0
-    this.totalBytes = 0
-    this.truncated = false
-    this.headBuf = Buffer.alloc(0)
-    this.tailBuf = Buffer.alloc(0)
-    this.carry = Buffer.alloc(0)
-  }
-}
-
-export function killChildProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  const pid = child.pid
-  if (!pid || pid <= 0) return
-  try {
-    process.kill(-pid, signal)
-  } catch {
-    try {
-      child.kill(signal)
-    } catch {
-      /* already gone */
-    }
-  }
-}
-
-interface ManagedBashJob {
+interface ManagedBashJobMeta {
   id: string
+  lifecycleClass: JobLifecycleClass
   commandPreview: string
   snapshotPreview: string
   cwd: string
   startedAt: number
   maxLifetimeAt: number
+  pid: number | undefined
+  pgid: number | undefined
   startTimeTicks: number | null
   snapshotPath: string | null
-  child: ChildProcess
-  stdout: DeltaStreamBuffer
-  stderr: DeltaStreamBuffer
+  stdoutLogPath?: string
+  stderrLogPath?: string
+  stdoutCursor: number
+  stderrCursor: number
   closed: boolean
   exitCode: number | null
   signal: NodeJS.Signals | null
   spawnError?: string
   yielded: boolean
   waiterInFlight: boolean
-  killRequested: boolean
   terminationReason: JobTerminationReason | null
-  killTimer: NodeJS.Timeout | null
-  closeSafetyTimer: NodeJS.Timeout | null
   idleTimer: NodeJS.Timeout | null
-  lifetimeTimer: NodeJS.Timeout | null
-  closePromise: Promise<void>
-  resolveClose: () => void
 }
 
-export interface OcBashJobManagerOptions {
-  idleJobTtlMs?: number
-  maxJobLifetimeMs?: number
-  maxActiveJobs?: number
-  maxBytes?: number
-  killGraceMs?: number
-  closeDrainSafetyMs?: number
-  trackProcessGroup?: (pid: number) => void
-  untrackProcessGroup?: (pid: number | undefined) => void
-  /** Override disk snapshot registry directory; pass `null` to disable snapshots. */
-  registryDir?: string | null
-  /** Override session key stamped into snapshots (defaults to OC_SESSION_KEY / OPENCLAUDE_SESSION_KEY). */
-  sessionKey?: string
-  /** Environment source for registryDir / sessionKey resolution (defaults to process.env). */
-  env?: NodeJS.ProcessEnv
+interface LingeringProcessGroup {
+  readonly jobId: string
+  readonly pgid: number
+  readonly startTimeTicks: number | null
+  readonly lifecycleClass: JobLifecycleClass
+  readonly startedAt: number
+  readonly commandPreview: string
+  readonly snapshotPath: string | null
+  readonly stdoutLogPath?: string
+  readonly stderrLogPath?: string
 }
 
-function makeCommandPreview(command: string): string {
-  const singleLine = command.replace(/\s+/g, ' ').trim()
-  return singleLine.length > 80 ? `${singleLine.slice(0, 77)}...` : singleLine
+function unlinkSafe(filePath: string | null | undefined): void {
+  if (!filePath) return
+  try {
+    unlinkSync(filePath)
+  } catch (err) {
+    void err
+  }
+}
+
+function unlinkRotatingLogPair(basePath: string | null | undefined): void {
+  if (!basePath) return
+  unlinkSafe(basePath)
+  unlinkSafe(`${basePath}.1`)
 }
 
 export class OcBashJobManager {
   private readonly idleJobTtlMs: number
   private readonly maxJobLifetimeMs: number
   private readonly maxActiveJobs: number
-  private readonly maxBytes: number
-  private readonly killGraceMs: number
-  private readonly closeDrainSafetyMs: number
   private readonly trackProcessGroup?: (pid: number) => void
   private readonly untrackProcessGroup?: (pid: number | undefined) => void
   private readonly registryDir: string | null
   private readonly sessionKeyOverride?: string
   private readonly env: NodeJS.ProcessEnv
+  readonly leaseId: string
+  private readonly defaultLifecycleClass: JobLifecycleClass
+  readonly registry: ExecEnvJobRegistry
 
   private seq = 0
-  private readonly jobs = new Map<string, ManagedBashJob>()
+  private readonly jobs = new Map<string, ManagedBashJobMeta>()
   private readonly tombstones = new Map<string, JobTombstone>()
-  private readonly localProcessGroups = new Set<number>()
-  private readonly activeSnapshotPaths = new Set<string>()
+  /** B07: Tracks lingering sub-children in the same pgrp after the shell leader exits. */
+  private readonly lingeringGroups = new Map<string, LingeringProcessGroup>()
+  private readonly trackedSnapshotClass = new Map<string, JobLifecycleClass>()
   private isShutdown = false
 
   constructor(opts: OcBashJobManagerOptions = {}) {
     this.idleJobTtlMs = opts.idleJobTtlMs ?? OC_BASH_IDLE_JOB_TTL_MS
     this.maxJobLifetimeMs = opts.maxJobLifetimeMs ?? OC_BASH_MAX_JOB_LIFETIME_MS
     this.maxActiveJobs = opts.maxActiveJobs ?? OC_BASH_MAX_ACTIVE_JOBS
-    this.maxBytes = opts.maxBytes ?? OC_BASH_MAX_OUTPUT_BYTES
-    this.killGraceMs = opts.killGraceMs ?? KILL_GRACE_MS
-    this.closeDrainSafetyMs = opts.closeDrainSafetyMs ?? CLOSE_DRAIN_SAFETY_MS
     this.trackProcessGroup = opts.trackProcessGroup
     this.untrackProcessGroup = opts.untrackProcessGroup
     this.env = opts.env ?? process.env
     this.sessionKeyOverride = opts.sessionKey
+    this.leaseId = opts.leaseId?.trim() || `oc_bash_lease_${process.pid}`
+    this.defaultLifecycleClass = opts.defaultLifecycleClass ?? 'ephemeral_turn'
     this.registryDir =
       opts.registryDir === undefined
         ? resolveOcBashRegistryDir(this.env)
-        : opts.registryDir && opts.registryDir.trim()
-          ? opts.registryDir.trim()
-          : null
+        : opts.registryDir?.trim() || null
+
+    this.registry = new ExecEnvJobRegistry({
+      maxOutputBytes: opts.maxBytes ?? OC_BASH_MAX_OUTPUT_BYTES,
+      killGraceMs: opts.killGraceMs ?? KILL_GRACE_MS,
+      closeDrainSafetyMs: opts.closeDrainSafetyMs ?? CLOSE_DRAIN_SAFETY_MS,
+      maxJobLifetimeMs: this.maxJobLifetimeMs,
+      maxTombstones: OC_BASH_TOMBSTONE_MAX,
+      defaultEnv: sanitizeEnvRecord(this.env),
+      envId: opts.envId ?? `oc-bash-${process.pid}`,
+      // F04: Pass explicit `null` when registryDir is disabled so managed_job/daemon_service
+      // fail closed instead of falling back to an MCP-dependent pipe.
+      survivableStdioDir: this.registryDir ? join(this.registryDir, 'logs') : null,
+      verifyProcessGroupOps: LOCAL_PROC_OPS,
+      ...(opts.maxLogFileBytes !== undefined ? { maxLogFileBytes: opts.maxLogFileBytes } : {}),
+      onJobStarted: (ev) => this.handleRegistryJobStarted(ev),
+      onJobClosed: (ev) => this.handleRegistryJobClosed(ev),
+    })
   }
 
-  private writeJobSnapshot(job: ManagedBashJob): void {
-    if (!this.registryDir || job.closed || this.isShutdown) return
-    const pid = job.child.pid
+  private handleRegistryJobStarted(ev: ExecEnvJobStartedEvent): void {
+    const meta = this.jobs.get(ev.jobId)
+    if (!meta) return
+    meta.pid = ev.pid
+    meta.pgid = ev.pgid
+    meta.startTimeTicks = ev.startTimeTicks
+    if (ev.stdoutLogPath) meta.stdoutLogPath = ev.stdoutLogPath
+    if (ev.stderrLogPath) meta.stderrLogPath = ev.stderrLogPath
+    if (ev.pgid && ev.pgid > 0) {
+      if (meta.lifecycleClass === 'ephemeral_turn') {
+        this.trackProcessGroup?.(ev.pgid)
+      }
+      this.writeJobSnapshot(meta)
+    }
+  }
+
+  private handleRegistryJobClosed(ev: ExecEnvJobClosedEvent): void {
+    const meta = this.jobs.get(ev.jobId)
+    if (!meta) return
+    meta.closed = true
+    meta.exitCode = ev.exitCode
+    meta.signal = ev.signal as NodeJS.Signals | null
+    if (ev.spawnError !== undefined) meta.spawnError = ev.spawnError
+    if (ev.terminationCause === 'max_lifetime') {
+      meta.terminationReason ??= 'max_lifetime'
+    }
+
+    const groupStillRunning =
+      !ev.killRequested &&
+      Boolean(ev.pgid && ev.pgid > 1) &&
+      hasAliveVerifiedGroupMembers(ev.pgid!, ev.startTimeTicks)
+
+    if (!groupStillRunning) {
+      if (meta.pgid && meta.pgid > 0) {
+        this.untrackProcessGroup?.(meta.pgid)
+      }
+      this.removeJobSnapshot(meta)
+    } else if (ev.pgid && ev.pgid > 1) {
+      // B07: Shell leader exited while verified descendants in the same process group are still alive.
+      // Retain ownership in `lingeringGroups` so turn reap / disconnect / disposeAll reaps ephemeral
+      // descendants cleanly while Gateway retains snapshot visibility.
+      this.lingeringGroups.set(meta.id, {
+        jobId: meta.id,
+        pgid: ev.pgid,
+        startTimeTicks: ev.startTimeTicks,
+        lifecycleClass: meta.lifecycleClass,
+        startedAt: meta.startedAt,
+        commandPreview: meta.commandPreview,
+        snapshotPath: meta.snapshotPath,
+        stdoutLogPath: meta.stdoutLogPath,
+        stderrLogPath: meta.stderrLogPath,
+      })
+      if (meta.lifecycleClass !== 'ephemeral_turn' && meta.snapshotPath) {
+        this.trackedSnapshotClass.delete(meta.snapshotPath)
+      }
+    }
+
+    if (!meta.waiterInFlight && meta.yielded) {
+      if (meta.terminationReason === 'idle_timeout' || meta.terminationReason === 'max_lifetime') {
+        this.recordTombstone(meta, meta.terminationReason)
+      } else {
+        // W03: Running managed/daemon jobs are exempt from idle kill, but once a yielded job has
+        // naturally EXITED, bound unread result retention by `idleJobTtlMs` so closed buffers do not leak.
+        this.armIdleTimer(meta, /* forClosedResult */ true)
+      }
+    }
+  }
+
+  private writeJobSnapshot(meta: ManagedBashJobMeta): void {
+    if (!this.registryDir || meta.closed || this.isShutdown) return
+    const pid = meta.pid
     if (!pid || pid <= 1) return
-    if (job.startTimeTicks === null) {
-      job.startTimeTicks = readProcStartTimeTicks(pid)
+    if (meta.startTimeTicks === null) {
+      meta.startTimeTicks = readProcStartTimeTicks(pid)
     }
     const now = Date.now()
     const { sessionKey, sessionId } = resolveOcBashSessionIdentity(this.env, this.sessionKeyOverride)
-    const id = `${process.pid}-${job.id}`
+    const id = `${process.pid}-${meta.id}`
     const snapshot: OcBashJobSnapshot = {
       id,
-      jobId: job.id,
+      jobId: meta.id,
       pid,
       pgid: pid,
       ownerPid: process.pid,
-      startTimeTicks: job.startTimeTicks,
+      startTimeTicks: meta.startTimeTicks,
       sessionKey,
       sessionId,
-      commandPreview: job.snapshotPreview,
-      cwd: job.cwd,
-      startedAt: job.startedAt,
+      commandPreview: meta.snapshotPreview,
+      cwd: meta.cwd,
+      startedAt: meta.startedAt,
       updatedAt: now,
-      maxLifetimeAt: job.maxLifetimeAt,
+      maxLifetimeAt: meta.maxLifetimeAt,
+      lifecycleClass: meta.lifecycleClass,
+      leaseId: this.leaseId,
+      ...(meta.stdoutLogPath ? { stdoutLogPath: meta.stdoutLogPath } : {}),
+      ...(meta.stderrLogPath ? { stderrLogPath: meta.stderrLogPath } : {}),
     }
     const targetPath = join(this.registryDir, `${id}.json`)
     const tmpPath = `${targetPath}.${randomBytes(6).toString('hex')}.tmp`
@@ -527,101 +374,204 @@ export class OcBashJobManager {
       mkdirSync(this.registryDir, { recursive: true })
       writeFileSync(tmpPath, JSON.stringify(snapshot), { encoding: 'utf8', mode: 0o600 })
       renameSync(tmpPath, targetPath)
-      job.snapshotPath = targetPath
-      this.activeSnapshotPaths.add(targetPath)
+      meta.snapshotPath = targetPath
+      this.trackedSnapshotClass.set(targetPath, meta.lifecycleClass)
     } catch {
-      // Fail-open: disk registry errors must never disrupt oc_bash execution.
-      try {
-        unlinkSync(tmpPath)
-      } catch {
-        /* ignore */
-      }
+      unlinkSafe(tmpPath)
     }
   }
 
-  private removeJobSnapshot(job: ManagedBashJob): void {
+  private removeJobSnapshot(meta: ManagedBashJobMeta): void {
     const filePath =
-      job.snapshotPath ??
-      (this.registryDir ? join(this.registryDir, `${process.pid}-${job.id}.json`) : null)
-    job.snapshotPath = null
+      meta.snapshotPath ??
+      (this.registryDir ? join(this.registryDir, `${process.pid}-${meta.id}.json`) : null)
+    meta.snapshotPath = null
     if (!filePath) return
-    this.activeSnapshotPaths.delete(filePath)
-    try {
-      unlinkSync(filePath)
-    } catch {
-      /* already removed or unwritable */
+    this.trackedSnapshotClass.delete(filePath)
+    unlinkSafe(filePath)
+  }
+
+  cleanupSnapshotsSync(opts?: { preserveSurvivors?: boolean }): void {
+    const preserve = opts?.preserveSurvivors === true
+    // A03: Never unlink snapshots belonging to still-live lingering groups whose stop is unconfirmed.
+    const protectedSnapshots = new Set<string>()
+    for (const group of this.lingeringGroups.values()) {
+      if (group.snapshotPath) protectedSnapshots.add(group.snapshotPath)
+    }
+    for (const [filePath, lifecycleClass] of [...this.trackedSnapshotClass.entries()]) {
+      if (preserve && lifecycleClass !== 'ephemeral_turn') continue
+      if (protectedSnapshots.has(filePath)) continue
+      unlinkSafe(filePath)
+      this.trackedSnapshotClass.delete(filePath)
     }
   }
 
-  /** Synchronously unlink all tracked snapshot files (safe for process exit/signal handlers). */
-  cleanupSnapshotsSync(): void {
-    for (const filePath of this.activeSnapshotPaths) {
-      try {
-        unlinkSync(filePath)
-      } catch {
-        /* ignore */
+  /**
+   * F06: Prune lingering process groups that have naturally exited (cleaning up their snapshot
+   * and canonical rotating log files) while retaining slot reservation for groups still alive.
+   */
+  private refreshLingeringGroups(): void {
+    for (const [jobId, group] of [...this.lingeringGroups.entries()]) {
+      if (!hasAliveVerifiedGroupMembers(group.pgid, group.startTimeTicks)) {
+        this.untrackProcessGroup?.(group.pgid)
+        unlinkSafe(group.snapshotPath)
+        unlinkRotatingLogPair(group.stdoutLogPath)
+        unlinkRotatingLogPair(group.stderrLogPath)
+        if (group.snapshotPath) this.trackedSnapshotClass.delete(group.snapshotPath)
+        this.lingeringGroups.delete(jobId)
       }
     }
-    this.activeSnapshotPaths.clear()
   }
 
   activeRunningCount(): number {
+    this.refreshLingeringGroups()
     let count = 0
     for (const job of this.jobs.values()) {
       if (!job.closed) count += 1
+    }
+    // F06: Count verified live lingering process groups against the concurrency cap.
+    for (const group of this.lingeringGroups.values()) {
+      const meta = this.jobs.get(group.jobId)
+      if (!meta || meta.closed) count += 1
     }
     return count
   }
 
   listActiveJobsSummary(): string[] {
+    this.refreshLingeringGroups()
     const now = Date.now()
     const lines: string[] = []
     for (const job of this.jobs.values()) {
       if (job.closed) continue
       const elapsedSec = Math.max(0, Math.round((now - job.startedAt) / 1000))
-      lines.push(`- ${job.id} (${elapsedSec}s): ${job.commandPreview}`)
+      const classSuffix = job.lifecycleClass === 'ephemeral_turn' ? '' : ` [${job.lifecycleClass}]`
+      lines.push(`- ${job.id} (${elapsedSec}s)${classSuffix}: ${job.commandPreview}`)
+    }
+    for (const group of this.lingeringGroups.values()) {
+      const meta = this.jobs.get(group.jobId)
+      if (meta && !meta.closed) continue
+      const elapsedSec = Math.max(0, Math.round((now - group.startedAt) / 1000))
+      const classSuffix = group.lifecycleClass === 'ephemeral_turn' ? '' : ` [${group.lifecycleClass}]`
+      lines.push(`- ${group.jobId} (${elapsedSec}s)${classSuffix} [lingering]: ${group.commandPreview}`)
     }
     return lines
   }
 
-  private clearIdleTimer(job: ManagedBashJob): void {
-    if (job.idleTimer) {
-      clearTimeout(job.idleTimer)
-      job.idleTimer = null
+  async listManagedJobs(): Promise<readonly ManagedJobSummary[]> {
+    return await this.registry.listJobs(this.leaseId)
+  }
+
+  private reapLingeringGroupsSync(preserveSurvivors: boolean): string[] {
+    const reaped: string[] = []
+    for (const [jobId, group] of [...this.lingeringGroups.entries()]) {
+      if (preserveSurvivors && group.lifecycleClass !== 'ephemeral_turn') {
+        continue
+      }
+      const wasAlive = hasAliveVerifiedGroupMembers(group.pgid, group.startTimeTicks)
+      const signaled = wasAlive
+        ? sendVerifiedGroupSignal(group.pgid, null, group.startTimeTicks, 'SIGKILL', LOCAL_PROC_OPS)
+        : false
+      // A03: Separate "stop requested" from "stop confirmed". Only count as reaped and delete the
+      // last recovery snapshot & rotating logs once verified group membership is confirmed empty.
+      const stillAlive = hasAliveVerifiedGroupMembers(group.pgid, group.startTimeTicks)
+      if (!stillAlive) {
+        if (wasAlive && signaled) {
+          reaped.push(jobId)
+        }
+        this.untrackProcessGroup?.(group.pgid)
+        unlinkSafe(group.snapshotPath)
+        unlinkRotatingLogPair(group.stdoutLogPath)
+        unlinkRotatingLogPair(group.stderrLogPath)
+        if (group.snapshotPath) this.trackedSnapshotClass.delete(group.snapshotPath)
+        this.lingeringGroups.delete(jobId)
+      }
+    }
+    return reaped
+  }
+
+  /**
+   * Reap only `ephemeral_turn` jobs (and lingering ephemeral groups), provably preserving
+   * `managed_job` and `daemon_service` jobs and their disk snapshots.
+   */
+  async reapTurnJobs(): Promise<ExecEnvReapStopProof> {
+    const proof = await this.registry.reapByClass(this.leaseId, ['ephemeral_turn'])
+    for (const jobId of proof.reapedJobIds) {
+      const meta = this.jobs.get(jobId)
+      if (meta) {
+        this.recordTombstone(meta, 'killed')
+      } else {
+        this.registry.pruneJob(jobId)
+      }
+    }
+    const lingeringReaped = this.reapLingeringGroupsSync(/* preserveSurvivors */ true)
+    if (lingeringReaped.length === 0) return proof
+    return {
+      ...proof,
+      activeJobsTerminated: proof.activeJobsTerminated + lingeringReaped.length,
+      reapedJobIds: [...proof.reapedJobIds, ...lingeringReaped],
     }
   }
 
-  private clearJobTimers(job: ManagedBashJob): void {
-    this.clearIdleTimer(job)
-    if (job.killTimer) {
-      clearTimeout(job.killTimer)
-      job.killTimer = null
+  async markEnvMigrated(reason: string): Promise<ExecEnvMigrationTombstoneResult> {
+    const res = await this.registry.markEnvMigratedTombstones(this.leaseId, reason)
+    for (const jobId of res.tombstonedJobIds) {
+      const meta = this.jobs.get(jobId)
+      if (meta) {
+        this.clearIdleTimer(meta)
+        this.removeJobSnapshot(meta)
+        if (meta.pgid) {
+          this.untrackProcessGroup?.(meta.pgid)
+        }
+        this.jobs.delete(jobId)
+      }
     }
-    if (job.closeSafetyTimer) {
-      clearTimeout(job.closeSafetyTimer)
-      job.closeSafetyTimer = null
-    }
-    if (job.lifetimeTimer) {
-      clearTimeout(job.lifetimeTimer)
-      job.lifetimeTimer = null
+    this.reapLingeringGroupsSync(/* preserveSurvivors */ false)
+    return res
+  }
+
+  private clearIdleTimer(meta: ManagedBashJobMeta): void {
+    if (meta.idleTimer) {
+      clearTimeout(meta.idleTimer)
+      meta.idleTimer = null
     }
   }
 
-  private recordTombstone(job: ManagedBashJob, reason: JobTombstoneReason): void {
-    this.clearJobTimers(job)
-    this.removeJobSnapshot(job)
-    job.stdout.clear()
-    job.stderr.clear()
-    this.jobs.delete(job.id)
-    if (!job.yielded) return
-    if (this.tombstones.has(job.id)) this.tombstones.delete(job.id)
-    this.tombstones.set(job.id, {
-      jobId: job.id,
-      exitCode: job.exitCode,
-      signal: job.signal,
+  private armIdleTimer(meta: ManagedBashJobMeta, forClosedResult = false): void {
+    this.clearIdleTimer(meta)
+    if (this.isShutdown) return
+    if (!forClosedResult && meta.lifecycleClass !== 'ephemeral_turn') return
+    meta.idleTimer = setTimeout(() => {
+      meta.idleTimer = null
+      if (meta.waiterInFlight || this.isShutdown) return
+      if (meta.closed) {
+        this.recordTombstone(meta, 'collected')
+        return
+      }
+      if (meta.lifecycleClass !== 'ephemeral_turn') return
+      meta.terminationReason ??= 'idle_timeout'
+      void this.registry.killJob(meta.id, 'SIGTERM').catch(() => {})
+    }, this.idleJobTtlMs)
+    meta.idleTimer.unref()
+  }
+
+  private recordTombstone(meta: ManagedBashJobMeta, reason: JobTombstoneReason): void {
+    this.clearIdleTimer(meta)
+    const hasLingering = this.lingeringGroups.has(meta.id)
+    if (!hasLingering) {
+      this.removeJobSnapshot(meta)
+    }
+    this.jobs.delete(meta.id)
+    // F06: Preserve canonical rotating logs while lingering descendants in the same process group are alive.
+    this.registry.pruneJob(meta.id, { preserveLogs: hasLingering })
+    if (!meta.yielded) return
+    if (this.tombstones.has(meta.id)) this.tombstones.delete(meta.id)
+    this.tombstones.set(meta.id, {
+      jobId: meta.id,
+      exitCode: meta.exitCode,
+      signal: meta.signal,
       reason,
-      elapsedMs: Date.now() - job.startedAt,
-      commandPreview: job.commandPreview,
+      elapsedMs: Date.now() - meta.startedAt,
+      commandPreview: meta.commandPreview,
     })
     while (this.tombstones.size > OC_BASH_TOMBSTONE_MAX) {
       const oldestKey = this.tombstones.keys().next().value
@@ -630,121 +580,12 @@ export class OcBashJobManager {
     }
   }
 
-  private killJobGroup(job: ManagedBashJob): void {
-    if (job.closed) return
-    if (job.killRequested) return
-    job.killRequested = true
-    killChildProcessGroup(job.child, 'SIGTERM')
-    job.killTimer = setTimeout(() => {
-      job.killTimer = null
-      if (job.closed) return
-      killChildProcessGroup(job.child, 'SIGKILL')
-      job.closeSafetyTimer = setTimeout(() => {
-        job.closeSafetyTimer = null
-        if (job.closed) return
-        try {
-          job.child.stdout?.destroy()
-          job.child.stderr?.destroy()
-        } catch {
-          /* ignore */
-        }
-        this.finalizeClosedJob(job, job.exitCode, job.signal ?? 'SIGKILL')
-      }, this.closeDrainSafetyMs)
-      job.closeSafetyTimer.unref()
-    }, this.killGraceMs)
-    job.killTimer.unref()
-  }
-
-  private armIdleTimer(job: ManagedBashJob): void {
-    this.clearIdleTimer(job)
-    if (this.isShutdown) return
-    job.idleTimer = setTimeout(() => {
-      job.idleTimer = null
-      if (job.waiterInFlight || this.isShutdown) return
-      if (job.closed) {
-        // Yielded job finished in background and was never collected before idle TTL elapsed.
-        this.recordTombstone(job, 'collected')
-        return
-      }
-      job.terminationReason ??= 'idle_timeout'
-      this.killJobGroup(job)
-    }, this.idleJobTtlMs)
-    job.idleTimer.unref()
-  }
-
-  private finalizeClosedJob(
-    job: ManagedBashJob,
-    exitCode: number | null,
-    signal: NodeJS.Signals | null,
-  ): void {
-    if (job.closed) return
-    if (job.killRequested) {
-      killChildProcessGroup(job.child, 'SIGKILL')
-    }
-    job.closed = true
-    job.exitCode = exitCode
-    job.signal = signal
-    if (job.killTimer) {
-      clearTimeout(job.killTimer)
-      job.killTimer = null
-    }
-    if (job.closeSafetyTimer) {
-      clearTimeout(job.closeSafetyTimer)
-      job.closeSafetyTimer = null
-    }
-    if (job.lifetimeTimer) {
-      clearTimeout(job.lifetimeTimer)
-      job.lifetimeTimer = null
-    }
-    const pid = job.child.pid
-    if (pid && pid > 0) {
-      this.localProcessGroups.delete(pid)
-      this.untrackProcessGroup?.(pid)
-    }
-    const groupStillRunning =
-      !job.killRequested &&
-      Boolean(pid && pid > 1) &&
-      hasAliveVerifiedGroupMembers(pid!, job.startTimeTicks)
-    if (!groupStillRunning) {
-      this.removeJobSnapshot(job)
-    } else if (job.snapshotPath) {
-      // Leader exited while child processes in the same process group are still alive:
-      // keep the disk snapshot so gateway list/cancel retains control until the group exits.
-      this.activeSnapshotPaths.delete(job.snapshotPath)
-    }
-    job.resolveClose()
-
-    if (!job.waiterInFlight && job.yielded) {
-      if (job.terminationReason === 'idle_timeout' || job.terminationReason === 'max_lifetime') {
-        this.recordTombstone(job, job.terminationReason)
-      } else {
-        // Keep output buffered for the next wait/status call, bounded by idleJobTtlMs.
-        this.armIdleTimer(job)
-      }
-    }
-  }
-
-  private async waitCloseOrTimeout(job: ManagedBashJob, timeoutMs: number): Promise<void> {
-    if (job.closed) return
-    let timer: NodeJS.Timeout | null = null
-    try {
-      await Promise.race([
-        job.closePromise,
-        new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, timeoutMs)
-          timer.unref()
-        }),
-      ])
-    } finally {
-      if (timer) clearTimeout(timer)
-    }
-  }
-
   async startAndWait(spec: {
     command: string
     cwd?: string
     timeoutMs: number
     killOnTimeout?: boolean
+    lifecycleClass?: JobLifecycleClass
   }): Promise<OcBashCallOutcome> {
     if (this.isShutdown) {
       return { kind: 'spawn_error', error: 'oc_bash 正在关闭，拒绝启动新命令' }
@@ -757,159 +598,132 @@ export class OcBashJobManager {
       }
     }
 
-    let child: ChildProcess
+    const jobId = `ocb_${++this.seq}`
+    const lifecycleClass: JobLifecycleClass = spec.lifecycleClass ?? this.defaultLifecycleClass
+    const startedAt = Date.now()
+    const { sessionKey } = resolveOcBashSessionIdentity(this.env, this.sessionKeyOverride)
+    const meta: ManagedBashJobMeta = {
+      id: jobId,
+      lifecycleClass,
+      commandPreview: makeCommandPreview(spec.command),
+      snapshotPreview: sanitizeOcBashCommandPreview(spec.command),
+      cwd: spec.cwd ?? process.cwd(),
+      startedAt,
+      maxLifetimeAt:
+        lifecycleClass === 'daemon_service'
+          ? startedAt + DAEMON_SNAPSHOT_HORIZON_MS
+          : startedAt + this.maxJobLifetimeMs,
+      pid: undefined,
+      pgid: undefined,
+      startTimeTicks: null,
+      snapshotPath: null,
+      stdoutCursor: 0,
+      stderrCursor: 0,
+      closed: false,
+      exitCode: null,
+      signal: null,
+      yielded: false,
+      waiterInFlight: true,
+      terminationReason: null,
+      idleTimer: null,
+    }
+    this.jobs.set(jobId, meta)
+
+    let res: ExecEnvJobStartResult
     try {
-      child = spawn('/bin/bash', ['-lc', spec.command], {
+      res = await this.registry.startJob({
+        jobId,
+        leaseId: this.leaseId,
+        sessionKey: sessionKey || undefined,
+        lifecycleClass,
+        label: meta.commandPreview,
+        command: ['/bin/bash', '-lc', spec.command],
         cwd: spec.cwd,
-        detached: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
         env: {
-          ...process.env,
+          ...sanitizeEnvRecord(this.env),
           OC_BASH_TIMEOUT_MS: String(spec.timeoutMs),
         },
+        yieldAfterMs: spec.timeoutMs,
+        killOnTimeout: spec.killOnTimeout,
+        maxLifetimeMs: lifecycleClass === 'daemon_service' ? undefined : this.maxJobLifetimeMs,
       })
     } catch (err) {
+      this.clearIdleTimer(meta)
+      this.removeJobSnapshot(meta)
+      this.jobs.delete(jobId)
       return {
         kind: 'spawn_error',
         error: err instanceof Error ? err.message : String(err),
       }
     }
 
-    const jobId = `ocb_${++this.seq}`
-    let resolveClose!: () => void
-    const closePromise = new Promise<void>((resolve) => {
-      resolveClose = resolve
-    })
-
-    const startedAt = Date.now()
-    const job: ManagedBashJob = {
-      id: jobId,
-      commandPreview: makeCommandPreview(spec.command),
-      snapshotPreview: sanitizeOcBashCommandPreview(spec.command),
-      cwd: spec.cwd ?? process.cwd(),
-      startedAt,
-      maxLifetimeAt: startedAt + this.maxJobLifetimeMs,
-      startTimeTicks: null,
-      snapshotPath: null,
-      child,
-      stdout: new DeltaStreamBuffer(this.maxBytes),
-      stderr: new DeltaStreamBuffer(this.maxBytes),
-      closed: false,
-      exitCode: null,
-      signal: null,
-      yielded: false,
-      waiterInFlight: true,
-      killRequested: false,
-      terminationReason: null,
-      killTimer: null,
-      closeSafetyTimer: null,
-      idleTimer: null,
-      lifetimeTimer: null,
-      closePromise,
-      resolveClose,
+    if (res.status !== 'running') {
+      return this.formatFinishedStartOutcome(meta, res, spec.timeoutMs)
     }
 
-    this.jobs.set(jobId, job)
-    if (child.pid && child.pid > 0) {
-      this.localProcessGroups.add(child.pid)
-      this.trackProcessGroup?.(child.pid)
-      this.writeJobSnapshot(job)
-    }
-
-    child.stdout?.on('data', (chunk: Buffer) => {
-      job.stdout.push(chunk)
-    })
-    child.stderr?.on('data', (chunk: Buffer) => {
-      job.stderr.push(chunk)
-    })
-    child.on('error', (err) => {
-      job.spawnError = err.message
-      this.finalizeClosedJob(job, null, null)
-    })
-    child.on('close', (code, signal) => {
-      this.finalizeClosedJob(job, code, signal)
-    })
-
-    job.lifetimeTimer = setTimeout(() => {
-      job.lifetimeTimer = null
-      if (job.closed || this.isShutdown) return
-      job.terminationReason ??= 'max_lifetime'
-      this.killJobGroup(job)
-    }, this.maxJobLifetimeMs)
-    job.lifetimeTimer.unref()
-
-    await this.waitCloseOrTimeout(job, spec.timeoutMs)
-
-    if (job.closed) {
-      job.waiterInFlight = false
-      this.clearJobTimers(job)
-      this.jobs.delete(jobId)
-      if (job.spawnError && job.terminationReason === null) {
-        job.stdout.clear()
-        job.stderr.clear()
-        return { kind: 'spawn_error', error: job.spawnError }
-      }
-      const out = job.stdout.drain(true)
-      const err = job.stderr.drain(true)
-      const truncated = out.truncated || err.truncated
-      if (job.terminationReason === 'max_lifetime') {
-        return {
-          kind: 'terminated',
-          jobId,
-          reason: 'max_lifetime',
-          exitCode: job.exitCode,
-          signal: job.signal,
-          stdout: out.text,
-          stderr: err.text,
-          truncated,
-          elapsedMs: Date.now() - job.startedAt,
-        }
-      }
-      return {
-        kind: 'finished',
-        jobId,
-        exitCode: job.exitCode,
-        signal: job.signal,
-        stdout: out.text,
-        stderr: err.text,
-        truncated,
-        elapsedMs: Date.now() - job.startedAt,
-      }
-    }
-
-    if (spec.killOnTimeout) {
-      job.terminationReason = 'hard_timeout'
-      this.killJobGroup(job)
-      await job.closePromise
-      job.waiterInFlight = false
-      this.clearJobTimers(job)
-      this.jobs.delete(jobId)
-      const out = job.stdout.drain(true)
-      const err = job.stderr.drain(true)
-      return {
-        kind: 'hard_timeout',
-        timeoutMs: spec.timeoutMs,
-        exitCode: job.exitCode,
-        signal: job.signal,
-        stdout: out.text,
-        stderr: err.text,
-        truncated: out.truncated || err.truncated,
-      }
-    }
-
-    job.yielded = true
-    job.waiterInFlight = false
-    this.writeJobSnapshot(job)
-    this.armIdleTimer(job)
-    const out = job.stdout.drain(false)
-    const err = job.stderr.drain(false)
+    meta.yielded = true
+    meta.waiterInFlight = false
+    meta.stdoutCursor = res.nextStdoutCursor
+    meta.stderrCursor = res.nextStderrCursor
+    this.writeJobSnapshot(meta)
+    this.armIdleTimer(meta)
     return {
       kind: 'running',
       jobId,
-      elapsedMs: Date.now() - job.startedAt,
-      stdout: out.text,
-      stderr: err.text,
-      truncated: out.truncated || err.truncated,
+      elapsedMs: res.durationMs,
+      stdout: res.stdout,
+      stderr: res.stderr,
+      truncated: res.truncated,
+      lifecycleClass: meta.lifecycleClass,
+    }
+  }
+
+  private formatFinishedStartOutcome(
+    meta: ManagedBashJobMeta,
+    res: ExecEnvJobStartResult,
+    timeoutMs: number,
+  ): OcBashCallOutcome {
+    meta.waiterInFlight = false
+    this.clearIdleTimer(meta)
+    this.jobs.delete(meta.id)
+    // F06: Preserve canonical rotating logs while lingering descendants in the same process group are alive.
+    this.registry.pruneJob(meta.id, { preserveLogs: this.lingeringGroups.has(meta.id) })
+    if (res.status === 'failed' && res.spawnError && meta.terminationReason === null) {
+      return { kind: 'spawn_error', error: res.spawnError }
+    }
+    if (res.terminationCause === 'yield_timeout') {
+      return {
+        kind: 'hard_timeout',
+        timeoutMs,
+        exitCode: res.exitCode,
+        signal: res.signal as NodeJS.Signals | null,
+        stdout: res.stdout,
+        stderr: res.stderr,
+        truncated: res.truncated,
+      }
+    }
+    if (res.terminationCause === 'max_lifetime' || meta.terminationReason === 'max_lifetime') {
+      return {
+        kind: 'terminated',
+        jobId: meta.id,
+        reason: 'max_lifetime',
+        exitCode: res.exitCode,
+        signal: res.signal as NodeJS.Signals | null,
+        stdout: res.stdout,
+        stderr: res.stderr,
+        truncated: res.truncated,
+        elapsedMs: res.durationMs,
+      }
+    }
+    return {
+      kind: 'finished',
+      jobId: meta.id,
+      exitCode: res.exitCode,
+      signal: res.signal as NodeJS.Signals | null,
+      stdout: res.stdout,
+      stderr: res.stderr,
+      truncated: res.truncated,
+      elapsedMs: res.durationMs,
     }
   }
 
@@ -919,205 +733,250 @@ export class OcBashJobManager {
     timeoutMs: number
     killOnTimeout?: boolean
   }): Promise<OcBashCallOutcome> {
-    const job = this.jobs.get(spec.jobId)
-    if (!job) {
-      const tombstone = this.tombstones.get(spec.jobId)
-      if (tombstone) return { kind: 'tombstone', tombstone }
-      return { kind: 'not_found', jobId: spec.jobId }
-    }
-    if (job.waiterInFlight) {
-      return { kind: 'busy', jobId: spec.jobId }
-    }
+    const meta = this.jobs.get(spec.jobId)
+    if (!meta) return await this.resolveMissingJobOutcome(spec.jobId)
+    if (meta.waiterInFlight) return { kind: 'busy', jobId: spec.jobId }
 
-    // If a background idle/lifetime kill is already in progress, let it finish closing cleanly.
+    // W02: Serialize ALL cursor-consuming / terminal-collecting operations under `waiterInFlight`.
+    this.clearIdleTimer(meta)
+    meta.waiterInFlight = true
+    try {
+      return await this.runContinueAction(meta, spec)
+    } finally {
+      meta.waiterInFlight = false
+    }
+  }
+
+  private async resolveMissingJobOutcome(jobId: string): Promise<OcBashCallOutcome> {
+    if (this.registry.hasMigratedTombstone(jobId)) {
+      const migrated = await this.registry.waitJob(jobId, { leaseId: this.leaseId, action: 'status' })
+      return {
+        kind: 'tombstone',
+        tombstone: {
+          jobId,
+          exitCode: null,
+          signal: null,
+          reason: 'env_migrated',
+          elapsedMs: migrated.durationMs,
+          commandPreview: migrated.tombstoneReason ?? 'env_migrated',
+        },
+      }
+    }
+    const tombstone = this.tombstones.get(jobId)
+    return tombstone ? { kind: 'tombstone', tombstone } : { kind: 'not_found', jobId }
+  }
+
+  private async runContinueAction(
+    meta: ManagedBashJobMeta,
+    spec: { jobId: string; action: OcBashAction; timeoutMs: number; killOnTimeout?: boolean },
+  ): Promise<OcBashCallOutcome> {
     if (
-      !job.closed &&
-      (job.terminationReason === 'idle_timeout' || job.terminationReason === 'max_lifetime')
+      !meta.closed &&
+      (meta.terminationReason === 'idle_timeout' || meta.terminationReason === 'max_lifetime')
     ) {
-      this.clearIdleTimer(job)
-      job.waiterInFlight = true
-      await job.closePromise
-      job.waiterInFlight = false
-      const reason = job.terminationReason
-      const out = job.stdout.drain(true)
-      const err = job.stderr.drain(true)
-      const truncated = out.truncated || err.truncated
-      this.recordTombstone(job, reason)
+      const reason = meta.terminationReason
+      const res = await this.registry.waitJob(spec.jobId, {
+        leaseId: this.leaseId,
+        action: 'wait',
+        stdoutCursor: meta.stdoutCursor,
+        stderrCursor: meta.stderrCursor,
+      })
+      this.recordTombstone(meta, reason)
       return {
         kind: 'terminated',
-        jobId: job.id,
+        jobId: meta.id,
         reason,
-        exitCode: job.exitCode,
-        signal: job.signal,
-        stdout: out.text,
-        stderr: err.text,
-        truncated,
-        elapsedMs: Date.now() - job.startedAt,
+        exitCode: res.exitCode,
+        signal: res.signal as NodeJS.Signals | null,
+        stdout: res.stdout,
+        stderr: res.stderr,
+        truncated: res.truncated,
+        elapsedMs: res.durationMs,
       }
     }
 
     if (spec.action === 'kill') {
-      this.clearIdleTimer(job)
-      job.waiterInFlight = true
-      if (!job.closed) {
-        job.terminationReason ??= 'killed'
-        this.killJobGroup(job)
-        await job.closePromise
-      }
-      job.waiterInFlight = false
-      const out = job.stdout.drain(true)
-      const err = job.stderr.drain(true)
-      const truncated = out.truncated || err.truncated
-      this.recordTombstone(job, 'killed')
+      meta.terminationReason ??= 'killed'
+      const res = await this.registry.waitJob(spec.jobId, {
+        leaseId: this.leaseId,
+        action: 'kill',
+        stdoutCursor: meta.stdoutCursor,
+        stderrCursor: meta.stderrCursor,
+      })
+      this.recordTombstone(meta, 'killed')
       return {
         kind: 'killed',
-        jobId: job.id,
-        exitCode: job.exitCode,
-        signal: job.signal,
-        stdout: out.text,
-        stderr: err.text,
-        truncated,
-        elapsedMs: Date.now() - job.startedAt,
+        jobId: meta.id,
+        exitCode: res.exitCode,
+        signal: res.signal as NodeJS.Signals | null,
+        stdout: res.stdout,
+        stderr: res.stderr,
+        truncated: res.truncated,
+        elapsedMs: res.durationMs,
       }
     }
 
-    if (spec.action === 'status') {
-      if (job.closed) {
-        return this.collectClosedJob(job)
-      }
-      this.writeJobSnapshot(job)
-      this.armIdleTimer(job)
-      const out = job.stdout.drain(false)
-      const err = job.stderr.drain(false)
-      return {
-        kind: 'running',
-        jobId: job.id,
-        elapsedMs: Date.now() - job.startedAt,
-        stdout: out.text,
-        stderr: err.text,
-        truncated: out.truncated || err.truncated,
-      }
+    if (meta.closed) return await this.collectClosedJob(meta)
+
+    const startStdoutCursor = meta.stdoutCursor
+    const startStderrCursor = meta.stderrCursor
+    const res = await this.registry.waitJob(spec.jobId, {
+      leaseId: this.leaseId,
+      action: spec.action,
+      ...(spec.action === 'wait' ? { timeoutMs: spec.timeoutMs } : {}),
+      stdoutCursor: startStdoutCursor,
+      stderrCursor: startStderrCursor,
+    })
+    if (res.status === 'terminated_env_migrated') {
+      return this.toEnvMigratedOutcome(meta, res.durationMs, res.tombstoneReason)
     }
-
-    // action === 'wait'
-    if (job.closed) {
-      return this.collectClosedJob(job)
-    }
-
-    this.clearIdleTimer(job)
-    job.waiterInFlight = true
-    await this.waitCloseOrTimeout(job, spec.timeoutMs)
-
-    if (job.closed) {
-      job.waiterInFlight = false
-      return this.collectClosedJob(job)
-    }
-
-    if (spec.killOnTimeout) {
-      job.terminationReason = 'hard_timeout'
-      this.killJobGroup(job)
-      await job.closePromise
-      job.waiterInFlight = false
-      const out = job.stdout.drain(true)
-      const err = job.stderr.drain(true)
-      const truncated = out.truncated || err.truncated
-      this.recordTombstone(job, 'killed')
+    if (res.status !== 'running') return this.finalizeCollectedResult(meta, res)
+    if (spec.action === 'wait' && spec.killOnTimeout) {
+      meta.terminationReason = 'hard_timeout'
+      const killed = await this.registry.waitJob(spec.jobId, {
+        leaseId: this.leaseId,
+        action: 'kill',
+        stdoutCursor: startStdoutCursor,
+        stderrCursor: startStderrCursor,
+      })
+      this.recordTombstone(meta, 'killed')
       return {
         kind: 'hard_timeout',
         timeoutMs: spec.timeoutMs,
-        exitCode: job.exitCode,
-        signal: job.signal,
-        stdout: out.text,
-        stderr: err.text,
-        truncated,
+        exitCode: killed.exitCode,
+        signal: killed.signal as NodeJS.Signals | null,
+        stdout: killed.stdout,
+        stderr: killed.stderr,
+        truncated: killed.truncated,
       }
     }
 
-    job.waiterInFlight = false
-    this.writeJobSnapshot(job)
-    this.armIdleTimer(job)
-    const out = job.stdout.drain(false)
-    const err = job.stderr.drain(false)
+    meta.stdoutCursor = res.nextStdoutCursor
+    meta.stderrCursor = res.nextStderrCursor
+    this.writeJobSnapshot(meta)
+    this.armIdleTimer(meta)
     return {
       kind: 'running',
-      jobId: job.id,
-      elapsedMs: Date.now() - job.startedAt,
-      stdout: out.text,
-      stderr: err.text,
-      truncated: out.truncated || err.truncated,
+      jobId: meta.id,
+      elapsedMs: res.durationMs,
+      stdout: res.stdout,
+      stderr: res.stderr,
+      truncated: res.truncated,
+      lifecycleClass: meta.lifecycleClass,
     }
   }
 
-  private collectClosedJob(job: ManagedBashJob): OcBashCallOutcome {
-    this.clearJobTimers(job)
-    const out = job.stdout.drain(true)
-    const err = job.stderr.drain(true)
-    const truncated = out.truncated || err.truncated
-    const reason = job.terminationReason
+  private toEnvMigratedOutcome(
+    meta: ManagedBashJobMeta,
+    durationMs: number,
+    reason?: string,
+  ): OcBashCallOutcome {
+    this.clearIdleTimer(meta)
+    this.removeJobSnapshot(meta)
+    this.jobs.delete(meta.id)
+    return {
+      kind: 'tombstone',
+      tombstone: {
+        jobId: meta.id,
+        exitCode: null,
+        signal: null,
+        reason: 'env_migrated',
+        elapsedMs: durationMs,
+        commandPreview: reason ?? meta.commandPreview,
+      },
+    }
+  }
+
+  private async collectClosedJob(meta: ManagedBashJobMeta): Promise<OcBashCallOutcome> {
+    const res = await this.registry.waitJob(meta.id, {
+      leaseId: this.leaseId,
+      action: 'status',
+      stdoutCursor: meta.stdoutCursor,
+      stderrCursor: meta.stderrCursor,
+    })
+    return this.finalizeCollectedResult(meta, res)
+  }
+
+  private finalizeCollectedResult(
+    meta: ManagedBashJobMeta,
+    res: {
+      exitCode: number | null
+      signal: string | null
+      stdout: string
+      stderr: string
+      truncated: boolean
+      durationMs: number
+      terminationCause?: string
+    },
+  ): OcBashCallOutcome {
+    this.clearIdleTimer(meta)
+    const reason =
+      meta.terminationReason ??
+      (res.terminationCause === 'max_lifetime' ? 'max_lifetime' : null)
     if (reason === 'idle_timeout' || reason === 'max_lifetime') {
-      this.recordTombstone(job, reason)
+      this.recordTombstone(meta, reason)
       return {
         kind: 'terminated',
-        jobId: job.id,
+        jobId: meta.id,
         reason,
-        exitCode: job.exitCode,
-        signal: job.signal,
-        stdout: out.text,
-        stderr: err.text,
-        truncated,
-        elapsedMs: Date.now() - job.startedAt,
+        exitCode: res.exitCode,
+        signal: res.signal as NodeJS.Signals | null,
+        stdout: res.stdout,
+        stderr: res.stderr,
+        truncated: res.truncated,
+        elapsedMs: res.durationMs,
       }
     }
-    this.recordTombstone(job, 'collected')
+    this.recordTombstone(meta, 'collected')
     return {
       kind: 'finished',
-      jobId: job.id,
-      exitCode: job.exitCode,
-      signal: job.signal,
-      stdout: out.text,
-      stderr: err.text,
-      truncated,
-      elapsedMs: Date.now() - job.startedAt,
+      jobId: meta.id,
+      exitCode: res.exitCode,
+      signal: res.signal as NodeJS.Signals | null,
+      stdout: res.stdout,
+      stderr: res.stderr,
+      truncated: res.truncated,
+      elapsedMs: res.durationMs,
     }
   }
 
   disposeAll(): void {
-    this.shutdown()
+    this.shutdown({ preserveSurvivors: false })
   }
 
-  shutdown(): void {
+  /**
+   * Shutdown this job manager using verified process-group signals (W04).
+   * - `preserveSurvivors: false` (default, e.g. `disposeAll` / test teardown): reaps every
+   *   active job and lingering group and removes all snapshots.
+   * - `preserveSurvivors: true` (MCP stdin disconnect / graceful brain switch): reaps only
+   *   `ephemeral_turn` jobs & lingering ephemeral groups while leaving `managed_job` and
+   *   `daemon_service` process groups (with intact file-backed stdio) and snapshots alive.
+   */
+  shutdown(opts?: { preserveSurvivors?: boolean }): ExecEnvShutdownResult {
+    const preserve = opts?.preserveSurvivors === true
     this.isShutdown = true
-    for (const pid of this.localProcessGroups) {
-      try {
-        process.kill(-pid, 'SIGKILL')
-      } catch {
-        /* already gone */
-      }
-      this.untrackProcessGroup?.(pid)
-    }
-    this.localProcessGroups.clear()
 
-    for (const job of this.jobs.values()) {
-      this.clearJobTimers(job)
-      this.removeJobSnapshot(job)
-      if (!job.closed) {
-        job.killRequested = true
-        killChildProcessGroup(job.child, 'SIGKILL')
-        job.closed = true
-        job.signal ??= 'SIGKILL'
-        job.resolveClose()
+    const result = this.registry.shutdownSync(
+      preserve ? { preserveClasses: ['managed_job', 'daemon_service'] } : undefined,
+    )
+    const lingeringReaped = this.reapLingeringGroupsSync(preserve)
+
+    for (const meta of this.jobs.values()) {
+      this.clearIdleTimer(meta)
+      if (meta.pgid && (!preserve || meta.lifecycleClass === 'ephemeral_turn')) {
+        this.untrackProcessGroup?.(meta.pgid)
       }
-      try {
-        job.child.stdout?.destroy()
-        job.child.stderr?.destroy()
-        job.child.unref()
-      } catch {
-        /* ignore */
+      if (!preserve || meta.lifecycleClass === 'ephemeral_turn') {
+        if (!this.lingeringGroups.has(meta.id)) {
+          this.removeJobSnapshot(meta)
+        }
       }
-      job.stdout.clear()
-      job.stderr.clear()
     }
     this.jobs.clear()
-    this.cleanupSnapshotsSync()
+    this.cleanupSnapshotsSync({ preserveSurvivors: preserve })
+    return {
+      reapedJobIds: [...result.reapedJobIds, ...lingeringReaped],
+      preservedJobIds: result.preservedJobIds,
+    }
   }
 }

@@ -7,6 +7,7 @@
  * configure the shared KV (Redis); tests keep the in-memory map.
  */
 import { createHash, randomBytes } from 'node:crypto'
+import type { Pool } from 'pg'
 import type { AntigravityRouteAuthority } from './antigravityRouteAuthority.js'
 
 import {
@@ -32,6 +33,53 @@ const KV_PREFIX = 'oc:v5:antigravity-relay:'
 /** requestKey value once the turn ended; a racing renewal sees it and backs out. */
 const EXPIRED_MARK = 'expired'
 
+/** Optional admission-frozen pricing (incl. composed agent multiplier) for delegate relay budget checks (OCV5-897 B2). */
+export interface AntigravityRelayPricingOverride {
+  readonly modelId: string
+  readonly displayName: string
+  readonly inputPerMtok: string
+  readonly outputPerMtok: string
+  readonly cacheReadPerMtok: string
+  readonly cacheWritePerMtok: string
+  readonly multiplier: string
+}
+
+const PRICING_INT_RE = /^\d+$/
+const PRICING_MUL_RE = /^\d+(?:\.\d{1,3})?$/
+
+function parsePricingOverride(
+  raw: unknown,
+  expectedModelId: string,
+): AntigravityRelayPricingOverride | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const p = raw as Record<string, unknown>
+  if (
+    p.modelId !== expectedModelId ||
+    typeof p.displayName !== 'string' ||
+    typeof p.inputPerMtok !== 'string' ||
+    !PRICING_INT_RE.test(p.inputPerMtok) ||
+    typeof p.outputPerMtok !== 'string' ||
+    !PRICING_INT_RE.test(p.outputPerMtok) ||
+    typeof p.cacheReadPerMtok !== 'string' ||
+    !PRICING_INT_RE.test(p.cacheReadPerMtok) ||
+    typeof p.cacheWritePerMtok !== 'string' ||
+    !PRICING_INT_RE.test(p.cacheWritePerMtok) ||
+    typeof p.multiplier !== 'string' ||
+    !PRICING_MUL_RE.test(p.multiplier)
+  ) {
+    return null
+  }
+  return {
+    modelId: expectedModelId,
+    displayName: p.displayName,
+    inputPerMtok: p.inputPerMtok,
+    outputPerMtok: p.outputPerMtok,
+    cacheReadPerMtok: p.cacheReadPerMtok,
+    cacheWritePerMtok: p.cacheWritePerMtok,
+    multiplier: p.multiplier,
+  }
+}
+
 export type AntigravityRelayRoute = {
   token: string
   containerId: number
@@ -40,6 +88,8 @@ export type AntigravityRelayRoute = {
   modelId: string
   /** Optional extra canonical Antigravity model ids permitted for local native swarm members (OCV5-879). */
   allowedModelIds?: readonly string[]
+  /** Optional frozen pricing (incl. agent multiplier) so relay budget cutoff matches settlement (OCV5-897 B2). */
+  pricingOverride?: AntigravityRelayPricingOverride
   accountId: bigint
   /** Spendable credits at admission; the relay stops new generate calls past it. */
   budgetCredits: bigint
@@ -140,6 +190,7 @@ function serialize(row: AntigravityRelayRoute): string {
     ...(row.allowedModelIds && row.allowedModelIds.length > 0
       ? { allowedModelIds: [...row.allowedModelIds] }
       : {}),
+    ...(row.pricingOverride ? { pricingOverride: row.pricingOverride } : {}),
     accountId: row.accountId.toString(),
     budgetCredits: row.budgetCredits.toString(),
     expiresAt: row.expiresAt,
@@ -174,6 +225,12 @@ function deserialize(token: string, raw: string): AntigravityRelayRoute | null {
       return null
     }
   }
+  let pricingOverride: AntigravityRelayPricingOverride | undefined
+  if (body.pricingOverride !== undefined) {
+    const parsedOverride = parsePricingOverride(body.pricingOverride, body.modelId)
+    if (!parsedOverride) return null
+    pricingOverride = parsedOverride
+  }
   const maxExpiresAt =
     typeof body.maxExpiresAt === 'number' && Number.isFinite(body.maxExpiresAt)
       ? body.maxExpiresAt
@@ -185,6 +242,7 @@ function deserialize(token: string, raw: string): AntigravityRelayRoute | null {
     requestId: body.requestId,
     modelId: body.modelId,
     ...(allowedModelIds ? { allowedModelIds } : {}),
+    ...(pricingOverride ? { pricingOverride } : {}),
     accountId: BigInt(body.accountId),
     budgetCredits: BigInt(body.budgetCredits),
     expiresAt: body.expiresAt,
@@ -198,6 +256,7 @@ export async function mintAntigravityRelayRoute(args: {
   requestId: string
   modelId: string
   allowedModelIds?: readonly string[]
+  pricingOverride?: AntigravityRelayPricingOverride
   accountId: bigint
   budgetCredits: bigint
   relayPort: number
@@ -215,6 +274,14 @@ export async function mintAntigravityRelayRoute(args: {
     throw new Error('antigravity relay model is not allowlisted')
   }
   const allowedModelIds = normalizeAllowedModelIds(args.modelId, args.allowedModelIds)
+  let pricingOverride: AntigravityRelayPricingOverride | undefined
+  if (args.pricingOverride !== undefined) {
+    const validated = parsePricingOverride(args.pricingOverride, args.modelId)
+    if (!validated) {
+      throw new Error('antigravity relay pricingOverride is invalid')
+    }
+    pricingOverride = validated
+  }
   if (args.budgetCredits <= 0n) {
     throw new Error('antigravity relay budget must be positive')
   }
@@ -232,6 +299,7 @@ export async function mintAntigravityRelayRoute(args: {
     requestId: args.requestId,
     modelId: args.modelId,
     ...(allowedModelIds ? { allowedModelIds } : {}),
+    ...(pricingOverride ? { pricingOverride } : {}),
     accountId: args.accountId,
     budgetCredits: args.budgetCredits,
     expiresAt: now + ttl,
@@ -448,4 +516,59 @@ export function _resetAntigravityRelayRoutesForTests(): void {
   routes.clear()
   kv = null
   authority = null
+}
+
+/**
+ * Atomically claim an inflight delegate_antigravity journal row before minting
+ * upstream pool/Redis resources (OCV5-897 B4 cross-instance race barrier).
+ */
+export async function claimDelegateAntigravityMint(
+  pool: Pick<Pool, 'query'>,
+  args: { requestId: string; claimId: string; userId: number; containerId: number },
+): Promise<boolean> {
+  const res = await pool.query(
+    `UPDATE request_finalize_journal
+        SET ctx = ctx || jsonb_build_object('antigravityMintClaim', $2::text),
+            updated_at = NOW()
+      WHERE request_id=$1 AND user_id=$3 AND container_id=$4
+        AND state='inflight'
+        AND NOT (ctx ? 'antigravityRouteToken')
+        AND NOT (ctx ? 'antigravityMintClaim')
+      RETURNING request_id`,
+    [args.requestId, args.claimId, args.userId, args.containerId],
+  )
+  return res.rows.length === 1
+}
+
+/** Release a previously acquired mint claim if minting fails before persisting a route token. */
+export async function releaseDelegateAntigravityMintClaim(
+  pool: Pick<Pool, 'query'>,
+  args: { requestId: string; claimId: string; userId: number; containerId: number },
+): Promise<void> {
+  await pool.query(
+    `UPDATE request_finalize_journal
+        SET ctx = ctx - 'antigravityMintClaim',
+            updated_at = NOW()
+      WHERE request_id=$1 AND user_id=$2 AND container_id=$3
+        AND state='inflight' AND ctx->>'antigravityMintClaim'=$4`,
+    [args.requestId, args.userId, args.containerId, args.claimId],
+  )
+}
+
+/** Swap the mint claim for the minted route token on the owned inflight journal row. */
+export async function persistDelegateAntigravityRouteToken(
+  pool: Pick<Pool, 'query'>,
+  args: { requestId: string; token: string; claimId: string; userId: number; containerId: number },
+): Promise<boolean> {
+  const res = await pool.query(
+    `UPDATE request_finalize_journal
+        SET ctx = (ctx - 'antigravityMintClaim') || jsonb_build_object('antigravityRouteToken', $2::text),
+            updated_at = NOW()
+      WHERE request_id=$1 AND user_id=$3 AND container_id=$4
+        AND state='inflight' AND NOT (ctx ? 'antigravityRouteToken')
+        AND ctx->>'antigravityMintClaim'=$5
+      RETURNING request_id`,
+    [args.requestId, args.token, args.userId, args.containerId, args.claimId],
+  )
+  return res.rows.length === 1
 }

@@ -25,7 +25,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from core.canonical import remote_canonical_bytes, strict_json  # noqa: E402
+from core.canonical import (  # noqa: E402
+    remote_canonical_bytes,
+    remote_canonical_sha256,
+    remote_schema_filtered_sha256,
+    strict_json,
+)
 from core.contract import need  # noqa: E402
 from core.mcp_client import (  # noqa: E402
     MAX_BODY,
@@ -106,7 +111,8 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
 
                 cur_cfg = read_config(root)
                 catalog = read_catalog(root, cur_cfg)
-                allowed_tools = {t["name"] for t in catalog["tools"]}
+                tools_by_name = {t["name"]: t for t in catalog["tools"]}
+                allowed_tools = set(tools_by_name.keys())
                 for k in ("driverId", "engineId", "operationId", "runId", "generation", "profileId", "authEpoch"):
                     need(body.get(k) == cur_cfg[k], "REMOTE_SOCKET_BINDING_MISMATCH")
                 need(
@@ -124,10 +130,53 @@ def run_socket_bridge(root: Path, source: BinaryIO, sink: BinaryIO) -> int:
                         time.sleep(0.01)
                     need(obs_path.exists(), "REMOTE_SOCKET_OBSERVATION_MISSING")
                     obs = strict_json(read_private(obs_path.parent, obs_path.name, 65536))
-                    for obs_field in ("operationId", "runId", "generation", "nativeSessionId", "callId", "name", "argsHash"):
+                    need(
+                        type(body.get("arguments")) is dict
+                        and remote_canonical_sha256(body["arguments"]) == body.get("argsHash"),
+                        "REMOTE_SOCKET_OBSERVATION_MISMATCH",
+                    )
+                    for obs_field in ("operationId", "runId", "generation", "nativeSessionId", "callId", "name"):
                         need(obs.get(obs_field) == body.get(obs_field), "REMOTE_SOCKET_OBSERVATION_MISMATCH")
                     if "nativeTurnId" in body:
                         need(obs.get("nativeTurnId") == body["nativeTurnId"], "REMOTE_SOCKET_TURN_MISMATCH")
+                    tool_entry = tools_by_name.get(body["name"])
+                    tool_schema = tool_entry.get("inputSchema") if isinstance(tool_entry, dict) else None
+                    schema_props = (
+                        tool_schema.get("properties")
+                        if isinstance(tool_schema, dict)
+                        and isinstance(tool_schema.get("properties"), dict)
+                        and len(tool_schema["properties"]) > 0
+                        else None
+                    )
+                    if "argsSchemaSha256" in obs and obs["argsSchemaSha256"] is not None:
+                        obs_schema_sha = obs["argsSchemaSha256"]
+                        need(
+                            isinstance(obs_schema_sha, str)
+                            and len(obs_schema_sha) == 64
+                            and all(ch in "0123456789abcdef" for ch in obs_schema_sha),
+                            "REMOTE_SOCKET_OBSERVATION_MISMATCH",
+                        )
+                        if schema_props is not None:
+                            need(
+                                set(body["arguments"].keys()) <= set(schema_props.keys()),
+                                "REMOTE_SOCKET_OBSERVATION_MISMATCH",
+                            )
+                            computed_schema_sha = remote_schema_filtered_sha256(body["arguments"], tool_schema)
+                            need(
+                                obs_schema_sha == computed_schema_sha,
+                                "REMOTE_SOCKET_OBSERVATION_MISMATCH",
+                            )
+                        else:
+                            need(
+                                obs.get("argsHash") == body.get("argsHash")
+                                and obs_schema_sha == body.get("argsHash"),
+                                "REMOTE_SOCKET_OBSERVATION_MISMATCH",
+                            )
+                    else:
+                        need(
+                            obs.get("argsHash") == body.get("argsHash"),
+                            "REMOTE_SOCKET_OBSERVATION_MISMATCH",
+                        )
 
                 attempt_file = attempts / (call_key + ".attempt.json")
                 result_file = attempts / (call_key + ".result.json")

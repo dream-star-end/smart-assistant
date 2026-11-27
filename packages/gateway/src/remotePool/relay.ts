@@ -34,6 +34,7 @@ import {
   type ModelAuthorityPayload,
   type RemoteControlReply,
   type RemoteDriverCommand,
+  type RemoteDriverTurnContentBlock,
   type RemoteDriverUsagePolicy,
   type RemotePendingToolRequest,
   type RemoteReceiptV4,
@@ -58,6 +59,68 @@ import {
 const MAX_BODY_BYTES = 16 * 1024 * 1024
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024
 const MAX_TOOL_BODY_BYTES = 6 * 1024 * 1024
+const CONTENT_BLOB_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const CONTENT_MIME_RE = /^[a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*$/i
+const TEXT_ONLY_REMOTE_DRIVERS = new Set<string>()
+
+export function validateRemoteTurnContentBlocks(raw: unknown): RemoteDriverTurnContentBlock[] {
+  remotePoolNeed(Array.isArray(raw) && raw.length > 0 && raw.length <= 64, 'REMOTE_CONTENT_BLOCK_INVALID')
+  const out: RemoteDriverTurnContentBlock[] = []
+  for (const item of raw) {
+    remotePoolNeed(item !== null && typeof item === 'object' && !Array.isArray(item), 'REMOTE_CONTENT_BLOCK_INVALID')
+    const b = item as Record<string, unknown>
+    if (b.type === 'text') {
+      remotePoolNeed(
+        Object.keys(b).every((k) => k === 'type' || k === 'text') &&
+          typeof b.text === 'string' &&
+          !b.text.includes('\u0000'),
+        'REMOTE_CONTENT_BLOCK_INVALID',
+      )
+      out.push({ type: 'text', text: b.text })
+    } else if (b.type === 'image') {
+      // B02 defense-in-depth: remote drivers cannot access the source container filesystem, so
+      // raw `path` blocks must never cross the relay boundary (must be materialized before dispatch).
+      // Reject malformed/traversal paths as REMOTE_CONTENT_BLOCK_INVALID first, and valid raw paths
+      // as REMOTE_IMAGE_PATH_UNSUPPORTED.
+      if (b.path !== undefined) {
+        remotePoolNeed(
+          typeof b.path === 'string' &&
+            b.path.length > 0 &&
+            b.path.startsWith('/') &&
+            !b.path.includes('\u0000') &&
+            !b.path.split('/').includes('..'),
+          'REMOTE_CONTENT_BLOCK_INVALID',
+        )
+        throw new Error('REMOTE_IMAGE_PATH_UNSUPPORTED')
+      }
+      remotePoolNeed(
+        Object.keys(b).every(
+          (k) => k === 'type' || k === 'mimeType' || k === 'data' || k === 'blobId',
+        ) &&
+          typeof b.mimeType === 'string' &&
+          b.mimeType.length <= 128 &&
+          CONTENT_MIME_RE.test(b.mimeType) &&
+          (b.data === undefined || (typeof b.data === 'string' && b.data.length > 0 && !b.data.includes('\u0000'))) &&
+          (b.blobId === undefined || (typeof b.blobId === 'string' && CONTENT_BLOB_ID_RE.test(b.blobId))),
+        'REMOTE_CONTENT_BLOCK_INVALID',
+      )
+      if (b.data === undefined) {
+        throw new Error(
+          b.blobId !== undefined ? 'REMOTE_IMAGE_BLOB_UNRESOLVED' : 'REMOTE_CONTENT_BLOCK_INVALID',
+        )
+      }
+      out.push({
+        type: 'image',
+        mimeType: b.mimeType,
+        data: b.data,
+        ...(typeof b.blobId === 'string' ? { blobId: b.blobId } : {}),
+      })
+    } else {
+      throw new Error('REMOTE_CONTENT_BLOCK_INVALID')
+    }
+  }
+  return out
+}
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   remotePoolNeed(req.method === 'POST' && !req.headers['transfer-encoding'], 'REMOTE_HTTP_INVALID')
@@ -109,6 +172,7 @@ export interface RemotePoolRelayOptions {
     readonly testFaultAllowDuplicateClaim?: boolean
     readonly allowTestBypassInTmp?: boolean
     readonly authorizeTimeoutMs?: number
+    readonly toolInputSchemas?: ReadonlyMap<string, Record<string, unknown>>
   }
 }
 
@@ -227,9 +291,15 @@ export class RemotePoolRelay {
       typeof options.spec.driverContext?.initialSessionUuid === 'string'
         ? options.spec.driverContext.initialSessionUuid
         : undefined
+    const probedCliVersion =
+      typeof options.spec.verifiedProbe?.cliVersion === 'string' &&
+      options.spec.verifiedProbe.cliVersion.length > 0
+        ? options.spec.verifiedProbe.cliVersion
+        : undefined
     this.masterNativeState = {
       expectedModel: options.spec.manifest.model,
       operationId: options.binding.operationId,
+      ...(probedCliVersion ? { cliVersion: probedCliVersion } : {}),
       ...(initialUuid ? { sessionId: initialUuid } : {}),
       ...(options.spec.manifest.nativeSessionId ? { sessionId: options.spec.manifest.nativeSessionId } : {}),
     }
@@ -579,9 +649,15 @@ export class RemotePoolRelay {
         typeof this.masterNativeState.resolvedConcreteModel === 'string'
           ? this.masterNativeState.resolvedConcreteModel
           : undefined
+      const probedCliVersion =
+        typeof this.spec.verifiedProbe?.cliVersion === 'string' &&
+        this.spec.verifiedProbe.cliVersion.length > 0
+          ? this.spec.verifiedProbe.cliVersion
+          : undefined
       this.masterNativeState = {
         expectedModel: this.spec.manifest.model,
         operationId: this.binding.operationId,
+        ...(probedCliVersion ? { cliVersion: probedCliVersion } : {}),
         ...(initialUuid ? { sessionId: initialUuid } : {}),
         ...(this.nativeSessionId ? { sessionId: this.nativeSessionId } : {}),
         ...(prevConcreteModel ? { resolvedConcreteModel: prevConcreteModel } : {}),
@@ -942,7 +1018,13 @@ export class RemotePoolRelay {
     this.publish({ kind: 'turn_settled', receipt, outcome })
   }
 
-  private admit(v: Record<string, unknown>): Promise<{ ready: true; seq: number; nativeSessionId: string }> {
+  private admit(v: Record<string, unknown>): Promise<{
+    ready: true
+    seq: number
+    nativeSessionId: string
+    countersBaseline?: Readonly<Record<string, number>>
+    threadUsageBaseline?: Readonly<Record<string, number>>
+  }> {
     remotePoolNeed(!this.admitting, 'REMOTE_ADMIT_CONCURRENT')
     const run = this.admitTurn(v)
     this.admitting = run.then(
@@ -954,7 +1036,13 @@ export class RemotePoolRelay {
     })
   }
 
-  private async admitTurn(v: Record<string, unknown>): Promise<{ ready: true; seq: number; nativeSessionId: string }> {
+  private async admitTurn(v: Record<string, unknown>): Promise<{
+    ready: true
+    seq: number
+    nativeSessionId: string
+    countersBaseline?: Readonly<Record<string, number>>
+    threadUsageBaseline?: Readonly<Record<string, number>>
+  }> {
     remotePoolNeed(!this.active && !this.starting && !this.revoked, 'REMOTE_ADMIT_BUSY_OR_CLOSED')
     remotePoolNeed(
       typeof v.authority === 'string' && typeof v.lease === 'string' && typeof v.turnKey === 'string' && /^[a-f0-9]{64}$/.test(v.turnKey),
@@ -1029,17 +1117,33 @@ export class RemotePoolRelay {
     remotePoolNeed(!this.revoked, 'REMOTE_REVOKED_DURING_ADMIT')
     this.record('admission', { authority: v.authority, lease: v.lease, turnKey: v.turnKey, catalogHash })
 
-    this.observation ??= new RemoteObservationGate(
-      {
-        operationId: this.binding.operationId,
-        generation: this.binding.generation,
-        profileId: this.binding.profileId,
-        authEpoch: this.binding.authEpoch,
-      },
-      aliasSet,
-      (reason) => this.fence(reason),
-      this.observationOptions,
-    )
+    if (!this.observation) {
+      const mergedSchemas = new Map<string, Record<string, unknown>>()
+      for (const t of catalog.tools) {
+        if (t.name && t.inputSchema && typeof t.inputSchema === 'object' && !Array.isArray(t.inputSchema)) {
+          mergedSchemas.set(t.name, t.inputSchema as Record<string, unknown>)
+        }
+      }
+      if (this.observationOptions?.toolInputSchemas) {
+        for (const [alias, schema] of this.observationOptions.toolInputSchemas) {
+          mergedSchemas.set(alias, schema)
+        }
+      }
+      this.observation = new RemoteObservationGate(
+        {
+          operationId: this.binding.operationId,
+          generation: this.binding.generation,
+          profileId: this.binding.profileId,
+          authEpoch: this.binding.authEpoch,
+        },
+        aliasSet,
+        (reason) => this.fence(reason),
+        {
+          ...this.observationOptions,
+          ...(mergedSchemas.size > 0 ? { toolInputSchemas: mergedSchemas } : {}),
+        },
+      )
+    }
     this.observation.beginTurn()
     this.armLeaseTimer(v.lease)
     try {
@@ -1164,7 +1268,17 @@ export class RemotePoolRelay {
     this.starting = false
     this.active = true
     this.localStopped = false
-    return { ready: true, seq: this.outputSeq, nativeSessionId: this.nativeSessionId }
+    return {
+      ready: true,
+      seq: this.outputSeq,
+      nativeSessionId: this.nativeSessionId,
+      ...(this.countersBaseline !== null
+        ? {
+            countersBaseline: this.countersBaseline,
+            threadUsageBaseline: this.countersBaseline,
+          }
+        : {}),
+    }
     } catch (err) {
       clearTimeout(this.expiry)
       this.expiry = undefined
@@ -1223,6 +1337,26 @@ export class RemotePoolRelay {
           'REMOTE_EFFORT_NOT_SUPPORTED',
         )
       }
+      let validatedServiceTier: 'standard' | 'fast' | 'ultrafast' | undefined
+      if (cmd.serviceTier !== undefined) {
+        remotePoolNeed(
+          cmd.serviceTier === 'standard' ||
+            cmd.serviceTier === 'fast' ||
+            cmd.serviceTier === 'ultrafast',
+          'REMOTE_SERVICE_TIER_INVALID',
+        )
+        validatedServiceTier = cmd.serviceTier
+      }
+      const validatedContent =
+        cmd.content !== undefined ? validateRemoteTurnContentBlocks(cmd.content) : undefined
+      if (validatedContent?.some((b) => b.type === 'image')) {
+        remotePoolNeed(
+          this.admitted.payload.executionDescriptor.supportsVision === true &&
+            !TEXT_ONLY_REMOTE_DRIVERS.has(this.binding.authorityEngine) &&
+            !TEXT_ONLY_REMOTE_DRIVERS.has(this.binding.driverId),
+          'REMOTE_VISION_CONTENT_UNSUPPORTED',
+        )
+      }
       const typedCmd: RemoteDriverCommand = {
         kind: 'newTurn',
         commandId: cmd.commandId,
@@ -1230,6 +1364,8 @@ export class RemotePoolRelay {
         prompt: cmd.prompt,
         nativeSessionId: this.nativeSessionId,
         ...(typeof cmd.effort === 'string' ? { effort: cmd.effort } : {}),
+        ...(validatedServiceTier !== undefined ? { serviceTier: validatedServiceTier } : {}),
+        ...(validatedContent !== undefined ? { content: validatedContent } : {}),
         ...(typeof cmd.instructions === 'string' ? { instructions: cmd.instructions } : {}),
       }
       // Burn dispatch flag BEFORE async effect marker so lost ACKs can never re-submit!

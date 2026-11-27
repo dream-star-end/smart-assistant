@@ -37,9 +37,10 @@ export function isDelegateGrokRoutePath(path: string): boolean {
   )
 }
 
-// ── delegate antigravity-route(v5 面 forwarder 放行例外)───────────────────
+// ── delegate antigravity-route(v5 面 forwarder 放行例外;两版均挂载)──────────
 // 容器本地 delegate turn 没有浏览器 frame 注入 __oc_antigravity_route,
-// gateway 向 master 申请同款 token-bound loopback route(OCV5-738)。
+// gateway 向 master 申请同款 token-bound loopback route(OCV5-738/OCV5-897);
+// 两版均挂载,靠 inflight `delegate_antigravity` 计费 journal 与容器身份双向鉴权。
 export const DELEGATE_ANTIGRAVITY_ROUTE_MINT_PATH = '/internal/v5/delegate/antigravity-route/mint'
 export const DELEGATE_ANTIGRAVITY_ROUTE_RELEASE_PATH = '/internal/v5/delegate/antigravity-route/release'
 export const DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH = '/internal/v5/delegate/antigravity-route/renew'
@@ -134,6 +135,10 @@ export const QQ_PROACTIVE_PATH = '/internal/v3/qq-proactive'
 export const MARKETPLACE_AGENT_PREFIX = '/internal/v3/marketplace/agent/'
 /** master 挂载的持久化静态站点发布前缀(oc-site CLI,startsWith 匹配)。 */
 export const SITES_AGENT_INTERNAL_PREFIX = '/internal/v3/sites/'
+/** OCV5-907 Wave 2 (P1-1): 容器 ↔ master 权威小状态 RPC 前缀(startsWith 匹配)。 */
+export const AUTHORITY_STATE_INTERNAL_PREFIX = '/internal/v3/authority-state/'
+/** OCV5-907 Wave 2 (P1-2): 容器 ↔ master 内容寻址 Artifact Blob 存储 RPC 前缀(startsWith 匹配)。 */
+export const ARTIFACT_BLOB_INTERNAL_PREFIX = '/internal/v3/artifact-blobs/'
 
 // ── v3 master→容器 面(容器 gateway 18789 上服务;不经 egress forwarder)────
 export const WECHAT_INBOUND_CONTAINER_PATH = '/internal/v3/wechat-inbound'
@@ -182,7 +187,7 @@ export interface InternalRouteEntry {
 }
 
 export const INTERNAL_ROUTES = [
-  // ── v5:delegate grok-route(forwarder 唯一放行例外;两版都挂载,relay 按计费 journal 放行)──
+  // ── v5:delegate grok/antigravity-route(forwarder 放行例外;两版均挂载,靠 inflight 计费 journal 与容器身份双向鉴权)──
   {
     path: DELEGATE_GROK_ROUTE_MINT_PATH,
     match: 'exact',
@@ -209,7 +214,6 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v5',
     egressForwardException: true,
-    selfhostOnly: true,
     sources: ['gateway/src/delegateAntigravityRoute.ts', 'commercial/src/http/internalDelegateAntigravityRoute.ts'],
   },
   {
@@ -217,7 +221,6 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v5',
     egressForwardException: true,
-    selfhostOnly: true,
     sources: ['gateway/src/delegateAntigravityRoute.ts', 'commercial/src/http/internalDelegateAntigravityRoute.ts'],
   },
   {
@@ -699,6 +702,24 @@ export const INTERNAL_ROUTES = [
     plane: 'v3',
     selfhostOnly: true,
     sources: ['gateway/src/delegateRemoteLane.ts', 'commercial/src/http/internalDelegateRemoteLane.ts'],
+  },
+  {
+    path: AUTHORITY_STATE_INTERNAL_PREFIX,
+    match: 'prefix',
+    plane: 'v3',
+    sources: [
+      'gateway/src/storageSeam/remoteSessionAuthorityClient.ts',
+      'commercial/src/http/internalAuthorityState.ts',
+    ],
+  },
+  {
+    path: ARTIFACT_BLOB_INTERNAL_PREFIX,
+    match: 'prefix',
+    plane: 'v3',
+    sources: [
+      'gateway/src/storageSeam/remoteArtifactBlobClient.ts',
+      'commercial/src/http/internalArtifactBlobs.ts',
+    ],
   },
 ] as const satisfies readonly InternalRouteEntry[]
 

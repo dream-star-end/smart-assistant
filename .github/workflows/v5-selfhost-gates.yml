@@ -17,6 +17,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  statuses: read
 
 concurrency:
   group: v5-selfhost-gates-${{ github.event.pull_request.number || github.ref }}
@@ -183,8 +184,60 @@ jobs:
             npx tsx scripts/check-changelog-guard.ts --base "$BASE_REF"
           fi
 
-      - name: Feature flags TTL registry gate
-        run: npx tsx scripts/check-feature-flags-ttl.ts
+      - name: Feature flags TTL registry gate (strict expired enforcement)
+        run: npx tsx scripts/check-feature-flags-ttl.ts --fail-on-expired
+
+      - name: Context static launch-budget gate
+        run: npx tsx scripts/check-context-static.ts --skip-sub-evals
+
+      # OCV5-904 / OCV5-905 / OCV5-906 / OCV5-903: A0/A1 单调分离裁判、AI 坏味/复杂度/克隆/SAST 棘轮、债务 TTL 与跨家族看护员硬门。
+      # B2: PR 显式绑定真实 PR head SHA（绝不绑定合成 merge SHA），与 push/宿主机共享同一份提交外可信审批通道，零永久降级。
+      - name: A0 / A1 monotonic guardrail separation referee
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ steps.base.outputs.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "$EVENT" = "pull_request" ] && [ -n "$PR_HEAD_SHA" ]; then
+            npx tsx scripts/check-a0-monotonic.ts --base "$BASE_REF" --head "$PR_HEAD_SHA" --github-repo "$GITHUB_REPOSITORY" --pr-number "$PR_NUMBER"
+          else
+            npx tsx scripts/check-a0-monotonic.ts --base "$BASE_REF" --head HEAD --github-repo "$GITHUB_REPOSITORY"
+          fi
+
+      - name: AI code smells zero-net-increase ratchet
+        run: npx tsx scripts/check-ai-smells-ratchet.ts --enforce --base "${{ steps.base.outputs.ref }}"
+
+      - name: Function complexity ratchet (100L / CC 20 / nesting 5)
+        run: npx tsx scripts/check-complexity-ratchet.ts --enforce --base "${{ steps.base.outputs.ref }}"
+
+      - name: Incremental 12-line cross-file clones ratchet
+        run: npx tsx scripts/check-clones-ratchet.ts --enforce --changed-only --base "${{ steps.base.outputs.ref }}"
+
+      - name: Deterministic SAST & secret leak gate
+        run: npx tsx scripts/check-security-sast.ts --enforce --base "${{ steps.base.outputs.ref }}"
+
+      - name: Debt TTL decay ratchet & Debt-First feature freeze
+        env:
+          BASE_REF: ${{ steps.base.outputs.ref }}
+          TARGET_REF: ${{ github.event.pull_request.head.sha || 'HEAD' }}
+        run: npx tsx scripts/check-debt-ttl.ts --enforce --base "$BASE_REF" --head "$TARGET_REF"
+
+      - name: Cross-family Architecture Steward gate
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ steps.base.outputs.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "$EVENT" = "pull_request" ] && [ -n "$PR_HEAD_SHA" ]; then
+            npx tsx scripts/check-cross-family-audit.ts --enforce-pr --base "$BASE_REF" --head "$PR_HEAD_SHA" --github-repo "$GITHUB_REPOSITORY"
+          else
+            npx tsx scripts/check-cross-family-audit.ts --enforce-commit --base "$BASE_REF" --head HEAD --github-repo "$GITHUB_REPOSITORY"
+          fi
 
       # OCV5-847 (Wave 2): PG 零停机 Expand-Contract 迁移安全门 & 核心 5 域 REST API 契约兼容门（直调 A 类脚本）。
       - name: PG zero-downtime migration safety gate
@@ -244,7 +297,7 @@ jobs:
         run: npx tsx scripts/check-rest-contract-compat.ts --base "${{ steps.base.outputs.ref }}"
 
       - name: Governance gate self-tests
-        run: npx tsx --test scripts/__tests__/check-docs-links.test.ts scripts/__tests__/check-ui-hard-gates.test.ts scripts/__tests__/check-no-silent-model-downgrade.test.ts scripts/__tests__/check-v5-route-sync.test.ts scripts/__tests__/check-monotonic-baselines.test.ts scripts/__tests__/check-changelog-guard.test.ts scripts/__tests__/check-feature-flags-ttl.test.ts scripts/__tests__/check-pg-migration-safety.test.ts scripts/__tests__/check-rest-contract-compat.test.ts scripts/__tests__/check-cross-family-audit.test.ts scripts/__tests__/check-vlm-aesthetic-judge.test.ts
+        run: npx tsx --test scripts/__tests__/check-docs-links.test.ts scripts/__tests__/check-ui-hard-gates.test.ts scripts/__tests__/check-no-silent-model-downgrade.test.ts scripts/__tests__/check-v5-route-sync.test.ts scripts/__tests__/check-monotonic-baselines.test.ts scripts/__tests__/check-changelog-guard.test.ts scripts/__tests__/check-feature-flags-ttl.test.ts scripts/__tests__/check-pg-migration-safety.test.ts scripts/__tests__/check-rest-contract-compat.test.ts scripts/__tests__/check-cross-family-audit.test.ts scripts/__tests__/check-vlm-aesthetic-judge.test.ts scripts/__tests__/runtimeImagePin.test.ts scripts/__tests__/checkA0Monotonic.test.ts scripts/__tests__/checkAiSmellsRatchet.test.ts scripts/__tests__/checkComplexityRatchet.test.ts scripts/__tests__/checkClonesRatchet.test.ts scripts/__tests__/checkDeadCodeWeekly.test.ts scripts/__tests__/checkSecuritySast.test.ts scripts/__tests__/archStewardGate.test.ts scripts/gardening/__tests__/gardeningLoop.test.ts scripts/__tests__/checkDebtTtl.test.ts scripts/__tests__/checkMutationWeekly.test.ts scripts/__tests__/v5GovernanceCockpitDigest.test.ts scripts/__tests__/ocGovernor.test.ts scripts/__tests__/v5TrainRefereeAndDebounce.test.ts scripts/__tests__/v5SelfhostGovernanceFastGates.test.ts scripts/__tests__/gitHooksPrePush.test.ts
 
       - name: Prepare and flip lane isolation (temporary git, locks and artifacts only)
         run: |
@@ -379,7 +432,7 @@ jobs:
         run: npx tsx scripts/check-architecture.ts --enforce
 
       - name: Checker tests
-        run: npx tsx --test scripts/__tests__/checkArchitecture.test.ts
+        run: npx tsx --test scripts/__tests__/checkArchitecture.test.ts scripts/__tests__/checkArchitectureUpgrades.test.ts
 
       - name: Upload report
         if: always()

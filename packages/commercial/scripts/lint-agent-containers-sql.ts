@@ -53,10 +53,9 @@
  *   纯函数 lintFile / lintFileDetailed 单测,fixture 含正负例。
  */
 
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
 
 /** 显式 state 检查的"下方"窗口大小,sql 多行写法 5 行足够。 */
 export const STATE_WINDOW_LINES = 5;
@@ -451,9 +450,30 @@ export function main(srcRoot: string): number {
 
 // 直接 `tsx ./this-file.ts` 跑(node esm import.meta.url 探测)
 const __filename = fileURLToPath(import.meta.url);
-if (process.argv[1] && process.argv[1] === __filename) {
+if (process.argv[1] && resolve(process.argv[1]) === __filename) {
   // 默认扫 packages/commercial/src/(脚本位于 packages/commercial/scripts/)
   const __dirname = dirname(__filename);
-  const srcRoot = join(__dirname, "..", "src");
+  let srcRoot = join(__dirname, "..", "src");
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--root") {
+      const val = args[++i];
+      if (!val) {
+        console.error("[lint-agent-containers-sql] --root requires a directory");
+        process.exit(2);
+      }
+      srcRoot = join(resolve(val), "packages", "commercial", "src");
+    } else if (arg?.startsWith("--root=")) {
+      srcRoot = join(resolve(arg.slice("--root=".length)), "packages", "commercial", "src");
+    } else {
+      console.error(`[lint-agent-containers-sql] unknown argument: ${arg}`);
+      process.exit(2);
+    }
+  }
+  if (!existsSync(srcRoot)) {
+    console.error(`[lint-agent-containers-sql] FAIL-CLOSED: missing src dir ${srcRoot}`);
+    process.exit(2);
+  }
   process.exit(main(srcRoot));
 }

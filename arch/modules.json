@@ -49,7 +49,8 @@
   "commercial-logging": {
    "layer": "L1",
    "match": [
-    "packages/commercial/src/logging/**"
+    "packages/commercial/src/logging/**",
+    "packages/commercial/src/observability/**"
    ],
    "scope": [
     "master",
@@ -58,7 +59,7 @@
    "allow": [
     "kernel"
    ],
-   "note": "→ @openclaude/kernel log (P1). allow kernel: logger.ts is a thin wrapper over kernel log (OCV5-555)"
+   "note": "→ @openclaude/kernel log (P1). allow kernel: logger.ts is a thin wrapper over kernel log (OCV5-555); also covers observability/** runtime telemetry (OCV5-906)"
   },
   "commercial-flavor": {
    "layer": "L1",
@@ -87,6 +88,26 @@
    "allow": [
     "kernel"
    ],
+   "subdomains": {
+    "core-types": {
+     "rank": 0,
+     "match": [
+      "packages/gateway/src/gatewayTypes.ts",
+      "packages/gateway/src/sessionTypes.ts"
+     ],
+     "note": "Pure gateway/session type contracts; must not depend on runtime logger/metrics/eventBus"
+    },
+    "core-telemetry": {
+     "rank": 1,
+     "match": [
+      "packages/gateway/src/logger.ts",
+      "packages/gateway/src/metrics.ts",
+      "packages/gateway/src/eventBus.ts",
+      "packages/gateway/src/runLog.ts"
+     ],
+     "note": "Gateway core runtime telemetry & event plumbing"
+    }
+   },
    "note": "→ @openclaude/kernel (P1). allow kernel: logger.ts is a thin wrapper over kernel log while it moves there (OCV5-550)"
   },
   "platform-pg": {
@@ -98,6 +119,42 @@
     "master",
     "egress"
    ],
+   "subdomains": {
+    "db-core": {
+     "rank": 0,
+     "match": [
+      "packages/commercial/src/db/**"
+     ],
+     "note": "PG pool, migrations, base queries, authority & small stores; must not depend upward on live-tape or pgSessionsBackend"
+    },
+    "db-live-tape": {
+     "rank": 1,
+     "match": [
+      "packages/commercial/src/db/liveFrame*.ts",
+      "packages/commercial/src/db/liveTurnFrames.ts",
+      "packages/commercial/src/db/liveUnitCheckpoints.ts",
+      "packages/commercial/src/db/turnTapeJobs.ts",
+      "packages/commercial/src/db/tapeJobScheduler.ts",
+      "packages/commercial/src/db/sessionSnapshot*.ts",
+      "packages/commercial/src/db/sessionMetadataApproval.ts",
+      "packages/commercial/src/db/sessionRecoveryEvidence.ts",
+      "packages/commercial/src/db/serviceRestartLiveFold.ts",
+      "packages/commercial/src/db/visibleFinalize.ts",
+      "packages/commercial/src/db/pgTimelinePerf.ts",
+      "packages/commercial/src/db/pgCcbTranscriptRestore.ts"
+     ],
+     "note": "Live frames, turn tape jobs, snapshots & recovery evidence; must not depend upward on pgSessionsBackend"
+    },
+    "db-sessions-backend": {
+     "rank": 2,
+     "match": [
+      "packages/commercial/src/db/pgSessionsBackend.ts",
+      "packages/commercial/src/db/ccbTranscriptRestoreReader.ts",
+      "packages/commercial/src/db/refusedRecoveryCards.ts"
+     ],
+     "note": "Sessions backend facade & restore readers"
+    }
+   },
    "note": "pgSessionsBackend.ts splits into domain stores in P6",
    "allow": [
     "platform-config"
@@ -738,6 +795,52 @@
    "scope": [
     "container"
    ],
+   "subdomains": {
+    "rt-exec-env": {
+     "rank": 0,
+     "match": [
+      "packages/gateway/src/execEnv/**",
+      "packages/gateway/src/storageSeam/**"
+     ],
+     "note": "Low-level execution environment and storage seam primitives inside gateway-runtime"
+    },
+    "rt-cc5": {
+     "rank": 1,
+     "match": [
+      "packages/gateway/src/cc5*.ts",
+      "packages/gateway/src/ccb*.ts"
+     ],
+     "note": "CC5/CCB container runtime & bridge internals"
+    },
+    "rt-codex-remote": {
+     "rank": 1,
+     "match": [
+      "packages/gateway/src/codex*.ts",
+      "packages/gateway/src/remotePool/**",
+      "packages/gateway/src/agentRemote/**",
+      "packages/gateway/src/inferencePool/**"
+     ],
+     "note": "Codex remote lanes, remote pool & inference pool internals"
+    },
+    "rt-context-policy": {
+     "rank": 1,
+     "match": [
+      "packages/gateway/src/context*.ts",
+      "packages/gateway/src/actionPolicyEngine.ts",
+      "packages/gateway/src/efficiency*.ts",
+      "packages/gateway/src/prompt*.ts",
+      "packages/gateway/src/modelAuthority.ts"
+     ],
+     "note": "Context governance, action policy, prompt slots & model authority"
+    },
+    "rt-misc": {
+     "rank": 2,
+     "match": [
+      "packages/gateway/src/**"
+     ],
+     "note": "Remaining flat-root gateway-runtime helpers"
+    }
+   },
    "note": "the rest of gateway's flat root; split in P7"
   },
   "mcp-memory": {
@@ -848,7 +951,56 @@
    ],
    "scope": [
     "master"
-   ]
+   ],
+   "subdomains": {
+    "http-middleware": {
+     "rank": 0,
+     "match": [
+      "packages/commercial/src/middleware/**"
+     ],
+     "note": "HTTP middleware foundation"
+    },
+    "http-domain-adapters": {
+     "rank": 1,
+     "match": [
+      "packages/commercial/src/muse/**",
+      "packages/commercial/src/media-studio/**",
+      "packages/commercial/src/sites/**",
+      "packages/commercial/src/system-assistant/**",
+      "packages/commercial/src/tavily/**"
+     ],
+     "note": "Self-contained domain HTTP adapters; must not couple upward into http/router or sibling route groups"
+    },
+    "http-admin-routes": {
+     "rank": 1,
+     "match": [
+      "packages/commercial/src/http/admin/**",
+      "packages/commercial/src/http/admin*.ts"
+     ],
+     "note": "Admin HTTP route handlers"
+    },
+    "http-internal-routes": {
+     "rank": 1,
+     "match": [
+      "packages/commercial/src/http/internal*.ts"
+     ],
+     "note": "Container-to-master internal HTTP handlers"
+    },
+    "http-org-routes": {
+     "rank": 1,
+     "match": [
+      "packages/commercial/src/http/org/**"
+     ],
+     "note": "Organization HTTP route handlers"
+    },
+    "http-core-router": {
+     "rank": 2,
+     "match": [
+      "packages/commercial/src/http/**"
+     ],
+     "note": "Top-level HTTP router, shared handlers & proxy dispatch"
+    }
+   }
   },
   "interface-ws": {
    "layer": "L5",
@@ -857,7 +1009,55 @@
    ],
    "scope": [
     "master"
-   ]
+   ],
+   "subdomains": {
+    "ws-types-policy": {
+     "rank": 0,
+     "match": [
+      "packages/commercial/src/ws/**"
+     ],
+     "note": "WS wire types, frame budgets, guards, tickets & pure helpers; must not import link/tunnel/bridge orchestrators"
+    },
+    "ws-desktop-tunnel": {
+     "rank": 1,
+     "match": [
+      "packages/commercial/src/ws/desktop*.ts",
+      "packages/commercial/src/ws/tunnelContainerSocket.ts",
+      "packages/commercial/src/ws/recycleUnattestedContainer.ts"
+     ],
+     "note": "Desktop mux & tunnel registry"
+    },
+    "ws-container-link": {
+     "rank": 1,
+     "allow": [
+      "ws-desktop-tunnel"
+     ],
+     "match": [
+      "packages/commercial/src/ws/containerLink*.ts",
+      "packages/commercial/src/ws/bridgeExecutorRegistration.ts"
+     ],
+     "note": "Container link lifecycle, recovery & transport; may use ws-desktop-tunnel, must not depend upward on userChatBridge"
+    },
+    "ws-chat-bridge": {
+     "rank": 2,
+     "match": [
+      "packages/commercial/src/ws/userChatBridge.ts"
+     ],
+     "note": "User chat WS bridge orchestrator"
+    },
+    "ws-preview-browser": {
+     "rank": 2,
+     "allow": [
+      "ws-chat-bridge"
+     ],
+     "match": [
+      "packages/commercial/src/ws/containerPreviewBridge.ts",
+      "packages/commercial/src/ws/directContainerPreview.ts",
+      "packages/commercial/src/ws/liveBrowserBridge.ts"
+     ],
+     "note": "Preview & live browser WS bridges"
+    }
+   }
   },
   "gateway-interface": {
    "layer": "L5",
@@ -903,6 +1103,48 @@
     "egress"
    ]
   },
+  "remote-relay-protocol": {
+   "layer": "L1",
+   "match": [
+    "packages/commercial/src/remoteRelay/protocol.ts"
+   ],
+   "scope": [
+    "master",
+    "remote-relay"
+   ],
+   "authorities": [
+    "crypto"
+   ],
+   "note": "Shared AF_UNIX RPC protocol, error codec, and constant-time secret helper for master and standalone remote-relay daemon"
+  },
+  "remote-relay-client": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/agent-sandbox/remoteRelayClient.ts"
+   ],
+   "scope": [
+    "master"
+   ],
+   "authorities": [
+    "net"
+   ],
+   "note": "AF_UNIX HTTP RPC client for standalone remote-relay daemon (imported by L4 app-container and L6 remote-relay)"
+  },
+  "remote-relay": {
+   "layer": "L6",
+   "match": [
+    "packages/commercial/src/remoteRelay/**"
+   ],
+   "scope": [
+    "remote-relay"
+   ],
+   "authorities": [
+    "env",
+    "net",
+    "crypto"
+   ],
+   "note": "Standalone blue-green remote-relay daemon entrypoint and AF_UNIX RPC server"
+  },
   "gateway-shell": {
    "layer": "L6",
    "match": [
@@ -941,21 +1183,216 @@
     "packages/web-react/src/App.tsx",
     "packages/web-react/src/appLazyViews.tsx",
     "packages/web-react/src/main.tsx",
-    "packages/web-react/src/registerSW.ts"
+    "packages/web-react/src/registerSW.ts",
+    "packages/web-react/src/components/AppDialogs.tsx",
+    "packages/web-react/src/admin/main.tsx",
+    "packages/web-react/src/admin/AdminApp.tsx",
+    "packages/web-react/src/admin/AdminShell.tsx"
    ],
    "scope": [
     "browser"
-   ]
+   ],
+   "note": "F5 app & admin shell composition (V5_SELFHOST_PLAYBOOK §1.1)"
   },
-  "web-views": {
+  "web-domain-chat": {
    "layer": "F4",
+   "boundaryBaseline": "subdomain",
    "match": [
-    "packages/web-react/src/components/**",
+    "packages/web-react/src/components/chat/**",
+    "packages/web-react/src/components/tool/**",
+    "packages/web-react/src/components/ToolCard.tsx",
+    "packages/web-react/src/components/Message.tsx",
+    "packages/web-react/src/components/MessageBoundary.tsx",
+    "packages/web-react/src/components/MessageRenderer.tsx",
+    "packages/web-react/src/components/SessionTimelineBoundary.tsx",
+    "packages/web-react/src/components/ChatHeader.tsx",
+    "packages/web-react/src/components/Composer*.tsx",
+    "packages/web-react/src/components/ModelSelector*.tsx",
+    "packages/web-react/src/components/lazyModelSelectorPanel.tsx",
+    "packages/web-react/src/components/LongContextCostWarning.tsx",
+    "packages/web-react/src/components/Markdown.tsx",
+    "packages/web-react/src/components/MarkdownImpl.tsx",
+    "packages/web-react/src/components/CodeBlock.tsx",
+    "packages/web-react/src/components/RichBlocks.tsx",
+    "packages/web-react/src/components/HtmlEmbed.tsx",
+    "packages/web-react/src/components/optionsGroup.tsx",
+    "packages/web-react/src/components/EmptyState.tsx",
+    "packages/web-react/src/components/ErrorBanner.tsx",
+    "packages/web-react/src/components/UpdateBanner.tsx",
+    "packages/web-react/src/components/GoalDialog.tsx",
+    "packages/web-react/src/components/ShareDialog.tsx",
+    "packages/web-react/src/components/InboxDialog.tsx",
+    "packages/web-react/src/components/AgentAvatar.tsx",
+    "packages/web-react/src/components/AgentPicker.tsx",
+    "packages/web-react/src/components/LazyAgentPicker.tsx",
+    "packages/web-react/src/components/github/**",
+    "packages/web-react/src/components/research/**"
+   ],
+   "scope": [
+    "browser"
+   ],
+   "note": "F4 parallel domain 1/10: chat thread, composer, message renderer, markdown & tool cards"
+  },
+  "web-domain-sidebar": {
+   "layer": "F4",
+   "boundaryBaseline": "subdomain",
+   "match": [
+    "packages/web-react/src/components/sidebar/**",
+    "packages/web-react/src/components/Sidebar.tsx",
+    "packages/web-react/src/components/SessionStatusDot.tsx",
+    "packages/web-react/src/components/palette/**",
+    "packages/web-react/src/components/CommandPalette.tsx",
+    "packages/web-react/src/components/project/**",
+    "packages/web-react/src/components/CreateProjectDialog.tsx",
+    "packages/web-react/src/components/ProjectArchiveDialog.tsx",
+    "packages/web-react/src/components/ProjectAssetsPanel.tsx",
+    "packages/web-react/src/components/ProjectSettingsDialog.tsx"
+   ],
+   "scope": [
+    "browser"
+   ],
+   "note": "F4 parallel domain 2/10: sidebar navigation, project spaces & command palette"
+  },
+  "web-domain-workbench": {
+   "layer": "F4",
+   "boundaryBaseline": "subdomain",
+   "match": [
+    "packages/web-react/src/components/InspectorPanel.tsx",
+    "packages/web-react/src/components/ContainerWebPreview.tsx",
+    "packages/web-react/src/components/ImageViewer.tsx",
+    "packages/web-react/src/components/ImageAnnotationEditor.tsx",
+    "packages/web-react/src/components/ImageCommentMode.tsx",
+    "packages/web-react/src/components/ImageResizeMode.tsx",
+    "packages/web-react/src/components/chat/WorkbenchBottomBar.tsx",
+    "packages/web-react/src/components/chat/workbench.ts",
+    "packages/web-react/src/components/chat/workPane.ts",
+    "packages/web-react/src/components/chat/workTurns.ts",
+    "packages/web-react/src/components/chat/inspectorState.ts",
+    "packages/web-react/src/components/chat/paneParts.tsx",
+    "packages/web-react/src/components/chat/BrowserView.tsx",
+    "packages/web-react/src/components/chat/LiveBrowserCanvas.tsx",
+    "packages/web-react/src/components/chat/LiveBrowserStage.tsx",
+    "packages/web-react/src/components/chat/LiveBrowserToolbar.tsx",
+    "packages/web-react/src/components/chat/liveBrowserAutoResume.ts",
+    "packages/web-react/src/components/chat/OutputPreview.tsx",
+    "packages/web-react/src/components/chat/OutputsView.tsx",
+    "packages/web-react/src/components/chat/OutputsCompactBar.tsx",
+    "packages/web-react/src/components/chat/OutputsAuxParts.tsx",
+    "packages/web-react/src/components/chat/DeliverableRichPreview.tsx",
+    "packages/web-react/src/components/chat/deliverablePreview.ts",
+    "packages/web-react/src/components/chat/OfficeRichPreview.tsx"
+   ],
+   "scope": [
+    "browser"
+   ],
+   "note": "F4 parallel domain 3/10: workbench inspector, live browser stage, output & image/artifact previews"
+  },
+  "web-domain-swarm": {
+   "layer": "F4",
+   "boundaryBaseline": "subdomain",
+   "match": [
+    "packages/web-react/src/components/taskboard/**",
+    "packages/web-react/src/components/chat/Swarm*.tsx",
+    "packages/web-react/src/components/chat/swarm*.ts",
+    "packages/web-react/src/components/chat/PinnedSwarmDock.tsx",
+    "packages/web-react/src/components/chat/TeamPanel.tsx",
+    "packages/web-react/src/components/chat/AgentGroupCard.tsx",
+    "packages/web-react/src/components/chat/PinnedDelegateTracker.tsx",
+    "packages/web-react/src/components/chat/PinnedTaskTracker.tsx",
+    "packages/web-react/src/components/chat/PinnedBackgroundTasksPanel.tsx",
+    "packages/web-react/src/components/chat/delegateProcessList.tsx"
+   ],
+   "scope": [
+    "browser"
+   ],
+   "note": "F4 parallel domain 4/10: swarm collaboration board, delegate team panels & taskboard"
+  },
+  "web-domain-sites": {
+   "layer": "F4",
+   "boundaryBaseline": "subdomain",
+   "match": [
+    "packages/web-react/src/components/sites/**"
+   ],
+   "scope": [
+    "browser"
+   ],
+   "note": "F4 parallel domain 5/10: hosted Sites workspace"
+  },
+  "web-domain-settings": {
+   "layer": "F4",
+   "boundaryBaseline": "subdomain",
+   "match": [
+    "packages/web-react/src/components/settings/**",
+    "packages/web-react/src/components/SettingsCenter.tsx",
+    "packages/web-react/src/components/payment/**",
+    "packages/web-react/src/components/ChatGptProxyDialog.tsx",
+    "packages/web-react/src/components/AuthGate.tsx",
+    "packages/web-react/src/components/AgentGate.tsx",
+    "packages/web-react/src/components/AccountSwitchNotice.tsx",
+    "packages/web-react/src/components/BootSplash.tsx",
+    "packages/web-react/src/components/DesktopEnrollPage.tsx",
+    "packages/web-react/src/components/Landing.tsx",
+    "packages/web-react/src/components/landing/**",
+    "packages/web-react/src/components/LegalPage.tsx",
+    "packages/web-react/src/components/TurnstileWidget.tsx"
+   ],
+   "scope": [
+    "browser"
+   ],
+   "note": "F4 parallel domain 6/10: settings, account/billing/payment, auth & onboarding/landing"
+  },
+  "web-domain-manage": {
+   "layer": "F4",
+   "boundaryBaseline": "subdomain",
+   "match": [
+    "packages/web-react/src/components/manage/**",
+    "packages/web-react/src/components/ManageCenter.tsx",
+    "packages/web-react/src/components/marketplace/**",
+    "packages/web-react/src/components/MarketplaceCenter.tsx",
+    "packages/web-react/src/components/org/**",
+    "packages/web-react/src/components/OrgCenter.tsx",
+    "packages/web-react/src/components/tutorials/**",
+    "packages/web-react/src/components/TutorialCenter.tsx",
+    "packages/web-react/src/components/AgentScopePicker.tsx"
+   ],
+   "scope": [
+    "browser"
+   ],
+   "note": "F4 parallel domain 7/10: skills/memory/cron manage center, marketplace, org & tutorials"
+  },
+  "web-domain-admin": {
+   "layer": "F4",
+   "boundaryBaseline": "subdomain",
+   "match": [
     "packages/web-react/src/admin/**"
    ],
    "scope": [
     "browser"
-   ]
+   ],
+   "note": "F4 parallel domain 8/10: admin console pages, tables & admin API client"
+  },
+  "web-domain-iui": {
+   "layer": "F4",
+   "boundaryBaseline": "subdomain",
+   "match": [
+    "packages/web-react/src/components/iui/**"
+   ],
+   "scope": [
+    "browser"
+   ],
+   "note": "F4 parallel domain 9/10: Intelligent UI interactive block renderers"
+  },
+  "web-domain-studio": {
+   "layer": "F4",
+   "boundaryBaseline": "subdomain",
+   "match": [
+    "packages/web-react/src/components/studio/**",
+    "packages/web-react/src/components/MediaTaskCenter.tsx"
+   ],
+   "scope": [
+    "browser"
+   ],
+   "note": "F4 parallel domain 10/10: Media Studio workbench & media task center"
   },
   "web-hooks": {
    "layer": "F3",
@@ -966,6 +1403,24 @@
     "browser"
    ]
   },
+  "web-state": {
+   "layer": "F2",
+   "boundaryBaseline": "subdomain",
+   "match": [
+    "packages/web-react/src/lib/chat/**",
+    "packages/web-react/src/lib/timeline/**",
+    "packages/web-react/src/lib/persist.ts",
+    "packages/web-react/src/lib/persistActiveTurn.ts",
+    "packages/web-react/src/lib/incidentStore.ts",
+    "packages/web-react/src/lib/liveTerminals.ts",
+    "packages/web-react/src/lib/workbenchOpen.ts",
+    "packages/web-react/src/lib/sessionSwarmMode.ts"
+   ],
+   "scope": [
+    "browser"
+   ],
+   "note": "F2 frontend state machines: chat socket/reducer, swarm/workbench state, timeline & persistence stores"
+  },
   "web-lib": {
    "layer": "F1",
    "match": [
@@ -975,7 +1430,29 @@
    "scope": [
     "browser"
    ],
-   "note": "socket.ts and the chat reducer split into F2 stores in P8"
+   "note": "F1 frontend API clients, pure helpers & workers (lib/chat & stores split into F2 web-state; lib/utils & lib/ui split into F0 web-primitives)"
+  },
+  "web-primitives": {
+   "layer": "F0",
+   "boundaryBaseline": "subdomain",
+   "match": [
+    "packages/web-react/src/components/ui/**",
+    "packages/web-react/src/lib/utils.ts",
+    "packages/web-react/src/lib/ui/**",
+    "packages/web-react/src/components/BrandMark.tsx",
+    "packages/web-react/src/components/ChunkErrorBoundary.tsx",
+    "packages/web-react/src/components/DialogFallback.tsx",
+    "packages/web-react/src/components/ThemeToggle.tsx",
+    "packages/web-react/src/components/ErrorTechDetails.tsx",
+    "packages/web-react/src/components/charts.tsx",
+    "packages/web-react/src/components/embedCsp.ts",
+    "packages/web-react/src/components/embedDoc.ts",
+    "packages/web-react/src/components/mathDelimiters.ts"
+   ],
+   "scope": [
+    "browser"
+   ],
+   "note": "F0 zero-business-coupling UI design system primitives, cn() utilities & pure visual helpers"
   },
   "web-legacy": {
    "layer": "F1",

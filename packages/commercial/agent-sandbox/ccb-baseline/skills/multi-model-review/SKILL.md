@@ -8,6 +8,7 @@ tags: [research, review, multi-model]
 
 同一份稿件交给多个模型互评时，**评审员是谁、各自说了什么、分歧在哪，必须可见、可控、可留痕**。
 评审产出 JSON；**汇总走确定性 `oc-review`**（不让模型心算合并多份评审——汇总本身是单点幻觉源）。
+若待审稿件涉及物理硬伤、数学推导、数值仿真或公式↔代码一致性核验，强烈建议联动 `scientific-deep-audit` 技能先跑净室底座，再进入本跨家族盲审与反例法庭闭环。
 
 默认采用 **「1 轮异构盲审 + 1 轮批判吸收与 P0 复核 → P0=0 即收敛放行」** 工业化收敛闭环，根治 6+ 轮无限拉锯。
 
@@ -16,21 +17,26 @@ tags: [research, review, multi-model]
 0. **前置：保真读稿 + 机器静态门禁**（不把机械纠错浪费在 LLM 审稿上）：
    - 若待审稿件为 `.docx`，**严禁裸抽纯文本丢公式或把大文件塞满请求体**；必须先用 `oc-docx extract <file.docx> --latex` 无损还原 OMML 公式为 LaTeX 与表格结构（大稿先 `oc-docx extract <file.docx> --toc`，再按 `--section` 分片或向评审员传递轻引用路径）；
    - 送审前先跑三道确定性静态门禁：`oc-docx check <file.docx> --expect-formulas`（清零占位符/断号引用/OMML 异常/行尾标点丢失）、`oc-cite verify`（核验真 DOI 与题录匹配）与 `oc-stylecheck <file.docx>`（去 AI 味），通过后再派异构模型盲审。
-1. **定评审员**（模型×角色，两者正交）：默认从 catalog 挑 3 个不同家族模型；用户点名的用点名的
-   （如 kimi/gpt/deepseek/glm 四家）。角色预设：方法学审查 / 统计与数据 / 写作与逻辑 / 领域专家（写进 goal）。
+1. **定评审员**（模型×角色，两者正交）：默认从四大家族强档审计池（GPT `gpt-6.2-astra` / `gpt-6.2-sol`、Gemini `antigravity-gemini-4-neon` / `antigravity-gemini-4-carbon`、Grok `grok-build`、DeepSeek `deepseek-v4-flash`）挑 3 个不同家族模型；用户点名且属于四大家族的用点名的。角色预设：方法学审查 / 统计与数据 / 写作与逻辑 / 领域专家（写进 goal）。
    上限 4 位（delegate_tasks 单次上限）。
-2. **要 schema 与 P0/P1/P2 硬分级**：`oc-review schema` 打印评审员必须遵守的 JSON 契约，原样贴进每个委派 goal，并要求评审员按硬分级标注 `priority`：
-   - **`P0`（阻断放行）**：数学/物理推导错误、代码与正文数值矛盾、引文失实/张冠李戴、前后硬矛盾；
+2. **要 schema 与 P0/P1/P2 硬分级**：`oc-review schema` 打印评审员必须遵守的 JSON 契约，原样贴进每个委派 goal，并要求评审员按硬分级标注 `priority`（科研/数学/代码评审同步填写 `model_family` 与可复现反例 `repro_script`）：
+   - **`P0`（阻断放行）**：数学/物理推导错误、代码与正文数值矛盾、引文失实/张冠李戴、前后硬矛盾；涉及物理/数学/代码一致性硬伤时须附带 `repro_script`（`.py`/`.m` 反例脚本：必须正常 `exit 0` 并通过 `OC_WITNESS_VERDICT_FILE` 或 stdout `OC_WITNESS_VERDICT: {"status":"confirmed"|"refuted","summary":"..."}` 明确裁决；**严禁凭退出码 1 判证伪**，任何非零退出均保持 `unverified`，零反例不立项；评审 JSON 自填 `verified_by_machine` 仅作展示不入闸门）；
    - **`P1/P2`（非阻断）**：论证结构完善（`P1`）与风格措辞偏好（`P2`）。
 3. **并行委派**（只评不改）：Cursor 等多回合同一并发起 `oc-memory delegate --model <slug> --goal "..."`
-   （每位评审员一条）；CCB 引擎走 MCP `delegate_tasks`，tasks[] 每项填 `model` + `goal`。
+   （每位评审员一条）；CCB 引擎走 MCP `delegate_tasks`，tasks[] 每项填 `model` + `goal`（仅限四大家族强档审计池；遇上游 500/429 熔断立即在强档池内替补：如 `gpt-6.2-astra` 切 `gpt-6.2-sol` 或其余三大家族强档，`antigravity-gemini-4-neon` 切 `antigravity-gemini-4-carbon` 或其余三大家族强档，`grok-build` / `deepseek-v4-flash` 跨家族强档互替）。
    goal 模板："你是<角色>。严格按下方 JSON schema 输出评审，只输出 JSON，不要改写稿件。
    稿件：<路径或经 oc-docx extract --latex 提取的保真文本/章节切片>。schema：<oc-review schema 输出>"。
 4. **落盘**：把每位评审员的 JSON 存为 `/home/agent/.openclaude/generated/review-<ts>/reviews-<model>.json`
    （文件名必须是 `reviews-*.json` 才会被 collate 读取；评审员只回 JSON 时原样保存，不加工）。
-5. **跨轮裁决账本（`/home/agent/.openclaude/generated/review-<ts>/decision-ledger.json`）与确定性汇总**：
-   第 1 轮评审后，对每条核心意见做批判性吸收，并将**已采纳**或**带证据驳回**的条文记入本次评审目录内的独立绝对路径账本，防止后续轮次无新反证反复翻案（Flip-Flop）及相对路径落盘风险：
+5. **跨轮裁决账本、机器反例法庭与确定性汇总**：
+   第 1 轮评审后，若含 `repro_script` 反例脚本，先跑 `oc-review verify`（默认只采集哈希与 `findingDigest` 绝不执行未审计脚本；`--exec` 在无内核沙箱环境亦自动退回只采集；**仅当协调者逐行审计或自写净室脚本后**，才显式传 `--unsafe-local-exec` 在当前容器内运行，明确不提供 OS 级文件系统/网络隔离，要求 `exit 0` + 携带匹配 `finding_digest` 的 `OC_WITNESS_VERDICT`，崩溃/缺依赖/非零退出/stdout 截断均保留 `unverified` 不降级 P0）；再对核心意见做批判性吸收并初始化/记入绝对路径账本（首轮若未 `ledger init` 可先省略 `--ledger`，复核轮次必须先 `ledger init` 并挂 `--ledger` 防 Flip-Flop）：
    ```bash
+   # 机器反例法庭：对未审计外部脚本默认只采集；仅经逐行审计/自写净室脚本可追加 --unsafe-local-exec
+   oc-review verify \
+     --dir /home/agent/.openclaude/generated/review-<ts> \
+     --script-root /home/agent/.openclaude/generated/review-<ts> \
+     --manuscript /path/to/manuscript.docx
+
    oc-review ledger init --file /home/agent/.openclaude/generated/review-<ts>/decision-ledger.json
    oc-review ledger record --file /home/agent/.openclaude/generated/review-<ts>/decision-ledger.json \
      --anchor "<location>" --topic "<topic>" \
@@ -38,15 +44,18 @@ tags: [research, review, multi-model]
      --reason "<裁决理由>" --round 1 [--evidence "<证据>"]
    oc-review ledger show --file /home/agent/.openclaude/generated/review-<ts>/decision-ledger.json
 
-   # 汇总（首轮可不挂 --ledger；复核轮次必须挂 --ledger 自动折叠无新反证的重复挑刺）
+   # 汇总（复核轮次挂 --ledger 防 Flip-Flop；科研深审叠加 --verification 与 --scientific-gate）
    oc-review collate --dir /home/agent/.openclaude/generated/review-<ts> \
+     --script-root /home/agent/.openclaude/generated/review-<ts> \
+     --manuscript /path/to/manuscript.docx \
+     --verification /home/agent/.openclaude/generated/review-<ts>/verification-report.json \
      --ledger /home/agent/.openclaude/generated/review-<ts>/decision-ledger.json \
-     --round 2 [--out 自定义汇总卡路径]
+     --round 2 --scientific-gate [--out 自定义汇总卡路径]
    ```
-   产出 `review-summary.md`（收敛闸门、共识区/分歧区/单发区、按账本折叠的 Flip-Flop 区，按 blocker>major>minor>suggestion 排序）+
-   `review-summary.json`（含 `priorityTotals`、`activePriorityTotals`、`suppressedFlipFlops`、`gate`）；stdout 末行 `COLLATE: <blocker>/<major>/<minor>/<suggestion>` 供程序判读。
+   产出 `review-summary.md`（收敛闸门、共识区/分歧区/单发区、机器反例证伪排除区、按账本折叠的 Flip-Flop 区，按 blocker>major>minor>suggestion 排序）+
+   `review-summary.json`（含 `priorityTotals`、`activePriorityTotals`、`suppressedFlipFlops`、`machineRefuted`、`scientificMetrics`、`gate`）；stdout 末行 `COLLATE: <blocker>/<major>/<minor>/<suggestion>` 供程序判读。
 6. **收敛闸门与交付**：
-   - 检查 `review-summary.json` 中的收敛闸门：**当 `gate.status === 'PASS_READY'`（活跃 `P0 = 0`）时，必须显式宣布达到放行线并进入交付**，禁止为交差继续编造新审稿清单或无休止加轮；仅当 `gate.status === 'FIX_REQUIRED'`（活跃 `P0 > 0`）时才针对剩余 P0 定向修稿复核。
+   - 检查 `review-summary.json` 中的收敛闸门：常规评审看活跃 `P0 = 0`；开启 `--scientific-gate` 时需同时满足 **`confirmedP0 = 0 && unverifiedP0 = 0 && familyCount >= 2 && chao1Residual < 0.5`**（跨家族 Chao1 残余 P0 估算闸门）。**当 `gate.status === 'PASS_READY'` 时，必须显式宣布达到放行线并进入交付**，禁止为交差继续编造新审稿清单或无休止加轮；仅当 `gate.status === 'FIX_REQUIRED'` / `INSUFFICIENT_COVERAGE` / `RESIDUAL_RISK_HIGH` 时才按对应缺口定向修稿或补盲审。
    - 正文贴闸门结论与共识/分歧摘要（分歧双方并列），汇总卡以绝对路径作为附件交付；全套 JSON+md+`decision-ledger.json` 留在同一目录可回溯。可选：对分歧处的多个修法候选跑 `oc-rank elo` 排序后再由用户裁决。
 
 ## 规则
@@ -59,6 +68,8 @@ tags: [research, review, multi-model]
 - **只评不改**：评审员输出 findings，不重写稿件；修稿是另一步。
 - **积分护栏**：每位评审员按其模型正常计费（≈一次读全文的委派）。发起前先向用户报预估
   （评审员数 × 稿件量级）；超过默认 3 位或稿件 >2 万字先确认再发。
+- **反例仲裁防多模型共识误判**：数学/物理/代码争端严禁凭多模型投票直接改稿；对外部未审计脚本用 `oc-review verify --dir <dir> --script-root <dir> --manuscript <file>` 只采集不执行，仅对经逐行审计或协调者自写净室脚本显式加 `--unsafe-local-exec`（无 OS 隔离）仲裁，再配合 `oc-review collate --verification ... --scientific-gate`，仅有匹配 `findingDigest` + `scriptSha256` + 稿件版本且显式 `OC_WITNESS_VERDICT`（含匹配 `finding_digest`）判为 `refuted` 的发现才隔离出活跃 P0（非零退出/缺依赖/stdout 截断/自填 `verified_by_machine` 均不降级 P0）。
+- **上游 500/429 自动替补**：某家族模型返回 500/429 时不死等重试，立即切换四大家族强档审计池内的同家族强档或跨家族强档（如 `gpt-6.2-astra` → `gpt-6.2-sol`、`antigravity-gemini-4-neon` → `antigravity-gemini-4-carbon`、或与 `grok-build` / `deepseek-v4-flash` 跨家族互替），保证 `--scientific-gate` 下有效强档 `familyCount >= 2` 的独立异构覆盖率（弱档与非四大家族模型不计入覆盖）。
 - **一位评审员故障不作废全局**：某位评审员 429/超时/输出非 JSON 时，`oc-review collate` 默认跳过该文件、
   在汇总卡顶部标注"缺席 N 位"（COLLATE 行追加 `skipped=<n>`），其余评审员照常汇总。交付时把缺席如实告知
   用户；若用户要求补齐，修文件或重派该评审员后重跑即可（`--strict` 可恢复任一坏文件即失败）。

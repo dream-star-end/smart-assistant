@@ -9,6 +9,7 @@ import protobuf from 'protobufjs'
 import {
   ANTIGRAVITY_EXTRA_CLI_SHA256_ENV,
   ANTIGRAVITY_NATIVE_CLI_1_5_15_SHA256,
+  ANTIGRAVITY_NATIVE_CLI_1_5_18_SHA256,
   ANTIGRAVITY_NATIVE_CLI_1_5_8_SHA256,
   ANTIGRAVITY_NATIVE_CLI_SHA256,
   ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST,
@@ -381,6 +382,34 @@ test('OCV5-860: built-in allowlist appends verified Antigravity CLI 1.5.15 SHA-2
   const degraded: AntigravityNativeDegradationEvent[] = []
   assert.equal(
     await verifyAntigravityNativeBinary(cli1515Path, ANTIGRAVITY_NATIVE_CLI_SHA256, {
+      onDegraded: (e) => degraded.push(e),
+    }),
+    true,
+  )
+  assert.equal(degraded.length, 0)
+})
+
+test('OCV5-899: built-in allowlist appends verified Antigravity CLI 1.5.18 SHA-256 while retaining 1.4.0, 1.5.8, and 1.5.15', async () => {
+  assert.equal(ANTIGRAVITY_NATIVE_CLI_1_5_18_SHA256, '7c96ad8c944c1a8d195ca34d2041a3d74d5166c96662b52183b748a3c455d52f')
+  assert.ok(ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST.includes(ANTIGRAVITY_NATIVE_CLI_SHA256))
+  assert.ok(ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST.includes(ANTIGRAVITY_NATIVE_CLI_1_5_8_SHA256))
+  assert.ok(ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST.includes(ANTIGRAVITY_NATIVE_CLI_1_5_15_SHA256))
+  assert.ok(ANTIGRAVITY_NATIVE_CLI_SHA256_ALLOWLIST.includes(ANTIGRAVITY_NATIVE_CLI_1_5_18_SHA256))
+  const resolved = resolveAntigravityNativeCliSha256Allowlist(undefined)
+  assert.equal(resolved.has(ANTIGRAVITY_NATIVE_CLI_SHA256), true)
+  assert.equal(resolved.has(ANTIGRAVITY_NATIVE_CLI_1_5_8_SHA256), true)
+  assert.equal(resolved.has(ANTIGRAVITY_NATIVE_CLI_1_5_15_SHA256), true)
+  assert.equal(resolved.has(ANTIGRAVITY_NATIVE_CLI_1_5_18_SHA256), true)
+
+  const cli1518Path = '/opt/antigravity-cli/versions/1.5.18/antigravity'
+  try {
+    await readFile(cli1518Path)
+  } catch {
+    return
+  }
+  const degraded: AntigravityNativeDegradationEvent[] = []
+  assert.equal(
+    await verifyAntigravityNativeBinary(cli1518Path, ANTIGRAVITY_NATIVE_CLI_SHA256, {
       onDegraded: (e) => degraded.push(e),
     }),
     true,

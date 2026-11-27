@@ -62,6 +62,7 @@ cc5_activation_py() {
 }
 egress_slot_flip() { event egress-effect; }
 systemctl() { event master-effect; }
+selfhost_master_restart_or_flip() { systemctl restart "$V5_UNIT"; }
 cutover_clog() { event "$*"; }
 write_cutover_grace() { event grace; }
 canonicalize_prev_release() { echo previous; }

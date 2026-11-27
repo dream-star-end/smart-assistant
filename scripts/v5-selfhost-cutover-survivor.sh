@@ -112,7 +112,7 @@ phase_is_legal() {
 # executor 消失时即使旧进程健康绿也必须二级恢复。
 phase_is_uncommitted_mutation() {
   case "$1" in
-    mutated|units-partial|units-installed|reloaded|grace|migrated|symlink-flipped|restarted)
+    mutated|units-partial|units-installed|reloaded|grace|migrated|symlink-flipped|restarted|verifying)
       return 0
       ;;
     *)

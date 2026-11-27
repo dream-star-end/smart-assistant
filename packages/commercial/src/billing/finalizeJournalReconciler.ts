@@ -450,6 +450,13 @@ export async function reconcileStuckFinalizeJournal(
           SELECT 1 FROM usage_records ur
            WHERE ur.request_id = rfj.request_id AND ur.user_id = rfj.user_id
         )
+        AND NOT (
+          rfj.ctx->>'source' = 'delegate_antigravity'
+          AND EXISTS (
+            SELECT 1 FROM antigravity_relay_usage aru
+             WHERE aru.request_id = rfj.request_id AND aru.user_id = rfj.user_id
+          )
+        )
       RETURNING rfj.request_id`,
     [durableMs, DURABLE_CODEX_RECOVERY_VERSION, waiverReason],
   )

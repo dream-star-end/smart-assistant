@@ -1,0 +1,39 @@
+[Unit]
+# OCV5-855: 独立蓝绿双槽 remote-relay (slot %i = A|B)，承接 remote-driver-v4 SSH 隧道与结算面，
+# 使 Master 双槽翻槽时可零中断带活放行运行中的 remote-driver-v4 回合。
+Description=OpenClaude v5 Selfhost Remote Relay (remote-driver-v4 plane, slot %i)
+After=network.target postgresql.service redis-server.service docker.service openclaude-v5-selfhost-boot-guard.service
+Wants=postgresql.service redis-server.service docker.service openclaude-v5-selfhost-boot-guard.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/openclaude/openclaude-v5-selfhost-live
+EnvironmentFile=/etc/openclaude/commercial-v5-selfhost.env
+Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="NODE_ENV=production"
+Environment="OPENCLAUDE_HOME=/root/.openclaude-v5-selfhost"
+Environment="OC_REMOTE_RELAY_SLOT=%i"
+Environment="OC_REMOTE_RELAY_SLOT_SOCK_PREFIX=/run/openclaude-v5-selfhost/remote-relay"
+Environment="OC_REMOTE_RELAY_SOCKET=/run/openclaude-v5-selfhost/remote-relay-active.sock"
+Environment="OC_REMOTE_RELAY_STATE_FILE=/var/lib/openclaude-v5-selfhost/remote-relay-state.json"
+ExecStartPre=/usr/bin/bash /opt/openclaude/openclaude-v5-selfhost-live/scripts/lib/assert-flavor.sh identity --effector /opt/openclaude/openclaude-v5-selfhost-live/scripts/lib
+ExecStart=/usr/bin/node --import tsx packages/commercial/src/remoteRelay/main.ts
+Restart=on-failure
+RestartSec=5
+# B3: KillMode=mixed 仅向主 Node 进程发送 SIGTERM，绝不同时向在飞 SSH 子进程发 SIGTERM。
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=1860
+SendSIGKILL=yes
+LimitNOFILE=65536
+RuntimeDirectory=openclaude-v5-selfhost
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory=openclaude-v5-selfhost
+StateDirectoryMode=0700
+StandardOutput=append:/var/log/openclaude-v5-selfhost-remote-relay.log
+StandardError=append:/var/log/openclaude-v5-selfhost-remote-relay.log
+
+[Install]
+WantedBy=multi-user.target

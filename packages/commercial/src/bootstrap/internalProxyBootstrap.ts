@@ -11,7 +11,12 @@ import type {
   ServerResponse,
 } from "node:http";
 import type { Server as HttpsServer } from "node:https";
-import { SITES_AGENT_INTERNAL_PREFIX, type DurableCodexBilling } from "@openclaude/protocol";
+import {
+  ARTIFACT_BLOB_INTERNAL_PREFIX,
+  AUTHORITY_STATE_INTERNAL_PREFIX,
+  SITES_AGENT_INTERNAL_PREFIX,
+  type DurableCodexBilling,
+} from "@openclaude/protocol";
 import {
   appendServerAuthoredMessage,
   appendServerAuthoredMessageDrainByUser,
@@ -30,6 +35,7 @@ import {
   selectApiKey,
   startApiKeyPoolCache,
 } from "../account-pool/apiKeyPool.js";
+import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
 import {
   expireCodexRouteContext,
   expireGrokRouteContextByLease,
@@ -41,11 +47,12 @@ import type { AccountScheduler } from "../account-pool/scheduler.js";
 import { getProviderRoutingAvailability } from "../admin/providerHealthGate.js";
 import { getResearchConfigPublic } from "../admin/researchConfig.js";
 import { getPhase6AccountUuidEnforce, getSessionPinMode } from "../admin/runtimeFlags.js";
+import type { LocalCasArtifactBlobStore } from "../agent-sandbox/artifactBlobStore.js";
 import type { CronWakeRunner } from "../agent-sandbox/cronWake.js";
 import { V3_CONTAINER_PORT } from "../agent-sandbox/v3supervisor.js";
 import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from "../auth/apiKeyIdentity.js";
 import { makePgApiKeyRepo } from "../auth/apiKeyRepo.js";
-import { createPgIdentityRepo } from "../auth/containerIdentity.js";
+import { createPgIdentityRepo, makeContainerRequestVerifier } from "../auth/containerIdentity.js";
 import { makeDesktopIdentityStrategy } from "../auth/desktopIdentity.js";
 import { stubMailer } from "../auth/mail.js";
 import { makeContainerIdentityStrategy } from "../auth/proxyIdentity.js";
@@ -86,6 +93,7 @@ import {
 } from "../connectors/rpc.js";
 import { makeCcbTranscriptRestoreReader } from "../db/ccbTranscriptRestoreReader.js";
 import { getPool } from "../db/index.js";
+import { PgSessionAuthorityStateStore } from "../db/threeLayerStateStore.js";
 import {
   lookupLeaseCallbackSession,
   type DispatchAdmissionBackend,
@@ -132,7 +140,10 @@ import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "../http/anthropicProxy.js";
-import { createAntigravityRouteRuntime } from "../http/antigravityRouteRuntime.js";
+import {
+  antigravityRelayConcurrencyFromConfig,
+  createAntigravityRouteRuntime,
+} from "../http/antigravityRouteRuntime.js";
 import {
   buildCodexRelayHandler,
   buildCodexTokenRefreshHandler,
@@ -150,6 +161,8 @@ import {
 } from "../http/desktopTlsListener.js";
 import type { CommercialHttpDeps } from "../http/handlers.js";
 import { ANTIGRAVITY_RELAY_PREFIX } from "../http/internalAntigravityRelay.js";
+import { makeInternalArtifactBlobsHandler } from "../http/internalArtifactBlobs.js";
+import { makeInternalAuthorityStateHandler } from "../http/internalAuthorityState.js";
 import {
   isAutoDreamOptimizerInternalPath,
   makeAutoDreamOptimizerHandler,
@@ -193,7 +206,7 @@ import {
   makeCronOriginInjectHandler,
   type CronOriginInjectHandler,
 } from "../http/internalCronOriginInject.js";
-import { DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH, isDelegateAntigravityRoutePath } from "../http/internalDelegateAntigravityRoute.js";
+import { isDelegateAntigravityRoutePath } from "../http/internalDelegateAntigravityRoute.js";
 import {
   isDelegateEngineBillingInternalPath,
   makeDelegateEngineBillingHandler,
@@ -203,7 +216,10 @@ import {
   isDelegateRemoteLaneInternalPath,
   makeDelegateRemoteLaneHandler,
 } from "../http/internalDelegateRemoteLane.js";
-import type { createMasterCc5Runtime } from "../agent-sandbox/cc5Runtime.js";
+import {
+  probeMasterCc5RemoteRelayReadiness,
+  type createMasterCc5Runtime,
+} from "../agent-sandbox/cc5Runtime.js";
 import {
   isDelegateGrokRoutePath,
   makeDelegateGrokRouteHandler,
@@ -333,6 +349,7 @@ import {
 import { makeCursorExternalRoute, type CursorExternalRoute } from "../http/proxy/cursorExternal.js";
 import { makeExternalModelsHandler, type ExternalModelsHandler } from "../http/proxy/externalModels.js";
 import { makeExternalUsageHandler, type ExternalUsageHandler } from "../http/proxy/externalUsage.js";
+import { fetchPlatformFlash } from "../http/proxy/shared.js";
 import {
   assertPlatformDefaultModelConfigured,
   staticProviderKeysFromConfig,
@@ -471,6 +488,7 @@ export interface InternalProxyBootstrapDeps {
   qqOutboundRef: { current: ReturnType<typeof makeQqOutboundReceiver> | null };
   qqProactiveRef: { current: ReturnType<typeof makeQqProactiveReceiver> | null };
   getModelAuthoritySigner: () => AuthoritySigner | undefined;
+  getArtifactBlobStore?: () => LocalCasArtifactBlobStore | undefined;
   getCronOriginBridge: () => UserChatBridgeHandler | null;
   getSystemActions: () => ReturnType<typeof assembleSystemActions> | undefined;
   setDesktopTlsClose: (fn: () => Promise<void>) => void;
@@ -609,6 +627,9 @@ export async function bootstrapInternalProxyAndListeners(
       const researchProxyHandler: ResearchProxyHandler = makeResearchProxyHandler({
         identityRepo,
         redis: deps.redis,
+        platformFlashApiKey: deps.cfg.OPENCODE_GO_API_KEY,
+        platformFlashFetch: fetchPlatformFlash,
+        minicheckDispatcher: directEgressDispatcher,
       });
       const ocrProxyHandler: OcrProxyHandler = makeOcrProxyHandler({
         identityRepo,
@@ -643,6 +664,16 @@ export async function bootstrapInternalProxyAndListeners(
       const sitesInternalHandler = makeSitesInternalHandler({
         identityRepo,
         sites: deps.sitesService,
+      });
+      const containerRequestVerifier = makeContainerRequestVerifier(identityRepo);
+      const authorityStateHandler = makeInternalAuthorityStateHandler({
+        verify: containerRequestVerifier,
+        store: new PgSessionAuthorityStateStore(getPool()),
+        pgPool: getPool(),
+      });
+      const artifactBlobsHandler = makeInternalArtifactBlobsHandler({
+        verify: containerRequestVerifier,
+        getStore: () => deps.getArtifactBlobStore?.(),
       });
       const tavilyWebSearchHandler: TavilyWebSearchHandler = makeTavilyWebSearchHandler({
         identityRepo,
@@ -750,10 +781,10 @@ export async function bootstrapInternalProxyAndListeners(
         rootLogger,
         pricing: deps.pricing,
         appendCostCredits: deps.appendCostCreditsForUser,
+        ...antigravityRelayConcurrencyFromConfig(deps.cfg, { flavorIdentity: deps.flavorIdentity }),
       });
-      // B8: Mount RENEW_PATH unconditionally so Commercial main Antigravity turns & FIFO queued
-      // swarms can renew already-minted route leases, while keeping MINT/RELEASE selfhost-only.
-      const allowDelegateAntigravityMint = deps.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1";
+      // OCV5-897: Mount mint/renew/release unconditionally across selfhost and commercial;
+      // authorization is enforced by container identity + owned inflight delegate_antigravity journal.
       const delegateAntigravityRouteHandler = antigravityRouteRuntime.makeDelegateHandler();
       const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
         identityRepo,
@@ -1122,6 +1153,12 @@ export async function bootstrapInternalProxyAndListeners(
         if (path.startsWith(SITES_AGENT_INTERNAL_PREFIX)) {
           return sitesInternalHandler(req, res, ctx);
         }
+        if (path.startsWith(AUTHORITY_STATE_INTERNAL_PREFIX)) {
+          return authorityStateHandler(req, res, ctx);
+        }
+        if (path.startsWith(ARTIFACT_BLOB_INTERNAL_PREFIX)) {
+          return artifactBlobsHandler(req, res, ctx);
+        }
         if (path === TAVILY_WEB_SEARCH_PATH) return tavilyWebSearchHandler(req, res, ctx);
         if (path === MINIMAX_WEB_SEARCH_PATH) return minimaxWebSearchHandler(req, res, ctx);
         if (path === GROK_WEB_SEARCH_PATH) return grokWebSearchHandler(req, res, ctx);
@@ -1147,12 +1184,7 @@ export async function bootstrapInternalProxyAndListeners(
         if (delegateGrokRouteHandler && isDelegateGrokRoutePath(path)) {
           return delegateGrokRouteHandler(req, res, ctx);
         }
-        if (
-          delegateAntigravityRouteHandler &&
-          (allowDelegateAntigravityMint
-            ? isDelegateAntigravityRoutePath(path)
-            : path === DELEGATE_ANTIGRAVITY_ROUTE_RENEW_PATH)
-        ) {
+        if (delegateAntigravityRouteHandler && isDelegateAntigravityRoutePath(path)) {
           return delegateAntigravityRouteHandler(req, res, ctx);
         }
         if (
@@ -1362,6 +1394,8 @@ export async function bootstrapInternalProxyAndListeners(
             getActiveBrowserWs: () => deps.getCronOriginBridge()?.registry.total() ?? 0,
             drainBrowserWebSockets: () => deps.getCronOriginBridge()?.drainBrowserWebSockets?.() ?? 0,
             getContainerLinkEnabled: () => deps.getCronOriginBridge()?.containerLinkEnabled === true,
+            probeRemoteRelayReadiness: () =>
+              probeMasterCc5RemoteRelayReadiness(deps.cc5RuntimeRef.current),
           })
         ) {
           return;

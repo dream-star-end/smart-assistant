@@ -70,3 +70,16 @@ test('Cursor Agent Sand patch follows renamed minified bindings (2026.10.16 buil
     /anchor count=0/,
   )
 })
+
+test('Cursor Agent Sand patch matches the 2026.11.22-e9042b2 build anchor', async () => {
+  const patcher = await import(patcherUrl) as {
+    SAND_PATCH_MARKER: string
+    patchCursorAgentSource(source: string): string
+  }
+  const anchor = 'i.header.set("x-cursor-client-version",`cli-2026.11.22-e9042b2${m}`),i.header.set("x-cursor-client-type",l)'
+  const patched = patcher.patchCursorAgentSource(`before;${anchor};after`)
+  assert.match(patched, /^before;\(\(\)=>\{const e=process\.env\.OPENCLAUDE_CURSOR_SAND_MODE===\"1\"/)
+  assert.match(patched, /e\?\(process\.env\.OPENCLAUDE_CURSOR_SAND_CLIENT_VERSION\|\|\"0\.30\.0\"\):`cli-2026\.11\.22-e9042b2\$\{m\}`/)
+  assert.match(patched, /e&&i\.header\.set\(\"x-sand-box-namespace\",\"prod\"\)/)
+  assert.match(patched, /e\?\"sand\":l\)\}\)\(\)\/\*OPENCLAUDE_SCOPED_SAND_V1\*\/;after$/)
+})

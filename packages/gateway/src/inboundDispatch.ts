@@ -1,5 +1,7 @@
-import { freezeGrokExecutionDescriptor } from '@openclaude/protocol'
-import { takeSystemHelpBootstrap } from '@openclaude/protocol'
+import { freezeGrokExecutionDescriptor, takeSystemHelpBootstrap } from '@openclaude/protocol'
+import { finalizeInboundCrossPoolMigration } from './crossPoolCheckpoint.js'
+import { savePendingCheckpointWithGeneration } from './sessionCheckpointStore.js'
+export { installTurnAuthorityRuntime, type EngineCapsuleRuntime } from './turnCapsuleRuntime.js'
 import { getSystemHelpBootstrap } from './systemHelpFrames.js'
 /**
  * Gateway inbound dispatch: the per-frame chat dispatch path (dispatchInbound)
@@ -99,7 +101,7 @@ import {
   stripModelAuthorityField,
   type TurnExecutionDescriptor,
 } from './modelAuthority.js'
-import { getDispatchContext } from './turnDispatchInbox.js'
+import { forwardDispatchReceiptSender, getDispatchContext } from './turnDispatchInbox.js'
 import {
   getLocalCatalogView,
   triggerLocalCatalogRefreshOnConfigChanged,
@@ -110,6 +112,7 @@ import {
   type DeliberationPanelMember,
 } from './teamMode.js'
 import { buildImageAttachmentHint } from './imageAttachmentHint.js'
+import { buildRemoteInboundTurnPayload } from './remotePool/remoteInboundMultimodal.js'
 import { isAutoDreamSuccessfulTurn } from './autoDream.js'
 import {
   _isBlockingUserInputTool,
@@ -817,20 +820,19 @@ export async function dispatchInbound(
       ...(turnAuthority !== undefined
         ? {
             executionAuthority: {
-              canonicalModel: turnAuthority.canonicalModel,
-              engine: turnAuthority.engine,
+              canonicalModel: turnAuthority.canonicalModel, engine: turnAuthority.engine,
               source: 'bridge_signed' as const,
               ...(turnAuthority.executionBackend ? { executionBackend: turnAuthority.executionBackend } : {}),
             },
+            ...(turnAuthority.poolMigration ? { poolMigration: turnAuthority.poolMigration } : {}),
           }
         : {}),
       ...(promptQueueExecutionFence ? { promptQueueExecutionFence } : {}),
     }).catch(rejectSessionStart)
     if (!session) return
-    admitCmid =
-      typeof safeClientMessageId === 'string' && safeClientMessageId !== ''
-        ? safeClientMessageId
-        : undefined
+    const migRes = finalizeInboundCrossPoolMigration(frame, turnAuthority, sessionKey, (f) => this.deliver(f as never), { dispatchContext: getDispatchContext(frame as object), clientMessageId: safeClientMessageId, userId: activeUserId, saveCheckpoint: savePendingCheckpointWithGeneration })
+    if (migRes.fatalError) { rejectSessionStart(new Error(migRes.fatalError)); return }
+    admitCmid = typeof safeClientMessageId === 'string' && safeClientMessageId !== '' ? safeClientMessageId : undefined
     admitSession = session
     if (admitCmid) session._admittingClientMessageId = admitCmid
     const wechatDispatchStarted = (frame as any)._wechatDispatchStarted
@@ -1837,8 +1839,9 @@ export async function dispatchInbound(
       } else if (swarmDirectiveResult.mode === 'off_with_history') {
         this.log.info('antigravity_swarm_mode_suppressed', { sessionKey, model: effectiveModelForSwarm, remote: isRemoteAntigravity })
       }
-      // Pass as plain text. No image content blocks — safer for non-multimodal providers.
-      const payload: string = finalText
+      // Preserve structured image blocks on remote-driver-v4 turns so RemoteContainerLane
+      // materializes trusted upload paths to inline base64 (local turns keep plain string).
+      const payload = buildRemoteInboundTurnPayload({ finalText, savedMedia, executionBackend: turnAuthority?.executionBackend })
       const taskType = sessionKey.includes(':cron:')
         ? ('cron' as const)
         : sessionKey.includes(':delegate:')
@@ -1874,10 +1877,10 @@ export async function dispatchInbound(
       session._currentTurnUserText = rawUserText
       {
         const userText = text ?? ''
-        let injected = payload
-        if (userText && payload.endsWith(userText)) {
-          injected = payload.slice(0, payload.length - userText.length)
-        } else if (payload === userText) {
+        let injected = finalText
+        if (userText && finalText.endsWith(userText)) {
+          injected = finalText.slice(0, finalText.length - userText.length)
+        } else if (finalText === userText) {
           injected = ''
         }
         session._injectedTurnConstraints =
@@ -2447,13 +2450,17 @@ export async function dispatchInbound(
         // DispatchTurnContext(uid/…)→ sessionManager 逻辑键形状(userId/…)。
         ...(turnDispatchContext
           ? {
-              dispatchContext: {
-                userId: turnDispatchContext.uid,
-                sessionId: turnDispatchContext.sessionId,
-                clientMessageId: turnDispatchContext.clientMessageId,
-                dispatchId: turnDispatchContext.dispatchId,
-                attemptNo: turnDispatchContext.attemptNo,
-              },
+              dispatchContext: (() => {
+                const ctx = {
+                  userId: turnDispatchContext.uid,
+                  sessionId: turnDispatchContext.sessionId,
+                  clientMessageId: turnDispatchContext.clientMessageId,
+                  dispatchId: turnDispatchContext.dispatchId,
+                  attemptNo: turnDispatchContext.attemptNo,
+                }
+                forwardDispatchReceiptSender(turnDispatchContext, ctx)
+                return ctx
+              })(),
             }
           : {}),
         ...(Object.prototype.hasOwnProperty.call(frame, '_goalState')

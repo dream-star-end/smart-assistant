@@ -489,9 +489,9 @@ describe("B5: handleSwarmCommandRoute (POST /api/sessions/:id/swarm/command)", (
 });
 
 describe("Swarm playbook templates & command parser", () => {
-  it("ships 6 built-in research/engineering templates and expands them cleanly by ID or Chinese title", () => {
+  it("ships 7 built-in research/engineering templates and expands them cleanly by ID or Chinese title", () => {
     const all = listSwarmPlaybooks();
-    assert.equal(all.length, 6);
+    assert.equal(all.length, 7);
     assert.deepEqual(
       all.map((t) => t.title),
       [
@@ -501,6 +501,7 @@ describe("Swarm playbook templates & command parser", () => {
         "多方案评审",
         "论文写作+盲审+批判修订",
         "受控实验循环（防刷分）",
+        "零硬伤科研深审（四层正交+反例法庭）",
       ],
     );
 
@@ -516,6 +517,55 @@ describe("Swarm playbook templates & command parser", () => {
     assert.equal(getSwarmPlaybook("防刷分实验循环")?.id, "research-controlled-exp-loop");
     assert.ok(expLoop.roles.some((r) => r.name === "eval-guardian" && r.readOnly === true));
 
+    const sciAudit = getSwarmPlaybook("scientific-deep-audit");
+    assert.ok(sciAudit);
+    assert.equal(sciAudit.category, "research");
+    assert.equal(sciAudit.title, "零硬伤科研深审（四层正交+反例法庭）");
+    for (const alias of ["零硬伤深审", "物理硬伤审查", "scientific-deep-audit", "paper-deep-audit", "科研深审"]) {
+      assert.equal(getSwarmPlaybook(alias)?.id, "scientific-deep-audit");
+    }
+    assert.deepEqual(
+      sciAudit.channels.map((c) => c.name),
+      ["main", "cleanroom", "slices", "redteam"],
+    );
+    assert.deepEqual(
+      sciAudit.roles.map((r) => r.name),
+      [
+        "coordinator",
+        "cleanroom-verifier",
+        "physics-slice-auditor",
+        "math-code-parity-auditor",
+        "impact-regression-guard",
+      ],
+    );
+    for (const name of [
+      "cleanroom-verifier",
+      "physics-slice-auditor",
+      "math-code-parity-auditor",
+      "impact-regression-guard",
+    ]) {
+      assert.ok(sciAudit.roles.some((r) => r.name === name && r.readOnly === true));
+    }
+    const expandedSci = expandSwarmPlaybook("零硬伤深审", "审查 128 页大地测量时空基准报告与 MATLAB 仿真代码");
+    assert.ok(expandedSci);
+    assert.ok(expandedSci.prompt.includes("oc-docx extract --latex"));
+    assert.ok(expandedSci.prompt.includes("gpt-6.2-astra"));
+    assert.ok(expandedSci.prompt.includes("gpt-6.2-sol"));
+    assert.ok(expandedSci.prompt.includes("antigravity-gemini-4-neon"));
+    assert.ok(expandedSci.prompt.includes("antigravity-gemini-4-carbon"));
+    assert.ok(expandedSci.prompt.includes("grok-build"));
+    assert.ok(expandedSci.prompt.includes("deepseek-v4-flash"));
+    assert.ok(expandedSci.prompt.includes("非四大家族与弱档/轻量档"));
+    assert.ok(!expandedSci.prompt.includes("DeepSeek-MiniMax-Qwen"));
+    assert.ok(!expandedSci.prompt.includes("/ Claude /"));
+    assert.ok(expandedSci.prompt.includes("oc-review verify"));
+    assert.ok(expandedSci.prompt.includes("--unsafe-local-exec"));
+    assert.ok(expandedSci.prompt.includes("OC_WITNESS_VERDICT"));
+    assert.ok(expandedSci.prompt.includes("oc-review ledger init"));
+    assert.ok(expandedSci.prompt.includes("--scientific-gate"));
+    assert.ok(expandedSci.prompt.includes("chao1Residual<0.5"));
+    assert.ok(expandedSci.prompt.includes("SymPy/Octave/pint/hypothesis"));
+
     for (const tpl of all) {
       assert.equal(getSwarmPlaybook(tpl.id)?.id, tpl.id);
       assert.equal(getSwarmPlaybook(tpl.title)?.id, tpl.id);
@@ -526,8 +576,17 @@ describe("Swarm playbook templates & command parser", () => {
       assert.ok(expanded.prompt.includes(tpl.title));
       assert.ok(expanded.prompt.includes("重构科研引用引擎"));
       assert.ok(expanded.kickoffBoardMessage.startsWith("@all "));
+      assert.ok(expanded.kickoffBoardMessage.includes("#seq"));
+      assert.ok(expanded.prompt.includes("去中心化协作约定"));
+      assert.ok(expanded.prompt.includes("P2P 交接"));
+      assert.ok(expanded.prompt.includes("integrator"));
       assert.ok(expanded.roles.some((r) => r.role === "coordinator"));
     }
+
+    const implVerify = getSwarmPlaybook("parallel-impl-verify");
+    assert.ok(implVerify);
+    assert.ok(implVerify.guardrails.some((g) => g.includes("P2P") && g.includes("#seq")));
+    assert.ok(implVerify.workflow.some((w) => w.includes("@integrator")));
 
     assert.equal(expandSwarmPlaybook("unknown-template", "task"), null);
     assert.equal(expandSwarmPlaybook("parallel-impl-verify", "   "), null);

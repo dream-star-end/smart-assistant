@@ -31,11 +31,19 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-
 import {
+  DEFAULT_CONTRACTS_SOURCE_PATH,
   type RestContractSnapshot,
-  serializeRestContractSnapshot,
-} from '../packages/protocol/src/httpContracts.js'
+  type SerializedRouteContract,
+  loadLiveRestContractSnapshot,
+} from './lib/restContractLoader.js'
+
+export {
+  DEFAULT_CONTRACTS_SOURCE_PATH,
+  type RestContractSnapshot,
+  type SerializedRouteContract,
+  loadLiveRestContractSnapshot,
+}
 
 export const DEFAULT_SNAPSHOT_PATH = 'packages/protocol/rest-contract-snapshot.json'
 
@@ -558,7 +566,7 @@ export function checkRestContractCompat(opts: {
 } {
   const snapshotRel = opts.snapshotRel ?? DEFAULT_SNAPSHOT_PATH
   const snapshotAbs = path.resolve(opts.root, snapshotRel)
-  const live = opts.liveSnapshot ?? serializeRestContractSnapshot()
+  const live = opts.liveSnapshot ?? loadLiveRestContractSnapshot(opts.root)
   const expectedJson = formatSnapshotJson(live)
   const breaks: RestContractBreak[] = []
 
@@ -651,7 +659,7 @@ function main(argv: string[]): number {
 
   try {
     if (writeSnapshot) {
-      const snap = serializeRestContractSnapshot()
+      const snap = loadLiveRestContractSnapshot(root)
       const outPath = path.resolve(root, snapshotRel)
       writeFileSync(outPath, formatSnapshotJson(snap), 'utf8')
       console.log(

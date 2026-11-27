@@ -1,0 +1,95 @@
+name: V5 selfhost security & dead-code weekly
+
+# OCV5-905: 每周安全与死码审计闭环
+#   1. gitleaks/gitleaks-action@v2 扫描全库历史/当前提交凭据泄漏
+#   2. scripts/check-security-sast.ts --enforce 确定性密钥 + 高危 SAST 反模式硬门
+#   3. scripts/check-dead-code-weekly.ts 生成结构化死码清单供园艺闭环 (gardening-loop) 消费
+#   4. npm audit --audit-level=high --omit=dev 消除日常 npm ci --no-audit 的生产依赖高危 CVE 盲区
+
+on:
+  schedule:
+    # 每周日 20:30 UTC = 周一 04:30 沪时（避开每日 19:00 UTC nightly 分片高峰）
+    - cron: '30 20 * * 0'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'checkout 的 git ref（默认 feat/v5-selfhost）'
+        required: false
+        default: 'feat/v5-selfhost'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v5-selfhost-security-weekly-${{ github.event.inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+env:
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+
+jobs:
+  gitleaks:
+    name: gitleaks-secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || 'feat/v5-selfhost' }}
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sast-cve-and-dead-code:
+    name: sast-cve-and-dead-code
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || 'feat/v5-selfhost' }}
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit
+
+      - name: Prepare report artifact directory
+        run: mkdir -p "$RUNNER_TEMP/security-weekly"
+
+      - name: Deterministic SAST & secret gate (enforced)
+        run: >-
+          npx tsx scripts/check-security-sast.ts
+          --enforce
+          --base origin/feat/v5-selfhost
+          --json "$RUNNER_TEMP/security-weekly/security-sast-report.json"
+
+      - name: Weekly dead-code inventory (for gardening-loop)
+        run: >-
+          npx tsx scripts/check-dead-code-weekly.ts
+          --out "$RUNNER_TEMP/security-weekly/dead-code-weekly.json"
+
+      - name: Production dependency CVE audit (high/critical)
+        run: |
+          set -euo pipefail
+          npm audit --audit-level=high --omit=dev --json > "$RUNNER_TEMP/security-weekly/npm-audit-prod.json" || true
+          npm audit --audit-level=high --omit=dev
+
+      - name: Upload structured security & dead-code artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v5-selfhost-security-weekly-artifacts
+          path: ${{ runner.temp }}/security-weekly/*.json
+          if-no-files-found: error
+          retention-days: 30

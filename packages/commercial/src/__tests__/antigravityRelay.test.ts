@@ -52,6 +52,7 @@ import {
   _antigravityInflightForTests,
   makeAntigravityRelayHandler,
 } from '../http/internalAntigravityRelay.js'
+import { antigravityRelayConcurrencyFromConfig } from '../http/antigravityRouteRuntime.js'
 
 const SECRET = 'b'.repeat(64)
 const CONTAINER_TOKEN = `oc-v3.11.${SECRET}`
@@ -660,6 +661,14 @@ describe('Antigravity relay concurrent budget (Codex r1 P1)', () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve
     })
+    let earlyDone = 0
+    let releaseBarrier!: () => void
+    const allAdmittedOrRejected = new Promise<void>((resolve) => {
+      releaseBarrier = resolve
+    })
+    const checkBarrier = () => {
+      if (calls + earlyDone >= opts.n) releaseBarrier()
+    }
     const handler = makeAntigravityRelayHandler({
       identityRepo: repo(),
       clientSecret: 'GOCSPX-test-secret-not-real-000',
@@ -669,6 +678,7 @@ describe('Antigravity relay concurrent budget (Codex r1 P1)', () => {
       meteredCost: async () => 0n,
       requestFn: (async () => {
         calls += 1
+        checkBarrier()
         await gate
         return {
           statusCode: 200,
@@ -694,11 +704,17 @@ describe('Antigravity relay concurrent budget (Codex r1 P1)', () => {
           body: generateBody('gemini-3.8-flash-low'),
         }).then(async (res) => {
           await res.text()
+          earlyDone += 1
+          checkBarrier()
           return res.status
         }),
       )
-      // Let every request reach the admission check before any upstream call finishes.
-      await new Promise((resolve) => setTimeout(resolve, 300))
+      // Wait deterministically until every request has either entered the upstream
+      // gate or already received its admission refusal (402/429), immune to CPU load.
+      await Promise.race([
+        allAdmittedOrRejected,
+        new Promise((resolve) => setTimeout(resolve, 10_000)),
+      ])
       release()
       return { statuses: await Promise.all(pending), calls }
     } finally {
@@ -727,6 +743,49 @@ describe('Antigravity relay concurrent budget (Codex r1 P1)', () => {
     assert.equal(calls, cap)
     assert.equal(statuses.filter((code) => code === 200).length, cap)
     assert.equal(statuses.filter((code) => code === 429).length, 3)
+  })
+
+  test('OCV5-894: maxInflightPerRoute=0 bypasses default 64 cap while preserving atomic budget reservation & config mapper aligns master/egress', async () => {
+    assert.deepEqual(antigravityRelayConcurrencyFromConfig({}), {})
+    assert.deepEqual(
+      antigravityRelayConcurrencyFromConfig({
+        OC_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE: 8,
+        OC_ANTIGRAVITY_AUX_MAX_INFLIGHT_PER_ROUTE: 0,
+      }),
+      { maxInflightPerRoute: 8, maxAuxInflightPerRoute: 0 },
+    )
+
+    // Exceed default ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE (64) to prove 0 truly uncapped
+    const overDefault = ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE + 6
+    const { statuses, calls } = await concurrent({
+      budget: 1_000_000n,
+      n: overDefault,
+      extra: { maxInflightPerRoute: 0, estimateCost: () => 1n },
+    })
+    assert.equal(calls, overDefault)
+    assert.equal(statuses.filter((code) => code === 200).length, overDefault)
+    assert.equal(statuses.filter((code) => code === 429).length, 0)
+
+    // Tight explicit cap via shared config mapper rejects cap+1 with 429
+    const tight = await concurrent({
+      budget: 1_000_000n,
+      n: 5,
+      extra: {
+        ...antigravityRelayConcurrencyFromConfig({ OC_ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE: 3 }),
+        estimateCost: () => 1n,
+      },
+    })
+    assert.equal(tight.calls, 3)
+    assert.equal(tight.statuses.filter((code) => code === 200).length, 3)
+    assert.equal(tight.statuses.filter((code) => code === 429).length, 2)
+
+    const budgetBounded = await concurrent({
+      budget: 5n,
+      n: 10,
+      extra: { maxInflightPerRoute: 0, estimateCost: () => 1n },
+    })
+    assert.equal(budgetBounded.statuses.filter((code) => code === 200).length, 5)
+    assert.equal(budgetBounded.statuses.filter((code) => code === 402).length, 5)
   })
 
   test("a finished call's cost counts even when the DB total read raced its insert", async () => {
@@ -865,6 +924,70 @@ describe('Antigravity relay budget rounding (Codex r2 P1)', () => {
       )
       assert.equal(res.status, 200, `call ${i + 1}`)
     }
+  })
+
+  test('OCV5-897 B2: frozen route pricingOverride enforces higher multiplier cutoff even when live pricing cache is 1x', async () => {
+    const livePricing = {
+      model_id: 'antigravity-gemini-3.8-flash',
+      display_name: 'Gemini 3.8 Flash',
+      input_per_mtok: 100_000n,
+      output_per_mtok: 1_000_000n,
+      cache_read_per_mtok: 0n,
+      cache_write_per_mtok: 0n,
+      multiplier: '1.000',
+      enabled: true,
+    } as unknown as ModelPricing
+    const { token } = await mintAntigravityRelayRoute({
+      containerId: 11,
+      userId: 42,
+      requestId: REQUEST_ID,
+      modelId: 'antigravity-gemini-3.8-flash',
+      accountId: 7n,
+      budgetCredits: 100n,
+      relayPort: 18789,
+      pricingOverride: {
+        modelId: 'antigravity-gemini-3.8-flash',
+        displayName: 'Gemini 3.8 Flash',
+        inputPerMtok: '100000',
+        outputPerMtok: '1000000',
+        cacheReadPerMtok: '0',
+        cacheWritePerMtok: '0',
+        multiplier: '2.000',
+      },
+    })
+    const resolved = await resolveAntigravityRelayRoute({ token, containerId: 11, userId: 42 })
+    assert.equal(resolved?.pricingOverride?.multiplier, '2.000')
+    const path = `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`
+    // 60k output tokens @ 1,000,000/Mtok = 60 fen at 1x, 120 fen at frozen 2x (> 100 fen budget).
+    const heavy = [
+      'data: {"response":{"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":60000}}}\n\n',
+    ]
+    const renewedTokens: string[] = []
+    const deps: Partial<AntigravityRelayDeps> = {
+      pricing: { get: () => livePricing },
+      meteredCost: async () => 0n,
+      estimateCost: undefined,
+      renewInflightFn: (tok: string) => {
+        renewedTokens.push(tok)
+        return true
+      },
+    }
+    const first = await relay(
+      path,
+      { body: generateBody('gemini-3.8-flash-low') },
+      { status: 200, body: heavy },
+      deps,
+    )
+    assert.equal(first.status, 200)
+    assert.deepEqual(renewedTokens, [REQUEST_ID], 'active relay call must slide account inflight slot TTL (OCV5-897 B3)')
+    const second = await relay(
+      path,
+      { body: generateBody('gemini-3.8-flash-low') },
+      { status: 200, body: heavy },
+      deps,
+    )
+    assert.equal(second.status, 402, 'frozen 2x multiplier must trip budget exhaustion at 120 > 100')
+    assert.equal(second.captured.calls, 0)
   })
 })
 
@@ -1934,10 +2057,10 @@ describe('Antigravity aux/monitoring billing attribution & concurrency slot deco
       const primaries = Array.from({ length: ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE }, () =>
         post('streamGenerateContent?alt=sse', generateBody('gemini-4-neon-high', 'agent')),
       )
-      await deadline(primaryFull, '12 primary calls did not saturate route')
+      await deadline(primaryFull, `${ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE} primary calls did not saturate route`)
       assert.equal(_antigravityInflightForTests().get(token)?.count, ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE)
 
-      // 13th primary call is rejected with 429 ANTIGRAVITY_ROUTE_BUSY.
+      // Next primary call is rejected with 429 ANTIGRAVITY_ROUTE_BUSY.
       const overflowPrimary = await post(
         'streamGenerateContent?alt=sse',
         generateBody('gemini-4-neon-high', 'agent'),

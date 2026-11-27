@@ -719,25 +719,11 @@ export const TOOLS = [
       properties: {
         command: { type: 'string', description: '交给 bash -lc 的新命令(与 job_id 二选一)' },
         cwd: { type: 'string', description: '启动新命令时的工作目录;不填则用 MCP 进程当前目录' },
-        timeout_ms: {
-          type: 'number',
-          minimum: 1000,
-          maximum: 600000,
-          description: '本次等待毫秒数,默认 60000,范围 1000–600000',
-        },
-        job_id: {
-          type: 'string',
-          description: '续等、查询或终止本回合在途 oc_bash 任务 ID(如 ocb_1,与 command 二选一)',
-        },
-        action: {
-          type: 'string',
-          enum: ['wait', 'status', 'kill'],
-          description: '配合 job_id 使用:wait(默认,阻塞续等)、status(立即看增量输出)、kill(SIGTERM→SIGKILL 终止进程组)',
-        },
-        kill_on_timeout: {
-          type: 'boolean',
-          description: '默认 false(到期保留进程并返回 job_id 供续等);传 true 时到期立即强杀进程组并报错',
-        },
+        timeout_ms: { type: 'number', minimum: 1000, maximum: 600000, description: '本次等待毫秒数,默认 60000,范围 1000–600000' },
+        job_id: { type: 'string', description: '续等、查询或终止本回合在途 oc_bash 任务 ID(如 ocb_1,与 command 二选一)' },
+        action: { type: 'string', enum: ['wait', 'status', 'kill'], description: '配合 job_id 使用:wait(默认,阻塞续等)、status(立即看增量输出)、kill(SIGTERM→SIGKILL 终止进程组)' },
+        kill_on_timeout: { type: 'boolean', description: '默认 false(到期保留进程并返回 job_id 供续等);传 true 时到期立即强杀进程组并报错' },
+        lifecycle_class: { type: 'string', enum: ['ephemeral_turn', 'managed_job', 'daemon_service'], description: '可选生命周期分级(仅启动新 command 时有效):ephemeral_turn(默认,回合结束或换脑回收)、managed_job(换脑保活,受最大运行上限约束)、daemon_service(长驻服务,换脑保活且无最大运行上限)' },
       },
       additionalProperties: false,
     },

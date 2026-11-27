@@ -12,8 +12,10 @@
  *    重新校验」—— 这段只是发现用,不是授权。
  *  - 没有投影时**不静默消失**:给一行提示,让模型知道去哪确认。
  */
+import { isAllowedDelegateModel } from '@openclaude/protocol'
 import type { LocalCatalogModel } from './modelCatalogClient.js'
 import { isEngineLocalTurnExempt } from './modelAuthority.js'
+import { isCommercialBilledDelegateEngine } from './engine/engineDelegateCapabilities.js'
 
 export const DELEGATE_MODEL_SECTION_HEADING = '## 委派可用型号'
 
@@ -150,7 +152,12 @@ export function renderDelegateModelSection(
   const localExempt = isEngineLocalTurnExempt(env)
   const byEngine = new Map<LocalCatalogModel['engine'], string[]>()
   for (const m of input.models) {
-    if (m.available !== true || (!localExempt && m.engine !== 'ccb' && m.engine !== 'grok')) continue
+    if (
+      m.available !== true ||
+      !isAllowedDelegateModel(m.modelId) ||
+      (!localExempt && !isCommercialBilledDelegateEngine(m.engine))
+    )
+      continue
     const list = byEngine.get(m.engine) ?? []
     list.push(m.modelId)
     byEngine.set(m.engine, list)
@@ -162,7 +169,7 @@ export function renderDelegateModelSection(
   void input.projectionRevision
   void input.verifiedAt
   lines.push(
-    '以下是你这个账号当前可委派的 catalog 型号 slug;`model`/`--model` 只能填这里的精确值,调用时服务端仍会重新校验。`{a,b}` 表示逐个可选,`[-fast]` 表示每个档位另有 `-fast` 变体;没写的组合就是不存在。',
+    '以下是你这个账号当前可委派的 catalog 型号 slug（委派仅开放 Grok / Gemini / GPT / DeepSeek 四大家族）;`model`/`--model` 只能填这里的精确值,调用时服务端仍会重新校验,非四大家族型号会在起进程前被拒绝（`DELEGATE_MODEL_FAMILY_NOT_ALLOWED`）。`{a,b}` 表示逐个可选,`[-fast]` 表示每个档位另有 `-fast` 变体;没写的组合就是不存在。',
   )
   let any = false
   for (const engine of ENGINE_ORDER) {

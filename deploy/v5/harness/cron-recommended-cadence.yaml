@@ -1,0 +1,90 @@
+# OpenClaude V5 selfhost · 4 节拍标准化 Cron 编排模板 (OCV5-905)
+#
+# 说明：
+# - 本文件落仓库 deploy/v5/harness/cron-recommended-cadence.yaml，在上线窗口由 coordinator 核验后替换
+#   容器活体 /home/agent/.openclaude/cron.yaml。
+# - 彻底清理历史停摆 9 周的 7 个僵尸 remind-*/disabled 任务及已过期的 OCV5-308 每 30 分钟商业看门狗。
+# - 收敛为清晰、正交、互不踩锁的 4 条核心节拍，并由 Beat 1 每小时执行 check-cron-liveness.ts 交叉看护。
+
+jobs:
+  # ── 节拍 1 · 小时级健康监测与 Cron 存活自检（每小时 :07，只读静默，crit 秒报） ──
+  - id: butler-light
+    schedule: "7 * * * *"
+    agent: butler
+    enabled: true
+    oneshot: false
+    deliver: webchat
+    heartbeat: true
+    label: 小时级轻心跳健康监测与 Cron 2x周期存活自检
+    prompt: >-
+      Butler 轻心跳与 Cron 存活看门狗（每小时，严格只读）。依次在 Bash 执行两项只读检查：
+
+      1) `bash /home/agent/.openclaude/workspace/butler/bin/butler-light-check.sh`
+
+      2) `env HOME=/home/agent /home/agent/.local/bin/host 'cd /opt/openclaude/openclaude-v5-selfhost && npx tsx scripts/check-cron-liveness.ts --cron-yaml /var/lib/docker/volumes/oc-v5-data-u3/_data/cron.yaml --last-run /var/lib/docker/volumes/oc-v5-data-u3/_data/cron/last-run.json'`
+
+
+      判定与输出纪律：
+
+      - 若两项退出码均为 0（无 crit）：最终回复必须是且仅是 `HEARTBEAT_OK` 这一个词，不加任何其他字符（warn 已落 heartbeat-log.jsonl，不打扰用户）。
+
+      - 若任一项退出码非 0（含任意 enabled: true 定时任务停跑超过 2×周期的 `[CRON-LIVENESS] crit`）：原样输出 crit 告警摘要，每项附一句只读排查建议，并按 wechat-notify skill 发送一条微信告警。
+
+      - 严禁在本任务内重启服务、清理磁盘或修改配置。
+
+  # ── 节拍 2 · 日级摩擦信号聚合、高置信提单与记忆日清（每天 06:30 北京时间） ──
+  - id: daily-friction-triage
+    schedule: "30 6 * * *"
+    agent: main
+    enabled: true
+    oneshot: false
+    deliver: webchat
+    label: 日级摩擦挖掘聚合与高置信 OCV5 自动提单
+    prompt: >-
+      【自进化 · 日级摩擦聚合与提单】（每天 06:30 北京时间）。先跑 `date '+%F %T %z'`。
+
+      1) 执行 `bash /home/agent/.openclaude/workspace/self-evolve/mine-friction.sh 24` 生成当日摩擦报告 `proposals/<今日>.md`，同时只读巡检宿主根盘 `df -h /`（>88% 记入报告告警）。
+
+      2) 审阅过去 24h 的负面摩擦信号、turn 错误终态、委派失败与隐性「改写重发」归因：仅挑选证据确凿、可定位到具体模块/技能的项，在报告写入候选提案（摩擦证据 → 假设 → 分层 L1/L2/L3-gardening/T2）。
+
+      3) 对高置信提案调用 `oc-task` 创建 OCV5 工单（label `self-evolve-proposal`），保持 backlog/ready 供园艺或主循环消费；无高置信信号则写明「今日无提案」。
+
+      4) 顺带巡检 `MEMORY.md`，仅沉淀跨会话持久偏好/规则，一次性发布流水账一律走 `oc-memory archival-add` 归档，保持 `MEMORY.md` <= 60 行。
+
+      5) 提交当日提案记录至 `/home/agent/.openclaude`（`HOME=/home/agent`）。全程只提案立项，不直接跨层改线上代码；若今日零异常且零提案，回复 `[SILENT]`。
+
+  # ── 节拍 3 · 周级架构健康快照、受限微 PR 园艺派单与 4 信号高管驾驶舱（每周一 08:00 北京时间） ──
+  - id: weekly-gardening-and-cockpit
+    schedule: "0 8 * * 1"
+    agent: butler
+    enabled: true
+    oneshot: false
+    deliver: webchat
+    label: 周级架构快照 + L3园艺清债派单 + 4信号治理驾驶舱周报
+    prompt: |-
+      【治理闭环 · 周一架构健康快照 + 园艺派单 + 4 信号高管驾驶舱】（每周一 08:00 北京时间）。
+
+      1) 生成最新架构健康快照 `arch-health.json`（含 `magnetScore × ttlUrgency` Top-20 清债队列）：
+         `env HOME=/home/agent /home/agent/.local/bin/host 'cd /opt/openclaude/openclaude-v5-selfhost && npx tsx scripts/gardening/arch-health-snapshot.ts --out /var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/self-evolve/arch-health.json'`
+      2) 运行园艺派发器（读取 `/opt/openclaude/harness-gate/control/mode.json` 与 14 天单条隔离冷却账本 `cooldown.json`，选出最多 2-3 件未冷却 L3 微 PR 清债项）：
+         `env HOME=/home/agent /home/agent/.local/bin/host 'cd /opt/openclaude/openclaude-v5-selfhost && npx tsx scripts/gardening/run-gardening-dispatch.ts --health /var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/self-evolve/arch-health.json --cooldown /var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/self-evolve/gardening-cooldown.json --limit 3 --out /var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/self-evolve/gardening-dispatch-latest.json'`
+         若 status=dispatched，按输出 `selected[].ocv5TicketCommand` 为本周选中的 2-3 件清债项创建 `OCV5` 园艺微 PR 工单（严格遵守 netLoc<=300、files<=5、单调降基线红线；单条失败仅写 `--record-failure <itemKey>` 冷却 14 天，不连坐冻结全局）。
+      3) 生成 4 信号高管驾驶舱摘要与 Butler 周报：
+         依次运行宿主 `npx tsx scripts/v5-governance-cockpit-digest.ts` 与容器 `bash /home/agent/.openclaude/workspace/butler/bin/butler-weekly-report.sh`，合并输出简洁 Markdown 周报卡片（结构返工晴雨表 / 交付体验稳定度 / 算力浪费护栏 / 元护栏完整性审计 + 本周已派发的园艺清债单号）。
+
+  # ── 节拍 4 · 周级配置防漂移、记忆卫生归档与 6/6 行为保留集回归（每周一 09:30 北京时间） ──
+  - id: weekly-antidrift-retention
+    schedule: "30 9 * * 1"
+    agent: main
+    enabled: true
+    oneshot: false
+    deliver: webchat
+    label: 周级配置防漂移 + 记忆归档裁剪 + 6/6行为保留集回归
+    prompt: >-
+      【治理闭环 · 周一防漂移巡检与保留集回归】（每周一 09:30 北京时间，承接升级版 policy-autonomy-tiers-v2.md）。
+
+      1) 记忆与技能防漂移卫生：核查 `MEMORY.md`（超 60 行裁剪、超 7 天发布流水账迁 `oc-memory archival-add`）、`user.md` 与 `skill_list()`，修复失效索引行与重复记忆。
+
+      2) 跑宿主机权威聚合门与 6/6 行为保留集：`env HOME=/home/agent /home/agent/.local/bin/host '/opt/openclaude/harness-gate/run-gates.sh'`（及 `oc-governor status` 只读核查物理 4 总闸状态）。任一保留集用例 FAIL 必须当轮定位：属近 7 天 L1/L2/L3 自动变更引入的回退则按纪律回滚对应候选并记录单条 14 天冷却；属环境瞬态则如实记录证据。
+
+      3) 核对 `workspace/self-evolve/ledger.md` 上周自动合入数是否符合周预算（L1+L2 <= 10、L3 园艺 <= 3）及 7 天生产回滚是否 < 2 次，将本周保留集与巡检结论记入 `ledger.md` 并 commit（`HOME=/home/agent`）。

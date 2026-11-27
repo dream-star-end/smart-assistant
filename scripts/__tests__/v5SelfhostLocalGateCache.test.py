@@ -18,6 +18,7 @@ CACHE_PY = ROOT / "scripts/lib/v5-selfhost-local-gate-cache.py"
 RECEIPTS_SH = ROOT / "scripts/lib/v5-selfhost-gate-receipts.sh"
 BUILD_JOBS_SH = ROOT / "scripts/lib/v5-selfhost-build-jobs.sh"
 SUMMARY_SH = ROOT / "scripts/lib/v5-selfhost-train-summary.sh"
+GOV_GATES_SH = ROOT / "scripts/lib/v5-selfhost-governance-gates.sh"
 MASTER_LIB_SH = ROOT / "scripts/v5-selfhost-master-release-lib.sh"
 MANIFEST_JSON = ROOT / "deploy/v5/selfhost-release-gates.json"
 
@@ -465,6 +466,9 @@ umask 022
 source {str(BUILD_JOBS_SH)!r}
 source {str(SUMMARY_SH)!r}
 source {str(RECEIPTS_SH)!r}
+source {str(GOV_GATES_SH)!r}
+OC_V5_REFEREE_ROOT={str(run_root / "missing-referee")!r}
+MASTER_LIVE_LINK={str(run_root / "missing-live")!r}
 REPO_ROOT={str(self.repo)!r}
 SCRIPT_DIR={str(ROOT / "scripts")!r}
 OC_V5_LOCAL_GATE_CACHE=1

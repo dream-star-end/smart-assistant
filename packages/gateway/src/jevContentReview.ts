@@ -6,6 +6,7 @@
  * settles, so a slow miss, error, or timeout still falls through to JEV.
  */
 import { createHash } from 'node:crypto'
+import { asRecord } from '@openclaude/kernel'
 
 import { createLogger } from './logger.js'
 import {
@@ -269,9 +270,4 @@ function parseRisk(body: unknown): { choice: string | null; confidence: number |
 
 function finite(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-  return value as Record<string, unknown>
 }

@@ -27,6 +27,8 @@ DRAIN_PREFIX="${V5_SLOT_DRAIN_SOCK_PREFIX:-/run/openclaude-v5-selfhost/remote-v4
 export OC_SLOT="$SLOT"
 export OPENCLAUDE_GATEWAY_PORT="$PORT"
 export OC_REMOTE_V4_DRAIN_SOCKET="${DRAIN_PREFIX}-${SLOT}.sock"
+export OC_REMOTE_RELAY_SOCKET="${OC_REMOTE_RELAY_SOCKET:-/run/openclaude-v5-selfhost/remote-relay-active.sock}"
+export OC_REMOTE_RELAY_MODE="${OC_REMOTE_RELAY_MODE:-auto}"
 export OC_PREHEAT_DISABLED=1
 export OC_IMAGE_DISTRIBUTE_DISABLED=1
 

@@ -176,6 +176,12 @@ test("cutover control endpoints enforce x-oc-egress-secret auth and serve readin
       activeMuse: 1,
       activeBrowserWs: 3,
       nonSurvivableInFlight: 1,
+      remoteRelayExternal: false,
+      remoteRelayHealthy: false,
+      remoteRelayDisabled: false,
+      remoteRelaySlot: null,
+      remoteRelayInstanceId: null,
+      remoteRelayActiveCount: 0,
     });
 
     // B05: containerLinkEnabled reflects real runtime truth (false vs true)
@@ -313,5 +319,116 @@ test("ContainerLinkControls stays idle while paused (standby) and scans immediat
     assert.equal(queries, beforePause, "pausing again must suppress subsequent scans");
   } finally {
     await controls.stop();
+  }
+});
+
+test("cutover-readiness reports live external remote-relay fields and fails closed on unhealthy/error probe", async () => {
+  type ProbeFn = NonNullable<CutoverControlDeps["probeRemoteRelayReadiness"]>;
+  let currentProbe: ProbeFn = async () => ({
+    external: true,
+    healthy: true,
+    slot: "A",
+    instanceId: "rr-inst-a-1",
+    activeCount: 4,
+  });
+
+  const deps: CutoverControlDeps = {
+    slot: "A",
+    secret: "relay-secret-xyz",
+    verifySecret: (a, b) => a === b,
+    getLeadership: () => ({ state: "leader", slot: "A", generation: 2, leasePid: process.pid }),
+    getControlListener: () => ({
+      status: () => ({ privateBound: true, vipBound: true, vipDesired: true }),
+      isVipOwner: () => true,
+    }),
+    tracker: createCutoverInFlightTracker(),
+    probeRemoteRelayReadiness: () => currentProbe(),
+  };
+
+  const server = createServer((req, res) => {
+    if (!handleCutoverControlRequest(req, res, deps)) {
+      res.statusCode = 404;
+      res.end("{}");
+    }
+  });
+  const port = await listen(server);
+  const auth = { "x-oc-egress-secret": "relay-secret-xyz" };
+
+  try {
+    // 1. Healthy external remote-relay
+    const healthy = await httpJson(port, "GET", CUTOVER_READINESS_PATH, auth);
+    assert.equal(healthy.status, 200);
+    assert.equal(healthy.json.remoteRelayExternal, true);
+    assert.equal(healthy.json.remoteRelayHealthy, true);
+    assert.equal(healthy.json.remoteRelayDisabled, false);
+    assert.equal(healthy.json.remoteRelaySlot, "A");
+    assert.equal(healthy.json.remoteRelayInstanceId, "rr-inst-a-1");
+    assert.equal(healthy.json.remoteRelayActiveCount, 4);
+
+    // 2. Unhealthy / draining external remote-relay
+    currentProbe = async () => ({
+      external: true,
+      healthy: false,
+      disabled: false,
+      slot: "A",
+      instanceId: "rr-inst-a-1",
+      activeCount: 2,
+    });
+    const draining = await httpJson(port, "GET", CUTOVER_READINESS_PATH, auth);
+    assert.equal(draining.status, 200);
+    assert.equal(draining.json.remoteRelayExternal, true);
+    assert.equal(draining.json.remoteRelayHealthy, false);
+    assert.equal(draining.json.remoteRelayDisabled, false);
+    assert.equal(draining.json.remoteRelaySlot, "A");
+    assert.equal(draining.json.remoteRelayInstanceId, "rr-inst-a-1");
+    assert.equal(draining.json.remoteRelayActiveCount, 2);
+
+    // 2b. B6: Intentionally disabled external remote-relay -> healthy=false, disabled=true (never fakes healthy)
+    currentProbe = async () => ({
+      external: true,
+      healthy: false,
+      disabled: true,
+      slot: "A",
+      instanceId: "rr-inst-a-disabled",
+      activeCount: 0,
+    });
+    const disabledRes = await httpJson(port, "GET", CUTOVER_READINESS_PATH, auth);
+    assert.equal(disabledRes.status, 200);
+    assert.equal(disabledRes.json.remoteRelayExternal, true);
+    assert.equal(disabledRes.json.remoteRelayHealthy, false);
+    assert.equal(disabledRes.json.remoteRelayDisabled, true);
+    assert.equal(disabledRes.json.remoteRelaySlot, "A");
+    assert.equal(disabledRes.json.remoteRelayInstanceId, "rr-inst-a-disabled");
+    assert.equal(disabledRes.json.remoteRelayActiveCount, 0);
+
+    // 3. Empty instanceId fails closed even if probe claimed healthy
+    currentProbe = async () => ({
+      external: true,
+      healthy: true,
+      slot: "B",
+      instanceId: "",
+      activeCount: 0,
+    });
+    const noId = await httpJson(port, "GET", CUTOVER_READINESS_PATH, auth);
+    assert.equal(noId.status, 200);
+    assert.equal(noId.json.remoteRelayExternal, true);
+    assert.equal(noId.json.remoteRelayHealthy, false);
+    assert.equal(noId.json.remoteRelayDisabled, false);
+    assert.equal(noId.json.remoteRelayInstanceId, null);
+
+    // 4. Probe throws/times out -> fail-closed 200 with healthy=false
+    currentProbe = async () => {
+      throw new Error("ENOENT: socket vanished");
+    };
+    const failed = await httpJson(port, "GET", CUTOVER_READINESS_PATH, auth);
+    assert.equal(failed.status, 200);
+    assert.equal(failed.json.remoteRelayExternal, false);
+    assert.equal(failed.json.remoteRelayHealthy, false);
+    assert.equal(failed.json.remoteRelayDisabled, false);
+    assert.equal(failed.json.remoteRelaySlot, null);
+    assert.equal(failed.json.remoteRelayInstanceId, null);
+    assert.equal(failed.json.remoteRelayActiveCount, 0);
+  } finally {
+    await close(server);
   }
 });

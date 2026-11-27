@@ -139,6 +139,13 @@ export interface AuthorityBillingAttribution {
   readonly delegateAgentId?: string
 }
 
+export interface AuthorityPoolMigrationGrant {
+  readonly migrationId: string
+  readonly placementEpoch: number
+  readonly allowBackendTransition: true
+  readonly continuityTier?: 'hot_native' | 'warm_capsule' | 'tape_rebuilt' | 'cold_degraded'
+}
+
 export interface ModelAuthorityPayload {
   readonly v: typeof MODEL_AUTHORITY_VERSION
   readonly keyId: string
@@ -151,6 +158,8 @@ export interface ModelAuthorityPayload {
   readonly executionDescriptor: ModelExecutionDescriptor
   /** Optional per-chat backend selected by the trusted signer, never by model/catalog aliases. */
   readonly executionBackend?: RemoteExecutionBackend
+  /** Optional trusted cross-pool migration grant signed by Master authority (OCV5-890). */
+  readonly poolMigration?: AuthorityPoolMigrationGrant
   readonly executionRevision: string
   readonly securityEpoch: number
   readonly issuedAt: number
@@ -750,6 +759,7 @@ function parseAuthorityPayload(raw: unknown): ModelAuthorityPayload {
       ? {}
       : { billingAttribution: parseBillingAttribution(o.billingAttribution) }),
     ...(o.executionBackend === undefined ? {} : { executionBackend: parseExecutionBackend(o.executionBackend) }),
+    ...(o.poolMigration === undefined ? {} : { poolMigration: parsePoolMigration(o.poolMigration) }),
   }
   // 重建对象后必须与 wire 载荷**字段集完全一致**:多出的未知字段一律拒 —— 否则
   // 「签名覆盖 wire 全字段、验签只取已知字段」会让未知字段成为不被校验的携带面。
@@ -771,11 +781,43 @@ function parseAuthorityPayload(raw: unknown): ModelAuthorityPayload {
     'billingRequestId',
     'billingAttribution',
     'executionBackend',
+    'poolMigration',
   ])
   if (payload.executionBackend !== undefined && !isRemoteBackendAuthority(payload)) {
     throw new ModelAuthorityError('BadShape', 'payload: execution backend/model/engine mismatch')
   }
   return payload
+}
+
+const POOL_MIGRATION_TIERS = new Set(['hot_native', 'warm_capsule', 'tape_rebuilt', 'cold_degraded'])
+
+function parsePoolMigration(value: unknown): AuthorityPoolMigrationGrant {
+  const m = asObject(value, 'poolMigration')
+  assertNoExtraKeys(m, ['migrationId', 'placementEpoch', 'allowBackendTransition', 'continuityTier'])
+  const migrationId = str(m, 'migrationId')
+  if (migrationId.trim().length < 8 || migrationId.length > 128) {
+    throw new ModelAuthorityError('BadShape', 'poolMigration: invalid migrationId')
+  }
+  const placementEpoch = int(m, 'placementEpoch')
+  if (placementEpoch < 1) {
+    throw new ModelAuthorityError('BadShape', 'poolMigration: placementEpoch must be >= 1')
+  }
+  if (m.allowBackendTransition !== true) {
+    throw new ModelAuthorityError('BadShape', 'poolMigration: allowBackendTransition must be true')
+  }
+  let continuityTier: AuthorityPoolMigrationGrant['continuityTier']
+  if (m.continuityTier !== undefined) {
+    if (typeof m.continuityTier !== 'string' || !POOL_MIGRATION_TIERS.has(m.continuityTier)) {
+      throw new ModelAuthorityError('BadShape', 'poolMigration: invalid continuityTier')
+    }
+    continuityTier = m.continuityTier as AuthorityPoolMigrationGrant['continuityTier']
+  }
+  return Object.freeze({
+    migrationId,
+    placementEpoch,
+    allowBackendTransition: true as const,
+    ...(continuityTier === undefined ? {} : { continuityTier }),
+  })
 }
 
 function parseBillingAttribution(value: unknown): AuthorityBillingAttribution {

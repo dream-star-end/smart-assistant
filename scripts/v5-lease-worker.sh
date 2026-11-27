@@ -20,6 +20,9 @@ source "$SCRIPT_DIR/lib/v5-selfhost-prewarm.sh"
 # OCV5-420:recovery_required / manual-recovery / 看护停用不再等人,由 autorecover 接管。
 # shellcheck source=scripts/v5-selfhost-autorecover.sh
 source "$SCRIPT_DIR/v5-selfhost-autorecover.sh"
+# OCV5-904: 45s 列车合流防抖 + planned 自动快进最新 CI 绿灯 SHA + 宿主 Governor 模式总闸。
+# shellcheck source=scripts/lib/v5-lease-train-debounce.sh
+source "$SCRIPT_DIR/lib/v5-lease-train-debounce.sh"
 
 WORKER_LOCK="${OC_V5_LEASE_WORKER_LOCK:-/run/openclaude-v5-selfhost/lease-worker.lock}"
 WORKER_LOG_DIR="${OC_V5_LEASE_LOG_DIR:-/opt/openclaude/tmp/lease-trains}"
@@ -176,6 +179,10 @@ SQL
 }
 
 describe_blocker() {
+  if declare -F worker_governor_blocks_dispatch >/dev/null 2>&1 && worker_governor_blocks_dispatch >/dev/null 2>&1; then
+    echo "宿主 Governor 模式总闸(emergency_stop / mode.json 不可信)"
+    return
+  fi
   local open
   open="$(lease_sql "SELECT id||'('||status||')' FROM train WHERE resource='$RESOURCE' AND status NOT IN ('committed','failed') LIMIT 1;")"
   if [[ -n "$open" ]]; then echo "open train $open"; return; fi
@@ -288,6 +295,9 @@ SQL
 
 dispatch_train() {
   lease_release_policy_held && { wlog "unresolved release policy blocks dispatch"; return 0; }
+  if declare -F worker_governor_blocks_dispatch >/dev/null 2>&1 && worker_governor_blocks_dispatch; then
+    return 0
+  fi
   local pending open tip miss id now logf
   pending="$(lease_sql "SELECT COUNT(*) FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")"
   [[ "$pending" -gt 0 ]] || return 0
@@ -296,6 +306,9 @@ dispatch_train() {
   [[ -n "$(lease_sql "SELECT id FROM lease WHERE resource='$RESOURCE' AND status='granted' LIMIT 1;")" ]] && { wlog "有 granted drive,不发车"; return 0; }
   lease_deploy_process_running && { wlog "外部 deploy 进程在跑,不发车"; return 0; }
   lease_in_cutover_grace && { wlog "cutover grace 窗口,不发车"; return 0; }
+  if declare -F worker_train_debounce_waiting >/dev/null 2>&1 && worker_train_debounce_waiting; then
+    return 0
+  fi
 
   git -C "$LEASE_REPO_ROOT" fetch -q origin "$LEASE_BRANCH" 2>/dev/null || true
   tip="$(lease_remote_tip)" || { wlog "读不到 origin tip"; return 0; }
@@ -303,6 +316,10 @@ dispatch_train() {
   miss="$(lease_sql "SELECT want_sha FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';" \
           | while read -r w; do lease_sha_contained "$w" "$tip" || echo "$w"; done)"
   [[ -z "$miss" ]] || { wlog "tip ${tip:0:12} 不含 pending sha: $miss;不发车"; return 0; }
+  # B5: 对当前远端 tip 做 CI 三态分类（success / pending / failed），在建 train 与结算 failed 之前执行
+  if declare -F worker_pre_dispatch_ci_gate >/dev/null 2>&1; then
+    worker_pre_dispatch_ci_gate "$tip" || return 0
+  fi
   # 同一 target 上一班由执行器自己上报 failed(门禁/构建拒绝 = 确定性失败)→ 不自动重发
   # (2026-09-05 实测:0274 迁移门拒绝后 worker 每 15min 烧一班)。worker 对账判的 failed(planned 超时、执行器被外力杀)不受此限。
   # 在那班结束前登记的 ride 置 failed 并回调(design-v2 §2.2:train failed 且无法自动重发 → failed);
@@ -365,6 +382,15 @@ $(lease_event_sql "$id" train-planned "$ACTOR" "target=$tip rides=$pending")
 COMMIT;
 SQL
   wlog "train $id planned target=${tip:0:12} rides=$pending → spawn deploy"
+  if declare -F worker_planned_fast_forward_green_tip >/dev/null 2>&1; then
+    local ff_rc=0
+    worker_planned_fast_forward_green_tip "$id" tip || ff_rc=$?
+    if (( ff_rc == 10 )) || [[ "${PLANNED_FF_OUTCOME:-}" == "defer" ]]; then
+      wlog "train $id planned 已原子延期(outcome=defer)，不派旧班 ${tip:0:12}，registered rides 保持待新 tip 绿后再排"
+      exec 8>&-; return 0
+    fi
+    if (( ff_rc != 0 )); then exec 8>&-; return 0; fi
+  fi
   if [[ "$DRY" == 1 ]]; then
     wlog "[dry] 不 spawn"; exec 8>&-; return 0
   fi

@@ -44,6 +44,9 @@ selfhost_prepare_assert_tip() { # <sha>; no ref update, live state or canonical 
 
 selfhost_prepare_identity() { # must run with artifact mutex held
   local sha="$1" key bun_version
+  if declare -F v5_selfhost_load_runtime_image_pin_for_commit >/dev/null 2>&1; then
+    v5_selfhost_load_runtime_image_pin_for_commit "$sha"
+  fi
   key="$(master_web_dist_key "$sha")" || die "cannot bind prepared web inputs"
   RUNTIME_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$RUNTIME_IMAGE")" \
     || die "cannot bind prepared runtime image"
@@ -145,6 +148,9 @@ cmd_prepare() {
   [[ -n "$LEASE_TARGET_SHA" ]] || die "--prepare requires --target-sha"
   PLATFORM_FROM_HEAD=1
   selfhost_prepare_assert_tip "$LEASE_TARGET_SHA"
+  if declare -F v5_selfhost_load_runtime_image_pin_for_commit >/dev/null 2>&1; then
+    v5_selfhost_load_runtime_image_pin_for_commit "$LEASE_TARGET_SHA"
+  fi
   preflight_common
   assert_fix_trailers "$LEASE_TARGET_SHA"
   selfhost_prepare_candidate "$LEASE_TARGET_SHA"

@@ -317,6 +317,10 @@ export const DURABLE_TABLES: readonly string[] = [
   "user_site_env_vars",
   "user_site_collaborators",
   "user_site_invites",
+  // OCV5-890 / OCV5-907 / OCV5-913 (0350): three-layer authoritative live state & admin pool bindings
+  // (session_engine_pointers/session_rolling_checkpoints cascade on users delete; model_logical_pool_bindings
+  // is admin config; artifact_blobs is soft-deleted/CAS-managed). Terminal migrations/uploads use TTL in auditRetention.ts.
+  "session_engine_pointers", "session_rolling_checkpoints", "artifact_blobs", "model_logical_pool_bindings",
 ] as const;
 
 /**

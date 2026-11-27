@@ -26,6 +26,13 @@ import {
   type AccountScheduler,
 } from "../account-pool/scheduler.js";
 import {
+  createSelfhostCrossPoolFallbackSelector,
+  createSelfhostForcedLocalMigrationResolver,
+  createSelfhostReturnToRemoteGrantResolver,
+  resolveSelfhostLogicalModelPoolTarget,
+  selectPeekBindingCandidate,
+} from "../account-pool/remotePool/index.js";
+import {
   observeWsBridgeBuffered,
   observeWsBridgeSessionDuration,
   observeWsBridgeTtft,
@@ -52,6 +59,12 @@ import type { PricingCache } from "../billing/pricing.js";
 import { expireZcodeRelayRoute, mintZcodeRelayRoute } from "../billing/zcodeRouteContext.js";
 import type { CommercialConfig } from "../config.js";
 import { getPool } from "../db/index.js";
+import type { LogicalModelPoolBinding } from "@openclaude/protocol";
+import {
+  PgLogicalModelBindingStore,
+  PgSessionAuthorityStateStore,
+  type PgTransactionPool,
+} from "../db/threeLayerStateStore.js";
 import { persistGatewayLiveFrame } from "../db/liveTurnFrames.js";
 import type {
   AutomaticRecoveryDecision,
@@ -80,8 +93,177 @@ import {
   type BridgeMetricSink,
   type CodexBindingHandle,
   type ResolveContainerEndpoint,
+  type UserChatBridgeDeps,
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
+
+/**
+ * Selfhost V5 implicit cross-pool routing hooks (N01/B06/B01):
+ * wires ONLY the authoritative PG `pool` (implicit `PgLogicalModelBindingStore`,
+ * `PgSessionAuthorityStateStore`, and PG pending-billing query) plus `modelCatalogCache`.
+ */
+export function buildSelfhostCrossPoolBridgeHooks(input: {
+  readonly isSelfhostV5: boolean;
+  readonly pool: PgTransactionPool;
+  readonly modelCatalogCache: Pick<ModelCatalogCache, "assertFresh"> | undefined;
+}): Pick<
+  UserChatBridgeDeps,
+  | "crossPoolFallbackSelector"
+  | "returnToRemoteGrantResolver"
+  | "forcedLocalMigrationResolver"
+  | "recordRemotePlacement"
+  | "markPlacementMigrationInstalled"
+  | "peekLogicalModelPoolTarget"
+  | "resolveLogicalModelPoolTarget"
+> {
+  if (!input.isSelfhostV5 || !input.modelCatalogCache) return {};
+  const authorityStore = new PgSessionAuthorityStateStore(input.pool);
+  const bindingStore = new PgLogicalModelBindingStore(input.pool);
+  // W1: Store ONLY global PG priority-sorted bindings; never mutate global order with per-user authz.
+  const globalBindingsByLogical = new Map<string, readonly LogicalModelPoolBinding[]>();
+  const sessionPoolHints = new Map<string, { poolKind: "local_pool" | "remote_pool"; updatedAtMs: number }>();
+  const PEEK_TTL_MS = 5_000;
+  const SESSION_HINT_MAX = 2_048;
+  let globalCacheUpdatedAtMs = 0;
+  let lastListRefreshAtMs = 0;
+  let listRefreshInFlight: Promise<void> | null = null;
+
+  const setSessionPoolHint = (uid: number, sessionKey: string, poolKind: "local_pool" | "remote_pool") => {
+    const key = `${uid}:${sessionKey}`;
+    if (sessionPoolHints.size >= SESSION_HINT_MAX && !sessionPoolHints.has(key)) {
+      const oldest = sessionPoolHints.keys().next().value;
+      if (oldest !== undefined) sessionPoolHints.delete(oldest);
+    }
+    sessionPoolHints.set(key, { poolKind, updatedAtMs: Date.now() });
+  };
+
+  const refreshGlobalPeekCache = (): void => {
+    const now = Date.now();
+    if (listRefreshInFlight || now - lastListRefreshAtMs < PEEK_TTL_MS) return;
+    lastListRefreshAtMs = now;
+    listRefreshInFlight = bindingStore
+      .listAllEnabledBindings()
+      .then((rows) => {
+        const grouped = new Map<string, LogicalModelPoolBinding[]>();
+        for (const row of rows) {
+          const list = grouped.get(row.logicalModelId) ?? [];
+          list.push(row);
+          grouped.set(row.logicalModelId, list);
+        }
+        globalBindingsByLogical.clear();
+        for (const [logicalModelId, list] of grouped) {
+          list.sort((a, b) => a.priority - b.priority || a.driverId.localeCompare(b.driverId));
+          globalBindingsByLogical.set(logicalModelId, Object.freeze(list));
+        }
+        globalCacheUpdatedAtMs = Date.now();
+      })
+      .catch(() => {})
+      .finally(() => {
+        listRefreshInFlight = null;
+      });
+  };
+  refreshGlobalPeekCache();
+
+  return {
+    crossPoolFallbackSelector: createSelfhostCrossPoolFallbackSelector({
+      pool: input.pool,
+      catalogCache: input.modelCatalogCache,
+      selfhost: input.isSelfhostV5,
+    }),
+    returnToRemoteGrantResolver: createSelfhostReturnToRemoteGrantResolver({
+      pool: input.pool,
+      selfhost: input.isSelfhostV5,
+    }),
+    forcedLocalMigrationResolver: createSelfhostForcedLocalMigrationResolver({
+      pool: input.pool,
+      selfhost: input.isSelfhostV5,
+    }),
+    recordRemotePlacement: async (args) => {
+      await input.pool.query(
+        `INSERT INTO session_engine_pointers (
+           user_id, session_key, placement_epoch, pool_kind, engine,
+           operation_id, profile_id, migration_state
+         ) VALUES ($1, $2, 1, 'remote_pool', $3, $4, $5, 'active')
+         ON CONFLICT (user_id, session_key) DO NOTHING`,
+        [args.uid, args.sessionKey, args.engine, args.operationId, args.profileId ?? null],
+      );
+      setSessionPoolHint(args.uid, args.sessionKey, "remote_pool");
+    },
+    markPlacementMigrationInstalled: (args) =>
+      authorityStore.markPlacementMigrationInstalled(
+        args.uid,
+        args.sessionKey,
+        args.placementEpoch,
+        args.migrationId,
+        {
+          ...(args.checkpointGeneration !== undefined
+            ? { checkpointGeneration: args.checkpointGeneration }
+            : {}),
+          ...(args.consumedByTurnKey !== undefined
+            ? { consumedByTurnKey: args.consumedByTurnKey }
+            : {}),
+          ...(args.requireWarmCheckpointMatch !== undefined
+            ? { requireWarmCheckpointMatch: args.requireWarmCheckpointMatch }
+            : {}),
+        },
+      ),
+    peekLogicalModelPoolTarget: (rawModelId, catalogSnapshot, isModelAllowed, uid, sessionKey) => {
+      refreshGlobalPeekCache();
+      if (globalCacheUpdatedAtMs === 0 || Date.now() - globalCacheUpdatedAtMs > PEEK_TTL_MS * 6) {
+        return null;
+      }
+      const hint =
+        typeof uid === "number" && typeof sessionKey === "string" && sessionKey.length > 0
+          ? sessionPoolHints.get(`${uid}:${sessionKey}`)?.poolKind ?? null
+          : null;
+      return selectPeekBindingCandidate({
+        rawModelId,
+        cachedBindingsByLogical: globalBindingsByLogical,
+        ...(catalogSnapshot ? { catalogSnapshot } : {}),
+        ...(isModelAllowed ? { isModelAllowed } : {}),
+        ...(hint ? { activeSessionPoolKind: hint } : {}),
+      });
+    },
+    resolveLogicalModelPoolTarget: async (args) => {
+      let activeSessionPoolKind: "local_pool" | "remote_pool" | null = null;
+      if (
+        typeof args.uid === "number" &&
+        Number.isSafeInteger(args.uid) &&
+        args.uid > 0 &&
+        typeof args.sessionKey === "string" &&
+        args.sessionKey.trim().length > 0
+      ) {
+        try {
+          const ptr = await authorityStore.getEnginePointer(args.uid, args.sessionKey);
+          if (ptr?.poolKind === "remote_pool") {
+            activeSessionPoolKind = "remote_pool";
+          } else if (ptr?.poolKind === "local_container") {
+            activeSessionPoolKind = "local_pool";
+          }
+        } catch {
+          return { ok: false as const, code: "MODEL_POOL_BINDING_READ_FAILED" };
+        }
+      }
+      const res = await resolveSelfhostLogicalModelPoolTarget({
+        rawModelId: args.rawModelId,
+        bindingStore,
+        catalogSnapshot: args.catalogSnapshot,
+        ...(args.isModelAllowed ? { isModelAllowed: args.isModelAllowed } : {}),
+        ...(activeSessionPoolKind ? { activeSessionPoolKind } : {}),
+      });
+      if (
+        res.ok &&
+        typeof args.uid === "number" &&
+        typeof args.sessionKey === "string" &&
+        args.sessionKey.trim().length > 0 &&
+        (res.poolKind === "local_pool" || res.poolKind === "remote_pool")
+      ) {
+        setSessionPoolHint(args.uid, args.sessionKey, res.poolKind);
+      }
+      return res;
+    },
+  };
+}
 
 export function createCodexBindingHandle(deps: {
   env: NodeJS.ProcessEnv;
@@ -276,16 +458,19 @@ export function createCommercialUserChatBridge(deps: {
     : undefined;
   const recycleUnattestedContainer = createUnattestedContainerRecycler(() => deps.v3Deps);
 
+  const isSelfhostV5 =
+    getRuntimeChannel() === "v5" &&
+    deps.flavorIdentity.status === "ok" &&
+    deps.flavorIdentity.flavor === "selfhost";
+
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     cc5BackendSelector: (input) =>
-      selectMasterCc5Backend(
-        deps.cc5Runtime,
-        input,
-        getRuntimeChannel() === "v5" &&
-          deps.flavorIdentity.status === "ok" &&
-          deps.flavorIdentity.flavor === "selfhost",
-        deps.env,
-      ),
+      selectMasterCc5Backend(deps.cc5Runtime, input, isSelfhostV5, deps.env),
+    ...buildSelfhostCrossPoolBridgeHooks({
+      isSelfhostV5,
+      pool: getPool(),
+      modelCatalogCache: deps.modelCatalogCache,
+    }),
     containerLinkEnabled: deps.containerLinkOn,
     resolveContainerLinkEndpoint: async (uid, cid) => {
       const ep = await resolveContainerLinkEndpoint(getPool(), deps.runtimeChannel, uid, cid);

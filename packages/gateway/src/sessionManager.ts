@@ -126,12 +126,8 @@ import {
 } from './turnUsage.js'
 import { emptyCompletedTurnAssistantText, shouldFailClosedEmptyModelTurn } from './emptyCompletedTurn.js'
 import { applyPlatformCostIfMissing } from './usageCost.js'
-import {
-  CCB_PROVIDER_TAG,
-  CCB_RESUME_HISTORY_CONTEXT_VERSION,
-  normalizeEngineTag,
-  ResumeStore,
-} from './resumeStore.js'
+import { CCB_PROVIDER_TAG, CCB_RESUME_HISTORY_CONTEXT_VERSION, normalizeEngineTag, ResumeStore } from './resumeStore.js'
+import { collectResumeSyncSnapshots, type SessionAuthorityRuntimePort, type SessionCapsuleRuntimePort } from './sessionAuthorityHook.js'
 import { collectSessionOutputAssets } from './projectAssetCollector.js'
 import { adoptRunContext } from './runContextPersist.js'
 import {
@@ -1411,16 +1407,12 @@ export class SessionManager {
   }
 
   private readonly resumeStore = new ResumeStore(join(paths.home, 'resume-map.json'))
-  private get resumeMapPath(): string {
-    return this.resumeStore.path
-  }
-  private set resumeMapPath(path: string) {
-    this.resumeStore.path = path
-  }
-
-  constructor(public config: OpenClaudeConfig) {
-    this._loadResumeMap()
-  }
+  authorityStateRuntime?: SessionAuthorityRuntimePort
+  capsuleRuntime?: SessionCapsuleRuntimePort
+  getResumeStore(): ResumeStore { return this.resumeStore }
+  private get resumeMapPath(): string { return this.resumeStore.path }
+  private set resumeMapPath(path: string) { this.resumeStore.path = path }
+  constructor(public config: OpenClaudeConfig) { this._loadResumeMap() }
 
   isRuntimeRecycleDraining(now = Date.now()): boolean {
     if (this._runtimeRecycleDrainUntil <= now) {
@@ -1760,7 +1752,9 @@ export class SessionManager {
   }
 
   private _forgetResumeEntry(key: string): void {
+    const prevProvider = this.resumeStore.provider.get(key)
     this.resumeStore.forget(key)
+    this.authorityStateRuntime?.syncResumeReset(key, prevProvider)
   }
 
   /**
@@ -1882,11 +1876,10 @@ export class SessionManager {
 
   private _saveResumeMap(): void {
     this.resumeStore.persist(this.resumeStore.serialize(this.sessions))
+    if (this.authorityStateRuntime?.isRemoteEnabled) this.authorityStateRuntime.syncResumeSnapshots(collectResumeSyncSnapshots(this.resumeStore))
   }
-
-  /** Await any pending resume-map disk writes (used by shutdown to prevent data loss). */
   async awaitResumeMapFlush(): Promise<void> {
-    await this.resumeStore.flush()
+    await Promise.allSettled([this.resumeStore.flush(), this.authorityStateRuntime?.flush() ?? Promise.resolve()])
   }
 
   /** Check which sessionKeys in the resume map match a given pattern (e.g., containing a peerId) */
@@ -2572,14 +2565,16 @@ export class SessionManager {
 
   /** Drop resume-map rows for an evicted/expired delegate binding. */
   forgetResume(sessionKey: string): void {
-    if (!this._resumeMap.has(sessionKey)) return
-    this._resumeMap.delete(sessionKey)
-    this._resumeMapTimestamps.delete(sessionKey)
-    this._resumeMapLastCost.delete(sessionKey)
-    this._resumeMapCostImprecise.delete(sessionKey)
-    this._resumeMapProvider.delete(sessionKey)
-    this._resumeMapHistory.delete(sessionKey)
+    if (!this._resumeMap.has(sessionKey) && !this.authorityStateRuntime?.isRemoteEnabled) return
+    this._forgetResumeEntry(sessionKey)
     this._saveResumeMap()
+  }
+
+  /** B1: Unbind live runner & persist cleaned resume-map after HTTP 409 authority quarantine. */
+  quarantineSessionResume(sessionKey: string): void {
+    const live = this.sessions.get(sessionKey)
+    if (live) { live.ccbSessionId = null; live.runner.clearSessionId?.() }
+    this.resumeStore.persist(this.resumeStore.serialize(this.sessions))
   }
 
   /** First shutdown stage; never throws so the rest of shutdown always runs. */

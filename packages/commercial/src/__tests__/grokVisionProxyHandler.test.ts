@@ -308,6 +308,7 @@ describe("grok vision handler", () => {
     assert.equal(up.url, GROK_VISION_UPSTREAM);
     assert.equal(up.init.headers.authorization, `Bearer ${GROK_TOKEN_BYTES}`);
     assert.equal(up.init.headers["x-grok-model-override"], "grok-build");
+    assert.equal(up.init.headers["x-grok-client-version"], "1.0.92");
     const sent = JSON.parse(up.init.body);
     assert.equal(sent.model, "grok-4.7");
     assert.equal(sent.store, false);

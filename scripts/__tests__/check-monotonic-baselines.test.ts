@@ -6,15 +6,27 @@ import path from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
+  AI_SMELLS_BASELINE_PATH,
   BUDGETS_PATH,
+  CLONES_BASELINE_PATH,
+  COMPLEXITY_BASELINE_PATH,
   DESIGN_TOKENS_COUNTS_PATH,
   FEATURE_FLAGS_REGISTRY_PATH,
+  FILE_CYCLES_BASELINE_PATH,
   LAYOUT_INVARIANTS_BASELINE_PATH,
+  SECURITY_SAST_BASELINE_PATH,
+  SUBDOMAIN_VIOLATIONS_BASELINE_PATH,
   UI_STATIC_BASELINE_PATH,
+  compareAiSmellsMonotonic,
   compareBudgets,
+  compareClonesMonotonic,
+  compareComplexityMonotonic,
   compareCountRatchet,
   compareFeatureFlagsRegistry,
+  compareFileCyclesMonotonic,
   compareLayoutInvariantsBaseline,
+  compareSecuritySastMonotonic,
+  compareSubdomainMonotonic,
   validateLayoutInvariantsBaselineSchema,
 } from '../check-monotonic-baselines.ts'
 
@@ -375,5 +387,127 @@ describe('check-monotonic-baselines CLI', () => {
       encoding: 'utf8',
     })
     assert.equal(r.status, 2)
+  })
+
+  test('OCV5-903 extra 6 baselines: introduction PASS, monotonic shrink/split PASS, raise/addition FAIL', (t) => {
+    const aiBase = {
+      schemaVersion: 1,
+      generatedAt: '2026-11-26',
+      categories: ['emptyCatch', 'typeEscape', 'syncIo', 'lintSuppress'],
+      totals: { emptyCatch: 2, typeEscape: 1, syncIo: 0, lintSuppress: 0, all: 3 },
+      files: { 'packages/commercial/src/a.ts': { emptyCatch: 2, typeEscape: 1, syncIo: 0, lintSuppress: 0 } },
+    }
+    const bigCycleKey =
+      'R2-file-cycle|scc:111111111111|packages/gateway/src/a.ts,packages/gateway/src/b.ts,packages/gateway/src/c.ts'
+    const subCycleKey =
+      'R2-file-cycle|scc:222222222222|packages/gateway/src/a.ts,packages/gateway/src/b.ts'
+    const newCycleKey =
+      'R2-file-cycle|scc:333333333333|packages/gateway/src/x.ts,packages/gateway/src/y.ts'
+    const cyclesBase = { schema: 1, entries: { [bigCycleKey]: 3 } }
+    const subBase = { schema: 1, entries: { 'R2-intramodule-boundary|a.ts|m:x->y': 2 } }
+    const cxBase = {
+      schemaVersion: 1,
+      limits: { lines: 100, ccDirect: 20, maxNesting: 5 },
+      summary: { exceedingFunctions: 1, overLines: 1, overCcDirect: 0, overMaxNesting: 0 },
+      functions: { 'packages/gateway/src/a.ts::fn': { lines: 120, ccDirect: 10, maxNesting: 3 } },
+    }
+    const clonesBase = {
+      schemaVersion: 1,
+      windowLines: 12,
+      summary: { scannedFiles: 10, totalClusters: 1, totalInstances: 2 },
+      topHotspots: [],
+      clusters: { aaaa1111: { files: 2, instances: 2 } },
+    }
+    const secBase = {
+      schemaVersion: 1,
+      summary: { totalEntries: 1, totalCount: 2, byRule: { 'SEC-SAST-SQL-INTERPOLATION': 2 } },
+      entries: { 'packages/commercial/src/a.ts|SEC-SAST-SQL-INTERPOLATION': 2 },
+    }
+
+    // Pure comparator checks: shrink / strict subset split PASS, growth FAIL
+    assert.deepEqual(
+      compareAiSmellsMonotonic(aiBase, {
+        ...aiBase,
+        totals: { emptyCatch: 1, typeEscape: 1, syncIo: 0, lintSuppress: 0, all: 2 },
+        files: { 'packages/commercial/src/a.ts': { emptyCatch: 1, typeEscape: 1, syncIo: 0, lintSuppress: 0 } },
+      }),
+      [],
+    )
+    assert.ok(
+      compareAiSmellsMonotonic(aiBase, {
+        ...aiBase,
+        totals: { emptyCatch: 3, typeEscape: 1, syncIo: 0, lintSuppress: 0, all: 4 },
+        files: { 'packages/commercial/src/a.ts': { emptyCatch: 3, typeEscape: 1, syncIo: 0, lintSuppress: 0 } },
+      }).length > 0,
+    )
+    assert.deepEqual(compareFileCyclesMonotonic(cyclesBase, { schema: 1, entries: { [subCycleKey]: 2 } }), [])
+    assert.ok(compareFileCyclesMonotonic(cyclesBase, { schema: 1, entries: { [bigCycleKey]: 3, [newCycleKey]: 2 } }).length > 0)
+    assert.deepEqual(
+      compareSubdomainMonotonic(subBase, { schema: 1, entries: { 'R2-intramodule-boundary|a.ts|m:x->y': 1 } }, compareCountRatchet),
+      [],
+    )
+    assert.ok(
+      compareSubdomainMonotonic(subBase, { schema: 1, entries: { 'R2-intramodule-boundary|a.ts|m:x->y': 3 } }, compareCountRatchet).length > 0,
+    )
+    assert.deepEqual(
+      compareComplexityMonotonic(cxBase, {
+        ...cxBase,
+        functions: { 'packages/gateway/src/a.ts::fn': { lines: 110, ccDirect: 10, maxNesting: 3 } },
+      }),
+      [],
+    )
+    assert.ok(
+      compareComplexityMonotonic(cxBase, {
+        ...cxBase,
+        functions: { 'packages/gateway/src/a.ts::fn': { lines: 121, ccDirect: 10, maxNesting: 3 } },
+      }).length > 0,
+    )
+    assert.deepEqual(compareClonesMonotonic(clonesBase, { ...clonesBase, summary: { scannedFiles: 10, totalClusters: 0, totalInstances: 0 }, clusters: {} }), [])
+    assert.ok(
+      compareClonesMonotonic(clonesBase, {
+        ...clonesBase,
+        summary: { scannedFiles: 10, totalClusters: 2, totalInstances: 4 },
+        clusters: { aaaa1111: { files: 2, instances: 2 }, bbbb2222: { files: 2, instances: 2 } },
+      }).length > 0,
+    )
+    assert.deepEqual(
+      compareSecuritySastMonotonic(secBase, {
+        ...secBase,
+        entries: { 'packages/commercial/src/a.ts|SEC-SAST-SQL-INTERPOLATION': 1 },
+      }),
+      [],
+    )
+    assert.ok(
+      compareSecuritySastMonotonic(secBase, {
+        ...secBase,
+        entries: { 'packages/commercial/src/a.ts|SEC-SAST-SQL-INTERPOLATION': 3 },
+      }).length > 0,
+    )
+
+    // CLI end-to-end against committed base
+    const dir = initGitRepo(t, {
+      [AI_SMELLS_BASELINE_PATH]: aiBase,
+      [FILE_CYCLES_BASELINE_PATH]: cyclesBase,
+      [SUBDOMAIN_VIOLATIONS_BASELINE_PATH]: subBase,
+      [COMPLEXITY_BASELINE_PATH]: cxBase,
+      [CLONES_BASELINE_PATH]: clonesBase,
+      [SECURITY_SAST_BASELINE_PATH]: secBase,
+    })
+    const passRun = spawnSync(process.execPath, ['--import', 'tsx', SCRIPT, '--root', dir, '--base', 'base'], {
+      encoding: 'utf8',
+    })
+    assert.equal(passRun.status, 0, passRun.stderr)
+    assert.match(passRun.stdout, /ai-smells-baseline\.json=compared/)
+    assert.match(passRun.stdout, /security-sast-baseline\.json=compared/)
+
+    writeFileSync(
+      path.join(dir, SECURITY_SAST_BASELINE_PATH),
+      JSON.stringify({ ...secBase, entries: { ...secBase.entries, 'packages/commercial/src/new.ts|SEC-SAST-SHELL-INJECTION': 1 } }),
+    )
+    const failRun = spawnSync(process.execPath, ['--import', 'tsx', SCRIPT, '--root', dir, '--base', 'base'], {
+      encoding: 'utf8',
+    })
+    assert.equal(failRun.status, 1)
+    assert.match(failRun.stderr, /security-sast-baseline\.json/)
   })
 })

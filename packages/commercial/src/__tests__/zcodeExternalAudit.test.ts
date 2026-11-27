@@ -357,8 +357,8 @@ describe("ZCode bridge source tripwire", () => {
     assert.doesNotMatch(zcodeBranch, /isCursorContainerOnSelfHost/);
     assert.doesNotMatch(zcodeBranch, /cursor_external_usage_audit/);
     assert.doesNotMatch(zcodeBranch, /settleCursorExternalUsage/);
-    assert.match(source, /isZcodeModel\(authorityModelForFrame\)/);
-    assert.match(source, /isCursorModel\(authorityModelForFrame\)/);
+    assert.match(source, /isZcodeModel\(peekedAuthorityModel\)/);
+    assert.match(source, /isCursorModel\(peekedAuthorityModel\)/);
     assert.match(source, /closeZcodeAuditWithRetry/);
     assert.match(source, /applyZcodeFinalizeOutcome/);
     assert.match(source, /reconcileStaleZcodeAudits/);

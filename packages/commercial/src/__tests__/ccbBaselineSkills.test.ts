@@ -275,4 +275,103 @@ describe('ccb-baseline skills ↔ manifest', () => {
       /oc-stylecheck .*--style-file \/home\/agent\/\.openclaude\/research\/style\/profile\.md/,
     )
   })
+
+  it('ships scientific-deep-audit, updated multi-model-review court gates, and pinned Python scientific deps (OCV5-895)', () => {
+    assert.ok(
+      (V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('scientific-deep-audit'),
+      'V3_CCB_BASELINE_SKILL_NAMES must include scientific-deep-audit',
+    )
+
+    const sciAuditSkill = readFileSync(join(skillsDir, 'scientific-deep-audit', 'SKILL.md'), 'utf8')
+    assert.match(sciAuditSkill, /name:\s*scientific-deep-audit/)
+    assert.match(sciAuditSkill, /scripts\/cleanroom_verify_template\.py/)
+    assert.match(sciAuditSkill, /repro_script/)
+    assert.match(sciAuditSkill, /oc-review verify --unsafe-local-exec/)
+    assert.doesNotMatch(sciAuditSkill, /oc-review verify --exec\b/)
+    assert.match(sciAuditSkill, /sandbox_unavailable_collect_only/)
+    assert.match(sciAuditSkill, /oc-review ledger init/)
+    assert.match(sciAuditSkill, /OC_WITNESS_VERDICT/)
+    assert.match(sciAuditSkill, /emit_witness_verdict/)
+    assert.match(sciAuditSkill, /verified_by_machine/)
+    assert.match(sciAuditSkill, /findingDigest/)
+    assert.match(sciAuditSkill, /scriptSha256/)
+    assert.match(sciAuditSkill, /--scientific-gate/)
+    assert.match(sciAuditSkill, /chao1Residual<0\.5/)
+    assert.match(sciAuditSkill, /PASS_READY/)
+    assert.match(sciAuditSkill, /gpt-6\.2-astra/)
+    assert.match(sciAuditSkill, /gpt-6\.2-sol/)
+    assert.match(sciAuditSkill, /antigravity-gemini-4-neon/)
+    assert.match(sciAuditSkill, /antigravity-gemini-4-carbon/)
+    assert.match(sciAuditSkill, /grok-build/)
+    assert.match(sciAuditSkill, /deepseek-v4-flash/)
+    assert.match(sciAuditSkill, /excludedReviewers/)
+    assert.match(sciAuditSkill, /check_smt_inequality/)
+    assert.match(sciAuditSkill, /\bz3\b/)
+    assert.doesNotMatch(sciAuditSkill, /box-api-claude-/)
+    assert.doesNotMatch(sciAuditSkill, /gpt-5\.6-sol/)
+    assert.doesNotMatch(sciAuditSkill, /k3\.1-pro/)
+    assert.doesNotMatch(sciAuditSkill, /minimax-m3-go/)
+    assert.doesNotMatch(sciAuditSkill, /qwen3\.7-plus-go/)
+
+    const verifyTemplatePath = join(
+      skillsDir,
+      'scientific-deep-audit',
+      'scripts',
+      'cleanroom_verify_template.py',
+    )
+    assert.ok(existsSync(verifyTemplatePath), 'cleanroom_verify_template.py must exist')
+    const verifyTemplate = readFileSync(verifyTemplatePath, 'utf8')
+    for (const fn of [
+      'check_jacobian_parity',
+      'check_so3_invariants',
+      'check_nonzero_roundtrip',
+      'check_dimensions',
+      'check_ssot_numbers',
+      'check_callsite_impact',
+      'check_smt_inequality',
+      'emit_witness_verdict',
+    ]) {
+      assert.match(verifyTemplate, new RegExp(`def ${fn}\\(`))
+    }
+    assert.match(verifyTemplate, /def check_smt_inequality\(/)
+    assert.match(verifyTemplate, /OC_WITNESS_VERDICT_FILE/)
+    assert.match(verifyTemplate, /missing_keys/)
+    assert.match(verifyTemplate, /NO_COVERAGE/)
+    assert.match(verifyTemplate, /vacuous_assumptions/)
+
+    const reviewSkill = readFileSync(join(skillsDir, 'multi-model-review', 'SKILL.md'), 'utf8')
+    assert.match(reviewSkill, /scientific-deep-audit/)
+    assert.match(reviewSkill, /repro_script/)
+    assert.match(reviewSkill, /oc-review verify/)
+    assert.match(reviewSkill, /--unsafe-local-exec/)
+    assert.doesNotMatch(reviewSkill, /oc-review verify --exec\b/)
+    assert.match(reviewSkill, /OC_WITNESS_VERDICT/)
+    assert.match(reviewSkill, /findingDigest/)
+    assert.match(reviewSkill, /scriptSha256/)
+    assert.match(reviewSkill, /--verification/)
+    assert.match(reviewSkill, /--scientific-gate/)
+    assert.match(reviewSkill, /500\/429/)
+    assert.match(reviewSkill, /gpt-6\.2-astra/)
+    assert.match(reviewSkill, /gpt-6\.2-sol/)
+    assert.match(reviewSkill, /antigravity-gemini-4-neon/)
+    assert.match(reviewSkill, /antigravity-gemini-4-carbon/)
+    assert.match(reviewSkill, /grok-build/)
+    assert.match(reviewSkill, /deepseek-v4-flash/)
+    assert.doesNotMatch(reviewSkill, /box-api-claude-/)
+    assert.doesNotMatch(reviewSkill, /gpt-5\.6-sol/)
+    assert.doesNotMatch(reviewSkill, /k3\.1-pro/)
+    assert.doesNotMatch(reviewSkill, /minimax-m3-go/)
+    assert.doesNotMatch(reviewSkill, /qwen3\.7-plus-go/)
+    assert.doesNotMatch(reviewSkill, /kimi\/gpt\/deepseek\/glm/)
+
+    const dockerfile = readFileSync(
+      join(here, '..', '..', 'agent-sandbox', 'Dockerfile.openclaude-runtime'),
+      'utf8',
+    )
+    assert.match(dockerfile, /pint==0\.25\.3/)
+    assert.match(dockerfile, /uncertainties==3\.2\.3/)
+    assert.match(dockerfile, /hypothesis==6\.170\.17/)
+    assert.match(dockerfile, /z3-solver==5\.4\.1\.0/)
+    assert.match(dockerfile, /pytest==9\.2\.0/)
+  })
 })

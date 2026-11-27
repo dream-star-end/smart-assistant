@@ -42,9 +42,13 @@ function view(models: Array<Record<string, unknown>>): LocalCatalogView {
 
 const FULL = view([
   row('glm-5.3-zai', 'ccb'),
+  row('gpt-6.2-astra', 'codex'),
+  row('gpt-6.2-sol', 'codex'),
   row('gpt-6-astra', 'codex'),
   row('gpt-5.6-sol', 'codex'),
   row('gpt-5.6-terra', 'codex'),
+  row('antigravity-gemini-4-neon', 'antigravity'),
+  row('antigravity-gemini-4-carbon', 'antigravity'),
   row('grok-build', 'grok'),
   row('deepseek-v4-pro', 'ccb'),
   row('deepseek-v4-flash', 'ccb'),
@@ -55,44 +59,52 @@ const FULL = view([
 ])
 
 describe('modelFamily', () => {
-  it('同家族归并、跨家族区分', () => {
+  it('同家族归并、跨家族区分（委托 protocol resolveCanonicalModelFamily）', () => {
     assert.equal(modelFamily('gpt-5.6-sol'), modelFamily('gpt-5.6-terra'))
     assert.equal(modelFamily('deepseek-v4-pro'), modelFamily('deepseek-v4-flash'))
     assert.notEqual(modelFamily('glm-5.3-zai'), modelFamily('grok-build'))
-    assert.equal(modelFamily('cursor-grok-4.6-high'), 'cursor')
+    assert.equal(modelFamily('cursor-grok-4.6-high'), 'xai')
+    assert.equal(modelFamily('box-api-claude-opus-5-5'), 'anthropic')
+    assert.equal(modelFamily('antigravity-gpt-oss-120b'), 'gpt_oss')
+    assert.equal(modelFamily('cursor-auto'), 'cursor_auto')
     // 认不出的按自身当独立家族
     assert.equal(modelFamily('some-new-model'), 'some-new-model')
   })
 })
 
 describe('pickDeliberationPanel', () => {
-  it('默认 3 个不同家族,排除队长型号所在家族,排除 cursor 与不可用', () => {
+  it('默认 3 个不同四大家族强档,排除队长型号所在家族,排除 cursor 与非四大家族', () => {
     const panel = pickDeliberationPanel(FULL, { excludeModel: 'glm-5.3-zai' })
     assert.equal(panel.length, 3)
     const fams = new Set(panel.map((p) => p.family))
     assert.equal(fams.size, 3)
-    assert.ok(!fams.has('zhipu'), '队长家族不进 panel')
+    assert.ok(!fams.has('zhipu'), '非四大家族不进 panel')
     assert.ok(!panel.some((p) => p.engine === 'cursor'))
     assert.deepEqual(
       panel.map((p) => p.modelId),
-      ['gpt-6-astra', 'grok-build', 'deepseek-v4-pro'],
+      ['gpt-6.2-astra', 'antigravity-gemini-4-neon', 'grok-build'],
     )
   })
 
-  it('requireLocalEngines(生产非豁免)只收 ccb', () => {
+  it('requireLocalEngines(商业生产非豁免)可选用全部商业可委派四大家族引擎(codex/antigravity/grok/ccb)并排除 cursor 与非四大家族', () => {
     const panel = pickDeliberationPanel(FULL, {
-      excludeModel: 'glm-5.3-zai',
+      excludeModel: 'gpt-6.2-astra',
       requireLocalEngines: true,
     })
-    assert.ok(panel.every((p) => p.engine === 'ccb'))
+    assert.ok(!panel.some((p) => p.engine === 'cursor'))
     assert.deepEqual(
       panel.map((p) => p.modelId),
-      ['deepseek-v4-pro', 'kimi-k3', 'MiniMax-M3'],
+      ['antigravity-gemini-4-neon', 'grok-build', 'deepseek-v4-flash'],
     )
   })
 
-  it('投影不够多样时返回能凑到的(不抛)', () => {
-    const small = view([row('glm-5.3-zai', 'ccb'), row('deepseek-v4-flash', 'ccb')])
+  it('投影不够多样时返回能凑到的(不抛),且绝不补入非四大家族模型', () => {
+    const small = view([
+      row('glm-5.3-zai', 'ccb'),
+      row('kimi-k3', 'ccb'),
+      row('MiniMax-M3', 'ccb'),
+      row('deepseek-v4-flash', 'ccb'),
+    ])
     const panel = pickDeliberationPanel(small, { excludeModel: 'glm-5.3-zai' })
     assert.deepEqual(
       panel.map((p) => p.modelId),
@@ -101,21 +113,35 @@ describe('pickDeliberationPanel', () => {
     assert.deepEqual(pickDeliberationPanel(view([]), {}), [])
   })
 
-  it('DELIBERATION_PANEL_PREFERENCE prefers active glm-5.3 instead of disabled glm-5.3-zai (OCV5-829)', () => {
-    assert.equal((DELIBERATION_PANEL_PREFERENCE as readonly string[]).includes('glm-5.3-zai'), false)
-    assert.equal((DELIBERATION_PANEL_PREFERENCE as readonly string[]).includes('glm-5.3'), true)
+  it('DELIBERATION_PANEL_PREFERENCE 收紧为四大家族强档优先池 (OCV5-897)', () => {
+    assert.deepEqual([...DELIBERATION_PANEL_PREFERENCE], [
+      'gpt-6.2-astra',
+      'gpt-6.2-sol',
+      'antigravity-gemini-4-neon',
+      'antigravity-gemini-4-carbon',
+      'grok-build',
+      'deepseek-v4-flash',
+    ])
   })
 })
 
 describe('pickReviewerModel', () => {
-  it('审查员 ≠ 队长家族;审议时还避开 panel 成员', () => {
-    assert.equal(pickReviewerModel(FULL, { leaderModel: 'glm-5.3-zai' }), 'gpt-6-astra')
+  it('审查员 ≠ 队长家族且限定四大家族;审议时还避开 panel 成员', () => {
+    assert.equal(pickReviewerModel(FULL, { leaderModel: 'glm-5.3-zai' }), 'gpt-6.2-astra')
     assert.equal(
       pickReviewerModel(FULL, {
         leaderModel: 'glm-5.3-zai',
-        avoidModels: ['gpt-6-astra', 'grok-build', 'deepseek-v4-pro'],
+        avoidModels: ['gpt-6.2-astra', 'antigravity-gemini-4-neon', 'grok-build'],
       }),
-      'kimi-k3',
+      'deepseek-v4-flash',
+    )
+    // 商业模式 requireLocalEngines 同样能跨 codex/antigravity/grok/ccb 选审查员
+    assert.equal(
+      pickReviewerModel(FULL, {
+        leaderModel: 'gpt-6.2-astra',
+        requireLocalEngines: true,
+      }),
+      'antigravity-gemini-4-neon',
     )
     // 队长就是 sol → 审查员不能是 openai 家族(terra 也不行)
     const r = pickReviewerModel(FULL, { leaderModel: 'gpt-5.6-sol' })
@@ -128,19 +154,21 @@ describe('pickReviewerModel', () => {
       row('gpt-6-astra', 'codex'),
       row('gpt-6.2-astra', 'codex'),
       row('grok-build', 'grok'),
-      row('deepseek-v4-pro', 'ccb'),
+      row('deepseek-v4-flash', 'ccb'),
     ])
     const panel = pickDeliberationPanel(with62, { excludeModel: 'glm-5.3-zai' })
     assert.equal(panel[0]?.modelId, 'gpt-6.2-astra')
     assert.equal(pickReviewerModel(with62, { leaderModel: 'glm-5.3-zai' }), 'gpt-6.2-astra')
   })
 
-  it('家族全被占时退化为只避开精确型号;彻底选不出 → undefined', () => {
-    const only = view([row('glm-5.3-zai', 'ccb'), row('glm-5.2', 'ccb')])
-    // 只剩同家族两款:严格轮选不出,宽松轮选到另一款(不是队长本尊即可)
-    assert.equal(pickReviewerModel(only, { leaderModel: 'glm-5.3-zai' }), 'glm-5.2')
+  it('家族全被占时退化为只避开精确型号;彻底选不出(或只剩非四大家族)→ undefined', () => {
+    const only = view([row('gpt-6.2-astra', 'codex'), row('gpt-6.2-sol', 'codex')])
+    // 只剩同家族两款四大家族模型:严格轮选不出,宽松轮选到另一款(不是队长本尊即可)
+    assert.equal(pickReviewerModel(only, { leaderModel: 'gpt-6.2-astra' }), 'gpt-6.2-sol')
     assert.equal(
-      pickReviewerModel(view([row('glm-5.3-zai', 'ccb')]), { leaderModel: 'glm-5.3-zai' }),
+      pickReviewerModel(view([row('glm-5.3-zai', 'ccb'), row('glm-5.2', 'ccb')]), {
+        leaderModel: 'glm-5.3-zai',
+      }),
       undefined,
     )
   })
@@ -263,8 +291,8 @@ describe('buildTeamPreamble', () => {
     assert.match(p, /## 第一步:分类/)
     assert.match(p, /审议类/)
     assert.match(p, /执行类/)
-    assert.match(p, /`gpt-6-astra`（openai）/)
-    assert.match(p, /delegate_tasks\(\{ tasks: \[\{ model: "gpt-6-astra", goal: "<同一个问题>" \}/)
+    assert.match(p, /`gpt-6\.2-astra`（openai）/)
+    assert.match(p, /delegate_tasks\(\{ tasks: \[\{ model: "gpt-6\.2-astra", goal: "<同一个问题>" \}/)
     assert.match(p, /request_review\(draft, mode="deliberation"\)/)
     assert.match(p, /request_review\(draft, mode="execution"\)/)
     assert.match(p, /约为单模型直答的 5 倍/)
@@ -275,7 +303,7 @@ describe('buildTeamPreamble', () => {
 
   it('Cursor 版:走 oc-memory CLI,panel 用 --allow-self --model', () => {
     const p = buildTeamPreamble({ ...base, cursorEngine: true })
-    assert.match(p, /oc-memory delegate --allow-self --model gpt-6-astra --goal "<同一个问题>"/)
+    assert.match(p, /oc-memory delegate --allow-self --model gpt-6\.2-astra --goal "<同一个问题>"/)
     assert.match(p, /oc-memory request-review --mode deliberation --draft/)
     assert.doesNotMatch(p, /delegate_tasks\(/)
   })
@@ -334,7 +362,7 @@ describe('OCV5-882 Antigravity & Box family grouping', () => {
     }
   })
 
-  it('pickDeliberationPanel 绝不把两款 Gemini 4 当跨家族,且能选中现役强模型家族代表', () => {
+  it('pickDeliberationPanel 绝不把两款 Gemini 4 当跨家族,且只选中四大家族强档代表(排除 Claude)', () => {
     const modern = view([
       row('antigravity-gemini-4-neon', 'antigravity'),
       row('antigravity-gemini-4-carbon', 'antigravity'),
@@ -342,12 +370,13 @@ describe('OCV5-882 Antigravity & Box family grouping', () => {
       row('antigravity-orchestrator-neon', 'antigravity'),
       row('box-claude-opus-5-5', 'ccb'),
       row('gpt-6.2-astra', 'codex'),
+      row('grok-build', 'grok'),
       row('deepseek-v4-flash', 'ccb'),
     ])
     const panelForGpt = pickDeliberationPanel(modern, { excludeModel: 'gpt-6.2-astra' })
     assert.deepEqual(
       panelForGpt.map((p) => p.modelId),
-      ['antigravity-gemini-4-neon', 'box-claude-opus-5-5', 'deepseek-v4-flash'],
+      ['antigravity-gemini-4-neon', 'grok-build', 'deepseek-v4-flash'],
     )
     assert.equal(panelForGpt.filter((p) => p.family === 'google').length, 1)
 
@@ -356,30 +385,32 @@ describe('OCV5-882 Antigravity & Box family grouping', () => {
     })
     assert.deepEqual(
       panelForGemini.map((p) => p.modelId),
-      ['gpt-6.2-astra', 'box-claude-opus-5-5', 'deepseek-v4-flash'],
+      ['gpt-6.2-astra', 'grok-build', 'deepseek-v4-flash'],
     )
     assert.equal(
-      panelForGemini.some((p) => p.family === 'google'),
+      panelForGemini.some((p) => p.family === 'google' || p.family === 'anthropic'),
       false,
-      'Gemini 队长时 panel 不得再塞任何 google 家族成员',
+      'Gemini 队长时 panel 不得塞入 google 或非四大家族成员',
     )
   })
 
-  it('pickReviewerModel 绝不让 Gemini 审 Gemini,且避开同家族 Box/Antigravity 模型', () => {
+  it('pickReviewerModel 绝不让 Gemini 审 Gemini,且排除非四大家族 Claude', () => {
     const modern = view([
       row('antigravity-gemini-4-neon', 'antigravity'),
       row('antigravity-gemini-4-carbon', 'antigravity'),
       row('antigravity-orchestrator-neon', 'antigravity'),
       row('box-claude-opus-5-5', 'ccb'),
       row('box-gpt-6-astra-pro', 'codex'),
+      row('deepseek-v4-flash', 'ccb'),
     ])
     const r1 = pickReviewerModel(modern, { leaderModel: 'antigravity-gemini-4-neon' })
-    assert.equal(r1, 'box-claude-opus-5-5')
+    assert.equal(r1, 'deepseek-v4-flash')
     assert.notEqual(modelFamily(r1!), 'google')
+    assert.notEqual(modelFamily(r1!), 'anthropic')
 
     const r2 = pickReviewerModel(modern, {
       leaderModel: 'antigravity-gemini-4-carbon',
-      avoidModels: ['box-claude-opus-5-5'],
+      avoidModels: ['deepseek-v4-flash'],
     })
     assert.equal(r2, 'box-gpt-6-astra-pro')
     assert.notEqual(modelFamily(r2!), 'google')

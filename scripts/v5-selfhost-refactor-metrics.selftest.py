@@ -382,6 +382,71 @@ class QueryAndReportTest(unittest.TestCase):
         self.assertIn("<redacted>", m.redact("fail postgres://user:secret@localhost/db tail"))
         self.assertNotIn("secret", m.redact("postgres://user:secret@localhost/db"))
 
+    def test_arch_telemetry_graceful_empty_and_populated(self):
+        empty = m.assemble({}, None, {}, None)
+        self.assertEqual(empty["arch_telemetry"]["dead_code_30d"]["total_candidates"], 0)
+        self.assertEqual(empty["arch_telemetry"]["dead_code_30d"]["status"], "N/A")
+        self.assertEqual(empty["arch_telemetry"]["event_loop_blocking"]["alert_count"], 0)
+        self.assertEqual(empty["arch_telemetry"]["event_loop_blocking"]["p99_ms"], "N/A")
+        self.assertEqual(empty["arch_telemetry"]["pg_query_budget"]["n_plus_one_alerts"], 0)
+        empty_md = m.render_markdown(empty)
+        self.assertIn("架构与运行时死码遥测", empty_md)
+        self.assertIn("0 / N/A", empty_md)
+
+        snap = {
+            "deadCode": {
+                "byKind": {
+                    "route": {"zeroHitWindowCount": 2},
+                    "featureFlag": {"zeroHitWindowCount": 1},
+                    "skill": {"zeroHitWindowCount": 0},
+                    "cron": {"zeroHitWindowCount": 1},
+                },
+                "deadCandidates": [
+                    {"kind": "route", "key": "/api/old-a"},
+                    {"kind": "route", "key": "/api/old-b"},
+                    {"kind": "featureFlag", "key": "ff_old"},
+                    {"kind": "cron", "key": "cron_old"},
+                ],
+            },
+            "eventLoop": {
+                "alertCount": 3,
+                "latestSample": {"p95Ms": 42.5, "p99Ms": 115.0, "maxMs": 240.0},
+            },
+            "pgQueryBudget": {
+                "observedRequests": 120,
+                "observedQueries": 640,
+                "nPlusOneAlertCount": 2,
+                "durationBudgetAlertCount": 1,
+                "offendersByRoute": [{"route": "/api/sessions", "alerts": 2, "maxQueriesSeen": 35}],
+            },
+            "commitAttribution": {
+                "regressingCommits": ["deadbeef1234"],
+                "commits": [
+                    {
+                        "sourceCommit": "deadbeef1234",
+                        "turns": 50,
+                        "rewriteResendCount": 9,
+                        "rewriteResendRate": 0.18,
+                        "regressing": True,
+                    }
+                ],
+            },
+        }
+        populated = m.assemble(
+            {},
+            None,
+            {"commit_rewrite_attribution": [{"source_commit": "deadbeef1234", "h_turns": 50, "implicit_rewrite_resend": 9}]},
+            None,
+            arch_snapshot=snap,
+        )
+        self.assertEqual(populated["arch_telemetry"]["dead_code_30d"]["total_candidates"], 4)
+        self.assertEqual(populated["arch_telemetry"]["event_loop_blocking"]["alert_count"], 3)
+        self.assertEqual(populated["arch_telemetry"]["pg_query_budget"]["n_plus_one_alerts"], 2)
+        self.assertEqual(populated["arch_telemetry"]["commit_rewrite_attribution"]["regressing_commits"], ["deadbeef1234"])
+        pop_md = m.render_markdown(populated)
+        self.assertIn("deadbeef1234", pop_md)
+        self.assertIn("[REGRESSING]", pop_md)
+
 
 if __name__ == "__main__":
     unittest.main()

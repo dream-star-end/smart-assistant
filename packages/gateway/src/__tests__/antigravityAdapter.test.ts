@@ -16,7 +16,7 @@ import path from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import type { OpenClaudeConfig } from '@openclaude/storage'
+import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import {
   ANTIGRAVITY_MAX_PROMPT_BYTES,
   ANTIGRAVITY_RESUMED_PREAMBLE,
@@ -57,7 +57,7 @@ const ROUTE = {
   idToken: 'eyJhbGciOi.id-token-payload.sig',
 }
 
-const FAKE_CLI = `#!/usr/bin/env node
+const FAKE_CLI = `#!${process.execPath}
 const fs = require('node:fs')
 let input = ''
 let replayed = false
@@ -77,6 +77,15 @@ function replay() {
       GOOGLE_API_KEY: process.env.GOOGLE_API_KEY,
       AGY_CLI_DISABLE_AUTO_UPDATE: process.env.AGY_CLI_DISABLE_AUTO_UPDATE,
       OPENCLAUDE_ENGINE: process.env.OPENCLAUDE_ENGINE,
+      OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME,
+      OPENCLAUDE_SESSION_KEY: process.env.OPENCLAUDE_SESSION_KEY,
+      OPENCLAUDE_PROJECT_ID: process.env.OPENCLAUDE_PROJECT_ID,
+      OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR,
+      OPENCLAUDE_DELEGATION_DEPTH: process.env.OPENCLAUDE_DELEGATION_DEPTH,
+      OPENCLAUDE_SKILL_EVAL_EXCLUDE: process.env.OPENCLAUDE_SKILL_EVAL_EXCLUDE,
+      OPENCLAUDE_SKILL_EVAL_DRAFT_NAME: process.env.OPENCLAUDE_SKILL_EVAL_DRAFT_NAME,
+      OPENCLAUDE_SKILL_EVAL_DRAFT_DIR: process.env.OPENCLAUDE_SKILL_EVAL_DRAFT_DIR,
+      OPENCLAUDE_GATEWAY_TOKEN_FILE: process.env.OPENCLAUDE_GATEWAY_TOKEN_FILE,
       OPENCLAUDE_V3_CONTAINER_TOKEN: process.env.OPENCLAUDE_V3_CONTAINER_TOKEN,
       PATH: process.env.PATH,
     },
@@ -735,7 +744,7 @@ describe('AntigravityAdapter', () => {
       const summaryWriterCli = path.join(h.dir, 'summary-writer-cli.cjs')
       const seededCheckFile = path.join(h.dir, 'seeded-check.json')
       const sqliteModulePath = fileURLToPath(import.meta.resolve('better-sqlite3'))
-      await writeFile(summaryWriterCli, `#!/usr/bin/env node
+      await writeFile(summaryWriterCli, `#!${process.execPath}
 const fs = require('node:fs')
 const path = require('node:path')
 const Database = require(${JSON.stringify(sqliteModulePath)})
@@ -829,7 +838,7 @@ process.stdin.on('end', () => {
       // Turn 4 (forceEnd via run.end() before exit 0): must NOT overwrite stable summary cache even when child exits 0.
       const forceEndCli = path.join(h.dir, 'force-end-cli.cjs')
       const readyMarker = path.join(h.dir, 'force-end-ready')
-      await writeFile(forceEndCli, `#!/usr/bin/env node
+      await writeFile(forceEndCli, `#!${process.execPath}
 const fs = require('node:fs')
 const path = require('node:path')
 const Database = require(${JSON.stringify(sqliteModulePath)})
@@ -1841,7 +1850,7 @@ describe('Antigravity resumed platform context deduplication (OCV5-781)', () => 
 
   async function installStatefulCli(h: Harness): Promise<string> {
     const cli = path.join(h.dir, 'stateful-agy.cjs')
-    await writeFile(cli, `#!/usr/bin/env node
+    await writeFile(cli, `#!${process.execPath}
 const fs = require('node:fs')
 const path = require('node:path')
 const Database = require(${JSON.stringify(sqliteModulePath)})
@@ -2450,6 +2459,110 @@ describe('Antigravity pre-spawn interrupt (OCV5-788)', () => {
     } finally {
       releasePrepare()
       await h.restore()
+    }
+  })
+
+  test('OCV5-894: forwards resolved OPENCLAUDE_HOME, CLI context & skill-eval arm env to antigravity process while keeping gateway token file out of ambient env', async () => {
+    const prevBaseline = process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
+    const prevOcHome = process.env.OPENCLAUDE_HOME
+    process.env.OPENCLAUDE_BASELINE_SKILLS_DIR = '/tmp/oc-baseline-skills-test'
+    const h = await harness({
+      projectId: '11111111-2222-4333-8444-555555555555',
+      delegationDepth: 0,
+      skillEvalExclude: 'excluded-skill',
+      skillEvalDraft: { name: 'draft-skill', dir: '/tmp/oc-draft-dir' },
+      config: { ...config(), gateway: { ...config().gateway, port: 18789, accessToken: 'tok-test' } },
+    })
+    try {
+      // Unset parent OPENCLAUDE_HOME after harness setup to verify fallback parity with MCP paths.home!
+      Reflect.deleteProperty(process.env, 'OPENCLAUDE_HOME')
+      const expectedDefaultHome = paths.home
+      h.adapter.setAntigravityRoute(ROUTE)
+      const res = await runTurn(h, 'stream-text.ndjson')
+      assert.equal(res.summary?.isError, false)
+      const cap = JSON.parse(await readFile(h.capture, 'utf8')) as {
+        env: Record<string, string | undefined>
+        mcp: string
+      }
+      const mcpCfg = JSON.parse(cap.mcp) as { mcpServers?: Record<string, { env?: Record<string, string> }> }
+      const mcpHome = mcpCfg.mcpServers?.['openclaude-memory']?.env?.OPENCLAUDE_HOME
+      assert.equal(cap.env.OPENCLAUDE_SESSION_KEY, 'agent:main:webchat:dm:agy-test')
+      assert.equal(cap.env.OPENCLAUDE_PROJECT_ID, '11111111-2222-4333-8444-555555555555')
+      assert.equal(cap.env.OPENCLAUDE_BASELINE_SKILLS_DIR, '/tmp/oc-baseline-skills-test')
+      assert.equal(cap.env.OPENCLAUDE_DELEGATION_DEPTH, '0')
+      assert.equal(cap.env.OPENCLAUDE_SKILL_EVAL_EXCLUDE, 'excluded-skill')
+      assert.equal(cap.env.OPENCLAUDE_SKILL_EVAL_DRAFT_NAME, 'draft-skill')
+      assert.equal(cap.env.OPENCLAUDE_SKILL_EVAL_DRAFT_DIR, '/tmp/oc-draft-dir')
+      assert.equal(cap.env.OPENCLAUDE_GATEWAY_TOKEN_FILE, undefined, 'gateway token file must remain confined to mcp_config.json')
+      // Blocker 7: even when parent OPENCLAUDE_HOME is unset, CLI env gets exact same resolved platform root as MCP, NOT isolated launchHome
+      assert.ok(cap.env.OPENCLAUDE_HOME && cap.env.OPENCLAUDE_HOME !== cap.env.HOME)
+      assert.equal(cap.env.OPENCLAUDE_HOME, expectedDefaultHome)
+      assert.equal(mcpHome, cap.env.OPENCLAUDE_HOME)
+    } finally {
+      if (prevOcHome === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_HOME')
+      else process.env.OPENCLAUDE_HOME = prevOcHome
+      if (prevBaseline === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_BASELINE_SKILLS_DIR')
+      else process.env.OPENCLAUDE_BASELINE_SKILLS_DIR = prevBaseline
+      await h.restore()
+    }
+  })
+
+  test('OCV5-894 Blocker 1: AntigravityAdapter honors OC_MAX_CONCURRENT_LOCAL_SWARMS explicit cap end-to-end without over-granting', async () => {
+    const prevCap = process.env.OC_MAX_CONCURRENT_LOCAL_SWARMS
+    process.env.OC_MAX_CONCURRENT_LOCAL_SWARMS = '1'
+    const h1 = await harness({ sessionKey: 'agent:main:webchat:dm:agy-cap-1' })
+    const h2 = await harness({ sessionKey: 'agent:main:webchat:dm:agy-cap-2' })
+    try {
+      h1.adapter.setAntigravityRoute(ROUTE)
+      h2.adapter.setAntigravityRoute(ROUTE)
+      process.env.FAKE_AGY_FIXTURE = path.join(FIXTURES, 'stream-text.ndjson')
+      process.env.FAKE_AGY_EXIT_DELAY_MS = '250'
+      const statuses2: string[] = []
+      const t1 = h1.adapter.submitTurn({
+        input: 'swarm 1',
+        requestId: '1'.repeat(32),
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+        antigravitySwarmCompaction: {
+          isAntigravityTurn: true,
+          isRemoteAntigravity: false,
+          swarmMode: true,
+          rawUserText: 'swarm 1',
+          appliedMode: 'on_full',
+        },
+      })
+      await t1.submitted
+      const t2 = h2.adapter.submitTurn({
+        input: 'swarm 2',
+        requestId: '2'.repeat(32),
+        onEvent: (ev) => {
+          if (ev.kind === 'turn_status' && ev.status && typeof ev.status === 'object' && 'detail' in ev.status && ev.status.detail) {
+            statuses2.push(ev.status.detail)
+          }
+        },
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+        antigravitySwarmCompaction: {
+          isAntigravityTurn: true,
+          isRemoteAntigravity: false,
+          swarmMode: true,
+          rawUserText: 'swarm 2',
+          appliedMode: 'on_full',
+        },
+      })
+      await Promise.all([t1.summary, t2.summary])
+      await Promise.all([h1.adapter.waitForOutputDrain(), h2.adapter.waitForOutputDrain()])
+      assert.ok(
+        statuses2.some((s) => s.includes('运行中 1/1') && s.includes('排队 #1')),
+        `expected second local swarm turn to queue under OC_MAX_CONCURRENT_LOCAL_SWARMS=1, got: ${JSON.stringify(statuses2)}`,
+      )
+    } finally {
+      Reflect.deleteProperty(process.env, 'FAKE_AGY_EXIT_DELAY_MS')
+      if (prevCap === undefined) Reflect.deleteProperty(process.env, 'OC_MAX_CONCURRENT_LOCAL_SWARMS')
+      else process.env.OC_MAX_CONCURRENT_LOCAL_SWARMS = prevCap
+      await h1.restore()
+      await h2.restore()
     }
   })
 })

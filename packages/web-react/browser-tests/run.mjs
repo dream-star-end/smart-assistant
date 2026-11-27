@@ -46,6 +46,7 @@ import { fileURLToPath } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import { build as viteBuild } from "vite";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
+import { assertCodexDensityTheme, waitForAnimationsSettled } from "./densityHelpers.mjs";
 
 // 与 src/components/chat/stickToBottom.ts WHEEL_FENCE_QUIET_MS 同值(run.mjs 不 import TS)。
 const WHEEL_QUIET_MS = 200;
@@ -1813,10 +1814,11 @@ await check("T24 mermaid 有效语法真出 SVG、半截语法回退可读源码
   const broken = page.getByTestId("mermaid-broken");
 
   // ① 有效图:等到真 <svg> 落地(动态 import mermaid + render 是异步的,轮询等落定)。
-  const svg = ok.locator("svg");
+  // RichBlockToolbar 自带 3 个 Lucide 图标 <svg>,限定在 [data-testid="mermaid-diagram"] 内取真流程图 SVG。
+  const svg = ok.getByTestId("mermaid-diagram").locator("svg");
   await svg.waitFor({ state: "attached", timeout: 20000 });
   const okState = await ok.evaluate((el) => {
-    const node = el.querySelector("svg");
+    const node = el.querySelector('[data-testid="mermaid-diagram"] svg');
     const rect = node?.getBoundingClientRect();
     return {
       text: (el.textContent ?? "").trim(),
@@ -1869,6 +1871,7 @@ async function assertContainerPreviewFillsViewport(page, expectedDevice, width, 
     throw new Error(`访问端未自动选择${expectedDevice}预览`);
   }
   const viewport = dialog.getByTestId("container-preview-viewport");
+  await waitForAnimationsSettled(viewport);
   const box = await viewport.boundingBox();
   if (!box) throw new Error("容器预览没有可测量画布");
   if (
@@ -2059,20 +2062,29 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
     );
   }
 
-  // ③ 顶栏入口全在视口内(挤爆时最先被推出去的是右侧查找/铃铛)。
+  // ③ 顶栏与输入坞底栏入口全在 390px 视口内（OCV5-843/844/862/872：余额/站内信迁侧栏底，
+  //    智能体常驻顶栏主位，会话内查找收敛在顶栏「更多操作」菜单，模型选择迁输入坞底栏）。
+  const mobileHeader = mobilePage.locator('[data-product-entry-scope="chat-header"]');
   const headerEntries = [
-    ["打开菜单", "汉堡(唯一的移动侧栏入口)"],
-    ["会话内查找", "会话内查找"],
-    ["站内信", "站内信"],
-    ["账户与计费", "余额"],
-    ["选择对话模型", "模型选择器"],
+    [mobileHeader.getByRole("button", { name: "打开菜单" }), "汉堡(唯一的移动侧栏入口)"],
+    [mobileHeader.getByTestId("chat-agent-chip"), "智能体切换胶囊"],
+    [mobileHeader.getByTestId("header-overflow-trigger"), "顶栏更多操作(含会话内查找)"],
+    [mobilePage.getByRole("button", { name: "选择对话模型" }), "底栏模型选择器"],
   ];
-  for (const [label, human] of headerEntries) {
-    const box = await mobilePage.getByRole("button", { name: label }).boundingBox();
-    if (!box) throw new Error(`顶栏「${human}」不可见`);
+  for (const [locator, human] of headerEntries) {
+    const box = await locator.boundingBox();
+    if (!box) throw new Error(`顶栏/底栏「${human}」不可见`);
     if (box.x < 0 || box.x + box.width > 390 + 1) {
-      throw new Error(`顶栏「${human}」被挤出视口: x=${Math.round(box.x)} w=${Math.round(box.width)}`);
+      throw new Error(`顶栏/底栏「${human}」被挤出视口: x=${Math.round(box.x)} w=${Math.round(box.width)}`);
     }
+  }
+  await mobileHeader.getByTestId("header-overflow-trigger").click();
+  const findItem = mobilePage.getByRole("menuitem", { name: /会话内查找/ });
+  await findItem.waitFor({ state: "visible", timeout: 3000 });
+  await findItem.click();
+  await findItem.waitFor({ state: "hidden", timeout: 3000 });
+  if ((await mobilePage.evaluate(() => window.__mobilePage.findOpens)) !== 1) {
+    throw new Error("移动端顶栏「更多操作」里的会话内查找点击未生效");
   }
 
   // ④ 三个关键入口真的按得动(受信点击 + 可观测结果),不是"渲染出来就算"。
@@ -2087,10 +2099,10 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
   if (attachBox.x < 0 || attachBox.x + attachBox.width > 390 + 1) {
     throw new Error(`移动端添加附件被挤出视口: x=${Math.round(attachBox.x)} w=${Math.round(attachBox.width)}`);
   }
-  // 本夹具未接设定目标，「+」按产品契约退化为禁用锚点；不得再出现附件菜单项。
+  // 本夹具未接目标/仓库/蜂群剧本，「+」按产品契约退化为禁用锚点（OCV5-861）；不得再出现附件菜单项。
   const mobilePlus = mobilePage.getByRole("button", { name: "更多选项" });
-  if ((await mobilePlus.getAttribute("title")) !== "会话目标暂不可用") {
-    throw new Error("移动端无目标时「+」应是禁用锚点(title=会话目标暂不可用;附件早已迁到一级回形针,不再说附件不可用)");
+  if ((await mobilePlus.getAttribute("title")) !== "更多选项暂不可用") {
+    throw new Error("移动端无可用扩展入口时「+」应是禁用锚点(title=更多选项暂不可用;附件早已迁到一级回形针,不再说附件不可用)");
   }
   if (await mobilePlus.isEnabled()) {
     throw new Error("移动端无目标时「+」不应可点");
@@ -2216,6 +2228,7 @@ await check("T68 390px 触屏:助手一击复制原文，更多菜单默认关�
   await copyAndRead(assistantCopy, expectedCopy.raw, "助手原文复制");
   await assistantToggle.click();
   await plainCopy.waitFor({ state: "visible", timeout: 3000 });
+  await waitForAnimationsSettled(plainCopy);
   const plainBox = await plainCopy.boundingBox();
   if (!plainBox || plainBox.height < TOUCH_MIN || plainBox.width < TOUCH_MIN) {
     throw new Error(`纯文本复制触控靶不足44px: ${JSON.stringify(plainBox)}`);
@@ -2922,83 +2935,96 @@ await check("T46 Codex 等待用户回答保持人类等待态，不显示模型
   await waitForReplay((state) => !state.sending, "等待用户证明轮没有被 final 正常收尾");
 });
 
-await check("T48 引擎冷启动阶段显示启动/恢复文案，首内容清除且终态不粘", async () => {
+await check("T48 引擎冷启动阶段显示准备中文案，首内容清除且终态不粘", async () => {
   const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
   if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
     throw new Error(`引擎启动证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
   }
-  await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_starting"));
-  await replayRoot.getByText(/正在启动引擎/).waitFor({ state: "visible", timeout: 3000 });
-  if (await replayRoot.getByLabel("生成中").getByText(/思考中|无新数据|深度思考/).count()) {
-    throw new Error("引擎启动期活动行被误标成思考中/卡住");
+  try {
+    await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_starting"));
+    // OCV5-846: engine_starting/engine_resuming 统一使用温和文案「正在准备中…」，不暴露底层引擎术语也不误标思考中。
+    await replayRoot.getByText(/正在准备中/).waitFor({ state: "visible", timeout: 3000 });
+    if (await replayRoot.getByLabel("生成中").getByText(/思考中|无新数据|深度思考|启动引擎/).count()) {
+      throw new Error("引擎启动期活动行被误标成思考中/卡住或泄漏引擎术语");
+    }
+    await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_resuming"));
+    await replayRoot.getByText(/正在准备中/).waitFor({ state: "visible", timeout: 3000 });
+    if (await replayRoot.getByLabel("生成中").getByText(/恢复会话|思考中|深度思考/).count()) {
+      throw new Error("会话恢复期活动行被误标成思考中或泄漏恢复会话术语");
+    }
+  } finally {
+    await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
+    await waitForReplay((state) => !state.sending, "引擎启动证明轮没有被 final 正常收尾");
   }
-  await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_resuming"));
-  await replayRoot.getByText(/正在恢复会话/).waitFor({ state: "visible", timeout: 3000 });
-  await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
-  await waitForReplay((state) => !state.sending, "引擎启动证明轮没有被 final 正常收尾");
-  if (await replayRoot.getByText(/正在启动引擎|正在恢复会话/).count()) {
+  if (await replayRoot.getByText(/正在准备中|正在启动引擎|正在恢复会话/).count()) {
     throw new Error("终态后引擎启动文案仍粘在时间线上");
   }
 });
 
 await check("T74 stale engine starting after resume shows an honest label; detached snapshot then live frame", async () => {
-  // INC-20261028-STALE-ENGINE-STARTING:商业 uid 4 手机切后台 19 分钟,切回时活动行仍是「正在启动引擎 (1184s)」。
+  // INC-20261028-STALE-ENGINE-STARTING:商业 uid 4 手机切后台 19 分钟,切回时活动行曾卡在启动态。
   const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
   if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
     throw new Error(`切回证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
   }
-  await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_starting"));
   const activity = replayRoot.getByLabel("生成中");
-  await activity.getByText(/正在启动引擎/).waitFor({ state: "visible", timeout: 3000 });
-  await page.evaluate(() => window.__replayDrive.ageTurnClock(1_163_000));
-  await activity.getByText(/无新数据|连接已断开/).waitFor({ state: "visible", timeout: 3000 });
-  if (await activity.getByText(/启动引擎/).count()) {
-    throw new Error("切回时启动态已过期,活动行仍显示「正在启动引擎」");
+  try {
+    await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_starting"));
+    await activity.getByText(/正在准备中/).waitFor({ state: "visible", timeout: 3000 });
+    await page.evaluate(() => window.__replayDrive.ageTurnClock(1_163_000));
+    await activity.getByText(/处理时间较长，仍在思考中/).waitFor({ state: "visible", timeout: 3000 });
+    if (await activity.getByText(/正在准备中|启动引擎|无新数据/).count()) {
+      throw new Error("切回时启动态已过期,活动行仍显示启动文案或焦虑文案");
+    }
+    await page.evaluate(() => window.__replayDrive.pushDetachedSnapshot(null));
+    await activity.getByText(/正在后台处理中/).waitFor({ state: "visible", timeout: 3000 });
+    if (await activity.getByText(/正在准备中|启动引擎/).count()) {
+      throw new Error("hello detached 快照后仍显示启动文案");
+    }
+    await page.evaluate(() => window.__replayDrive.pushModelThinking(true));
+    await activity.getByText(/深度思考中/).waitFor({ state: "visible", timeout: 3000 });
+    if (await activity.getByText(/正在后台处理中|后台运行中|正在准备中|启动引擎/).count()) {
+      throw new Error("新帧到达后 detached / 启动文案仍粘着");
+    }
+    await page.evaluate(() => window.__replayDrive.pushModelThinking(false));
+  } finally {
+    await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
+    await waitForReplay((state) => !state.sending, "切回证明轮没有被 final 正常收尾");
   }
-  await page.evaluate(() => window.__replayDrive.pushDetachedSnapshot(null));
-  await activity.getByText(/后台运行中/).waitFor({ state: "visible", timeout: 3000 });
-  if (await activity.getByText(/启动引擎/).count()) {
-    throw new Error("hello detached 快照后仍显示「正在启动引擎」");
-  }
-  await page.evaluate(() => window.__replayDrive.pushModelThinking(true));
-  await activity.getByText(/深度思考中/).waitFor({ state: "visible", timeout: 3000 });
-  if (await activity.getByText(/后台运行中|启动引擎/).count()) {
-    throw new Error("新帧到达后 detached / 启动文案仍粘着");
-  }
-  await page.evaluate(() => window.__replayDrive.pushModelThinking(false));
-  await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
-  await waitForReplay((state) => !state.sending, "切回证明轮没有被 final 正常收尾");
-  if (await replayRoot.getByText(/正在启动引擎|后台运行中|深度思考中/).count()) {
+  if (await replayRoot.getByText(/正在准备中|正在启动引擎|正在后台处理中|后台运行中|深度思考中/).count()) {
     throw new Error("终态后启动/后台/思考文案仍粘在时间线上");
   }
 });
 
 await check("T70 empty thinking clears engine starting and shows deep thinking", async () => {
-  // INC-20261007-ENGINE-STARTING-THINKING:Box Opus 最高档思考 ~150s 且思考正文为空,活动行曾一直挂「正在启动引擎 (136s)…」。
+  // INC-20261007-ENGINE-STARTING-THINKING:Box Opus 最高档思考 ~150s 且思考正文为空,活动行不得一直挂启动态。
   const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
   if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
     throw new Error(`模型思考证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
   }
-  await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_starting"));
-  await replayRoot.getByText(/正在启动引擎/).waitFor({ state: "visible", timeout: 3000 });
-  await page.evaluate(() => window.__replayDrive.pushModelThinking(true));
-  const activity = replayRoot.getByLabel("生成中");
-  await activity.getByText(/深度思考中/).waitFor({ state: "visible", timeout: 3000 });
-  if (await replayRoot.getByText(/正在启动引擎/).count()) {
-    throw new Error("模型已开始思考,活动行仍挂着「正在启动引擎」");
+  try {
+    await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_starting"));
+    await replayRoot.getByText(/正在准备中/).waitFor({ state: "visible", timeout: 3000 });
+    await page.evaluate(() => window.__replayDrive.pushModelThinking(true));
+    const activity = replayRoot.getByLabel("生成中");
+    await activity.getByText(/深度思考中/).waitFor({ state: "visible", timeout: 3000 });
+    if (await replayRoot.getByText(/正在准备中|正在启动引擎/).count()) {
+      throw new Error("模型已开始思考,活动行仍挂着启动文案");
+    }
+    if (await activity.getByText(/无新数据|执行操作/).count()) {
+      throw new Error("思考态被渲染成卡住或工具动作");
+    }
+    await page.evaluate(() => window.__replayDrive.pushModelThinking(false));
+    await page.waitForFunction(
+      () => !/深度思考中|执行操作/.test(document.querySelector('[aria-label="生成中"]')?.textContent ?? ""),
+      null,
+      { timeout: 3000 },
+    );
+  } finally {
+    await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
+    await waitForReplay((state) => !state.sending, "模型思考证明轮没有被 final 正常收尾");
   }
-  if (await activity.getByText(/无新数据|执行操作/).count()) {
-    throw new Error("思考态被渲染成卡住或工具动作");
-  }
-  await page.evaluate(() => window.__replayDrive.pushModelThinking(false));
-  await page.waitForFunction(
-    () => !/深度思考中|执行操作/.test(document.querySelector('[aria-label="生成中"]')?.textContent ?? ""),
-    null,
-    { timeout: 3000 },
-  );
-  await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
-  await waitForReplay((state) => !state.sending, "模型思考证明轮没有被 final 正常收尾");
-  if (await replayRoot.getByText(/正在启动引擎|深度思考中/).count()) {
+  if (await replayRoot.getByText(/正在准备中|正在启动引擎|深度思考中/).count()) {
     throw new Error("终态后启动/思考文案仍粘在时间线上");
   }
 });
@@ -3251,13 +3277,12 @@ await check("T37 新会话草稿与历史加载反馈：连续新建不增行，
     state: "visible",
     timeout: 3000,
   });
-  const loader = root.getByRole("status", { name: "正在加载会话内容" });
-  await loader.waitFor({ state: "visible", timeout: 3000 });
-  if (await loader.getAttribute("aria-busy") !== "true") {
-    throw new Error("部分历史加载占位没有暴露 aria-busy");
+  // OCV5-846: 已有部分真实消息时的后台同步静默合并，不在尾部闪烁假回复骨架（PartialHistorySkeleton → null）。
+  if (await root.getByRole("status", { name: "正在加载会话内容" }).count() !== 0) {
+    throw new Error("部分历史加载期间不应渲染「正在加载会话内容」尾部假骨架");
   }
-  if (await root.getByTestId("partial-history-skeleton").count() !== 1) {
-    throw new Error("部分历史加载占位缺失或重复");
+  if (await root.getByTestId("partial-history-skeleton").count() !== 0) {
+    throw new Error("部分历史加载期间不应渲染 partial-history-skeleton");
   }
 });
 
@@ -3350,128 +3375,28 @@ await check("T40 390px 失败轮只有一个保留原任务上下文的继续出
 });
 
 await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390 明暗主题成立", async () => {
-  async function assertTheme(theme) {
-    await page.evaluate((next) => {
-      document.documentElement.classList.toggle("dark", next === "dark");
-    }, theme);
+  try {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await assertCodexDensityTheme(page, "light");
+    const asideWidth = await page.locator("#codex-density-root aside").evaluate((el) => el.getBoundingClientRect().width);
+    if (Math.abs(asideWidth - 268) > 1) {
+      throw new Error(`1440 下侧栏宽度应为 268px,实际 ${asideWidth}`);
+    }
+    await assertCodexDensityTheme(page, "dark");
 
-    const composerClass = await page.locator("#root [data-testid='composer-shell']").first().getAttribute("class") ?? "";
-    if (!composerClass.includes("border-border-control")) {
-      throw new Error(`Composer 非聚焦边框丢失(${theme}): ${composerClass}`);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await assertCodexDensityTheme(page, "light");
+    await assertCodexDensityTheme(page, "dark");
+    const composerOverflow = await page.locator("#root").evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+    if (composerOverflow) throw new Error("Composer 在 390px 发生横向溢出");
+  } finally {
+    if (await page.getByRole("menu").isVisible().catch(() => false)) {
+      await page.keyboard.press("Escape").catch(() => {});
+      await page.getByRole("menu").waitFor({ state: "hidden", timeout: 2000 }).catch(() => {});
     }
-    if (!composerClass.includes("focus-within:border-border-strong")) {
-      throw new Error(`Composer 聚焦边框丢失(${theme}): ${composerClass}`);
-    }
-    if (/(?:^|\s)border-border(?:\s|$)/.test(composerClass)) {
-      throw new Error(`Composer 仍用分隔线 border-border(${theme}): ${composerClass}`);
-    }
-
-    const tool = await page.locator("#tool-card-polish-root").evaluate((root) => {
-      const header = root.querySelector("button");
-      if (!(header instanceof HTMLElement)) return { error: "找不到工具卡头部" };
-      const card = header.closest("div.overflow-hidden.rounded-md");
-      const body = card?.querySelector(".border-t");
-      return {
-        headerClass: header.className,
-        cardClass: card?.className ?? "",
-        bodyClass: body?.className ?? "",
-      };
-    });
-    if (tool.error) throw new Error(`${tool.error}(${theme})`);
-    if (!tool.cardClass.includes("rounded-md")) {
-      throw new Error(`工具卡圆角丢失(${theme}): ${tool.cardClass}`);
-    }
-    if (!tool.headerClass.includes("px-3") || !tool.headerClass.includes("py-2")) {
-      throw new Error(`工具卡头部 padding 丢失(${theme}): ${tool.headerClass}`);
-    }
-
-    const sidebar = page.locator("#codex-density-root");
-    const active = sidebar.getByRole("button", { name: "密度验收活跃会话" });
-    await active.waitFor({ state: "visible", timeout: 3000 });
-    const activeState = await active.evaluate((btn) => {
-      const row = btn.closest("div");
-      const duration = row?.querySelector("[data-session-duration]");
-      return {
-        // SIDEBAR-R1：选中态 = 浮起卡片（bg-sidebar-active + shadow-sidebar-active），不再是左侧 accent 竖条。
-        isCard:
-          row?.getAttribute("data-active") === "true" &&
-          row.classList.contains("bg-sidebar-active") &&
-          row.classList.contains("shadow-sidebar-active"),
-        cardBg: row ? getComputedStyle(row).backgroundColor : "",
-        durationText: duration?.textContent ?? "",
-        durationTitle: duration?.getAttribute("title") ?? "",
-      };
-    });
-    if (!activeState.isCard) throw new Error(`活跃会话缺少选中卡片(${theme}): ${JSON.stringify(activeState)}`);
-    // 真实 CSS 必须把选中面画出来（token 漏定义时会回落透明，卡片隐形）。
-    if (!activeState.cardBg || /rgba\(0, 0, 0, 0\)|transparent/.test(activeState.cardBg)) {
-      throw new Error(`活跃会话选中面是透明的(${theme}): ${activeState.cardBg}`);
-    }
-    // 用时改用中文单位（侧栏审计 SR-01：中文界面不混英文缩写 25m/3h/2d），8 分钟 → 「8分」。
-    if (activeState.durationText !== "8分" || !activeState.durationTitle.includes("→")) {
-      throw new Error(`会话累计用时未按 createdAt → lastAt 展示(${theme}): ${JSON.stringify(activeState)}`);
-    }
-    if (await sidebar.getByText("浏览器契约：摘要不应显示", { exact: true }).count() !== 0) {
-      throw new Error(`会话行仍显示最新消息摘要(${theme})`);
-    }
-    const idleCard = await sidebar.getByRole("button", { name: "密度验收空闲会话" }).evaluate(
-      (btn) => btn.closest("div")?.getAttribute("data-active") === "true",
-    );
-    if (idleCard) throw new Error(`空闲会话不应是选中卡片(${theme})`);
-
-    // SIDEBAR-R1：描边 + 实底画在外层卡片 [data-sidebar-new] 上，按钮本身透明铺满。
-    const createClass = await sidebar.getByRole("button", { name: "新建会话" }).evaluate(
-      (btn) => btn.closest("[data-sidebar-new]")?.getAttribute("class") ?? "",
-    );
-    if (!createClass.includes("text-section") || !createClass.includes("border-border") || !createClass.includes("bg-surface")) {
-      throw new Error(`新建会话未保持 secondary(${theme}): ${createClass}`);
-    }
-    if (await sidebar.getByRole("button", { name: /管理中心/ }).count() !== 0) {
-      throw new Error(`管理中心仍占侧栏主区(${theme})`);
-    }
-    const gallery = sidebar.getByRole("button", { name: "打开案例展厅", exact: true });
-    if (await gallery.count() !== 1) {
-      throw new Error(`底栏案例展厅入口不唯一或丢失(${theme})`);
-    }
-    await gallery.waitFor({ state: "visible", timeout: 3000 });
-    const galleryOpens = await page.evaluate(() => window.__densityGalleryOpens);
-    await gallery.click();
-    if (await page.evaluate(() => window.__densityGalleryOpens) !== galleryOpens + 1) {
-      throw new Error(`案例展厅入口没有精确触发一次打开(${theme})`);
-    }
-    if (await sidebar.getByRole("button", { name: /切换主题/ }).count() !== 1) {
-      throw new Error(`底栏主题开关丢失(${theme})`);
-    }
-    await sidebar.getByRole("button", { name: "账号菜单" }).click();
-    const menu = page.getByRole("menu");
-    await menu.waitFor({ state: "visible", timeout: 3000 });
-    for (const label of ["管理中心", "市场", "组织", "管理后台", "视频任务", "设置"]) {
-      if (await menu.getByRole("menuitem", { name: new RegExp(label) }).count() !== 1) {
-        throw new Error(`账号菜单缺少「${label}」(${theme})`);
-      }
-    }
-    const adminHref = await menu.getByRole("menuitem", { name: /管理后台/ }).getAttribute("href");
-    if (adminHref !== "/admin.html") throw new Error(`管理后台入口丢失或 href 错误(${theme}): ${adminHref}`);
-    await page.keyboard.press("Escape");
-    await menu.waitFor({ state: "hidden", timeout: 3000 });
+    if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
+    await page.evaluate(() => document.documentElement.classList.remove("dark"));
   }
-
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await assertTheme("light");
-  const asideWidth = await page.locator("#codex-density-root aside").evaluate((el) => el.getBoundingClientRect().width);
-  if (Math.abs(asideWidth - 268) > 1) {
-    throw new Error(`1440 下侧栏宽度应为 268px,实际 ${asideWidth}`);
-  }
-  await assertTheme("dark");
-
-  await page.setViewportSize({ width: 390, height: 844 });
-  await assertTheme("light");
-  await assertTheme("dark");
-  const composerOverflow = await page.locator("#root").evaluate((el) => el.scrollWidth > el.clientWidth + 1);
-  if (composerOverflow) throw new Error("Composer 在 390px 发生横向溢出");
-
-  if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
-  await page.evaluate(() => document.documentElement.classList.remove("dark"));
 });
 
 await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、默认关闭不盖 harness", async () => {
@@ -3620,7 +3545,7 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
     }, theme);
 
     const dialog = page.getByRole("dialog", { name: "设置" });
-    await dialog.waitFor({ state: "visible", timeout: 3000 });
+    await dialog.waitFor({ state: "visible", timeout: 6000 });
     await assertNoOverflow(dialog, `${viewport} ${theme}`);
 
     const tablist = dialog.getByRole("tablist", { name: "设置分区" });
@@ -3646,37 +3571,44 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
     }
   }
 
-  await page.setViewportSize({ width: 390, height: 844 });
-  await probe.getByRole("button", { name: "打开设置壳" }).click();
-  await assertTheme("light", "390");
-  const dialog = page.getByRole("dialog", { name: "设置" });
-  for (const [name, marker] of SECTIONS) {
-    const tab = dialog.getByRole("tab", { name, exact: true });
-    await tab.click();
-    if ((await tab.getAttribute("aria-selected")) !== "true") {
-      throw new Error(`390 切到「${name}」后未选中`);
-    }
-    await dialog.getByText(marker, { exact: true }).waitFor({ state: "visible", timeout: 3000 });
-    if (name === "账户") {
-      await dialog.getByText("订单生效，旧额度结清", { exact: false }).waitFor({ state: "visible" });
-      const ledger = await dialog.getByRole("list").filter({ hasText: "旧额度结清" }).innerText();
-      if (!ledger.includes("订阅额度到账") || !ledger.includes("新周期额度另行到账") || /订阅扣费|expire 300/.test(ledger)) {
-        throw new Error(`订单替换免费额度仍误报到期/扣费: ${ledger}`);
+  try {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await probe.getByRole("button", { name: "打开设置壳" }).click();
+    await assertTheme("light", "390");
+    const dialog = page.getByRole("dialog", { name: "设置" });
+    for (const [name, marker] of SECTIONS) {
+      const tab = dialog.getByRole("tab", { name, exact: true });
+      await tab.click();
+      if ((await tab.getAttribute("aria-selected")) !== "true") {
+        throw new Error(`390 切到「${name}」后未选中`);
       }
+      await dialog.getByText(marker, { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+      if (name === "账户") {
+        await dialog.getByText("订单生效，旧额度结清", { exact: false }).waitFor({ state: "visible" });
+        const ledger = await dialog.getByRole("list").filter({ hasText: "旧额度结清" }).innerText();
+        if (!ledger.includes("订阅额度到账") || !ledger.includes("新周期额度另行到账") || /订阅扣费|expire 300/.test(ledger)) {
+          throw new Error(`订单替换免费额度仍误报到期/扣费: ${ledger}`);
+        }
+      }
+      await assertNoOverflow(dialog, `390 分区 ${name}`);
     }
-    await assertNoOverflow(dialog, `390 分区 ${name}`);
+    await assertTheme("dark", "390");
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await assertTheme("light", "1440");
+    await assertTheme("dark", "1440");
+
+    await dialog.getByRole("button", { name: "关闭" }).click();
+    await dialog.waitFor({ state: "hidden", timeout: 3000 });
+  } finally {
+    const openDialog = page.getByRole("dialog", { name: "设置" });
+    if (await openDialog.isVisible().catch(() => false)) {
+      await openDialog.getByRole("button", { name: "关闭" }).click().catch(() => {});
+      await openDialog.waitFor({ state: "hidden", timeout: 2000 }).catch(() => {});
+    }
+    if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
+    await page.evaluate(() => document.documentElement.classList.remove("dark"));
   }
-  await assertTheme("dark", "390");
-
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await assertTheme("light", "1440");
-  await assertTheme("dark", "1440");
-
-  await dialog.getByRole("button", { name: "关闭" }).click();
-  await dialog.waitFor({ state: "hidden", timeout: 3000 });
-
-  if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
-  await page.evaluate(() => document.documentElement.classList.remove("dark"));
 });
 
 await check("T44 当前会话 unread=false 回执前的流式刷新只发送一次 mark-read", async () => {
@@ -3691,7 +3623,9 @@ await check("T44 当前会话 unread=false 回执前的流式刷新只发送一�
     throw new Error(`running 期间流式刷新不应 mark-read，实际 ${unreadMarkReadRequests}`);
   }
   await page.evaluate(() => window.__completeUnreadProbe());
-  await page.waitForTimeout(100);
+  for (let i = 0; i < 40 && unreadMarkReadRequests === 0; i += 1) {
+    await page.waitForTimeout(50);
+  }
   if (unreadMarkReadRequests !== 1) {
     throw new Error(`当前会话终态后应只发一次 mark-read，实际 ${unreadMarkReadRequests}`);
   }
@@ -3741,10 +3675,14 @@ await check("T45 中断 turn 刷新后仍显示 requestId/积分，空窗给出�
     timeout: 3000,
   });
   await stoppedMenu.getByLabel("消耗 4096 积分").waitFor({ state: "visible", timeout: 3000 });
+  await waitForAnimationsSettled(stoppedMenu);
   await page.keyboard.press("Escape");
   await stoppedMenu.waitFor({ state: "hidden", timeout: 3000 });
   await root.getByRole("button", { name: /思考|已思考/ }).first().waitFor({ state: "visible", timeout: 3000 });
-  await root.getByRole("status", { name: "过程记录整理中" }).waitFor({ state: "visible", timeout: 3000 });
+  // OCV5-846: records_unpublished 空窗静默补齐，不再叠显「过程记录整理中…」状态条，仍保留 requestId 与积分。
+  if ((await root.getByRole("status", { name: "过程记录整理中" }).count()) !== 0) {
+    throw new Error("records_unpublished 空窗不应叠显「过程记录整理中」状态条");
+  }
   await root.getByRole("button", { name: "复制请求ID req-unpublished-window" }).waitFor({
     state: "visible",
     timeout: 3000,

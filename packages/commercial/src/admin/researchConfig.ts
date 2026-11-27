@@ -80,13 +80,13 @@ export const ResearchConfigJson = Type.Object(
       },
       { additionalProperties: false },
     ),
-    // MiniCheck 蕴含闸⑤(P1.5):backend=off → 跳过(verified 仍是 quote-bound+identifier);
-    // http → master 调 endpoint 算 claim↔quote 蕴含分;strict=true 时低于 threshold 的
-    // verified claim 降级 unsupported(高风险报告 gate)。
+    // MiniCheck 蕴含闸⑤(P1.5):off → 跳过;http → 调 endpoint;llm → 走平台 flash 模型
+    // (缺省 deepseek-v4-flash,可选 model 覆写);strict=true 时低分 verified 降级 unsupported。
     minicheck: Type.Object(
       {
-        backend: Type.Union([Type.Literal("off"), Type.Literal("http")]),
+        backend: Type.Union([Type.Literal("off"), Type.Literal("http"), Type.Literal("llm")]),
         endpoint: Type.Optional(Type.String()),
+        model: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
         threshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
         strict: Type.Optional(Type.Boolean()),
       },

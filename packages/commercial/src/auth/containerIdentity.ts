@@ -199,7 +199,7 @@ export function createPgIdentityRepo(): ContainerIdentityRepo {
  * 调用方必须把 ContainerIdentityError catch 住,翻成 HTTP 401 response,
  * **errcode 不能放进 response body** — 只进服务端 log,避免给攻击者反馈。
  */
-export async function verifyContainerIdentity(
+async function verifyContainerIdentityCore(
   repo: ContainerIdentityRepo,
   ctx: ContainerIdentityContext,
   authorizationHeader: string | undefined,
@@ -238,4 +238,25 @@ export async function verifyContainerIdentity(
     boundIp: row.bound_ip,
     hostUuid: row.host_uuid,
   };
+}
+
+export async function verifyContainerIdentity(
+  repo: ContainerIdentityRepo,
+  ctx: ContainerIdentityContext,
+  authorizationHeader: string | undefined,
+): Promise<ContainerIdentity> {
+  return verifyContainerIdentityCore(repo, ctx, authorizationHeader);
+}
+
+/**
+ * Bind a `ContainerIdentityRepo` into an HTTP-boundary verifier closure so
+ * internal route handlers can authenticate requests via dependency injection.
+ */
+export function makeContainerRequestVerifier(
+  repo: ContainerIdentityRepo,
+): (
+  req: { readonly headers: { readonly authorization?: string | undefined } },
+  ctx: ContainerIdentityContext,
+) => Promise<ContainerIdentity> {
+  return (req, ctx) => verifyContainerIdentityCore(repo, ctx, req.headers.authorization);
 }

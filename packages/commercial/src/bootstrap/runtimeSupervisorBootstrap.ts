@@ -27,6 +27,10 @@ import {
   AccountPoolUnavailableError,
   type AccountScheduler,
 } from "../account-pool/scheduler.js";
+import { syncLogicalModelPoolBindingsFromCatalog } from "../account-pool/remotePool/logicalModelBindingsSync.js";
+import { bootstrapLegacyRetirementGate, type LegacyTrackRetirementGate } from "../account-pool/remotePool/legacyRetirementRuntime.js";
+import type { LocalCasArtifactBlobStore } from "../agent-sandbox/artifactBlobStore.js";
+import { initMasterArtifactBlobStoreForBootstrap } from "../agent-sandbox/artifactBlobRuntime.js";
 import { createMasterCc5Runtime } from "../agent-sandbox/cc5Runtime.js";
 import {
   makeDraftPreparation,
@@ -421,6 +425,7 @@ export function assembleV3SupervisorCore(deps: {
   v3Docker: Docker;
   v3Deps: V3SupervisorDeps;
   cc5Runtime: ReturnType<typeof createMasterCc5Runtime>;
+  legacyRetirementGate: LegacyTrackRetirementGate;
 } {
   const v3Docker = deps.cfg.AGENT_DOCKER_SOCKET
     ? new Docker({ socketPath: deps.cfg.AGENT_DOCKER_SOCKET })
@@ -479,27 +484,48 @@ export function assembleV3SupervisorCore(deps: {
     runtimeTuple = t;
   }
 
+  const isSelfhostV5 =
+    getRuntimeChannel() === "v5" &&
+    deps.flavorIdentity.status === "ok" &&
+    deps.flavorIdentity.flavor === "selfhost";
+
+  if (isSelfhostV5 && deps.modelCatalogCache) {
+    const catalogCache = deps.modelCatalogCache;
+    void syncLogicalModelPoolBindingsFromCatalog(
+      getPool(),
+      async () => (await catalogCache.assertFresh()).entries,
+      { overwriteAdminOverrides: false },
+    )
+      .then((stats) => {
+        rootLogger.info("[commercial] selfhost logical model pool bindings synced", {
+          synced: stats.synced,
+          enabled: stats.enabled,
+          disabled: stats.disabled,
+          skipped: stats.skipped,
+        });
+      })
+      .catch((err: unknown) => {
+        rootLogger.warn(
+          "[commercial] selfhost logical model pool bindings startup sync failed (fail-open)",
+          { error: err instanceof Error ? err.message : String(err) },
+        );
+      });
+  }
+
+  const legacyRetirementGate = bootstrapLegacyRetirementGate({ queryable: getPool(), rawFlag: deps.env.OC_LEGACY_REMOTE_TRACKS_RETIRED, isSelfhostV5, log: rootLogger });
   const cc5Runtime = createMasterCc5Runtime({
-    selfhost:
-      getRuntimeChannel() === "v5" &&
-      deps.flavorIdentity.status === "ok" &&
-      deps.flavorIdentity.flavor === "selfhost",
-    authorityReady:
-      deps.modelAuthoritySigner !== null &&
-      deps.modelAuthoritySigner !== undefined &&
-      deps.modelAuthorityProvisionRequired,
-    env: deps.env,
+    selfhost: isSelfhostV5,
+    authorityReady: Boolean(deps.modelAuthoritySigner) && deps.modelAuthorityProvisionRequired,
+    env: deps.env, egressSecret: deps.cfg.OC_EGRESS_SECRET, legacyRetirementGate,
     ...(deps.modelAuthoritySigner && deps.modelCatalogCache
       ? {
           financeFactory: (_binding, lane) =>
             createRemoteNativeTurnFinance({
-              pool: getPool(),
-              preCheckRedis: deps.preCheckRedis,
-              catalog: deps.modelCatalogCache!,
+              pool: getPool(), preCheckRedis: deps.preCheckRedis, catalog: deps.modelCatalogCache!,
               keyring: () => deps.modelAuthoritySigner!.publicKeyring(),
               loadUserModelAuthz: deps.loadUserModelAuthz,
               log: rootLogger.child({ subsys: "remoteNativeBilling" }),
-              upstreamModel: lane.upstreamModel,
+              upstreamModel: lane.upstreamModel, legacyRetirementGate,
             }),
         }
       : {}),
@@ -605,7 +631,7 @@ export function assembleV3SupervisorCore(deps: {
     );
   }
 
-  return { v3Docker, v3Deps, cc5Runtime };
+  return { v3Docker, v3Deps, cc5Runtime, legacyRetirementGate };
 }
 
 export function wireRemoteMuxDeps(): void {
@@ -1158,12 +1184,21 @@ export async function bootstrapMailerBridgeAndAuthority(deps: {
     });
   }
 
+  const artifactBlobStore = initMasterArtifactBlobStoreForBootstrap({
+    openClaudeHome: deps.env.OPENCLAUDE_HOME ?? path.join(homedir(), ".openclaude"),
+    casRootDir: deps.env.OC_ARTIFACT_CAS_ROOT,
+    pgPool: getPool(),
+    bridgeSecret,
+    env: deps.env,
+  });
+
   return {
     mailer,
     bridgeSecret,
     mediaSignKey,
     wechatLiveLinkKey,
     thumbnailCache,
+    artifactBlobStore,
     modelAuthorityProvisionRequired,
     modelAuthoritySigner,
     modelCatalogCache,

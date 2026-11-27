@@ -10,7 +10,18 @@
  * has exited.
  */
 import { lstatSync, readdirSync, readFileSync, unlinkSync } from 'node:fs'
-import { join } from 'node:path'
+import { lstat, readdir, realpath, unlink } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { JOB_LIFECYCLE_CLASSES, type JobLifecycleClass } from '@openclaude/protocol'
+import { parseProcStatFull } from '@openclaude/storage'
+
+const JOB_LIFECYCLE_CLASS_SET: ReadonlySet<string> = new Set<string>(JOB_LIFECYCLE_CLASSES)
+
+function parseSnapshotLifecycleClass(raw: unknown): JobLifecycleClass {
+  return typeof raw === 'string' && JOB_LIFECYCLE_CLASS_SET.has(raw)
+    ? (raw as JobLifecycleClass)
+    : 'ephemeral_turn'
+}
 
 export const SESSION_BG_COMMAND_ID_RE = /^[0-9]+-ocb_[0-9]+$/
 export const SESSION_BG_COMMANDS_MAX_ITEMS = 20
@@ -38,7 +49,15 @@ export interface SessionBgCommandSnapshot {
   startedAt: number
   updatedAt: number
   maxLifetimeAt: number
+  lifecycleClass?: JobLifecycleClass
+  leaseId?: string
+  stdoutLogPath?: string
+  stderrLogPath?: string
 }
+
+export type SessionBgCommandOwnerFilter =
+  | string
+  | { readonly sessionKey: string; readonly sessionId?: string }
 
 export interface SessionBgCommandItem {
   id: string
@@ -47,6 +66,19 @@ export interface SessionBgCommandItem {
   cwd?: string
   startedAt: number
   updatedAt: number
+  lifecycleClass: JobLifecycleClass
+}
+
+export interface ReapSessionBgCommandsResult {
+  readonly reapedIds: readonly string[]
+  readonly preservedIds: readonly string[]
+  readonly failedIds: readonly string[]
+}
+
+export interface SweepExpiredSessionBgCommandsResult {
+  readonly reapedIds: readonly string[]
+  readonly cleanedStaleIds: readonly string[]
+  readonly failedIds: readonly string[]
 }
 
 export type CancelSessionBgCommandResult =
@@ -88,22 +120,7 @@ export function resolveSessionBgCommandsRegistryDir(
  *   - field 22 (`starttime`): index 19 after last `)`
  */
 export function parseProcStatInfo(statLine: string): ProcStatInfo | null {
-  const rparen = statLine.lastIndexOf(')')
-  if (rparen < 0) return null
-  const rest = statLine.slice(rparen + 1).trim()
-  if (!rest) return null
-  const fields = rest.split(/\s+/)
-  const state = fields[0]
-  const rawPgrp = fields[2]
-  const rawTicks = fields[19]
-  if (!state || !rawPgrp || !rawTicks) return null
-  if (!/^-?\d+$/.test(rawPgrp) || !/^\d+$/.test(rawTicks)) return null
-  const pgrp = Number(rawPgrp)
-  const startTimeTicks = Number(rawTicks)
-  if (!Number.isSafeInteger(pgrp) || !Number.isSafeInteger(startTimeTicks) || startTimeTicks < 0) {
-    return null
-  }
-  return { state, pgrp, startTimeTicks }
+  return parseProcStatFull(statLine)
 }
 
 export function parseProcStatStartTimeTicks(statLine: string): number | null {
@@ -166,11 +183,119 @@ function defaultSleep(ms: number): Promise<void> {
   })
 }
 
-function unlinkSafe(filePath: string): void {
+function unlinkSafe(filePath: string | undefined): void {
+  if (!filePath) return
   try {
     unlinkSync(filePath)
+  } catch (err) {
+    void err
+  }
+}
+
+/**
+ * F01: Strictly unlink ONLY canonical job log files derived from validated `entryId` inside
+ * `<registryDir>/logs` (never trusting raw path strings from snapshot JSON, never following
+ * symlinks, and verifying `dirname(realpath(target)) === realpath(logsDir)` before unlink).
+ */
+async function unlinkCanonicalJobLogsAsync(registryDir: string, entryId: string): Promise<void> {
+  if (!SESSION_BG_COMMAND_ID_RE.test(entryId)) return
+  const logsDir = join(registryDir, 'logs')
+  let realLogsDir: string
+  try {
+    const dirStat = await lstat(logsDir)
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return
+    realLogsDir = await realpath(logsDir)
   } catch {
-    /* ignore */
+    return
+  }
+  const canonicalNames = [
+    `${entryId}.stdout.log`,
+    `${entryId}.stdout.log.1`,
+    `${entryId}.stderr.log`,
+    `${entryId}.stderr.log.1`,
+  ]
+  for (const name of canonicalNames) {
+    const candidate = join(realLogsDir, name)
+    try {
+      const st = await lstat(candidate)
+      if (st.isSymbolicLink() || !st.isFile()) continue
+      const realCandidate = await realpath(candidate)
+      if (dirname(realCandidate) !== realLogsDir) continue
+      await unlink(realCandidate)
+    } catch (err) {
+      void err
+    }
+  }
+}
+
+function shouldUnlinkOwnedLogs(
+  entry: Pick<SessionBgCommandSnapshot, 'ownerPid'>,
+  ops: SessionBgCommandsOps,
+  opts?: { readonly forceUnlinkLogs?: boolean },
+): boolean {
+  if (opts?.forceUnlinkLogs) return true
+  const isAlive = ops.isProcessAlive ?? defaultIsProcessAlive
+  const ownerAlive =
+    Number.isInteger(entry.ownerPid) && entry.ownerPid > 1 && isAlive(entry.ownerPid)
+  return !ownerAlive
+}
+
+async function unlinkSnapshotAndOwnedLogsAsync(
+  registryDir: string,
+  filePath: string,
+  entry: Pick<SessionBgCommandSnapshot, 'id' | 'ownerPid'>,
+  ops: SessionBgCommandsOps,
+  opts?: { readonly forceUnlinkLogs?: boolean },
+): Promise<void> {
+  unlinkSafe(filePath)
+  if (shouldUnlinkOwnedLogs(entry, ops, opts)) {
+    await unlinkCanonicalJobLogsAsync(registryDir, entry.id)
+  }
+}
+
+function scheduleUnlinkSnapshotAndOwnedLogs(
+  registryDir: string,
+  filePath: string,
+  entry: Pick<SessionBgCommandSnapshot, 'id' | 'ownerPid'>,
+  ops: SessionBgCommandsOps,
+): void {
+  unlinkSafe(filePath)
+  if (shouldUnlinkOwnedLogs(entry, ops)) {
+    void unlinkCanonicalJobLogsAsync(registryDir, entry.id)
+  }
+}
+
+function matchesOwner(
+  entry: Pick<SessionBgCommandSnapshot, 'sessionKey' | 'sessionId'>,
+  owner: SessionBgCommandOwnerFilter,
+): boolean {
+  if (typeof owner === 'string') {
+    const sid = owner.trim()
+    return sid.length > 0 && (entry.sessionId === sid || entry.sessionKey === sid)
+  }
+  const key = owner.sessionKey.trim()
+  if (!key || !entry.sessionKey) return false
+  return entry.sessionKey === key
+}
+
+function optNonEmptyString(val: unknown): string | undefined {
+  return typeof val === 'string' && val ? val : undefined
+}
+
+function parseSnapshotOptionalFields(raw: Record<string, unknown>): Pick<
+  SessionBgCommandSnapshot,
+  'cwd' | 'lifecycleClass' | 'leaseId' | 'stdoutLogPath' | 'stderrLogPath'
+> {
+  const cwd = optNonEmptyString(raw.cwd)
+  const leaseId = optNonEmptyString(raw.leaseId)
+  const stdoutLogPath = optNonEmptyString(raw.stdoutLogPath)
+  const stderrLogPath = optNonEmptyString(raw.stderrLogPath)
+  return {
+    lifecycleClass: parseSnapshotLifecycleClass(raw.lifecycleClass),
+    ...(cwd ? { cwd } : {}),
+    ...(leaseId ? { leaseId } : {}),
+    ...(stdoutLogPath ? { stdoutLogPath } : {}),
+    ...(stderrLogPath ? { stderrLogPath } : {}),
   }
 }
 
@@ -189,22 +314,12 @@ function parseSnapshotFile(filePath: string, expectedId: string): SessionBgComma
       typeof raw.startTimeTicks === 'number' && Number.isSafeInteger(raw.startTimeTicks)
         ? raw.startTimeTicks
         : null
-    const sessionKey = typeof raw.sessionKey === 'string' ? raw.sessionKey : ''
-    const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : ''
-    const commandPreview = typeof raw.commandPreview === 'string' ? raw.commandPreview : ''
-    const cwd = typeof raw.cwd === 'string' && raw.cwd ? raw.cwd : undefined
     const startedAt = typeof raw.startedAt === 'number' ? raw.startedAt : Number.NaN
     const updatedAt = typeof raw.updatedAt === 'number' ? raw.updatedAt : startedAt
     const maxLifetimeAt = typeof raw.maxLifetimeAt === 'number' ? raw.maxLifetimeAt : Number.NaN
     if (
-      id !== expectedId ||
-      !jobId ||
-      !Number.isInteger(pid) ||
-      pid <= 1 ||
-      !Number.isInteger(pgid) ||
-      pgid !== pid ||
-      !Number.isFinite(startedAt) ||
-      !Number.isFinite(maxLifetimeAt)
+      id !== expectedId || !jobId || !Number.isInteger(pid) || pid <= 1 ||
+      pgid !== pid || !Number.isFinite(startedAt) || !Number.isFinite(maxLifetimeAt)
     ) {
       return null
     }
@@ -215,13 +330,13 @@ function parseSnapshotFile(filePath: string, expectedId: string): SessionBgComma
       pgid,
       ownerPid,
       startTimeTicks,
-      sessionKey,
-      sessionId,
-      commandPreview,
-      ...(cwd ? { cwd } : {}),
+      sessionKey: typeof raw.sessionKey === 'string' ? raw.sessionKey : '',
+      sessionId: typeof raw.sessionId === 'string' ? raw.sessionId : '',
+      commandPreview: typeof raw.commandPreview === 'string' ? raw.commandPreview : '',
       startedAt,
       updatedAt: Number.isFinite(updatedAt) ? updatedAt : startedAt,
       maxLifetimeAt,
+      ...parseSnapshotOptionalFields(raw),
     }
   } catch {
     return null
@@ -313,16 +428,16 @@ function signalVerifiedGroup(
   try {
     sendSignal(-entry.pgid, signal)
     delivered = true
-  } catch {
-    /* group kill failed (e.g., leader exited or ESRCH); fall through to member PIDs */
+  } catch (err) {
+    void err
   }
   if (!delivered || alsoSignalMembers) {
     for (const pid of members) {
       try {
         sendSignal(pid, signal)
         delivered = true
-      } catch {
-        /* member already exited */
+      } catch (err) {
+        void err
       }
     }
   }
@@ -356,15 +471,15 @@ export function listSessionBgCommands(
       unlinkSafe(filePath)
       continue
     }
-    if (now >= entry.maxLifetimeAt) {
-      unlinkSafe(filePath)
-      continue
-    }
     const scan = scanVerifiedGroupMembers(entry, ops)
     if (scan.identityMismatch || scan.members.length === 0) {
-      unlinkSafe(filePath)
+      scheduleUnlinkSnapshotAndOwnedLogs(dir, filePath, entry, ops)
       continue
     }
+    // B07: Never hide a live expired process by unlinking its snapshot while members are alive,
+    // and never emit OS signals from this read-only listing path. Live expired processes remain
+    // visible until actively terminated & confirmed empty by `sweepExpiredSessionBgCommands` or
+    // `cancelSessionBgCommand`.
     if (entry.sessionId !== sid) continue
     items.push({
       id: entry.id,
@@ -373,6 +488,7 @@ export function listSessionBgCommands(
       ...(entry.cwd ? { cwd: entry.cwd } : {}),
       startedAt: entry.startedAt,
       updatedAt: entry.updatedAt,
+      lifecycleClass: entry.lifecycleClass ?? 'ephemeral_turn',
     })
   }
 
@@ -380,14 +496,73 @@ export function listSessionBgCommands(
   return items.slice(0, SESSION_BG_COMMANDS_MAX_ITEMS)
 }
 
+async function pollUntilGroupEmpty(
+  entry: SessionBgCommandSnapshot,
+  ops: SessionBgCommandsOps,
+  maxWaitMs: number,
+  sleep: (ms: number) => Promise<void>,
+): Promise<VerifiedGroupScan> {
+  if (maxWaitMs <= 0) return scanVerifiedGroupMembers(entry, ops)
+  let waited = 0
+  let scan = scanVerifiedGroupMembers(entry, ops)
+  while (waited < maxWaitMs && !scan.identityMismatch && scan.members.length > 0) {
+    const step = Math.min(KILL_POLL_STEP_MS, maxWaitMs - waited)
+    await sleep(step)
+    waited += step
+    scan = scanVerifiedGroupMembers(entry, ops)
+  }
+  return scan
+}
+
+async function terminateVerifiedSnapshotEntry(
+  registryDir: string,
+  filePath: string,
+  entry: SessionBgCommandSnapshot,
+  ops: SessionBgCommandsOps,
+): Promise<CancelSessionBgCommandResult> {
+  let scan = scanVerifiedGroupMembers(entry, ops)
+  if (scan.identityMismatch || scan.members.length === 0) {
+    await unlinkSnapshotAndOwnedLogsAsync(registryDir, filePath, entry, ops)
+    return { ok: true, cancelled: false, alreadyExited: true }
+  }
+  const sendSignal = ops.sendSignal ?? defaultSendSignal
+  const sleep = ops.sleep ?? defaultSleep
+  const graceMs = Math.max(0, ops.killGraceMs ?? SESSION_BG_COMMAND_KILL_GRACE_MS)
+  const confirmMs = Math.max(0, ops.killConfirmMs ?? SESSION_BG_COMMAND_KILL_CONFIRM_MS)
+
+  if (!signalVerifiedGroup(entry, scan.members, 'SIGTERM', sendSignal, false)) {
+    scan = scanVerifiedGroupMembers(entry, ops)
+    if (scan.identityMismatch || scan.members.length === 0) {
+      await unlinkSnapshotAndOwnedLogsAsync(registryDir, filePath, entry, ops)
+      return { ok: true, cancelled: false, alreadyExited: true }
+    }
+  }
+  scan = await pollUntilGroupEmpty(entry, ops, graceMs, sleep)
+  if (!scan.identityMismatch && scan.members.length > 0) {
+    signalVerifiedGroup(entry, scan.members, 'SIGKILL', sendSignal, true)
+    scan = await pollUntilGroupEmpty(entry, ops, confirmMs, sleep)
+  }
+  if (!scan.identityMismatch && scan.members.length > 0) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'BG_COMMAND_CANCEL_UNCONFIRMED',
+      error: `background command process group still has ${scan.members.length} live member(s)`,
+    }
+  }
+  await unlinkSnapshotAndOwnedLogsAsync(registryDir, filePath, entry, ops, { forceUnlinkLogs: true })
+  return { ok: true, cancelled: true }
+}
+
 export async function cancelSessionBgCommand(
-  sessionId: string,
+  owner: SessionBgCommandOwnerFilter,
   entryId: string,
   registryDir?: string,
   ops: SessionBgCommandsOps = {},
 ): Promise<CancelSessionBgCommandResult> {
-  const sid = sessionId.trim()
-  if (!sid) {
+  const validOwner =
+    typeof owner === 'string' ? owner.trim().length > 0 : owner.sessionKey.trim().length > 0
+  if (!validOwner) {
     return { ok: false, status: 400, code: 'INVALID_SESSION_ID', error: 'sessionId required' }
   }
   if (!SESSION_BG_COMMAND_ID_RE.test(entryId)) {
@@ -403,7 +578,7 @@ export async function cancelSessionBgCommand(
 
   let st
   try {
-    st = lstatSync(filePath)
+    st = await lstat(filePath)
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
       return { ok: true, cancelled: false, alreadyExited: true }
@@ -423,82 +598,179 @@ export async function cancelSessionBgCommand(
       error: 'background command snapshot failed pgid/pid validation',
     }
   }
-  if (entry.sessionId !== sid) {
+  if (!matchesOwner(entry, owner)) {
     return { ok: false, status: 404, code: 'NOT_FOUND', error: 'background command not found' }
   }
 
-  const nowFn = ops.now ?? Date.now
-  if (nowFn() >= entry.maxLifetimeAt) {
-    unlinkSafe(filePath)
-    return { ok: true, cancelled: false, alreadyExited: true }
-  }
+  // B07: Even if `now >= maxLifetimeAt`, never unlink without proving the process group exited;
+  // fall straight into verified SIGTERM -> SIGKILL -> confirm-empty termination.
+  return await terminateVerifiedSnapshotEntry(dir, filePath, entry, ops)
+}
 
-  let scan = scanVerifiedGroupMembers(entry, ops)
-  if (scan.identityMismatch) {
-    unlinkSafe(filePath)
-    return { ok: true, cancelled: false, alreadyExited: true }
+/**
+ * Reap ONLY session-scoped background command snapshots whose `lifecycleClass` belongs to `classes`
+ * (e.g. `['ephemeral_turn']` during brain switches / cross-pool handoffs), provably preserving
+ * `managed_job` and `daemon_service` processes and snapshots.
+ *
+ * B05 / W01 / A02: Scans ALL snapshots in `registryDir` without the 20-item UI truncation cap,
+ * matches strictly by full `sessionKey` when `{ sessionKey }` is supplied (never guessing by tail),
+ * and distinguishes missing registry (`ENOENT`) from real directory read errors (which rethrow).
+ */
+export async function reapSessionBgCommandsByClass(
+  owner: SessionBgCommandOwnerFilter,
+  classes: readonly JobLifecycleClass[],
+  registryDir?: string,
+  ops: SessionBgCommandsOps = {},
+): Promise<ReapSessionBgCommandsResult> {
+  const validOwner =
+    typeof owner === 'string' ? owner.trim().length > 0 : owner.sessionKey.trim().length > 0
+  if (!validOwner || classes.length === 0) {
+    return { reapedIds: [], preservedIds: [], failedIds: [] }
   }
-  if (scan.members.length === 0) {
-    unlinkSafe(filePath)
-    return { ok: true, cancelled: false, alreadyExited: true }
-  }
-
-  const sendSignal = ops.sendSignal ?? defaultSendSignal
-  const sleep = ops.sleep ?? defaultSleep
-  const graceMs = Math.max(0, ops.killGraceMs ?? SESSION_BG_COMMAND_KILL_GRACE_MS)
-  const confirmMs = Math.max(0, ops.killConfirmMs ?? SESSION_BG_COMMAND_KILL_CONFIRM_MS)
-
-  // Phase 1: SIGTERM to verified process group (falling back to verified members if needed).
-  const sentTerm = signalVerifiedGroup(entry, scan.members, 'SIGTERM', sendSignal, false)
-  if (!sentTerm) {
-    scan = scanVerifiedGroupMembers(entry, ops)
-    if (scan.identityMismatch || scan.members.length === 0) {
-      unlinkSafe(filePath)
-      return { ok: true, cancelled: false, alreadyExited: true }
+  const dir = registryDir ?? resolveSessionBgCommandsRegistryDir()
+  let names: string[]
+  try {
+    names = await readdir(dir)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return { reapedIds: [], preservedIds: [], failedIds: [] }
     }
+    throw err
   }
 
-  // Wait up to graceMs for the entire verified group to exit cleanly.
-  if (graceMs > 0) {
-    let waited = 0
-    while (waited < graceMs) {
-      const step = Math.min(KILL_POLL_STEP_MS, graceMs - waited)
-      await sleep(step)
-      waited += step
-      scan = scanVerifiedGroupMembers(entry, ops)
-      if (scan.identityMismatch || scan.members.length === 0) break
+  const classSet = new Set<JobLifecycleClass>(classes)
+  const reapedIds: string[] = []
+  const preservedIds: string[] = []
+  const failedIds: string[] = []
+
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const stem = name.slice(0, -'.json'.length)
+    if (!SESSION_BG_COMMAND_ID_RE.test(stem)) continue
+    const filePath = join(dir, name)
+    const entry = parseSnapshotFile(filePath, stem)
+    if (!entry) continue
+    if (!matchesOwner(entry, owner)) continue
+
+    const effectiveClass = entry.lifecycleClass ?? 'ephemeral_turn'
+    if (!classSet.has(effectiveClass)) {
+      preservedIds.push(entry.id)
+      continue
     }
-  } else {
-    scan = scanVerifiedGroupMembers(entry, ops)
-  }
-
-  // Phase 2: escalate to SIGKILL on -pgid AND any remaining verified members, then confirm exit.
-  if (!scan.identityMismatch && scan.members.length > 0) {
-    signalVerifiedGroup(entry, scan.members, 'SIGKILL', sendSignal, true)
-    if (confirmMs > 0) {
-      let waited = 0
-      while (waited < confirmMs) {
-        const step = Math.min(KILL_POLL_STEP_MS, confirmMs - waited)
-        await sleep(step)
-        waited += step
-        scan = scanVerifiedGroupMembers(entry, ops)
-        if (scan.identityMismatch || scan.members.length === 0) break
-      }
+    const res = await cancelSessionBgCommand(owner, entry.id, dir, ops)
+    if (res.ok) {
+      reapedIds.push(entry.id)
     } else {
-      scan = scanVerifiedGroupMembers(entry, ops)
+      failedIds.push(entry.id)
     }
   }
 
-  // Never delete snapshot or report success if verified group members are still running.
-  if (!scan.identityMismatch && scan.members.length > 0) {
-    return {
-      ok: false,
-      status: 409,
-      code: 'BG_COMMAND_CANCEL_UNCONFIRMED',
-      error: `background command process group still has ${scan.members.length} live member(s)`,
+  return { reapedIds, preservedIds, failedIds }
+}
+
+/**
+ * B07: Host/Gateway-level sweeper enforcing deadlines for disconnected `managed_job` snapshots
+ * (`now >= maxLifetimeAt`) and reaping orphaned `ephemeral_turn` snapshots whose owning MCP
+ * process (`ownerPid`) has exited. Never touches `daemon_service` snapshots while alive.
+ */
+export async function sweepExpiredSessionBgCommands(
+  registryDir?: string,
+  ops: SessionBgCommandsOps = {},
+): Promise<SweepExpiredSessionBgCommandsResult> {
+  const dir = registryDir ?? resolveSessionBgCommandsRegistryDir()
+  let names: string[]
+  try {
+    names = await readdir(dir)
+  } catch {
+    return { reapedIds: [], cleanedStaleIds: [], failedIds: [] }
+  }
+
+  const now = (ops.now ?? Date.now)()
+  const isAlive = ops.isProcessAlive ?? defaultIsProcessAlive
+  const reapedIds: string[] = []
+  const cleanedStaleIds: string[] = []
+  const failedIds: string[] = []
+
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const stem = name.slice(0, -'.json'.length)
+    if (!SESSION_BG_COMMAND_ID_RE.test(stem)) continue
+    const filePath = join(dir, name)
+    const entry = parseSnapshotFile(filePath, stem)
+    if (!entry) {
+      unlinkSafe(filePath)
+      cleanedStaleIds.push(stem)
+      continue
+    }
+
+    const scan = scanVerifiedGroupMembers(entry, ops)
+    if (scan.identityMismatch || scan.members.length === 0) {
+      await unlinkSnapshotAndOwnedLogsAsync(dir, filePath, entry, ops)
+      cleanedStaleIds.push(entry.id)
+      continue
+    }
+
+    const effectiveClass = entry.lifecycleClass ?? 'ephemeral_turn'
+    if (effectiveClass === 'daemon_service') {
+      continue
+    }
+
+    const expired = now >= entry.maxLifetimeAt
+    const orphanedEphemeral =
+      effectiveClass === 'ephemeral_turn' &&
+      Number.isInteger(entry.ownerPid) &&
+      entry.ownerPid > 1 &&
+      !isAlive(entry.ownerPid)
+
+    if (!expired && !orphanedEphemeral) {
+      continue
+    }
+
+    const res = await terminateVerifiedSnapshotEntry(dir, filePath, entry, ops)
+    if (res.ok) {
+      if (res.cancelled) reapedIds.push(entry.id)
+      else cleanedStaleIds.push(entry.id)
+    } else {
+      failedIds.push(entry.id)
     }
   }
 
-  unlinkSafe(filePath)
-  return { ok: true, cancelled: true }
+  return { reapedIds, cleanedStaleIds, failedIds }
+}
+
+interface BgSweepLogger {
+  info(msg: string, meta?: Record<string, unknown>): void
+  warn(msg: string, meta?: Record<string, unknown>): void
+}
+
+export async function runPeriodicBgCommandSweep(logger: BgSweepLogger): Promise<void> {
+  const bgSweep = await sweepExpiredSessionBgCommands().catch((err) => {
+    logger.warn('expired bg command sweep failed', { error: String(err) })
+    return null
+  })
+  if (bgSweep && (bgSweep.reapedIds.length > 0 || bgSweep.failedIds.length > 0)) {
+    logger.info('expired bg command sweep', {
+      reapedCount: bgSweep.reapedIds.length,
+      cleanedStaleCount: bgSweep.cleanedStaleIds.length,
+      failedCount: bgSweep.failedIds.length,
+    })
+  }
+}
+
+export async function reapEphemeralBgCommandsSafe(
+  sessionKey: string,
+  skip: unknown,
+  logger: BgSweepLogger,
+): Promise<void> {
+  if (skip) return
+  const reap = await reapSessionBgCommandsByClass({ sessionKey }, ['ephemeral_turn']).catch((err) => {
+    logger.warn('session_ephemeral_bg_reap_failed', {
+      sessionKey,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    return null
+  })
+  if (reap?.failedIds.length) {
+    logger.warn('session_ephemeral_bg_reap_incomplete', { sessionKey, failedIds: reap.failedIds })
+  }
 }

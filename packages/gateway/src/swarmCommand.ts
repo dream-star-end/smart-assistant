@@ -687,7 +687,7 @@ export async function terminateSwarmMember(
   };
 }
 
-// ── 高阶剧本库(6 套内置科研/工程默认模板) ─────────────────────────────────────
+// ── 高阶剧本库(7 套内置科研/工程默认模板) ─────────────────────────────────────
 
 export type SwarmPlaybookId =
   | "parallel-impl-verify"
@@ -695,7 +695,8 @@ export type SwarmPlaybookId =
   | "arch-deep-audit"
   | "multi-option-review"
   | "research-write-review-revise"
-  | "research-controlled-exp-loop";
+  | "research-controlled-exp-loop"
+  | "scientific-deep-audit";
 
 export interface SwarmPlaybookRoleSpec {
   name: string;
@@ -723,30 +724,30 @@ export const SWARM_PLAYBOOK_TEMPLATES: readonly SwarmPlaybookTemplate[] = Object
     title: "并行实现+验收",
     aliases: ["并行实现", "impl-verify", "parallel-impl", "并行开发验收"],
     category: "engineering",
-    summary: "将功能拆分为零冲突文件所有权的并行开发切片，并配置独立只读验收员执行类型与单测闭环。",
+    summary: "将功能拆分为零冲突文件所有权的并行开发切片，去中心化 P2P 交接，并配独立验收/预整合角色完成类型与单测闭环。",
     channels: [
-      { name: "main", topic: "任务切分、交付汇总与最终结论" },
-      { name: "impl", topic: "各切片接口契约与并行实现进度" },
-      { name: "verify", topic: "独立回归测试、边界审查与缺陷追踪" },
+      { name: "main", topic: "任务切分、接口契约、交付汇总与最终结论（禁过程刷屏）" },
+      { name: "impl", topic: "各切片接口契约与并行实现进度（P2P 交接）" },
+      { name: "verify", topic: "分支预合并、独立回归测试、边界审查与缺陷追踪" },
     ],
     roles: [
       {
         name: "coordinator",
         role: "coordinator",
         workspace: "inherit",
-        responsibility: "切分零冲突文件所有权、定义共享类型契约、协调合并与最终交付。",
+        responsibility: "仅做最小边界切分与接口契约约定即发车，不亲手编码/串行消化过程讨论；收尾终审预整合结果并统一 commit/push。",
       },
       {
         name: "worker-a",
         role: "worker",
         workspace: "share",
-        responsibility: "负责核心模块切片 A 实现及对应单元测试，严禁越界修改他人文件。",
+        responsibility: "负责核心模块切片 A 实现及对应单元测试，严禁越界修改他人文件；完工后在 #verify 直接 @verifier 交接并附贴号 #seq（勿 CC @coordinator）。",
       },
       {
         name: "worker-b",
         role: "worker",
         workspace: "share",
-        responsibility: "负责外围/集成切片 B 实现及对应单元测试，严禁越界修改他人文件。",
+        responsibility: "负责外围/集成切片 B 实现及对应单元测试，严禁越界修改他人文件；完工后在 #verify 直接 @verifier 交接并附贴号 #seq（勿 CC @coordinator）。",
       },
       {
         name: "verifier",
@@ -754,17 +755,18 @@ export const SWARM_PLAYBOOK_TEMPLATES: readonly SwarmPlaybookTemplate[] = Object
         workspace: "inherit",
         readOnly: true,
         responsibility:
-          "独立只读复核代码差异、运行触碰范围目标单测与类型检查（仅做功能自测核验，不替代 T2 跨家族独立审计），发现阻断问题点名 @worker 返修（限 1 轮复核收口）。",
+          "独立只读复核代码差异、运行触碰范围目标单测与类型检查（多分支收口时可由 coordinator 另派 integrator 预合并后验收；仅做功能自测核验，不替代 T2 跨家族独立审计），发现阻断问题直接 @原作者 返修（限 1 轮复核收口），全绿后一次 @coordinator [done]。",
       },
     ],
     workflow: [
-      "1. @coordinator 先明确接口契约与严格文件所有权清单，广播至 @all。",
-      "2. @worker-a 与 @worker-b 在各自独立工作区并行实现并自测，完成后直接 @verifier 交接。",
-      "3. @verifier 独立跑触碰范围目标单测、类型检查与边界复核，输出 PASS/FAIL 结论；发现阻断问题点名对应 @worker 返修（限 1 轮复核收口）。",
-      "4. 验收全绿后 @coordinator 汇总交付清单并结束蜂群。",
+      "1. @coordinator 发布最小接口契约、零交集文件所有权清单与下游交接链至 @all（本地原生蜂群需复用已读上下文可传 fork:\"coordinator\"，远端蜂群用自包含 brief + 贴号 #seq）。",
+      "2. @worker-a 与 @worker-b 在 #impl 独立 worktree 并行实现并自测（重探索可自带快档 helper），完成后直接 @verifier 交接（不抄送 @coordinator）。",
+      "3. @verifier 独立跑触碰范围目标单测、类型检查与边界复核，发现阻断问题直接点名对应 @worker P2P 返修（限 1 轮复核收口）；多分支收口可派专职 @integrator 先预合并解冲突再验收。",
+      "4. 验收全绿后由 @verifier（或 @integrator）一次性 @coordinator [done]（附贴号 #seq），@coordinator 终审合入、kill 成员、统一 push 并收口。",
     ],
     guardrails: [
       "严格文件所有权隔离，禁止两名写手编辑同一文件。",
+      "去中心化 P2P 交接：@name 仅唤醒下一环节负责人，严禁将 @coordinator 当抄送（CC）；引用前文一律写贴号 #seq。",
       "验收员保持只读，不代改业务代码；发现缺陷必须由原作者修复并复测。",
     ],
   },
@@ -1036,6 +1038,80 @@ export const SWARM_PLAYBOOK_TEMPLATES: readonly SwarmPlaybookTemplate[] = Object
       "评测守护员保持只读，未通过完整性与可复现核验的分数不得进入结论。",
     ],
   },
+  {
+    id: "scientific-deep-audit",
+    title: "零硬伤科研深审（四层正交+反例法庭）",
+    aliases: [
+      "零硬伤深审",
+      "物理硬伤审查",
+      "scientific-deep-audit",
+      "paper-deep-audit",
+      "科研深审",
+    ],
+    category: "research",
+    summary:
+      "四层正交科研零硬伤审查流水线：净室非零大参数确定性引擎 + 正交物理/公式代码/影响面切片蜂群 + 四大家族强档跨模型盲审红队 + oc-review verify 机器反例法庭与 Chao1 残余风险门禁。",
+    channels: [
+      { name: "main", topic: "基线 SHA-256 冻结、四层汇合进度、跨家族盲审裁决与科学深审放行结论" },
+      { name: "cleanroom", topic: "第一层净室引擎：SymPy/Octave/pint/hypothesis 非零大参数核验与 SSOT 全表对账" },
+      { name: "slices", topic: "第二层正交切片蜂群：物理建模/量纲、公式↔代码等价性与补丁影响面调用链取证" },
+      { name: "redteam", topic: "第三/四层跨家族盲审红队、oc-review verify 机器反例法庭与 Chao1 残余估算门禁" },
+    ],
+    roles: [
+      {
+        name: "coordinator",
+        role: "coordinator",
+        workspace: "inherit",
+        responsibility:
+          "冻结稿件/代码/数据基线 SHA-256 并用 `oc-docx extract --latex` 保真分片读稿；统筹四层节奏并在第三层并行调用 `delegate_tasks` 发起四大家族强档跨模型盲审（GPT `gpt-6.2-astra`/`gpt-6.2-sol`、Gemini `antigravity-gemini-4-neon`/`antigravity-gemini-4-carbon`、Grok `grok-build`、DeepSeek `deepseek-v4-flash`；非四大家族与弱档/轻量档在 `--scientific-gate` 中不计入跨家族覆盖，上游 500/429 自动切换同家族强档或其余三大家族强档替补）；第四层运行 `oc-review verify --dir <dir> --script-root <dir>`（默认只采集，经审计或净室脚本显式 `--unsafe-local-exec`，显式 `OC_WITNESS_VERDICT` 协议）与 `oc-review collate --scientific-gate --verification ...`（首轮先 `oc-review ledger init` 或省略 `--ledger`，复核轮次挂载 `--ledger`），仅在 `confirmedP0=0 && unverifiedP0=0 && familyCount>=2 && chao1Residual<0.5`（PASS_READY）时放行。",
+      },
+      {
+        name: "cleanroom-verifier",
+        role: "verifier",
+        workspace: "inherit",
+        readOnly: true,
+        responsibility:
+          "独立只读运行 SymPy/Octave/pint/hypothesis 非零大参数净室验证引擎（SO(3) 正交与手性、量纲一致、非零大参数往返差分 Fuzzing）及 SSOT 全表数值对账，阻断手抄误差与 RMS/方差混淆。",
+      },
+      {
+        name: "physics-slice-auditor",
+        role: "verifier",
+        workspace: "inherit",
+        readOnly: true,
+        responsibility:
+          "独立只读负责物理建模、量纲、守恒律、多级旋转链与显式假设边界切片审查；坚持零反例不立项，每条 P0/P1 必须附可独立执行的 `.py`/`.m` 反例脚本（`repro_script`，正常 `exit 0` 并通过 `OC_WITNESS_VERDICT` 协议输出 `confirmed`/`refuted` 裁决）。",
+      },
+      {
+        name: "math-code-parity-auditor",
+        role: "verifier",
+        workspace: "inherit",
+        readOnly: true,
+        responsibility:
+          "独立只读负责正文公式↔仿真代码逐行等价性与解析雅可比中心差分/复步差分核验切片（公差 <1e-8），专门抓出符号反号、因子遗漏与未同步修改的解析导数。",
+      },
+      {
+        name: "impact-regression-guard",
+        role: "verifier",
+        workspace: "inherit",
+        readOnly: true,
+        responsibility:
+          "独立只读负责补丁影响面调用链追踪与门控参数穿透检查（逐一核查所有生产调用点是否传入新增 `opt`/物理开关，防静默回退旧模型），根治「修 1 个破 2 个」的次生回归。",
+      },
+    ],
+    workflow: [
+      "1. @coordinator 冻结稿件/代码/指标表基线 SHA-256，使用 `oc-docx extract --latex`（大稿按 `--toc`/`--section` 分片）保真提取公式与正文，并先执行 `oc-review ledger init --file <dir>/decision-ledger.json`（或首轮 `collate` 省略 `--ledger`，复核轮次再挂 `--ledger`）后广播 @all。",
+      "2. 第一层（#cleanroom）：@cleanroom-verifier 执行 SymPy/Octave/pint/hypothesis 非零大参数净室引擎与 SSOT 全表数值对账，产出遵循 `OC_WITNESS_VERDICT` 协议的反例脚本（`repro_script`）并同步至 #slices。",
+      "3. 第二层（#slices）：@physics-slice-auditor、@math-code-parity-auditor、@impact-regression-guard 按零交集物理/代码/影响面边界并行只读深审，严格遵循「零反例不立项」，每条 P0/P1 必附 `.py`/`.m` 反例脚本（正常 `exit 0` 并经 `OC_WITNESS_VERDICT_FILE` 或 stdout `OC_WITNESS_VERDICT: {\"status\":\"confirmed\"|\"refuted\",\"summary\":\"...\"}` 输出裁决）。",
+      "4. 第三层（#redteam）：@coordinator 并行调用 `delegate_tasks` 发起四大家族强档跨模型独立盲审（GPT `gpt-6.2-astra`/`gpt-6.2-sol`、Gemini `antigravity-gemini-4-neon`/`antigravity-gemini-4-carbon`、Grok `grok-build`、DeepSeek `deepseek-v4-flash`）；非四大家族与弱档/轻量档在 `--scientific-gate` 中不计入跨家族覆盖与 Chao1 捕获，若任一上游返回 500/429，立即切同家族强档或其余三大家族强档替补，保住跨家族正交覆盖。",
+      "5. 第四层（#redteam → #main）：@coordinator 先运行 `oc-review verify --dir <dir> --script-root <dir> --manuscript <file>` 默认安全只采集（绝不直接执行未审计的外部评审脚本；无内核沙箱时 `--exec` 亦自动退回只采集）；仅当脚本由 `@cleanroom-verifier` 自写或经逐行审计无越界读写/外联后，方可显式加 `--unsafe-local-exec` 在当前容器内运行（明确不提供内核级文件系统/网络隔离；要求 `exit 0` + 携带匹配 `finding_digest` 的 `OC_WITNESS_VERDICT`，崩溃/非零退出/截断一律 `unverified` 绝不降级 P0），再执行 `oc-review collate --dir <dir> --script-root <dir> --manuscript <file> --scientific-gate --verification <dir>/verification-report.json [--ledger <dir>/decision-ledger.json]`；仅当 `confirmedP0=0 && unverifiedP0=0 && familyCount>=2 && chao1Residual<0.5`（`PASS_READY`）方可封版放行。",
+    ],
+    guardrails: [
+      "全体审查员与净室验证员严格只读，审计阶段禁止私自改动稿件或业务源码。",
+      "零反例不立项与诚实执行边界：所有数学/物理/代码 P0/P1 主张必须附 `.py`/`.m` `repro_script`；外部未审计脚本默认只采集不执行，仅经 `@cleanroom-verifier` 重写或逐行审计后才允许 `--unsafe-local-exec` 按 `OC_WITNESS_VERDICT`（必含匹配 `finding_digest`）协议仲裁；评审 JSON 自填 `verified_by_machine` 仅作展示、绝不能降级 P0，唯有绑定 `findingDigest` + `scriptSha256` + 稿件版本的机器证伪报告方可自动排除误判。",
+      "根治修 1 破 2：每轮修订后必须过 `@impact-regression-guard` 调用链与门控穿透检查及非零大参数净室往返回归，杜绝半拉子补丁静默退回旧模型。",
+      "严格执行科学深审量化停机门禁：仅四大家族强档（GPT `gpt-6.2-astra`/`gpt-6.2-sol`、Gemini `antigravity-gemini-4-neon`/`antigravity-gemini-4-carbon`、Grok `grok-build`、DeepSeek `deepseek-v4-flash`）计入跨家族覆盖（非四大家族与弱档/轻量档在 `--scientific-gate` 中不计入覆盖），上游 500/429 立即切同家族强档或其余三大家族强档替补，必须经 `oc-review collate --scientific-gate` 达成 `confirmedP0=0 && unverifiedP0=0 && familyCount>=2 && chao1Residual<0.5`（`PASS_READY`）后方可交付。",
+    ],
+  },
 ]);
 
 export function listSwarmPlaybooks(): readonly SwarmPlaybookTemplate[] {
@@ -1092,6 +1168,12 @@ export function expandSwarmPlaybook(
     .map((g) => `- ${g}`)
     .join("\n");
 
+  const coordinationLines = [
+    "- **P2P 交接防瓶颈**：`@name` 是唤醒门铃而非抄送（CC），上下游直接 `@下一环节负责人` 闭环交接与返修，仅在最终 `[done]` 交付、需要拍板或遇阻塞时唤醒 `@coordinator`。",
+    "- **频道与引用降噪**：过程讨论留在对应 `#channel`，`#main` 只发跨区契约与终态；引用前文汇报一律写贴号 `#seq`，禁整段复制转述；本地原生蜂群需复用已读上下文可传 `fork:\"coordinator\"`（远端蜂群靠自包含 `brief` + 贴号 `#seq` 传递上下文）。",
+    "- **收口与分层选模**：多 `share` 写手收口可派专职 `integrator` 预合并并跑完单测再交 `@coordinator` 终审 push；本地原生蜂群可按分工显式指定已放行模型档位（轻探索用快档、重攻坚用高档）。",
+  ].join("\n");
+
   const prompt = [
     `【Swarm 剧本：${template.title} (${template.id})】`,
     `目标任务：${cleanTask}`,
@@ -1099,12 +1181,13 @@ export function expandSwarmPlaybook(
     `角色编排：\n${roleLines}`,
     `频道规划：\n${channelLines}`,
     `执行流程：\n${workflowLines}`,
+    `去中心化协作约定：\n${coordinationLines}`,
     `硬约束与红线：\n${guardrailLines}`,
   ]
     .filter(Boolean)
     .join("\n\n");
 
-  const kickoffBoardMessage = `@all 启动剧本「${template.title}」：${cleanTask}。请按各自角色与红线推进，阶段交接直接 @下一环节负责人。`;
+  const kickoffBoardMessage = `@all 启动剧本「${template.title}」：${cleanTask}。请按各自角色与频道推进，阶段交接直接 @下一环节负责人（勿 CC @coordinator，引用前文写 #seq）。`;
 
   return {
     template,
