@@ -59,6 +59,13 @@ export type BrowserHandoffSpec = Sub & {
   resume_when?: BrowserHandoffResumeWhen;
 };
 
+export type GovernanceApprovalSpec = Sub & {
+  type: "governance_approval";
+  approvalId: string;
+  title?: string;
+  subtitle?: string;
+};
+
 export type V2Spec =
   | DeliverablesSpec
   | CitationsSpec
@@ -66,7 +73,8 @@ export type V2Spec =
   | PromptTemplateSpec
   | StoryboardSpec
   | FlashcardsSpec
-  | BrowserHandoffSpec;
+  | BrowserHandoffSpec
+  | GovernanceApprovalSpec;
 export type V2Type = V2Spec["type"];
 
 const V2_LIMITS = {
@@ -82,6 +90,8 @@ const V2_LIMITS = {
 } as const;
 
 const ID_RE = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/;
+const GOVERNANCE_APPROVAL_ID_RE = /^gov-[a-z0-9_-]{4,80}$/;
+const GOVERNANCE_APPROVAL_ALLOWED_KEYS = new Set(["type", "approvalId", "approval_id", "title", "subtitle"]);
 
 function str(v: unknown, max: number = V2_LIMITS.short): string | undefined {
   if (typeof v === "number" && Number.isFinite(v)) return String(v);
@@ -354,6 +364,22 @@ function browserHandoff(raw: Record<string, unknown>, _ctx: Ctx): BrowserHandoff
   };
 }
 
+function governanceApproval(raw: Record<string, unknown>, _ctx: Ctx): GovernanceApprovalSpec | null {
+  for (const key of Object.keys(raw)) {
+    if (!GOVERNANCE_APPROVAL_ALLOWED_KEYS.has(key)) return null;
+  }
+  const idRaw = raw.approvalId ?? raw.approval_id;
+  if (typeof idRaw !== "string") return null;
+  const approvalId = idRaw.trim();
+  if (!GOVERNANCE_APPROVAL_ID_RE.test(approvalId)) return null;
+  return {
+    type: "governance_approval",
+    approvalId,
+    ...optional("title", str(raw.title, 120)),
+    ...optional("subtitle", str(raw.subtitle, 200)),
+  };
+}
+
 export const V2_VALIDATORS: Record<V2Type, (raw: Record<string, unknown>, ctx: Ctx) => V2Spec | null> = {
   deliverables,
   citations,
@@ -362,6 +388,7 @@ export const V2_VALIDATORS: Record<V2Type, (raw: Record<string, unknown>, ctx: C
   storyboard,
   flashcards,
   browser_handoff: browserHandoff,
+  governance_approval: governanceApproval,
 };
 
 export const V2_ALIASES: Record<string, V2Type> = {
@@ -378,4 +405,6 @@ export const V2_ALIASES: Record<string, V2Type> = {
   browser_login: "browser_handoff",
   live_browser: "browser_handoff",
   takeover: "browser_handoff",
+  gov_approval: "governance_approval",
+  governance_gate: "governance_approval",
 };

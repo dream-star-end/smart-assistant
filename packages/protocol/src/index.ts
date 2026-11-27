@@ -385,3 +385,6 @@ export type {
   WorkspaceSeam,
   WorkspaceStatResult,
 } from './exec-env/index.js'
+
+export { GOVERNANCE_APPROVAL_ID_RE } from './selfhostGovernance.js'
+export type { GovernanceMode, GovernanceEffectiveMode, SafetyLightLevel, GovernanceApprovalKind, GovernanceApprovalClassification, GovernanceApprovalStatus, GovernanceSafetyLightKey, GovernanceResumeStatus, GovernanceSafetyLight, GovernanceStewardVerdict, GovernanceApprovalDecision, PendingGovernanceApproval, DecideGovernanceApprovalRequest, GovernanceCockpitGauge, GovernanceAuditItem, GovernanceModeState, GovernanceBreakerState, GovernanceCockpitSummary, GovernanceOverviewResponse } from './selfhostGovernance.js'

@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
@@ -21,6 +22,8 @@ import {
   computeA0ReceiptHmac,
   verifyA0ApprovalFile,
 } from '../lib/a0ApprovalReceipt.js'
+import { signArchStewardReceipt } from '../lib/archStewardReceipt.js'
+import { ARCH_STEWARD_RECEIPT_SCHEMA_VERSION } from '../lib/archStewardTypes.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const HARNESS_SCRIPTS = path.join(REPO_ROOT, 'scripts/harness-gate')
@@ -967,6 +970,1486 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       assert.ok(existsSync(path.join(refereeDir, 'node_modules/tsx/index.js')))
     } finally {
       spawnSync('chmod', ['-R', 'u+w', tmp])
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  test('OCV5-914 Gate 3 semantic noise reduction (B1/B2/B3/B6): mutual-exclusive classification, mandatory HMAC authoritative steward, AST pure-type/comment whitelist, expanded core, NUL paths, bound vouchers', () => {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'oc-gov-semantic-'))
+    try {
+      const govRoot = path.join(tmp, 'harness-gate')
+      const ctrlDir = path.join(govRoot, 'control')
+      const stewardDir = path.join(govRoot, 'steward-receipts')
+      const repoDir = path.join(tmp, 'repo')
+      mkdirSync(ctrlDir, { recursive: true })
+      mkdirSync(stewardDir, { recursive: true })
+      mkdirSync(path.join(repoDir, 'packages/commercial/src/billing/__tests__'), { recursive: true })
+      mkdirSync(path.join(repoDir, 'packages/commercial/src/payment'), { recursive: true })
+
+      const hmacSecret = 'ocv5-914-steward-hmac-secret-key-0123456789'
+      const hmacPath = path.join(ctrlDir, '.hmac-key')
+      writeFileSync(hmacPath, `${hmacSecret}\n`, { mode: 0o600 })
+      chmodSync(hmacPath, 0o600)
+
+      const gitEnv = {
+        ...process.env,
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_AUTHOR_NAME: 'test',
+        GIT_AUTHOR_EMAIL: 'test@example.invalid',
+        GIT_COMMITTER_NAME: 'test',
+        GIT_COMMITTER_EMAIL: 'test@example.invalid',
+      }
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-C', repoDir, ...args], { env: gitEnv, encoding: 'utf8' }).trim()
+      git('init', '-q', '-b', 'feat/v5-selfhost')
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/proxyBilling.ts'),
+        'export function formatTag(x: number): string {\n  return String(x)\n}\n',
+      )
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/ledger.ts'), 'export const LEDGER = 1\n')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/antigravitySettle.ts'), 'export const SETTLE = 1\n')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/modelSwitchCostPolicy.ts'), 'export const COST = 1\n')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/payment/orders.ts'), 'export const ORDER = 1\n')
+      git('add', '.')
+      git('commit', '-qm', 'chore(v5): base')
+      const baseSha = git('rev-parse', 'HEAD')
+
+      const writeSignedSteward = (
+        headSha: string,
+        opts: {
+          verdict?: 'approve' | 'veto'
+          hmacKey?: string
+          baseSha?: string
+          dryRun?: boolean
+          sameFamily?: boolean
+          spoofedFamily?: boolean
+        } = {},
+      ) => {
+        const unsigned = {
+          schemaVersion: ARCH_STEWARD_RECEIPT_SCHEMA_VERSION,
+          headSha,
+          baseSha: opts.baseSha ?? baseSha,
+          authorModel: 'claude-opus-4-6',
+          authorFamily: (opts.spoofedFamily ? 'openai-gpt' : 'anthropic-claude') as 'anthropic-claude' | 'openai-gpt',
+          stewardModel: opts.sameFamily ? 'claude-sonnet-4-6' : 'gpt-5.4',
+          stewardFamily: (opts.sameFamily ? 'anthropic-claude' : 'openai-gpt') as 'anthropic-claude' | 'openai-gpt',
+          verdict: opts.verdict ?? 'approve',
+          triggers: ['CLONE_OR_T2_CORE_PATH' as const],
+          dimensions: {
+            godClassAppend: { status: 'pass' as const, notes: 'clean' },
+            wheelReinvention: { status: 'pass' as const, notes: 'clean' },
+            boundaryIntegrity: { status: 'pass' as const, notes: 'clean' },
+            complexityDrift: { status: 'pass' as const, notes: 'clean' },
+          },
+          blockers: [],
+          usageEvidence: {
+            jobId: 'job-914-real',
+            timestamp: '2026-11-27T01:00:00Z',
+          },
+        }
+        const signed = signArchStewardReceipt(unsigned, opts.hmacKey)
+        const doc: Record<string, unknown> = { ...signed }
+        if (opts.dryRun) doc.dryRun = true
+        const p = path.join(stewardDir, `${headSha}.json`)
+        writeFileSync(p, `${JSON.stringify(doc, null, 2)}\n`, { mode: 0o644 })
+        chmodSync(p, 0o644)
+        return p
+      }
+
+      const env = {
+        OC_GOVERNOR_ROOT: govRoot,
+        OC_GOVERNOR_NOW_ISO: '2026-11-27T02:00:00Z',
+        OC_GOVERNOR_STEWARD_VERIFIER: path.join(REPO_ROOT, 'scripts/lib/archStewardReceipt.ts'),
+      }
+
+      // 0. Commercial branch -> classification=absolute_reject
+      const auroraRes = runBash(
+        GOVERNOR_SH,
+        ['check-blast-radius', '--branch', 'feat/v5-aurora-rewrite', '--files', 'README.md'],
+        env,
+      )
+      assert.equal(auroraRes.status, 1)
+      const auroraDoc = JSON.parse(auroraRes.stderr)
+      assert.equal(auroraDoc.code, 'COMMERCIAL_BRANCH_HARD_LOCK')
+      assert.equal(auroraDoc.classification, 'absolute_reject')
+
+      // 1. Tightened test exemption: real *.test.* / *.spec.* pass as auto_pass; non-test __tests__/helper.ts MUST be human_review_required!
+      const pureTests = runBash(
+        GOVERNOR_SH,
+        [
+          'check-blast-radius',
+          '--branch',
+          'feat/v5-selfhost',
+          '--files',
+          'packages/commercial/src/billing/__tests__/ledger.test.ts',
+          'packages/commercial/src/billing/boxBillingRecovery.test.ts',
+          'packages/commercial/src/payment/orders.spec.ts',
+        ],
+        env,
+      )
+      assert.equal(pureTests.status, 0, pureTests.stderr)
+      assert.equal(JSON.parse(pureTests.stdout).classification, 'auto_pass')
+
+      const helperInTests = runBash(
+        GOVERNOR_SH,
+        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--files', 'packages/commercial/src/billing/__tests__/helper.ts'],
+        env,
+      )
+      assert.equal(helperInTests.status, 1)
+      assert.equal(JSON.parse(helperInTests.stderr).classification, 'human_review_required')
+
+      // 2. Non-core billing file with PURE comments + import type + export type + type annotation (ZERO runtime JS change!)
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/proxyBilling.ts'),
+        `${[
+          'import type { IncomingMessage } from "node:http"',
+          '// Pure documentation comment',
+          'export type ProxyMeta = { req?: IncomingMessage; label?: string }',
+          'export function formatTag(x: number | bigint): string {',
+          '  return String(x)',
+          '}',
+        ].join('\n')}\n`,
+      )
+      git('commit', '-qam', 'refactor(v5): pure comment and type annotation update in proxyBilling')
+      const pureTypeSha = git('rev-parse', 'HEAD')
+
+      // 2a. Missing --sha -> human_review_required
+      const noShaRes = runBash(
+        GOVERNOR_SH,
+        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--repo-root', repoDir, '--files', 'packages/commercial/src/billing/proxyBilling.ts'],
+        env,
+      )
+      assert.equal(noShaRes.status, 1)
+      assert.equal(JSON.parse(noShaRes.stderr).classification, 'human_review_required')
+
+      // 2b. Plain sha256 steward receipt when .hmac-key is MISSING -> MUST FAIL-CLOSED (ZERO downgrade to plain sha256!)
+      rmSync(hmacPath)
+      writeSignedSteward(pureTypeSha, { hmacKey: undefined })
+      const missingKeyRes = runBash(
+        GOVERNOR_SH,
+        [
+          'check-blast-radius',
+          '--branch',
+          'feat/v5-selfhost',
+          '--repo-root',
+          repoDir,
+          '--sha',
+          pureTypeSha,
+          '--base-ref',
+          baseSha,
+          '--files',
+          'packages/commercial/src/billing/proxyBilling.ts',
+        ],
+        env,
+      )
+      assert.equal(missingKeyRes.status, 1, 'missing .hmac-key MUST NEVER downgrade to plain sha256!')
+      assert.match(JSON.parse(missingKeyRes.stderr).semanticReason, /\.hmac-key/)
+
+      // Restore 0600 .hmac-key
+      writeFileSync(hmacPath, `${hmacSecret}\n`, { mode: 0o600 })
+      chmodSync(hmacPath, 0o600)
+
+      // 2c. Spoofed authorFamily vs real authorModel (claude-opus-4-6 claiming openai) -> rejected by authoritative archStewardReceipt.ts!
+      writeSignedSteward(pureTypeSha, { hmacKey: hmacSecret, spoofedFamily: true })
+      const spoofRes = runBash(
+        GOVERNOR_SH,
+        [
+          'check-blast-radius',
+          '--branch',
+          'feat/v5-selfhost',
+          '--repo-root',
+          repoDir,
+          '--sha',
+          pureTypeSha,
+          '--base-ref',
+          baseSha,
+          '--files',
+          'packages/commercial/src/billing/proxyBilling.ts',
+        ],
+        env,
+      )
+      assert.equal(spoofRes.status, 1, 'spoofed model family claim MUST be rejected by authoritative verifier')
+
+      // 2d. Wrong baseSha in steward receipt -> rejected!
+      writeSignedSteward(pureTypeSha, { hmacKey: hmacSecret, baseSha: '0'.repeat(40) })
+      const wrongBaseRes = runBash(
+        GOVERNOR_SH,
+        [
+          'check-blast-radius',
+          '--branch',
+          'feat/v5-selfhost',
+          '--repo-root',
+          repoDir,
+          '--sha',
+          pureTypeSha,
+          '--base-ref',
+          baseSha,
+          '--files',
+          'packages/commercial/src/billing/proxyBilling.ts',
+        ],
+        env,
+      )
+      assert.equal(wrongBaseRes.status, 1, 'mismatched baseSha in steward receipt MUST be rejected')
+
+      // 2e. Valid HMAC authoritative steward + pure comment/type AST proof -> auto_pass + ok_semantic_noncore audit!
+      writeSignedSteward(pureTypeSha, { hmacKey: hmacSecret })
+      const okNonCore = runBash(
+        GOVERNOR_SH,
+        [
+          'check-blast-radius',
+          '--branch',
+          'feat/v5-selfhost',
+          '--repo-root',
+          repoDir,
+          '--sha',
+          pureTypeSha,
+          '--base-ref',
+          baseSha,
+          '--files',
+          'packages/commercial/src/billing/proxyBilling.ts',
+        ],
+        env,
+      )
+      assert.equal(okNonCore.status, 0, okNonCore.stderr)
+      const okDoc = JSON.parse(okNonCore.stdout)
+      assert.equal(okDoc.ok, true)
+      assert.equal(okDoc.classification, 'auto_pass')
+      assert.equal(okDoc.semanticNonCorePassed, true)
+      const auditLines = readFileSync(path.join(ctrlDir, 'audit.jsonl'), 'utf8')
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l))
+      assert.ok(auditLines.some((ev) => ev.action === 'check_blast_radius' && ev.outcome === 'ok_semantic_noncore'))
+
+      // 3. Non-core billing file with ANY runtime statement (even benign constant) -> MUST be human_review_required!
+      git('checkout', '-q', baseSha)
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/proxyBilling.ts'),
+        'export const PROXY_HEADER = "x-openclaude"\nexport function formatTag(x: number): string {\n  return String(x)\n}\n',
+      )
+      git('commit', '-qam', 'fix(v5): add runtime constant in proxyBilling')
+      const runtimeNonCoreSha = git('rev-parse', 'HEAD')
+      writeSignedSteward(runtimeNonCoreSha, { hmacKey: hmacSecret })
+      const runtimeBlocked = runBash(
+        GOVERNOR_SH,
+        [
+          'check-blast-radius',
+          '--branch',
+          'feat/v5-selfhost',
+          '--repo-root',
+          repoDir,
+          '--sha',
+          runtimeNonCoreSha,
+          '--base-ref',
+          baseSha,
+          '--files',
+          'packages/commercial/src/billing/proxyBilling.ts',
+        ],
+        env,
+      )
+      assert.equal(runtimeBlocked.status, 1, 'runtime edit in non-core billing MUST require human review')
+      const runtimeDoc = JSON.parse(runtimeBlocked.stderr)
+      assert.equal(runtimeDoc.classification, 'human_review_required')
+      assert.equal(runtimeDoc.code, 'BILLING_CORE_LOCKED')
+
+      // 4. Expanded core protection (*Cost* / ledger / settle / payment) -> ALWAYS human_review_required even with pure comment + HMAC steward!
+      git('checkout', '-q', baseSha)
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/modelSwitchCostPolicy.ts'), '// comment\nexport const COST = 1\n')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/ledger.ts'), '// comment\nexport const LEDGER = 1\n')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/antigravitySettle.ts'), '// comment\nexport const SETTLE = 1\n')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/payment/orders.ts'), '// comment\nexport const ORDER = 1\n')
+      git('commit', '-qam', 'docs(v5): comments in core billing/cost/settle/payment')
+      const coreSha = git('rev-parse', 'HEAD')
+      writeSignedSteward(coreSha, { hmacKey: hmacSecret })
+      for (const coreFile of [
+        'packages/commercial/src/billing/modelSwitchCostPolicy.ts',
+        'packages/commercial/src/billing/ledger.ts',
+        'packages/commercial/src/billing/antigravitySettle.ts',
+        'packages/commercial/src/payment/orders.ts',
+      ]) {
+        const res = runBash(
+          GOVERNOR_SH,
+          [
+            'check-blast-radius',
+            '--branch',
+            'feat/v5-selfhost',
+            '--repo-root',
+            repoDir,
+            '--sha',
+            coreSha,
+            '--base-ref',
+            baseSha,
+            '--files',
+            coreFile,
+          ],
+          env,
+        )
+        assert.equal(res.status, 1, `${coreFile} MUST ALWAYS be human_review_required`)
+        const errDoc = JSON.parse(res.stderr)
+        assert.equal(errDoc.classification, 'human_review_required')
+        assert.deepEqual(errDoc.coreBillingFiles, [coreFile])
+      }
+
+      // 5. Empty file list with --sha when commit actually has changes -> fail-closed!
+      const emptyFilesRes = runBash(
+        GOVERNOR_SH,
+        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--repo-root', repoDir, '--sha', coreSha, '--base-ref', baseSha],
+        env,
+      )
+      assert.equal(emptyFilesRes.status, 1)
+      assert.equal(JSON.parse(emptyFilesRes.stderr).code, 'EMPTY_FILE_LIST_MISMATCH')
+
+      // 6. B6: Bound blast voucher enforces exact SHA & branch, and rejects commercial branch on issue!
+      const auroraVoucher = runBash(
+        GOVERNOR_SH,
+        [
+          'issue-blast-voucher',
+          '--scope',
+          'billing',
+          '--branch',
+          'feat/v5-aurora-rewrite',
+          '--files',
+          'packages/commercial/src/billing/ledger.ts',
+          '--reason',
+          'must be blocked on commercial branch',
+        ],
+        env,
+      )
+      assert.notEqual(auroraVoucher.status, 0)
+      assert.match(auroraVoucher.stderr, /COMMERCIAL_BRANCH_HARD_LOCK/)
+
+      const boundVoucherRes = runBash(
+        GOVERNOR_SH,
+        [
+          'issue-blast-voucher',
+          '--scope',
+          'billing',
+          '--sha',
+          coreSha,
+          '--branch',
+          'feat/v5-selfhost',
+          '--approval-id',
+          'gov-billing-boundtest001',
+          '--files',
+          'packages/commercial/src/billing/ledger.ts',
+          '--reason',
+          'Bound to exact coreSha on selfhost',
+        ],
+        env,
+      )
+      assert.equal(boundVoucherRes.status, 0, boundVoucherRes.stderr)
+      const boundVoucher = JSON.parse(boundVoucherRes.stdout)
+      assert.equal(boundVoucher.sha, coreSha)
+      assert.equal(boundVoucher.branch, 'feat/v5-selfhost')
+
+      // Matching SHA + branch -> PASS
+      const boundOk = runBash(
+        GOVERNOR_SH,
+        [
+          'check-blast-radius',
+          '--branch',
+          'feat/v5-selfhost',
+          '--repo-root',
+          repoDir,
+          '--sha',
+          coreSha,
+          '--base-ref',
+          baseSha,
+          '--voucher',
+          boundVoucher.id,
+          '--files',
+          'packages/commercial/src/billing/ledger.ts',
+        ],
+        env,
+      )
+      assert.equal(boundOk.status, 0, boundOk.stderr)
+
+      // Different SHA -> VOUCHER_SHA_MISMATCH!
+      const wrongShaVoucher = runBash(
+        GOVERNOR_SH,
+        [
+          'check-blast-radius',
+          '--branch',
+          'feat/v5-selfhost',
+          '--repo-root',
+          repoDir,
+          '--sha',
+          runtimeNonCoreSha,
+          '--base-ref',
+          baseSha,
+          '--voucher',
+          boundVoucher.id,
+          '--files',
+          'packages/commercial/src/billing/ledger.ts',
+        ],
+        env,
+      )
+      assert.equal(wrongShaVoucher.status, 1)
+      assert.equal(JSON.parse(wrongShaVoucher.stderr).code, 'VOUCHER_SHA_MISMATCH')
+
+      // Different branch -> VOUCHER_BRANCH_MISMATCH!
+      const wrongBranchVoucher = runBash(
+        GOVERNOR_SH,
+        [
+          'check-blast-radius',
+          '--branch',
+          'feat/other-branch',
+          '--repo-root',
+          repoDir,
+          '--sha',
+          coreSha,
+          '--base-ref',
+          baseSha,
+          '--voucher',
+          boundVoucher.id,
+          '--files',
+          'packages/commercial/src/billing/ledger.ts',
+        ],
+        env,
+      )
+      assert.equal(wrongBranchVoucher.status, 1)
+      assert.equal(JSON.parse(wrongBranchVoucher.stderr).code, 'VOUCHER_BRANCH_MISMATCH')
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  test('OCV5-914 Gate 3b atomic single-writer (B4/B5/B6/NB6): create-only idempotency, 2-process concurrent decide flock, A0 allowed-path binding, resume updates, rollback/reconcile, tripped breaker mode guard', async () => {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'oc-gov-pending-'))
+    try {
+      const govRoot = path.join(tmp, 'harness-gate')
+      const ctrlDir = path.join(govRoot, 'control')
+      const stewardDir = path.join(govRoot, 'steward-receipts')
+      mkdirSync(ctrlDir, { recursive: true })
+      mkdirSync(stewardDir, { recursive: true })
+
+      const hmacSecret = 'pending-approval-hmac-secret-914'
+      const hmacPath = path.join(ctrlDir, '.hmac-key')
+      writeFileSync(hmacPath, `${hmacSecret}\n`, { mode: 0o600 })
+      chmodSync(hmacPath, 0o600)
+
+      const sha = 'a'.repeat(40)
+      const baseSha = 'b'.repeat(40)
+      const signedSteward = signArchStewardReceipt(
+        {
+          schemaVersion: ARCH_STEWARD_RECEIPT_SCHEMA_VERSION,
+          headSha: sha,
+          baseSha,
+          authorModel: 'claude-opus-4-6',
+          authorFamily: 'anthropic-claude',
+          stewardModel: 'gpt-5.4',
+          stewardFamily: 'openai-gpt',
+          verdict: 'approve',
+          triggers: ['CLONE_OR_T2_CORE_PATH'],
+          dimensions: {
+            godClassAppend: { status: 'pass', notes: 'ok' },
+            wheelReinvention: { status: 'pass', notes: 'ok' },
+            boundaryIntegrity: { status: 'pass', notes: 'ok' },
+            complexityDrift: { status: 'pass', notes: 'ok' },
+          },
+          blockers: [],
+          usageEvidence: { jobId: 'job-steward-914', timestamp: '2026-11-27T01:30:00Z' },
+        },
+        hmacSecret,
+      )
+      writeFileSync(path.join(stewardDir, `${sha}.json`), `${JSON.stringify(signedSteward, null, 2)}\n`, { mode: 0o644 })
+
+      const env = {
+        OC_GOVERNOR_ROOT: govRoot,
+        OC_GOVERNOR_NOW_ISO: '2026-11-27T02:00:00Z',
+        OC_GOVERNOR_STEWARD_VERIFIER: path.join(REPO_ROOT, 'scripts/lib/archStewardReceipt.ts'),
+        OC_GOVERNOR_UNSAFE_TEST_SKIP_OWNER: '1',
+      }
+
+      // 1. Path traversal / invalid ID, commercial branch, and absolute_reject MUST be rejected
+      for (const badId of ['../escape', 'gov-../x', 'bad-id-1234', 'gov-ab', 'gov-UPPERCASE']) {
+        const bad = runBash(
+          GOVERNOR_SH,
+          ['record-pending-approval', '--id', badId, '--kind', 'blast_voucher', '--code', 'BILLING_CORE_LOCKED', '--branch', 'feat/v5-selfhost'],
+          env,
+        )
+        assert.notEqual(bad.status, 0, `invalid id ${badId} MUST fail`)
+      }
+      const auroraRec = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          'gov-billing-aurora000001',
+          '--kind',
+          'blast_voucher',
+          '--code',
+          'BILLING_CORE_LOCKED',
+          '--branch',
+          'feat/v5-aurora-rewrite',
+          '--files',
+          'packages/commercial/src/billing/ledger.ts',
+        ],
+        env,
+      )
+      assert.notEqual(auroraRec.status, 0)
+      assert.match(auroraRec.stderr, /COMMERCIAL_BRANCH_HARD_LOCK/)
+
+      const absRec = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          'gov-billing-absrej000001',
+          '--kind',
+          'blast_voucher',
+          '--code',
+          'COMMERCIAL_BRANCH_HARD_LOCK',
+          '--classification',
+          'absolute_reject',
+          '--branch',
+          'feat/v5-selfhost',
+        ],
+        env,
+      )
+      assert.notEqual(absRec.status, 0)
+      assert.match(absRec.stderr, /ABSOLUTE_REJECT_FORBIDDEN/)
+
+      // 2. Create-only idempotency on pending approval: second call at later timestamp MUST NOT overwrite title or refresh TTL!
+      // B2: Pass explicit --base-ref when running outside a git repo so authoritative steward verification binds exact baseSha.
+      const rec1 = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          'gov-billing-aaaaaaaaaaaa',
+          '--kind',
+          'blast_voucher',
+          '--code',
+          'BILLING_CORE_LOCKED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--sha',
+          sha,
+          '--base-ref',
+          baseSha,
+          '--train',
+          'tr-914-01',
+          '--ticket',
+          'OCV5-914',
+          '--total-files',
+          '5',
+          '--files',
+          'packages/commercial/src/billing/ledger.ts',
+        ],
+        env,
+      )
+      assert.equal(rec1.status, 0, rec1.stderr)
+      const doc1 = JSON.parse(rec1.stdout)
+      assert.equal(doc1.version, 1)
+      assert.equal(doc1.classification, 'human_review_required')
+      assert.equal(doc1.stewardVerdict.verdict, 'approve')
+      assert.equal(doc1.stewardVerdict.hmacVerified, true)
+
+      const rec1Again = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          'gov-billing-aaaaaaaaaaaa',
+          '--kind',
+          'blast_voucher',
+          '--code',
+          'BILLING_CORE_LOCKED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--title',
+          'SHOULD NOT OVERWRITE',
+          '--ttl-hours',
+          '48',
+        ],
+        { ...env, OC_GOVERNOR_NOW_ISO: '2026-11-27T05:00:00Z' },
+      )
+      assert.equal(rec1Again.status, 0, rec1Again.stderr)
+      const doc1Again = JSON.parse(rec1Again.stdout)
+      assert.equal(doc1Again.expiresAt, doc1.expiresAt, 'create-only record MUST NOT refresh TTL')
+      assert.equal(doc1Again.title, doc1.title, 'create-only record MUST NOT overwrite existing pending record')
+      assert.equal(doc1Again.sha256, doc1.sha256)
+
+      // 3. Optimistic lock mismatch rejected cleanly
+      const badVer = runBash(
+        GOVERNOR_SH,
+        [
+          'decide-pending-approval',
+          '--id',
+          'gov-billing-aaaaaaaaaaaa',
+          '--decision',
+          'approve',
+          '--actor',
+          'admin-uid3',
+          '--expected-version',
+          '99',
+        ],
+        env,
+      )
+      assert.notEqual(badVer.status, 0)
+      assert.match(badVer.stderr, /CONFLICT_VERSION_MISMATCH/)
+
+      // 4. Real 2-process concurrent decide-pending-approval under per-ID flock -> EXACTLY 1 wins, 1 conflicts, ONLY 1 voucher!
+      const spawnAsync = (args: string[]) =>
+        new Promise<{ status: number; stdout: string; stderr: string }>((resolve, reject) => {
+          const child = spawn('bash', [GOVERNOR_SH, ...args], {
+            env: { ...process.env, ...env },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          })
+          let stdout = ''
+          let stderr = ''
+          child.stdout.setEncoding('utf8')
+          child.stderr.setEncoding('utf8')
+          child.stdout.on('data', (d) => { stdout += d })
+          child.stderr.on('data', (d) => { stderr += d })
+          child.on('error', reject)
+          child.on('close', (code) => resolve({ status: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() }))
+        })
+
+      const [c1, c2] = await Promise.all([
+        spawnAsync([
+          'decide-pending-approval',
+          '--id',
+          'gov-billing-aaaaaaaaaaaa',
+          '--decision',
+          'approve',
+          '--actor',
+          'admin-proc-1',
+          '--expected-version',
+          '1',
+          '--expected-sha256',
+          doc1.sha256,
+          '--note',
+          'Concurrent race A',
+        ]),
+        spawnAsync([
+          'decide-pending-approval',
+          '--id',
+          'gov-billing-aaaaaaaaaaaa',
+          '--decision',
+          'approve',
+          '--actor',
+          'admin-proc-2',
+          '--expected-version',
+          '1',
+          '--expected-sha256',
+          doc1.sha256,
+          '--note',
+          'Concurrent race B',
+        ]),
+      ])
+      const winners = [c1, c2].filter((r) => r.status === 0)
+      const losers = [c1, c2].filter((r) => r.status !== 0)
+      assert.equal(winners.length, 1, `expected exactly 1 concurrent winner: c1=${c1.status}/${c1.stderr} c2=${c2.status}/${c2.stderr}`)
+      assert.equal(losers.length, 1)
+      assert.match(losers[0]!.stderr, /ALREADY_RESOLVED|CONFLICT_VERSION_MISMATCH|CONFLICT_SHA256_MISMATCH/)
+      const winDoc = JSON.parse(winners[0]!.stdout)
+      assert.equal(winDoc.status, 'approved')
+      assert.equal(winDoc.version, 2)
+      assert.equal(winDoc.decision.resumeStatus, 'not_started')
+      assert.match(winDoc.decision.issuedArtifactId, /^bv-[0-9a-f]{16}$/)
+      const voucherFiles = readdirSync(path.join(ctrlDir, 'blast-vouchers')).filter((f) => f.endsWith('.json'))
+      assert.equal(voucherFiles.length, 1, 'concurrent race MUST mint exactly ONE voucher artifact')
+      const mintedVoucher = JSON.parse(readFileSync(path.join(ctrlDir, 'blast-vouchers', voucherFiles[0]!), 'utf8'))
+      assert.equal(mintedVoucher.sha, sha)
+      assert.equal(mintedVoucher.branch, 'feat/v5-selfhost')
+      assert.equal(mintedVoucher.approvalId, 'gov-billing-aaaaaaaaaaaa')
+
+      // 5. update-approval-resume updates approved record & increments version
+      const resBusy = runBash(
+        GOVERNOR_SH,
+        [
+          'update-approval-resume',
+          '--id',
+          'gov-billing-aaaaaaaaaaaa',
+          '--status',
+          'not_started_busy',
+          '--detail',
+          'deploy lock held by active train',
+        ],
+        env,
+      )
+      assert.equal(resBusy.status, 0, resBusy.stderr)
+      const busyDoc = JSON.parse(resBusy.stdout)
+      assert.equal(busyDoc.version, 3)
+      assert.equal(busyDoc.decision.resumeStatus, 'not_started_busy')
+
+      const resStarted = runBash(
+        GOVERNOR_SH,
+        [
+          'update-approval-resume',
+          '--id',
+          'gov-billing-aaaaaaaaaaaa',
+          '--status',
+          'started',
+          '--unit',
+          'oc-v5-gov-resume-01',
+          '--detail',
+          'systemd unit started',
+        ],
+        env,
+      )
+      assert.equal(resStarted.status, 0, resStarted.stderr)
+      assert.equal(JSON.parse(resStarted.stdout).version, 4)
+      assert.equal(JSON.parse(resStarted.stdout).decision.resumeUnit, 'oc-v5-gov-resume-01')
+
+      // 6. A0 approval: enforces per-file --allowed-path binding, and rejects empty files without --allow-whole-commit!
+      const a0Sha = 'e'.repeat(40)
+      const recA0Scoped = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          'gov-a0-scoped000001',
+          '--kind',
+          'a0_approval',
+          '--code',
+          'A0_RELAXATION_REQUIRED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--sha',
+          a0Sha,
+          '--files',
+          'arch/a0-protected-paths.json',
+        ],
+        env,
+      )
+      assert.equal(recA0Scoped.status, 0, recA0Scoped.stderr)
+      const decA0Scoped = runBash(
+        GOVERNOR_SH,
+        [
+          'decide-pending-approval',
+          '--id',
+          'gov-a0-scoped000001',
+          '--decision',
+          'approve',
+          '--actor',
+          'admin-uid3',
+          '--note',
+          'Approve single A0 manifest edit',
+        ],
+        env,
+      )
+      assert.equal(decA0Scoped.status, 0, decA0Scoped.stderr)
+      const a0Doc = JSON.parse(readFileSync(path.join(ctrlDir, `a0-approvals/${a0Sha}.json`), 'utf8'))
+      assert.deepEqual(a0Doc.allowedPaths, ['arch/a0-protected-paths.json'], 'A0 approval MUST bind exact allowedPaths, never silent wildcard *')
+
+      const a0WholeSha = 'f'.repeat(40)
+      const recA0Empty = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          'gov-a0-whole0000001',
+          '--kind',
+          'a0_approval',
+          '--code',
+          'A0_RELAXATION_REQUIRED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--sha',
+          a0WholeSha,
+        ],
+        env,
+      )
+      assert.equal(recA0Empty.status, 0, recA0Empty.stderr)
+      const decA0EmptyDenied = runBash(
+        GOVERNOR_SH,
+        ['decide-pending-approval', '--id', 'gov-a0-whole0000001', '--decision', 'approve', '--actor', 'admin-uid3'],
+        env,
+      )
+      assert.notEqual(decA0EmptyDenied.status, 0)
+      assert.match(decA0EmptyDenied.stderr, /A0_WHOLE_COMMIT_CONFIRM_REQUIRED/)
+
+      // 7. Pre-mint failure rolls back to pending with lastError; post-mint failure records reconcile_required!
+      const recFail = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          'gov-billing-failtest001',
+          '--kind',
+          'blast_voucher',
+          '--code',
+          'BILLING_CORE_LOCKED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--sha',
+          'c'.repeat(40),
+          '--files',
+          'packages/commercial/src/billing/ledger.ts',
+        ],
+        env,
+      )
+      assert.equal(recFail.status, 0, recFail.stderr)
+
+      const preFail = runBash(
+        GOVERNOR_SH,
+        ['decide-pending-approval', '--id', 'gov-billing-failtest001', '--decision', 'approve', '--actor', 'admin-uid3'],
+        { ...env, OC_GOVERNOR_TEST_FAIL_BEFORE_MINT: '1' },
+      )
+      assert.notEqual(preFail.status, 0)
+      assert.match(preFail.stderr, /ARTIFACT_MINT_FAILED/)
+      const rolledBack = JSON.parse(readFileSync(path.join(ctrlDir, 'pending-approvals/gov-billing-failtest001.json'), 'utf8'))
+      assert.equal(rolledBack.status, 'pending')
+      assert.match(rolledBack.lastError, /simulated pre-mint failure/)
+
+      const postFail = runBash(
+        GOVERNOR_SH,
+        ['decide-pending-approval', '--id', 'gov-billing-failtest001', '--decision', 'approve', '--actor', 'admin-uid3'],
+        { ...env, OC_GOVERNOR_TEST_FAIL_AFTER_MINT: '1' },
+      )
+      assert.notEqual(postFail.status, 0)
+      assert.match(postFail.stderr, /RECONCILE_REQUIRED/)
+      const reconciled = JSON.parse(readFileSync(path.join(ctrlDir, 'pending-approvals/gov-billing-failtest001.json'), 'utf8'))
+      assert.equal(reconciled.status, 'reconcile_required')
+      assert.match(reconciled.decision.issuedArtifactId, /^bv-[0-9a-f]{16}$/)
+
+      // 8. NB6-host: tripped circuit breaker rejects 'mode autonomous' with BREAKER_TRIPPED_USE_UNLOCK,
+      // and breaker_unlock approval requires >= 8 char note!
+      const trip = runBash(GOVERNOR_SH, ['trip-breaker', '--train', 'tr-nb6', '--reason', 'retention regression'], env)
+      assert.equal(trip.status, 0, trip.stderr)
+      const badAuto = runBash(GOVERNOR_SH, ['mode', 'autonomous', '--reason', 'try bypass breaker'], env)
+      assert.notEqual(badAuto.status, 0)
+      assert.match(badAuto.stderr, /BREAKER_TRIPPED_USE_UNLOCK/)
+
+      const recUnlock = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          'gov-breaker-unlock0001',
+          '--kind',
+          'breaker_unlock',
+          '--code',
+          'CIRCUIT_BREAKER_TRIPPED',
+          '--branch',
+          'feat/v5-selfhost',
+        ],
+        env,
+      )
+      assert.equal(recUnlock.status, 0, recUnlock.stderr)
+      const shortNoteUnlock = runBash(
+        GOVERNOR_SH,
+        ['decide-pending-approval', '--id', 'gov-breaker-unlock0001', '--decision', 'approve', '--actor', 'admin-uid3', '--note', 'short'],
+        env,
+      )
+      assert.notEqual(shortNoteUnlock.status, 0)
+      assert.match(shortNoteUnlock.stderr, /REASON_TOO_SHORT/)
+
+      const okUnlock = runBash(
+        GOVERNOR_SH,
+        [
+          'decide-pending-approval',
+          '--id',
+          'gov-breaker-unlock0001',
+          '--decision',
+          'approve',
+          '--actor',
+          'admin-uid3',
+          '--note',
+          'Root cause fixed and retention 6/6 verified green',
+        ],
+        env,
+      )
+      assert.equal(okUnlock.status, 0, okUnlock.stderr)
+      assert.equal(JSON.parse(readFileSync(path.join(ctrlDir, 'breaker.json'), 'utf8')).tripped, false)
+      assert.equal(JSON.parse(readFileSync(path.join(ctrlDir, 'mode.json'), 'utf8')).mode, 'autonomous')
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  test('OCV5-914 R2 hardening (B2/B3/B4/B6/B7/N1/N2): unified baseSha, safe SQL whitelist & lossless paths, approving crash self-heal, explicit voucher check on clean files, atomic resume claim, expired reopen, web A0 GitHub status', async () => {
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'oc-gov-r2-'))
+    try {
+      const govRoot = path.join(tmp, 'harness-gate')
+      const ctrlDir = path.join(govRoot, 'control')
+      const stewardDir = path.join(govRoot, 'steward-receipts')
+      const pendingDir = path.join(ctrlDir, 'pending-approvals')
+      const vouchersDir = path.join(ctrlDir, 'blast-vouchers')
+      const approvalsDir = path.join(ctrlDir, 'a0-approvals')
+      const repoDir = path.join(tmp, 'repo')
+      mkdirSync(stewardDir, { recursive: true })
+      mkdirSync(ctrlDir, { recursive: true })
+      mkdirSync(path.join(repoDir, 'packages/commercial/src/billing'), { recursive: true })
+      mkdirSync(path.join(repoDir, 'packages/commercial/src/db/migrations'), { recursive: true })
+
+      const hmacSecret = 'ocv5-914-r2-hmac-secret-0123456789'
+      const hmacPath = path.join(ctrlDir, '.hmac-key')
+      writeFileSync(hmacPath, `${hmacSecret}\n`, { mode: 0o600 })
+      chmodSync(hmacPath, 0o600)
+
+      const gitEnv = {
+        ...process.env,
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_AUTHOR_NAME: 'test',
+        GIT_AUTHOR_EMAIL: 'test@example.invalid',
+        GIT_COMMITTER_NAME: 'test',
+        GIT_COMMITTER_EMAIL: 'test@example.invalid',
+      }
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-C', repoDir, ...args], { env: gitEnv, encoding: 'utf8' }).trim()
+      git('init', '-q', '-b', 'feat/v5-selfhost')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/proxyBilling.ts'), 'export function tag(x: number): string { return String(x) }\n')
+      writeFileSync(path.join(repoDir, 'README.md'), 'root\n')
+      git('add', '.')
+      git('commit', '-qm', 'chore(v5): root commit')
+      const rootSha = git('rev-parse', 'HEAD')
+
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/proxyBilling.ts'),
+        '// R2 pure comment\nexport type R2Meta = { ok: boolean }\nexport function tag(x: number | bigint): string { return String(x) }\n',
+      )
+      git('commit', '-qam', 'refactor(v5): pure comment and type update')
+      const childSha = git('rev-parse', 'HEAD')
+
+      const writeSteward = (headSha: string, baseSha: string) => {
+        const signed = signArchStewardReceipt(
+          {
+            schemaVersion: ARCH_STEWARD_RECEIPT_SCHEMA_VERSION,
+            headSha,
+            baseSha,
+            authorModel: 'claude-opus-4-6',
+            authorFamily: 'anthropic-claude',
+            stewardModel: 'gpt-5.4',
+            stewardFamily: 'openai-gpt',
+            verdict: 'approve',
+            triggers: ['CLONE_OR_T2_CORE_PATH'],
+            dimensions: {
+              godClassAppend: { status: 'pass', notes: 'ok' },
+              wheelReinvention: { status: 'pass', notes: 'ok' },
+              boundaryIntegrity: { status: 'pass', notes: 'ok' },
+              complexityDrift: { status: 'pass', notes: 'ok' },
+            },
+            blockers: [],
+            usageEvidence: { jobId: 'job-r2', timestamp: '2026-11-27T01:00:00Z' },
+          },
+          hmacSecret,
+        )
+        writeFileSync(path.join(stewardDir, `${headSha}.json`), `${JSON.stringify(signed, null, 2)}\n`, { mode: 0o644 })
+      }
+      writeSteward(childSha, rootSha)
+      writeSteward(rootSha, '0'.repeat(40))
+
+      const env = {
+        OC_GOVERNOR_ROOT: govRoot,
+        OC_GOVERNOR_NOW_ISO: '2026-11-27T02:00:00Z',
+        OC_GOVERNOR_STEWARD_VERIFIER: path.join(REPO_ROOT, 'scripts/lib/archStewardReceipt.ts'),
+        OC_GOVERNOR_UNSAFE_TEST_SKIP_OWNER: '1',
+      }
+
+      // ── B2: Unified exact baseSha binding ──
+      // 1a. Omitting --base-ref on childSha automatically resolves childSha^ (= rootSha) for BOTH AST & steward -> auto_pass!
+      const b2AutoOk = runBash(
+        GOVERNOR_SH,
+        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--repo-root', repoDir, '--sha', childSha, '--files', 'packages/commercial/src/billing/proxyBilling.ts'],
+        env,
+      )
+      assert.equal(b2AutoOk.status, 0, b2AutoOk.stderr)
+      assert.equal(JSON.parse(b2AutoOk.stdout).semanticNonCorePassed, true)
+
+      // 1b. Omitting --base-ref on rootSha (no parent commit) -> fail-closed AND record-pending-approval marks stewardVerdict invalid!
+      const b2RootFail = runBash(
+        GOVERNOR_SH,
+        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--repo-root', repoDir, '--sha', rootSha, '--files', 'packages/commercial/src/billing/proxyBilling.ts'],
+        env,
+      )
+      assert.equal(b2RootFail.status, 1)
+      assert.match(JSON.parse(b2RootFail.stderr).semanticReason, /无法确定精确比较基线/)
+
+      const b2RecRoot = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          'gov-billing-b2root000001',
+          '--kind',
+          'blast_voucher',
+          '--code',
+          'BILLING_CORE_LOCKED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--repo-root',
+          repoDir,
+          '--sha',
+          rootSha,
+          '--files',
+          'packages/commercial/src/billing/proxyBilling.ts',
+        ],
+        env,
+      )
+      assert.equal(b2RecRoot.status, 0, b2RecRoot.stderr)
+      const b2RecDoc = JSON.parse(b2RecRoot.stdout)
+      assert.equal(b2RecDoc.stewardVerdict.verdict, 'invalid')
+      assert.match(b2RecDoc.stewardVerdict.summary, /无法确定比较基线/)
+
+      // ── B3: Conservative SQL DDL whitelist + lossless paths + control-char rejection ──
+      const safeSql = [
+        '-- leading comment with DROP TABLE decoy',
+        'BEGIN;',
+        "SET LOCAL lock_timeout = '3s';",
+        '/* block comment with TRUNCATE decoy */',
+        'CREATE TABLE IF NOT EXISTS audit_events (id bigserial PRIMARY KEY, note text);',
+        'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_events_id ON audit_events (id);',
+        "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS tag text DEFAULT 'DROP TABLE literal';",
+        'ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS "meta--safe" text DEFAULT E\'safe\\\'--val\';',
+        "COMMENT ON TABLE audit_events IS 'safe additive table';",
+        'COMMIT;',
+      ].join('\n')
+      const safeSqlRes = runBash(
+        GOVERNOR_SH,
+        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--sql', safeSql],
+        env,
+      )
+      assert.equal(safeSqlRes.status, 0, `safe additive SQL should auto_pass: ${safeSqlRes.stderr}`)
+      assert.equal(JSON.parse(safeSqlRes.stdout).classification, 'auto_pass')
+
+      for (const unsafeSql of [
+        'DROP TABLE users;',
+        'TRUNCATE TABLE credit_ledger;',
+        'DELETE FROM org_wallets WHERE id = 1;',
+        'ALTER TABLE users ADD COLUMN x int, ALTER y TYPE bigint;',
+        'ALTER TABLE users ADD COLUMN "x--" integer, DROP COLUMN email;',
+        'ALTER TABLE users ADD COLUMN "a""--" integer, DROP COLUMN email;',
+        'ALTER TABLE users ADD COLUMN "a/*b" integer, DROP COLUMN email;',
+        "ALTER TABLE users ADD COLUMN x text DEFAULT E'\\'' , DROP COLUMN email;",
+        'ALTER TABLE users ADD COLUMN "unclosed_ident integer;',
+        'DO $$ BEGIN PERFORM 1; END $$;',
+        "UPDATE users SET role = 'admin';",
+        'ALTER TABLE users RENAME TO users_old;',
+      ]) {
+        const res = runBash(
+          GOVERNOR_SH,
+          ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--sql', unsafeSql],
+          env,
+        )
+        assert.equal(res.status, 1, `unsafe/unrecognized SQL MUST fail closed: ${unsafeSql}`)
+        assert.equal(JSON.parse(res.stderr).code, 'DESTRUCTIVE_DDL_LOCKED')
+      }
+
+      // Lossless path with comma & space via --files-json + control-char rejection
+      const specialPath = 'packages/commercial/src/billing/a,b file.ts'
+      const ctrlReject = runBash(
+        GOVERNOR_SH,
+        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--files-json', JSON.stringify(['packages/commercial/src/billing/bad\nfile.ts'])],
+        env,
+      )
+      assert.notEqual(ctrlReject.status, 0, 'control characters in file paths MUST be rejected')
+      const specialRec = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          'gov-billing-special00001',
+          '--kind',
+          'blast_voucher',
+          '--code',
+          'BILLING_CORE_LOCKED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--sha',
+          childSha,
+          '--files-json',
+          JSON.stringify([specialPath]),
+        ],
+        env,
+      )
+      assert.equal(specialRec.status, 0, specialRec.stderr)
+      assert.deepEqual(JSON.parse(specialRec.stdout).files, [specialPath])
+
+      // ── B6: Explicit --voucher MUST validate sha/branch even when changed files are clean! ──
+      const vCleanRes = runBash(
+        GOVERNOR_SH,
+        [
+          'issue-blast-voucher',
+          '--scope',
+          'billing',
+          '--sha',
+          childSha,
+          '--branch',
+          'feat/v5-selfhost',
+          '--files-json',
+          JSON.stringify([specialPath]),
+          '--reason',
+          'Bound voucher for childSha only',
+        ],
+        env,
+      )
+      assert.equal(vCleanRes.status, 0, vCleanRes.stderr)
+      const vClean = JSON.parse(vCleanRes.stdout)
+      const cleanWrongSha = runBash(
+        GOVERNOR_SH,
+        [
+          'check-blast-radius',
+          '--branch',
+          'feat/v5-selfhost',
+          '--repo-root',
+          repoDir,
+          '--sha',
+          rootSha,
+          '--voucher',
+          vClean.id,
+          '--files',
+          'README.md',
+        ],
+        env,
+      )
+      assert.equal(cleanWrongSha.status, 1, 'explicit --voucher with mismatched SHA MUST fail even on clean files')
+      assert.equal(JSON.parse(cleanWrongSha.stderr).code, 'VOUCHER_SHA_MISMATCH')
+
+      // ── B4: Crash self-healing for stale status="approving" ──
+      const computePendingSig = (doc: Record<string, unknown>) => {
+        const sortRec = (v: unknown): unknown => {
+          if (Array.isArray(v)) return v.map(sortRec)
+          if (v && typeof v === 'object') {
+            const out: Record<string, unknown> = {}
+            for (const k of Object.keys(v as Record<string, unknown>).sort()) {
+              out[k] = sortRec((v as Record<string, unknown>)[k])
+            }
+            return out
+          }
+          return v
+        }
+        const { sha256: _ignoredSha256, ...clone } = doc
+        void _ignoredSha256
+        return createHash('sha256').update(`pending-approval-v1\n${JSON.stringify(sortRec(clone))}`, 'utf8').digest('hex')
+      }
+
+      // Case 4a: Voucher WAS minted before crash -> reconcile / decide advances to approved reusing pendingArtifactId (NO duplicate voucher!)
+      const crashIdPresent = 'gov-billing-crashpres001'
+      const recCrash1 = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          crashIdPresent,
+          '--kind',
+          'blast_voucher',
+          '--code',
+          'BILLING_CORE_LOCKED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--sha',
+          childSha,
+          '--files-json',
+          JSON.stringify([specialPath]),
+        ],
+        env,
+      )
+      assert.equal(recCrash1.status, 0, recCrash1.stderr)
+      const crashDoc1 = JSON.parse(recCrash1.stdout)
+      const expectedPid = `bv-${createHash('sha256').update(`${crashIdPresent}:1:${childSha}`, 'utf8').digest('hex').slice(0, 16)}`
+      // Pre-mint the deterministic voucher and put approval file into stale "approving"
+      const preMint = runBash(
+        GOVERNOR_SH,
+        [
+          'issue-blast-voucher',
+          '--id',
+          expectedPid,
+          '--scope',
+          'billing',
+          '--sha',
+          childSha,
+          '--branch',
+          'feat/v5-selfhost',
+          '--approval-id',
+          crashIdPresent,
+          '--files-json',
+          JSON.stringify([specialPath]),
+          '--reason',
+          'Simulated pre-crash minted voucher',
+        ],
+        env,
+      )
+      assert.equal(preMint.status, 0, preMint.stderr)
+      const stale1: Record<string, unknown> = {
+        ...crashDoc1,
+        status: 'approving',
+        pendingArtifactId: expectedPid,
+        decision: { action: 'approve', decidedBy: 'admin-crash', decidedAt: '2026-11-27T02:00:00Z' },
+      }
+      stale1.sha256 = computePendingSig(stale1)
+      writeFileSync(path.join(pendingDir, `${crashIdPresent}.json`), `${JSON.stringify(stale1, null, 2)}\n`)
+      const vouchersBefore = readdirSync(vouchersDir).filter((f) => f.endsWith('.json')).length
+      const healDecide = runBash(
+        GOVERNOR_SH,
+        ['decide-pending-approval', '--id', crashIdPresent, '--decision', 'approve', '--actor', 'admin-retry'],
+        env,
+      )
+      assert.equal(healDecide.status, 0, healDecide.stderr)
+      const healedDoc1 = JSON.parse(healDecide.stdout)
+      assert.equal(healedDoc1.status, 'approved')
+      assert.equal(healedDoc1.decision.issuedArtifactId, expectedPid)
+      assert.equal(readdirSync(vouchersDir).filter((f) => f.endsWith('.json')).length, vouchersBefore, 'must NOT mint duplicate voucher')
+
+      // Case 4b: Voucher NOT minted before crash -> reconcile rolls back to pending
+      const crashIdAbsent = 'gov-billing-crashabs0001'
+      const recCrash2 = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          crashIdAbsent,
+          '--kind',
+          'blast_voucher',
+          '--code',
+          'BILLING_CORE_LOCKED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--sha',
+          childSha,
+          '--files-json',
+          JSON.stringify([specialPath]),
+        ],
+        env,
+      )
+      assert.equal(recCrash2.status, 0, recCrash2.stderr)
+      const crashDoc2 = JSON.parse(recCrash2.stdout)
+      const stale2: Record<string, unknown> = {
+        ...crashDoc2,
+        status: 'approving',
+        pendingArtifactId: 'bv-0000000000000000',
+        decision: { action: 'approve', decidedBy: 'admin-crash', decidedAt: '2026-11-27T02:00:00Z' },
+      }
+      stale2.sha256 = computePendingSig(stale2)
+      writeFileSync(path.join(pendingDir, `${crashIdAbsent}.json`), `${JSON.stringify(stale2, null, 2)}\n`)
+      const recHeal2 = runBash(GOVERNOR_SH, ['reconcile-pending-approval', '--id', crashIdAbsent], env)
+      assert.equal(recHeal2.status, 0, recHeal2.stderr)
+      assert.equal(JSON.parse(recHeal2.stdout).status, 'pending')
+
+      // Case 4c: a0_approval with publishGithubStatus=true and local .json present without .gh.json -> reconcile_required
+      const a0CrashSha = '9'.repeat(40)
+      const crashIdA0 = 'gov-a0-crashgh000001'
+      const recCrashA0 = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          crashIdA0,
+          '--kind',
+          'a0_approval',
+          '--code',
+          'A0_RELAXATION_REQUIRED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--sha',
+          a0CrashSha,
+          '--files',
+          'arch/a0-protected-paths.json',
+        ],
+        env,
+      )
+      assert.equal(recCrashA0.status, 0, recCrashA0.stderr)
+      mkdirSync(approvalsDir, { recursive: true })
+      writeFileSync(path.join(approvalsDir, `${a0CrashSha}.json`), JSON.stringify({ sha: a0CrashSha }))
+      const staleA0: Record<string, unknown> = {
+        ...JSON.parse(recCrashA0.stdout),
+        status: 'approving',
+        pendingArtifactId: `a0-${a0CrashSha}`,
+        publishGithubStatus: true,
+        decision: { action: 'approve', decidedBy: 'admin-crash', decidedAt: '2026-11-27T02:00:00Z' },
+      }
+      staleA0.sha256 = computePendingSig(staleA0)
+      writeFileSync(path.join(pendingDir, `${crashIdA0}.json`), `${JSON.stringify(staleA0, null, 2)}\n`)
+      const recHealA0 = runBash(GOVERNOR_SH, ['reconcile-pending-approval', '--id', crashIdA0], env)
+      assert.equal(recHealA0.status, 0, recHealA0.stderr)
+      assert.equal(JSON.parse(recHealA0.stdout).status, 'reconcile_required')
+
+      // ── B7: Atomic resume claim via --claim-from ──
+      const claim1 = runBash(
+        GOVERNOR_SH,
+        [
+          'update-approval-resume',
+          '--id',
+          crashIdPresent,
+          '--claim-from',
+          'not_started,not_started_busy,failed',
+          '--status',
+          'starting',
+          '--detail',
+          'claimed by backend',
+        ],
+        env,
+      )
+      assert.equal(claim1.status, 0, claim1.stderr)
+      assert.equal(JSON.parse(claim1.stdout).decision.resumeStatus, 'starting')
+      const claim2 = runBash(
+        GOVERNOR_SH,
+        [
+          'update-approval-resume',
+          '--id',
+          crashIdPresent,
+          '--claim-from',
+          'not_started,not_started_busy,failed',
+          '--status',
+          'starting',
+        ],
+        env,
+      )
+      assert.notEqual(claim2.status, 0, 'second concurrent/duplicate resume claim MUST fail with RESUME_ALREADY_CLAIMED')
+      assert.match(claim2.stderr, /RESUME_ALREADY_CLAIMED/)
+
+      // B7b: Host hard-fence forbids unfenced overwrite of active/terminal resumeStatus (starting/started/running/completed)
+      const unfencedOverwrite = runBash(
+        GOVERNOR_SH,
+        [
+          'update-approval-resume',
+          '--id',
+          crashIdPresent,
+          '--status',
+          'not_started_busy',
+          '--detail',
+          'stale unfenced busy write must be rejected',
+        ],
+        env,
+      )
+      assert.notEqual(unfencedOverwrite.status, 0, 'unfenced overwrite of active starting claim MUST fail')
+      assert.match(unfencedOverwrite.stderr, /RESUME_FENCE_REQUIRED/)
+
+      // ── N1: Reopen expired pending approval (archives old round & opens version+1, round+1) ──
+      const expId = 'gov-billing-reopen000001'
+      const recExp1 = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          expId,
+          '--kind',
+          'blast_voucher',
+          '--code',
+          'BILLING_CORE_LOCKED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--sha',
+          childSha,
+          '--ttl-hours',
+          '1',
+          '--files-json',
+          JSON.stringify([specialPath]),
+        ],
+        env,
+      )
+      assert.equal(recExp1.status, 0, recExp1.stderr)
+      const expDoc1 = JSON.parse(recExp1.stdout)
+      assert.equal(expDoc1.round, 1)
+      const recExp2 = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          expId,
+          '--kind',
+          'blast_voucher',
+          '--code',
+          'BILLING_CORE_LOCKED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--sha',
+          childSha,
+          '--ttl-hours',
+          '24',
+          '--files-json',
+          JSON.stringify([specialPath]),
+        ],
+        { ...env, OC_GOVERNOR_NOW_ISO: '2026-11-27T05:00:00Z' },
+      )
+      assert.equal(recExp2.status, 0, recExp2.stderr)
+      const expDoc2 = JSON.parse(recExp2.stdout)
+      assert.equal(expDoc2.status, 'pending')
+      assert.equal(expDoc2.version, 2)
+      assert.equal(expDoc2.round, 2)
+      assert.equal(expDoc2.previousExpiredAt, expDoc1.expiresAt)
+      const archivedFiles = readdirSync(pendingDir).filter((f) => f.startsWith(`${expId}.expired-`))
+      assert.equal(archivedFiles.length, 1, 'expired round MUST be archived on disk')
+
+      // ── N2: Web A0 --publish-github-status success & failure rollback ──
+      const fakeBin = path.join(tmp, 'fake-bin')
+      const ghLog = path.join(tmp, 'gh-n2.log')
+      const ghFailFlag = path.join(tmp, 'gh-fail')
+      mkdirSync(fakeBin, { recursive: true })
+      writeFileSync(
+        path.join(fakeBin, 'gh'),
+        `#!/usr/bin/env bash\nif [[ -f "${ghFailFlag}" ]]; then echo "gh simulated outage" >&2; exit 1; fi\nprintf '%s\\n' "$*" >> "${ghLog}"\n`,
+        { mode: 0o755 },
+      )
+      const a0GhSha = '8'.repeat(40)
+      const a0GhId = 'gov-a0-pubgh0000001'
+      const recA0Gh = runBash(
+        GOVERNOR_SH,
+        [
+          'record-pending-approval',
+          '--id',
+          a0GhId,
+          '--kind',
+          'a0_approval',
+          '--code',
+          'A0_RELAXATION_REQUIRED',
+          '--branch',
+          'feat/v5-selfhost',
+          '--sha',
+          a0GhSha,
+          '--files',
+          'arch/a0-protected-paths.json',
+        ],
+        env,
+      )
+      assert.equal(recA0Gh.status, 0, recA0Gh.stderr)
+
+      // When gh fails -> rolls back cleanly to pending with NO orphaned local .json/.gh.json!
+      writeFileSync(ghFailFlag, '1')
+      const a0GhFail = runBash(
+        GOVERNOR_SH,
+        [
+          'decide-pending-approval',
+          '--id',
+          a0GhId,
+          '--decision',
+          'approve',
+          '--actor',
+          'admin-uid3',
+          '--note',
+          'Publish A0 to GitHub',
+          '--publish-github-status',
+          '--github-repo',
+          'dream-star-end/openclaude',
+        ],
+        { ...env, PATH: `${fakeBin}:${process.env.PATH ?? ''}` },
+      )
+      assert.notEqual(a0GhFail.status, 0)
+      assert.equal(existsSync(path.join(approvalsDir, `${a0GhSha}.json`)), false)
+      assert.equal(JSON.parse(readFileSync(path.join(pendingDir, `${a0GhId}.json`), 'utf8')).status, 'pending')
+
+      // When gh succeeds -> publishes oc-v5/a0-approval, writes .gh.json, commits approved!
+      rmSync(ghFailFlag)
+      const a0GhOk = runBash(
+        GOVERNOR_SH,
+        [
+          'decide-pending-approval',
+          '--id',
+          a0GhId,
+          '--decision',
+          'approve',
+          '--actor',
+          'admin-uid3',
+          '--note',
+          'Publish A0 to GitHub ok',
+          '--publish-github-status',
+          '--github-repo',
+          'dream-star-end/openclaude',
+        ],
+        { ...env, PATH: `${fakeBin}:${process.env.PATH ?? ''}` },
+      )
+      assert.equal(a0GhOk.status, 0, a0GhOk.stderr)
+      const a0GhOkDoc = JSON.parse(a0GhOk.stdout)
+      assert.equal(a0GhOkDoc.status, 'approved')
+      assert.equal(a0GhOkDoc.decision.issuedArtifactId, `a0-${a0GhSha}`)
+      assert.equal(JSON.parse(readFileSync(path.join(approvalsDir, `${a0GhSha}.gh.json`), 'utf8')).publishedGithubStatus, true)
+      assert.match(readFileSync(ghLog, 'utf8'), /context=oc-v5\/a0-approval/)
+    } finally {
       rmSync(tmp, { recursive: true, force: true })
     }
   })

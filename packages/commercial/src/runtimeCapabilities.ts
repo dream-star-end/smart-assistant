@@ -79,3 +79,27 @@ export function assertModelAuthorityCutoverFloor(env: NodeJS.ProcessEnv = proces
       "(事务性恢复 catalog 至 baked 等价值 + bump epoch + 等快照/容器收敛后才允许清 marker)。",
   );
 }
+
+/** OCV5-914: 个人版自托管视觉治理控制面路径配置（经 platform-config 唯一权威入口读取 env）。 */
+export function loadSelfhostGovernanceEnvConfig(env: NodeJS.ProcessEnv = process.env): {
+  governorRoot: string;
+  governorBin: string;
+  cockpitDir: string;
+  deployScriptPath: string;
+  repoRoot: string;
+  deployLockPath: string;
+  githubRepo?: string;
+} {
+  const governorRoot = env.OC_GOVERNOR_ROOT?.trim() || "/opt/openclaude/harness-gate";
+  const repoRoot = env.OC_V5_SELFHOST_REPO_ROOT?.trim() || "/opt/openclaude/openclaude-v5-selfhost";
+  return {
+    governorRoot,
+    governorBin: env.OC_V5_GOVERNOR_BIN?.trim() || `${governorRoot}/bin/oc-governor`,
+    cockpitDir: env.OC_GOVERNANCE_COCKPIT_DIR?.trim() || "/opt/openclaude/var/selfevolve-report",
+    deployScriptPath:
+      env.OC_V5_DEPLOY_SCRIPT?.trim() || `${repoRoot}/scripts/deploy-v5-selfhost.sh`,
+    repoRoot,
+    deployLockPath: env.OC_V5_DEPLOY_LOCK_PATH?.trim() || "/run/openclaude-v5-selfhost/deploy.lock",
+    githubRepo: env.GITHUB_REPOSITORY?.trim() || undefined,
+  };
+}

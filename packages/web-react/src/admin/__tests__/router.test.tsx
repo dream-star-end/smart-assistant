@@ -20,6 +20,9 @@ describe("parseAdminHash", () => {
 
   test("非白名单 tab → 回落 dashboard", () => {
     expect(parseAdminHash("#tab=nope").tab).toBe("dashboard");
+    expect(parseAdminHash("#tab=governance").tab).toBe("dashboard");
+    expect(parseAdminHash("#tab=governance", { selfhostGovernance: false }).tab).toBe("dashboard");
+    expect(parseAdminHash("#tab=governance", { selfhostGovernance: true }).tab).toBe("governance");
   });
 
   test("解析并 URL 解码查询参数", () => {
