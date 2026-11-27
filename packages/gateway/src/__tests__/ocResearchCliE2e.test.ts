@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { type Server, createServer } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -285,9 +285,11 @@ describe('research oc-* CLI public operations against a loopback master', () => 
     assert.match(result.stdout, /\[--docs/)
     assert.match(result.stdout, /\[--project/)
     // OCV5-874 #7a: oc-cite --help 明确列出全部 5 种格式及 --doc-id/--span-id/--evidence-grade 与示例
+    let citeHelpStdout = ''
     for (const args of [['--help'], ['format', '--help']]) {
       result = await runCli('packages/gateway/src/ocCiteCli.ts', args)
       assert.equal(result.code, 0, result.stderr)
+      if (args.length === 1) citeHelpStdout = result.stdout
       for (const expected of [
         'gb-t-7714-2015',
         'ieee',
@@ -301,6 +303,20 @@ describe('research oc-* CLI public operations against a loopback master', () => 
       ]) {
         assert.ok(result.stdout.includes(expected), `oc-cite ${args.join(' ')} missing ${expected}`)
       }
+    }
+    const wrapperBin = join(
+      REPO_ROOT,
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-cite.sh',
+    )
+    for (const flag of ['--help', '-h', 'help']) {
+      const wrapper = spawnSync(wrapperBin, [flag], {
+        encoding: 'utf8',
+        timeout: 2000,
+        env: { ...process.env, PATH: '/usr/bin:/bin' },
+      })
+      assert.equal(wrapper.status, 0, `oc-cite.sh ${flag}: ${wrapper.stderr}`)
+      assert.equal(wrapper.stderr ?? '', '')
+      assert.equal(wrapper.stdout, citeHelpStdout, `oc-cite.sh ${flag} must match ocCiteCli --help`)
     }
     assert.equal(captured.length, 0)
   })

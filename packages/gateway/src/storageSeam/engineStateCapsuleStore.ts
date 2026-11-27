@@ -1285,7 +1285,7 @@ export class UniversalEngineStateCapsuleStore implements EngineStateCapsuleStore
       ENGINE_STATE_CAPSULE_MAX_FILES,
     )
     const chunkSizeBytes = Math.max(1024, req.chunkSizeBytes ?? this.defaultChunkSizeBytes)
-    const logicalPaths = requireSessionOwnedPaths(this.collectAllowedFiles(req.sourceRoot, req.engine, maxFiles), req.nativeSessionId)
+    const logicalPaths = requireSessionOwnedPaths(this.collectAllowedFiles(req.sourceRoot, req.engine, maxFiles), req.engine, req.nativeSessionId)
     const busyPolicy: SqliteBusyPolicy = req.sqliteBusyPolicy ?? this.defaultSqliteBusyPolicy
     const checkpointedSqlitePaths: string[] = []
     const sqliteSnapshotStrategies: Record<string, 'wal_checkpoint' | 'vacuum_into'> = {}

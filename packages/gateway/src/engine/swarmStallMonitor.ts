@@ -26,6 +26,8 @@ import type {
   SwarmSnapshot,
 } from '@openclaude/protocol'
 
+import { classifyWork, findPeerHandoffs, isMemberEffectivelyWaiting, mentionMatchesWorker } from './swarmStallBoard.js'
+
 export const GATEWAY_STALL_MONITOR_AGENT = 'gateway-monitor'
 export const DEFAULT_SWARM_STALL_THRESHOLD_MS = 180_000
 export const DEFAULT_SWARM_WORKING_STALL_THRESHOLD_MS = 2_400_000
@@ -90,7 +92,7 @@ export interface SwarmStallAlert {
 export interface SwarmStallMonitorOptions {
   /** Quiet duration before emitting the first stall alert when all core members are parked (default 3 min). */
   stallThresholdMs?: number
-  /** Quiet duration with zero step/tool/board progress before alerting on a stuck `working` member (default `max(2 * stallThresholdMs, 6 min)`). */
+  /** Quiet duration with zero step/tool/board progress before alerting on a stuck `working` member (default `max(2 * stallThresholdMs, 40 min)`). */
   workingStallThresholdMs?: number
   /** Cooldown between repeated alerts for the same stall (default 9 min). */
   retryCooldownMs?: number
@@ -104,7 +106,8 @@ export interface SwarmStallMonitorOptions {
 
 const MONITOR_NAME_RE = /^monitor(?:-\d+)?$/i
 const DONE_PREFIX_RE = /^\s*(?:@all\s+)?(?:\*{1,2}|_{1,2})?\[done\](?::|：)?(?:\*{1,2}|_{1,2})?(?:\s|$|:|：|-|—)/i
-const PARKED_WAIT_ACTIVITIES = new Set(['等待讨论板消息', '已完成本轮思考'])
+
+export { isMemberEffectivelyWaiting } from './swarmStallBoard.js'
 
 export function isSwarmMonitorAgentName(name: string): boolean {
   const lower = name.trim().toLowerCase()
@@ -115,40 +118,12 @@ export function isSwarmAuxiliaryRole(role: SwarmMemberRole): boolean {
   return role === 'monitor' || role === 'narrator'
 }
 
-/**
- * True when a live member is parked waiting for board activity rather than
- * actively executing tools or thinking.
- *
- * Note: in native Antigravity transcripts, a member currently blocked inside
- * `swarm_wait` shows `status: 'working'` with `activity: '等待讨论板消息'`.
- * Treating that state as effectively waiting prevents deadlocked `swarm_wait`
- * pairs from looking permanently busy.
- */
-export function isMemberEffectivelyWaiting(member: SwarmMemberSnapshot): boolean {
-  if (member.status === 'killed') return false
-  if (member.status === 'waiting' || member.status === 'stopped') return true
-  if (typeof member.waitingOnBoard === 'boolean') return member.waitingOnBoard
-  return (
-    member.status === 'working' &&
-    typeof member.activity === 'string' &&
-    PARKED_WAIT_ACTIVITIES.has(member.activity)
-  )
-}
-
 function isMonitorPost(post: SwarmBoardPost): boolean {
   return isSwarmMonitorAgentName(post.agent)
 }
 
 function isCoordinatorDonePost(post: SwarmBoardPost): boolean {
   return post.agent.trim().toLowerCase() === 'coordinator' && DONE_PREFIX_RE.test(post.text)
-}
-
-function mentionMatchesWorker(mention: string, workerName: string): boolean {
-  const m = mention.toLowerCase()
-  const w = workerName.toLowerCase()
-  if (!m || m === 'all' || m.startsWith('#')) return false
-  if (m === w) return true
-  return w.startsWith(`${m}-`) && /^\d+$/.test(w.slice(m.length + 1))
 }
 
 function postHasLiveCoreRecipient(
@@ -215,6 +190,8 @@ export class SwarmStallMonitor {
 
   /** Highest coordinator `[done]` post seq observed. */
   private lastDoneSeq = 0
+  private lastBoardHead = 0
+  private lastRevision = 0
   /** Whether the swarm is currently settled in a `[done]` stage awaiting an explicit new-stage start. */
   private stageDone = false
   /** Live core worker names present when the stage entered `[done]` (detects newly added workers). */
@@ -259,6 +236,8 @@ export class SwarmStallMonitor {
   /** Clear all state on turn end, user stop, or swarm teardown. */
   reset(): void {
     this.lastDoneSeq = 0
+    this.lastBoardHead = 0
+    this.lastRevision = 0
     this.stageDone = false
     this.doneWorkerNames.clear()
     this.lastBusinessKey = null
@@ -322,11 +301,11 @@ export class SwarmStallMonitor {
   }
 
   /**
-   * Inspect a snapshot in O(members + recentPosts) memory time with zero I/O and
-   * zero LLM calls. Returns an alert only when every live core member is parked
-   * past `stallThresholdMs` and the current stage is active (not `[done]`).
+   * Inspect the watcher's full, bounded snapshot with zero I/O and zero LLM calls.
+   * Working members and accepted peer handoffs get a longer quiet window.
    */
   evaluate(snap: SwarmSnapshot, now: number = Date.now()): SwarmStallAlert | null {
+    if (snap.revision < this.lastRevision) return null
     if (snap.phase !== 'running' && snap.phase !== 'starting') {
       this.emitDiagnostic(now, {
         kind: 'skipped_phase',
@@ -341,6 +320,12 @@ export class SwarmStallMonitor {
       this.reset()
       return null
     }
+
+    const nonMonitorPosts = snap.posts.filter((p) => !isMonitorPost(p)).sort((a, b) => a.seq - b.seq)
+    const effectiveHeadSeq = nonMonitorPosts.at(-1)?.seq ?? 0
+    if (effectiveHeadSeq < this.lastBoardHead) return null
+    this.lastBoardHead = effectiveHeadSeq
+    this.lastRevision = snap.revision
 
     const liveCoreMembers = snap.members.filter(
       (m) => m.status !== 'killed' && !isSwarmAuxiliaryRole(m.role),
@@ -364,16 +349,7 @@ export class SwarmStallMonitor {
       return null
     }
 
-    const nonMonitorPosts = snap.posts.filter((p) => !isMonitorPost(p))
-    const effectiveHeadSeq =
-      nonMonitorPosts.length > 0 ? nonMonitorPosts[nonMonitorPosts.length - 1]!.seq : 0
-
-    const workingMembers: string[] = []
-    const waitingMembers: string[] = []
-    for (const m of liveCoreMembers) {
-      if (isMemberEffectivelyWaiting(m)) waitingMembers.push(m.name)
-      else workingMembers.push(m.name)
-    }
+    const { workingMembers, waitingMembers } = classifyWork(liveCoreMembers)
 
     let newestDoneSeq = this.lastDoneSeq
     for (const post of nonMonitorPosts) {
@@ -508,43 +484,13 @@ export class SwarmStallMonitor {
       return null
     }
 
-    if (anyWorking) {
-      if (activityKey !== this.lastActivityKey) {
-        this.lastActivityKey = activityKey
-        this.lastQuietSince = now
-        this.emitDiagnostic(now, {
-          kind: 'skipped_working',
-          swarmId: snap.swarmId,
-          phase: snap.phase,
-          headSeq: effectiveHeadSeq,
-          idleMs: 0,
-          alertCount: this.alertCount,
-          workingMembers,
-          waitingMembers,
-        })
-        return null
-      }
-      const workingIdleMs = Math.max(0, now - this.lastQuietSince)
-      if (workingIdleMs < this.workingStallThresholdMs) {
-        this.emitDiagnostic(now, {
-          kind: 'skipped_working',
-          swarmId: snap.swarmId,
-          phase: snap.phase,
-          headSeq: effectiveHeadSeq,
-          idleMs: workingIdleMs,
-          alertCount: this.alertCount,
-          workingMembers,
-          waitingMembers,
-        })
-        return null
-      }
-    } else if (activityKey !== this.lastActivityKey) {
+    if (activityKey !== this.lastActivityKey) {
       // Member briefly woke / stepped and re-parked with no new business post:
       // postpone idle timer, but keep `alertCount` and `repingedMentions` intact.
       this.lastActivityKey = activityKey
       this.lastQuietSince = now
       this.emitDiagnostic(now, {
-        kind: 'activity_postponed',
+        kind: anyWorking ? 'skipped_working' : 'activity_postponed',
         swarmId: snap.swarmId,
         phase: snap.phase,
         headSeq: effectiveHeadSeq,
@@ -599,19 +545,11 @@ export class SwarmStallMonitor {
     }
 
     const attempt = this.alertCount + 1
-    const alert: SwarmStallAlert = {
-      ...this.diagnoseStall({
-        snap,
-        liveCoreMembers,
-        liveWorkers,
-        workingMembers,
-        stagePosts,
-        effectiveHeadSeq,
-        idleMs,
-        attempt,
-      }),
-      generation: this.stageGeneration,
-    }
+    const diagnosis = this.diagnoseStall({
+      snap, liveCoreMembers, liveWorkers, workingMembers, stagePosts, effectiveHeadSeq, idleMs, attempt,
+    })
+    if (!diagnosis) return null
+    const alert = { ...diagnosis, generation: this.stageGeneration }
 
     this.prevAlertAt = this.lastAlertAt
     this.alertCount = attempt
@@ -644,7 +582,7 @@ export class SwarmStallMonitor {
     effectiveHeadSeq: number
     idleMs: number
     attempt: number
-  }): Omit<SwarmStallAlert, 'generation'> {
+  }): Omit<SwarmStallAlert, 'generation'> | null {
     const { snap, liveCoreMembers, liveWorkers, workingMembers, stagePosts, effectiveHeadSeq, idleMs, attempt } = input
     const idleMins = formatIdleMinutes(idleMs)
     const coordinator = liveCoreMembers.find((m) => m.role === 'coordinator')
@@ -691,6 +629,104 @@ export class SwarmStallMonitor {
       }
     }
 
+    // A parked coordinator is not the recipient of a peer handoff. A direct
+    // request to that coordinator, however, needs follow-through even if read.
+    const mentionsOnly = coordinator?.wakeMode?.toLowerCase() === 'mentions'
+    const coordLastPostSeq = coordinator?.lastPostSeq ?? 0
+    const outstanding = stagePosts.filter((post) =>
+      post.seq > coordLastPostSeq && post.agent.trim().toLowerCase() !== 'coordinator',
+    )
+    const coordinatorRequests = mentionsOnly
+      ? outstanding.filter((post) => post.mentions.includes('coordinator'))
+      : []
+    const peerHandoffs = mentionsOnly ? findPeerHandoffs(outstanding, liveWorkers) : undefined
+
+    if (coordinatorRequests.length === 0) {
+      const unanswered = this.diagnoseUnansweredMention({
+        stagePosts: stagePosts.filter((post) => !peerHandoffs?.coveredSeqs.has(post.seq)),
+        liveWorkers, idleMs, attempt, effectiveHeadSeq,
+      })
+      if (unanswered) return unanswered
+    }
+
+    const boardHeadSeq = snap.posts.reduce((head, post) => Math.max(head, post.seq), 0)
+    const coordLastReadSeq = Math.max(0, boardHeadSeq - (coordinator?.unreadCount ?? boardHeadSeq))
+    const unclaimedPosts = coordinatorRequests.length > 0 ? coordinatorRequests : outstanding.filter((post) =>
+      !peerHandoffs?.coveredSeqs.has(post.seq) &&
+      (post.seq > coordLastReadSeq || !postHasLiveCoreRecipient(post, liveCoreMembers)),
+    )
+    if (unclaimedPosts.length > 0) {
+      const recent = unclaimedPosts.slice(-3)
+      const seqLabel = recent.map((p) => `#${p.seq}`).join('、')
+      const ownership = coordinatorRequests.length > 0 ? '已点名协调者但尚无回复' : '无人认领或未读'
+      const authors = [...new Set(recent.map((p) => `\`${sanitizeQuotedText(p.agent, 64, 'worker')}\``))].join('、')
+      return {
+        target: 'coordinator',
+        channel: 'main',
+        reason: 'unclaimed_result',
+        message: `@coordinator [stall] ${seqLabel}（来自 ${authors}）${ownership}，全员已静默 ${idleMins} 分钟，请审阅并分派下一步（如已完成请发 [done]）。`,
+        attempt,
+        idleMs,
+        headSeq: effectiveHeadSeq,
+        citedSeqs: recent.map((p) => p.seq),
+      }
+    }
+
+    // A verified handoff at the head gets the working quiet window even when
+    // a native DONE/no-calls planner tail makes the verifier look parked.
+    // This delays only the generic fallback, not concrete intervention requests.
+    const handoffAtHead = peerHandoffs?.receiptSeq === effectiveHeadSeq
+    if (handoffAtHead && idleMs < this.workingStallThresholdMs) return null
+
+    // 4. Non-main channel stalled without notifying coordinator.
+    const latestStagePost = handoffAtHead ? undefined : stagePosts.at(-1)
+    if (
+      latestStagePost &&
+      latestStagePost.channel &&
+      latestStagePost.channel !== 'main' &&
+      !latestStagePost.mentions.includes('coordinator')
+    ) {
+      const chMeta = snap.channels.find((c) => c.name === latestStagePost.channel)
+      if (!chMeta?.archived) {
+        const safeCh = sanitizeQuotedText(latestStagePost.channel, 64, 'channel')
+        return {
+          target: 'coordinator',
+          channel: 'main',
+          reason: 'channel_stalled',
+          message: `@coordinator [stall] 频道 #${safeCh} 自 #${latestStagePost.seq} 后已静默 ${idleMins} 分钟且未通知协调者，请核查是否需要推进或收口。`,
+          attempt,
+          idleMs,
+          headSeq: effectiveHeadSeq,
+          citedSeqs: [latestStagePost.seq],
+        }
+      }
+    }
+
+    // 5. Fallback: everyone is parked with no active work.
+    const headHint = effectiveHeadSeq > 0 ? `（最新讨论 #${effectiveHeadSeq}）` : ''
+    return {
+      target: 'coordinator',
+      channel: 'main',
+      reason: 'idle_waiting',
+      message: handoffAtHead
+        ? `@coordinator [stall] 交接回执 #${effectiveHeadSeq} 后已连续 ${idleMins} 分钟无新步骤、工具或讨论板进展，请核查任务是否停滞。`
+        : `@coordinator [stall] 全员已静默等待 ${idleMins} 分钟${headHint}，请推进下一步任务或发送 [done] 结束本阶段。`,
+      attempt,
+      idleMs,
+      headSeq: effectiveHeadSeq,
+      citedSeqs: effectiveHeadSeq > 0 ? [effectiveHeadSeq] : [],
+    }
+  }
+
+  private diagnoseUnansweredMention(input: {
+    stagePosts: readonly SwarmBoardPost[]
+    liveWorkers: readonly SwarmMemberSnapshot[]
+    effectiveHeadSeq: number
+    idleMs: number
+    attempt: number
+  }): Omit<SwarmStallAlert, 'generation'> | null {
+    const { stagePosts, liveWorkers, effectiveHeadSeq, idleMs, attempt } = input
+    const idleMins = formatIdleMinutes(idleMs)
     // 2. Direct @mention to a waiting worker went unanswered.
     for (let i = stagePosts.length - 1; i >= 0; i -= 1) {
       const post = stagePosts[i]!
@@ -735,68 +771,6 @@ export class SwarmStallMonitor {
       }
     }
 
-    // 3. Result went to nobody or coordinator left unread worker posts.
-    const boardHeadSeq = snap.posts.length > 0 ? snap.posts[snap.posts.length - 1]!.seq : 0
-    const coordLastReadSeq = coordinator ? Math.max(0, boardHeadSeq - coordinator.unreadCount) : 0
-    const coordLastPostSeq = coordinator?.lastPostSeq ?? 0
-    const unclaimedPosts = stagePosts.filter((post) => {
-      if (post.agent.trim().toLowerCase() === 'coordinator') return false
-      if (post.seq <= coordLastPostSeq) return false
-      const unreadByCoord = coordinator ? post.seq > coordLastReadSeq : true
-      const unaddressed = !postHasLiveCoreRecipient(post, liveCoreMembers)
-      return unreadByCoord || unaddressed
-    })
-    if (unclaimedPosts.length > 0) {
-      const recent = unclaimedPosts.slice(-3)
-      const seqLabel = recent.map((p) => `#${p.seq}`).join('、')
-      const authors = [...new Set(recent.map((p) => `\`${sanitizeQuotedText(p.agent, 64, 'worker')}\``))].join('、')
-      return {
-        target: 'coordinator',
-        channel: 'main',
-        reason: 'unclaimed_result',
-        message: `@coordinator [stall] ${seqLabel}（来自 ${authors}）无人认领或未读，全员已静默 ${idleMins} 分钟，请审阅并分派下一步（如已完成请发 [done]）。`,
-        attempt,
-        idleMs,
-        headSeq: effectiveHeadSeq,
-        citedSeqs: recent.map((p) => p.seq),
-      }
-    }
-
-    // 4. Non-main channel stalled without notifying coordinator.
-    const latestStagePost = stagePosts[stagePosts.length - 1]
-    if (
-      latestStagePost &&
-      latestStagePost.channel &&
-      latestStagePost.channel !== 'main' &&
-      !latestStagePost.mentions.includes('coordinator')
-    ) {
-      const chMeta = snap.channels.find((c) => c.name === latestStagePost.channel)
-      if (!chMeta?.archived) {
-        const safeCh = sanitizeQuotedText(latestStagePost.channel, 64, 'channel')
-        return {
-          target: 'coordinator',
-          channel: 'main',
-          reason: 'channel_stalled',
-          message: `@coordinator [stall] 频道 #${safeCh} 自 #${latestStagePost.seq} 后已静默 ${idleMins} 分钟且未通知协调者，请核查是否需要推进或收口。`,
-          attempt,
-          idleMs,
-          headSeq: effectiveHeadSeq,
-          citedSeqs: [latestStagePost.seq],
-        }
-      }
-    }
-
-    // 5. Fallback: everyone is parked with no active work.
-    const headHint = effectiveHeadSeq > 0 ? `（最新讨论 #${effectiveHeadSeq}）` : ''
-    return {
-      target: 'coordinator',
-      channel: 'main',
-      reason: 'idle_waiting',
-      message: `@coordinator [stall] 全员已静默等待 ${idleMins} 分钟${headHint}，请推进下一步任务或发送 [done] 结束本阶段。`,
-      attempt,
-      idleMs,
-      headSeq: effectiveHeadSeq,
-      citedSeqs: effectiveHeadSeq > 0 ? [effectiveHeadSeq] : [],
-    }
+    return null
   }
 }

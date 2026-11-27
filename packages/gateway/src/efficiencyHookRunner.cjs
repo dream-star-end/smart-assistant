@@ -12,14 +12,19 @@
 'use strict'
 
 const fs = require('node:fs')
+const http = require('node:http')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 
 const DEFAULT_TIMEOUT_MS = 2500
 const MIN_TIMEOUT_MS = 200
 const MAX_TIMEOUT_MS = 5000
+const BROKER_DEFAULT_TIMEOUT_MS = 62000
+const BROKER_MAX_TIMEOUT_MS = 65000
 const PRECOMPILED_NODE_FLAGS = ['--conditions=openclaude-precompiled']
 const RUN_STARTED_MS = Date.now()
+const TOOL_BROKER_HOOK_EVAL_PATH = '/internal/v3/tool-broker/hook-evaluate'
+const SCRUBBED_BROKER_PREFIXES = ['OPENCLAUDE_TOOL_BROKER_', 'OC_TOOL_BROKER_']
 
 function parseArg(prefix, argv) {
   const flag = argv.find((a) => a.startsWith(prefix))
@@ -30,10 +35,64 @@ function parseProtocol(argv) {
   return parseArg('--protocol=', argv) === 'cursor' ? 'cursor' : 'ccb'
 }
 
-function parseTimeoutMs() {
+function scrubBrokerEnv(env) {
+  const clean = {}
+  for (const [k, v] of Object.entries(env || {})) {
+    if (typeof v !== 'string') continue
+    if (SCRUBBED_BROKER_PREFIXES.some((prefix) => k.startsWith(prefix))) continue
+    clean[k] = v
+  }
+  return clean
+}
+
+function isLoopbackUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl)
+    if (parsed.protocol !== 'http:') return false
+    const host = parsed.hostname.toLowerCase()
+    return host === '127.0.0.1' || host === '::1' || host === '[::1]' || host === 'localhost'
+  } catch {
+    return false
+  }
+}
+
+function resolveBrokerHookConfig(argv = [], env = process.env) {
+  const argUrl = parseArg('--broker-url=', argv).trim()
+  const argTokenFile = parseArg('--broker-token-file=', argv).trim()
+  const envUrl = String(env.OPENCLAUDE_TOOL_BROKER_URL || '').trim()
+  const envTokenFile = String(env.OPENCLAUDE_TOOL_BROKER_HOOK_TOKEN_FILE || '').trim()
+  const envToken = String(env.OPENCLAUDE_TOOL_BROKER_HOOK_TOKEN || '').trim()
+
+  const anyConfigured = Boolean(argUrl || argTokenFile || envUrl || envTokenFile || envToken)
+  if (!anyConfigured) return { state: 'unconfigured' }
+
+  const brokerUrl = argUrl || envUrl
+  if (!brokerUrl || !isLoopbackUrl(brokerUrl)) {
+    return { state: 'misconfigured', reason: 'broker_url_invalid' }
+  }
+
+  let token = ''
+  const tokenFile = argTokenFile || envTokenFile
+  if (tokenFile) {
+    try {
+      token = fs.readFileSync(tokenFile, 'utf8').trim()
+    } catch {
+      return { state: 'misconfigured', reason: 'broker_token_file_unreadable' }
+    }
+  }
+  if (!token) token = envToken
+  if (!token.startsWith('octh1.')) {
+    return { state: 'misconfigured', reason: 'broker_token_invalid' }
+  }
+  return { state: 'configured', config: { brokerUrl: brokerUrl.replace(/\/+$/, ''), hookToken: token } }
+}
+
+function parseTimeoutMs(brokerActive) {
   const raw = Number(process.env.OPENCLAUDE_EFFICIENCY_HOOK_TIMEOUT_MS)
-  if (!Number.isFinite(raw)) return DEFAULT_TIMEOUT_MS
-  return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.trunc(raw)))
+  const cap = brokerActive ? BROKER_MAX_TIMEOUT_MS : MAX_TIMEOUT_MS
+  const fallback = brokerActive ? BROKER_DEFAULT_TIMEOUT_MS : DEFAULT_TIMEOUT_MS
+  if (!Number.isFinite(raw)) return fallback
+  return Math.min(cap, Math.max(MIN_TIMEOUT_MS, Math.trunc(raw)))
 }
 
 function isActionPolicyEnabled(env = process.env) {
@@ -93,7 +152,7 @@ function normalizeDecisionObject(protocol, obj) {
     }
     return null
   }
-  const decision = obj.hookSpecificOutput && obj.hookSpecificOutput.permissionDecision
+  const decision = obj.hookSpecificOutput?.permissionDecision
   if (decision === 'allow' || decision === 'deny' || decision === 'ask') return obj
   return null
 }
@@ -134,7 +193,7 @@ function recordFailSignal(event, reason, protocol) {
     const countPath = path.join(dir, `${label}.count`)
     let n = 0
     try {
-      n = parseInt(fs.readFileSync(countPath, 'utf8'), 10) || 0
+      n = Number.parseInt(fs.readFileSync(countPath, 'utf8'), 10) || 0
     } catch {
       n = 0
     }
@@ -191,10 +250,202 @@ function resolveInnerArgs(argv) {
   return resolveTsxArgs(innerTs, extra)
 }
 
+function extractBrokerCommand(input) {
+  if (typeof input.command === 'string' && input.command.trim()) return input.command
+  const ti = input.tool_input
+  if (ti && typeof ti === 'object' && !Array.isArray(ti)) {
+    for (const key of ['command', 'CommandLine', 'cmd', 'script']) {
+      if (typeof ti[key] === 'string' && ti[key].trim()) return ti[key]
+    }
+  }
+  return undefined
+}
+
+function extractBrokerTarget(input) {
+  if (typeof input.target === 'string' && input.target.trim()) return input.target.trim()
+  const ti = input.tool_input
+  if (ti && typeof ti === 'object' && !Array.isArray(ti)) {
+    for (const key of ['target', 'provider', 'site', 'slug', 'url']) {
+      if (typeof ti[key] === 'string' && ti[key].trim()) return ti[key].trim()
+    }
+  }
+  return undefined
+}
+
+function translateBrokerDecision(protocol, resp) {
+  if (!resp || typeof resp !== 'object') return null
+  if (resp.decision === 'allow') {
+    if (protocol === 'cursor') {
+      return resp.message ? { permission: 'allow', agent_message: resp.message } : allowPayload('cursor')
+    }
+    if (resp.message) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'allow',
+          additionalContext: resp.message,
+        },
+      }
+    }
+    return allowPayload('ccb')
+  }
+  if (resp.decision === 'deny') {
+    const reason = resp.reason || resp.code || 'Blocked by ToolBroker policy'
+    if (protocol === 'cursor') {
+      return {
+        permission: 'deny',
+        ...(resp.approvalStatus === 'detached_pending' || resp.code === 'APPROVAL_DEFERRED_DETACHED'
+          ? { requiresHumanApproval: true }
+          : {}),
+        agent_message: reason,
+        user_message: reason,
+      }
+    }
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: reason,
+      },
+      reason,
+    }
+  }
+  return null
+}
+
+function handleBrokerFault(protocol, reason) {
+  recordFailSignal('fail_closed', reason, protocol)
+  writeJsonAndExit(
+    translateBrokerDecision(protocol, {
+      decision: 'deny',
+      reason: `[tool-broker] 策略评估失败或令牌已失效，已 fail-closed 拦截（${reason}）`,
+    }),
+  )
+}
+
+function runBrokerEvaluation(protocol, mode, brokerCfg, timeoutMs) {
+  let settled = false
+  const finishErr = (reason) => {
+    if (settled) return
+    settled = true
+    handleBrokerFault(protocol, reason)
+  }
+  const chunks = []
+  let req = null
+  const timer = setTimeout(() => {
+    if (req) {
+      try { req.destroy() } catch { /* ignore */ }
+    }
+    finishErr('timeout')
+  }, timeoutMs)
+
+  process.stdin.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+  process.stdin.on('error', () => {
+    clearTimeout(timer)
+    finishErr('stdin_error')
+  })
+  process.stdin.on('end', () => {
+    if (settled) return
+    const raw = Buffer.concat(chunks).toString('utf8').replace(/^\uFEFF/, '').trim()
+    let parsed
+    try {
+      parsed = raw ? JSON.parse(raw) : null
+    } catch {
+      clearTimeout(timer)
+      finishErr('invalid_stdin_json')
+      return
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      clearTimeout(timer)
+      finishErr('invalid_stdin_payload')
+      return
+    }
+    const toolName =
+      typeof parsed.tool_name === 'string' && parsed.tool_name.trim()
+        ? parsed.tool_name.trim()
+        : typeof parsed.tool === 'string' && parsed.tool.trim()
+          ? parsed.tool.trim()
+          : 'Bash'
+    const command = extractBrokerCommand(parsed)
+    const target = extractBrokerTarget(parsed)
+    const args =
+      parsed.tool_input && typeof parsed.tool_input === 'object' && !Array.isArray(parsed.tool_input)
+        ? parsed.tool_input
+        : command
+          ? { command }
+          : {}
+    const payload = JSON.stringify({
+      toolName,
+      arguments: args,
+      ...(command ? { command } : {}),
+      ...(target ? { target } : {}),
+      ...(typeof parsed.model === 'string' ? { mainModel: parsed.model } : {}),
+      guardMode: mode === 'off' || mode === 'warn' || mode === 'deny' ? mode : 'deny',
+    })
+    const url = `${brokerCfg.brokerUrl}${TOOL_BROKER_HOOK_EVAL_PATH}`
+    req = http.request(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+          'x-openclaude-broker-hook-token': brokerCfg.hookToken,
+        },
+      },
+      (res) => {
+        const out = []
+        res.on('data', (c) => out.push(Buffer.from(c)))
+        res.on('end', () => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          if ((res.statusCode || 0) !== 200) {
+            handleBrokerFault(protocol, `broker_http_${res.statusCode || 0}`)
+            return
+          }
+          let body
+          try {
+            body = JSON.parse(Buffer.concat(out).toString('utf8'))
+          } catch {
+            handleBrokerFault(protocol, 'broker_invalid_json')
+            return
+          }
+          const translated = translateBrokerDecision(protocol, body)
+          if (!translated) {
+            handleBrokerFault(protocol, 'broker_invalid_decision')
+            return
+          }
+          writeJsonAndExit(translated)
+        })
+      },
+    )
+    req.on('error', (err) => {
+      clearTimeout(timer)
+      finishErr(`broker_error:${err?.code ? err.code : 'unknown'}`)
+    })
+    req.end(payload)
+  })
+}
+
 function main() {
   const argv = process.argv.slice(2)
   const protocol = parseProtocol(argv)
-  const timeoutMs = parseTimeoutMs()
+  const mode = parseArg('--mode=', argv) || 'warn'
+  const override = parseArg('--script=', argv)
+  const brokerResolution = !override ? resolveBrokerHookConfig(argv, process.env) : { state: 'unconfigured' }
+  if (brokerResolution.state === 'misconfigured') {
+    handleBrokerFault(protocol, brokerResolution.reason)
+    return
+  }
+  const brokerCfg = brokerResolution.state === 'configured' ? brokerResolution.config : null
+  const timeoutMs = parseTimeoutMs(Boolean(brokerCfg))
+
+  if (brokerCfg) {
+    runBrokerEvaluation(protocol, mode, brokerCfg, timeoutMs)
+    return
+  }
+
   let settled = false
   let child
 
@@ -235,16 +486,17 @@ function main() {
     child = spawn(process.execPath, spawnArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
+      env: scrubBrokerEnv(process.env),
     })
   } catch (err) {
     clearTimeout(timer)
-    handleRunnerFault(protocol, `spawn_error:${err && err.code ? err.code : 'unknown'}`)
+    handleRunnerFault(protocol, `spawn_error:${err?.code ? err.code : 'unknown'}`)
     return
   }
 
   child.on('error', (err) => {
     clearTimeout(timer)
-    finishFail(`spawn_error:${err && err.code ? err.code : 'unknown'}`)
+    finishFail(`spawn_error:${err?.code ? err.code : 'unknown'}`)
   })
 
   process.stdin.pipe(child.stdin)
@@ -296,5 +548,5 @@ try {
   main()
 } catch (err) {
   const protocol = parseProtocol(process.argv.slice(2))
-  handleRunnerFault(protocol, `runner_throw:${err && err.name ? err.name : 'Error'}`)
+  handleRunnerFault(protocol, `runner_throw:${err?.name ? err.name : 'Error'}`)
 }

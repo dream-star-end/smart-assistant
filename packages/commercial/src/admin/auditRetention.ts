@@ -134,14 +134,10 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
     column: "observed_at",
     days: 90,
   },
-  // OCV5-890 / OCV5-913 (0350): terminal cross-pool migration audit rows (90d TTL; active 'migrating' rows never swept).
-  {
-    table: "session_placement_migrations",
-    column: "created_at",
-    days: 90,
-    predicate: "state IN ('committed','aborted')",
-  },
-  // OCV5-890 / OCV5-913 (0350): terminal multipart CAS upload sessions (30d TTL; active 'open' uploads never swept).
+  // OCV5-890 / OCV5-913 (0350/0354): terminal multipart CAS upload sessions (30d TTL; active 'open' uploads never swept).
+  // Note: `session_placement_migrations` is intentionally excluded from TTL deletion and registered as
+  // DURABLE in `retentionRegistry.ts` because `migrationCoordinator.ts` relies on reading back authoritative
+  // terminal (`committed`/`aborted`) rows during post-crash credential/ExecEnv reconciliation.
   {
     table: "artifact_blob_uploads",
     column: "updated_at",

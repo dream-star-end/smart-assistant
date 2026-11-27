@@ -69,6 +69,13 @@ const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
           req.method === 'POST',
       },
     ]
+    const toolBrokerLocalRoute = {
+      id: 'TOOL_BROKER_LOCAL_PREFIX',
+      line: 0,
+      calls: ['handleToolBrokerLocal', 'sendInternalError'],
+      match: (_req: { method?: string }, url: URL) =>
+        url.pathname.startsWith('/internal/v3/tool-broker/'),
+    }
     return {
       ...base,
       routes: [
@@ -81,6 +88,7 @@ const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
         ...base.routes.slice(0, afterProjectSearch),
         remoteSwarmRoute,
         ...sessionBgInternalRoutes,
+        toolBrokerLocalRoute,
         ...base.routes.slice(afterProjectSearch),
       ],
       samples: [
@@ -90,6 +98,10 @@ const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
         '/internal/sessions/web-sess-1/background-state',
         '/internal/sessions/web-sess-1/inflight-delegates/dlgjob-abc/cancel',
         '/internal/sessions/web-sess-1/bg-commands/1234-ocb_1/cancel',
+        '/internal/v3/tool-broker/invoke',
+        '/internal/v3/tool-broker/hook-evaluate',
+        '/internal/v3/tool-broker/mcp-execute',
+        '/internal/v3/tool-broker/spill-read',
         ...base.samples,
       ],
     }

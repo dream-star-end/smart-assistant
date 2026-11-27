@@ -2,27 +2,9 @@ import { delegateMcpBudgetEnvironment } from '../delegateMcpBudget.js'
 import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 /**
  * Project OpenClaude platform context + openclaude-memory MCP into the
- * official Google Antigravity CLI (OCV5-415). The CLI inherits nothing from
- * CCB; this module is the explicit projection, same shape as grokPlatform.
- *
- * Layout under `<OPENCLAUDE_HOME>/antigravity-cli/` (all 0700):
- *   home/.gemini/antigravity-cli/conversations  durable `<uuid>.db` per
- *       conversation; `--conversation <id>` resumes from here across launches
- *       (resumeArtifacts.antigravitySessionArtifact probes the same path).
- *   home/.gemini/antigravity-cli/bin            helpers the CLI extracts on
- *       first run (a 16 MB webm_encoder); shared so each launch does not.
- *   cache/                                     XDG_CACHE_HOME (fontconfig/mesa).
- *   launch/s-<sessionHash>/                per-session deterministic HOME (or
- *       launch/r-<random>/ when concurrently occupied or sticky mode is off).
- *       settings.json, config/mcp_config.json and the limited OAuth token file
- *       live here and are removed on turn cleanup, keeping `$HOME` paths in the
- *       CLI's `systemInstruction` byte-identical across sequential turns while
- *       isolating concurrent turns.
- *
- * Behaviour pinned from the 1.3.4 binary (docs/ocv5-415-antigravity-cli.md):
- * MCP is read only from `$HOME/.gemini/config/mcp_config.json` (no CLI flag);
- * MCP tools are lazy and reached through native `call_mcp_tool`; settings.json
- * keeps unknown keys but the CLI rewrites the file on start.
+ * official Google Antigravity CLI (OCV5-415).
+ * Layout under `<OPENCLAUDE_HOME>/antigravity-cli/` (0700): `home/.gemini/antigravity-cli/{conversations,bin}`,
+ * `cache/`, and per-launch `launch/s-<hash>/` (or `r-<random>/` / `readonly-turns/ro-<id>/`).
  */
 import { createHash, randomBytes } from 'node:crypto'
 import {
@@ -54,10 +36,13 @@ import {
   ANTIGRAVITY_READ_ONLY_EAGER_MCP_TOOLS,
   ANTIGRAVITY_READ_ONLY_GUARD_UNAVAILABLE,
   ANTIGRAVITY_READ_ONLY_MCP_TOOLS,
-  clearAntigravityReadOnlyHookIfPresent,
-  installAntigravityReadOnlyGuard,
   type AntigravityReadOnlyGuardArtifacts,
 } from './antigravityReadOnlyGuard.js'
+import {
+  projectAntigravityTurnHooks,
+  type AntigravityBrokerHookArtifacts,
+  type AntigravityBrokerHookBinding,
+} from './antigravityBrokerHook.js'
 
 export const ANTIGRAVITY_MCP_SERVER = 'openclaude-memory'
 /** MCP per-call timeout in seconds (`mcp_config.json` defaults to 180s without this). */
@@ -182,8 +167,14 @@ export interface AntigravityPlatformProjection {
   cliTokenFileExpiry: string
   /** True when projected into an isolated read-only turn directory with a hard PreToolUse guard. */
   readOnly?: boolean
-  /** Installed out-of-process read-only guard script + hooks.json metadata (present when readOnly=true). */
+  /** True when projected into an isolated hermetic no-tools turn directory. */
+  hermeticNoTools?: boolean
+  /** Installed out-of-process read-only/hermetic guard script + hooks.json metadata. */
   readOnlyGuard?: AntigravityReadOnlyGuardArtifacts | null
+  /** Installed live ToolBroker PreToolUse hook metadata (when broker is active). */
+  brokerHook?: AntigravityBrokerHookArtifacts | null
+  /** Synchronously revokes turn-scoped broker hook/MCP tokens and unlinks private cred files (B02). */
+  revokeTurnTokens?: (() => void) | null
 }
 
 /** Limited (openid/userinfo) Google token minted by master for one turn. */
@@ -214,6 +205,12 @@ export interface AntigravityPlatformInput {
   hostBin?: string | null
   /** Isolate this turn in `readonly-turns/` with a hard PreToolUse guard and read-only MCP scope. */
   readOnly?: boolean
+  /** Isolate this turn with zero MCP servers and a fail-closed hermetic PreToolUse hook. */
+  hermeticNoTools?: boolean
+  /** Authoritative workspace working directory bound to turn-scoped ToolBroker credentials (S2). */
+  workspaceCwd?: string
+  /** Explicit ToolBroker hook binding (null disables automatic registered broker hook). */
+  brokerHook?: AntigravityBrokerHookBinding | null
 }
 
 function writePrivate(path: string, value: string): void {
@@ -226,15 +223,7 @@ function privateDir(path: string): string {
   return path
 }
 
-/**
- * Lifetime the CLI's token file claims (OCV5-556). The CLI checks the limited
- * token against userinfo once at start; every later Cloud Code call goes to the
- * loopback relay, which replaces Authorization with the container token, so the
- * file's token never authenticates anything mid-turn. With the real expiry
- * (20-60 min) and no refresh_token, Go oauth2 refused locally once it passed:
- * `oauth2: token expired and refresh token is not set` on an 82-minute turn.
- * Outlives the 12 h turn hard limit.
- */
+/** Lifetime claimed in CLI token file (OCV5-556); outlives the 12h turn hard limit. */
 export const ANTIGRAVITY_CLI_TOKEN_FILE_TTL_MS = 24 * 60 * 60 * 1000
 
 /** max(real expiry, now + TTL); an unparseable real expiry counts as now. */
@@ -334,12 +323,7 @@ function writePrivateBytes(filePath: string, data: Buffer): void {
   chmodSync(filePath, 0o600)
 }
 
-/**
- * Copy-seed CLI summary caches from stable storage into the private launch HOME.
- * Without this, every turn starts with an empty summary store (`trigger=empty_on_open`)
- * and scans every shared `<uuid>.db` (~17-22s across ~190 conversations). Each
- * launch gets an independent file copy so concurrent turns never contend on SQLite locks.
- */
+/** Copy-seed CLI summary caches into the private launch HOME to avoid cold scans and SQLite contention. */
 function seedAntigravitySummaryCache(stableCliDir: string, launchCliDir: string): void {
   for (const name of SUMMARY_CACHE_FILES) {
     const data = readBoundedRegularFile(join(stableCliDir, name), {
@@ -782,14 +766,7 @@ const DISABLED_NATIVE_SWARM_SKILLS: ReadonlyArray<{
   },
 ])
 
-/**
- * Override conflicting built-in skills (`swarm_monitor`, `swarm_narrator`,
- * `swarm_pane`, `automation`) via documented Global Discovery precedence
- * (`~/.gemini/config/skills/<name>/SKILL.md` > built-in) without touching
- * CLI-managed `builtin/` or `.checksum` files. Always overwrites cached files
- * on launch projection and sets `disable-model-invocation: true` so the CLI
- * hides them completely from the model's `<skills>` listing.
- */
+/** Override conflicting built-in auxiliary skills via Global Discovery precedence (`disable-model-invocation: true`). */
 function projectDisabledAuxiliarySwarmSkills(configDir: string): void {
   const skillsDir = privateDir(join(configDir, 'skills'))
   for (const spec of DISABLED_NATIVE_SWARM_SKILLS) {
@@ -810,6 +787,33 @@ function projectDisabledAuxiliarySwarmSkills(configDir: string): void {
   }
 }
 
+function buildAntigravityMcpServerEntry(params: {
+  readonly input: AntigravityPlatformInput; readonly mcpLaunch: { readonly command: string; readonly args: readonly string[] }
+  readonly openClaudeHome: string; readonly tokenFile: string; readonly delegateContextFile: string
+  readonly readOnly: boolean; readonly mcpBrokerEnv: Readonly<Record<string, string>>; readonly baselineSkillsDir?: string
+}): Record<string, unknown> {
+  const { input, mcpLaunch, openClaudeHome, tokenFile, delegateContextFile, readOnly, mcpBrokerEnv, baselineSkillsDir } = params
+  const eagerTools: Record<string, { eager: true }> = {}
+  for (const toolName of readOnly ? ANTIGRAVITY_READ_ONLY_EAGER_MCP_TOOLS : ANTIGRAVITY_EAGER_MCP_TOOLS) eagerTools[toolName] = { eager: true }
+  return {
+    command: mcpLaunch.command, args: [...mcpLaunch.args], timeoutSeconds: ANTIGRAVITY_MCP_TOOL_TIMEOUT_SEC, tools: eagerTools,
+    env: {
+      ...delegateMcpBudgetEnvironment(ANTIGRAVITY_MCP_TOOL_TIMEOUT_SEC * 1000),
+      OPENCLAUDE_AGENT_ID: input.agentId, OC_AGENT_ID: input.agentId, ...identityCompatEnvironment(input.identityCompat),
+      ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
+      OPENCLAUDE_HOME: openClaudeHome, OPENCLAUDE_SESSION_KEY: input.sessionKey, ...systemHelpEnvironment(input.systemHelpContextFile, input.gatewayPort),
+      OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort), OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile, OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
+      OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth), OPENCLAUDE_ENGINE: 'antigravity', ...mcpBrokerEnv,
+      ...(readOnly ? { OC_READ_ONLY_TURN: '1', OPENCLAUDE_ADVISOR_READ_ONLY: '1' } : {}),
+      ...(baselineSkillsDir ? { OPENCLAUDE_BASELINE_SKILLS_DIR: baselineSkillsDir } : {}),
+      ...(input.skillEvalMode ? { OPENCLAUDE_SKILL_EVAL_MODE: '1' } : {}),
+      ...(input.skillEvalExclude ? { OPENCLAUDE_SKILL_EVAL_EXCLUDE: input.skillEvalExclude } : {}),
+      ...(input.skillEvalDraft ? { OPENCLAUDE_SKILL_EVAL_DRAFT_NAME: input.skillEvalDraft.name, OPENCLAUDE_SKILL_EVAL_DRAFT_DIR: input.skillEvalDraft.dir } : {}),
+      ...(input.skillTrainRunId ? { OPENCLAUDE_SKILL_TRAIN_RUN_ID: input.skillTrainRunId } : {}),
+    },
+  }
+}
+
 export function projectAntigravityPlatform(
   input: AntigravityPlatformInput,
 ): AntigravityPlatformProjection {
@@ -817,43 +821,40 @@ export function projectAntigravityPlatform(
   const root = antigravityRoot()
   const stable = antigravityStableCliDir(root)
   const cacheDir = privateDir(join(root, 'cache'))
-  const readOnly = input.readOnly === true
+  const hermeticNoTools = input.hermeticNoTools === true
+  const readOnly = input.readOnly === true || hermeticNoTools
   const { launchHome, leaseId } = acquireAntigravityLaunchHome(root, openClaudeHome, input.sessionKey, {
     readOnly,
     traceId: input.traceId,
   })
+  let revokeTurnTokens: (() => void) | null | undefined
   try {
-    // Commercial and read-only turns keep the sandboxed PATH without exposing the host wrapper.
     const hostPathDir = readOnly ? null : projectHostPathDir(launchHome, input.hostBin)
     const cliDir = privateDir(join(launchHome, '.gemini', 'antigravity-cli'))
     const configDir = privateDir(join(launchHome, '.gemini', 'config'))
     projectDisabledAuxiliarySwarmSkills(configDir)
-    let readOnlyGuard: AntigravityReadOnlyGuardArtifacts | null = null
-    if (readOnly) {
-      readOnlyGuard = installAntigravityReadOnlyGuard({ launchHome, configDir })
-    } else {
-      clearAntigravityReadOnlyHookIfPresent(configDir)
-      clearAntigravityReadOnlyHookIfPresent(join(root, 'home', '.gemini', 'config'))
-    }
+    const credDir = join(openClaudeHome, 'tool-broker-runtime', 'turn-creds')
+    const turnHooks = projectAntigravityTurnHooks({
+      launchHome,
+      configDir,
+      sharedConfigDir: join(root, 'home', '.gemini', 'config'),
+      credDir,
+      ensurePrivateDir: privateDir,
+      sessionKey: input.sessionKey,
+      gatewayPort: input.gatewayPort,
+      readOnly,
+      hermeticNoTools,
+      ...(input.workspaceCwd ? { workspaceCwd: input.workspaceCwd } : {}),
+      explicitBrokerHook: input.brokerHook,
+    })
+    revokeTurnTokens = turnHooks.revokeTurnTokens
     linkShared(join(stable, 'conversations'), join(cliDir, 'conversations'))
     linkShared(join(stable, 'bin'), join(cliDir, 'bin'))
-    // Read-only turns keep an ephemeral brain dir inside `readonly-turns/ro-*` so the CLI
-    // never writes into or mutates the shared session brain (swarm rosters/transcripts).
     const sessionBrainDir = readOnly
       ? privateDir(join(cliDir, 'brain'))
       : privateDir(antigravitySessionBrainDir(root, input.sessionKey))
-    if (!readOnly) {
-      // Persist `<appData>/brain/<conv>/.system_generated/swarm/` and member transcripts
-      // per OpenClaude session across sequential turns while isolating other sessions (OCV5-809).
-      linkShared(sessionBrainDir, join(cliDir, 'brain'))
-    }
+    if (!readOnly) linkShared(sessionBrainDir, join(cliDir, 'brain'))
     seedAntigravitySummaryCache(stable, cliDir)
-
-    // Google-account mode: no modelProvider override. The CLI reads this token
-    // file when no keyring is reachable; it only runs the userinfo eligibility
-    // check with it. Every Cloud Code call goes to CLOUD_CODE_URL (the relay),
-    // which swaps in the account's real token. refresh_token stays empty, so the
-    // file claims a lifetime longer than any turn (see ANTIGRAVITY_CLI_TOKEN_FILE_TTL_MS).
     const cliTokenFileExpiry = antigravityCliTokenFileExpiry(input.credential.accessTokenExpiresAt)
     writePrivate(join(cliDir, 'settings.json'), `${JSON.stringify({}, null, 2)}\n`)
     writePrivate(
@@ -877,7 +878,9 @@ export function projectAntigravityPlatform(
     const localSwarmMaxConcurrent =
       rawLocalSwarmCap !== undefined ? parseLocalSwarmConcurrencyCap(rawLocalSwarmCap) : undefined
     const servers: Record<string, unknown> = {}
-    const mcpLaunch = resolveMcpMemoryLaunch(input.claudeCodePath, { fallback: 'node-tsx' })
+    const mcpLaunch = hermeticNoTools
+      ? null
+      : resolveMcpMemoryLaunch(input.claudeCodePath, { fallback: 'node-tsx' })
     if (mcpLaunch && input.gatewayToken) {
       const tokenFile = join(launchHome, 'gateway-token')
       delegateContextFile = join(launchHome, 'delegate-context')
@@ -892,51 +895,19 @@ export function projectAntigravityPlatform(
           consultTurn: input.consultTurn,
         })}\n`,
       )
-      const eagerTools: Record<string, { eager: true }> = {}
-      const eagerSource = readOnly ? ANTIGRAVITY_READ_ONLY_EAGER_MCP_TOOLS : ANTIGRAVITY_EAGER_MCP_TOOLS
-      for (const toolName of eagerSource) {
-        eagerTools[toolName] = { eager: true }
-      }
-      servers[ANTIGRAVITY_MCP_SERVER] = {
-        command: mcpLaunch.command,
-        args: [...mcpLaunch.args],
-        timeoutSeconds: ANTIGRAVITY_MCP_TOOL_TIMEOUT_SEC,
-        tools: eagerTools,
-        env: {
-          ...delegateMcpBudgetEnvironment(ANTIGRAVITY_MCP_TOOL_TIMEOUT_SEC * 1000),
-          OPENCLAUDE_AGENT_ID: input.agentId,
-          OC_AGENT_ID: input.agentId,
-          ...identityCompatEnvironment(input.identityCompat),
-          ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
-          OPENCLAUDE_HOME: openClaudeHome,
-          OPENCLAUDE_SESSION_KEY: input.sessionKey,
-          ...systemHelpEnvironment(input.systemHelpContextFile, input.gatewayPort),
-          OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
-          OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
-          OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
-          OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),
-          OPENCLAUDE_ENGINE: 'antigravity',
-          ...(readOnly ? { OC_READ_ONLY_TURN: '1', OPENCLAUDE_ADVISOR_READ_ONLY: '1' } : {}),
-          ...(baselineSkillsDir ? { OPENCLAUDE_BASELINE_SKILLS_DIR: baselineSkillsDir } : {}),
-          ...(input.skillEvalMode ? { OPENCLAUDE_SKILL_EVAL_MODE: '1' } : {}),
-          ...(input.skillEvalExclude
-            ? { OPENCLAUDE_SKILL_EVAL_EXCLUDE: input.skillEvalExclude }
-            : {}),
-          ...(input.skillEvalDraft
-            ? {
-                OPENCLAUDE_SKILL_EVAL_DRAFT_NAME: input.skillEvalDraft.name,
-                OPENCLAUDE_SKILL_EVAL_DRAFT_DIR: input.skillEvalDraft.dir,
-              }
-            : {}),
-          ...(input.skillTrainRunId ? { OPENCLAUDE_SKILL_TRAIN_RUN_ID: input.skillTrainRunId } : {}),
-        },
-      }
+      servers[ANTIGRAVITY_MCP_SERVER] = buildAntigravityMcpServerEntry({
+        input,
+        mcpLaunch,
+        openClaudeHome,
+        tokenFile,
+        delegateContextFile,
+        readOnly,
+        mcpBrokerEnv: turnHooks.mcpBrokerEnv,
+        baselineSkillsDir,
+      })
       advertisedMcpTools.push(...(readOnly ? ANTIGRAVITY_READ_ONLY_MCP_TOOLS : ANTIGRAVITY_MEMORY_MCP_TOOLS))
     }
-    writePrivate(
-      join(configDir, 'mcp_config.json'),
-      `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`,
-    )
+    writePrivate(join(configDir, 'mcp_config.json'), `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`)
     const projection: AntigravityPlatformProjection = {
       openClaudeHome,
       root,
@@ -950,7 +921,10 @@ export function projectAntigravityPlatform(
       ...(localSwarmMaxConcurrent !== undefined ? { localSwarmMaxConcurrent } : {}),
       cliTokenFileExpiry,
       readOnly,
-      readOnlyGuard,
+      ...(hermeticNoTools ? { hermeticNoTools } : {}),
+      readOnlyGuard: turnHooks.readOnlyGuard,
+      ...(turnHooks.brokerHook ? { brokerHook: turnHooks.brokerHook } : {}),
+      ...(turnHooks.revokeTurnTokens ? { revokeTurnTokens: turnHooks.revokeTurnTokens } : {}),
     }
     Object.defineProperty(projection, LAUNCH_LEASE, {
       value: leaseId,
@@ -960,6 +934,7 @@ export function projectAntigravityPlatform(
     })
     return projection
   } catch (err) {
+    revokeTurnTokens?.()
     releaseLaunchLeaseOnSetupFailure(root, launchHome, leaseId)
     throw err
   }
@@ -967,9 +942,10 @@ export function projectAntigravityPlatform(
 
 /** Remove one launch HOME. Never follows the shared symlinks or clobbers a newer turn's lease. */
 export function cleanupAntigravityLaunch(
-  projection: Pick<AntigravityPlatformProjection, 'root' | 'launchHome'>,
+  projection: Pick<AntigravityPlatformProjection, 'root' | 'launchHome' | 'revokeTurnTokens'>,
   opts?: { persistSummaryCache?: boolean },
 ): void {
+  projection.revokeTurnTokens?.()
   const resolved = resolveOwnedLaunchSubpath(projection.root, projection.launchHome)
   if (!resolved) return
   const leaseId = (projection as { [LAUNCH_LEASE]?: string })[LAUNCH_LEASE]

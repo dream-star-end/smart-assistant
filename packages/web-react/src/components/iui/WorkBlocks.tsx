@@ -1,5 +1,5 @@
 import { AlertTriangle, BookOpen, Check, ChevronDown, Copy, Download, Eye, EyeOff, Globe, Loader2, Lock, Maximize2, PanelRight, Play, RotateCcw } from "lucide-react";
-import { useId, useState, useSyncExternalStore } from "react";
+import { Suspense, lazy, useId, useState, useSyncExternalStore } from "react";
 import { nativeDownload } from "../../lib/chat/download";
 import { cn } from "../../lib/utils";
 import { dispatchOpenInWorkbench } from "../../lib/workbenchOpen";
@@ -15,9 +15,9 @@ import {
 import { useMediaSigner } from "../chat/media";
 import { chatInteractionUnavailableText, useArtifactInspect, useChatInteraction } from "../tool/context";
 import { useToast } from "../ui";
-import { BodyMarkdown, Frame, Inline, useCopiedFlag } from "./shell";
+import { BodyMarkdown, Frame, Inline, Skeleton, useCopiedFlag } from "./shell";
 import { interpolateRunbookCommand, v2ToMarkdown } from "./v2Markdown";
-import type { BrowserHandoffSpec, CitationsSpec, DeliverablesSpec, RunbookSpec } from "./v2Schema";
+import type { BrowserHandoffSpec, CitationsSpec, DeliverablesSpec, GovernanceApprovalSpec, RunbookSpec } from "./v2Schema";
 import "./browserHandoff.css";
 
 type BlockProps<S> = { spec: S; notes: string[]; streaming: boolean; readOnly?: boolean; nested?: boolean };
@@ -547,5 +547,24 @@ export function BrowserHandoffBlock({ spec, notes, streaming, readOnly, nested }
         )}
       </div>
     </Frame>
+  );
+}
+
+const LazyGovernanceApprovalBlock = lazy(() => import("./GovernanceApprovalBlock"));
+
+export function GovernanceApprovalSlot({ spec, notes, streaming, readOnly, nested }: BlockProps<GovernanceApprovalSpec>) {
+  const { sendUserText, busy } = useChatInteraction();
+  return (
+    <Suspense fallback={<Skeleton kind="governance_approval" />}>
+      <LazyGovernanceApprovalBlock
+        spec={spec}
+        notes={notes}
+        streaming={streaming}
+        readOnly={readOnly}
+        nested={nested}
+        sendUserText={sendUserText}
+        chatBusy={busy}
+      />
+    </Suspense>
   );
 }

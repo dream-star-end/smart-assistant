@@ -128,6 +128,7 @@ export const KIND_ICON_SOURCES = {
   storyboard: "camera",
   flashcards: "brain",
   browser_handoff: "globe",
+  governance_approval: "shield",
   quote: "gauge",
   kline: "chart-column",
   intraday: "chart-column",

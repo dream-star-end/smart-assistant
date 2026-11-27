@@ -14,6 +14,8 @@ import {
   UniversalEngineStateCapsuleStore,
   hasPendingRestoreMarker,
 } from '../engineStateCapsuleStore.js'
+import { encodeCcbProjectDir } from '../tapeWarmRebuilder.js'
+import { extractLogicalPathOwner } from '../capsuleSessionOwnership.js'
 import { EngineCapsuleRuntime } from '../../turnCapsuleRuntime.js'
 
 function sha256Hex(buf: Uint8Array): string {
@@ -276,5 +278,142 @@ describe('OCV5-913 T2 B1: per-session capsule file ownership & no cross-session 
     assert.equal(rt.isEnabled, false)
     assert.equal(rt.blobStore, null)
     assert.equal(rt.capsuleStore, null)
+  })
+
+  it('CCB dual-session isolation: project dir containing session A id never exports or overwrites sibling session B', async () => {
+    const stateRoot = makeDir('ccb-dir-collision-state')
+    const sourceRoot = makeDir('ccb-dir-collision-src')
+    const targetRoot = makeDir('ccb-dir-collision-dst')
+
+    const idA = 'aaaaaaaa-1111-4111-8111-111111111111'
+    const idB = 'bbbbbbbb-2222-4222-8222-222222222222'
+    // Project directory slug literally embeds session A's ID!
+    const sourceCwd = `/workspace/session-${idA}`
+    const targetCwd = `/workspace/restored-${idA}`
+    const oldSlug = encodeCcbProjectDir(sourceCwd)
+    const newSlug = encodeCcbProjectDir(targetCwd)
+    assert.equal(oldSlug.includes(idA), true)
+    assert.equal(newSlug.includes(idA), true)
+
+    const relA = `projects/${oldSlug}/${idA}.jsonl`
+    const relB = `projects/${oldSlug}/${idB}.jsonl`
+    const dstRelB = `projects/${newSlug}/${idB}.jsonl`
+
+    mkdirSync(join(sourceRoot, 'projects', oldSlug), { recursive: true })
+    writeFileSync(join(sourceRoot, relA), '{"session":"A","rev":"src"}\n', 'utf8')
+    writeFileSync(join(sourceRoot, relB), '{"session":"B","rev":"stale"}\n', 'utf8')
+
+    mkdirSync(join(targetRoot, 'projects', newSlug), { recursive: true })
+    writeFileSync(join(targetRoot, dstRelB), '{"session":"B","rev":"live-current"}\n', 'utf8')
+
+    const blobStore = new InMemoryArtifactBlobStore()
+    const store = new UniversalEngineStateCapsuleStore({ blobStore, stateRoot })
+
+    // 1. Export for A MUST strictly exclude sibling B even though oldSlug contains idA.
+    const exported = await store.exportCapsule({
+      tenantId: 'c:42',
+      sessionKey: 'sess:ccb:A',
+      engine: 'ccb',
+      engineVersion: '1.4.2',
+      placementEpoch: 1,
+      nativeSessionId: idA,
+      sourceRoot,
+      sourceCwd,
+    })
+    assert.deepEqual(
+      exported.manifest.files.map((f) => f.logicalPath),
+      [relA],
+      'CCB export must derive owner from filename stem, never project directory name',
+    )
+
+    // 2. Legacy unfiltered capsule containing sibling B under oldSlug MUST be rejected BEFORE
+    //    creating a restore marker, leaving target sibling B bytes 100% untouched.
+    const bytesA = new TextEncoder().encode('{"session":"A","rev":"legacy"}\n')
+    const bytesB = new TextEncoder().encode('{"session":"B","rev":"stale-overwrite"}\n')
+    const refA = await blobStore.put({
+      tenantId: 'c:42',
+      kind: 'capsule_file',
+      mimeType: 'application/x-ndjson',
+      bytes: bytesA,
+      logicalName: relA,
+    })
+    const refB = await blobStore.put({
+      tenantId: 'c:42',
+      kind: 'capsule_file',
+      mimeType: 'application/x-ndjson',
+      bytes: bytesB,
+      logicalName: relB,
+    })
+    const legacyBody: EngineStateCapsuleManifestBody = {
+      schemaVersion: 1,
+      tenantId: 'c:42',
+      sessionKey: 'sess:ccb:A',
+      engine: 'ccb',
+      engineVersion: '1.4.2',
+      placementEpoch: 1,
+      portability: 'portable',
+      nativeSessionId: idA,
+      totalBytes: bytesA.byteLength + bytesB.byteLength,
+      files: [
+        {
+          logicalPath: relA,
+          sha256: sha256Hex(bytesA),
+          sizeBytes: bytesA.byteLength,
+          blobId: refA.blobId,
+          mode: 0o600,
+          isSqlite: false,
+        },
+        {
+          logicalPath: relB,
+          sha256: sha256Hex(bytesB),
+          sizeBytes: bytesB.byteLength,
+          blobId: refB.blobId,
+          mode: 0o600,
+          isSqlite: false,
+        },
+      ],
+      createdAt: new Date().toISOString(),
+    }
+    const legacyManifest: EngineStateCapsuleManifest = {
+      ...legacyBody,
+      capsuleId: computeEngineStateCapsuleId(legacyBody),
+    }
+
+    const legacyRes = await store.importCapsule({
+      tenantId: 'c:42',
+      capsuleId: legacyManifest.capsuleId,
+      manifest: legacyManifest,
+      targetRoot,
+      expectedSessionKey: 'sess:ccb:A',
+      expectedEngine: 'ccb',
+      expectedNativeSessionId: idA,
+      targetCwd,
+    })
+    assert.equal(legacyRes.status, 'incompatible')
+    assert.match(legacyRes.reason, /capsule_file_ownership_unverified/)
+    assert.equal(
+      hasPendingRestoreMarker(stateRoot, idA),
+      false,
+      'ownership check must reject BEFORE creating a restore marker',
+    )
+    assert.equal(
+      readFileSync(join(targetRoot, dstRelB), 'utf8'),
+      '{"session":"B","rev":"live-current"}\n',
+      'sibling session B bytes must remain completely untouched',
+    )
+
+    // 3. Unknown layouts & multi-UUID filenames fail closed or bind strictly to positional owner.
+    assert.equal(extractLogicalPathOwner('ccb', `projects/${oldSlug}/${idB}.jsonl`), idB)
+    assert.equal(extractLogicalPathOwner('ccb', `unknown/${idA}.jsonl`), null)
+    assert.equal(
+      extractLogicalPathOwner('codex', `sessions/2026/11/27/rollout-${idA}-${idB}.jsonl`),
+      idB,
+    )
+    assert.equal(extractLogicalPathOwner('cursor', `state/${idA}.db`), null)
+    assert.equal(extractLogicalPathOwner('cursor', `chats/deadbeef/${idA}/store.db`), idA)
+    assert.equal(extractLogicalPathOwner('zcode', `cli/db/${idA}.sqlite`), null)
+    assert.equal(extractLogicalPathOwner('zcode', `cli/exec/${idA}/run.json`), idA)
+    assert.equal(extractLogicalPathOwner('grok', `sessions/grp/${idA}/events.jsonl`), idA)
+    assert.equal(extractLogicalPathOwner('grok', `fast/sessions/grp/${idA}/events.jsonl`), idA)
   })
 })

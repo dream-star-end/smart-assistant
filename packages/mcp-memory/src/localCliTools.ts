@@ -14,8 +14,8 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { constants as fsConstants } from 'node:fs'
-import { access } from 'node:fs/promises'
-import { delimiter } from 'node:path'
+import { access, lstat, readdir, readFile } from 'node:fs/promises'
+import { delimiter, join, relative, resolve as resolvePath } from 'node:path'
 import {
   KILL_GRACE_MS,
   OC_BASH_MAX_OUTPUT_BYTES,
@@ -25,6 +25,10 @@ import {
   type OcBashAction,
   type OcBashCallOutcome,
 } from './ocBashJobManager.js'
+import {
+  executeViaMcpToolBroker,
+  scrubToolBrokerEnv,
+} from './toolBrokerClient.js'
 import type { JobLifecycleClass } from '@openclaude/protocol'
 
 export {
@@ -86,6 +90,7 @@ export interface RunCapturedSpec {
   cwd?: string
   timeoutMs: number
   maxBytes: number
+  env?: NodeJS.ProcessEnv
 }
 
 export interface RunCapturedResult {
@@ -233,6 +238,10 @@ function untrackProcessGroup(pid: number | undefined): void {
   if (pid && pid > 0) activeProcessGroups.delete(pid)
 }
 
+function currentProcessEnv(override?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return override ?? process.env
+}
+
 /** `detached` puts the child in its own process group so a timeout can signal `bash -lc` and its sleep/rg child. */
 export function runCaptured(spec: RunCapturedSpec): Promise<RunCapturedResult> {
   return new Promise((resolve) => {
@@ -248,7 +257,7 @@ export function runCaptured(spec: RunCapturedSpec): Promise<RunCapturedResult> {
         cwd: spec.cwd,
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: process.env,
+        env: scrubToolBrokerEnv(currentProcessEnv(spec.env)),
       })
       if (child.pid && child.pid > 0) trackProcessGroup(child.pid)
     } catch (err) {
@@ -462,65 +471,97 @@ function formatOcBashOutcome(outcome: OcBashCallOutcome): ToolTextResult {
   }
 }
 
-export async function handleOcBash(
-  args: unknown,
-  deps?: { jobManager?: OcBashJobManager },
-): Promise<ToolTextResult> {
-  const input = asRecord(args)
+type ValidatedOcBashArgs =
+  | { readonly ok: false; readonly error: ToolTextResult }
+  | {
+      readonly ok: true
+      readonly command: string
+      readonly jobId: string
+      readonly action: OcBashAction
+      readonly killOnTimeout: boolean
+      readonly lifecycleClass?: JobLifecycleClass
+      readonly timeoutMs: number
+    }
+
+function validateOcBashInput(input: Record<string, unknown>): ValidatedOcBashArgs {
   const command = asText(input.command).trim()
   const jobId = asText(input.job_id).trim()
   const rawAction = input.action === undefined ? 'wait' : asText(input.action).trim()
-  const killOnTimeout = input.kill_on_timeout === true
   const rawLifecycleClass =
     input.lifecycle_class === undefined ? undefined : asText(input.lifecycle_class).trim()
 
   if (!command && !jobId) {
-    return textResult('oc_bash: command 不能为空（或传入 job_id 操作在途任务）', true)
+    return { ok: false, error: textResult('oc_bash: command 不能为空（或传入 job_id 操作在途任务）', true) }
   }
   if (command && jobId) {
-    return textResult('oc_bash: command 与 job_id 不能同时传入；续等请只传 job_id', true)
+    return { ok: false, error: textResult('oc_bash: command 与 job_id 不能同时传入；续等请只传 job_id', true) }
   }
   if (rawAction !== 'wait' && rawAction !== 'status' && rawAction !== 'kill') {
-    return textResult(`oc_bash: 无效的 action "${rawAction}"（仅支持 wait / status / kill）`, true)
+    return { ok: false, error: textResult(`oc_bash: 无效的 action "${rawAction}"（仅支持 wait / status / kill）`, true) }
   }
   if (command && rawAction !== 'wait') {
-    return textResult('oc_bash: 启动新 command 时不能指定 action="status" 或 "kill"', true)
+    return { ok: false, error: textResult('oc_bash: 启动新 command 时不能指定 action="status" 或 "kill"', true) }
   }
   let lifecycleClass: JobLifecycleClass | undefined
   if (rawLifecycleClass !== undefined) {
     if (!command) {
-      return textResult('oc_bash: 续等已有 job_id 时不能修改 lifecycle_class', true)
+      return { ok: false, error: textResult('oc_bash: 续等已有 job_id 时不能修改 lifecycle_class', true) }
     }
     if (!isJobLifecycleClass(rawLifecycleClass)) {
-      return textResult(
-        `oc_bash: 无效的 lifecycle_class "${rawLifecycleClass}"（仅支持 ephemeral_turn / managed_job / daemon_service）`,
-        true,
-      )
+      return {
+        ok: false,
+        error: textResult(
+          `oc_bash: 无效的 lifecycle_class "${rawLifecycleClass}"（仅支持 ephemeral_turn / managed_job / daemon_service）`,
+          true,
+        ),
+      }
     }
     lifecycleClass = rawLifecycleClass
   }
+  return {
+    ok: true,
+    command,
+    jobId,
+    action: rawAction,
+    killOnTimeout: input.kill_on_timeout === true,
+    lifecycleClass,
+    timeoutMs: clampInt(input.timeout_ms, OC_BASH_DEFAULT_TIMEOUT_MS, OC_BASH_MIN_TIMEOUT_MS, OC_BASH_MAX_TIMEOUT_MS),
+  }
+}
 
-  const action: OcBashAction = rawAction
-  const timeoutMs = clampInt(
-    input.timeout_ms,
-    OC_BASH_DEFAULT_TIMEOUT_MS,
-    OC_BASH_MIN_TIMEOUT_MS,
-    OC_BASH_MAX_TIMEOUT_MS,
-  )
+export async function handleOcBash(
+  args: unknown,
+  deps?: { jobManager?: OcBashJobManager; env?: NodeJS.ProcessEnv; callId?: string; turnId?: string },
+): Promise<ToolTextResult> {
+  const input = asRecord(args)
+  const parsed = validateOcBashInput(input)
+  if (!parsed.ok) return parsed.error
+
+  if (!deps?.jobManager) {
+    const brokered = await executeViaMcpToolBroker({
+      toolName: 'oc_bash',
+      args: input,
+      env: currentProcessEnv(deps?.env),
+      timeoutMs: parsed.timeoutMs,
+      ...(deps?.callId ? { callId: deps.callId } : {}),
+      ...(deps?.turnId ? { turnId: deps.turnId } : {}),
+    })
+    if (brokered) return brokered
+  }
   const manager = deps?.jobManager ?? defaultOcBashManager
-  const outcome = command
+  const outcome = parsed.command
     ? await manager.startAndWait({
-        command,
+        command: parsed.command,
         cwd: optionalCwd(input.cwd),
-        timeoutMs,
-        killOnTimeout,
-        ...(lifecycleClass !== undefined ? { lifecycleClass } : {}),
+        timeoutMs: parsed.timeoutMs,
+        killOnTimeout: parsed.killOnTimeout,
+        ...(parsed.lifecycleClass !== undefined ? { lifecycleClass: parsed.lifecycleClass } : {}),
       })
     : await manager.continueJob({
-        jobId,
-        action,
-        timeoutMs,
-        killOnTimeout,
+        jobId: parsed.jobId,
+        action: parsed.action,
+        timeoutMs: parsed.timeoutMs,
+        killOnTimeout: parsed.killOnTimeout,
       })
   return formatOcBashOutcome(outcome)
 }
@@ -562,11 +603,22 @@ function clipLines(
 
 export async function handleOcGrep(
   args: unknown,
-  deps?: { rgBin?: string | null },
+  deps?: { rgBin?: string | null; env?: NodeJS.ProcessEnv; callId?: string; turnId?: string },
 ): Promise<ToolTextResult> {
   const input = asRecord(args)
   const pattern = asText(input.pattern)
   if (!pattern) return textResult('oc_grep: pattern 不能为空', true)
+  if (!(deps && 'rgBin' in deps)) {
+    const brokered = await executeViaMcpToolBroker({
+      toolName: 'oc_grep',
+      args: input,
+      env: currentProcessEnv(deps?.env),
+      timeoutMs: OC_BASH_DEFAULT_TIMEOUT_MS,
+      ...(deps?.callId ? { callId: deps.callId } : {}),
+      ...(deps?.turnId ? { turnId: deps.turnId } : {}),
+    })
+    if (brokered) return brokered
+  }
   const rg = await rgBinOrError(deps)
   if (typeof rg !== 'string') return rg
   const maxMatches = clampInt(
@@ -604,11 +656,22 @@ export async function handleOcGrep(
 
 export async function handleOcGlob(
   args: unknown,
-  deps?: { rgBin?: string | null },
+  deps?: { rgBin?: string | null; env?: NodeJS.ProcessEnv; callId?: string; turnId?: string },
 ): Promise<ToolTextResult> {
   const input = asRecord(args)
   const pattern = asText(input.pattern).trim()
   if (!pattern) return textResult('oc_glob: pattern 不能为空', true)
+  if (!(deps && 'rgBin' in deps)) {
+    const brokered = await executeViaMcpToolBroker({
+      toolName: 'oc_glob',
+      args: input,
+      env: currentProcessEnv(deps?.env),
+      timeoutMs: OC_BASH_DEFAULT_TIMEOUT_MS,
+      ...(deps?.callId ? { callId: deps.callId } : {}),
+      ...(deps?.turnId ? { turnId: deps.turnId } : {}),
+    })
+    if (brokered) return brokered
+  }
   const rg = await rgBinOrError(deps)
   if (typeof rg !== 'string') return rg
   const maxResults = clampInt(
@@ -636,4 +699,94 @@ export async function handleOcGlob(
   const truncated = outcome.truncated || clipped.clipped
   const body = clipped.text || 'no matches'
   return textResult(truncated ? `${body}\n[truncated]` : body)
+}
+
+async function listWalkEntries(rootDir: string, maxDepth: number, maxEntries: number): Promise<string[]> {
+  const out: string[] = []
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (depth > maxDepth || out.length >= maxEntries) return
+    const entries = await readdir(dir, { withFileTypes: true })
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const ent of entries) {
+      if (out.length >= maxEntries) break
+      if (ent.name === '.git' || ent.name === 'node_modules') continue
+      const full = join(dir, ent.name)
+      const rel = relative(rootDir, full)
+      out.push(ent.isDirectory() ? `${rel}/` : rel)
+      if (ent.isDirectory() && !ent.isSymbolicLink() && depth < maxDepth) await walk(full, depth + 1)
+    }
+  }
+  await walk(rootDir, 0)
+  return out
+}
+
+export async function handleOcRead(
+  args: unknown,
+  deps?: { env?: NodeJS.ProcessEnv; callId?: string; turnId?: string },
+): Promise<ToolTextResult> {
+  const input = asRecord(args)
+  const target = asText(input.path).trim()
+  if (!target) return textResult('oc_read: path 不能为空', true)
+  const brokered = await executeViaMcpToolBroker({
+    toolName: 'oc_read',
+    args: input,
+    env: currentProcessEnv(deps?.env),
+    ...(deps?.callId ? { callId: deps.callId } : {}),
+    ...(deps?.turnId ? { turnId: deps.turnId } : {}),
+  })
+  if (brokered) return brokered
+  try {
+    const st = await lstat(target)
+    if (!st.isFile() || st.isSymbolicLink()) return textResult('oc_read: 目标不是常规文件', true)
+    return textResult(await readFile(target, 'utf8'))
+  } catch (err) {
+    return textResult(`oc_read: ${err instanceof Error ? err.message : String(err)}`, true)
+  }
+}
+
+export async function handleOcFind(
+  args: unknown,
+  deps?: { env?: NodeJS.ProcessEnv; callId?: string; turnId?: string },
+): Promise<ToolTextResult> {
+  const input = asRecord(args)
+  const brokered = await executeViaMcpToolBroker({
+    toolName: 'oc_find',
+    args: input,
+    env: currentProcessEnv(deps?.env),
+    ...(deps?.callId ? { callId: deps.callId } : {}),
+    ...(deps?.turnId ? { turnId: deps.turnId } : {}),
+  })
+  if (brokered) return brokered
+  try {
+    const rootDir = resolvePath(asText(input.path).trim() || '.')
+    const maxDepth = clampInt(input.max_depth, 4, 0, 8)
+    const maxResults = clampInt(input.max_results, 200, 1, 500)
+    const entries = await listWalkEntries(rootDir, maxDepth, maxResults)
+    return textResult(entries.join('\n') || 'no matches')
+  } catch (err) {
+    return textResult(`oc_find: ${err instanceof Error ? err.message : String(err)}`, true)
+  }
+}
+
+export async function handleOcTree(
+  args: unknown,
+  deps?: { env?: NodeJS.ProcessEnv; callId?: string; turnId?: string },
+): Promise<ToolTextResult> {
+  const input = asRecord(args)
+  const brokered = await executeViaMcpToolBroker({
+    toolName: 'oc_tree',
+    args: input,
+    env: currentProcessEnv(deps?.env),
+    ...(deps?.callId ? { callId: deps.callId } : {}),
+    ...(deps?.turnId ? { turnId: deps.turnId } : {}),
+  })
+  if (brokered) return brokered
+  try {
+    const rootDir = resolvePath(asText(input.path).trim() || '.')
+    const maxDepth = clampInt(input.max_depth, 3, 0, 6)
+    const entries = await listWalkEntries(rootDir, maxDepth, 250)
+    return textResult(entries.join('\n') || '(empty)')
+  } catch (err) {
+    return textResult(`oc_tree: ${err instanceof Error ? err.message : String(err)}`, true)
+  }
 }

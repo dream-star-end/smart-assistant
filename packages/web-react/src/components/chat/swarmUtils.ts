@@ -6,15 +6,13 @@ import type {
   SwarmPhase,
   SwarmSnapshot,
 } from "@openclaude/protocol/browser";
+import { isSwarmActive } from "./swarmDetect";
 export {
   extractSwarmSnapshotFromMessage,
+  isSwarmActive,
   latestSwarmSnapshot,
   type SwarmOpenRequest,
 } from "./swarmDetect";
-
-export function isSwarmActive(phase: SwarmPhase): boolean {
-  return phase === "starting" || phase === "running";
-}
 
 export function swarmPhaseMeta(phase: SwarmPhase): {
   label: string;

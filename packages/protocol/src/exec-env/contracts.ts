@@ -112,11 +112,25 @@ export interface ExecEnvStopProof {
   readonly proofDigest: string
 }
 
+export interface OpenToolBrokerChannelRequest {
+  readonly leaseId?: string
+  readonly fencingToken: string
+  readonly brainGen?: number
+  readonly sessionKey?: string
+  readonly channelKind?: ExecEnvChannelKind
+  readonly channelId?: string
+  readonly requestTimeoutMs?: number
+}
+
 export interface ExecEnvHandle {
   readonly envId: string
   readonly lease: ExecEnvLease
   readonly capabilities: ExecEnvCapabilities
   readonly attachment: ExecEnvAttachmentDigest
+  openChannel?(
+    channelName: 'tool-broker',
+    opts: OpenToolBrokerChannelRequest,
+  ): ToolBrokerTransport & { close?(reason?: string): void }
 }
 
 export interface ToolCatalogEntry {
@@ -162,6 +176,10 @@ export interface ToolResultEnvelope {
   readonly errorMessage?: string
   readonly durationMs: number
   readonly spilledBlobId?: string
+  readonly replayStatus?: 'executed' | 'cached_receipt' | 'unknown_effect_fenced'
+  readonly approvalStatus?: 'not_required' | 'approved' | 'denied' | 'detached_pending'
+  readonly detachedCard?: object
+  readonly isError?: boolean
 }
 
 export type ToolStreamFrame =

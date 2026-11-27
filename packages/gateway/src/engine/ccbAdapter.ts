@@ -559,7 +559,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         // parser.finish() 幂等 → onFinish 恰好一次。identity guard:只有当
         // activeTurn 仍指向本 turn 才清(防 stale end 误清后继 turn)。
         if (this._activeTurn === ctx) this._activeTurn = null
-        ctx.stopLeaseRenewal?.()
+        ctx.stopLeaseRenewal?.(); this.runner.revokeTurnBrokerHook?.()
         if (result?.isError && isBoxContinuationRejectedDetail(result.errorDetail)) {
           this._notifyBoxStop(ctx, 'continuation_rejected')
         }
@@ -637,9 +637,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
           )
         }
       })
-    void submitted.catch(() => {
-      if (this._activeTurn === ctx) this._activeTurn = null
-    })
+    void submitted.catch(() => { if (this._activeTurn === ctx) this._activeTurn = null; if (this._routeTurn === ctx) this.runner.revokeTurnBrokerHook?.() })
     return {
       submitted,
       summary,

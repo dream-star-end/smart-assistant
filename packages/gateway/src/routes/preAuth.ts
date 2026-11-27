@@ -51,10 +51,12 @@ import {
   SESSION_BACKGROUND_INTERNAL_ROUTES,
   type CronJobsWithMetaReader,
 } from './sessionBackgroundRoute.js'
+import { TOOL_BROKER_LOCAL_ROUTES } from './toolBrokerLocalRoute.js'
 
 export interface PreAuthRoutesIo {
   handleSystemHelp?(req: IncomingMessage, res: ServerResponse): Promise<void>
   handleRemoteSwarmLocal?(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void>
+  handleToolBrokerLocal?(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void>
   delegateJobs?(): DelegateJobStore | undefined
   ensureDelegateInflightSurface?(): DelegateInflightSurfaceStore
   delegateCancelHost?(): DelegateCancelHost
@@ -317,6 +319,8 @@ export const PRE_AUTH_ROUTES: readonly HttpRoute<PreAuthRoutesIo>[] = [
   ),
   // Session background tasks container-internal routes (OCV5-844): fail-closed signed bridge auth.
   ...SESSION_BACKGROUND_INTERNAL_ROUTES,
+  // ToolBroker loopback-only local routes (OCV5-915 P3-2): octk1/octh1/octm1 scoped auth.
+  ...TOOL_BROKER_LOCAL_ROUTES,
   // ── Multi-user login (no auth required, rate-limited) ──
   predicateRoute(
     'POST /api/auth/login',

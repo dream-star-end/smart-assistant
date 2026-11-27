@@ -24,7 +24,7 @@ describe("状态语义表(UI-SPEC §4.3)", () => {
       stopped: "idle",
       failed: "failed",
       disconnected: "attention",
-      unread: "running",
+      unread: "done",
       service_restart: "attention",
     });
     expect(STATUS.done.iconTone).toBe("done");

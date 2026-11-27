@@ -774,9 +774,7 @@ export function QuickAskWindow({
       demo
         ? { reason: "demo" }
         : {
-            sendUserText: (t: string) => {
-              void sendQuestion(t);
-            },
+            sendUserText: (t: string) => sendQuestion(t),
             busy: sending,
           },
     [demo, sendQuestion, sending],

@@ -70,6 +70,8 @@ export {
   TOOL_BROKER_DEFAULT_MAX_INLINE_PAYLOAD_BYTES,
   ToolBrokerPolicyError,
   ToolBrokerServer,
+  extractActionPolicyTarget,
+  loadAuthoritativeBrokerActionPolicy,
 } from './toolBroker.js'
 export type {
   DetachedApprovalCard,
@@ -89,8 +91,11 @@ export type {
 export {
   ContainerLinkToolBrokerClient,
   ContainerLinkToolBrokerHost,
+  TOOL_BROKER_LOCAL_PREFIX,
   ToolBrokerTransportError,
   createInMemoryFrameLinkPair,
+  isReservedToolBrokerFrame,
+  isToolBrokerWireFrame,
   openChannel,
   parseToolBrokerWireFrame,
 } from './containerLinkBrokerTransport.js'
@@ -99,5 +104,14 @@ export type {
   ContainerLinkToolBrokerHostOptions,
   FrameLinkLike,
   OpenToolBrokerChannelOptions,
+  ToolBrokerRebindAck,
   ToolBrokerWireFrame,
 } from './containerLinkBrokerTransport.js'
+
+export { createLiveExecEnvHandle } from './liveExecEnvHandle.js'
+export type {
+  LiveExecEnvHandle,
+  LiveExecEnvHandleOptions,
+  OpenExecEnvFrameLinkContext,
+  OpenExecEnvFrameLinkFn,
+} from './liveExecEnvHandle.js'

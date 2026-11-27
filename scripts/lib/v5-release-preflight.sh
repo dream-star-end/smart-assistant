@@ -64,10 +64,10 @@ rpf_check_source_pin() { # <repo> <target-sha>
   if [[ ! "$want" =~ ^[0-9a-f]{40}$ ]]; then
     rpf_add fail source-pin "target is not a 40-hex sha: ${want:-<empty>}"; return 0
   fi
-  if ! git -C "$repo" cat-file -e "${want}^{commit}" 2>/dev/null; then
+  if ! git -c safe.directory='*' -C "$repo" cat-file -e "${want}^{commit}" 2>/dev/null; then
     rpf_add fail source-pin "target ${want:0:12} is not a commit in $repo"; return 0
   fi
-  head="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+  head="$(git -c safe.directory='*' -C "$repo" rev-parse HEAD 2>/dev/null || true)"
   if [[ "$head" != "$want" ]]; then
     rpf_add fail source-pin "$repo HEAD ${head:0:12} ≠ target ${want:0:12} (the shared tree moved after pinning)"
     return 0
@@ -111,10 +111,10 @@ rpf_check_migrations() { # <repo> <from-sha|""> <target-sha>
   if [[ ! "$from" =~ ^[0-9a-f]{40}$ ]]; then
     rpf_add warn migrations "no live sourceCommit to diff against; cutover gate decides"; return 0
   fi
-  if ! git -C "$repo" cat-file -e "${from}^{commit}" 2>/dev/null; then
+  if ! git -c safe.directory='*' -C "$repo" cat-file -e "${from}^{commit}" 2>/dev/null; then
     rpf_add fail migrations "live sourceCommit ${from:0:12} is not a commit in $repo (cutover gate fails closed)"; return 0
   fi
-  if ! changed="$(git -C "$repo" diff --name-only "$from" "$to" -- '**/migrations/**')"; then
+  if ! changed="$(git -c safe.directory='*' -C "$repo" diff --name-only "$from" "$to" -- '**/migrations/**')"; then
     rpf_add fail migrations "git diff ${from:0:12}..${to:0:12} failed"; return 0
   fi
   if [[ -z "$changed" ]]; then
@@ -122,15 +122,15 @@ rpf_check_migrations() { # <repo> <from-sha|""> <target-sha>
   fi
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/oc-preflight-mig.XXXXXX")" || { rpf_add fail migrations "mktemp failed"; return 0; }
   mkdir -p "$tmp/deploy/v5"
-  if ! git -C "$repo" show "$to:deploy/v5/release-metadata.json" >"$tmp/deploy/v5/release-metadata.json" 2>/dev/null; then
+  if ! git -c safe.directory='*' -C "$repo" show "$to:deploy/v5/release-metadata.json" >"$tmp/deploy/v5/release-metadata.json" 2>/dev/null; then
     rm -rf -- "$tmp"; rpf_add fail migrations "target has no deploy/v5/release-metadata.json"; return 0
   fi
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     n=$((n + 1))
-    if git -C "$repo" cat-file -e "$to:$f" 2>/dev/null; then
+    if git -c safe.directory='*' -C "$repo" cat-file -e "$to:$f" 2>/dev/null; then
       mkdir -p "$tmp/$(dirname "$f")"
-      git -C "$repo" show "$to:$f" >"$tmp/$f" || true
+      git -c safe.directory='*' -C "$repo" show "$to:$f" >"$tmp/$f" || true
     fi
     # the gate's die/mlog, captured: a refusal becomes one reason instead of an exit
     out="$( (die() { printf '%s\n' "$*"; exit 1; }; mlog() { :; }

@@ -41,7 +41,14 @@ const DRIVER_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 const IDENT_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const TENANT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/
 const STICKY_KEY_RE = /^s-[a-f0-9]{16}$/
-const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/
+
+function hasControlChar(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i)
+    if (code <= 0x1f || code === 0x7f) return true
+  }
+  return false
+}
 
 const POOL_KIND_SET: ReadonlySet<string> = new Set<string>(INFERENCE_POOL_KINDS)
 const ENGINE_FAMILY_SET: ReadonlySet<string> = new Set<string>(INFERENCE_ENGINE_FAMILIES)
@@ -69,100 +76,41 @@ const ATTESTATION_MODE_SET: ReadonlySet<string> = new Set<string>([
 ])
 
 const CAPABILITY_KEYS: ReadonlySet<string> = new Set<string>([
-  'logicalModel',
-  'upstreamModelId',
-  'supportsVision',
-  'supportedEfforts',
-  'defaultEffort',
-  'supportedServiceTiers',
-  'supportsReadOnly',
-  'supportsConsultTurn',
-  'supportsHermeticNoTools',
-  'supportsSwarm',
-  'supportsAdaptiveThinking',
-  'contextWindow',
+  'logicalModel', 'upstreamModelId', 'supportsVision', 'supportedEfforts',
+  'defaultEffort', 'supportedServiceTiers', 'supportsReadOnly', 'supportsConsultTurn',
+  'supportsHermeticNoTools', 'supportsSwarm', 'supportsAdaptiveThinking', 'contextWindow',
 ])
 
 const MANIFEST_KEYS: ReadonlySet<string> = new Set<string>([
-  'schemaVersion',
-  'poolKind',
-  'engineFamily',
-  'authorityEngine',
-  'driverId',
-  'driverVersion',
-  'observedAt',
-  'models',
+  'schemaVersion', 'poolKind', 'engineFamily', 'authorityEngine',
+  'driverId', 'driverVersion', 'observedAt', 'models',
 ])
 
 const PLACEMENT_HINT_KEYS: ReadonlySet<string> = new Set<string>([
-  'poolPreference',
-  'stickyHomeKey',
-  'cacheAffinityKey',
-  'preferredDriverId',
-  'preferredProfileId',
-  'placementEpoch',
+  'poolPreference', 'stickyHomeKey', 'cacheAffinityKey',
+  'preferredDriverId', 'preferredProfileId', 'placementEpoch',
 ])
 
 const TOOL_BRIDGE_KEYS: ReadonlySet<string> = new Set<string>([
-  'kind',
-  'uri',
-  'authTokenRef',
-  'attestationMode',
+  'kind', 'uri', 'authTokenRef', 'attestationMode',
 ])
 
 const TURN_REQUEST_KEYS: ReadonlySet<string> = new Set<string>([
-  'schemaVersion',
-  'turnId',
-  'turnKey',
-  'requestId',
-  'tenantId',
-  'sessionKey',
-  'logicalModel',
-  'reasoningEffort',
-  'serviceTier',
-  'input',
-  'systemInstructions',
-  'placementHint',
-  'toolBridge',
-  'readOnly',
-  'consultTurn',
-  'hermeticNoTools',
-  'needsSwarm',
-  'nativeSessionId',
-  'authorityTurnId',
+  'schemaVersion', 'turnId', 'turnKey', 'requestId', 'tenantId', 'sessionKey',
+  'logicalModel', 'reasoningEffort', 'serviceTier', 'input', 'systemInstructions',
+  'placementHint', 'toolBridge', 'readOnly', 'consultTurn', 'hermeticNoTools',
+  'needsSwarm', 'nativeSessionId', 'authorityTurnId',
 ])
 
 const USAGE_COUNTER_KEYS: ReadonlySet<string> = new Set<string>([
-  'inputTokens',
-  'outputTokens',
-  'cacheReadTokens',
-  'cacheWriteTokens',
-  'reasoningTokens',
+  'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens',
 ])
 
 const RECEIPT_V5_KEYS: ReadonlySet<string> = new Set<string>([
-  'version',
-  'poolKind',
-  'engineFamily',
-  'driverId',
-  'driverVersion',
-  'tenantId',
-  'sessionKey',
-  'turnId',
-  'turnKey',
-  'requestId',
-  'logicalModel',
-  'canonicalModel',
-  'upstreamModel',
-  'serviceTier',
-  'placementEpoch',
-  'usageSemantics',
-  'usage',
-  'status',
-  'errorCode',
-  'rawEvidenceDigest',
-  'semanticDigest',
-  'receiptDigest',
+  'version', 'poolKind', 'engineFamily', 'driverId', 'driverVersion', 'tenantId',
+  'sessionKey', 'turnId', 'turnKey', 'requestId', 'logicalModel', 'canonicalModel',
+  'upstreamModel', 'serviceTier', 'placementEpoch', 'usageSemantics', 'usage',
+  'status', 'errorCode', 'rawEvidenceDigest', 'semanticDigest', 'receiptDigest',
   'finalizedAt',
 ])
 
@@ -370,7 +318,7 @@ export function computeStickyHomeKey(sessionKey: string): string {
     typeof sessionKey === 'string' &&
       sessionKey.length > 0 &&
       sessionKey.length <= 512 &&
-      !CONTROL_CHAR_RE.test(sessionKey),
+      !hasControlChar(sessionKey),
     'INFERENCE_STICKY_HOME_SESSION_KEY_INVALID',
   )
   const digest = remoteCanonicalSha256({
@@ -392,7 +340,7 @@ export function computeCacheAffinityKey(parts: CacheAffinityKeyParts): string {
       typeof parts.sessionKey === 'string' &&
       parts.sessionKey.length > 0 &&
       parts.sessionKey.length <= 512 &&
-      !CONTROL_CHAR_RE.test(parts.sessionKey) &&
+      !hasControlChar(parts.sessionKey) &&
       typeof parts.logicalModel === 'string' &&
       MODEL_ID_RE.test(parts.logicalModel),
     'INFERENCE_CACHE_AFFINITY_PARTS_INVALID',
@@ -516,7 +464,7 @@ export function validateTurnReceiptV5(raw: unknown): TurnReceiptV5 {
       typeof r.sessionKey === 'string' &&
       r.sessionKey.length > 0 &&
       r.sessionKey.length <= 512 &&
-      !CONTROL_CHAR_RE.test(r.sessionKey) &&
+      !hasControlChar(r.sessionKey) &&
       typeof r.turnId === 'string' &&
       IDENT_RE.test(r.turnId) &&
       typeof r.turnKey === 'string' &&
@@ -843,7 +791,7 @@ function validateToolBridgeEndpoint(raw: unknown): ToolBridgeEndpoint {
       typeof e.uri === 'string' &&
       e.uri.length > 0 &&
       e.uri.length <= 1024 &&
-      !CONTROL_CHAR_RE.test(e.uri),
+      !hasControlChar(e.uri),
     'INFERENCE_TOOL_BRIDGE_INVALID',
   )
   if (e.authTokenRef !== undefined) {
@@ -882,7 +830,7 @@ export function validateUnifiedTurnRequest(raw: unknown): UnifiedTurnRequest {
       typeof q.sessionKey === 'string' &&
       q.sessionKey.length > 0 &&
       q.sessionKey.length <= 512 &&
-      !CONTROL_CHAR_RE.test(q.sessionKey) &&
+      !hasControlChar(q.sessionKey) &&
       typeof q.logicalModel === 'string' &&
       MODEL_ID_RE.test(q.logicalModel) &&
       Array.isArray(q.input) &&
@@ -915,7 +863,7 @@ export function validateUnifiedTurnRequest(raw: unknown): UnifiedTurnRequest {
       typeof q.nativeSessionId === 'string' &&
         q.nativeSessionId.length > 0 &&
         q.nativeSessionId.length <= 256 &&
-        !CONTROL_CHAR_RE.test(q.nativeSessionId),
+        !hasControlChar(q.nativeSessionId),
       'INFERENCE_TURN_REQUEST_INVALID',
     )
   }

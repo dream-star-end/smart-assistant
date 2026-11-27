@@ -2,6 +2,8 @@ import "@testing-library/jest-dom/vitest";
 import type { ComponentProps } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import type { SwarmSnapshot } from "@openclaude/protocol/browser";
+import { liveUnitToMessage } from "../lib/chat/liveUnitsHydrate";
 import type { ChatMessage } from "../lib/chat/model";
 import { canonicalTaskContinuationError, manualTaskContinuationSource } from "../lib/chat/manualTaskContinuation";
 import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkeleton";
@@ -2059,6 +2061,112 @@ describe("MessageList Manus 过程披露", () => {
       expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("等待模型响应");
       view.rerender(<MessageList processDisclosure messages={[user, tool]} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} turnActivity={activity} />);
       expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
+    });
+
+    const swarmActivity = { startedAt: T0 - 8 * 3600_000, lastFrameAt: T0, agentName: "助手" };
+    const swarmWait = row("swarm-wait", "tool", "", {
+      _clientMessageId: user.id,
+      toolName: "SwarmWait",
+      _completed: true,
+      ts: T0 - 7 * 3600_000 - 1000,
+      completedAt: T0 - 7 * 3600_000,
+    });
+
+    function replayedBoard(phase: SwarmSnapshot["phase"], coordinatorWaiting: boolean, updatedAt = T0) {
+      const snapshot: SwarmSnapshot = {
+        swarmId: "one-swarm", title: "并行核验", phase, revision: 2, updatedAt,
+        members: [
+          { name: "coordinator", role: "coordinator", status: coordinatorWaiting ? "waiting" : "working",
+            waitingOnBoard: coordinatorWaiting, stepCount: 1, unreadCount: 0 },
+          { name: "worker", role: "worker", status: "waiting", waitingOnBoard: true, stepCount: 1, unreadCount: 0 },
+        ],
+        channels: [], posts: [], totalPosts: 0,
+      };
+      return liveUnitToMessage({
+        id: "swarm-board", blockId: "agy-swarm-1", clientMessageId: user.id,
+        kind: "tool", toolName: "SwarmBoard", inputJson: { snapshot },
+        open: phase === "running", seqFirst: 1, seqLast: 5, recordIdFirst: "r1", recordIdLast: "r5",
+      });
+    }
+
+    test.each([
+      [true, "等待蜂群回复"],
+      [false, "蜂群协作中"],
+    ] as const)("聚合的进程重放：协调者停泊=%s，折叠表头和展开尾行一致", (parked, label) => {
+      // SwarmBoard is replayed as its own interactive card, not a process step.
+      // Keep it out of the fold and exercise the real MessageList grouping.
+      renderList([user, replayedBoard("running", parked), swarmWait], { sending: true, turnActivity: swarmActivity });
+      const shell = screen.getByTestId("process-disclosure");
+      const rail = within(shell).getByTestId("process-live-tail");
+      expect(rail).toHaveTextContent(label);
+      expect(rail).not.toHaveTextContent(/等待模型响应|7 小时/);
+      fireEvent.click(within(shell).getByTestId("process-toggle"));
+      expect(within(shell).queryByTestId("process-live-tail")).not.toBeInTheDocument();
+      expect(within(shell).getByTestId("process-step-live")).toHaveTextContent(label);
+    });
+
+    test("单位重放的已完成工具没有真实完成时间，只显示协作进展，不编造尾行时长", () => {
+      const step = liveUnitToMessage({
+        id: "replayed-post", blockId: "post-1", clientMessageId: user.id,
+        kind: "tool", toolName: "SwarmPost", open: false,
+        seqFirst: 6, seqLast: 7, recordIdFirst: "r6", recordIdLast: "r7",
+      });
+      renderList([user, replayedBoard("running", false), step], { sending: true, turnActivity: swarmActivity });
+      const group = screen.getByTestId("process-step-group");
+      expect(within(group).getByTestId("process-step-live")).toHaveTextContent("蜂群协作中");
+      expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
+      expect(within(group).queryByTestId("swarm-inline-card")).not.toBeInTheDocument();
+    });
+
+    test.each([
+      [true, "等待蜂群回复"],
+      [false, "蜂群协作中"],
+    ] as const)("看板有较新进展：协调者停泊=%s，不覆盖明确的新思考", (parked, label) => {
+      const board = replayedBoard("running", parked);
+      const tool = { ...done, completedAt: T0 - 10_000 };
+      const view = renderList([user, tool, board], { sending: true, turnActivity: swarmActivity });
+      expect(screen.getByTestId("process-live-tail")).toHaveTextContent(label);
+      const thinking = row("thinking", "thinking", "继续分析", { _clientMessageId: user.id, ts: T0 });
+      view.rerender(<MessageList processDisclosure messages={[user, tool, board, thinking]} sending sessionId="session-a"
+        cb={{}} onRespondPermission={() => {}} turnActivity={swarmActivity} />);
+      expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
+      expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考");
+    });
+
+    test("没有看板时，正在执行的等待工具可证明蜂群等待，但完成后不能", () => {
+      const wait = { ...swarmWait, toolName: "mcp__openclaude-memory__swarm_wait" };
+      const view = renderList([user, { ...wait, _completed: false }], { sending: true, turnActivity: swarmActivity });
+      expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待蜂群回复");
+      view.rerender(<MessageList processDisclosure messages={[user, wait]} sending sessionId="session-a"
+        cb={{}} onRespondPermission={() => {}} turnActivity={swarmActivity} />);
+      expect(screen.getByTestId("process-live-tail")).toHaveTextContent("等待模型响应7 小时");
+    });
+
+    test("蜂群看板终态、后续普通工具和下一轮不接续旧的等待", () => {
+      const modelTool = { ...done, ts: T0 - 11_000, completedAt: T0 - 10_000 };
+      const terminal = replayedBoard("completed", true);
+      const runningBoard = replayedBoard("running", true, T0 - 20_000);
+      const view = renderList([user, runningBoard, swarmWait, modelTool], { sending: true, turnActivity: swarmActivity });
+      const expectOrdinaryWait = () => expect(screen.getByTestId("process-live-tail")).toHaveTextContent("等待模型响应10 秒");
+      expectOrdinaryWait();
+
+      const redraw = (messages: ChatMessage[], sending = true) => view.rerender(
+        <MessageList processDisclosure messages={messages} sending={sending} sessionId="session-a" cb={{}}
+          onRespondPermission={() => {}} turnActivity={swarmActivity} />,
+      );
+      redraw([user, swarmWait, terminal]);
+      expect(screen.getByTestId("process-live-tail")).toHaveTextContent("等待模型响应7 小时");
+      redraw([user, swarmWait, terminal], false);
+      expect(screen.queryByTestId("process-step-live")).not.toBeInTheDocument();
+
+      const next = row("u2", "user", "普通问题", { status: "sent", ts: T0 - 15_000 });
+      redraw([{ ...user, status: "replied" }, runningBoard, swarmWait, next, { ...modelTool, _clientMessageId: next.id }]);
+      expectOrdinaryWait();
+      // A stale board with an explicit older owner must not lend evidence to
+      // a later turn even if its replay arrives on the other side of the user row.
+      redraw([{ ...user, status: "replied" }, swarmWait, next, runningBoard, { ...swarmWait, id: "next-tool",
+        _clientMessageId: next.id, ts: modelTool.ts, completedAt: modelTool.completedAt }]);
+      expectOrdinaryWait();
     });
 
     test("命令连续运行超过 5 秒，在干活的摘要行旁显示每秒在走的「已运行 N 秒」", () => {

@@ -5,8 +5,8 @@ import { IconButton } from "./IconButton";
 import { useToastAnchor } from "./Toast";
 
 /**
- * 顶栏未读状态点（OCV5-820 / OCV5-850）：
- * - 站内信使用克制 6px danger 静默实心点；会话未读使用克制 6px accent 静默实心点（不加水波闪烁，减少顶栏视觉噪声）；
+ * 顶栏未读状态点（OCV5-820 / OCV5-850 / OCV5-920）：
+ * - 站内信使用克制 6px danger 静默实心点；会话未读使用克制 6px success 静默实心绿点（不加水波闪烁，减少顶栏视觉噪声）；
  * - 彻底消灭高饱和 `99+` / `40` 焦虑数字泡泡，精准计数保留在父按钮 `aria-label` 与 `title` 中；
  * - count 缺省或 ≤0 时不占位。
  */
@@ -19,7 +19,7 @@ export function HeaderCountBadge({
 }: {
   count?: number;
   testId?: string;
-  tone?: "danger" | "accent";
+  tone?: "danger" | "accent" | "success";
   ariaLabel?: string;
   className?: string;
 }) {
@@ -31,7 +31,7 @@ export function HeaderCountBadge({
       aria-label={ariaLabel}
       className={cn(
         "pointer-events-none absolute right-1.5 top-1.5 size-1.5 rounded-full ring-2 ring-bg",
-        tone === "accent" ? "bg-accent" : "bg-danger",
+        tone === "success" ? "bg-success" : tone === "accent" ? "bg-accent" : "bg-danger",
         className,
       )}
     />
@@ -129,7 +129,7 @@ export function WorkspaceShellHeader({
                 <HeaderCountBadge
                   count={sessionUnreadCount}
                   testId="session-unread-badge"
-                  tone="accent"
+                  tone="success"
                   ariaLabel={hasUnreadSessions ? `${sessionUnreadCount} 条未读会话` : undefined}
                 />
               </div>
@@ -161,7 +161,7 @@ export function WorkspaceShellHeader({
                 <HeaderCountBadge
                   count={sessionUnreadCount}
                   testId="session-unread-badge"
-                  tone="accent"
+                  tone="success"
                   ariaLabel={hasUnreadSessions ? `${sessionUnreadCount} 条未读会话` : undefined}
                 />
               </div>

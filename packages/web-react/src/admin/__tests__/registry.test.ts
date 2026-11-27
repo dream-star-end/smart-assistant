@@ -1,10 +1,13 @@
 import { describe, expect, test } from "vitest";
 import {
   ADMIN_GROUP_ORDER,
+  SELFHOST_GOVERNANCE_PAGE,
   adminGroups,
   adminPages,
   adminTabKeys,
   getAdminPage,
+  getVisibleAdminGroups,
+  getVisibleAdminPage,
 } from "../registry";
 
 // 分组 → 期望 key 列表（权威源 = React registry 的运营信息架构）。
@@ -64,5 +67,18 @@ describe("registry 完整性", () => {
     expect(getAdminPage("productFriction").key).toBe("productFriction");
     expect(getAdminPage("nope").key).toBe("dashboard");
     expect(getAdminPage("").key).toBe("dashboard");
+    expect(getAdminPage("governance").key).toBe("dashboard");
+  });
+
+  test("商业版隔离：selfhostGovernance=false 时隐藏自治治理且深链回落 dashboard，为 true 时展示", () => {
+    expect(getVisibleAdminPage("governance", { selfhostGovernance: false }).key).toBe("dashboard");
+    expect(getVisibleAdminPage("governance").key).toBe("dashboard");
+    expect(getVisibleAdminGroups({ selfhostGovernance: false }).flatMap((g) => g.pages.map((p) => p.key))).not.toContain(
+      "governance",
+    );
+
+    expect(getVisibleAdminPage("governance", { selfhostGovernance: true })).toBe(SELFHOST_GOVERNANCE_PAGE);
+    const selfhostAuditGroup = getVisibleAdminGroups({ selfhostGovernance: true }).find((g) => g.group === "审计与安全");
+    expect(selfhostAuditGroup?.pages.map((p) => p.key)).toContain("governance");
   });
 });

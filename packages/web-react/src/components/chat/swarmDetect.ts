@@ -1,9 +1,7 @@
-import {
-  SWARM_BOARD_TOOL_NAME,
-  isSwarmSnapshot,
-  type SwarmSnapshot,
-} from "@openclaude/protocol/browser";
+import type { SwarmSnapshot } from "@openclaude/protocol/browser";
 import type { ChatMessage } from "../../lib/chat/model";
+import { extractSwarmSnapshotFromMessage } from "../../lib/chat/swarmBoardEvidence";
+export { extractSwarmSnapshotFromMessage, isSwarmActive } from "../../lib/chat/swarmBoardEvidence";
 
 export type SwarmOpenRequest = {
   snapshot: SwarmSnapshot;
@@ -21,21 +19,6 @@ export type SwarmCardEntry = {
   blockId?: string;
   snapshot: SwarmSnapshot;
 };
-
-/** Extract a SwarmSnapshot from either a live WS-updated message or a persisted
- * server-authored `SwarmBoard` tool row (zero DB migration durability). */
-export function extractSwarmSnapshotFromMessage(msg: ChatMessage | null | undefined): SwarmSnapshot | null {
-  if (!msg) return null;
-  if (isSwarmSnapshot(msg._swarmSnapshot)) return msg._swarmSnapshot;
-  if (msg.role !== "tool" || msg.toolName !== SWARM_BOARD_TOOL_NAME) return null;
-  if (isSwarmSnapshot(msg.outputJson)) return msg.outputJson;
-  if (msg.inputJson && typeof msg.inputJson === "object" && !Array.isArray(msg.inputJson)) {
-    const rec = msg.inputJson as Record<string, unknown>;
-    if (isSwarmSnapshot(rec.snapshot)) return rec.snapshot;
-    if (isSwarmSnapshot(rec)) return rec;
-  }
-  return null;
-}
 
 /**
  * UI-side check for Antigravity models capable of Swarm mode without

@@ -46,9 +46,14 @@ import {
 } from '@openclaude/protocol'
 import {
   evaluateActionPolicy,
+  loadActionPolicy,
   type AiReviewHook,
   type LoadedActionPolicy,
 } from '../actionPolicyEngine.js'
+
+export function loadAuthoritativeBrokerActionPolicy(): LoadedActionPolicy {
+  return loadActionPolicy()
+}
 import { evaluateShellForHook, type GuardMode } from '../agentEfficiencyGuard.js'
 import { ExecEnvLeaseError, type ExecEnvLeaseManager } from './execEnvLease.js'
 import {
@@ -145,6 +150,8 @@ export interface ToolApprovalRequest {
   readonly approvalId: string
   readonly leaseId: string
   readonly sessionKey: string
+  readonly turnId?: string
+  readonly grantId?: string
   readonly callId: string
   readonly toolName: string
   readonly arguments: Readonly<Record<string, unknown>>
@@ -196,14 +203,25 @@ export interface ToolBrokerDurableWalAdapter {
   ): { readonly bytes: Uint8Array; readonly mimeType: string; readonly sha256?: string } | null
 }
 
+export type PreExecuteAuthorizer = (input: {
+  readonly call: ToolBrokerInvokeRequest
+  readonly sessionKey: string
+  readonly leaseId: string
+  readonly turnId: string
+  readonly grantId?: string
+  readonly brainGen?: number
+}) => { readonly ok: true } | { readonly ok: false; readonly errorCode: string; readonly errorMessage: string }
+
 export interface ToolBrokerServerOptions {
   readonly channelKind?: ExecEnvChannelKind
   readonly leaseManager?: ExecEnvLeaseManager
   readonly requireFencingToken?: boolean
   readonly capabilityAuthority?: ScopedCapabilityTokenAuthority
   readonly requireCapabilityToken?: boolean
+  readonly authorizeBeforeExecute?: PreExecuteAuthorizer
   readonly defaultPolicy?: ExecutionPolicyEnvelope
   readonly loadedActionPolicy?: LoadedActionPolicy
+  readonly actionPolicyLoader?: () => LoadedActionPolicy
   readonly aiReviewHook?: AiReviewHook
   readonly trustedStrongModels?: readonly string[]
   readonly defaultMainModel?: string
@@ -289,6 +307,20 @@ function isWalEntryInterrupted(entry: WalEntry | null): boolean {
   return entry !== null && entry.state === 'interrupted'
 }
 
+const ACTION_POLICY_TARGET_KEYS = ['target', 'provider', 'site', 'slug', 'url'] as const
+
+export function extractActionPolicyTarget(
+  args: Readonly<Record<string, unknown>>,
+  explicitTarget?: string,
+): string | undefined {
+  if (typeof explicitTarget === 'string' && explicitTarget.trim()) return explicitTarget.trim()
+  for (const key of ACTION_POLICY_TARGET_KEYS) {
+    const value = args[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
 function readRegularJsonFileSync<T>(filePath: string): { readonly exists: boolean; readonly data?: T; readonly corrupt?: boolean } {
   let stat: ReturnType<typeof lstatSync>
   try {
@@ -313,6 +345,9 @@ function readRegularJsonFileSync<T>(filePath: string): { readonly exists: boolea
 interface InFlightCall {
   readonly callId: string
   readonly leaseId: string
+  readonly sessionKey: string
+  readonly turnId: string
+  readonly grantId?: string
   readonly idempotencyKey: string
   readonly controller: AbortController
   cancelReason?: string
@@ -437,8 +472,10 @@ export class ToolBrokerServer implements ToolBrokerTransport {
   private readonly requireFencingToken: boolean
   private readonly capabilityAuthority?: ScopedCapabilityTokenAuthority
   private readonly requireCapabilityToken: boolean
+  private readonly authorizeBeforeExecute?: PreExecuteAuthorizer
   private readonly defaultPolicy?: ExecutionPolicyEnvelope
   private readonly loadedActionPolicy: LoadedActionPolicy
+  private readonly actionPolicyLoader?: () => LoadedActionPolicy
   private readonly aiReviewHook?: AiReviewHook
   private readonly trustedStrongModels?: readonly string[]
   private readonly defaultMainModel?: string
@@ -470,10 +507,12 @@ export class ToolBrokerServer implements ToolBrokerTransport {
     this.requireFencingToken = opts.requireFencingToken ?? Boolean(opts.leaseManager)
     this.capabilityAuthority = opts.capabilityAuthority
     this.requireCapabilityToken = opts.requireCapabilityToken ?? Boolean(opts.capabilityAuthority)
+    this.authorizeBeforeExecute = opts.authorizeBeforeExecute
     this.defaultPolicy = opts.defaultPolicy
       ? validateExecutionPolicyEnvelope(opts.defaultPolicy)
       : undefined
     this.loadedActionPolicy = opts.loadedActionPolicy ?? defaultInMemoryLoadedActionPolicy()
+    this.actionPolicyLoader = opts.actionPolicyLoader
     this.aiReviewHook = opts.aiReviewHook
     this.trustedStrongModels = opts.trustedStrongModels
     this.defaultMainModel = opts.defaultMainModel
@@ -750,13 +789,36 @@ export class ToolBrokerServer implements ToolBrokerTransport {
     return count
   }
 
+  cancelTurn(sessionKey: string, turnId: string, reason = 'turn_revoked', grantId?: string): number {
+    let count = 0
+    for (const active of [...this.inFlight.values()]) {
+      if (active.sessionKey !== sessionKey || active.turnId !== turnId) continue
+      if (grantId !== undefined && active.grantId !== grantId) continue
+      const wal = this.wal.get(active.idempotencyKey)
+      if (wal && wal.state === 'in_flight') wal.state = 'interrupted'
+      active.cancelReason = reason
+      active.onCancel?.(reason)
+      active.controller.abort(new Error(reason))
+      count += 1
+    }
+    return count
+  }
+
   async cancel(callId: string, reason: string, leaseId?: string): Promise<void> {
-    const active = this.inFlight.get(callId)
-    if (!active) return
-    if (leaseId !== undefined && active.leaseId !== leaseId) return
-    active.cancelReason = reason
-    active.onCancel?.(reason)
-    active.controller.abort(new Error(reason))
+    if (leaseId !== undefined) {
+      const active = this.inFlight.get(`${leaseId}\u0000${callId}`)
+      if (!active) return
+      active.cancelReason = reason
+      active.onCancel?.(reason)
+      active.controller.abort(new Error(reason))
+      return
+    }
+    for (const active of [...this.inFlight.values()]) {
+      if (active.callId !== callId) continue
+      active.cancelReason = reason
+      active.onCancel?.(reason)
+      active.controller.abort(new Error(reason))
+    }
   }
 
   async invoke(call: ToolBrokerInvokeRequest): Promise<ToolBrokerResultEnvelope> {
@@ -809,6 +871,91 @@ export class ToolBrokerServer implements ToolBrokerTransport {
     }
   }
 
+  private verifyPreExecuteAuthorization(
+    call: ToolBrokerInvokeRequest,
+    activeSessionKey: string,
+    currentBrainGen: number | undefined,
+    controller: AbortController,
+    inFlightRec: InFlightCall,
+  ):
+    | { readonly ok: true; readonly activeBrainGen?: number }
+    | { readonly ok: false; readonly status: 'denied' | 'error'; readonly errorCode: string; readonly errorMessage: string } {
+    if (controller.signal.aborted) {
+      return { ok: false, status: 'error', errorCode: 'TOOL_CALL_CANCELLED', errorMessage: inFlightRec.cancelReason ?? String(controller.signal.reason ?? 'TOOL_CALL_CANCELLED') }
+    }
+    let activeBrainGen = currentBrainGen
+    if (this.leaseManager && (this.requireFencingToken || call.fencingToken !== undefined)) {
+      if (!call.fencingToken) {
+        return { ok: false, status: 'denied', errorCode: 'EXEC_FENCING_TOKEN_STALE', errorMessage: 'Missing fencingToken before tool side-effect execution' }
+      }
+      try {
+        activeBrainGen = this.leaseManager.validateFencingToken(call.leaseId, call.fencingToken, call.brainGen).brainGen
+      } catch (err) {
+        return { ok: false, status: 'denied', errorCode: err instanceof ExecEnvLeaseError ? err.code : 'EXEC_FENCING_TOKEN_STALE', errorMessage: err instanceof Error ? err.message : String(err) }
+      }
+    }
+    if (this.authorizeBeforeExecute) {
+      const auth = this.authorizeBeforeExecute({ call, sessionKey: activeSessionKey, leaseId: call.leaseId, turnId: call.turnId, grantId: call.attestation?.grantId, brainGen: activeBrainGen })
+      if (!auth.ok) return { ok: false, status: 'denied', errorCode: auth.errorCode, errorMessage: auth.errorMessage }
+    }
+    return { ok: true, activeBrainGen }
+  }
+
+  private verifyGate1LeaseAndCapability(
+    call: ToolBrokerInvokeRequest,
+  ):
+    | { readonly ok: true; readonly activeSessionKey: string; readonly activeBrainGen?: number }
+    | { readonly ok: false; readonly errorCode: string; readonly errorMessage: string } {
+    let activeSessionKey = call.sessionKey ?? ''
+    let activeBrainGen = call.brainGen
+    if (this.leaseManager && (this.requireFencingToken || call.fencingToken !== undefined)) {
+      if (!call.fencingToken) {
+        return { ok: false, errorCode: 'EXEC_FENCING_TOKEN_STALE', errorMessage: 'Missing fencingToken for leased tool broker invocation' }
+      }
+      try {
+        const lease = this.leaseManager.validateFencingToken(call.leaseId, call.fencingToken, call.brainGen)
+        activeSessionKey = call.sessionKey ?? lease.sessionKey
+        activeBrainGen = lease.brainGen
+      } catch (err) {
+        return { ok: false, errorCode: err instanceof ExecEnvLeaseError ? err.code : 'EXEC_FENCING_TOKEN_STALE', errorMessage: err instanceof Error ? err.message : String(err) }
+      }
+    }
+    if (this.capabilityAuthority && (this.requireCapabilityToken || call.capabilityToken !== undefined)) {
+      if (!call.capabilityToken) {
+        return { ok: false, errorCode: 'CAPABILITY_TOKEN_MALFORMED', errorMessage: 'Missing R8 scoped capability token' }
+      }
+      try {
+        this.capabilityAuthority.verifyAndConsumeToken(call.capabilityToken, {
+          toolName: call.canonicalName, sessionKey: activeSessionKey, leaseId: call.leaseId,
+          callId: call.callId, minBrainGen: activeBrainGen, nowMs: this.clock(),
+        })
+      } catch (err) {
+        return { ok: false, errorCode: err instanceof ScopedCapabilityTokenError ? err.code : 'CAPABILITY_TOKEN_SIGNATURE_INVALID', errorMessage: err instanceof Error ? err.message : String(err) }
+      }
+    }
+    return { ok: true, activeSessionKey, activeBrainGen }
+  }
+
+  private verifyGate2ExecutionPolicy(
+    call: ToolBrokerInvokeRequest,
+  ): { readonly errorCode: string; readonly errorMessage: string } | null {
+    const policy = this.getPolicy(call.leaseId)
+    if (!policy) return null
+    if (policy.mode === 'hermetic_no_tools') {
+      return { errorCode: 'EXEC_POLICY_HERMETIC_NO_TOOLS', errorMessage: 'Tool execution is blocked in hermetic_no_tools mode' }
+    }
+    if (policy.deniedTools?.includes(call.canonicalName)) {
+      return { errorCode: 'EXEC_POLICY_TOOL_DENIED', errorMessage: `Tool "${call.canonicalName}" is explicitly denied by execution policy` }
+    }
+    if (policy.mode === 'read_only' && !isReadOnlyAllowedCanonicalTool(call.canonicalName, call.arguments)) {
+      return { errorCode: 'EXEC_POLICY_READ_ONLY_DENIED', errorMessage: `Tool "${call.canonicalName}" is forbidden in read_only execution mode` }
+    }
+    if (policy.allowedTools.length > 0 && !policy.allowedTools.includes(call.canonicalName)) {
+      return { errorCode: 'EXEC_POLICY_TOOL_NOT_ALLOWED', errorMessage: `Tool "${call.canonicalName}" is not in allowedCanonicalTools` }
+    }
+    return null
+  }
+
   private async executeInternal(
     call: ToolBrokerInvokeRequest,
     streamHooks?: {
@@ -842,102 +989,14 @@ export class ToolBrokerServer implements ToolBrokerTransport {
       durationMs: Math.max(0, this.clock() - startedAtMs),
     })
 
-    // ── Gate 1: Lease & FencingToken validation (R10) + R8 ScopedCapabilityToken ──────────
-    let activeSessionKey = call.sessionKey ?? ''
-    let activeBrainGen = call.brainGen
-    if (this.leaseManager && (this.requireFencingToken || call.fencingToken !== undefined)) {
-      if (!call.fencingToken) {
-        return makeResult({
-          status: 'denied',
-          errorCode: 'EXEC_FENCING_TOKEN_STALE',
-          errorMessage: 'Missing fencingToken for leased tool broker invocation',
-        })
-      }
-      try {
-        const lease = this.leaseManager.validateFencingToken(
-          call.leaseId,
-          call.fencingToken,
-          call.brainGen,
-        )
-        activeSessionKey = call.sessionKey ?? lease.sessionKey
-        activeBrainGen = lease.brainGen
-      } catch (err) {
-        const code = err instanceof ExecEnvLeaseError ? err.code : 'EXEC_FENCING_TOKEN_STALE'
-        return makeResult({
-          status: 'denied',
-          errorCode: code,
-          errorMessage: err instanceof Error ? err.message : String(err),
-        })
-      }
-    }
+    // ── Gate 1 & Gate 2: Lease/Fencing + R8 Capability + Monotonic ExecutionPolicy ────────
+    const gate1 = this.verifyGate1LeaseAndCapability(call)
+    if (!gate1.ok) return makeResult({ status: 'denied', errorCode: gate1.errorCode, errorMessage: gate1.errorMessage })
+    const activeSessionKey = gate1.activeSessionKey
+    let activeBrainGen = gate1.activeBrainGen
 
-    if (
-      this.capabilityAuthority &&
-      (this.requireCapabilityToken || call.capabilityToken !== undefined)
-    ) {
-      if (!call.capabilityToken) {
-        return makeResult({
-          status: 'denied',
-          errorCode: 'CAPABILITY_TOKEN_MALFORMED',
-          errorMessage: 'Missing R8 scoped capability token',
-        })
-      }
-      try {
-        this.capabilityAuthority.verifyAndConsumeToken(call.capabilityToken, {
-          toolName: call.canonicalName,
-          sessionKey: activeSessionKey,
-          leaseId: call.leaseId,
-          callId: call.callId,
-          minBrainGen: activeBrainGen,
-          nowMs: this.clock(),
-        })
-      } catch (err) {
-        const code =
-          err instanceof ScopedCapabilityTokenError
-            ? err.code
-            : 'CAPABILITY_TOKEN_SIGNATURE_INVALID'
-        return makeResult({
-          status: 'denied',
-          errorCode: code,
-          errorMessage: err instanceof Error ? err.message : String(err),
-        })
-      }
-    }
-
-    // ── Gate 2: Monotonic ExecutionPolicy guard (R9) ──────────────────────────────────────
-    const policy = this.getPolicy(call.leaseId)
-    if (policy) {
-      if (policy.mode === 'hermetic_no_tools') {
-        return makeResult({
-          status: 'denied',
-          errorCode: 'EXEC_POLICY_HERMETIC_NO_TOOLS',
-          errorMessage: 'Tool execution is blocked in hermetic_no_tools mode',
-        })
-      }
-      if (policy.deniedTools?.includes(call.canonicalName)) {
-        return makeResult({
-          status: 'denied',
-          errorCode: 'EXEC_POLICY_TOOL_DENIED',
-          errorMessage: `Tool "${call.canonicalName}" is explicitly denied by execution policy`,
-        })
-      }
-      if (policy.mode === 'read_only') {
-        if (!isReadOnlyAllowedCanonicalTool(call.canonicalName, call.arguments)) {
-          return makeResult({
-            status: 'denied',
-            errorCode: 'EXEC_POLICY_READ_ONLY_DENIED',
-            errorMessage: `Tool "${call.canonicalName}" is forbidden in read_only execution mode`,
-          })
-        }
-      }
-      if (policy.allowedTools.length > 0 && !policy.allowedTools.includes(call.canonicalName)) {
-        return makeResult({
-          status: 'denied',
-          errorCode: 'EXEC_POLICY_TOOL_NOT_ALLOWED',
-          errorMessage: `Tool "${call.canonicalName}" is not in allowedCanonicalTools`,
-        })
-      }
-    }
+    const gate2Denied = this.verifyGate2ExecutionPolicy(call)
+    if (gate2Denied) return makeResult({ status: 'denied', errorCode: gate2Denied.errorCode, errorMessage: gate2Denied.errorMessage })
 
     const toolDef = this.tools.get(call.canonicalName)
     if (!toolDef) {
@@ -976,151 +1035,90 @@ export class ToolBrokerServer implements ToolBrokerTransport {
       })
     }
 
-    // ── Gate 4: Unified ActionPolicy + Compound Shell Guard (R9) ─────────────────────────
-    let approvalStatus: ToolBrokerResultEnvelope['approvalStatus'] = 'not_required'
-    const shellTool = isShellTool(call.canonicalName, toolDef)
-    const command = shellTool ? extractShellCommand(call.arguments) : undefined
-
-    if (shellTool && command) {
-      const hookDecision = evaluateShellForHook(command, this.shellHookGuardMode)
-      if (hookDecision.decision === 'deny') {
-        return makeResult({
-          status: 'denied',
-          errorCode: 'SHELL_EFFICIENCY_GUARD_DENIED',
-          errorMessage: hookDecision.message ?? 'Shell command blocked by efficiency guard',
-        })
-      }
+    // ── Gate 4..7: Register cancellable inFlight BEFORE Gate 4 approval (B08 composite key) ──
+    const inFlightKey = `${call.leaseId}\u0000${call.callId}`
+    if (this.inFlight.has(inFlightKey)) {
+      return makeResult({ status: 'denied', errorCode: 'TOOL_CALL_DUPLICATE_IN_FLIGHT', errorMessage: `Concurrent duplicate in-flight call "${call.callId}" on lease "${call.leaseId}"` })
     }
-
-    const actionPolicyToolName = shellTool ? 'Bash' : call.canonicalName
-    const policyEval = await evaluateActionPolicy(
-      {
-        toolName: actionPolicyToolName,
-        ...(command === undefined ? {} : { command }),
-        args: { ...call.arguments },
-        mainModel: call.mainModel ?? this.defaultMainModel,
-        sessionKey: activeSessionKey || undefined,
-      },
-      {
-        loaded: this.loadedActionPolicy,
-        mainModel: call.mainModel ?? this.defaultMainModel,
-        trustedStrongModels: this.trustedStrongModels,
-        aiReviewHook: this.aiReviewHook,
-      },
-    )
-
-    if (policyEval.tier === 'deny') {
-      return makeResult({
-        status: 'denied',
-        errorCode: 'ACTION_POLICY_DENIED',
-        errorMessage: policyEval.reason,
-        approvalStatus: 'denied',
-      })
-    }
-
-    if (policyEval.tier === 'human_approval') {
-      const approvalId = `appr_${randomUUID().replace(/-/g, '').slice(0, 12)}`
-      const approvalReq: ToolApprovalRequest = {
-        approvalId,
-        leaseId: call.leaseId,
-        sessionKey: activeSessionKey,
-        callId: call.callId,
-        toolName: call.canonicalName,
-        arguments: call.arguments,
-        command,
-        evaluation: policyEval,
-      }
-      if (!this.approvalHandler) {
-        return makeResult({
-          status: 'denied',
-          errorCode: 'HUMAN_APPROVAL_REQUIRED',
-          errorMessage: policyEval.reason,
-          approvalStatus: 'denied',
-        })
-      }
-
-      const approvalOutcome = await this.awaitBlockingThenDetachedApproval(approvalReq)
-      if (approvalOutcome.kind === 'detached') {
-        const card: DetachedApprovalCard = {
-          approvalId,
-          leaseId: call.leaseId,
-          callId: call.callId,
-          toolName: call.canonicalName,
-          reason: policyEval.reason,
-          evaluation: policyEval,
-          createdAtMs: this.clock(),
-        }
-        this.onDetachedApprovalCard?.(card)
-        return makeResult({
-          status: 'denied',
-          errorCode: 'APPROVAL_DEFERRED_DETACHED',
-          errorMessage: `Human approval timed out after ${this.detachedFallbackAfterMs}ms; downgraded to async approval card ${approvalId}`,
-          approvalStatus: 'detached_pending',
-          detachedCard: card,
-        })
-      }
-      if (approvalOutcome.decision !== 'approve') {
-        return makeResult({
-          status: 'denied',
-          errorCode: 'HUMAN_APPROVAL_DENIED',
-          errorMessage: approvalOutcome.reason ?? 'Action denied by human approver',
-          approvalStatus: 'denied',
-        })
-      }
-      approvalStatus = 'approved'
-    }
-
-    // ── Gate 5: Idempotency WAL check (memory + cross-process disk WAL) ──────────────────
-    let idempotencyKey: string
-    try {
-      idempotencyKey = computeToolIdempotencyKey(call.leaseId, call.turnId, call.callId)
-    } catch (err) {
-      return makeResult({
-        status: 'denied',
-        errorCode: 'EXEC_TOOL_CALL_IDEMPOTENCY_MISMATCH',
-        errorMessage: err instanceof Error ? err.message : String(err),
-      })
-    }
-
-    if (call.idempotencyKey !== idempotencyKey) {
-      return makeResult({
-        status: 'denied',
-        errorCode: 'EXEC_TOOL_CALL_IDEMPOTENCY_MISMATCH',
-        errorMessage: `Provided idempotencyKey "${call.idempotencyKey}" does not match expected "${idempotencyKey}"`,
-      })
-    }
-
-    const preCheckReplay = await this.checkExistingWal(
-      idempotencyKey,
-      expectedArgsSha256,
-      call,
-      approvalStatus,
-      makeResult,
-    )
-    if (preCheckReplay !== null) {
-      return preCheckReplay
-    }
-
-    // ── Gate 6: Multi-concurrency scheduling + cooperative cancellation ──────────────────
     const controller = new AbortController()
     const inFlightRec: InFlightCall = {
       callId: call.callId,
       leaseId: call.leaseId,
-      idempotencyKey,
+      sessionKey: activeSessionKey,
+      turnId: call.turnId,
+      grantId: call.attestation?.grantId,
+      idempotencyKey: call.idempotencyKey,
       controller,
       onCancel: streamHooks?.onCancel,
     }
-    this.inFlight.set(call.callId, inFlightRec)
-
+    this.inFlight.set(inFlightKey, inFlightRec)
     let release: (() => void) | null = null
     let timeoutTimer: NodeJS.Timeout | null = null
     let timedOut = false
     let walEntry: WalEntry | null = null
+    let idempotencyKey = call.idempotencyKey
+    let approvalStatus: ToolBrokerResultEnvelope['approvalStatus'] = 'not_required'
 
     try {
+      const shellTool = isShellTool(call.canonicalName, toolDef)
+      const command = shellTool ? extractShellCommand(call.arguments) : undefined
+      if (shellTool && command) {
+        const hookDecision = evaluateShellForHook(command, this.shellHookGuardMode)
+        if (hookDecision.decision === 'deny') {
+          return makeResult({ status: 'denied', errorCode: 'SHELL_EFFICIENCY_GUARD_DENIED', errorMessage: hookDecision.message ?? 'Shell command blocked by efficiency guard' })
+        }
+      }
+
+      const loadedPolicy = this.actionPolicyLoader ? this.actionPolicyLoader() : this.loadedActionPolicy
+      const policyEval = await evaluateActionPolicy(
+        { toolName: shellTool ? 'Bash' : call.canonicalName, ...(command === undefined ? {} : { command }), target: extractActionPolicyTarget(call.arguments), args: { ...call.arguments }, mainModel: call.mainModel ?? this.defaultMainModel, sessionKey: activeSessionKey || undefined },
+        { loaded: loadedPolicy, mainModel: call.mainModel ?? this.defaultMainModel, trustedStrongModels: this.trustedStrongModels, aiReviewHook: this.aiReviewHook },
+      )
+      if (controller.signal.aborted) {
+        return makeResult({ status: 'error', errorCode: 'TOOL_CALL_CANCELLED', errorMessage: inFlightRec.cancelReason ?? String(controller.signal.reason ?? 'TOOL_CALL_CANCELLED'), approvalStatus: 'denied' })
+      }
+      if (policyEval.tier === 'deny') {
+        return makeResult({ status: 'denied', errorCode: 'ACTION_POLICY_DENIED', errorMessage: policyEval.reason, approvalStatus: 'denied' })
+      }
+
+      if (policyEval.tier === 'human_approval') {
+        const approvalId = `appr_${randomUUID().replace(/-/g, '').slice(0, 12)}`
+        const approvalReq: ToolApprovalRequest = { approvalId, leaseId: call.leaseId, sessionKey: activeSessionKey, turnId: call.turnId, grantId: call.attestation?.grantId, callId: call.callId, toolName: call.canonicalName, arguments: call.arguments, command, evaluation: policyEval }
+        if (!this.approvalHandler) {
+          return makeResult({ status: 'denied', errorCode: 'HUMAN_APPROVAL_REQUIRED', errorMessage: policyEval.reason, approvalStatus: 'denied' })
+        }
+        const approvalOutcome = await this.awaitBlockingThenDetachedApproval(approvalReq, controller.signal)
+        if (controller.signal.aborted || approvalOutcome.kind === 'cancelled') {
+          return makeResult({ status: 'error', errorCode: 'TOOL_CALL_CANCELLED', errorMessage: inFlightRec.cancelReason ?? (approvalOutcome.kind === 'cancelled' ? approvalOutcome.reason : String(controller.signal.reason ?? 'TOOL_CALL_CANCELLED')), approvalStatus: 'denied' })
+        }
+        if (approvalOutcome.kind === 'detached') {
+          const card: DetachedApprovalCard = { approvalId, leaseId: call.leaseId, callId: call.callId, toolName: call.canonicalName, reason: policyEval.reason, evaluation: policyEval, createdAtMs: this.clock() }
+          this.onDetachedApprovalCard?.(card)
+          return makeResult({ status: 'denied', errorCode: 'APPROVAL_DEFERRED_DETACHED', errorMessage: `Human approval timed out after ${this.detachedFallbackAfterMs}ms; downgraded to async approval card ${approvalId}`, approvalStatus: 'detached_pending', detachedCard: card })
+        }
+        if (approvalOutcome.decision !== 'approve') {
+          return makeResult({ status: 'denied', errorCode: 'HUMAN_APPROVAL_DENIED', errorMessage: approvalOutcome.reason ?? 'Action denied by human approver', approvalStatus: 'denied' })
+        }
+        approvalStatus = 'approved'
+      }
+
+      // ── Gate 5: Idempotency WAL check (memory + cross-process disk WAL) ────────────────
+      try {
+        idempotencyKey = computeToolIdempotencyKey(call.leaseId, call.turnId, call.callId)
+      } catch (err) {
+        return makeResult({ status: 'denied', errorCode: 'EXEC_TOOL_CALL_IDEMPOTENCY_MISMATCH', errorMessage: err instanceof Error ? err.message : String(err) })
+      }
+      if (call.idempotencyKey !== idempotencyKey) {
+        return makeResult({ status: 'denied', errorCode: 'EXEC_TOOL_CALL_IDEMPOTENCY_MISMATCH', errorMessage: `Provided idempotencyKey "${call.idempotencyKey}" does not match expected "${idempotencyKey}"` })
+      }
+      const preCheckReplay = await this.checkExistingWal(idempotencyKey, expectedArgsSha256, call, approvalStatus, makeResult)
+      if (preCheckReplay !== null) return preCheckReplay
+
+      // ── Gate 6: Multi-concurrency scheduling + cooperative cancellation ────────────────
       release = await this.semaphore.acquire(controller.signal)
-      if (this.semaphore.currentActive > this.peakConcurrency) {
-        this.peakConcurrency = this.semaphore.currentActive
+      if (this.semaphore.currentActive > this.peakConcurrency) this.peakConcurrency = this.semaphore.currentActive
+      if (controller.signal.aborted) {
+        return makeResult({ idempotencyKey, status: 'error', errorCode: 'TOOL_CALL_CANCELLED', errorMessage: inFlightRec.cancelReason ?? String(controller.signal.reason ?? 'TOOL_CALL_CANCELLED'), approvalStatus })
       }
 
       // Re-check WAL atomically BEFORE final synchronous fencing check and attempt creation.
@@ -1168,35 +1166,14 @@ export class ToolBrokerServer implements ToolBrokerTransport {
         })
       }
 
-      // Atomic pre-side-effect fencing re-validation (B12 / R2): runs synchronously AFTER
-      // all async approval/semaphore/WAL replay awaits and IMMEDIATELY BEFORE writing the
-      // durable attempt marker or invoking the handler (zero `await`s in between).
-      if (this.leaseManager && (this.requireFencingToken || call.fencingToken !== undefined)) {
-        if (!call.fencingToken) {
-          return makeResult({
-            idempotencyKey,
-            status: 'denied',
-            errorCode: 'EXEC_FENCING_TOKEN_STALE',
-            errorMessage: 'Missing fencingToken before tool side-effect execution',
-          })
-        }
-        try {
-          const lease = this.leaseManager.validateFencingToken(
-            call.leaseId,
-            call.fencingToken,
-            call.brainGen,
-          )
-          activeBrainGen = lease.brainGen
-        } catch (err) {
-          const code = err instanceof ExecEnvLeaseError ? err.code : 'EXEC_FENCING_TOKEN_STALE'
-          return makeResult({
-            idempotencyKey,
-            status: 'denied',
-            errorCode: code,
-            errorMessage: err instanceof Error ? err.message : String(err),
-          })
-        }
+      // Atomic pre-side-effect fencing & turn-grant re-validation (B12 / R2 / S8): runs
+      // synchronously AFTER all async approval/semaphore/WAL replay awaits and IMMEDIATELY
+      // BEFORE writing the durable attempt marker or invoking the handler (zero `await`s in between).
+      const preExec = this.verifyPreExecuteAuthorization(call, activeSessionKey, activeBrainGen, controller, inFlightRec)
+      if (!preExec.ok) {
+        return makeResult({ idempotencyKey, status: preExec.status, errorCode: preExec.errorCode, errorMessage: preExec.errorMessage, approvalStatus })
       }
+      activeBrainGen = preExec.activeBrainGen
 
       // Persist durable WAL attempt BEFORE running any side-effect handler.
       if (this.hasDurableWal) {
@@ -1417,7 +1394,9 @@ export class ToolBrokerServer implements ToolBrokerTransport {
     } finally {
       if (timeoutTimer) clearTimeout(timeoutTimer)
       release?.()
-      this.inFlight.delete(call.callId)
+      if (this.inFlight.get(inFlightKey) === inFlightRec) {
+        this.inFlight.delete(inFlightKey)
+      }
     }
   }
 
@@ -1789,34 +1768,36 @@ export class ToolBrokerServer implements ToolBrokerTransport {
 
   private async awaitBlockingThenDetachedApproval(
     request: ToolApprovalRequest,
+    parentSignal: AbortSignal,
   ): Promise<
     | { readonly kind: 'decided'; readonly decision: 'approve' | 'deny'; readonly reason?: string }
     | { readonly kind: 'detached' }
+    | { readonly kind: 'cancelled'; readonly reason: string }
   > {
+    if (parentSignal.aborted) return { kind: 'cancelled', reason: String(parentSignal.reason ?? 'TOOL_CALL_CANCELLED') }
     const controller = new AbortController()
     let timer: NodeJS.Timeout | null = null
+    let onParentAbort: (() => void) | null = null
     try {
       return await Promise.race([
-        this.approvalHandler!(request, controller.signal).then((res) => ({
-          kind: 'decided' as const,
-          decision: res.decision,
-          reason: res.reason,
-        })),
+        this.approvalHandler!(request, controller.signal).then((res) => ({ kind: 'decided' as const, decision: res.decision, reason: res.reason })),
         new Promise<{ readonly kind: 'detached' }>((resolve) => {
-          timer = setTimeout(() => {
-            controller.abort(new Error('APPROVAL_DEFERRED_DETACHED'))
-            resolve({ kind: 'detached' })
-          }, this.detachedFallbackAfterMs)
+          timer = setTimeout(() => { controller.abort(new Error('APPROVAL_DEFERRED_DETACHED')); resolve({ kind: 'detached' }) }, this.detachedFallbackAfterMs)
+        }),
+        new Promise<{ readonly kind: 'cancelled'; readonly reason: string }>((resolve) => {
+          onParentAbort = () => {
+            const reason = String(parentSignal.reason ?? 'TOOL_CALL_CANCELLED')
+            controller.abort(new Error(reason))
+            resolve({ kind: 'cancelled', reason })
+          }
+          parentSignal.addEventListener('abort', onParentAbort, { once: true })
         }),
       ])
     } catch (err) {
-      return {
-        kind: 'decided',
-        decision: 'deny',
-        reason: err instanceof Error ? err.message : String(err),
-      }
+      return { kind: 'decided', decision: 'deny', reason: err instanceof Error ? err.message : String(err) }
     } finally {
       if (timer) clearTimeout(timer)
+      if (onParentAbort) parentSignal.removeEventListener('abort', onParentAbort)
     }
   }
 }
