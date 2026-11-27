@@ -1004,8 +1004,33 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
         execFileSync('git', ['-C', repoDir, ...args], { env: gitEnv, encoding: 'utf8' }).trim()
       git('init', '-q', '-b', 'feat/v5-selfhost')
       writeFileSync(
-        path.join(repoDir, 'packages/commercial/src/billing/proxyBilling.ts'),
-        'export function formatTag(x: number): string {\n  return String(x)\n}\n',
+        path.join(repoDir, 'packages/commercial/src/billing/ledgerRowContext.ts'),
+        'export function formatLedgerContext(x: number): string {\n  return String(x)\n}\n',
+      )
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/authzModels.ts'),
+        'export async function canUseModel(): Promise<boolean> {\n  return false\n}\n',
+      )
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/modelPublicProjection.ts'),
+        'export function formatPublicProjection(x: number): string {\n  return String(x)\n}\n',
+      )
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/remoteDriverReceiptV5.ts'),
+        'export const JOURNAL_WRITER = 1\n',
+      )
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/remoteDriverTurnBilling.ts'),
+        'export const WAIVE_ZERO_OUTPUT = true\n',
+      )
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/codexServiceTierPricing.ts'),
+        'export const TIER_MULTIPLIER = 1.5\n',
+      )
+      mkdirSync(path.join(repoDir, 'packages/protocol/src'), { recursive: true })
+      writeFileSync(
+        path.join(repoDir, 'packages/protocol/src/serviceTiers.ts'),
+        'export const FAST_MULTIPLIER = 2\n',
       )
       writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/ledger.ts'), 'export const LEDGER = 1\n')
       writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/antigravitySettle.ts'), 'export const SETTLE = 1\n')
@@ -1074,7 +1099,7 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       assert.equal(auroraDoc.code, 'COMMERCIAL_BRANCH_HARD_LOCK')
       assert.equal(auroraDoc.classification, 'absolute_reject')
 
-      // 1. Tightened test exemption: real *.test.* / *.spec.* pass as auto_pass; non-test __tests__/helper.ts MUST be human_review_required!
+      // 1. Default-protect ALL billing/payment code: pure *.test.*/*.spec.* auto_pass; ONLY explicitly allowlisted pure helpers (e.g. remoteDriverReceiptV5.ts, usageReport.ts) auto_pass!
       const pureTests = runBash(
         GOVERNOR_SH,
         [
@@ -1091,147 +1116,55 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       assert.equal(pureTests.status, 0, pureTests.stderr)
       assert.equal(JSON.parse(pureTests.stdout).classification, 'auto_pass')
 
-      const helperInTests = runBash(
-        GOVERNOR_SH,
-        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--files', 'packages/commercial/src/billing/__tests__/helper.ts'],
-        env,
-      )
-      assert.equal(helperInTests.status, 1)
-      assert.equal(JSON.parse(helperInTests.stderr).classification, 'human_review_required')
-
-      // 2. Non-core billing file with PURE comments + import type + export type + type annotation (ZERO runtime JS change!)
-      writeFileSync(
-        path.join(repoDir, 'packages/commercial/src/billing/proxyBilling.ts'),
-        `${[
-          'import type { IncomingMessage } from "node:http"',
-          '// Pure documentation comment',
-          'export type ProxyMeta = { req?: IncomingMessage; label?: string }',
-          'export function formatTag(x: number | bigint): string {',
-          '  return String(x)',
-          '}',
-        ].join('\n')}\n`,
-      )
-      git('commit', '-qam', 'refactor(v5): pure comment and type annotation update in proxyBilling')
-      const pureTypeSha = git('rev-parse', 'HEAD')
-
-      // 2a. Missing --sha -> human_review_required
-      const noShaRes = runBash(
-        GOVERNOR_SH,
-        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--repo-root', repoDir, '--files', 'packages/commercial/src/billing/proxyBilling.ts'],
-        env,
-      )
-      assert.equal(noShaRes.status, 1)
-      assert.equal(JSON.parse(noShaRes.stderr).classification, 'human_review_required')
-
-      // 2b. Plain sha256 steward receipt when .hmac-key is MISSING -> MUST FAIL-CLOSED (ZERO downgrade to plain sha256!)
-      rmSync(hmacPath)
-      writeSignedSteward(pureTypeSha, { hmacKey: undefined })
-      const missingKeyRes = runBash(
+      const nonCoreHelpers = runBash(
         GOVERNOR_SH,
         [
           'check-blast-radius',
           '--branch',
           'feat/v5-selfhost',
-          '--repo-root',
-          repoDir,
-          '--sha',
-          pureTypeSha,
-          '--base-ref',
-          baseSha,
           '--files',
-          'packages/commercial/src/billing/proxyBilling.ts',
+          'packages/commercial/src/billing/ledgerRowContext.ts',
+          'packages/commercial/src/billing/usageReport.ts',
         ],
         env,
       )
-      assert.equal(missingKeyRes.status, 1, 'missing .hmac-key MUST NEVER downgrade to plain sha256!')
-      assert.match(JSON.parse(missingKeyRes.stderr).semanticReason, /\.hmac-key/)
-
-      // Restore 0600 .hmac-key
-      writeFileSync(hmacPath, `${hmacSecret}\n`, { mode: 0o600 })
-      chmodSync(hmacPath, 0o600)
-
-      // 2c. Spoofed authorFamily vs real authorModel (claude-opus-4-6 claiming openai) -> rejected by authoritative archStewardReceipt.ts!
-      writeSignedSteward(pureTypeSha, { hmacKey: hmacSecret, spoofedFamily: true })
-      const spoofRes = runBash(
-        GOVERNOR_SH,
-        [
-          'check-blast-radius',
-          '--branch',
-          'feat/v5-selfhost',
-          '--repo-root',
-          repoDir,
-          '--sha',
-          pureTypeSha,
-          '--base-ref',
-          baseSha,
-          '--files',
-          'packages/commercial/src/billing/proxyBilling.ts',
-        ],
-        env,
-      )
-      assert.equal(spoofRes.status, 1, 'spoofed model family claim MUST be rejected by authoritative verifier')
-
-      // 2d. Wrong baseSha in steward receipt -> rejected!
-      writeSignedSteward(pureTypeSha, { hmacKey: hmacSecret, baseSha: '0'.repeat(40) })
-      const wrongBaseRes = runBash(
-        GOVERNOR_SH,
-        [
-          'check-blast-radius',
-          '--branch',
-          'feat/v5-selfhost',
-          '--repo-root',
-          repoDir,
-          '--sha',
-          pureTypeSha,
-          '--base-ref',
-          baseSha,
-          '--files',
-          'packages/commercial/src/billing/proxyBilling.ts',
-        ],
-        env,
-      )
-      assert.equal(wrongBaseRes.status, 1, 'mismatched baseSha in steward receipt MUST be rejected')
-
-      // 2e. Valid HMAC authoritative steward + pure comment/type AST proof -> auto_pass + ok_semantic_noncore audit!
-      writeSignedSteward(pureTypeSha, { hmacKey: hmacSecret })
-      const okNonCore = runBash(
-        GOVERNOR_SH,
-        [
-          'check-blast-radius',
-          '--branch',
-          'feat/v5-selfhost',
-          '--repo-root',
-          repoDir,
-          '--sha',
-          pureTypeSha,
-          '--base-ref',
-          baseSha,
-          '--files',
-          'packages/commercial/src/billing/proxyBilling.ts',
-        ],
-        env,
-      )
-      assert.equal(okNonCore.status, 0, okNonCore.stderr)
-      const okDoc = JSON.parse(okNonCore.stdout)
-      assert.equal(okDoc.ok, true)
-      assert.equal(okDoc.classification, 'auto_pass')
-      assert.equal(okDoc.semanticNonCorePassed, true)
-      const auditLines = readFileSync(path.join(ctrlDir, 'audit.jsonl'), 'utf8')
+      assert.equal(nonCoreHelpers.status, 0, nonCoreHelpers.stderr)
+      const ncDoc = JSON.parse(nonCoreHelpers.stdout)
+      assert.equal(ncDoc.ok, true)
+      assert.equal(ncDoc.classification, 'auto_pass')
+      assert.equal(ncDoc.autoApprovedNonCoreBilling, true)
+      assert.deepEqual(ncDoc.nonCoreBillingFiles, [
+        'packages/commercial/src/billing/ledgerRowContext.ts',
+        'packages/commercial/src/billing/usageReport.ts',
+      ])
+      const ncAudits = readFileSync(path.join(ctrlDir, 'audit.jsonl'), 'utf8')
         .trim()
         .split('\n')
         .map((l) => JSON.parse(l))
-      assert.ok(auditLines.some((ev) => ev.action === 'check_blast_radius' && ev.outcome === 'ok_semantic_noncore'))
+      assert.ok(ncAudits.some((ev) => ev.action === 'check_blast_radius' && ev.outcome === 'ok_auto_noncore_billing'))
 
-      // 3. Non-core billing file with ANY runtime statement (even benign constant) -> MUST be human_review_required!
-      git('checkout', '-q', baseSha)
+      // 2. Strictly read-only allowlisted helper with runtime edit -> direct auto_pass;
+      //    authzModels.ts / modelPublicProjection.ts / pricing & journal files -> BILLING_CORE_LOCKED!
+      const policyAllowlist = (
+        JSON.parse(readFileSync(path.join(REPO_ROOT, 'arch/a0-protected-paths.json'), 'utf8')) as {
+          billingNonCoreAllowlist: string[]
+        }
+      ).billingNonCoreAllowlist
+      const govShSrc = readFileSync(GOVERNOR_SH, 'utf8')
+      const fallbackMatch = govShSrc.match(/DEFAULT_BILLING_NONCORE_ALLOWLIST = frozenset\(f"packages\/commercial\/src\/billing\/\{n\}" for n in \(([^)]+)\)\)/)
+      assert.ok(fallbackMatch, 'oc-governor.sh MUST declare DEFAULT_BILLING_NONCORE_ALLOWLIST matching policy')
+      const fallbackList = [...fallbackMatch[1]!.matchAll(/"([^"]+)"/g)]
+        .map((m) => `packages/commercial/src/billing/${m[1]}`)
+        .sort()
+      assert.deepEqual(fallbackList, [...policyAllowlist].sort(), 'oc-governor.sh fallback allowlist MUST match arch/a0-protected-paths.json')
+
       writeFileSync(
-        path.join(repoDir, 'packages/commercial/src/billing/proxyBilling.ts'),
-        'export const PROXY_HEADER = "x-openclaude"\nexport function formatTag(x: number): string {\n  return String(x)\n}\n',
+        path.join(repoDir, 'packages/commercial/src/billing/ledgerRowContext.ts'),
+        'export const CONTEXT_HEADER = "x-openclaude"\nexport function formatLedgerContext(x: number): string {\n  return String(x)\n}\n',
       )
-      git('commit', '-qam', 'fix(v5): add runtime constant in proxyBilling')
+      git('commit', '-qam', 'fix(v5): runtime edit in allowlisted read-only ledger context helper')
       const runtimeNonCoreSha = git('rev-parse', 'HEAD')
-      writeSignedSteward(runtimeNonCoreSha, { hmacKey: hmacSecret })
-      const runtimeBlocked = runBash(
+      const okRuntimeNonCore = runBash(
         GOVERNOR_SH,
         [
           'check-blast-radius',
@@ -1244,22 +1177,138 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
           '--base-ref',
           baseSha,
           '--files',
-          'packages/commercial/src/billing/proxyBilling.ts',
+          'packages/commercial/src/billing/ledgerRowContext.ts',
         ],
         env,
       )
-      assert.equal(runtimeBlocked.status, 1, 'runtime edit in non-core billing MUST require human review')
-      const runtimeDoc = JSON.parse(runtimeBlocked.stderr)
-      assert.equal(runtimeDoc.classification, 'human_review_required')
-      assert.equal(runtimeDoc.code, 'BILLING_CORE_LOCKED')
+      assert.equal(okRuntimeNonCore.status, 0, okRuntimeNonCore.stderr)
+      const okNcDoc = JSON.parse(okRuntimeNonCore.stdout)
+      assert.equal(okNcDoc.classification, 'auto_pass')
+      assert.equal(okNcDoc.autoApprovedNonCoreBilling, true)
 
-      // 4. Expanded core protection (*Cost* / ledger / settle / payment) -> ALWAYS human_review_required even with pure comment + HMAC steward!
+      // 2b. BLOCKER 1 + R2 #1 + Steward Blocker 2: pricing, authzModels (canUseModel bypass), projection, & journal writers MUST be blocked!
       git('checkout', '-q', baseSha)
-      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/modelSwitchCostPolicy.ts'), '// comment\nexport const COST = 1\n')
-      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/ledger.ts'), '// comment\nexport const LEDGER = 1\n')
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/authzModels.ts'),
+        'export async function canUseModel(): Promise<boolean> {\n  return true\n}\n',
+      )
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/modelPublicProjection.ts'),
+        'export function formatPublicProjection(x: number): string {\n  return `free:${x}`\n}\n',
+      )
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/remoteDriverTurnBilling.ts'),
+        'export const WAIVE_ZERO_OUTPUT = false\n',
+      )
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/remoteDriverReceiptV5.ts'),
+        'export const JOURNAL_WRITER = 2\n',
+      )
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/codexServiceTierPricing.ts'),
+        'export const TIER_MULTIPLIER = 2.0\n',
+      )
+      writeFileSync(
+        path.join(repoDir, 'packages/protocol/src/serviceTiers.ts'),
+        'export const FAST_MULTIPLIER = 3\n',
+      )
+      mkdirSync(path.join(repoDir, 'arch'), { recursive: true })
+      writeFileSync(
+        path.join(repoDir, 'arch/a0-protected-paths.json'),
+        JSON.stringify({
+          schemaVersion: 1,
+          billingNonCoreAllowlist: [
+            'packages/commercial/src/billing/authzModels.ts',
+            'packages/commercial/src/billing/modelPublicProjection.ts',
+            'packages/commercial/src/billing/remoteDriverTurnBilling.ts',
+            'packages/commercial/src/billing/remoteDriverReceiptV5.ts',
+            'packages/commercial/src/billing/codexServiceTierPricing.ts',
+          ],
+        }),
+      )
+      git('add', '.')
+      git('commit', '-qam', 'feat(v5): change authz, projection, waiver, journal writer & tier multiplier source with candidate policy tamper')
+      const b1RuntimeSha = git('rev-parse', 'HEAD')
+      for (const b1File of [
+        'packages/commercial/src/billing/authzModels.ts',
+        'packages/commercial/src/billing/modelPublicProjection.ts',
+        'packages/commercial/src/billing/remoteDriverTurnBilling.ts',
+        'packages/commercial/src/billing/remoteDriverReceiptV5.ts',
+        'packages/commercial/src/billing/codexServiceTierPricing.ts',
+        'packages/protocol/src/serviceTiers.ts',
+      ]) {
+        const res = runBash(
+          GOVERNOR_SH,
+          [
+            'check-blast-radius',
+            '--branch',
+            'feat/v5-selfhost',
+            '--repo-root',
+            repoDir,
+            '--sha',
+            b1RuntimeSha,
+            '--base-ref',
+            baseSha,
+            '--files',
+            b1File,
+          ],
+          env,
+        )
+        assert.equal(res.status, 1, `BLOCKER 1: ${b1File} runtime edit MUST be blocked as BILLING_CORE_LOCKED`)
+        const errDoc = JSON.parse(res.stderr)
+        assert.equal(errDoc.classification, 'human_review_required')
+        assert.equal(errDoc.code, 'BILLING_CORE_LOCKED')
+        assert.equal(errDoc.riskCategory, 'billing_change')
+        assert.deepEqual(errDoc.coreBillingFiles, [b1File])
+      }
+
+      // 3. Core billing/payment TS files with PURE comments / type declarations (zero runtime JS diff) -> auto_pass (semanticNoRuntimeBillingChange: true)!
+      git('checkout', '-q', baseSha)
+      writeFileSync(
+        path.join(repoDir, 'packages/commercial/src/billing/modelSwitchCostPolicy.ts'),
+        '// Pure doc comment\nexport type CostHint = { id: string }\nexport const COST = 1\n',
+      )
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/ledger.ts'), '// comment\nexport type LedgerMeta = { v: number }\nexport const LEDGER = 1\n')
       writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/antigravitySettle.ts'), '// comment\nexport const SETTLE = 1\n')
       writeFileSync(path.join(repoDir, 'packages/commercial/src/payment/orders.ts'), '// comment\nexport const ORDER = 1\n')
-      git('commit', '-qam', 'docs(v5): comments in core billing/cost/settle/payment')
+      git('commit', '-qam', 'docs(v5): pure comments and types in core billing/payment')
+      const coreTypeOnlySha = git('rev-parse', 'HEAD')
+      for (const coreFile of [
+        'packages/commercial/src/billing/modelSwitchCostPolicy.ts',
+        'packages/commercial/src/billing/ledger.ts',
+        'packages/commercial/src/billing/antigravitySettle.ts',
+        'packages/commercial/src/payment/orders.ts',
+      ]) {
+        const res = runBash(
+          GOVERNOR_SH,
+          [
+            'check-blast-radius',
+            '--branch',
+            'feat/v5-selfhost',
+            '--repo-root',
+            repoDir,
+            '--sha',
+            coreTypeOnlySha,
+            '--base-ref',
+            baseSha,
+            '--files',
+            coreFile,
+          ],
+          env,
+        )
+        assert.equal(res.status, 0, `${coreFile} pure comment/type edit should auto_pass: ${res.stderr}`)
+        const okDoc = JSON.parse(res.stdout)
+        assert.equal(okDoc.classification, 'auto_pass')
+        assert.equal(okDoc.semanticNoRuntimeBillingChange, true)
+      }
+
+      // 4. Core billing/payment files with REAL runtime code changes -> human_review_required (code=BILLING_CORE_LOCKED, riskCategory=billing_change) even with HMAC steward!
+      git('checkout', '-q', baseSha)
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/modelSwitchCostPolicy.ts'), 'export const COST = 2\n')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/ledger.ts'), 'export const LEDGER = 2\n')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/antigravitySettle.ts'), 'export const SETTLE = 2\n')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/payment/orders.ts'), 'export const ORDER = 2\n')
+      git('commit', '-qam', 'feat(v5): adjust core billing pricing & payment runtime logic')
       const coreSha = git('rev-parse', 'HEAD')
       writeSignedSteward(coreSha, { hmacKey: hmacSecret })
       for (const coreFile of [
@@ -1285,9 +1334,11 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
           ],
           env,
         )
-        assert.equal(res.status, 1, `${coreFile} MUST ALWAYS be human_review_required`)
+        assert.equal(res.status, 1, `${coreFile} runtime edit MUST be human_review_required`)
         const errDoc = JSON.parse(res.stderr)
         assert.equal(errDoc.classification, 'human_review_required')
+        assert.equal(errDoc.code, 'BILLING_CORE_LOCKED')
+        assert.equal(errDoc.riskCategory, 'billing_change')
         assert.deepEqual(errDoc.coreBillingFiles, [coreFile])
       }
 
@@ -1544,6 +1595,14 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       const doc1 = JSON.parse(rec1.stdout)
       assert.equal(doc1.version, 1)
       assert.equal(doc1.classification, 'human_review_required')
+      assert.equal(doc1.riskCategory, 'billing_change')
+      assert.equal(doc1.title, '计费规则变更，需要你确认')
+      assert.equal(typeof doc1.whatChanged, 'string')
+      assert.ok(doc1.whatChanged.length > 0)
+      assert.match(doc1.whyNeedYou, /计费方式/)
+      assert.doesNotMatch(doc1.whyNeedYou, /HMAC|AST|签发绑定凭证/)
+      assert.equal(doc1.recommendation.action, 'approve')
+      assert.equal(doc1.recommendation.label, '建议批准')
       assert.equal(doc1.stewardVerdict.verdict, 'approve')
       assert.equal(doc1.stewardVerdict.hmacVerified, true)
 
@@ -1894,14 +1953,15 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       const git = (...args: string[]) =>
         execFileSync('git', ['-C', repoDir, ...args], { env: gitEnv, encoding: 'utf8' }).trim()
       git('init', '-q', '-b', 'feat/v5-selfhost')
-      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/proxyBilling.ts'), 'export function tag(x: number): string { return String(x) }\n')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/ledger.ts'), 'export function tag(x: number): string { return String(x) }\n')
+      writeFileSync(path.join(repoDir, 'packages/commercial/src/billing/ledgerRowContext.ts'), 'export const P = 1\n')
       writeFileSync(path.join(repoDir, 'README.md'), 'root\n')
       git('add', '.')
       git('commit', '-qm', 'chore(v5): root commit')
       const rootSha = git('rev-parse', 'HEAD')
 
       writeFileSync(
-        path.join(repoDir, 'packages/commercial/src/billing/proxyBilling.ts'),
+        path.join(repoDir, 'packages/commercial/src/billing/ledger.ts'),
         '// R2 pure comment\nexport type R2Meta = { ok: boolean }\nexport function tag(x: number | bigint): string { return String(x) }\n',
       )
       git('commit', '-qam', 'refactor(v5): pure comment and type update')
@@ -1943,19 +2003,19 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       }
 
       // ── B2: Unified exact baseSha binding ──
-      // 1a. Omitting --base-ref on childSha automatically resolves childSha^ (= rootSha) for BOTH AST & steward -> auto_pass!
+      // 1a. Omitting --base-ref on childSha automatically resolves childSha^ (= rootSha) for core billing AST pure-type check -> auto_pass!
       const b2AutoOk = runBash(
         GOVERNOR_SH,
-        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--repo-root', repoDir, '--sha', childSha, '--files', 'packages/commercial/src/billing/proxyBilling.ts'],
+        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--repo-root', repoDir, '--sha', childSha, '--files', 'packages/commercial/src/billing/ledger.ts'],
         env,
       )
       assert.equal(b2AutoOk.status, 0, b2AutoOk.stderr)
-      assert.equal(JSON.parse(b2AutoOk.stdout).semanticNonCorePassed, true)
+      assert.equal(JSON.parse(b2AutoOk.stdout).semanticNoRuntimeBillingChange, true)
 
       // 1b. Omitting --base-ref on rootSha (no parent commit) -> fail-closed AND record-pending-approval marks stewardVerdict invalid!
       const b2RootFail = runBash(
         GOVERNOR_SH,
-        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--repo-root', repoDir, '--sha', rootSha, '--files', 'packages/commercial/src/billing/proxyBilling.ts'],
+        ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--repo-root', repoDir, '--sha', rootSha, '--files', 'packages/commercial/src/billing/ledger.ts'],
         env,
       )
       assert.equal(b2RootFail.status, 1)
@@ -1971,6 +2031,8 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
           'blast_voucher',
           '--code',
           'BILLING_CORE_LOCKED',
+          '--risk-category',
+          'billing_change',
           '--branch',
           'feat/v5-selfhost',
           '--repo-root',
@@ -1978,7 +2040,7 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
           '--sha',
           rootSha,
           '--files',
-          'packages/commercial/src/billing/proxyBilling.ts',
+          'packages/commercial/src/billing/ledger.ts',
         ],
         env,
       )
@@ -1986,17 +2048,31 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
       const b2RecDoc = JSON.parse(b2RecRoot.stdout)
       assert.equal(b2RecDoc.stewardVerdict.verdict, 'invalid')
       assert.match(b2RecDoc.stewardVerdict.summary, /无法确定比较基线/)
+      assert.equal(b2RecDoc.riskCategory, 'billing_change')
+      assert.equal(b2RecDoc.recommendation.action, 'caution')
 
-      // ── B3: Conservative SQL DDL whitelist + lossless paths + control-char rejection ──
+      // ── B3: Conservative SQL DDL whitelist (including safe idempotent DO $$ blocks) + lossless paths + control-char rejection ──
       const safeSql = [
         '-- leading comment with DROP TABLE decoy',
         'BEGIN;',
         "SET LOCAL lock_timeout = '3s';",
         '/* block comment with TRUNCATE decoy */',
-        'CREATE TABLE IF NOT EXISTS audit_events (id bigserial PRIMARY KEY, note text);',
+        'CREATE TABLE IF NOT EXISTS audit_events (id bigserial PRIMARY KEY, note text NOT NULL);',
         'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_events_id ON audit_events (id);',
         "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS tag text DEFAULT 'DROP TABLE literal';",
         'ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS "meta--safe" text DEFAULT E\'safe\\\'--val\';',
+        'ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT \'active\';',
+        'DO $$',
+        'DECLARE v_ok boolean := true;',
+        'BEGIN',
+        "  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_audit_tag') THEN",
+        '    ALTER TABLE audit_events ADD CONSTRAINT uq_audit_tag UNIQUE (tag);',
+        '  END IF;',
+        "  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'audit_events' AND column_name = 'extra_tag') THEN",
+        "    ALTER TABLE audit_events ADD COLUMN extra_tag text DEFAULT '';",
+        '  END IF;',
+        'END $$;',
+        'DO $mig$ BEGIN CREATE INDEX IF NOT EXISTS idx_audit_tag ON audit_events (tag); END $mig$;',
         "COMMENT ON TABLE audit_events IS 'safe additive table';",
         'COMMIT;',
       ].join('\n')
@@ -2005,7 +2081,7 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
         ['check-blast-radius', '--branch', 'feat/v5-selfhost', '--sql', safeSql],
         env,
       )
-      assert.equal(safeSqlRes.status, 0, `safe additive SQL should auto_pass: ${safeSqlRes.stderr}`)
+      assert.equal(safeSqlRes.status, 0, `safe additive + idempotent DO SQL should auto_pass: ${safeSqlRes.stderr}`)
       assert.equal(JSON.parse(safeSqlRes.stdout).classification, 'auto_pass')
 
       for (const unsafeSql of [
@@ -2013,12 +2089,23 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
         'TRUNCATE TABLE credit_ledger;',
         'DELETE FROM org_wallets WHERE id = 1;',
         'ALTER TABLE users ADD COLUMN x int, ALTER y TYPE bigint;',
+        'ALTER TABLE users ADD COLUMN req_col text NOT NULL;',
         'ALTER TABLE users ADD COLUMN "x--" integer, DROP COLUMN email;',
         'ALTER TABLE users ADD COLUMN "a""--" integer, DROP COLUMN email;',
         'ALTER TABLE users ADD COLUMN "a/*b" integer, DROP COLUMN email;',
         "ALTER TABLE users ADD COLUMN x text DEFAULT E'\\'' , DROP COLUMN email;",
         'ALTER TABLE users ADD COLUMN "unclosed_ident integer;',
         'DO $$ BEGIN PERFORM 1; END $$;',
+        'DO $$ BEGIN DROP TABLE users; END $$;',
+        'DO $$ BEGIN ALTER TABLE users ADD COLUMN no_def text NOT NULL; END $$;',
+        'DO $$ BEGIN ALTER TABLE users ALTER COLUMN email TYPE text; END $$;',
+        'DO $$ BEGIN IF (SELECT 1 FROM (DELETE FROM users RETURNING 1) t) THEN CREATE INDEX IF NOT EXISTS i ON users (id); END IF; END $$;',
+        'DO $$ BEGIN IF my_custom_predicate() THEN ALTER TABLE audit_events ADD COLUMN x text; END IF; END $$;',
+        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM users WHERE email = 'a@b.com') THEN ALTER TABLE audit_events ADD COLUMN x text; END IF; END $$;",
+        'DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_class WHERE my_custom_fn() = 1) THEN CREATE INDEX IF NOT EXISTS i ON audit_events (id); END IF; END $$;',
+        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'audit_events' LIMIT 1) THEN CREATE INDEX IF NOT EXISTS i ON audit_events (id); END IF; END $$;",
+        'DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_class) OR my_custom_predicate() THEN CREATE INDEX IF NOT EXISTS i ON audit_events (id); END IF; END $$;',
+        'DO $$ DECLARE v int := my_custom_fn(); BEGIN CREATE INDEX IF NOT EXISTS i ON audit_events (id); END $$;',
         "UPDATE users SET role = 'admin';",
         'ALTER TABLE users RENAME TO users_old;',
       ]) {
@@ -2028,8 +2115,49 @@ describe('Host 4-Gate Control Plane (oc-governor + sync-referee + installer)', (
           env,
         )
         assert.equal(res.status, 1, `unsafe/unrecognized SQL MUST fail closed: ${unsafeSql}`)
-        assert.equal(JSON.parse(res.stderr).code, 'DESTRUCTIVE_DDL_LOCKED')
+        const err = JSON.parse(res.stderr)
+        assert.equal(err.code, 'DESTRUCTIVE_DDL_LOCKED')
+        assert.equal(err.riskCategory, 'ux_degradation')
       }
+
+      // Verify explicit --voucher still validates SHA even on auto-approved non-core billing files (B6)
+      const ncVoucher = runBash(
+        GOVERNOR_SH,
+        [
+          'issue-blast-voucher',
+          '--scope',
+          'billing',
+          '--sha',
+          childSha,
+          '--branch',
+          'feat/v5-selfhost',
+          '--files',
+          'packages/commercial/src/billing/ledgerRowContext.ts',
+          '--reason',
+          'Bound voucher for childSha noncore check',
+        ],
+        env,
+      )
+      assert.equal(ncVoucher.status, 0, ncVoucher.stderr)
+      const ncWrongSha = runBash(
+        GOVERNOR_SH,
+        [
+          'check-blast-radius',
+          '--branch',
+          'feat/v5-selfhost',
+          '--repo-root',
+          repoDir,
+          '--sha',
+          rootSha,
+          '--voucher',
+          JSON.parse(ncVoucher.stdout).id,
+          '--files',
+          'packages/commercial/src/billing/ledgerRowContext.ts',
+        ],
+        env,
+      )
+      assert.equal(ncWrongSha.status, 1, 'explicit --voucher with mismatched SHA MUST still fail on non-core billing')
+      assert.equal(JSON.parse(ncWrongSha.stderr).code, 'VOUCHER_SHA_MISMATCH')
 
       // Lossless path with comma & space via --files-json + control-char rejection
       const specialPath = 'packages/commercial/src/billing/a,b file.ts'

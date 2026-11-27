@@ -16,6 +16,13 @@ export type GovernanceApprovalClassification =
   | "absolute_reject"
   | "human_review_required"
   | "auto_pass";
+export type GovernanceRiskCategory = "ux_degradation" | "billing_change";
+
+export interface GovernanceApprovalRecommendation {
+  action: "approve" | "reject" | "caution";
+  label: string;
+  reason: string;
+}
 export type GovernanceApprovalStatus =
   | "pending"
   | "approving"
@@ -82,6 +89,10 @@ export interface PendingGovernanceApproval {
   ticketId?: string;
   title: string;
   plainSummary: string;
+  riskCategory?: GovernanceRiskCategory;
+  whatChanged?: string;
+  whyNeedYou?: string;
+  recommendation?: GovernanceApprovalRecommendation;
   approveEffect: string;
   rejectEffect: string;
   files: string[];

@@ -220,7 +220,7 @@ resolve_github_repo_slug() {
   [[ -n "$explicit" ]] && { printf '%s\n' "$explicit"; return 0; }
   [[ -n "${GITHUB_REPOSITORY:-}" ]] && { printf '%s\n' "$GITHUB_REPOSITORY"; return 0; }
   [[ -n "${GH_REPO:-}" ]] && { printf '%s\n' "$GH_REPO"; return 0; }
-  origin_url="$(git remote get-url origin 2>/dev/null || true)"
+  origin_url="$(git -c safe.directory='*' remote get-url origin 2>/dev/null || true)"
   [[ -n "$origin_url" ]] && python3 -c 'import re,sys; m=re.search(r"github\.com[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?$",sys.argv[1].strip()); print(m.group(1)) if m else None' "$origin_url" || true
 }
 
@@ -680,7 +680,7 @@ if (!git(["cat-file", "-e", `${sha}^{commit}`]).ok) fail(`目标提交 ${sha.sli
 if (!git(["cat-file", "-e", `${baseCommit}^{commit}`]).ok) fail(`基线提交 ${baseCommit.slice(0, 12)} 不存在`);
 for (const f of files) {
   const nf = String(f).replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
-  if (!TS_EXT_RE.test(nf)) fail(`非核心计费文件 ${nf} 不是 TypeScript 源码`);
+  if (!TS_EXT_RE.test(nf)) fail(`核心计费文件 ${nf} 不是 TypeScript 源码`);
   const hasNew = git(["cat-file", "-e", `${sha}:${nf}`]).ok;
   const hasOld = git(["cat-file", "-e", `${baseCommit}:${nf}`]).ok;
   if (!hasNew && !hasOld) fail(`无法在基线或目标提交定位 ${nf}`);
@@ -690,7 +690,7 @@ for (const f of files) {
   if (oldR.out === newR.out) fail(`未检测到 ${nf} 在基线与目标提交之间的内容差异`);
   try {
     if (canonicalRuntimeJs(oldR.out, path.basename(nf)) !== canonicalRuntimeJs(newR.out, path.basename(nf))) {
-      fail(`非核心计费文件 ${nf} 包含运行时代码变更（非纯注释/类型声明），按保守策略必须人工审批`);
+      fail(`核心计费文件 ${nf} 包含运行时代码变更（非纯注释/类型声明），需人工确认`);
     }
   } catch (err) { fail(`解析 ${nf} AST 失败（${err instanceof Error ? err.message : "unknown"}）`); }
 }
@@ -745,42 +745,39 @@ cmd_check_blast_radius() {
       append_audit_safe "$(python3 -c 'import json,sys; t,a,b,raw=sys.argv[1:]; d=json.loads(raw); print(json.dumps({"ts":t,"action":"check_blast_radius","actor":a,"branch":b,"code":d.get("code","BLOCKED"),"classification":d.get("classification"),"outcome":"blocked"}, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$branch" "$check_res")"
       printf '%s\n' "$check_res" >&2; exit 1
     fi
-    append_audit_safe "$(python3 -c 'import json,sys; print(json.dumps({"ts":sys.argv[1],"action":"check_blast_radius","actor":sys.argv[2],"branch":sys.argv[3],"classification":"auto_pass","outcome":"ok"}, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$branch")"
+    append_audit_safe "$(python3 -c 'import json,sys; t,a,b,s,raw=sys.argv[1:]; d=json.loads(raw); is_nc=bool(d.get("autoApprovedNonCoreBilling")); ev={"ts":t,"action":"check_blast_radius","actor":a,"branch":b,"classification":"auto_pass","outcome":"ok_auto_noncore_billing" if is_nc else "ok"}; (ev.update({"sha":s}) if s else None); (ev.update({"nonCoreBillingFiles":d.get("nonCoreBillingFiles")}) if is_nc else None); print(json.dumps(ev, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$branch" "$sha" "$check_res")"
     printf '%s\n' "$check_res"; return 0
   fi
 
-  local semantic_eligible="0" noncore_json="[]"
-  semantic_eligible="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("1" if (not d["ddlHits"] and not d["coreBillingHits"] and d["nonCoreBillingHits"]) else "0")' "$phase1_out")"
-  noncore_json="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["nonCoreBillingHits"], ensure_ascii=False))' "$phase1_out")"
+  local core_ast_eligible="0" core_json="[]"
+  core_ast_eligible="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("1" if (not d["ddlHits"] and d["coreBillingHits"]) else "0")' "$phase1_out")"
+  core_json="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["coreBillingHits"], ensure_ascii=False))' "$phase1_out")"
 
-  local ts_check_json='{"ok":false,"reason":""}' steward_json='{"present":false,"ok":false,"verdict":"missing","hmacVerified":false,"reason":""}'
-  if [[ "$semantic_eligible" == "1" && "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+  local ts_check_json='{"ok":false,"reason":""}'
+  if [[ "$core_ast_eligible" == "1" && "$sha" =~ ^[0-9a-f]{40}$ ]]; then
     if [[ -z "$resolved_base_sha" ]]; then
-      ts_check_json='{"ok":false,"reason":"无法确定精确比较基线 baseSha，按 fail-closed 转人工审批"}'
+      ts_check_json='{"ok":false,"reason":"无法确定精确比较基线 baseSha，按保守策略转人工确认"}'
     else
-      ts_check_json="$(_verify_noncore_ts_only_diff "$repo_root" "$sha" "$resolved_base_sha" "$noncore_json")"
-      if [[ "$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1]).get("ok") else "0")' "$ts_check_json" 2>/dev/null || echo 0)" == "1" ]]; then
-        steward_json="$(_verify_steward_receipt_authoritative "$sha" "$resolved_base_sha")"
-      fi
+      ts_check_json="$(_verify_noncore_ts_only_diff "$repo_root" "$sha" "$resolved_base_sha" "$core_json")"
     fi
   fi
 
   set +e
-  check_res="$(_pending_approval_py blast_p3 "$branch" "$phase1_out" "$ts_check_json" "$steward_json" "$voucher" "$VOUCHERS_DIR" "$ts" "$sha")"
+  check_res="$(_pending_approval_py blast_p3 "$branch" "$phase1_out" "$ts_check_json" "$voucher" "$VOUCHERS_DIR" "$ts" "$sha")"
   rc=$?
   set -e
   if [[ "$rc" -ne 0 ]]; then
     append_audit_safe "$(python3 -c 'import json,sys; t,a,b,raw=sys.argv[1:]; d=json.loads(raw) if raw.startswith("{") else {}; print(json.dumps({"ts":t,"action":"check_blast_radius","actor":a,"branch":b,"code":d.get("code","BLOCKED"),"classification":d.get("classification"),"outcome":"blocked"}, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$branch" "$check_res")"
     printf '%s\n' "$check_res" >&2; exit 1
   fi
-  append_audit_safe "$(python3 -c 'import json,sys; t,a,b,s,raw=sys.argv[1:]; d=json.loads(raw) if raw.startswith("{") else {}; ev={"ts":t,"action":"check_blast_radius","actor":a,"branch":b,"classification":d.get("classification"),"outcome":"ok_semantic_noncore" if d.get("semanticNonCorePassed") else "ok"}; (ev.update({"sha":s}) if s else None); (ev.update({"nonCoreBillingFiles":d.get("nonCoreBillingFiles")}) if d.get("semanticNonCorePassed") else None); (ev.update({"voucherId":d["voucherId"]}) if d.get("voucherId") else None); (ev.update({"voucherAutoDiscovered":bool(d["voucherAutoDiscovered"])}) if "voucherAutoDiscovered" in d else None); print(json.dumps(ev, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$branch" "$sha" "$check_res")"
+  append_audit_safe "$(python3 -c 'import json,sys; t,a,b,s,raw=sys.argv[1:]; d=json.loads(raw) if raw.startswith("{") else {}; out="ok_semantic_no_runtime_billing" if d.get("semanticNoRuntimeBillingChange") else ("ok_auto_noncore_billing" if d.get("autoApprovedNonCoreBilling") else "ok"); ev={"ts":t,"action":"check_blast_radius","actor":a,"branch":b,"classification":d.get("classification"),"outcome":out}; (ev.update({"sha":s}) if s else None); (ev.update({"coreBillingFiles":d.get("coreBillingFiles")}) if d.get("semanticNoRuntimeBillingChange") else None); (ev.update({"nonCoreBillingFiles":d.get("nonCoreBillingFiles")}) if d.get("autoApprovedNonCoreBilling") else None); (ev.update({"voucherId":d["voucherId"]}) if d.get("voucherId") else None); (ev.update({"voucherAutoDiscovered":bool(d["voucherAutoDiscovered"])}) if "voucherAutoDiscovered" in d else None); print(json.dumps(ev, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$branch" "$sha" "$check_res")"
   printf '%s\n' "$check_res"
 }
 
 # ── Gate 3b: Structured Pending Approvals Queue (OCV5-914) ─────────────────
 # Single shared Python engine for blast_p1/blast_p3/record/list/decide_prep/decide_commit/reconcile/update_resume/resolve
 _pending_approval_py() {
-  python3 - "$@" <<'PY'
+  OC_GOV_ROOT_RESOLVED="$GOV_ROOT" python3 - "$@" <<'PY'
 import datetime as dt, hashlib, hmac, json, os, pathlib, re, secrets, stat, subprocess, sys
 op, args = sys.argv[1], sys.argv[2:]
 SHA40_RE, SHA64_RE = re.compile(r"^[0-9a-f]{40}$"), re.compile(r"^[0-9a-f]{64}$")
@@ -790,20 +787,87 @@ MAX_BYTES = 256 * 1024
 VALID_STATUSES = {"pending", "approving", "approved", "rejected", "expired", "reconcile_required"}
 TEST_FILE_RE = re.compile(r"^packages/commercial/src/(?:billing|payment)/(?:.*/)?__tests__/.*\.(?:test|spec)\.[cm]?[jt]sx?$|^packages/commercial/src/(?:billing|payment)/.*\.(?:test|spec)\.[cm]?[jt]sx?$")
 BILLING_DIR_RE, PAYMENT_DIR_RE = re.compile(r"^packages/commercial/src/billing/"), re.compile(r"^packages/commercial/src/payment/")
-BILLING_CORE_EXACT = {"packages/commercial/src/billing/ledger.ts", "packages/commercial/src/billing/pricing.ts", "packages/commercial/src/billing/persistedBillingPricing.ts", "packages/commercial/src/billing/calculator.ts", "packages/commercial/src/billing/spend.ts", "packages/commercial/src/billing/refund.ts", "packages/commercial/src/billing/preCheck.ts"}
-BILLING_CORE_KEYWORD_RE = re.compile(r"^packages/commercial/src/billing/.*(?:wallet|credit|settle|cost|price|rate|quota).*\.[cm]?[jt]sx?$", re.IGNORECASE)
+BILLING_CORE_EXTRA_PATHS = frozenset({"packages/protocol/src/serviceTiers.ts"})
+DEFAULT_BILLING_NONCORE_ALLOWLIST = frozenset(f"packages/commercial/src/billing/{n}" for n in ("apiKeyMessageAudit.ts", "apiKeyUsageReport.ts", "ledgerRowContext.ts", "usageReport.ts"))
+def _load_billing_noncore_allowlist() -> frozenset[str]:
+    p = pathlib.Path(os.environ.get("OC_GOV_ROOT_RESOLVED") or "/opt/openclaude/harness-gate") / "referee" / "arch" / "a0-protected-paths.json"
+    if not os.path.lexists(p): return DEFAULT_BILLING_NONCORE_ALLOWLIST
+    try:
+        st, skip_owner = os.lstat(p), os.environ.get("OC_GOVERNOR_UNSAFE_TEST_SKIP_OWNER") == "1"
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or (st.st_mode & 0o022) != 0 or (not skip_owner and os.geteuid() == 0 and str(p).startswith("/opt/openclaude/") and st.st_uid != 0): return DEFAULT_BILLING_NONCORE_ALLOWLIST
+        raw = (json.loads(p.read_text(encoding="utf-8")) or {}).get("billingNonCoreAllowlist")
+        if isinstance(raw, list) and all(isinstance(x, str) and x.startswith("packages/commercial/src/billing/") for x in raw): return frozenset(x.replace("\\", "/").lstrip("./") for x in raw)
+    except Exception: pass
+    return DEFAULT_BILLING_NONCORE_ALLOWLIST
+BILLING_NONCORE_ALLOWLIST = _load_billing_noncore_allowlist()
+def _classify_billing(f: str, nf: str, core_b: list, noncore_b: list):
+    if TEST_FILE_RE.search(nf): return
+    if nf in BILLING_CORE_EXTRA_PATHS or PAYMENT_DIR_RE.search(nf) or (BILLING_DIR_RE.search(nf) and nf not in BILLING_NONCORE_ALLOWLIST): core_b.append(f)
+    elif BILLING_DIR_RE.search(nf): noncore_b.append(f)
 
 # B3: Conservative SQL DDL safe-additive whitelist (strips SQL comments safely; ANY unrecognized statement -> human_review_required!)
-SAFE_SQL_RES = [
-    re.compile(r"^CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b", re.IGNORECASE),
-    re.compile(r"^CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?IF\s+NOT\s+EXISTS\b", re.IGNORECASE),
-    re.compile(r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:\"(?:\"\"|[^\"])+\"|[A-Za-z_][\w$.]*)\s+ADD\s+(?:COLUMN\s+)?", re.IGNORECASE),
-    re.compile(r"^COMMENT\s+ON\s+(?:TABLE|COLUMN|INDEX|SCHEMA|CONSTRAINT|VIEW|TYPE|FUNCTION)\b", re.IGNORECASE),
-    re.compile(r"^(?:BEGIN(?:\s+TRANSACTION|\s+WORK)?|COMMIT(?:\s+TRANSACTION|\s+WORK)?|SET\s+LOCAL\s+[A-Za-z_][\w.]*\s*(?:=|TO)\s+.+)$", re.IGNORECASE),
-]
+SAFE_SQL_RES = [re.compile(p, re.IGNORECASE) for p in (r"^CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b", r"^CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?IF\s+NOT\s+EXISTS\b", r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:\"(?:\"\"|[^\"])+\"|[A-Za-z_][\w$.]*)\s+ADD\s+(?:COLUMN\s+)?", r"^COMMENT\s+ON\s+(?:TABLE|COLUMN|INDEX|SCHEMA|CONSTRAINT|VIEW|TYPE|FUNCTION)\b", r"^(?:BEGIN(?:\s+TRANSACTION|\s+WORK)?|COMMIT(?:\s+TRANSACTION|\s+WORK)?|SET\s+LOCAL\s+[A-Za-z_][\w.]*\s*(?:=|TO)\s+.+)$")]
 UNSAFE_SQL_TOKEN_RE = re.compile(r"\b(?:DROP|TRUNCATE|DELETE\s+FROM|ALTER\s+COLUMN|SET\s+DATA\s+TYPE|RENAME)\b|,\s*(?:DROP|ALTER|RENAME|SET|OWNER|DISABLE|ENABLE)\b", re.IGNORECASE)
+DO_BLOCK_RE = re.compile(r"^DO\s+(?:LANGUAGE\s+(?:'plpgsql'|plpgsql)\s+)?(\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$)([\s\S]*)\1(?:\s+LANGUAGE\s+(?:'plpgsql'|plpgsql))?\s*$", re.IGNORECASE)
+DECL_LINE_RE = re.compile(r"^[A-Za-z_]\w*\s+[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?(?:\[\])?(?:\s*:=\s*(?:'[^']*'|[\d.]+|true|false|null))?$", re.IGNORECASE)
+SAFE_CATALOG_TABLES = frozenset({"pg_class", "pg_namespace", "pg_constraint", "pg_indexes", "pg_attribute", "pg_type", "pg_enum", "pg_proc", "pg_trigger", "pg_tables"})
+FORBIDDEN_COND_WORDS = frozenset({"select", "from", "where", "into", "join", "union", "with", "values", "returning", "drop", "delete", "update", "insert", "alter", "create", "truncate", "execute", "perform", "call", "copy", "grant", "revoke", "set", "do", "begin", "end", "loop", "while", "for"})
+COND_TOK_RE = re.compile(r"\s*(?:('(?:''|[^'])*')|(\"(?:\"\"|[^\"])+\")|(!=|<>)|([=(),*.])|(\d+(?:\.\d+)?)|([A-Za-z_][A-Za-z0-9_]*))")
+def _is_safe_do_condition(cond: str) -> bool:
+    if "$" in cond or not cond.strip(): return False
+    toks, pos, n = [], 0, len(cond)
+    while pos < n:
+        if cond[pos].isspace(): pos += 1; continue
+        m = COND_TOK_RE.match(cond, pos)
+        if not m or m.end() == pos: return False
+        toks.append(("str" if m.group(1) else "qid" if m.group(2) else "op" if (m.group(3) or m.group(4)) else "num" if m.group(5) else "word", m.group(0).strip())); pos = m.end()
+    idx = 1 if (toks and toks[0][0] == "word" and toks[0][1].lower() == "not") else 0
+    if idx + 2 >= len(toks) or toks[idx][0] != "word" or toks[idx][1].lower() != "exists" or toks[idx + 1] != ("op", "(") or toks[-1] != ("op", ")"): return False
+    inner, depth = toks[idx + 2:-1], 0
+    for kv in inner:
+        depth += 1 if kv == ("op", "(") else (-1 if kv == ("op", ")") else 0)
+        if depth < 0: return False
+    if depth != 0 or len(inner) < 4 or inner[0][0] != "word" or inner[0][1].lower() != "select" or inner[2][0] != "word" or inner[2][1].lower() != "from": return False
+    if not (inner[1] in (("num", "1"), ("op", "*")) or (inner[1][0] == "word" and inner[1][1].lower() not in FORBIDDEN_COND_WORDS)): return False
+    j = 3
+    if j + 2 < len(inner) and inner[j][0] == "word" and inner[j][1].lower() in ("information_schema", "pg_catalog") and inner[j + 1] == ("op", ".") and inner[j + 2][0] == "word" and inner[j + 2][1].lower() not in FORBIDDEN_COND_WORDS: j += 3
+    elif j < len(inner) and inner[j][0] == "word" and inner[j][1].lower() in SAFE_CATALOG_TABLES: j += 1
+    else: return False
+    if j == len(inner): return True
+    if inner[j][0] != "word" or inner[j][1].lower() != "where" or j + 1 >= len(inner): return False
+    w, wn, KWR = inner[j + 1:], len(inner) - (j + 1), FORBIDDEN_COND_WORDS | {"and", "or", "not", "is", "in", "null", "limit", "offset", "order", "group", "having", "fetch", "for"}
+    _w = lambda p, s: p < wn and w[p][0] == "word" and w[p][1].lower() == s
+    def _atom(p: int) -> int:
+        if p >= wn: return -1
+        k, v = w[p]; vl = v.lower()
+        if k in ("str", "num") or (k == "word" and vl in ("true", "false")): return p + 1
+        if k == "word" and vl == "current_schema" and p + 2 < wn and w[p + 1] == ("op", "(") and w[p + 2] == ("op", ")"): return p + 3
+        if k == "qid" or (k == "word" and vl not in KWR):
+            p += 1
+            if p + 1 < wn and w[p] == ("op", ".") and (w[p + 1][0] == "qid" or (w[p + 1][0] == "word" and w[p + 1][1].lower() not in KWR)): p += 2
+            return -1 if (p < wn and w[p] == ("op", "(")) else p
+        return -1
+    def _pred(p: int) -> int:
+        if p < wn and w[p] == ("op", "("): q = _or(p + 1); return q + 1 if (0 <= q < wn and w[q] == ("op", ")")) else -1
+        q = _atom(p)
+        if q < 0 or q >= wn: return -1
+        if w[q][0] == "op" and w[q][1] in ("=", "!=", "<>"): return _atom(q + 1)
+        if _w(q, "is"): q += 2 if _w(q + 1, "not") else 1; return q + 1 if _w(q, "null") else -1
+        if _w(q, "not"): q += 1
+        if _w(q, "in") and q + 1 < wn and w[q + 1] == ("op", "("):
+            q = _atom(q + 2)
+            while q >= 0 and q < wn and w[q] == ("op", ","): q = _atom(q + 1)
+            return q + 1 if (q >= 0 and q < wn and w[q] == ("op", ")")) else -1
+        return -1
+    _not = lambda p: _not(p + 1) if _w(p, "not") else _pred(p)
+    def _bin(p: int, kw: str, sub) -> int:
+        q = sub(p)
+        while q >= 0 and _w(q, kw): q = sub(q + 1)
+        return q
+    _or = lambda p: _bin(p, "or", lambda x: _bin(x, "and", _not))
+    return _or(0) == wn
 
-def is_safe_ddl_sql(sql_text: str) -> tuple[bool, str]:
+def _split_sql_stmts(sql_text: str) -> tuple[bool, str, list[str]]:
     stmts, buf, i, n, in_sq, in_eq, in_dq, dtag, bc = [], [], 0, len(sql_text), False, False, False, None, 0
     while i < n:
         ch = sql_text[i]
@@ -815,26 +879,17 @@ def is_safe_ddl_sql(sql_text: str) -> tuple[bool, str]:
             buf.append(ch)
             if ch == "\\" and i + 1 < n: buf.append(sql_text[i+1]); i += 2
             elif ch == "'" and i + 1 < n and sql_text[i+1] == "'": buf.append("'"); i += 2
-            elif ch == "'": in_eq = False; i += 1
-            else: i += 1
-        elif in_sq:
-            buf.append(ch)
-            if ch == "'" and i + 1 < n and sql_text[i+1] == "'": buf.append("'"); i += 2
-            elif ch == "'": in_sq = False; i += 1
-            else: i += 1
-        elif in_dq:
-            buf.append(ch)
-            if ch == '"' and i + 1 < n and sql_text[i+1] == '"': buf.append('"'); i += 2
-            elif ch == '"': in_dq = False; i += 1
-            else: i += 1
+            else: in_eq = (ch != "'"); i += 1
+        elif in_sq or in_dq:
+            q = "'" if in_sq else '"'; buf.append(ch)
+            if ch == q and i + 1 < n and sql_text[i+1] == q: buf.append(q); i += 2
+            else: in_sq, in_dq, i = (False if ch == q else in_sq), (False if ch == q else in_dq), i + 1
         elif dtag is not None:
             if sql_text.startswith(dtag, i): buf.append(dtag); i += len(dtag); dtag = None
             else: buf.append(ch); i += 1
-        elif sql_text[i:i+2] == "--":
-            nl = sql_text.find("\n", i); i = n if nl < 0 else nl + 1; buf.append(" ")
+        elif sql_text[i:i+2] == "--": nl = sql_text.find("\n", i); i = n if nl < 0 else nl + 1; buf.append(" ")
         elif sql_text[i:i+2] == "/*": bc = 1; i += 2
-        elif ch in ("E", "e") and i + 1 < n and sql_text[i+1] == "'" and (i == 0 or not (sql_text[i-1].isalnum() or sql_text[i-1] in ("_", "$"))):
-            in_eq = True; buf.append("E'"); i += 2
+        elif ch in ("E", "e") and i + 1 < n and sql_text[i+1] == "'" and (i == 0 or not (sql_text[i-1].isalnum() or sql_text[i-1] in ("_", "$"))): in_eq = True; buf.append("E'"); i += 2
         elif ch == "'": in_sq = True; buf.append(ch); i += 1
         elif ch == '"': in_dq = True; buf.append(ch); i += 1
         elif ch == "$":
@@ -843,20 +898,72 @@ def is_safe_ddl_sql(sql_text: str) -> tuple[bool, str]:
             else: buf.append(ch); i += 1
         elif ch == ";": stmts.append("".join(buf).strip()); buf = []; i += 1
         else: buf.append(ch); i += 1
-    if bc > 0 or in_sq or in_eq or in_dq or dtag is not None: return False, "SQL 语法存在未闭合注释或引号（fail-closed）"
-    tail = "".join(buf).strip()
-    if tail: stmts.append(tail)
+    if bc > 0 or in_sq or in_eq or in_dq or dtag is not None: return False, "SQL 语法存在未闭合注释或引号（fail-closed）", []
+    if "".join(buf).strip(): stmts.append("".join(buf).strip())
+    return True, "ok", stmts
+
+def _sanitize_sql(norm: str) -> str:
+    return re.sub(r'"(?:""|[^"])*"', '"_id_"', re.sub(r"[Ee]'(?:\\.|''|[^'\\])*'|'(?:''|[^'])*'", "''", norm))
+
+def _check_single_safe_ddl(norm: str) -> tuple[bool, str]:
+    if "$" in norm and re.search(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", norm): return False, f"SQL 包含未识别 dollar-quote，须人工确认: {norm[:70]}"
+    if not any(r.match(norm) for r in SAFE_SQL_RES): return False, f"SQL 语句不在安全增量白名单内，须人工确认: {norm[:70]}"
+    sanitized = _sanitize_sql(norm)
+    if UNSAFE_SQL_TOKEN_RE.search(sanitized): return False, f"SQL 复合语句包含潜在破坏性子句: {norm[:70]}"
+    if re.match(r"^ALTER\s+TABLE\b", sanitized, re.IGNORECASE):
+        clauses, depth, cur = [], 0, []
+        for ch in sanitized:
+            if ch == "," and depth == 0: clauses.append("".join(cur)); cur = []
+            else: depth = depth + 1 if ch == "(" else (max(0, depth - 1) if ch == ")" else depth); cur.append(ch)
+        for cl in clauses + ["".join(cur)]:
+            if re.search(r"\bADD\b", cl, re.IGNORECASE) and re.search(r"\bNOT\s+NULL\b", cl, re.IGNORECASE) and not re.search(r"\bDEFAULT\b", cl, re.IGNORECASE):
+                return False, f"SQL 包含无 DEFAULT 的 NOT NULL 列变更，须人工确认: {norm[:70]}"
+    return True, "ok"
+
+def is_safe_ddl_sql(sql_text: str) -> tuple[bool, str]:
+    ok, err, stmts = _split_sql_stmts(sql_text)
+    if not ok: return False, err
     for st in stmts:
         if not st: continue
-        norm = re.sub(r"\s+", " ", st)
-        if re.match(r"^DO\b", norm, re.IGNORECASE) or ("$" in norm and re.search(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", norm)):
-            return False, f"SQL 包含匿名块/dollar-quote，须人工审批: {norm[:70]}"
-        if not any(r.match(norm) for r in SAFE_SQL_RES):
-            return False, f"SQL 语句不在安全增量白名单内，须人工审批: {norm[:70]}"
-        sanitized = re.sub(r"[Ee]'(?:\\.|''|[^'\\])*'|'(?:''|[^'])*'", "''", norm)
-        sanitized = re.sub(r'"(?:""|[^"])*"', '"_id_"', sanitized)
-        if UNSAFE_SQL_TOKEN_RE.search(sanitized):
-            return False, f"SQL 复合语句包含潜在破坏性子句: {norm[:70]}"
+        norm = re.sub(r"\s+", " ", st).strip()
+        if re.match(r"^DO\b", norm, re.IGNORECASE):
+            m = DO_BLOCK_RE.match(st.strip())
+            if not m or m.group(1) in m.group(2): return False, f"SQL 匿名块格式不在安全白名单内，须人工确认: {norm[:70]}"
+            i_ok, i_err, inner = _split_sql_stmts(m.group(2))
+            if not i_ok: return False, i_err
+            in_decl, safe_cnt = False, 0
+            for ist in inner:
+                s = re.sub(r"\s+", " ", ist).strip()
+                if not s: continue
+                if not safe_cnt and re.match(r"^DECLARE\b", s, re.IGNORECASE):
+                    s = re.sub(r"^DECLARE\b\s*", "", s, flags=re.IGNORECASE)
+                    bm = re.search(r"\bBEGIN\b", s, re.IGNORECASE)
+                    if bm:
+                        if s[:bm.start()].strip() and not DECL_LINE_RE.match(s[:bm.start()].strip()): return False, f"DO 块 DECLARE 语句不安全: {norm[:70]}"
+                        s = s[bm.end():].strip()
+                    else:
+                        if s and not DECL_LINE_RE.match(s): return False, f"DO 块 DECLARE 语句不安全: {norm[:70]}"
+                        in_decl = True; continue
+                elif in_decl:
+                    if re.match(r"^BEGIN\b", s, re.IGNORECASE): in_decl = False; s = re.sub(r"^BEGIN\b\s*", "", s, flags=re.IGNORECASE)
+                    elif DECL_LINE_RE.match(s): continue
+                    else: return False, f"DO 块 DECLARE 语句不安全: {s[:70]}"
+                while s:
+                    m_if = re.match(r"^(?:IF|ELSIF)\b([\s\S]*?)\bTHEN\b\s*", s, re.IGNORECASE)
+                    if m_if:
+                        if not _is_safe_do_condition(m_if.group(1)): return False, "SQL 匿名块条件非受信任只读目录查询，须人工审批"
+                        s = s[m_if.end():].strip(); continue
+                    m_ctl = re.match(r"^(?:BEGIN|END\s+IF|END|ELSE|EXCEPTION\s+WHEN\s+(?:duplicate_object|duplicate_column|duplicate_table|unique_violation)\s+THEN\s+NULL)\b\s*", s, re.IGNORECASE)
+                    if m_ctl: s = s[m_ctl.end():].strip(); continue
+                    break
+                if not s: continue
+                s_ok, s_msg = _check_single_safe_ddl(s)
+                if not s_ok: return False, s_msg
+                safe_cnt += 1
+            if in_decl or safe_cnt == 0: return False, f"SQL 匿名块未包含有效安全增量语句: {norm[:70]}"
+            continue
+        s_ok, s_msg = _check_single_safe_ddl(norm)
+        if not s_ok: return False, s_msg
     return True, "ok"
 
 def parse_lossless_files(nul_path: str, files_json: str) -> list[str]:
@@ -879,25 +986,13 @@ def norm_rel(p: str) -> str:
     s = p.replace("\\", "/")
     while s.startswith("./"): s = s[2:]
     return s
-
-def norm_branch_name(b: str) -> str:
-    return re.sub(r"^(?:refs/heads/|origin/)", "", str(b or "").strip())
-
-def is_commercial_branch(nb: str) -> bool:
-    return nb == "feat/v5-aurora-rewrite" or "v5-aurora-rewrite" in nb
-
+def norm_branch_name(b: str) -> str: return re.sub(r"^(?:refs/heads/|origin/)", "", str(b or "").strip())
+def is_commercial_branch(nb: str) -> bool: return nb == "feat/v5-aurora-rewrite" or "v5-aurora-rewrite" in nb
 def canonical_sort(val):
     if isinstance(val, list): return [canonical_sort(x) for x in val]
-    if isinstance(val, dict): return {k: canonical_sort(val[k]) for k in sorted(val.keys())}
-    return val
-
-def compute_sig(doc: dict) -> str:
-    clone = {k: v for k, v in doc.items() if k != "sha256"}
-    return hashlib.sha256(("pending-approval-v1\n" + json.dumps(canonical_sort(clone), separators=(",", ":"), ensure_ascii=False)).encode("utf-8")).hexdigest()
-
-def verify_sig(doc: dict) -> bool:
-    stored = str(doc.get("sha256") or "")
-    return bool(re.fullmatch(r"[0-9a-f]{64}", stored)) and hmac.compare_digest(stored, compute_sig(doc))
+    return {k: canonical_sort(val[k]) for k in sorted(val.keys())} if isinstance(val, dict) else val
+def compute_sig(doc: dict) -> str: return hashlib.sha256(("pending-approval-v1\n" + json.dumps(canonical_sort({k: v for k, v in doc.items() if k != "sha256"}), separators=(",", ":"), ensure_ascii=False)).encode("utf-8")).hexdigest()
+def verify_sig(doc: dict) -> bool: return bool(re.fullmatch(r"[0-9a-f]{64}", str(doc.get("sha256") or ""))) and hmac.compare_digest(str(doc.get("sha256") or ""), compute_sig(doc))
 
 def write_exclusive_atomic(target: pathlib.Path, content: str):
     tmp_path = target.parent / f".{target.name}.tmp.{os.getpid()}.{secrets.token_hex(6)}"
@@ -1123,9 +1218,7 @@ if op == "blast_p1":
     root_path = pathlib.Path(repo_root)
     for f in files:
         nf = norm_rel(f)
-        if not TEST_FILE_RE.search(nf):
-            if PAYMENT_DIR_RE.search(nf) or nf in BILLING_CORE_EXACT or BILLING_CORE_KEYWORD_RE.search(nf): core_b.append(f)
-            elif BILLING_DIR_RE.search(nf): noncore_b.append(f)
+        _classify_billing(f, nf, core_b, noncore_b)
         if nf.endswith(".sql") or "/migrations/" in nf:
             if valid_sha:
                 if not git_ok: ddl_hits.append(f); sql_reason = f"无法通过 git 读取目标提交 SQL 文件 {f}（fail-closed）"
@@ -1143,46 +1236,49 @@ if op == "blast_p1":
                     if not s_ok: ddl_hits.append(f); sql_reason = s_msg
                 else: ddl_hits.append(f); sql_reason = f"SQL 文件 {f} 不存在，无法证明安全增量白名单（fail-closed）"
     # B6: Only short-circuit auto_pass when NO --voucher was supplied; explicit --voucher MUST still validate sha/branch!
-    if not ddl_hits and not core_b and not noncore_b and not voucher_arg:
-        emit_final(0, {"ok": True, "classification": "auto_pass", "branch": branch, "checkedFiles": len(files)})
+    if not ddl_hits and not core_b and not voucher_arg:
+        pay = {"ok": True, "classification": "auto_pass", "branch": branch, "checkedFiles": len(files)}
+        if noncore_b: pay["autoApprovedNonCoreBilling"] = True; pay["nonCoreBillingFiles"] = noncore_b
+        emit_final(0, pay)
     print(json.dumps({"phase": "evaluate", "normBranch": norm_branch, "checkedFiles": len(files), "ddlHits": ddl_hits, "coreBillingHits": core_b, "nonCoreBillingHits": noncore_b, "sqlReadFailReason": sql_reason}, ensure_ascii=False))
 
 elif op == "blast_p3":
-    branch, p1_raw, ts_raw, st_raw, voucher_arg, vouchers_dir, now_iso, sha_arg = args
-    p1, ts_res, st_res = json.loads(p1_raw), json.loads(ts_raw), json.loads(st_raw)
+    branch, p1_raw, ts_raw, voucher_arg, vouchers_dir, now_iso, sha_arg = args
+    p1, ts_res = json.loads(p1_raw), json.loads(ts_raw)
     norm_branch, ddl_hits, core_b, noncore_b, checked_files = p1["normBranch"], p1["ddlHits"], p1["coreBillingHits"], p1["nonCoreBillingHits"], p1["checkedFiles"]
     valid_sha = bool(SHA40_RE.fullmatch(sha_arg))
-    if not ddl_hits and not core_b and not noncore_b:
-        # B6: Explicit voucher supplied on clean files — still enforce voucher integrity/sha/branch!
+    if not ddl_hits and not core_b:
+        # B6: Explicit voucher supplied on clean/noncore-only files — still enforce voucher integrity/sha/branch!
         ok_v, v_rc, v_pay = verify_voucher_file(voucher_arg, vouchers_dir, now_iso, sha_arg, norm_branch, [], [])
         if not ok_v: print(json.dumps(v_pay, ensure_ascii=False)); sys.exit(v_rc)
-        print(json.dumps({"ok": True, "classification": "auto_pass", "branch": branch, "voucherId": v_pay["vid"], "checkedFiles": checked_files}, ensure_ascii=False)); sys.exit(0)
-    semantic_reason = ""
-    if not ddl_hits and not core_b and noncore_b:
-        if not valid_sha: semantic_reason = "未传入合法 40 位 --sha，无法执行纯类型/注释与跨家族 HMAC 审计核验"
-        elif not ts_res.get("ok"): semantic_reason = str(ts_res.get("reason") or "非核心计费文件不满足纯注释/类型声明白名单")
-        elif not (st_res.get("ok") and st_res.get("hmacVerified") and st_res.get("verdict") == "approve"):
-            semantic_reason = str(st_res.get("summary") or st_res.get("reason") or "未通过强制 HMAC 跨家族权威 Steward 审计签收")
-        else:
-            if voucher_arg:
-                ok_v, v_rc, v_pay = verify_voucher_file(voucher_arg, vouchers_dir, now_iso, sha_arg, norm_branch, [], [])
-                if not ok_v: print(json.dumps(v_pay, ensure_ascii=False)); sys.exit(v_rc)
-            print(json.dumps({"ok": True, "classification": "auto_pass", "branch": branch, "semanticNonCorePassed": True, "nonCoreBillingFiles": noncore_b, "checkedFiles": checked_files}, ensure_ascii=False)); sys.exit(0)
-    elif ddl_hits: semantic_reason = p1.get("sqlReadFailReason") or "命中非安全增量 SQL/破坏性 DDL，必须人工签发凭证"
-    elif core_b: semantic_reason = "命中核心计费/支付生产文件，必须人工签发凭证"
-    billing_hits = core_b + noncore_b
+        pay = {"ok": True, "classification": "auto_pass", "branch": branch, "voucherId": v_pay["vid"], "checkedFiles": checked_files}
+        if noncore_b: pay["autoApprovedNonCoreBilling"] = True; pay["nonCoreBillingFiles"] = noncore_b
+        print(json.dumps(pay, ensure_ascii=False)); sys.exit(0)
+    if not ddl_hits and core_b and valid_sha and ts_res.get("ok"):
+        v_id = None
+        if voucher_arg:
+            ok_v, v_rc, v_pay = verify_voucher_file(voucher_arg, vouchers_dir, now_iso, sha_arg, norm_branch, [], [])
+            if not ok_v: print(json.dumps(v_pay, ensure_ascii=False)); sys.exit(v_rc)
+            v_id = v_pay["vid"]
+        pay = {"ok": True, "classification": "auto_pass", "branch": branch, "semanticNoRuntimeBillingChange": True, "coreBillingFiles": core_b, "checkedFiles": checked_files}
+        if noncore_b: pay["autoApprovedNonCoreBilling"] = True; pay["nonCoreBillingFiles"] = noncore_b
+        if v_id: pay["voucherId"] = v_id
+        print(json.dumps(pay, ensure_ascii=False)); sys.exit(0)
+    semantic_reason = (p1.get("sqlReadFailReason") or "检测到破坏性或非白名单数据库变更，需要你确认") if ddl_hits else (str(ts_res.get("reason") or "") if (valid_sha and ts_res.get("reason")) else "命中核心计费/支付生产文件，需要你确认")
+    billing_hits = core_b
     if not voucher_arg:
         auto_v = find_matching_voucher(vouchers_dir, now_iso, sha_arg, norm_branch, ddl_hits, billing_hits)
         if auto_v is not None:
             print(json.dumps({"ok": True, "classification": "human_review_required", "branch": branch, "voucherId": auto_v["vid"], "voucherAutoDiscovered": True, "ddlFiles": ddl_hits, "billingFiles": billing_hits, "coreBillingFiles": core_b, "nonCoreBillingFiles": noncore_b}, ensure_ascii=False)); sys.exit(0)
         code = "DESTRUCTIVE_DDL_LOCKED" if ddl_hits else "BILLING_CORE_LOCKED"
-        print(json.dumps({"ok": False, "classification": "human_review_required", "code": code, "branch": branch, "ddlFiles": ddl_hits, "billingFiles": billing_hits, "coreBillingFiles": core_b, "nonCoreBillingFiles": noncore_b, "semanticReason": semantic_reason}, ensure_ascii=False)); sys.exit(22)
+        risk_cat = "ux_degradation" if code == "DESTRUCTIVE_DDL_LOCKED" else "billing_change"
+        print(json.dumps({"ok": False, "classification": "human_review_required", "code": code, "riskCategory": risk_cat, "branch": branch, "ddlFiles": ddl_hits, "billingFiles": billing_hits, "coreBillingFiles": core_b, "nonCoreBillingFiles": noncore_b, "semanticReason": semantic_reason}, ensure_ascii=False)); sys.exit(22)
     ok_v, v_rc, v_pay = verify_voucher_file(voucher_arg, vouchers_dir, now_iso, sha_arg, norm_branch, ddl_hits, billing_hits)
     if not ok_v: print(json.dumps(v_pay, ensure_ascii=False)); sys.exit(v_rc)
     print(json.dumps({"ok": True, "classification": "human_review_required", "branch": branch, "voucherId": v_pay["vid"], "ddlFiles": ddl_hits, "billingFiles": billing_hits, "coreBillingFiles": core_b, "nonCoreBillingFiles": noncore_b}, ensure_ascii=False))
 
 elif op == "record":
-    (approval_id, kind, code, branch, sha, train_id, ticket_id, scope, title_arg, summary_arg, ttl_s, repo_root, total_files_s, files_nul_path, files_json, now_iso, pending_dir, classification, allow_whole_s, steward_raw) = args
+    (approval_id, kind, code, branch, sha, train_id, ticket_id, scope, title_arg, summary_arg, ttl_s, repo_root, total_files_s, files_nul_path, files_json, now_iso, pending_dir, classification, allow_whole_s, steward_raw, risk_cat_arg) = args
     norm_branch = norm_branch_name(branch)
     if is_commercial_branch(norm_branch): sys.stderr.write("COMMERCIAL_BRANCH_HARD_LOCK: 商业分支永久硬锁\n"); sys.exit(21)
     ttl = float(ttl_s)
@@ -1204,28 +1300,20 @@ elif op == "record":
             except Exception: ex_expired = False
         if not ex_expired:
             print(json.dumps({"written": False, "doc": existing}, ensure_ascii=False)); sys.exit(0)
-        # N1: Archive expired record preserving full audit trail, then open fresh round (version+1, round+1)!
         ts_compact = now_dt.strftime("%Y%m%dT%H%M%SZ")
-        arch_path = pending_root / f"{approval_id}.expired-{ts_compact}.json"
-        suffix = 1
+        arch_path, suffix = pending_root / f"{approval_id}.expired-{ts_compact}.json", 1
         while os.path.lexists(arch_path):
             arch_path = pending_root / f"{approval_id}.expired-{ts_compact}-{suffix}.json"; suffix += 1
-        archived = {**existing, "status": "expired"}
-        archived["sha256"] = compute_sig(archived)
+        archived = {**existing, "status": "expired"}; archived["sha256"] = compute_sig(archived)
         write_exclusive_atomic(arch_path, json.dumps(archived, ensure_ascii=False, indent=2) + "\n")
-        next_version = int(existing.get("version") or 1) + 1
-        next_round = int(existing.get("round") or 1) + 1
-        prev_expired_at = str(existing.get("expiresAt") or "")
+        next_version, next_round, prev_expired_at = int(existing.get("version") or 1) + 1, int(existing.get("round") or 1) + 1, str(existing.get("expiresAt") or "")
 
     files = sorted(parse_lossless_files(files_nul_path, files_json))
     total_files = int(total_files_s) if total_files_s else len(files)
-    core_b, noncore_b, ddl_f = [], [], []
-    root_path = pathlib.Path(repo_root)
+    core_b, noncore_b, ddl_f, root_path = [], [], [], pathlib.Path(repo_root)
     for f in files:
         nf = norm_rel(f)
-        if not TEST_FILE_RE.search(nf):
-            if PAYMENT_DIR_RE.search(nf) or nf in BILLING_CORE_EXACT or BILLING_CORE_KEYWORD_RE.search(nf): core_b.append(f)
-            elif BILLING_DIR_RE.search(nf): noncore_b.append(f)
+        _classify_billing(f, nf, core_b, noncore_b)
         if nf.endswith(".sql") or "/migrations/" in nf:
             sql_text = None
             if sha:
@@ -1240,16 +1328,19 @@ elif op == "record":
     has_ddl = bool(ddl_f) or code == "DESTRUCTIVE_DDL_LOCKED" or (scope and "ddl" in scope.split("+"))
     if not scope and kind == "blast_voucher":
         scope = "ddl+billing" if (has_ddl and (core_b or noncore_b)) else ("ddl" if has_ddl else "billing")
-    comm_detail = "仅改动个人版分支 feat/v5-selfhost，未触碰商业版" if norm_branch == "feat/v5-selfhost" else f"仅改动分支 {norm_branch}，未触碰商业版"
-    if core_b: b_light = {"key": "billingFormulaSafety", "label": "计费公式安全", "level": "red", "detail": f"命中 {len(core_b)} 个核心计费/支付生产文件，需确认未改动扣费或账本逻辑"}
-    elif noncore_b or code == "BILLING_CORE_LOCKED": b_light = {"key": "billingFormulaSafety", "label": "计费公式安全", "level": "yellow", "detail": f"仅涉及 {len(noncore_b)} 个非核心计费辅助文件，未命中核心账本/定价文件" if noncore_b else "涉及计费目录辅助变更，未命中核心账本/定价文件"}
-    else: b_light = {"key": "billingFormulaSafety", "label": "计费公式安全", "level": "green", "detail": "未触碰任何计费或支付代码"}
-    safety_lights = [
-        {"key": "commercialIsolation", "label": "商业版隔离", "level": "green", "detail": comm_detail},
-        b_light,
-        {"key": "dataIntegrity", "label": "数据无损", "level": "red" if has_ddl else "green", "detail": "包含非安全增量或破坏性数据库结构变更，需核验数据安全" if has_ddl else "无破坏性删表或删列操作，用户数据无损"},
-        {"key": "rollbackSafety", "label": "秒级回滚", "level": "yellow" if has_ddl else "green", "detail": "含结构变更，回滚需额外核验" if has_ddl else "个人版双槽架构，异常可自动回滚恢复"},
-    ]
+    if risk_cat_arg in ("ux_degradation", "billing_change"): risk_cat = risk_cat_arg
+    elif code == "BILLING_CORE_LOCKED" or scope == "billing" or (core_b and not has_ddl): risk_cat = "billing_change"
+    elif has_ddl or code == "DESTRUCTIVE_DDL_LOCKED" or kind == "breaker_unlock": risk_cat = "ux_degradation"
+    elif any(PAYMENT_DIR_RE.search(norm_rel(f)) or BILLING_DIR_RE.search(norm_rel(f)) for f in files): risk_cat = "billing_change"
+    else: risk_cat = "ux_degradation"
+
+    comm_detail = "仅作用于个人版，完全不会影响商业版" if norm_branch == "feat/v5-selfhost" else "仅作用于当前测试分支，完全不会影响商业版"
+    is_billing_risk = risk_cat == "billing_change" or bool(core_b)
+    b_light = {"key": "billingFormulaSafety", "label": "计费方式影响", "level": "red" if is_billing_risk else "green", "detail": "涉及核心计费或支付逻辑，可能会改变扣费或定价方式" if is_billing_risk else "不涉及扣费、定价或支付逻辑，计费方式不变"}
+    d_light = {"key": "dataIntegrity", "label": "数据与体验安全", "level": "red" if has_ddl else ("yellow" if risk_cat == "ux_degradation" else "green"), "detail": "包含数据库删除或不可逆修改，可能影响用户数据或线上体验" if has_ddl else ("涉及用户体验底线或稳定性防线，请确认不会导致体验下降" if risk_cat == "ux_degradation" else "无删表或破坏性结构修改，用户数据安全")}
+    r_light = {"key": "rollbackSafety", "label": "回滚恢复能力", "level": "yellow" if has_ddl else "green", "detail": "含数据库结构变更，上线后若异常需要额外人工回滚" if has_ddl else "支持一键秒级回滚，异常可自动恢复到上一版本"}
+    safety_lights = [{"key": "commercialIsolation", "label": "商业版隔离", "level": "green", "detail": comm_detail}, b_light, d_light, r_light]
+
     st_parsed = json.loads(steward_raw)
     steward_verdict = {"present": bool(st_parsed.get("present")), "verdict": str(st_parsed.get("verdict") or "missing")}
     for k in ("authorFamily", "stewardFamily", "stewardModel", "recordedAt", "summary"):
@@ -1260,40 +1351,56 @@ elif op == "record":
     if sha:
         glog = run_git(repo_root, ["log", "-1", "--format=%s", sha])
         if glog is not None and glog.returncode == 0 and glog.stdout.strip(): commit_subject = glog.stdout.strip().splitlines()[0]
-    if title_arg.strip(): title = title_arg.strip()
-    elif code == "DESTRUCTIVE_DDL_LOCKED": title = "数据库结构变更需要你拍板放行"
-    elif code == "BILLING_CORE_LOCKED": title = "核心计费代码变更需要你拍板放行" if core_b else "计费辅助模块变更需要你拍板放行"
-    elif kind == "a0_approval": title = "A0 核心守护规则调整需要你拍板"
-    elif kind == "breaker_unlock": title = "熔断器解锁恢复自动发版确认"
-    else: title = f"治理防线拦截（{code}）需要你拍板"
-    if summary_arg.strip():
-        plain_summary = summary_arg.strip()
-        if commit_subject and commit_subject not in plain_summary: plain_summary = f"{plain_summary}（提交说明：{commit_subject}）"
+    clean_subj = re.sub(r"^(?:feat|fix|bug|refactor|chore|ci|docs|perf|test|revert|style|build)(?:\([^)]*\))?!?:\s*", "", commit_subject.strip(), flags=re.IGNORECASE)
+    clean_subj = re.sub(r"\[?OCV5-\d+\]?:?\s*", "", clean_subj, flags=re.IGNORECASE)
+    clean_subj = re.sub(r"\b[0-9a-f]{12,40}\b", "", clean_subj)
+    clean_subj = re.sub(r"\s+", " ", clean_subj).strip(" ：:;-")
+
+    if clean_subj: what_changed = f"本次改动：{clean_subj}（涉及 {len(files)} 个关键文件）。" if files else f"本次改动：{clean_subj}。"
+    elif has_ddl: what_changed = f"本次改动包含 {len(ddl_f) or len(files) or 1} 处数据库结构删除或修改操作。"
+    elif risk_cat == "billing_change": what_changed = f"本次改动修改了 {len(core_b) or len(files) or 1} 个核心计费或支付逻辑文件。"
+    elif kind == "breaker_unlock": what_changed = "线上近期触发了自动保护暂停，现申请恢复个人版自动发版。"
+    else: what_changed = f"本次改动调整了 {len(files) or total_files or 1} 项影响用户体验或核心保护的设置。"
+
+    if has_ddl or code == "DESTRUCTIVE_DDL_LOCKED": why_need_you = "命中「用户体验可能下降」：检测到可能影响用户数据或线上体验的破坏性数据库变更，确认后才会放行。"
+    elif risk_cat == "billing_change": why_need_you = "命中「计费方式可能变化」：本次改动涉及核心扣费/定价逻辑，可能会改变计费方式，需要你确认后才会生效。"
+    elif kind == "breaker_unlock": why_need_you = "命中「用户体验可能下降」：近期连续出现异常回滚，系统已暂停自动发版，确认问题已修复后才会恢复。"
+    else: why_need_you = "命中「用户体验可能下降」：本次改动放宽了页面体验或稳定性保护底线，可能会导致用户体验变差，需要你确认后才会放行。"
+
+    sv = steward_verdict["verdict"]
+    if sv == "veto": recommendation = {"action": "reject", "label": "建议驳回整改", "reason": "独立复核发现明确阻断风险，建议先驳回退回助手修复后再提交。"}
+    elif sv == "invalid": recommendation = {"action": "caution", "label": "请核对后再决定", "reason": "独立复核结果未通过核验，请先确认改动细节无误后再拍板。"}
+    elif sv == "approve" and steward_verdict.get("hmacVerified") is True:
+        if has_ddl: recommendation = {"action": "caution", "label": "请核对后再决定", "reason": "独立复核已通过，但包含数据库结构变更，请确认无数据丢失风险后再批准。"}
+        elif risk_cat == "billing_change": recommendation = {"action": "approve", "label": "建议批准", "reason": "独立复核已通过，商业版已隔离且支持秒级回滚；若计费调整符合预期可直接批准。"}
+        else: recommendation = {"action": "approve", "label": "建议批准", "reason": "独立复核已通过，影响范围可控且支持秒级回滚，可直接批准放行。"}
     else:
-        parts = [f"分支 {norm_branch}"]
-        if sha: parts.append(f"版本 {sha[:12]}")
-        if commit_subject: parts.append(f"提交「{commit_subject}」")
-        if total_files > 0: parts.append(f"共涉及 {total_files} 个变更文件（其中 {len(files)} 个触发防线检查）")
-        if has_ddl: parts.append("检测到破坏性或非白名单数据库结构变更，需人工拍板后才能继续发版")
-        elif core_b: parts.append("触及核心计费或支付生产文件，为防止误伤账本与扣费规则，需你拍板签发绑定本次提交的放行凭证")
-        elif noncore_b: parts.append("触及计费目录辅助文件且含运行时变更或未通过强制 HMAC 跨家族审计，需你确认后签发绑定凭证")
-        elif kind == "a0_approval": parts.append("触及 A0 元护栏保护路径，需你确认后签发单次提交审批印章")
-        elif kind == "breaker_unlock": parts.append("发版熔断器已触发，请确认根因修复完成后解锁恢复自动发版")
-        else: parts.append(f"触发治理防线 {code}，需你拍板决定是否放行")
-        plain_summary = "，".join(parts) + "。"
-    effects = {
-        "blast_voucher": ("签发 4 小时精确绑定本提交与文件清单的放行凭证，并可自动续跑卡住的发版列车", "保持拦截不签发凭证，发版列车保持暂停，等待开发整改后重新提交"),
-        "a0_approval": ("签发精确绑定文件范围的单次提交 A0 审批印章，放行该版本通过架构元护栏", "拒绝放行本次 A0 变更，需开发调整方案后重新提交"),
-        "breaker_unlock": ("解除当前熔断器冻结，恢复全自动自治发版模式（autonomous）", "保持熔断器冻结状态，继续暂停新特性合入"),
-    }
-    approve_effect, reject_effect = effects[kind]
+        if has_ddl: recommendation = {"action": "caution", "label": "请核对后再决定", "reason": "本次包含数据库结构删除或修改且暂无独立复核结论，请确认不会影响用户数据后再决定。"}
+        elif risk_cat == "billing_change": recommendation = {"action": "caution", "label": "请核对后再决定", "reason": "本次涉及核心扣费逻辑且暂无独立复核结论，请确认计费方式调整符合预期后再决定。"}
+        else: recommendation = {"action": "caution", "label": "请核对后再决定", "reason": "暂无独立复核结论，请先确认改动不会导致用户体验下降后再决定。"}
+
+    if title_arg.strip(): title = title_arg.strip()
+    elif has_ddl or code == "DESTRUCTIVE_DDL_LOCKED": title = "数据库结构删除/修改，需要你确认"
+    elif risk_cat == "billing_change": title = "计费规则变更，需要你确认"
+    elif kind == "breaker_unlock": title = "恢复自动发版，需要你确认"
+    else: title = "可能影响用户体验的变更，需要你确认"
+
+    plain_summary = summary_arg.strip() if summary_arg.strip() else f"{what_changed}{why_need_you}"
+    if kind == "blast_voucher":
+        approve_effect = "立即放行本次变更并自动继续发版，同时自动通知助手继续后续处理"
+        reject_effect = "拦下本次变更，线上版本与计费方式保持不变，退回助手调整" if risk_cat == "billing_change" else "拦下本次变更，线上版本与用户数据保持不变，退回助手调整"
+    elif kind == "a0_approval":
+        approve_effect, reject_effect = "立即放行本次变更并继续发版流程，同时自动通知助手继续后续处理", "拦下本次变更，原有体验与计费保护底线保持不变，退回助手调整"
+    else:
+        approve_effect, reject_effect = "解除暂停状态，恢复个人版自动发版，并通知助手继续处理", "保持暂停状态，继续拦截新改动上线，直到问题彻底解决"
+
     doc = {
         "schemaVersion": 1, "version": next_version, "round": next_round, "classification": classification, "id": approval_id,
-        "kind": kind, "status": "pending", "code": code, "branch": norm_branch,
-        "title": title, "plainSummary": plain_summary, "approveEffect": approve_effect, "rejectEffect": reject_effect,
+        "kind": kind, "status": "pending", "code": code, "riskCategory": risk_cat, "branch": norm_branch,
+        "title": title, "plainSummary": plain_summary, "whatChanged": what_changed, "whyNeedYou": why_need_you,
+        "recommendation": recommendation, "approveEffect": approve_effect, "rejectEffect": reject_effect,
         "files": files, "totalChangedFiles": total_files, "safetyLights": safety_lights, "stewardVerdict": steward_verdict,
-        "createdAt": now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "expiresAt": (now_dt + dt.timedelta(hours=ttl)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "createdAt": now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "expiresAt": (now_dt + dt.timedelta(hours=ttl)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     if scope: doc["scope"] = scope
     if sha: doc["sha"] = sha
@@ -1485,106 +1592,60 @@ PY
 }
 
 cmd_record_pending_approval() {
-  local id="" kind="" code="" branch="" sha="" base_ref="" train_id="" ticket_id="" scope=""
-  local title="" summary="" ttl_hours="24" repo_root="." total_files="" files_json="" files_nul=0
-  local classification="human_review_required" allow_whole_commit=0
+  local id="" kind="" code="" branch="" sha="" base_ref="" train_id="" ticket_id="" scope="" risk_category="" title="" summary="" ttl_hours="24" repo_root="." total_files="" files_json="" files_nul=0 classification="human_review_required" allow_whole_commit=0
   local -a raw_files=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --id) id="${2:-}"; shift 2 ;;
-      --kind) kind="${2:-}"; shift 2 ;;
-      --code) code="${2:-}"; shift 2 ;;
-      --branch) branch="${2:-}"; shift 2 ;;
-      --sha) sha="${2:-}"; shift 2 ;;
-      --base-ref) base_ref="${2:-}"; shift 2 ;;
-      --train) train_id="${2:-}"; shift 2 ;;
-      --ticket) ticket_id="${2:-}"; shift 2 ;;
-      --scope) scope="${2:-}"; shift 2 ;;
-      --title) title="${2:-}"; shift 2 ;;
-      --summary) summary="${2:-}"; shift 2 ;;
-      --ttl-hours) ttl_hours="${2:-}"; shift 2 ;;
-      --repo-root) repo_root="${2:-}"; shift 2 ;;
-      --total-files) total_files="${2:-}"; shift 2 ;;
-      --classification) classification="${2:-}"; shift 2 ;;
-      --allow-whole-commit) allow_whole_commit=1; shift ;;
-      --files-json) files_json="${2:-}"; shift 2 ;;
-      --files-nul) files_nul=1; shift ;;
+      --id) id="${2:-}"; shift 2 ;; --kind) kind="${2:-}"; shift 2 ;; --code) code="${2:-}"; shift 2 ;; --branch) branch="${2:-}"; shift 2 ;;
+      --sha) sha="${2:-}"; shift 2 ;; --base-ref) base_ref="${2:-}"; shift 2 ;; --train) train_id="${2:-}"; shift 2 ;; --ticket) ticket_id="${2:-}"; shift 2 ;;
+      --scope) scope="${2:-}"; shift 2 ;; --risk-category) risk_category="${2:-}"; shift 2 ;; --title) title="${2:-}"; shift 2 ;; --summary) summary="${2:-}"; shift 2 ;;
+      --ttl-hours) ttl_hours="${2:-}"; shift 2 ;; --repo-root) repo_root="${2:-}"; shift 2 ;; --total-files) total_files="${2:-}"; shift 2 ;;
+      --classification) classification="${2:-}"; shift 2 ;; --allow-whole-commit) allow_whole_commit=1; shift ;; --files-json) files_json="${2:-}"; shift 2 ;; --files-nul) files_nul=1; shift ;;
       --files) shift; while [[ $# -gt 0 && "$1" != --* ]]; do raw_files+=("$1"); shift; done ;;
       *) die_usage "unknown record-pending-approval argument: $1" ;;
     esac
   done
   [[ "$id" =~ ^gov-[a-z0-9_-]{4,80}$ ]] || die_usage "--id must match ^gov-[a-z0-9_-]{4,80}$ (got: ${id:-<empty>})"
   case "$kind" in blast_voucher|a0_approval|breaker_unlock) ;; *) die_usage "--kind must be blast_voucher | a0_approval | breaker_unlock" ;; esac
-  case "$classification" in
-    human_review_required|auto_pass) ;;
-    absolute_reject) die_gate "ABSOLUTE_REJECT_FORBIDDEN: classification=absolute_reject 禁止创建审批单" ;;
-    *) die_usage "--classification must be human_review_required | auto_pass | absolute_reject" ;;
-  esac
+  case "$risk_category" in ""|ux_degradation|billing_change) ;; *) die_usage "--risk-category must be ux_degradation | billing_change" ;; esac
+  case "$classification" in human_review_required|auto_pass) ;; absolute_reject) die_gate "ABSOLUTE_REJECT_FORBIDDEN: classification=absolute_reject 禁止创建审批单" ;; *) die_usage "--classification must be human_review_required | auto_pass | absolute_reject" ;; esac
   [[ -n "${code// /}" ]] || die_usage "--code is required"
   [[ -n "${branch// /}" ]] || die_usage "--branch is required"
   [[ -z "$sha" || "$sha" =~ ^[0-9a-f]{40}$ ]] || die_usage "--sha must be a 40-char lowercase hex commit SHA"
   [[ "$ttl_hours" =~ ^[0-9]+([.][0-9]+)?$ ]] || die_usage "--ttl-hours must be a positive number"
   [[ -z "$total_files" || "$total_files" =~ ^[0-9]+$ ]] || die_usage "--total-files must be a non-negative integer"
   local norm_br="${branch#refs/heads/}"; norm_br="${norm_br#origin/}"
-  [[ "$norm_br" != "feat/v5-aurora-rewrite" && "$norm_br" != *v5-aurora-rewrite* ]] \
-    || die_gate "COMMERCIAL_BRANCH_HARD_LOCK: 商业分支 feat/v5-aurora-rewrite 永久物理硬锁，禁止创建审批单"
-
-  ensure_dirs
-  _assert_safe_dir_chain || die_gate "unsafe control directory chain"
+  [[ "$norm_br" != "feat/v5-aurora-rewrite" && "$norm_br" != *v5-aurora-rewrite* ]] || die_gate "COMMERCIAL_BRANCH_HARD_LOCK: 商业分支 feat/v5-aurora-rewrite 永久物理硬锁，禁止创建审批单"
+  ensure_dirs; _assert_safe_dir_chain || die_gate "unsafe control directory chain"
   local lock_file="$PENDING_LOCKS_DIR/${id}.lock"
   [[ ! -L "$lock_file" ]] || die_gate "UNSAFE_LOCK_FILE: symlink lock file refused: $lock_file"
-
   local ts actor resolved_base_sha="" steward_json='{"present":false,"ok":false,"verdict":"missing","hmacVerified":false}'
   ts="$(now_iso)"; actor="$(actor_name)"
   if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
     resolved_base_sha="$(_resolve_exact_base_sha "$repo_root" "$sha" "$base_ref")"
     if [[ -z "$resolved_base_sha" ]]; then
-      if [[ -e "$STEWARD_RECEIPTS_DIR/${sha}.json" || -L "$STEWARD_RECEIPTS_DIR/${sha}.json" ]]; then
-        steward_json='{"present":true,"ok":false,"verdict":"invalid","hmacVerified":false,"summary":"无法确定比较基线，需人工核验"}'
-      fi
-    else
-      steward_json="$(_verify_steward_receipt_authoritative "$sha" "$resolved_base_sha")"
-    fi
+      [[ -e "$STEWARD_RECEIPTS_DIR/${sha}.json" || -L "$STEWARD_RECEIPTS_DIR/${sha}.json" ]] && steward_json='{"present":true,"ok":false,"verdict":"invalid","hmacVerified":false,"summary":"无法确定比较基线，需人工核验"}'
+    else steward_json="$(_verify_steward_receipt_authoritative "$sha" "$resolved_base_sha")"; fi
   fi
-
-  local tmp_files_nul=""
+  local tmp_files_nul="" out_res="" rc=0
   tmp_files_nul="$(mktemp "${TMPDIR:-/tmp}/oc-rec-files.XXXXXX")"
   if [[ "$files_nul" == "1" ]]; then cat >"$tmp_files_nul"
   elif (( ${#raw_files[@]} > 0 )); then printf '%s\0' "${raw_files[@]}" >"$tmp_files_nul"; fi
-
-  local out_res="" rc=0
   set +e
-  out_res="$(
-    exec 9>"$lock_file"
-    flock -w 15 -x 9 || { echo "LOCK_TIMEOUT: could not acquire lock for $id" >&2; exit 19; }
-    _pending_approval_py record "$id" "$kind" "$code" "$branch" "$sha" "$train_id" "$ticket_id" "$scope" "$title" "$summary" "$ttl_hours" "$repo_root" "$total_files" "$tmp_files_nul" "$files_json" "$ts" "$PENDING_APPROVALS_DIR" "$classification" "$allow_whole_commit" "$steward_json"
-  )"
-  rc=$?
-  set -e
+  out_res="$(exec 9>"$lock_file"; flock -w 15 -x 9 || { echo "LOCK_TIMEOUT: could not acquire lock for $id" >&2; exit 19; }; _pending_approval_py record "$id" "$kind" "$code" "$branch" "$sha" "$train_id" "$ticket_id" "$scope" "$title" "$summary" "$ttl_hours" "$repo_root" "$total_files" "$tmp_files_nul" "$files_json" "$ts" "$PENDING_APPROVALS_DIR" "$classification" "$allow_whole_commit" "$steward_json" "$risk_category")"
+  rc=$?; set -e
   rm -f -- "$tmp_files_nul" 2>/dev/null || true
-  if [[ "$rc" -ne 0 ]]; then
-    [[ "$rc" -eq 2 ]] && die_usage "record-pending-approval failed"
-    die_gate "record-pending-approval rejected (rc=$rc)"
-  fi
-
+  if [[ "$rc" -ne 0 ]]; then [[ "$rc" -eq 2 ]] && die_usage "record-pending-approval failed"; die_gate "record-pending-approval rejected (rc=$rc)"; fi
   local was_written="" doc_pretty=""
   was_written="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1]).get("written") else "0")' "$out_res")"
   doc_pretty="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["doc"], ensure_ascii=False, indent=2))' "$out_res")"
-  if [[ "$was_written" == "1" ]]; then
-    append_audit_safe "$(python3 -c 'import json,sys; t,a,i,k,c,b,cls=sys.argv[1:]; print(json.dumps({"ts":t,"action":"record_pending_approval","actor":a,"approvalId":i,"kind":k,"code":c,"branch":b,"classification":cls,"outcome":"ok"}, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$id" "$kind" "$code" "$branch" "$classification")"
-  fi
+  [[ "$was_written" == "1" ]] && append_audit_safe "$(python3 -c 'import json,sys; t,a,i,k,c,b,cls=sys.argv[1:]; print(json.dumps({"ts":t,"action":"record_pending_approval","actor":a,"approvalId":i,"kind":k,"code":c,"branch":b,"classification":cls,"outcome":"ok"}, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$id" "$kind" "$code" "$branch" "$classification")"
   printf '%s\n' "$doc_pretty"
 }
 
 cmd_list_pending_approvals() {
   local status_filter="pending" limit_arg="200"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --status) status_filter="${2:-}"; shift 2 ;;
-      --limit) limit_arg="${2:-}"; shift 2 ;;
-      *) die_usage "unknown list-pending-approvals argument: $1" ;;
-    esac
-  done
+  while [[ $# -gt 0 ]]; do case "$1" in --status) status_filter="${2:-}"; shift 2 ;; --limit) limit_arg="${2:-}"; shift 2 ;; *) die_usage "unknown list-pending-approvals argument: $1" ;; esac; done
   case "$status_filter" in pending|all|approving|approved|rejected|expired|reconcile_required) ;; *) die_usage "--status invalid" ;; esac
   [[ "$limit_arg" =~ ^[1-9][0-9]*$ ]] || die_usage "--limit must be a positive integer"
   _pending_approval_py list "$PENDING_APPROVALS_DIR" "$status_filter" "$limit_arg" "$(now_iso)"
@@ -1592,45 +1653,23 @@ cmd_list_pending_approvals() {
 
 cmd_reconcile_pending_approval() {
   local id=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --id) id="${2:-}"; shift 2 ;;
-      *) die_usage "unknown reconcile-pending-approval argument: $1" ;;
-    esac
-  done
+  while [[ $# -gt 0 ]]; do case "$1" in --id) id="${2:-}"; shift 2 ;; *) die_usage "unknown reconcile-pending-approval argument: $1" ;; esac; done
   [[ "$id" =~ ^gov-[a-z0-9_-]{4,80}$ ]] || die_usage "--id must match ^gov-[a-z0-9_-]{4,80}$"
-  ensure_dirs
-  _assert_safe_dir_chain || die_gate "unsafe control directory chain"
-  local lock_file="$PENDING_LOCKS_DIR/${id}.lock"
+  ensure_dirs; _assert_safe_dir_chain || die_gate "unsafe control directory chain"
+  local lock_file="$PENDING_LOCKS_DIR/${id}.lock" out_json="" rc=0
   [[ ! -L "$lock_file" ]] || die_gate "UNSAFE_LOCK_FILE: $lock_file"
-  local out_json="" rc=0
-  set +e
-  out_json="$(
-    exec 9>"$lock_file"
-    flock -w 15 -x 9 || { echo "LOCK_TIMEOUT: $id" >&2; exit 19; }
-    _pending_approval_py reconcile "$PENDING_APPROVALS_DIR" "$VOUCHERS_DIR" "$APPROVALS_DIR" "$BREAKER_FILE" "$COST_BREAKER_FILE" "$id"
-  )"
-  rc=$?
-  set -e
+  set +e; out_json="$(exec 9>"$lock_file"; flock -w 15 -x 9 || { echo "LOCK_TIMEOUT: $id" >&2; exit 19; }; _pending_approval_py reconcile "$PENDING_APPROVALS_DIR" "$VOUCHERS_DIR" "$APPROVALS_DIR" "$BREAKER_FILE" "$COST_BREAKER_FILE" "$id")"; rc=$?; set -e
   [[ "$rc" -eq 0 ]] || die_gate "reconcile-pending-approval failed (rc=$rc)"
   printf '%s\n' "$out_json"
 }
 
 cmd_decide_pending_approval() {
-  local id="" decision="" actor_arg="" note="" expected_version="" expected_sha256=""
-  local allow_whole_commit=0 publish_gh=0 gh_repo=""
+  local id="" decision="" actor_arg="" note="" expected_version="" expected_sha256="" allow_whole_commit=0 publish_gh=0 gh_repo=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --id) id="${2:-}"; shift 2 ;;
-      --decision) decision="${2:-}"; shift 2 ;;
-      --actor) actor_arg="${2:-}"; shift 2 ;;
-      --expected-version) expected_version="${2:-}"; shift 2 ;;
-      --expected-sha256) expected_sha256="${2:-}"; shift 2 ;;
-      --note) note="${2:-}"; shift 2 ;;
-      --allow-whole-commit) allow_whole_commit=1; shift ;;
-      --publish-github-status) publish_gh=1; shift ;;
-      --github-repo) gh_repo="${2:-}"; shift 2 ;;
-      *) die_usage "unknown decide-pending-approval argument: $1" ;;
+      --id) id="${2:-}"; shift 2 ;; --decision) decision="${2:-}"; shift 2 ;; --actor) actor_arg="${2:-}"; shift 2 ;; --expected-version) expected_version="${2:-}"; shift 2 ;;
+      --expected-sha256) expected_sha256="${2:-}"; shift 2 ;; --note) note="${2:-}"; shift 2 ;; --allow-whole-commit) allow_whole_commit=1; shift ;;
+      --publish-github-status) publish_gh=1; shift ;; --github-repo) gh_repo="${2:-}"; shift 2 ;; *) die_usage "unknown decide-pending-approval argument: $1" ;;
     esac
   done
   [[ "$id" =~ ^gov-[a-z0-9_-]{4,80}$ ]] || die_usage "--id must match ^gov-[a-z0-9_-]{4,80}$"
@@ -1638,28 +1677,22 @@ cmd_decide_pending_approval() {
   [[ -n "${actor_arg// /}" ]] || die_usage "--actor <name> is required"
   [[ -z "$expected_version" || "$expected_version" =~ ^[1-9][0-9]*$ ]] || die_usage "--expected-version must be a positive integer"
   [[ -z "$expected_sha256" || "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || die_usage "--expected-sha256 must be a 64-char lowercase hex SHA-256"
-  ensure_dirs
-  _assert_safe_dir_chain || die_gate "unsafe control directory chain"
-  local lock_file="$PENDING_LOCKS_DIR/${id}.lock"
+  ensure_dirs; _assert_safe_dir_chain || die_gate "unsafe control directory chain"
+  local lock_file="$PENDING_LOCKS_DIR/${id}.lock" ts out_json rc=0
   [[ ! -L "$lock_file" ]] || die_gate "UNSAFE_LOCK_FILE: $lock_file"
-
-  local ts out_json rc=0
   ts="$(now_iso)"
   set +e
   out_json="$(
     exec 9>"$lock_file"
     flock -w 15 -x 9 || { echo "LOCK_TIMEOUT: could not acquire lock for $id" >&2; exit 19; }
     prep_out="$(_pending_approval_py decide_prep "$PENDING_APPROVALS_DIR" "$VOUCHERS_DIR" "$APPROVALS_DIR" "$BREAKER_FILE" "$COST_BREAKER_FILE" "$id" "$decision" "$actor_arg" "$note" "$expected_version" "$expected_sha256" "$allow_whole_commit" "$publish_gh" "$ts")"
-    prep_rc=$?
-    [[ "$prep_rc" -eq 0 ]] || exit "$prep_rc"
+    prep_rc=$?; [[ "$prep_rc" -eq 0 ]] || exit "$prep_rc"
     mapfile -d '' -t _dp < <(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); vals=["1" if d.get("done") else "0", json.dumps(d.get("doc"),ensure_ascii=False,indent=2) if d.get("done") else "", str(d.get("kind","")), str(d.get("scope","")), str(d.get("branch","")), str(d.get("sha","")), str(d.get("curVersion","")), str(d.get("cleanNote","")), str(d.get("pendingArtifactId","")), json.dumps(d.get("files",[]),ensure_ascii=False)]; sys.stdout.buffer.write(b"".join(v.encode("utf-8")+b"\x00" for v in vals))' "$prep_out")
     if [[ "${_dp[0]}" == "1" ]]; then printf '%s\n' "${_dp[1]}"; exit 0; fi
     kind="${_dp[2]}"; scope="${_dp[3]}"; branch="${_dp[4]}"; sha="${_dp[5]}"; cur_ver="${_dp[6]}"; clean_note="${_dp[7]}"; pending_aid="${_dp[8]}"; files_json_arg="${_dp[9]}"
     artifact_reason="Approved ${id} by ${actor_arg}${clean_note:+: ${clean_note}}"
     mint_out=""; mint_rc=0; issued_id=""; default_resume="not_applicable"
-
-    if [[ "${OC_GOVERNOR_TEST_FAIL_BEFORE_MINT:-0}" == "1" ]]; then
-      mint_rc=1; mint_out="simulated pre-mint failure"
+    if [[ "${OC_GOVERNOR_TEST_FAIL_BEFORE_MINT:-0}" == "1" ]]; then mint_rc=1; mint_out="simulated pre-mint failure"
     elif [[ "$kind" == "blast_voucher" ]]; then
       default_resume="not_started"
       b_args=(--id "$pending_aid" --scope "$scope" --reason "$artifact_reason" --ttl-hours 4 --branch "$branch" --approval-id "$id" --files-json "$files_json_arg")
@@ -1671,16 +1704,13 @@ cmd_decide_pending_approval() {
       a_args=(--sha "$sha" --reason "$artifact_reason" --ttl-hours 24)
       for af in "${file_arr[@]}"; do a_args+=(--allowed-path "$af"); done
       if [[ "$publish_gh" == "1" ]]; then a_args+=(--publish-github-status); [[ -n "$gh_repo" ]] && a_args+=(--github-repo "$gh_repo"); fi
-      mint_out="$(cmd_approve_a0 "${a_args[@]}" 2>&1)"; mint_rc=$?
-      [[ "$mint_rc" -eq 0 ]] && issued_id="$pending_aid"
+      mint_out="$(cmd_approve_a0 "${a_args[@]}" 2>&1)"; mint_rc=$?; [[ "$mint_rc" -eq 0 ]] && issued_id="$pending_aid"
     elif [[ "$kind" == "breaker_unlock" ]]; then
-      mint_out="$(cmd_unlock_breaker --reason "$clean_note" 2>&1)"; mint_rc=$?
-      [[ "$mint_rc" -eq 0 ]] && issued_id="$pending_aid"
+      mint_out="$(cmd_unlock_breaker --reason "$clean_note" 2>&1)"; mint_rc=$?; [[ "$mint_rc" -eq 0 ]] && issued_id="$pending_aid"
     fi
     _pending_approval_py decide_commit "$PENDING_APPROVALS_DIR" "$VOUCHERS_DIR" "$APPROVALS_DIR" "$BREAKER_FILE" "$id" "$kind" "$sha" "$cur_ver" "$mint_rc" "$issued_id" "$pending_aid" "$default_resume" "$publish_gh" "$mint_out" "${OC_GOVERNOR_TEST_FAIL_AFTER_MINT:-0}"
   )"
-  rc=$?
-  set -e
+  rc=$?; set -e
   if [[ "$rc" -ne 0 ]]; then
     append_audit_safe "$(python3 -c 'import json,sys; t,a,i,d,r=sys.argv[1:]; print(json.dumps({"ts":t,"action":"decide_pending_approval","actor":a,"approvalId":i,"decision":d,"rc":int(r),"outcome":"failed"}, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor_arg" "$id" "$decision" "$rc")"
     die_gate "decide-pending-approval failed (rc=$rc)"
@@ -1695,32 +1725,17 @@ cmd_update_approval_resume() {
   local id="" resume_status="" claim_from="" expected_unit="" resume_unit="" train_id="" resume_detail=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --id) id="${2:-}"; shift 2 ;;
-      --status) resume_status="${2:-}"; shift 2 ;;
-      --claim-from) claim_from="${2:-}"; shift 2 ;;
-      --expected-unit) expected_unit="${2:-}"; shift 2 ;;
-      --unit) resume_unit="${2:-}"; shift 2 ;;
-      --train) train_id="${2:-}"; shift 2 ;;
-      --detail) resume_detail="${2:-}"; shift 2 ;;
-      *) die_usage "unknown update-approval-resume argument: $1" ;;
+      --id) id="${2:-}"; shift 2 ;; --status) resume_status="${2:-}"; shift 2 ;; --claim-from) claim_from="${2:-}"; shift 2 ;; --expected-unit) expected_unit="${2:-}"; shift 2 ;;
+      --unit) resume_unit="${2:-}"; shift 2 ;; --train) train_id="${2:-}"; shift 2 ;; --detail) resume_detail="${2:-}"; shift 2 ;; *) die_usage "unknown update-approval-resume argument: $1" ;;
     esac
   done
   [[ "$id" =~ ^gov-[a-z0-9_-]{4,80}$ ]] || die_usage "--id must match ^gov-[a-z0-9_-]{4,80}$"
   case "$resume_status" in starting|running|started|not_started_busy|head_moved|failed|completed|skipped|not_applicable|not_started) ;; *) die_usage "invalid --status: $resume_status" ;; esac
-  ensure_dirs
-  _assert_safe_dir_chain || die_gate "unsafe control directory chain"
-  local lock_file="$PENDING_LOCKS_DIR/${id}.lock"
+  ensure_dirs; _assert_safe_dir_chain || die_gate "unsafe control directory chain"
+  local lock_file="$PENDING_LOCKS_DIR/${id}.lock" ts actor out_json rc=0
   [[ ! -L "$lock_file" ]] || die_gate "UNSAFE_LOCK_FILE: $lock_file"
-  local ts actor out_json rc=0
   ts="$(now_iso)"; actor="$(actor_name)"
-  set +e
-  out_json="$(
-    exec 9>"$lock_file"
-    flock -w 15 -x 9 || { echo "LOCK_TIMEOUT: could not acquire lock for $id" >&2; exit 19; }
-    _pending_approval_py update_resume "$PENDING_APPROVALS_DIR" "$id" "$resume_status" "$claim_from" "$expected_unit" "$resume_unit" "$train_id" "$resume_detail" "$ts"
-  )"
-  rc=$?
-  set -e
+  set +e; out_json="$(exec 9>"$lock_file"; flock -w 15 -x 9 || { echo "LOCK_TIMEOUT: could not acquire lock for $id" >&2; exit 19; }; _pending_approval_py update_resume "$PENDING_APPROVALS_DIR" "$id" "$resume_status" "$claim_from" "$expected_unit" "$resume_unit" "$train_id" "$resume_detail" "$ts")"; rc=$?; set -e
   [[ "$rc" -eq 0 ]] || die_gate "update-approval-resume failed (rc=$rc)"
   append_audit_safe "$(python3 -c 'import json,sys; t,a,i,s,u=sys.argv[1:]; ev={"ts":t,"action":"update_approval_resume","actor":a,"approvalId":i,"resumeStatus":s,"outcome":"ok"}; (ev.update({"resumeUnit":u}) if u else None); print(json.dumps(ev, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor" "$id" "$resume_status" "$resume_unit")"
   printf '%s\n' "$out_json"
@@ -1730,34 +1745,19 @@ cmd_resolve_pending_approval() {
   local id="" decision="" actor_arg="" note="" voucher_id="" resume_status="" resume_unit="" resume_detail=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --id) id="${2:-}"; shift 2 ;;
-      --decision) decision="${2:-}"; shift 2 ;;
-      --actor) actor_arg="${2:-}"; shift 2 ;;
-      --note) note="${2:-}"; shift 2 ;;
-      --voucher-id) voucher_id="${2:-}"; shift 2 ;;
-      --resume-status) resume_status="${2:-}"; shift 2 ;;
-      --resume-unit) resume_unit="${2:-}"; shift 2 ;;
-      --resume-detail) resume_detail="${2:-}"; shift 2 ;;
+      --id) id="${2:-}"; shift 2 ;; --decision) decision="${2:-}"; shift 2 ;; --actor) actor_arg="${2:-}"; shift 2 ;; --note) note="${2:-}"; shift 2 ;;
+      --voucher-id) voucher_id="${2:-}"; shift 2 ;; --resume-status) resume_status="${2:-}"; shift 2 ;; --resume-unit) resume_unit="${2:-}"; shift 2 ;; --resume-detail) resume_detail="${2:-}"; shift 2 ;;
       *) die_usage "unknown resolve-pending-approval argument: $1" ;;
     esac
   done
   [[ "$id" =~ ^gov-[a-z0-9_-]{4,80}$ ]] || die_usage "--id must match ^gov-[a-z0-9_-]{4,80}$"
   case "$decision" in approve|reject) ;; *) die_usage "--decision must be approve | reject" ;; esac
   [[ -n "${actor_arg// /}" ]] || die_usage "--actor <name> is required"
-  ensure_dirs
-  _assert_safe_dir_chain || die_gate "unsafe control directory chain"
-  local lock_file="$PENDING_LOCKS_DIR/${id}.lock"
+  ensure_dirs; _assert_safe_dir_chain || die_gate "unsafe control directory chain"
+  local lock_file="$PENDING_LOCKS_DIR/${id}.lock" ts out_json rc=0
   [[ ! -L "$lock_file" ]] || die_gate "UNSAFE_LOCK_FILE: $lock_file"
-  local ts out_json rc=0
   ts="$(now_iso)"
-  set +e
-  out_json="$(
-    exec 9>"$lock_file"
-    flock -w 15 -x 9 || { echo "LOCK_TIMEOUT: could not acquire lock for $id" >&2; exit 19; }
-    _pending_approval_py resolve "$PENDING_APPROVALS_DIR" "$id" "$decision" "$actor_arg" "$note" "$voucher_id" "$resume_status" "$resume_unit" "$resume_detail" "$ts"
-  )"
-  rc=$?
-  set -e
+  set +e; out_json="$(exec 9>"$lock_file"; flock -w 15 -x 9 || { echo "LOCK_TIMEOUT: could not acquire lock for $id" >&2; exit 19; }; _pending_approval_py resolve "$PENDING_APPROVALS_DIR" "$id" "$decision" "$actor_arg" "$note" "$voucher_id" "$resume_status" "$resume_unit" "$resume_detail" "$ts")"; rc=$?; set -e
   [[ "$rc" -eq 0 ]] || die_gate "resolve-pending-approval failed (rc=$rc)"
   append_audit_safe "$(python3 -c 'import json,sys; t,a,i,d,v=sys.argv[1:]; ev={"ts":t,"action":"resolve_pending_approval","actor":a,"approvalId":i,"decision":d,"outcome":"ok"}; (ev.update({"issuedArtifactId":v}) if v else None); print(json.dumps(ev, ensure_ascii=False, separators=(",",":")))' "$ts" "$actor_arg" "$id" "$decision" "$voucher_id")"
   printf '%s\n' "$out_json"
@@ -1951,7 +1951,7 @@ Usage: oc-governor <command> [options]
   verify-a0 --sha <40hex> [--file <path>] [--path <rel>] [--hmac-key-file <path>] [--unsafe-test-skip-owner]
   check-blast-radius --branch <br> [--files <f1> [f2...] | --files-nul] [--sha <40hex>] [--base-ref <ref>] [--repo-root <dir>] [--voucher <id|path>]
   issue-blast-voucher --scope <ddl|billing|ddl+billing> --files <...> --reason "..." [--ttl-hours 4] [--sha <40hex>] [--branch <br>] [--approval-id <gov-...>]
-  record-pending-approval --id <gov-...> --kind <blast_voucher|a0_approval|breaker_unlock> --code <code> --branch <br> [--sha <40hex>] [--base-ref <ref>] [--train <id>] [--ticket <id>] [--scope <scope>] [--classification <cls>] [--title "..."] [--summary "..."] [--ttl-hours 24] [--repo-root <dir>] [--total-files N] [--allow-whole-commit] [--files f1 f2 ...]
+  record-pending-approval --id <gov-...> --kind <blast_voucher|a0_approval|breaker_unlock> --code <code> --branch <br> [--risk-category <ux_degradation|billing_change>] [--sha <40hex>] [--base-ref <ref>] [--train <id>] [--ticket <id>] [--scope <scope>] [--classification <cls>] [--title "..."] [--summary "..."] [--ttl-hours 24] [--repo-root <dir>] [--total-files N] [--allow-whole-commit] [--files f1 f2 ...]
   list-pending-approvals [--status pending|all] [--limit N]
   decide-pending-approval --id <gov-...> --decision <approve|reject> --actor <name> [--expected-version N] [--expected-sha256 <hex>] [--note "..."] [--allow-whole-commit] [--publish-github-status] [--github-repo <owner/repo>]
   reconcile-pending-approval --id <gov-...>

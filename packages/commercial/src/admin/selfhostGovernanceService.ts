@@ -503,16 +503,16 @@ async function spawnAndRecordBlastResume(
     });
     if (!spawned.started) {
       return await recordFencedResumeResult(rt, approval.id, "failed", unitName, {
-        unit: spawned.unitName, detail: spawned.detail ?? "自动续跑发版启动失败",
+        unit: spawned.unitName, detail: spawned.detail ?? "自动发版启动失败，请稍后点击重试",
       });
     }
     return await recordFencedResumeResult(rt, approval.id, "started", unitName, {
-      unit: spawned.unitName, train: approval.trainId, detail: spawned.detail ?? `已拉起发版单元 (${spawned.unitName})`,
+      unit: spawned.unitName, train: approval.trainId, detail: spawned.detail ?? "已启动后台自动发版任务",
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return await recordFencedResumeResult(rt, approval.id, "failed", unitName, {
-      unit: unitName, detail: `凭证已签发但自动续跑失败：${msg.slice(0, 180)}`,
+      unit: unitName, detail: `审批已生效，但自动发版启动失败（${msg.slice(0, 100)}），请点击重试`,
     }).catch((recErr) => { void recErr; return loadApprovalByIdRaw(rt, approval.id); });
   }
 }
@@ -529,31 +529,31 @@ async function runSafeBlastResume(rt: GovernanceRuntime, approval: PendingGovern
   await claimResumeSlot(rt, approval.id, unitName);
   try {
     if (!rt.deployScriptPath) {
-      return await recordFencedResumeResult(rt, approval.id, "not_applicable", unitName, { detail: "未配置自动发版脚本路径" });
+      return await recordFencedResumeResult(rt, approval.id, "not_applicable", unitName, { detail: "未配置自动发版任务，请手动执行发版" });
     }
     if (!approval.sha || !SHA40_RE.test(approval.sha) || !rt.repoRoot) {
-      return await recordFencedResumeResult(rt, approval.id, "failed", unitName, { detail: "审批单缺少有效 40 位提交 SHA 或仓库路径，保守拒绝自动发版" });
+      return await recordFencedResumeResult(rt, approval.id, "failed", unitName, { detail: "审批单缺少有效的版本信息，暂未自动发版" });
     }
     const headSha = await rt.readRepoHeadSha(rt.repoRoot);
     if (!headSha) {
-      return await recordFencedResumeResult(rt, approval.id, "failed", unitName, { detail: "无法读取仓库当前 HEAD 提交，保守拒绝自动发版" });
+      return await recordFencedResumeResult(rt, approval.id, "failed", unitName, { detail: "未能读取当前代码版本，暂未自动发版，请稍后重试" });
     }
     if (headSha !== approval.sha) {
       return await recordFencedResumeResult(rt, approval.id, "head_moved", unitName, {
-        detail: `主分支已前进至 ${headSha.slice(0, 12)}（审批绑定 ${approval.sha.slice(0, 12)}），未自动发版`,
+        detail: `代码分支已有更新提交（当前 ${headSha.slice(0, 8)}，审批时为 ${approval.sha.slice(0, 8)}），为安全起见未自动发版`,
       });
     }
     const busyCheck = await rt.checkDeployBusy(rt.deployLockPath);
     if (busyCheck.busy) {
       return await recordFencedResumeResult(rt, approval.id, "not_started_busy", unitName, {
-        detail: busyCheck.detail ?? "发版锁正忙，凭证已签发但未自动发车；请稍后点击安全重试",
+        detail: busyCheck.detail ?? "当前已有其他发版正在进行，审批已生效，请稍后点击重试",
       });
     }
     return await spawnAndRecordBlastResume(rt, approval, voucherId, approval.sha, rt.deployScriptPath, unitName);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return await recordFencedResumeResult(rt, approval.id, "failed", unitName, {
-      unit: unitName, detail: `自动续跑前检查异常：${msg.slice(0, 180)}`,
+      unit: unitName, detail: `自动发版前检查失败（${msg.slice(0, 100)}），请稍后点击重试`,
     }).catch((recErr) => { void recErr; return loadApprovalByIdRaw(rt, approval.id); });
   }
 }
