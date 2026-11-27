@@ -197,7 +197,7 @@ describe("GovernancePage", () => {
     ).toBeInTheDocument();
   });
 
-  test("renders unknown gray lights, honest audit heading, steward endorsement, and expandable scope details", async () => {
+  test("renders unknown gray lights, honest audit heading, recommendation summary, and expandable technical details", async () => {
     getGovernanceOverview.mockResolvedValueOnce(makeOverview());
 
     renderPage();
@@ -206,14 +206,21 @@ describe("GovernancePage", () => {
     expect(screen.getByText("放行计费辅助适配层改动")).toBeInTheDocument();
     expect(screen.getByText("宿主记录的近期治理操作流水")).toBeInTheDocument();
     expect(screen.queryByText(/不可篡改/)).not.toBeInTheDocument();
-    // Both safety light and cockpit gauge with level="unknown" render neutral "未采集 / 待核验".
-    expect(screen.getAllByText("未采集 / 待核验").length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText(/OpenAI GPT（gpt-5\.4） 独立审计通过 · 签章有效/)).toBeInTheDocument();
+    // Policy copy communicates the minimal human-approval boundary clearly
+    expect(
+      screen.getAllByText(/仅在可能影响用户体验或改变计费方式时拦下待你拍板/).length,
+    ).toBeGreaterThanOrEqual(2);
+    // Card safety light uses compact "待核验", cockpit gauge uses "未采集 / 待核验"
+    expect(screen.getByText("待核验")).toBeInTheDocument();
+    expect(screen.getAllByText("未采集 / 待核验").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("建议批准")).toBeInTheDocument();
+    expect(screen.getByText("跨家族审计确认未改动任何计费公式或 SQL 写路径。")).toBeInTheDocument();
 
-    // Technical scope files are collapsed by default.
+    // Technical details (files & steward model metadata) are collapsed by default.
     expect(screen.queryByText("packages/commercial/src/billing/proxyBilling.ts")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /查看涉及范围/ }));
+    fireEvent.click(screen.getByRole("button", { name: /查看技术详情/ }));
     expect(screen.getByText("packages/commercial/src/billing/proxyBilling.ts")).toBeInTheDocument();
+    expect(screen.getByText(/OpenAI GPT（gpt-5\.4） · 复核通过 · 签章有效/)).toBeInTheDocument();
   });
 
   test("shows red alert and clears active autonomous highlight when mode config is corrupt/unknown", async () => {
@@ -355,7 +362,7 @@ describe("GovernancePage", () => {
     await screen.findByText("放行计费辅助适配层改动");
 
     fireEvent.change(screen.getByLabelText("审批备注"), { target: { value: "核对无误，放行" } });
-    fireEvent.click(screen.getByRole("button", { name: "批准并自动继续发版" }));
+    fireEvent.click(screen.getByRole("button", { name: "批准并自动继续" }));
 
     await waitFor(() => {
       expect(decideGovernanceApproval).toHaveBeenCalledWith(expect.anything(), "gov-blast-001", {
@@ -372,13 +379,13 @@ describe("GovernancePage", () => {
     ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /近期已裁决记录/ }));
-    expect(screen.getByText(/发版锁正忙，凭证已签发但未自动发车/)).toBeInTheDocument();
+    expect(screen.getByText(/当前有其他更新进行中，稍后可重试自动发版/)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /仅重触发版（复用已签凭证）/ }));
+    fireEvent.click(screen.getByRole("button", { name: "重试自动发版" }));
     await waitFor(() => {
       expect(resumeGovernanceApproval).toHaveBeenCalledWith(expect.anything(), "gov-blast-001");
     });
-    expect(await screen.findByText(/已自动拉起发版列车/)).toBeInTheDocument();
+    expect(await screen.findByText("已由你批准生效，正在自动续跑发版")).toBeInTheDocument();
   });
 
   test("renders head_moved and reconcile_required statuses truthfully without resume button", async () => {
@@ -418,9 +425,9 @@ describe("GovernancePage", () => {
     await screen.findByText("当前没有需要你拍板的拦截项，代码自治流水线正常运转中");
     fireEvent.click(screen.getByRole("button", { name: /近期已裁决记录/ }));
 
-    expect(screen.getByText(/主分支已前进到新提交，未自动发版/)).toBeInTheDocument();
-    expect(screen.getByText("需核对状态，请勿重复签发")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /仅重触发版/ })).not.toBeInTheDocument();
+    expect(screen.getByText(/代码已有更新，本次未自动发版/)).toBeInTheDocument();
+    expect(screen.getByText("需核对状态，请勿重复提交")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /重试自动发版/ })).not.toBeInTheDocument();
   });
 
   test("aborts in-flight overview fetch on unmount", () => {
@@ -526,14 +533,21 @@ describe("GovernancePage", () => {
     await screen.findByText("当前没有需要你拍板的拦截项，代码自治流水线正常运转中");
     fireEvent.click(screen.getByRole("button", { name: /近期已裁决记录/ }));
 
-    expect(screen.getByText(/发版列车正在执行中…/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /仅重触发版（发版执行中）/ })).toBeDisabled();
-    expect(screen.getByText("失败原因：systemd unit exited with status 1")).toBeInTheDocument();
+    expect(screen.getByText("已由你批准生效，正在自动续跑发版")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /正在自动发版/ })).toBeDisabled();
     expect(
-      screen.getByText("该审批单已过期，下次发车拦截时将自动生成新一轮待拍板审批单"),
+      screen.getByText("审批已生效，但自动发版未能完成，请点击下方按钮重试；排查详情见「查看技术详情」。"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/systemd unit exited with status 1/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("该审批单已过期，下次需要确认时将自动生成新的审批卡。"),
     ).toBeInTheDocument();
 
-    const retryBtn = screen.getByRole("button", { name: /仅重触发版（复用已签凭证）/ });
+    const detailButtons = screen.getAllByRole("button", { name: /查看技术详情/ });
+    fireEvent.click(detailButtons[1]!);
+    expect(screen.getByText(/systemd unit exited with status 1/)).toBeInTheDocument();
+
+    const retryBtn = screen.getByRole("button", { name: "重试自动发版" });
     expect(retryBtn).not.toBeDisabled();
     fireEvent.click(retryBtn);
     await waitFor(() => {

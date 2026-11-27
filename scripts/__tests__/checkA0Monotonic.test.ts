@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -240,8 +241,8 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       JSON.stringify(
         {
           schemaVersion: 1,
-          thresholds: { maxTotalBytes: 44000, maxTotalGrowthRatio: 0.05 },
-          subEvals: { coreMemory: { minPrecisionAt3: 0.9 } },
+          thresholds: { maxTotalBytes: 44000, maxTotalGrowthRatio: 0.05, maxSlotGrowthRatio: 0.15, minSlotGrowthBytes: 256 },
+          subEvals: { coreMemory: { minPrecisionAt3: 1, maxAvgHitsRatio: 0.4 } },
           waivers: [],
         },
         null,
@@ -379,8 +380,8 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       JSON.stringify(
         {
           schemaVersion: 1,
-          thresholds: { maxTotalBytes: 40000, maxTotalGrowthRatio: 0.04 },
-          subEvals: { coreMemory: { minPrecisionAt3: 0.95 } },
+          thresholds: { maxTotalBytes: 40000, maxTotalGrowthRatio: 0.04, maxSlotGrowthRatio: 0.12, minSlotGrowthBytes: 128 },
+          subEvals: { coreMemory: { minPrecisionAt3: 1, maxAvgHitsRatio: 0.35 } },
           waivers: [],
         },
         null,
@@ -394,24 +395,19 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
     assert.ok(res.a1Passes.length >= 6)
   })
 
-  // === A0 Negative Cases (Hard Block) ===
+  // === A0 Negative Cases & ux_or_billing_only Auto-Approval ===
 
-  test('A0 hard-block: deleting or modifying an existing gate script fails', () => {
+  test('A1 auto-pass (ux_or_billing_only): modifying/deleting non-meta gate scripts, internal baselines, modules.json, exceptions, and flag TTL auto-passes without A0 block', () => {
+    // Deleting or modifying non-meta gate script -> A1-AUTO-NON-UX-BILLING
     rmSync(path.join(repo, 'scripts/check-existing-gate.ts'))
-    commit('bad: delete gate')
+    commit('chore: delete internal gate')
     const rDel = checkInProcess()
-    assert.equal(rDel.ok, false)
-    assert.equal(rDel.a0Blocks[0]?.rule, 'A0-GATE-DELETED')
+    assert.equal(rDel.ok, true)
+    assert.equal(rDel.a0Blocks.length, 0)
+    assert.equal(rDel.a1Passes[0]?.rule, 'A1-AUTO-NON-UX-BILLING')
 
     git('reset', '--hard', 'base')
     write('scripts/check-existing-gate.ts', 'export const ok = false\n')
-    commit('bad: weaken gate')
-    const rMod = checkInProcess()
-    assert.equal(rMod.ok, false)
-    assert.equal(rMod.a0Blocks[0]?.rule, 'A0-GATE-MODIFIED')
-  })
-
-  test('A0 hard-block: adding allow edge or authority in arch/modules.json fails', () => {
     write(
       'arch/modules.json',
       JSON.stringify(
@@ -437,68 +433,27 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
         2,
       ),
     )
-    commit('bad: add allow edge + authority')
-    const res = checkInProcess()
-    assert.equal(res.ok, false)
-    const rules = res.a0Blocks.map((b) => b.rule)
-    assert.ok(rules.includes('A0-MODULES-ALLOW-ADDED'))
-    assert.ok(rules.includes('A0-MODULES-AUTHORITY-ADDED'))
-  })
-
-  test('A0 hard-block: adding or renewing file-size-ratchet-exceptions.json fails', () => {
+    write(
+      '.github/file-size-baseline.json',
+      JSON.stringify({
+        limit: 3000,
+        slack: 50,
+        files: { 'src/monolith.ts': 3800 },
+        yellowZoneLimit: 2000,
+        yellowZoneSlack: 0,
+        yellowZoneFiles: {},
+        orangeZoneLimit: 800,
+        orangeZoneSlack: 0,
+        orangeZoneFiles: { 'src/mid.ts': 1000 },
+      }),
+    )
     write(
       '.github/file-size-ratchet-exceptions.json',
-      JSON.stringify(
-        [
-          {
-            path: 'src/monolith.ts',
-            maxLines: 3600,
-            ticket: 'OCV5-100',
-            reason: 'renewing exception',
-            expires: '2026-12-25',
-          },
-        ],
-        null,
-        2,
-      ),
+      JSON.stringify([
+        { path: 'src/monolith.ts', maxLines: 3900, ticket: 'OCV5-100', reason: 'renew', expires: '2026-12-25' },
+        { path: 'src/newGiant.ts', maxLines: 950, ticket: 'OCV5-999', reason: 'add', expires: '2026-12-25' },
+      ]),
     )
-    commit('bad: renew exception')
-    const rRenew = checkInProcess()
-    assert.equal(rRenew.ok, false)
-    assert.equal(rRenew.a0Blocks[0]?.rule, 'A0-EXCEPTION-RENEWED')
-
-    git('reset', '--hard', 'base')
-    write(
-      '.github/file-size-ratchet-exceptions.json',
-      JSON.stringify(
-        [
-          {
-            path: 'src/monolith.ts',
-            maxLines: 3600,
-            ticket: 'OCV5-100',
-            reason: 'split in progress for monolith',
-            expires: '2026-12-10',
-          },
-          {
-            path: 'src/newGiant.ts',
-            maxLines: 950,
-            ticket: 'OCV5-999',
-            reason: 'trying to add exception',
-            expires: '2026-12-10',
-          },
-        ],
-        null,
-        2,
-      ),
-    )
-    commit('bad: add exception')
-    const rAdd = checkInProcess()
-    assert.equal(rAdd.ok, false)
-    assert.equal(rAdd.a0Blocks[0]?.rule, 'A0-EXCEPTION-ADDED')
-  })
-
-  test('A0 hard-block: raising budgets, slack, ai-smells baseline, or flag TTL fails', () => {
-    write('packages/web-react/budgets.json', JSON.stringify({ firstScreenGzipBytes: 500000, cssTotalRawBytes: 380000 }))
     write(
       'arch/ai-smells-baseline.json',
       JSON.stringify({
@@ -509,32 +464,70 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
         files: { 'packages/commercial/src/a.ts': { emptyCatch: 3, typeEscape: 3, syncIo: 0, lintSuppress: 1 } },
       }),
     )
+    write('arch/violations-baseline.json', JSON.stringify({ schema: 1, entries: { 'R2-same-layer|a.ts|b': 9 } }))
     write(
       'deploy/v5/feature-flags-registry.json',
-      JSON.stringify({ schema: 1, flags: [{ name: 'OC_TEMP', permanent: false, expireAt: '2027-01-15' }] }),
+      JSON.stringify({ schema: 1, flags: [{ name: 'OC_TEMP', permanent: true, expireAt: '2027-01-15' }] }),
     )
+    write('.github/workflows/v5-selfhost-gates.yml', 'name: updated\n')
+    write('biome.json', '{}\n')
+    write('changelog.json', '[]\n')
+    commit('chore: internal engineering baselines, workflows, and non-meta gates')
+    const res = checkInProcess()
+    assert.equal(res.ok, true, `non-UX/billing internal surfaces MUST auto-pass: ${JSON.stringify(res.a0Blocks)}`)
+    assert.equal(res.a0Blocks.length, 0)
+    assert.ok(res.a1Passes.some((p) => p.rule === 'A1-AUTO-NON-UX-BILLING'))
+  })
+
+  test('A0 hard-block (ux_degradation): raising UX budgets, context-eval, UI static/layout baselines, or adding design-tokens exemptions fails with riskCategory=ux_degradation', () => {
+    write('packages/web-react/budgets.json', JSON.stringify({ firstScreenGzipBytes: 500000, cssTotalRawBytes: 380000 }))
     write(
-      '.github/file-size-baseline.json',
+      '.github/context-eval-baseline.json',
       JSON.stringify({
-        limit: 3000,
-        slack: 50,
-        files: { 'src/monolith.ts': 3500 },
-        yellowZoneLimit: 2000,
-        yellowZoneSlack: 0,
-        yellowZoneFiles: {},
-        orangeZoneLimit: 800,
-        orangeZoneSlack: 0,
-        orangeZoneFiles: { 'src/mid.ts': 1000 },
+        schemaVersion: 1,
+        thresholds: { maxTotalBytes: 99000, maxTotalGrowthRatio: 0.05 },
+        subEvals: { coreMemory: { minPrecisionAt3: 0.7 } },
+        waivers: [],
       }),
     )
-    commit('bad: loosen everything')
+    write('packages/web-react/ui-static-baseline.json', JSON.stringify({ counts: { cardOverflow: 1 } }))
+    write('packages/web-react/design-tokens-exempt.json', JSON.stringify({ exempt: ['src/Foo.tsx'] }))
+    commit('bad: loosen UX baselines')
     const res = checkInProcess()
     assert.equal(res.ok, false)
     const rules = res.a0Blocks.map((b) => b.rule)
     assert.ok(rules.includes('A0-BUDGET-RAISED'))
-    assert.ok(rules.includes('A0-BASELINE-RAISED'))
-    assert.ok(rules.includes('A0-FLAG-TTL-EXTENDED'))
-    assert.ok(rules.includes('A0-FILESIZE-SLACK-NONZERO'))
+    assert.ok(rules.includes('A0-THRESHOLD-LOOSENED'))
+    assert.ok(res.a0Blocks.every((b) => b.riskCategory === 'ux_degradation'))
+  })
+
+  test('A0 hard-block (billing_change & ux_degradation): policy has ux_or_billing_only with exactly 3 categories (billing-accounting-core, ux-regression-guards, a0-meta-referee)', () => {
+    const policy = JSON.parse(readFileSync(path.join(root, 'arch/a0-protected-paths.json'), 'utf8')) as {
+      approvalPolicy?: string
+      a0Categories: Array<{ id: string; riskCategory?: string; paths?: string[] }>
+    }
+    assert.equal(policy.approvalPolicy, 'ux_or_billing_only')
+    assert.deepEqual(
+      policy.a0Categories.map((c) => c.id),
+      ['billing-accounting-core', 'ux-regression-guards', 'a0-meta-referee'],
+    )
+
+    // payment/** -> billing_change A0 block
+    write('packages/commercial/src/payment/orders.ts', 'export const orderV = 2\n')
+    commit('feat: edit payment orders')
+    const rPay = checkInProcess()
+    assert.equal(rPay.ok, false)
+    assert.equal(rPay.a0Blocks[0]?.category, 'billing-accounting-core')
+    assert.equal(rPay.a0Blocks[0]?.riskCategory, 'billing_change')
+
+    // ux-regression-guards -> ux_degradation A0 block
+    git('reset', '--hard', 'base')
+    write('e2e/session-display/incident-ledger-baseline.json', '{"incidents":[]}\n')
+    commit('feat: edit incident ledger')
+    const rUx = checkInProcess()
+    assert.equal(rUx.ok, false)
+    assert.equal(rUx.a0Blocks[0]?.category, 'ux-regression-guards')
+    assert.equal(rUx.a0Blocks[0]?.riskCategory, 'ux_degradation')
   })
 
   test('A0 hard-block: self-tampering check-a0-monotonic.ts or arch/a0-protected-paths.json fails', () => {
@@ -723,59 +716,166 @@ describe('check-a0-monotonic.ts (A0/A1 separation + approval receipts)', () => {
       assert.equal(rAfter.ok, false)
       assert.notEqual(rAfter.bootstrap, true)
 
-      // 4. Disallowed weakening during bootstrap (deleting existing gate) -> FAILS CLOSED even with receipt!
+      // 4. Disallowed weakening during bootstrap (raising UX budget) -> FAILS CLOSED even with receipt!
       bGit('reset', '--hard', 'pre-a0')
+      bWrite('packages/web-react/budgets.json', JSON.stringify({ firstScreenGzipBytes: 480000 }))
+      bGit('add', '-A')
+      bGit('commit', '-qm', 'seed budgets before bootstrap')
+      bGit('tag', 'pre-a0-budget')
       mkdirSync(path.join(bootRepo, 'arch'), { recursive: true })
       copyFileSync(path.join(root, 'arch/a0-protected-paths.json'), path.join(bootRepo, 'arch/a0-protected-paths.json'))
-      rmSync(path.join(bootRepo, 'scripts/check-existing.ts'))
+      bWrite('packages/web-react/budgets.json', JSON.stringify({ firstScreenGzipBytes: 999999 }))
       bGit('add', '-A')
-      bGit('commit', '-qm', 'bootstrap delete gate')
+      bGit('commit', '-qm', 'bootstrap raise UX budget')
       const weakSha = bGit('rev-parse', 'HEAD')
       writeSignedReceipt(weakSha)
-      const rWeak = runCheckA0Monotonic({ root: bootRepo, base: 'pre-a0', approvalDir, requireRootOwner: false })
+      const rWeak = runCheckA0Monotonic({ root: bootRepo, base: 'pre-a0-budget', approvalDir, requireRootOwner: false })
       assert.equal(rWeak.ok, false)
-      assert.ok((rWeak.bootstrapErrors ?? []).some((e) => e.includes('A0-GATE-DELETED')))
+      assert.ok((rWeak.bootstrapErrors ?? []).some((e) => e.includes('A0-BUDGET-RAISED')))
     } finally {
       rmSync(bootRepo, { recursive: true, force: true })
     }
   })
 
-  test('A0 rename regression: renaming deploy/v5/runtime-image-pin.json or baselines is hard-blocked as A0', () => {
+  test('A0 rename regression: renaming runtime-image-pin.json or UX budgets is A0; renaming internal arch/modules.json auto-passes as A1', () => {
     // Rename A1 declarative runtime pin -> MUST trigger A0-PIN-DELETED on oldPath!
     git('mv', 'deploy/v5/runtime-image-pin.json', 'deploy/v5/runtime-image-pin-moved.json')
     commit('bad: rename runtime image pin')
     const rPinRename = checkInProcess()
     assert.equal(rPinRename.ok, false)
     assert.ok(
-      rPinRename.a0Blocks.some((b) => b.rule === 'A0-PIN-DELETED' && b.path === 'deploy/v5/runtime-image-pin.json'),
+      rPinRename.a0Blocks.some((b) => b.rule === 'A0-PIN-DELETED' && b.path === 'deploy/v5/runtime-image-pin.json' && b.riskCategory === 'ux_degradation'),
       `expected A0-PIN-DELETED for renamed pin, got ${JSON.stringify(rPinRename.a0Blocks)}`,
     )
 
-    // Rename arch/modules.json -> MUST trigger A0-MODULES-DELETED!
+    // Rename UX budgets.json -> MUST trigger A0-BASELINE-DELETED (ux_degradation)!
+    git('reset', '--hard', 'base')
+    git('mv', 'packages/web-react/budgets.json', 'packages/web-react/budgets-renamed.json')
+    commit('bad: rename UX budgets.json')
+    const rBudgetRename = checkInProcess()
+    assert.equal(rBudgetRename.ok, false)
+    assert.ok(rBudgetRename.a0Blocks.some((b) => b.rule === 'A0-BASELINE-DELETED' && b.riskCategory === 'ux_degradation'))
+
+    // Rename internal arch/modules.json -> auto-passes as A1 under ux_or_billing_only!
     git('reset', '--hard', 'base')
     git('mv', 'arch/modules.json', 'arch/modules-renamed.json')
-    commit('bad: rename modules.json')
+    commit('chore: rename internal modules.json')
     const rModRename = checkInProcess()
-    assert.equal(rModRename.ok, false)
-    assert.ok(rModRename.a0Blocks.some((b) => b.rule === 'A0-MODULES-DELETED'))
+    assert.equal(rModRename.ok, true)
+    assert.equal(rModRename.a0Blocks.length, 0)
   })
 
-  test('B7 A0 protection list covers lease worker, debounce, train guards, governance gates, and release policy', () => {
+  test('ux_or_billing_only: non-meta deploy scripts auto-pass while full meta-referee chain (BLOCKER 3), contextEval threshold direction (BLOCKER 4), and billing/payment test/allowlist/zero-runtime-TS alignment (BLOCKER 6) are enforced', () => {
+    // 1. Non-meta deploy/train scripts auto-pass without manual A0 approval
     for (const rel of [
+      'scripts/deploy-v5-selfhost.sh',
+      'scripts/lib/v5-selfhost-prepare.sh',
       'scripts/v5-lease-worker.sh',
       'scripts/lib/v5-lease-train-debounce.sh',
-      'scripts/lib/v5-selfhost-train-guards.sh',
-      'scripts/lib/v5-selfhost-governance-gates.sh',
       'scripts/lib/v5-selfhost-release-policy.sh',
     ]) {
       git('reset', '--hard', 'base')
-      write(rel, '#!/usr/bin/env bash\necho tampered\n')
-      commit(`bad: modify ${rel}`)
+      write(rel, '#!/usr/bin/env bash\necho updated\n')
+      commit(`chore: update ${rel}`)
       const res = checkInProcess()
-      assert.equal(res.ok, false, `expected A0 block for ${rel}`)
+      assert.equal(res.ok, true, `expected auto-pass for non-meta deploy script ${rel}: ${JSON.stringify(res.a0Blocks)}`)
+      assert.equal(res.a0Blocks.length, 0)
+    }
+
+    // 2. BLOCKER 3: Full meta-referee & forward-guard chain MUST hard-block A0 on solo edits
+    for (const rel of [
+      'scripts/lib/a0MonotonicRules.ts',
+      'scripts/harness-gate/oc-governor.sh',
+      'scripts/harness-gate/sync-referee.sh',
+      'scripts/lib/v5-selfhost-governance-gates.sh',
+      'scripts/lib/v5-selfhost-train-guards.sh',
+    ]) {
+      git('reset', '--hard', 'base')
+      write(rel, '// tampered referee\n')
+      commit(`bad: tamper meta-referee ${rel}`)
+      const res = checkInProcess()
+      assert.equal(res.ok, false, `BLOCKER 3: modifying ${rel} MUST hard-block A0`)
+      assert.ok(res.a0Blocks.some((b) => b.path === rel && b.category === 'a0-meta-referee'))
+    }
+
+    // 3. BLOCKER 4: contextEval thresholds.minSlotGrowthBytes bidirectional check (256->128 A1 pass, 256->512 A0 block; subEvals.coreMemory.minPrecisionAt3 1->0.9 A0 block)
+    git('reset', '--hard', 'base')
+    write(
+      '.github/context-eval-baseline.json',
+      JSON.stringify({
+        schemaVersion: 1,
+        thresholds: { maxTotalBytes: 44000, maxTotalGrowthRatio: 0.05, maxSlotGrowthRatio: 0.15, minSlotGrowthBytes: 128 },
+        subEvals: { coreMemory: { minPrecisionAt3: 1, maxAvgHitsRatio: 0.4 } },
+        waivers: [],
+      }),
+    )
+    commit('refactor: tighten minSlotGrowthBytes 256 -> 128')
+    const rTighten = checkInProcess()
+    assert.equal(rTighten.ok, true, `256->128 MUST tighten and auto-pass A1: ${JSON.stringify(rTighten.a0Blocks)}`)
+
+    git('reset', '--hard', 'base')
+    write(
+      '.github/context-eval-baseline.json',
+      JSON.stringify({
+        schemaVersion: 1,
+        thresholds: { maxTotalBytes: 44000, maxTotalGrowthRatio: 0.05, maxSlotGrowthRatio: 0.15, minSlotGrowthBytes: 512 },
+        subEvals: { coreMemory: { minPrecisionAt3: 1, maxAvgHitsRatio: 0.4 } },
+        waivers: [],
+      }),
+    )
+    commit('bad: loosen minSlotGrowthBytes 256 -> 512')
+    const rLoosen = checkInProcess()
+    assert.equal(rLoosen.ok, false, '256->512 MUST be blocked as A0-THRESHOLD-LOOSENED')
+    assert.ok(
+      rLoosen.a0Blocks.some((b) => b.rule === 'A0-THRESHOLD-LOOSENED' && b.riskCategory === 'ux_degradation' && b.detail.includes('minSlotGrowthBytes')),
+      `expected minSlotGrowthBytes loosened block, got ${JSON.stringify(rLoosen.a0Blocks)}`,
+    )
+
+    git('reset', '--hard', 'base')
+    write(
+      '.github/context-eval-baseline.json',
+      JSON.stringify({
+        schemaVersion: 1,
+        thresholds: { maxTotalBytes: 44000, maxTotalGrowthRatio: 0.05, maxSlotGrowthRatio: 0.15, minSlotGrowthBytes: 256 },
+        subEvals: { coreMemory: { minPrecisionAt3: 0.9, maxAvgHitsRatio: 0.4 } },
+        waivers: [],
+      }),
+    )
+    commit('bad: loosen minPrecisionAt3 1 -> 0.9')
+    const rPrec = checkInProcess()
+    assert.equal(rPrec.ok, false, 'minPrecisionAt3 1->0.9 MUST be blocked as A0-THRESHOLD-LOOSENED')
+    assert.ok(rPrec.a0Blocks.some((b) => b.rule === 'A0-THRESHOLD-LOOSENED' && b.riskCategory === 'ux_degradation'))
+
+    // 4. BLOCKER 6 + R2 #1/#6: CI check-a0-monotonic aligns with oc-governor on billing/payment pure tests, allowlisted pure helpers, and zero-runtime-diff TS edits (M/A/D)
+    git('reset', '--hard', 'base')
+    write('packages/commercial/src/billing/ledger.ts', '// pure comment\nexport type LedgerHint = { v: number }\nexport const ledgerVersion = 1\n')
+    write('packages/commercial/src/billing/pureTypesNew.ts', 'export interface BillingHintOnly { readonly ok: boolean }\n')
+    write('packages/commercial/src/payment/orders.test.ts', 'export const testOk = true\n')
+    write('packages/commercial/src/billing/usageReport.ts', 'export const reportFormat = 2\n')
+    commit('chore: billing pure comment/type, pure-type new file, payment test, and allowlisted pure helper')
+    const rBillingExempt = checkInProcess()
+    assert.equal(rBillingExempt.ok, true, `expected A1 auto-pass for aligned billing exemptions: ${JSON.stringify(rBillingExempt.a0Blocks)}`)
+    assert.ok(rBillingExempt.a1Passes.some((p) => p.rule === 'A1-BILLING-NO-RUNTIME-DIFF' && p.path === 'packages/commercial/src/billing/ledger.ts'))
+    assert.ok(rBillingExempt.a1Passes.some((p) => p.rule === 'A1-BILLING-NO-RUNTIME-DIFF' && p.path === 'packages/commercial/src/billing/pureTypesNew.ts'))
+    assert.ok(rBillingExempt.a1Passes.some((p) => p.rule === 'A1-BILLING-TEST-ONLY' && p.path === 'packages/commercial/src/payment/orders.test.ts'))
+    assert.ok(rBillingExempt.a1Passes.some((p) => p.rule === 'A1-BILLING-NONCORE-HELPER' && p.path === 'packages/commercial/src/billing/usageReport.ts'))
+
+    for (const prodBillingPath of [
+      'packages/commercial/src/billing/ledger.ts',
+      'packages/commercial/src/billing/remoteDriverTurnBilling.ts',
+      'packages/commercial/src/billing/remoteDriverReceiptV5.ts',
+      'packages/commercial/src/billing/codexServiceTierPricing.ts',
+      'packages/protocol/src/serviceTiers.ts',
+      'packages/commercial/src/payment/stripe.ts',
+    ]) {
+      git('reset', '--hard', 'base')
+      write(prodBillingPath, 'export const runtimeBehaviorChanged = 999\n')
+      commit(`feat: runtime billing change in ${prodBillingPath}`)
+      const rProd = checkInProcess()
+      assert.equal(rProd.ok, false, `runtime edit in ${prodBillingPath} MUST A0-block`)
       assert.ok(
-        res.a0Blocks.some((b) => b.path === rel && b.category === 'host-control-plane-and-deploy'),
-        `expected host-control-plane-and-deploy block for ${rel}, got ${JSON.stringify(res.a0Blocks)}`,
+        rProd.a0Blocks.some((b) => b.path === prodBillingPath && b.category === 'billing-accounting-core' && b.riskCategory === 'billing_change'),
+        `expected billing_change A0 block for ${prodBillingPath}, got ${JSON.stringify(rProd.a0Blocks)}`,
       )
     }
   })

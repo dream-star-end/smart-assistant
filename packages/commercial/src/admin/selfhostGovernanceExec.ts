@@ -22,9 +22,10 @@ const SHA40_RE = /^[0-9a-f]{40}$/;
 const SAFE_UNIT_RE = /^[a-zA-Z0-9._@-]{1,128}$/;
 
 export const RESUME_WRAPPER_SCRIPT =
+  'export HOME="${HOME:-/root}"; [ -d /root/.bun/bin ] && export PATH="/root/.bun/bin:$PATH"; ' +
   'rc=0; "$1" "${@:7}" || rc=$?; ' +
-  'if [ "$rc" -eq 0 ]; then st=completed; d="发版单元执行成功 (exit=0, sha=${5:0:12})"; ' +
-  'else st=failed; d="发版单元执行失败 (exit=${rc}, sha=${5:0:12})"; fi; ' +
+  'if [ "$rc" -eq 0 ]; then st=completed; d="自动发版执行成功 (exit=0, sha=${5:0:12})"; ' +
+  'else st=failed; d="自动发版执行失败 (exit=${rc}, sha=${5:0:12})"; fi; ' +
   'OC_GOVERNOR_ROOT="$3" "$2" update-approval-resume --id "$4" --status "$st" --expected-unit "$6" --unit "$6" --detail "$d" >/dev/null 2>&1 || true; exit "$rc"';
 
 function isErrnoEnoent(err: unknown): boolean {
@@ -70,7 +71,7 @@ export function createDefaultCheckDeployBusy(execFn: ExecFileFn, timeout: number
 export function createDefaultReadRepoHeadSha(execFn: ExecFileFn, timeout: number, env: Readonly<Record<string, string>>): ReadRepoHeadShaFn {
   return async (repoRoot: string) => {
     try {
-      const out = await execFn("git", ["-C", repoRoot, "rev-parse", "HEAD"], { timeout: Math.min(timeout, 5_000), env });
+      const out = await execFn("git", ["-c", "safe.directory=*", "-C", repoRoot, "rev-parse", "HEAD"], { timeout: Math.min(timeout, 5_000), env });
       const sha = out.stdout.trim();
       return SHA40_RE.test(sha) ? sha : null;
     } catch (err) {

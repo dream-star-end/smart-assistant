@@ -1958,6 +1958,10 @@ describe('B7. Shared forward cutover guard boundary, physical blast-radius & tru
     assert.equal(coreApproval.version, 1)
     assert.equal(coreApproval.classification, 'human_review_required')
     assert.equal(coreApproval.code, 'BILLING_CORE_LOCKED')
+    assert.equal(coreApproval.riskCategory, 'billing_change')
+    assert.equal(typeof coreApproval.whatChanged, 'string')
+    assert.match(coreApproval.whyNeedYou, /计费方式/)
+    assert.ok(['approve', 'reject', 'caution'].includes(coreApproval.recommendation?.action))
     assert.equal(coreApproval.sha, coreSha)
 
     // 2. Commercial branch feat/v5-aurora-rewrite -> blocked AND NEVER creates any pending approval!
@@ -2102,10 +2106,10 @@ describe('B7. Shared forward cutover guard boundary, physical blast-radius & tru
 
     // 2. B3: Lossless path with space & comma flows 3-way identically: git diff -> pending approval -> blast voucher -> re-check passes!
     f.git('checkout', '-q', baseSha)
-    const trickyRel = 'packages/commercial/src/billing/x,y helper.ts'
+    const trickyRel = 'packages/commercial/src/billing/x,y costHelper.ts'
     writeFileSync(join(f.repo, trickyRel), 'export const TRICKY = 1\n')
     f.git('add', trickyRel)
-    f.git('commit', '-qm', 'fix(v5): add helper with comma and space')
+    f.git('commit', '-qm', 'fix(v5): add cost helper with comma and space')
     const trickySha = f.git('rev-parse', 'HEAD')
 
     const runBlastOnly = (sha: string, extra = '') =>
@@ -2129,6 +2133,7 @@ describe('B7. Shared forward cutover guard boundary, physical blast-radius & tru
     const trickyApprovalId = `gov-billing-${trickySha.slice(0, 12)}`
     const trickyApprovalDoc = JSON.parse(readFileSync(join(ctrl, 'pending-approvals', `${trickyApprovalId}.json`), 'utf8'))
     assert.deepEqual(trickyApprovalDoc.files, [trickyRel], 'pending approval MUST preserve exact path with space & comma')
+    assert.equal(trickyApprovalDoc.riskCategory, 'billing_change')
 
     const decTricky = spawnSync(
       'bash',
@@ -2140,17 +2145,17 @@ describe('B7. Shared forward cutover guard boundary, physical blast-radius & tru
     const trickyPass = runBlastOnly(trickySha, `OC_V5_BLAST_VOUCHER=${q(trickyVoucherId)}`)
     assert.equal(trickyPass.status, 0, `approved voucher for tricky space+comma path MUST pass check-blast-radius: ${trickyPass.stderr}`)
 
-    // 3. B3 SQL DDL whitelist via train guards: safe additive passes, DO $$ & UPDATE fail closed as DESTRUCTIVE_DDL_LOCKED
+    // 3. B3 SQL DDL whitelist via train guards: safe additive & safe idempotent DO $$ pass; unsafe DO $$ fails closed as DESTRUCTIVE_DDL_LOCKED with riskCategory=ux_degradation
     f.git('checkout', '-q', baseSha)
     writeFileSync(
       join(f.repo, 'packages/commercial/src/db/migrations/100_safe_additive.sql'),
-      'CREATE TABLE IF NOT EXISTS r2_events (id bigserial PRIMARY KEY);\nCREATE INDEX IF NOT EXISTS idx_r2_events ON r2_events (id);\n',
+      'CREATE TABLE IF NOT EXISTS r2_events (id bigserial PRIMARY KEY);\nDO $$\nBEGIN\n  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = \'idx_r2_events\') THEN\n    CREATE INDEX IF NOT EXISTS idx_r2_events ON r2_events (id);\n  END IF;\nEND $$;\n',
     )
     f.git('add', '.')
-    f.git('commit', '-qm', 'feat(v5): safe additive migration')
+    f.git('commit', '-qm', 'feat(v5): safe additive + idempotent DO migration')
     const safeSqlSha = f.git('rev-parse', 'HEAD')
     const safeSqlPass = runBlastOnly(safeSqlSha)
-    assert.equal(safeSqlPass.status, 0, `safe additive SQL migration should pass: ${safeSqlPass.stderr}`)
+    assert.equal(safeSqlPass.status, 0, `safe additive + idempotent DO SQL migration should pass: ${safeSqlPass.stderr}`)
 
     f.git('checkout', '-q', baseSha)
     mkdirSync(join(f.repo, 'packages/commercial/src/db/migrations'), { recursive: true })
@@ -2162,8 +2167,12 @@ describe('B7. Shared forward cutover guard boundary, physical blast-radius & tru
     f.git('commit', '-qm', 'feat(v5): DO block migration')
     const doSqlSha = f.git('rev-parse', 'HEAD')
     const doSqlBlocked = runBlastOnly(doSqlSha)
-    assert.notEqual(doSqlBlocked.status, 0, 'DO $$ migration MUST be blocked as DESTRUCTIVE_DDL_LOCKED')
+    assert.notEqual(doSqlBlocked.status, 0, 'unrecognized DO $$ migration MUST be blocked as DESTRUCTIVE_DDL_LOCKED')
     assert.match(doSqlBlocked.stderr, /DESTRUCTIVE_DDL_LOCKED/)
+    const ddlApprovalId = `gov-ddl-${doSqlSha.slice(0, 12)}`
+    const ddlApprovalDoc = JSON.parse(readFileSync(join(ctrl, 'pending-approvals', `${ddlApprovalId}.json`), 'utf8'))
+    assert.equal(ddlApprovalDoc.riskCategory, 'ux_degradation')
+    assert.match(ddlApprovalDoc.whyNeedYou, /用户体验/)
   })
 
   test('removes OC_V5_SKIP_TRAILER_GATE=1 env escape hatch while allowing exact-SHA host break-glass file', (t) => {

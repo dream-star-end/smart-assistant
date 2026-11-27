@@ -5,8 +5,16 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { defaultExecFile } from "../selfhostGovernanceExec.js";
-import { computeApprovalSha256 } from "../selfhostGovernanceFormat.js";
+import {
+  createDefaultReadRepoHeadSha,
+  defaultExecFile,
+  RESUME_WRAPPER_SCRIPT,
+} from "../selfhostGovernanceExec.js";
+import {
+  computeApprovalSha256,
+  normalizePendingApproval,
+  translateAuditEntry,
+} from "../selfhostGovernanceFormat.js";
 import { createSelfhostGovernanceService } from "../selfhostGovernanceService.js";
 import {
   GovernanceServiceError,
@@ -969,5 +977,125 @@ describe("selfhostGovernanceService", () => {
       assert.equal(diskView.decision?.resumeUnit, ownerUnit);
       assert.equal(spawnedUnits.length, spawnsBefore + 1);
     }
+  });
+
+  it("passes -c safe.directory=* in createDefaultReadRepoHeadSha and restores HOME/bun PATH in RESUME_WRAPPER_SCRIPT", async () => {
+    const gitCalls: RecordedExec[] = [];
+    const readHead = createDefaultReadRepoHeadSha(
+      async (file, args, opts) => {
+        gitCalls.push({ file, args, env: opts.env });
+        return { stdout: `${VALID_SHA}\n`, stderr: "" };
+      },
+      5_000,
+      { PATH: "/usr/bin:/bin" },
+    );
+    const sha = await readHead("/opt/openclaude/openclaude-v5-selfhost");
+    assert.equal(sha, VALID_SHA);
+    assert.equal(gitCalls.length, 1);
+    assert.equal(gitCalls[0]!.file, "git");
+    assert.deepEqual(gitCalls[0]!.args, [
+      "-c", "safe.directory=*", "-C", "/opt/openclaude/openclaude-v5-selfhost", "rev-parse", "HEAD",
+    ]);
+
+    const readHeadErr = createDefaultReadRepoHeadSha(
+      async () => { throw new Error("dubious ownership"); },
+      5_000,
+      { PATH: "/usr/bin:/bin" },
+    );
+    assert.equal(await readHeadErr("/opt/openclaude/openclaude-v5-selfhost"), null);
+
+    assert.ok(RESUME_WRAPPER_SCRIPT.includes('export HOME="${HOME:-/root}"'));
+    assert.ok(RESUME_WRAPPER_SCRIPT.includes("/root/.bun/bin"));
+    assert.ok(
+      RESUME_WRAPPER_SCRIPT.indexOf('export HOME="${HOME:-/root}"') < RESUME_WRAPPER_SCRIPT.indexOf('"$1"'),
+      "HOME/PATH bootstrap must run before invoking deploy script",
+    );
+  });
+
+  it("synthesizes plain-language UX fields for legacy approvals, verifies new signed fields, and translates auto-pass billing audit entries", () => {
+    const nowMs = Date.parse(NOW_ISO);
+
+    // 1. Legacy billing approval (no new fields on disk) verifies sha256 intact and synthesizes clean fallbacks
+    const legacyBilling = makeSignedApprovalDoc({
+      id: "gov-legacy-bill-01",
+      code: "BILLING_CORE_LOCKED",
+      scope: "billing",
+      plainSummary: `commit ${VALID_SHA} on feat/v5-selfhost failed HMAC check`,
+    });
+    const normBilling = normalizePendingApproval(legacyBilling, nowMs);
+    assert.ok(normBilling);
+    assert.equal(normBilling.sha256, legacyBilling.sha256);
+    assert.equal(normBilling.riskCategory, "billing_change");
+    assert.ok(normBilling.whatChanged && !normBilling.whatChanged.includes(VALID_SHA));
+    assert.ok(normBilling.whyNeedYou?.includes("计费方式可能变化"));
+    assert.equal(normBilling.recommendation?.action, "caution");
+
+    // 2. Legacy DDL approval infers ux_degradation; all-green + steward approve -> recommendation.action = approve
+    const legacyDdl = makeSignedApprovalDoc({
+      id: "gov-legacy-ddl-01",
+      code: "DESTRUCTIVE_DDL_LOCKED",
+      scope: "sql",
+      files: ["packages/commercial/migrations/0042_alter.sql"],
+      safetyLights: [
+        { key: "commercialIsolation", label: "商业版隔离", level: "green", detail: "安全" },
+        { key: "dataIntegrity", label: "数据无损", level: "green", detail: "安全" },
+      ],
+      stewardVerdict: { present: true, verdict: "approve", hmacVerified: true },
+    });
+    const normDdl = normalizePendingApproval(legacyDdl, nowMs);
+    assert.ok(normDdl);
+    assert.equal(normDdl.riskCategory, "ux_degradation");
+    assert.ok(normDdl.whyNeedYou?.includes("用户体验可能下降"));
+    assert.equal(normDdl.recommendation?.action, "approve");
+
+    // 3. Steward veto / red light -> recommendation.action = reject; missing steward -> caution
+    const vetoDoc = makeSignedApprovalDoc({
+      id: "gov-legacy-veto-01",
+      stewardVerdict: { present: true, verdict: "veto" },
+    });
+    assert.equal(normalizePendingApproval(vetoDoc, nowMs)?.recommendation?.action, "reject");
+    const missingStewardDoc = makeSignedApprovalDoc({
+      id: "gov-legacy-nosteward-01",
+      stewardVerdict: { present: false, verdict: "missing" },
+    });
+    assert.equal(normalizePendingApproval(missingStewardDoc, nowMs)?.recommendation?.action, "caution");
+
+    // 4. New-format signed approval preserves explicit fields and rejects tampering
+    const modernDoc = makeSignedApprovalDoc({
+      id: "gov-modern-01",
+      riskCategory: "billing_change",
+      whatChanged: "调整按量计费的扣费单价计算。",
+      whyNeedYou: "可能直接改变每次对话的扣费金额。",
+      recommendation: { action: "approve", label: "建议批准", reason: "单测与复核均已通过。" },
+    });
+    const normModern = normalizePendingApproval(modernDoc, nowMs);
+    assert.ok(normModern);
+    assert.equal(normModern.riskCategory, "billing_change");
+    assert.equal(normModern.whatChanged, "调整按量计费的扣费单价计算。");
+    assert.equal(normModern.whyNeedYou, "可能直接改变每次对话的扣费金额。");
+    assert.deepEqual(normModern.recommendation, { action: "approve", label: "建议批准", reason: "单测与复核均已通过。" });
+
+    const tamperedModern = { ...modernDoc, whatChanged: "恶意篡改文案" };
+    assert.equal(normalizePendingApproval(tamperedModern, nowMs), null);
+
+    // 5. Audit entry formatters for ok_auto_noncore_billing and ok_auto_no_runtime_billing
+    const noncoreAudit = translateAuditEntry({
+      ts: NOW_ISO,
+      action: "check_blast_radius",
+      actor: "root",
+      branch: "feat/v5-selfhost",
+      outcome: "ok_auto_noncore_billing",
+    });
+    assert.equal(noncoreAudit?.label, "非核心计费辅助自动放行");
+    assert.equal(noncoreAudit?.detail, "仅涉及非核心计费辅助模块，未改动计费规则，已自动放行");
+
+    const noRuntimeAudit = translateAuditEntry({
+      ts: NOW_ISO,
+      action: "check_blast_radius",
+      actor: "root",
+      branch: "feat/v5-selfhost",
+      outcome: "ok_auto_no_runtime_billing",
+    });
+    assert.equal(noRuntimeAudit?.label, "纯注释/类型声明自动放行");
   });
 });
