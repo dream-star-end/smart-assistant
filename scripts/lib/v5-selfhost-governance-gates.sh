@@ -870,6 +870,23 @@ _master_governance_run_gate() {
   else
     cmd=("${MASTER_GOV_TSX_CMD[@]}" "$script_exec" "$@")
   fi
+  local _was_xtrace=0 _rc=0 _inject_gh_tok=0
+  local -a unset_args=(-u NODE_OPTIONS -u NODE_PATH -u TSX_TSCONFIG_PATH -u npm_config_node_options)
+  # B7: 仅可信外置裁判且显式开启 MASTER_GOV_ALLOW_GH_TOKEN=1 且未禁用时允许凭据进入子进程，
+  # 并全程关闭 xtrace 防止令牌展开到 bash -x 跟踪日志；bootstrap 候选脚本与其他门禁一律物理清除。
+  if [[ "$mode" == referee && "${MASTER_GOV_ALLOW_GH_TOKEN:-0}" == 1 && "${OC_V5_DISABLE_GH_APPROVAL_LOOKUP:-0}" != 1 ]]; then
+    if [[ $- == *x* ]]; then
+      _was_xtrace=1
+      set +x
+    fi
+    if [[ -n "${MASTER_GOV_GH_TOKEN:-}" ]]; then
+      _inject_gh_tok=1
+    else
+      unset_args+=(-u GITHUB_TOKEN -u GH_TOKEN)
+    fi
+  else
+    unset_args+=(-u GITHUB_TOKEN -u GH_TOKEN)
+  fi
   if ! (
     cd "$run_cwd"
     export TMPDIR="$MASTER_GATE_TMPDIR"
@@ -877,12 +894,31 @@ _master_governance_run_gate() {
     export OC_TEST_RETRY_ENFORCE=1
     export OC_PG_MIGRATION_BOSS_APPROVED=0
     export BOSS_APPROVED_CHANGELOG=0
+    if (( _inject_gh_tok )); then
+      export GITHUB_TOKEN="$MASTER_GOV_GH_TOKEN"
+    fi
     if [[ -n "$env_git_dir" ]]; then export GIT_DIR="$env_git_dir"; fi
     if [[ -n "$env_work_tree" ]]; then export GIT_WORK_TREE="$env_work_tree"; fi
-    env -u NODE_OPTIONS -u NODE_PATH -u TSX_TSCONFIG_PATH -u npm_config_node_options "${cmd[@]}"
+    env "${unset_args[@]}" "${cmd[@]}"
   ); then
+    _rc=1
+  fi
+  if (( _was_xtrace )); then set -x; fi
+  if (( _rc != 0 )); then
     mlog "✗ pinned governance gate 失败 ($mode): $rel"
     return 1
+  fi
+}
+
+# B7: 严格锚定协议与主机解析 GitHub 仓库 slug（仅认 github.com，不匹配路径伪造）。
+_master_governance_parse_github_origin_repo() { # <url>
+  local url="${1:-}"
+  if [[ "$url" =~ ^https://([^/@[:space:]]+@)?github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[2]%.git}"
+  elif [[ "$url" =~ ^git@github\.com:([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]%.git}"
+  elif [[ "$url" =~ ^ssh://git@github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]%.git}"
   fi
 }
 
@@ -1044,7 +1080,58 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
   fi
 
   # ── Phase 4: OCV5-904/905/906 治理棘轮门(全部显式 --root "$staging"；check-debt-ttl 传 --base/--head)──
-  _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-a0-monotonic.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --base "$base_ref" --head "$full_sha" || return 1
+  # B5/B7: 仅当使用已验证可信外置裁判（ref_root 非空）且未禁用在线查询时才解析 GitHub 仓库与只读凭据，
+  # 并全程关闭 xtrace 防止令牌泄露；同时显式钉住目标发布分支（默认 feat/v5-selfhost）。
+  local gov_gh_repo="" gov_expected_branch="${OC_V5_EXPECTED_BASE_BRANCH:-${BRANCH:-feat/v5-selfhost}}"
+  local MASTER_GOV_GH_TOKEN="" gov_gh_enabled=0 a0_script="" origin_url="" _gh_xtrace=0
+  local -a a0_args=(--root "$staging" --base "$base_ref" --head "$full_sha")
+  if [[ -n "$ref_root" && "${OC_V5_DISABLE_GH_APPROVAL_LOOKUP:-0}" != 1 ]]; then
+    if [[ $- == *x* ]]; then
+      _gh_xtrace=1
+      set +x
+    fi
+    gov_gh_repo="${GITHUB_REPOSITORY:-${GH_REPO:-}}"
+    MASTER_GOV_GH_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    local _is_default_api=1 _is_default_gov=1
+    if [[ -n "${GITHUB_API_URL:-}" && "${GITHUB_API_URL%/}" != "https://api.github.com" ]]; then
+      _is_default_api=0
+    fi
+    if [[ -n "${OC_GOVERNOR_ROOT:-}" && "${OC_GOVERNOR_ROOT%/}" != "/opt/openclaude/harness-gate" ]]; then
+      _is_default_gov=0
+    fi
+    if [[ -z "${OC_A0_APPROVAL_DIR:-}" && -z "${OC_STEWARD_RECEIPT_DIR:-}" && "$_is_default_api" == 1 && "$_is_default_gov" == 1 ]]; then
+      if [[ -z "$gov_gh_repo" ]]; then
+        origin_url="$("${g[@]}" remote get-url origin 2>/dev/null || true)"
+        gov_gh_repo="$(_master_governance_parse_github_origin_repo "$origin_url")"
+      fi
+      if [[ -z "$MASTER_GOV_GH_TOKEN" && -n "$gov_gh_repo" ]] && command -v gh >/dev/null 2>&1; then
+        MASTER_GOV_GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+      fi
+    fi
+    if [[ -n "$gov_gh_repo" && -n "$MASTER_GOV_GH_TOKEN" ]]; then
+      gov_gh_enabled=1
+    else
+      MASTER_GOV_GH_TOKEN=""
+    fi
+    if (( _gh_xtrace )); then set -x; fi
+  fi
+
+  a0_script="${ref_root:+$ref_view/scripts/check-a0-monotonic.ts}"
+  [[ -n "$a0_script" ]] || a0_script="$staging/scripts/check-a0-monotonic.ts"
+  if [[ "$gov_gh_enabled" == 1 && -f "$a0_script" ]] && grep -qF -- '--github-repo' "$a0_script" 2>/dev/null; then
+    a0_args+=(--github-repo "$gov_gh_repo")
+  fi
+  if [[ -n "$gov_expected_branch" && -f "$a0_script" ]] && grep -qF -- '--expected-base-branch' "$a0_script" 2>/dev/null; then
+    a0_args+=(--expected-base-branch "$gov_expected_branch")
+  fi
+  local MASTER_GOV_ALLOW_GH_TOKEN=0
+  MASTER_GOV_ALLOW_GH_TOKEN="$gov_gh_enabled"
+  _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-a0-monotonic.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- "${a0_args[@]}" || {
+    MASTER_GOV_ALLOW_GH_TOKEN=0
+    MASTER_GOV_GH_TOKEN=""
+    return 1
+  }
+  MASTER_GOV_ALLOW_GH_TOKEN=0
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-ai-smells-ratchet.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --enforce --base "$base_ref" || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-complexity-ratchet.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --enforce --base "$base_ref" || return 1
   _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-clones-ratchet.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "" 1 -- --root "$staging" --enforce --base "$base_ref" || return 1
@@ -1058,7 +1145,20 @@ master_run_governance_fast_gates() { # <pinned-staging> <full-sha>
     && grep -qF -- '--hmac-key-file' "$steward_script" 2>/dev/null; then
     steward_args+=(--hmac-key-file "$steward_hmac_key")
   fi
-  _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-cross-family-audit.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "--enforce-commit" 1 -- "${steward_args[@]}" || return 1
+  if [[ "$gov_gh_enabled" == 1 && -f "$steward_script" ]] && grep -qF -- '--github-repo' "$steward_script" 2>/dev/null; then
+    steward_args+=(--github-repo "$gov_gh_repo")
+  fi
+  if [[ -n "$gov_expected_branch" && -f "$steward_script" ]] && grep -qF -- '--expected-base-branch' "$steward_script" 2>/dev/null; then
+    steward_args+=(--expected-base-branch "$gov_expected_branch")
+  fi
+  MASTER_GOV_ALLOW_GH_TOKEN="$gov_gh_enabled"
+  _master_governance_run_gate "$ref_root" "$ref_view" "$staging" scripts/check-cross-family-audit.ts tsx "$ref_view" "$pinned_gitdir" "$staging" "--enforce-commit" 1 -- "${steward_args[@]}" || {
+    MASTER_GOV_ALLOW_GH_TOKEN=0
+    MASTER_GOV_GH_TOKEN=""
+    return 1
+  }
+  MASTER_GOV_ALLOW_GH_TOKEN=0
+  MASTER_GOV_GH_TOKEN=""
 
   debt_script="${ref_root:+$ref_view/scripts/check-debt-ttl.ts}"
   [[ -n "$debt_script" ]] || debt_script="$staging/scripts/check-debt-ttl.ts"

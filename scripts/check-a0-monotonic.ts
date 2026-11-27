@@ -50,6 +50,7 @@ import {
   verifyA0ApprovalReceipt,
   verifyA0ApprovalUnified,
 } from './lib/a0MonotonicRules.js'
+import { resolveA0ApprovalForBaseRange } from './lib/a0RangeCarryOver.js'
 import { type FetchLike, resolveGithubToken } from './lib/githubTrustedApproval.js'
 
 export {
@@ -82,6 +83,7 @@ export interface CheckA0Options {
   base?: string
   head?: string
   staged?: boolean
+  prNumber?: number
   approvalDir?: string
   hmacKeyFile?: string
   hmacKey?: string
@@ -93,6 +95,8 @@ export interface CheckA0Options {
     prNumber?: number
     trustedApprovers?: readonly string[]
     apiBaseUrl?: string
+    allowMergedPrCarryOver?: boolean
+    expectedBaseRef?: string
     fetchImpl?: FetchLike
   }
 }
@@ -326,11 +330,15 @@ function prepareA0Diff(opts: CheckA0Options): PreparedDiff {
   // Always prefer base's policy when present so a candidate cannot weaken arch/a0-protected-paths.json
   // to hide its own A0 changes. Fall back to head/working tree only on initial introduction.
   const baseRefForPolicy = opts.staged ? 'HEAD' : opts.base
-  const basePolicyText = baseRefForPolicy ? gitFileAt(opts.root, baseRefForPolicy, POLICY_PATH) : null
+  const basePolicyText = baseRefForPolicy
+    ? gitFileAt(opts.root, baseRefForPolicy, POLICY_PATH)
+    : null
   const localPolicyAbs = path.join(opts.root, POLICY_PATH)
   const policyText =
     basePolicyText ??
-    (opts.staged ? gitStagedFile(opts.root, POLICY_PATH) : gitFileAt(opts.root, headRef, POLICY_PATH)) ??
+    (opts.staged
+      ? gitStagedFile(opts.root, POLICY_PATH)
+      : gitFileAt(opts.root, headRef, POLICY_PATH)) ??
     (existsSync(localPolicyAbs) ? readFileSync(localPolicyAbs, 'utf8') : null)
   if (!policyText) {
     throw new Error(`missing ${POLICY_PATH}`)
@@ -383,7 +391,10 @@ function prepareA0Diff(opts: CheckA0Options): PreparedDiff {
   }
 }
 
-function resolveApprovalConfig(policy: A0Policy, opts: CheckA0Options): {
+function resolveApprovalConfig(
+  policy: A0Policy,
+  opts: CheckA0Options,
+): {
   approvalDir: string
   requireRootOwner: boolean
 } {
@@ -454,7 +465,30 @@ export function runCheckA0Monotonic(opts: CheckA0Options): CheckA0Result {
   }
 }
 
-/** Asynchronous A0 evaluation supporting both host root-only receipts and GitHub out-of-commit approvals. */
+function classifyCommitRangeA0Paths(
+  root: string,
+  policy: A0Policy,
+  parentSha: string,
+  commitSha: string,
+): string[] {
+  const raw = git(root, ['diff', '--name-status', '-z', '-M', `${parentSha}...${commitSha}`])
+  const entries = parseNameStatusZ(raw)
+  const paths = new Set<string>()
+  for (const e of entries) {
+    const fs = classifyDiffEntry(
+      e,
+      policy,
+      (p) => gitFileAt(root, parentSha, p),
+      (p) => gitFileAt(root, commitSha, p),
+    )
+    for (const f of fs) {
+      if (f.tier === 'A0') paths.add(f.path)
+    }
+  }
+  return [...paths]
+}
+
+/** Asynchronous A0 evaluation supporting host root-only receipts, GitHub approvals & multi-commit ranges. */
 export async function runCheckA0MonotonicAsync(opts: CheckA0Options): Promise<CheckA0Result> {
   const prep = prepareA0Diff(opts)
   if (prep.a0Blocks.length === 0) {
@@ -487,16 +521,43 @@ export async function runCheckA0MonotonicAsync(opts: CheckA0Options): Promise<Ch
   }
 
   const { approvalDir, requireRootOwner } = resolveApprovalConfig(prep.policy, opts)
-  const approval = await verifyA0ApprovalUnified({
-    approvalDir,
-    targetSha: prep.targetSha,
-    a0Paths: [...new Set(prep.a0Blocks.map((b) => b.path))],
-    requireRootOwner,
-    hmacKeyFile: opts.hmacKeyFile,
-    hmacKey: opts.hmacKey,
-    nowMs: opts.nowMs,
-    github: prep.mode === 'staged' ? undefined : opts.github,
-  })
+  const a0Paths = [...new Set(prep.a0Blocks.map((b) => b.path))]
+  const effectivePrNum = opts.prNumber ?? opts.github?.prNumber
+  const isOpenPr = effectivePrNum !== undefined
+  const ghOpts =
+    prep.mode === 'staged' || !opts.github
+      ? undefined
+      : { ...opts.github, prNumber: effectivePrNum }
+
+  let approval: ApprovalVerification
+  if (prep.mode === 'base' && !isOpenPr && opts.base) {
+    const baseSha = git(opts.root, ['rev-parse', '--verify', `${opts.base}^{commit}`]).trim()
+    approval = await resolveA0ApprovalForBaseRange({
+      root: opts.root,
+      baseSha,
+      headSha: prep.targetSha,
+      aggregateA0Paths: a0Paths,
+      classifyCommitA0Paths: (pSha, cSha) =>
+        classifyCommitRangeA0Paths(opts.root, prep.policy, pSha, cSha),
+      approvalDir,
+      requireRootOwner,
+      hmacKeyFile: opts.hmacKeyFile,
+      hmacKey: opts.hmacKey,
+      nowMs: opts.nowMs,
+      github: ghOpts,
+    })
+  } else {
+    approval = await verifyA0ApprovalUnified({
+      approvalDir,
+      targetSha: prep.targetSha,
+      a0Paths,
+      requireRootOwner,
+      hmacKeyFile: opts.hmacKeyFile,
+      hmacKey: opts.hmacKey,
+      nowMs: opts.nowMs,
+      github: ghOpts ? { ...ghOpts, allowMergedPrCarryOver: false } : undefined,
+    })
+  }
 
   return {
     ok: approval.valid,
@@ -524,6 +585,7 @@ async function main(argv: string[]): Promise<number> {
   let prNumberRaw = process.env.PR_NUMBER?.trim() || process.env.GITHUB_PR_NUMBER?.trim() || ''
   let trustedApproversRaw = process.env.OC_TRUSTED_APPROVERS?.trim() || ''
   let githubApiUrl = process.env.GITHUB_API_URL?.trim() || undefined
+  let expectedBaseBranchArg: string | undefined
 
   const takeValue = (flag: string, idx: number): string | null => {
     const v = argv[idx]
@@ -580,6 +642,10 @@ async function main(argv: string[]): Promise<number> {
       const v = takeValue(arg, ++i)
       if (!v) return 2
       githubApiUrl = v
+    } else if (arg === '--expected-base-branch') {
+      const v = takeValue(arg, ++i)
+      if (!v) return 2
+      expectedBaseBranchArg = v
     } else {
       console.error(`unknown arg: ${arg}`)
       return 2
@@ -597,9 +663,13 @@ async function main(argv: string[]): Promise<number> {
   }
 
   if (!staged && !base) {
-    const r = spawnSync('git', ['-C', repoRoot, 'rev-parse', '--verify', 'origin/feat/v5-selfhost^{commit}'], {
-      encoding: 'utf8',
-    })
+    const r = spawnSync(
+      'git',
+      ['-C', repoRoot, 'rev-parse', '--verify', 'origin/feat/v5-selfhost^{commit}'],
+      {
+        encoding: 'utf8',
+      },
+    )
     if (r.status === 0) base = 'origin/feat/v5-selfhost'
     else base = 'HEAD'
   }
@@ -622,6 +692,12 @@ async function main(argv: string[]): Promise<number> {
         .filter(Boolean)
     : undefined
 
+  const expectedBaseRef =
+    expectedBaseBranchArg?.trim() ||
+    (process.env.GITHUB_REF_TYPE === 'branch' && process.env.GITHUB_REF_NAME?.trim()
+      ? process.env.GITHUB_REF_NAME.trim()
+      : process.env.OC_V5_EXPECTED_BASE_BRANCH?.trim() || undefined)
+
   let result: CheckA0Result
   try {
     result = await runCheckA0MonotonicAsync({
@@ -629,6 +705,7 @@ async function main(argv: string[]): Promise<number> {
       base: staged ? undefined : base,
       head,
       staged,
+      prNumber,
       approvalDir,
       hmacKeyFile,
       requireRootOwner,
@@ -640,6 +717,7 @@ async function main(argv: string[]): Promise<number> {
               prNumber,
               trustedApprovers,
               apiBaseUrl: githubApiUrl,
+              expectedBaseRef,
             }
           : undefined,
     })
@@ -679,7 +757,7 @@ async function main(argv: string[]): Promise<number> {
         `  Violation : ${blk.detail}`,
         '  Why       : A0 meta-layer guardrails and baseline ceilings cannot be loosened or tampered with autonomously.',
         `  How to Fix: Keep changes strictly A1 (monotonic tighten-only), or obtain an out-of-commit A0 approval bound to exact ${result.targetSha}: host \`oc-governor approve-a0 --sha ${result.targetSha} --reason "..." [--publish-github-status]\` or CODEOWNER PR APPROVED review.`,
-        `  Approval  : ${result.approval ? `${result.approval.receiptPath} (${result.approval.reason})` : 'none'}`,
+        `  Approval  : ${result.approval ? `${result.approval.receiptPath} (${result.approval.valid ? result.approval.receipt.reason : result.approval.reason})` : 'none'}`,
       ].join('\n'),
     )
   }
