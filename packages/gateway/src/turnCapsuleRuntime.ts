@@ -117,10 +117,11 @@ export class EngineCapsuleRuntime {
     this.stateRoot = options.stateRoot ?? join(paths.home, 'capsule-state')
     this.authorityRuntime = options.authorityRuntime ?? null
 
-    let blobStore = options.blobStore ?? null
-    if (!blobStore) {
+    const explicitlyDisabled = options.env?.OC_CAPSULE_RUNTIME_ENABLED === '0'
+    let blobStore = explicitlyDisabled ? null : (options.blobStore ?? null)
+    if (!explicitlyDisabled && !blobStore) {
       const creds = resolveContainerAuthorityCredentials(options.env)
-      if (creds) {
+      if (creds && !creds.capsuleRuntimeDisabled) {
         blobStore = new RemoteArtifactBlobStore({
           masterBaseUrl: creds.masterBaseUrl,
           containerToken: creds.containerToken,

@@ -65,6 +65,9 @@ const expectedSuffix = [
         '0346_commercial_perf_timeline_and_live_snapshot',
         '0347_commercial_perf_timeline_and_live_snapshot_indexes',
         '0348_commercial_pending_browser_handoffs',
+        '0349_commercial_context_eval_observability',
+        '0350_commercial_three_layer_pool_unification',
+        '0351_commercial_turn_dispatches_active_user_turn_key_unique',
       ]),
 ].sort()
 const url = process.env.TEST_DATABASE_URL

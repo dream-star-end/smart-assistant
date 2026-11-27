@@ -319,18 +319,15 @@ export class V3SinkError extends Error {
 export interface V3MasterSinkConfig {
   baseUrl: string
   bearer: string
+  capsuleRuntimeDisabled?: boolean
 }
 
-/** Read env-driven config. Returns null when either env is missing —
- *  personal version + dev sandbox don't set them, and we want to
- *  no-op silently in that case (sessionManager falls back to the
- *  legacy local durable path). */
+/** Read env-driven config. Returns null when either env is missing. */
 export function readV3MasterSinkConfig(env: NodeJS.ProcessEnv = process.env): V3MasterSinkConfig | null {
   const baseUrl = env.OPENCLAUDE_V3_MASTER_BASE_URL
   const bearer = env.OPENCLAUDE_V3_CONTAINER_TOKEN
   if (!baseUrl || !bearer) return null
-  // Strip trailing slash so URL composition is unambiguous.
-  return { baseUrl: baseUrl.replace(/\/+$/, ''), bearer }
+  return { baseUrl: baseUrl.replace(/\/+$/, ''), bearer, ...(env.OC_CAPSULE_RUNTIME_ENABLED === '0' ? { capsuleRuntimeDisabled: true } : {}) }
 }
 
 export interface AttemptSendDeps {

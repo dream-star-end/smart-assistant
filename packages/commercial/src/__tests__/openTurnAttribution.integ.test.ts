@@ -107,12 +107,12 @@ for (const state of ['one', 'none', 'many', 'unkeyed'] as const) {
   })
 }
 
-test('OCV5-898 R2 real PG: positive evidence, two-connection concurrency + unique index 0355, lockTurnBillingKeys waiver serialization, and strict container isolation', async t => {
+test('OCV5-898 R2 real PG: positive evidence, two-connection concurrency + unique index 0351/0355, lockTurnBillingKeys waiver serialization, and strict container isolation', async t => {
   if (fixture.skipIfUnavailable(t)) return
   __resetOpenTurnKeyMemory()
   const pool = getPool()
 
-  // 0. Verify migration 0355 partial unique index exists and is valid
+  // 0. Verify migration 0351/0355 partial unique index exists and is valid
   const idxRow = (await pool.query<{ indisvalid: boolean; indisunique: boolean }>(
     `SELECT i.indisvalid, i.indisunique
        FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid

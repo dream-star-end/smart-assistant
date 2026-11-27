@@ -81,17 +81,12 @@ const BACKGROUND_REPLAY_MAX_BACKOFF_MS = 30_000
 const CONVERSATION_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
-export interface ContainerAuthorityCredentials {
-  readonly masterBaseUrl: string
-  readonly containerToken: string
-}
+export interface ContainerAuthorityCredentials { readonly masterBaseUrl: string; readonly containerToken: string; readonly capsuleRuntimeDisabled?: boolean }
 
-export function resolveContainerAuthorityCredentials(
-  env?: NodeJS.ProcessEnv,
-): ContainerAuthorityCredentials | null {
+export function resolveContainerAuthorityCredentials(env?: NodeJS.ProcessEnv): ContainerAuthorityCredentials | null {
   const cfg = readV3MasterSinkConfig(env)
   if (!cfg) return null
-  return { masterBaseUrl: cfg.baseUrl, containerToken: cfg.bearer }
+  return { masterBaseUrl: cfg.baseUrl, containerToken: cfg.bearer, ...(cfg.capsuleRuntimeDisabled ? { capsuleRuntimeDisabled: true } : {}) }
 }
 
 function toAuthorityEngine(raw: string | undefined): AuthorityEngineKind {

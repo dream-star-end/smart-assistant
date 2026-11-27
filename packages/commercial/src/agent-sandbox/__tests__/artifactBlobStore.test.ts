@@ -441,8 +441,9 @@ describe('OCV5-890 Wave 1B: LocalCasArtifactBlobStore', () => {
     // Populate sourceRoot with BOTH a multi-part non-empty file (> 140 KiB -> 3 parts at 64 KiB) AND a 0-byte empty file!
     const sessionsDir = path.join(sourceRoot, 'sessions', '2026', '11', '25')
     mkdirSync(sessionsDir, { recursive: true })
-    const multiPartRel = 'sessions/2026/11/25/rollout-multipart.jsonl'
-    const emptyRel = 'sessions/2026/11/25/rollout-empty.jsonl'
+    const nativeSessionId = '99999999-1111-4222-8333-444444444444'
+    const multiPartRel = `sessions/2026/11/25/rollout-multipart-${nativeSessionId}.jsonl`
+    const emptyRel = `sessions/2026/11/25/rollout-empty-${nativeSessionId}.jsonl`
     const multiPartContent = Buffer.concat([
       Buffer.from(`${'{"line":"chunk0"}\n'.repeat(4000)}`, 'utf8'),
       Buffer.from(`${'{"line":"chunk1"}\n'.repeat(4000)}`, 'utf8'),
@@ -464,7 +465,7 @@ describe('OCV5-890 Wave 1B: LocalCasArtifactBlobStore', () => {
       engine: 'codex',
       engineVersion: '1.3.0',
       placementEpoch: 5,
-      nativeSessionId: '99999999-1111-4222-8333-444444444444',
+      nativeSessionId,
       sourceRoot,
       chunkSizeBytes: 65_536,
     })
