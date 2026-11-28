@@ -232,6 +232,10 @@ export class ExecEnvJobRegistry implements ProcessJobSeam {
   ): Promise<ChildProcess> {
     const [cmd, ...args] = spec.command
     const spawnEnv: Record<string, string> = { ...this.defaultEnv, ...(spec.env ?? {}) }
+    if (spec.lifecycleClass !== 'ephemeral_turn') {
+      Reflect.deleteProperty(spawnEnv, 'OPENCLAUDE_TURN_REAP_TAG')
+      spawnEnv.OPENCLAUDE_LIFECYCLE_CLASS = spec.lifecycleClass
+    }
     const childStdio: ['ignore', 'pipe' | Writable, 'pipe' | Duplex] = sink
       ? ['ignore', sink.sinkProcess.stdio[0] as Writable, sink.sinkProcess.stdio[3] as Duplex]
       : ['ignore', 'pipe', 'pipe']
