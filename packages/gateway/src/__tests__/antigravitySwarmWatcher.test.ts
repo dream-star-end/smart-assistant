@@ -2858,6 +2858,110 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
       `R6 idLookups must scale linearly (32=${idm32.idLookups}, 64=${idm64.idLookups}, 128=${idm128.idLookups})`,
     )
     assert.equal(idm128.setCopies, 0)
+
+    // Steward R7 Blocker (boundaryIntegrity): speculative ID-bearing DONE(B, read_file) + swarm_wait DONE + SYSTEM_MESSAGE
+    // MUST NOT irreversibly cut turnStart when a later step registers read_file(B) & replays DONE(B), leaving A unfinished!
+    // Test BOTH the planner-next-epoch variant AND the direct-TOOL_CALL-same-epoch variant, plus positive control with A's own DONE.
+    for (const [variant, postSysSteps, revBase] of [
+      [
+        'direct-TOOL_CALL',
+        [
+          { step_index: 5, type: 'TOOL_CALL', tool_call_id: 'cid-B', tool_name: 'read_file', status: 'ACTIVE', arguments: { Path: '/repo/b.ts' } },
+          { step_index: 6, type: 'TOOL_RESULT', tool_call_id: 'cid-B', tool_name: 'read_file', status: 'DONE', content: 'b done replay' },
+          { step_index: 7, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 2 } }] },
+        ],
+        105,
+      ],
+      [
+        'planner-next-epoch',
+        [
+          { step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', arguments: { Path: '/repo/b.ts' } }] },
+          { step_index: 6, type: 'TOOL_CALL', tool_call_id: 'cid-B', tool_name: 'read_file', status: 'ACTIVE', arguments: { Path: '/repo/b.ts' } },
+          { step_index: 7, type: 'TOOL_RESULT', tool_call_id: 'cid-B', tool_name: 'read_file', status: 'DONE', content: 'b done replay' },
+          { step_index: 8, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 2 } }] },
+        ],
+        110,
+      ],
+    ] as const) {
+      const r7Steps: Record<string, unknown>[] = [
+        {
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            { name: 'read_file', arguments: { Path: '/repo/a.ts' } },
+            { name: 'swarm_wait', arguments: { since: 1 } },
+          ],
+        },
+        { step_index: 2, type: 'TOOL_RESULT', tool_call_id: 'cid-B', tool_name: 'read_file', status: 'DONE', content: 'b done early' },
+        { step_index: 3, type: 'TOOL_RESULT', tool_name: 'swarm_wait', status: 'DONE', content: 'parked' },
+        { step_index: 4, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>\nReminder: work efficiently.\n</SYSTEM_MESSAGE>' },
+        ...postSysSteps,
+      ]
+      assert.equal(findTurnStartIndex(r7Steps), 0, `R7 ${variant}: speculative cut MUST be revoked when B reclaims cid-B`)
+      await writeFile(workerTranscript, `${r7Steps.map((s) => JSON.stringify(s)).join('\n')}\n`)
+      const snap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: revBase })!
+      assert.equal(snap.members.find((m) => m.name === 'parser')!.status, 'working', `R7 ${variant}: A is unfinished -> working`)
+      let reclaims = 0
+      const mon = new SwarmStallMonitor({
+        stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+        onStallExhausted: () => { reclaims += 1 },
+      })
+      mon.evaluate(snap, 1_000)
+      mon.evaluate({ ...snap, revision: revBase + 1 }, 3_000)
+      mon.evaluate({ ...snap, revision: revBase + 2 }, 5_000)
+      assert.equal(reclaims, 0, `R7 ${variant}: unfinished A across speculative SYSTEM_MESSAGE cut must trigger 0 reclaims`)
+
+      // Positive control: adding A's own independent DONE allows reclaim (1)
+      const r7WithADone = [
+        r7Steps[0]!,
+        r7Steps[1]!,
+        { step_index: 25, type: 'TOOL_RESULT', tool_name: 'read_file', status: 'DONE', content: 'a done' },
+        ...r7Steps.slice(2),
+      ]
+      await writeFile(workerTranscript, `${r7WithADone.map((s) => JSON.stringify(s)).join('\n')}\n`)
+      const doneSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: revBase + 3 })!
+      assert.equal(doneSnap.members.find((m) => m.name === 'parser')!.status, 'waiting', `R7 ${variant} positive: with A DONE -> waiting`)
+      let doneReclaims = 0
+      const doneMon = new SwarmStallMonitor({
+        stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+        onStallExhausted: () => { doneReclaims += 1 },
+      })
+      doneMon.evaluate(doneSnap, 1_000)
+      doneMon.evaluate({ ...doneSnap, revision: revBase + 4 }, 3_000)
+      doneMon.evaluate({ ...doneSnap, revision: revBase + 5 }, 5_000)
+      assert.equal(doneReclaims, 1, `R7 ${variant} positive: once A has its own DONE, deadlock reclaims (1)`)
+    }
+
+    // Steward R7 complexityDrift concern: same-epoch alternating GENERIC DONE + SYSTEM_MESSAGE across 32/64/128 calls
+    // must keep candidate visits strictly O(N) (not N*(N+1))
+    const measureSameEpochGenericAlternating = (nCalls: number) => {
+      const seq: Record<string, unknown>[] = [
+        { step_index: 0, type: 'USER_INPUT', status: 'DONE' },
+        {
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            ...Array.from({ length: nCalls }, (_, k) => ({ name: 'read_file', arguments: { Path: `/repo/g-${k}.ts` } })),
+            { name: 'swarm_wait', arguments: { since: 1 } },
+          ],
+        },
+        { step_index: 2, type: 'TOOL_RESULT', tool_name: 'swarm_wait', status: 'DONE', content: 'parked' },
+      ]
+      let si = 3
+      for (let k = 0; k < nCalls; k += 1) {
+        seq.push({ step_index: si++, type: 'GENERIC', status: 'DONE', content: `done-${k}` })
+        seq.push({ step_index: si++, type: 'SYSTEM_MESSAGE', status: 'DONE', content: `tick-${k}` })
+      }
+      resetTurnReductionCandidateVisitsForTests()
+      assert.equal(findTurnStartIndex(seq), 0)
+      return getTurnReductionMetricsForTests()
+    }
+    for (const n of [32, 64, 128] as const) {
+      const m = measureSameEpochGenericAlternating(n)
+      assert.ok(m.candidateVisits <= n + 8, `R7 same-epoch alternating GENERIC+SYSTEM_MESSAGE must be O(N) (N=${n}, got=${m.candidateVisits})`)
+    }
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }

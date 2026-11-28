@@ -13,20 +13,15 @@ export {
   type BackgroundTaskState, type BackgroundTaskTelemetrySummary, type MergedBackgroundTaskState, type TrackedBackgroundTask,
 }
 
-let turnReductionCandidateVisitsForTests = 0
-let turnReductionSetCopiesForTests = 0
-let turnReductionBucketWritesForTests = 0
-let turnReductionIdLookupsForTests = 0
+const turnReductionMetricsForTests = { candidateVisits: 0, setCopies: 0, bucketWrites: 0, idLookups: 0 }
 export function resetTurnReductionCandidateVisitsForTests(): void {
-  turnReductionCandidateVisitsForTests = 0
-  turnReductionSetCopiesForTests = 0
-  turnReductionBucketWritesForTests = 0
-  turnReductionIdLookupsForTests = 0
+  turnReductionMetricsForTests.candidateVisits = 0
+  turnReductionMetricsForTests.setCopies = 0
+  turnReductionMetricsForTests.bucketWrites = 0
+  turnReductionMetricsForTests.idLookups = 0
 }
-export function getTurnReductionCandidateVisitsForTests(): number { return turnReductionCandidateVisitsForTests }
-export function getTurnReductionMetricsForTests() {
-  return { candidateVisits: turnReductionCandidateVisitsForTests, setCopies: turnReductionSetCopiesForTests, bucketWrites: turnReductionBucketWritesForTests, idLookups: turnReductionIdLookupsForTests }
-}
+export function getTurnReductionCandidateVisitsForTests(): number { return turnReductionMetricsForTests.candidateVisits }
+export function getTurnReductionMetricsForTests() { return { ...turnReductionMetricsForTests } }
 
 const SWARM_MCP_TOOL_PREFIX = 'mcp_openclaude-memory_'
 
@@ -83,7 +78,6 @@ export function settleSwarmSnapshotTerminal(snap: SwarmSnapshot, phase: SwarmPha
     members: snap.members.map((m) => ({ ...m, status: m.status === 'killed' ? 'killed' : 'waiting' })),
   }
 }
-
 /** Concise one-line status text for the live turn_status working bar. */
 export function formatSwarmWorkingDetail(snap: SwarmSnapshot): string {
   const working = snap.members.filter((m) => m.status === 'working' && m.role !== 'monitor' && m.role !== 'narrator').length
@@ -92,30 +86,21 @@ export function formatSwarmWorkingDetail(snap: SwarmSnapshot): string {
   if (snap.totalPosts > 0) parts.push(`${snap.totalPosts} 条讨论`)
   return parts.join(' · ')
 }
-
 export interface DurableSwarmBoardInput { swarmId: string; title: string; phase: SwarmPhase; snapshot: SwarmSnapshot }
-
 export function compactSwarmSnapshotForPersistence(snap: SwarmSnapshot, maxBytes = 13_000): SwarmSnapshot {
   return structuredClone(compactSwarmSnapshotToByteBudget(snap, maxBytes))
 }
-
 export function buildDurableSwarmBoardInput(snap: SwarmSnapshot, maxBytes = 13_000): DurableSwarmBoardInput {
   const snapshot = compactSwarmSnapshotForPersistence(snap, maxBytes)
   return { swarmId: snapshot.swarmId, title: snapshot.title, phase: snapshot.phase, snapshot }
 }
-
 const BOARD_COORD_TOOLS = new Set(['swarm_wait', 'post_message', 'read_board'])
 
 function plannerBatchHasSwarmWait(calls: readonly unknown[]): boolean {
-  for (const raw of calls) {
-    if (normTool(strOf(recOf(raw)?.name)) === 'swarm_wait') return true
-  }
-  return false
+  return calls.some((raw) => normTool(strOf(recOf(raw)?.name)) === 'swarm_wait')
 }
 
-function recordUnsettledStep(
-  cid: string, tname: string, b: BatchDoneTracker,
-): void {
+function recordUnsettledStep(cid: string, tname: string, b: BatchDoneTracker): void {
   if (cid) {
     if (!b.seenIds.has(cid)) b.unsettledIds.add(cid)
     return
@@ -134,25 +119,19 @@ function consumeAnonymousDoneStep(step: Record<string, unknown>, tname: string, 
     if (b.seenPayloads.has(fp)) return false
     b.seenPayloads.add(fp)
   }
-  if (tname && (b.unsettledAnonTools.get(tname) ?? 0) > 0) {
-    b.unsettledAnonTools.set(tname, b.unsettledAnonTools.get(tname)! - 1)
-    b.unsettledAnonCount -= 1
-  } else if ((b.unsettledAnonTools.get('*') ?? 0) > 0) {
-    b.unsettledAnonTools.set('*', b.unsettledAnonTools.get('*')! - 1)
+  const key = tname && (b.unsettledAnonTools.get(tname) ?? 0) > 0 ? tname : ((b.unsettledAnonTools.get('*') ?? 0) > 0 ? '*' : '')
+  if (key) {
+    b.unsettledAnonTools.set(key, b.unsettledAnonTools.get(key)! - 1)
     b.unsettledAnonCount -= 1
   }
   return true
 }
 
 interface BatchDoneTracker {
-  readonly seenIds: Set<string>
-  readonly unsettledIds: Set<string>
-  readonly unsettledAnonTools: Map<string, number>
-  unsettledAnonCount: number
-  readonly seenIndices: Set<number>
-  readonly seenPayloads: Set<string>
-  doneCount: number
-  explicitSwarmWaitDone: boolean
+  readonly seenIds: Set<string>; readonly unsettledIds: Set<string>
+  readonly unsettledAnonTools: Map<string, number>; unsettledAnonCount: number
+  readonly seenIndices: Set<number>; readonly seenPayloads: Set<string>
+  doneCount: number; explicitSwarmWaitDone: boolean
 }
 
 function createBatchDoneTracker(): BatchDoneTracker {
@@ -182,42 +161,32 @@ function ingestBatchDoneStep(b: BatchDoneTracker, step: Record<string, unknown>,
   b.doneCount += 1
 }
 
-function batchHasUnsettled(b: BatchDoneTracker): boolean {
-  return b.unsettledIds.size > 0 || b.unsettledAnonCount > 0
-}
+function batchHasUnsettled(b: BatchDoneTracker): boolean { return b.unsettledIds.size > 0 || b.unsettledAnonCount > 0 }
+
+type TurnEndKind = 'none' | 'speculative' | 'certain'
 
 interface TurnBoundaryState {
-  hasSteps: boolean
-  lastType: string
-  lastSt: string
-  lastToolName: string
-  lastCallsLen: number
-  hasPlanner: boolean
-  lastPlannerSt: string
-  lastPlannerHasWait: boolean
-  lastPlannerCallsLen: number
-  epoch: number
-  readonly callState: CallReductionState
-  batch: BatchDoneTracker
-  cachedEnded: boolean | null
+  hasSteps: boolean; lastType: string; lastSt: string; lastToolName: string; lastCallsLen: number
+  hasPlanner: boolean; lastPlannerSt: string; lastPlannerHasWait: boolean; lastPlannerCallsLen: number
+  epoch: number; readonly callState: CallReductionState; batch: BatchDoneTracker
+  cachedEnded: TurnEndKind | null; lastCutPending: boolean
 }
 
 function createTurnBoundaryState(): TurnBoundaryState {
   return {
     hasSteps: false, lastType: '', lastSt: '', lastToolName: '', lastCallsLen: 0,
     hasPlanner: false, lastPlannerSt: '', lastPlannerHasWait: false, lastPlannerCallsLen: 0,
-    epoch: 0, callState: createCallReductionState(), batch: createBatchDoneTracker(), cachedEnded: null,
+    epoch: 0, callState: createCallReductionState(), batch: createBatchDoneTracker(),
+    cachedEnded: null, lastCutPending: false,
   }
 }
 
 function ingestTurnBoundaryStep(
-  t: TurnBoundaryState,
-  step: Record<string, unknown>,
-  stepType: string,
-  bgTasks?: BackgroundTaskState,
+  t: TurnBoundaryState, step: Record<string, unknown>, stepType: string, bgTasks?: BackgroundTaskState,
 ): void {
   t.hasSteps = true
   t.cachedEnded = null
+  if (stepType !== 'SYSTEM_MESSAGE') t.lastCutPending = false
   t.lastType = stepType
   t.lastSt = strOf(step.status).toUpperCase()
   if (stepType === 'PLANNER_RESPONSE') {
@@ -240,62 +209,80 @@ function ingestTurnBoundaryStep(
   ingestBatchDoneStep(t.batch, step, stepType)
 }
 
-function isTurnEndedIncremental(t: TurnBoundaryState): boolean {
-  if (!t.hasSteps) return false
+function isTurnEndedIncremental(t: TurnBoundaryState): TurnEndKind {
+  if (!t.hasSteps) return 'none'
   if (t.cachedEnded !== null) return t.cachedEnded
-  let ended = false
+  let kind: TurnEndKind = 'none'
+  const hasSpeculative = t.callState.speculativeIdOwners.size > 0
   if (t.lastType === 'ERROR_MESSAGE') {
-    ended = true
+    kind = hasSpeculative ? 'speculative' : 'certain'
   } else if (t.lastType === 'PLANNER_RESPONSE') {
-    ended = t.lastSt === 'DONE' && t.lastCallsLen === 0
+    if (t.lastSt === 'DONE' && t.lastCallsLen === 0) kind = hasSpeculative ? 'speculative' : 'certain'
   } else if (!t.hasPlanner) {
-    ended =
-      t.lastToolName === 'swarm_wait' &&
-      t.lastSt === 'DONE' &&
-      !batchHasUnsettled(t.batch) &&
-      t.batch.explicitSwarmWaitDone &&
-      !hasUnaccountedNonBoardToolSnapshot(t.callState)
+    if (t.lastToolName === 'swarm_wait' && t.lastSt === 'DONE' && !batchHasUnsettled(t.batch) && t.batch.explicitSwarmWaitDone) {
+      kind = classifyNonBoardTurnEnd(t.callState)
+    }
   } else if (
-    t.lastPlannerSt === 'DONE' &&
-    t.lastPlannerHasWait &&
-    !batchHasUnsettled(t.batch) &&
+    t.lastPlannerSt === 'DONE' && t.lastPlannerHasWait && !batchHasUnsettled(t.batch) &&
     (t.batch.explicitSwarmWaitDone || t.batch.doneCount >= t.lastPlannerCallsLen)
   ) {
-    ended = !hasUnaccountedNonBoardToolSnapshot(t.callState)
+    kind = classifyNonBoardTurnEnd(t.callState)
   }
-  t.cachedEnded = ended
-  return ended
+  t.cachedEnded = kind
+  return kind
+}
+
+function resolveDeferredSpeculativeCuts(
+  tracker: TurnBoundaryState, pendingCuts: readonly { stepIdx: number; preCutCallCount: number }[], turnStart: number,
+): number {
+  resolveFallbackTerminals(tracker.callState)
+  let minUnaccounted = Number.POSITIVE_INFINITY
+  for (const idx of tracker.callState.unaccountedNonBoard) {
+    if (!tracker.callState.accounted.has(idx) && idx < minUnaccounted) minUnaccounted = idx
+  }
+  for (let k = pendingCuts.length - 1; k >= 0; k -= 1) {
+    if (pendingCuts[k]!.preCutCallCount <= minUnaccounted) return pendingCuts[k]!.stepIdx
+  }
+  return turnStart
 }
 
 /**
  * Single-pass O(N) turn boundary locator: `USER_INPUT` always starts a new turn,
- * while `SYSTEM_MESSAGE` starts a new turn only after the preceding turn has
- * verifiably ended (never slicing or re-scanning prefixes on consecutive system messages).
+ * while `SYSTEM_MESSAGE` cuts irreversibly only when turn end is non-speculative
+ * (speculative ID-bearing fallbacks defer cut confirmation until scan completion).
  */
 export function findTurnStartIndex(
-  steps: readonly Record<string, unknown>[],
-  bgTasks?: BackgroundTaskState,
+  steps: readonly Record<string, unknown>[], bgTasks?: BackgroundTaskState,
 ): number {
   let turnStart = 0
   let tracker = createTurnBoundaryState()
+  const pendingCuts: Array<{ stepIdx: number; preCutCallCount: number }> = []
   for (let i = 0; i < steps.length; i += 1) {
     const step = steps[i]!
     const stepType = strOf(step.type).toUpperCase()
     if (stepType === 'USER_INPUT') {
       turnStart = i
+      pendingCuts.length = 0
       tracker = createTurnBoundaryState()
       ingestTurnBoundaryStep(tracker, step, stepType, bgTasks)
     } else if (stepType === 'SYSTEM_MESSAGE') {
-      if (i > turnStart && isTurnEndedIncremental(tracker)) {
-        turnStart = i
-        tracker = createTurnBoundaryState()
-        ingestTurnBoundaryStep(tracker, step, stepType, bgTasks)
+      if (i > turnStart && !tracker.lastCutPending) {
+        const endKind = isTurnEndedIncremental(tracker)
+        if (endKind === 'certain') {
+          turnStart = i
+          pendingCuts.length = 0
+          tracker = createTurnBoundaryState()
+          ingestTurnBoundaryStep(tracker, step, stepType, bgTasks)
+        } else if (endKind === 'speculative') {
+          pendingCuts.push({ stepIdx: i, preCutCallCount: tracker.callState.calls.length })
+          tracker.lastCutPending = true
+        }
       }
     } else {
       ingestTurnBoundaryStep(tracker, step, stepType, bgTasks)
     }
   }
-  return turnStart
+  return pendingCuts.length > 0 ? resolveDeferredSpeculativeCuts(tracker, pendingCuts, turnStart) : turnStart
 }
 
 function recOf(v: unknown): Record<string, unknown> | null {
@@ -324,13 +311,17 @@ interface TrackedToolCall {
 interface TerminalToolStep { readonly id: string; readonly norm: string; readonly epoch: number }
 
 interface ArgsBucket { readonly indices: number[]; head: number; second: number }
-interface FallbackOverlay { readonly accounted: Set<number>; nonBoardCovered: number }
+interface FallbackOverlay {
+  readonly accounted: Set<number>; readonly genericCoveredEpochs: Set<number>
+  nonBoardCovered: number; certainNonBoardCovered: number
+}
 
 interface CallReductionState {
   readonly calls: TrackedToolCall[]; readonly callIndicesById: Map<string, number[]>
   readonly callsByEpoch: Map<number, number[]>; readonly callsByEpochNorm: Map<string, number[]>
   readonly unboundByEpochNormArgs: Map<string, ArgsBucket>
   readonly accounted: Set<number>; readonly unaccountedNonBoard: Set<number>
+  readonly retirableNonBoardByEpoch: Map<number, number>
   readonly idMatchedEpochNorms: Set<string>; readonly plannerEpochNormCounts: Map<string, number>
   readonly plannerEpochCallCounts: Map<number, number>; readonly genericTerminalsByEpoch: Map<number, number>
   readonly namedFallbacksByEpoch: Map<number, TerminalToolStep[]>; readonly seenUnidNamedEpochNorms: Set<string>
@@ -344,10 +335,10 @@ function createCallReductionState(): CallReductionState {
   return {
     calls: [], callIndicesById: new Map(), callsByEpoch: new Map(), callsByEpochNorm: new Map(),
     unboundByEpochNormArgs: new Map(), accounted: new Set(), unaccountedNonBoard: new Set(),
-    idMatchedEpochNorms: new Set(), plannerEpochNormCounts: new Map(), plannerEpochCallCounts: new Map(),
-    genericTerminalsByEpoch: new Map(), namedFallbacksByEpoch: new Map(), seenUnidNamedEpochNorms: new Set(),
-    nonBoardNamedFallbackCount: 0, pendingIdFallbacks: new Map(), speculativeIdOwners: new Map(),
-    backupSpeculativeNamedByIdx: new Map(), exactIdSettled: new Set(),
+    retirableNonBoardByEpoch: new Map(), idMatchedEpochNorms: new Set(), plannerEpochNormCounts: new Map(),
+    plannerEpochCallCounts: new Map(), genericTerminalsByEpoch: new Map(), namedFallbacksByEpoch: new Map(),
+    seenUnidNamedEpochNorms: new Set(), nonBoardNamedFallbackCount: 0, pendingIdFallbacks: new Map(),
+    speculativeIdOwners: new Map(), backupSpeculativeNamedByIdx: new Map(), exactIdSettled: new Set(),
     seenTerminalIds: new Set(), seenStepIndices: new Set(), seenUnindexedPayloads: new Set(),
   }
 }
@@ -357,14 +348,12 @@ function pushBucketIndex<K, V = number>(map: Map<K, V[]>, key: K, item: V): void
   if (bucket) bucket.push(item)
   else map.set(key, [item])
 }
-
 function pushArgsBucket(state: CallReductionState, key: string, idx: number): void {
-  turnReductionBucketWritesForTests += 1
+  turnReductionMetricsForTests.bucketWrites += 1
   const bucket = state.unboundByEpochNormArgs.get(key)
   if (bucket) bucket.indices.push(idx)
   else state.unboundByEpochNormArgs.set(key, { indices: [idx], head: 0, second: 1 })
 }
-
 function pushNamedFallback(state: CallReductionState, epoch: number, term: TerminalToolStep): void {
   if (!term.id) {
     const key = `${epoch}:${term.norm}`
@@ -374,26 +363,30 @@ function pushNamedFallback(state: CallReductionState, epoch: number, term: Termi
   pushBucketIndex(state.namedFallbacksByEpoch, epoch, term)
   if (!BOARD_COORD_TOOLS.has(term.norm)) state.nonBoardNamedFallbackCount += 1
 }
-
-function indexCallId(state: CallReductionState, id: string, idx: number): void {
-  if (id) pushBucketIndex(state.callIndicesById, id, idx)
+function indexCallId(state: CallReductionState, id: string, idx: number): void { if (id) pushBucketIndex(state.callIndicesById, id, idx) }
+function isRetirablePlannerNonBoard(state: CallReductionState, idx: number): boolean {
+  const c = state.calls[idx]
+  return !!c && !c.isBoard && c.fromPlanner && !c.id && !c.boundDirect && !state.accounted.has(idx)
 }
-
+function adjustRetirableNonBoard(state: CallReductionState, epoch: number, delta: number): void {
+  const next = (state.retirableNonBoardByEpoch.get(epoch) ?? 0) + delta
+  if (next > 0) state.retirableNonBoardByEpoch.set(epoch, next)
+  else state.retirableNonBoardByEpoch.delete(epoch)
+}
 function markCallAccounted(state: CallReductionState, idx: number): void {
+  if (isRetirablePlannerNonBoard(state, idx)) adjustRetirableNonBoard(state, state.calls[idx]!.epoch, -1)
   state.accounted.add(idx)
   state.unaccountedNonBoard.delete(idx)
 }
-
 function unmarkCallAccounted(state: CallReductionState, idx: number): void {
   state.accounted.delete(idx)
   const c = state.calls[idx]
   if (c && !c.isBoard) state.unaccountedNonBoard.add(idx)
+  if (isRetirablePlannerNonBoard(state, idx)) adjustRetirableNonBoard(state, c!.epoch, 1)
 }
-
 function isCallAccounted(state: CallReductionState, overlay: FallbackOverlay | null, idx: number): boolean {
   return state.accounted.has(idx) || (overlay?.accounted.has(idx) ?? false)
 }
-
 function recordFallbackMatch(state: CallReductionState, overlay: FallbackOverlay | null, idx: number): void {
   if (!overlay) {
     markCallAccounted(state, idx)
@@ -423,7 +416,7 @@ function claimTerminalIdForCall(
   state: CallReductionState, idx: number, id: string, norm: string, epoch: number,
 ): void {
   if (!id || state.exactIdSettled.has(id)) return
-  turnReductionIdLookupsForTests += 1
+  turnReductionMetricsForTests.idLookups += 1
   const pending = state.pendingIdFallbacks.get(id)
   if (pending) {
     state.pendingIdFallbacks.delete(id)
@@ -445,7 +438,7 @@ function claimTerminalIdForCall(
 function findUnaccountedIndexById(
   state: CallReductionState, id: string, overlay: FallbackOverlay | null = null,
 ): number {
-  turnReductionIdLookupsForTests += 1
+  turnReductionMetricsForTests.idLookups += 1
   const bucket = state.callIndicesById.get(id)
   if (!bucket) return -1
   for (const idx of bucket) {
@@ -460,14 +453,16 @@ function isUnboundPlannerCandidate(state: CallReductionState, idx: number): bool
 }
 
 function findUnboundPlannerCallByEpochNorm(
-  state: CallReductionState, epoch: number, norm: string, requireNoId: boolean,
+  state: CallReductionState, epoch: number, norm: string, requireNoId: boolean, args: Record<string, unknown> | null,
 ): TrackedToolCall | null {
   const bucket = state.callsByEpochNorm.get(`${epoch}:${norm}`)
   if (!bucket || bucket.length === 0) return null
-  turnReductionCandidateVisitsForTests += 1
+  turnReductionMetricsForTests.candidateVisits += 1
   const idx = bucket[0]!
   const c = state.calls[idx]!
-  return !state.accounted.has(idx) && c.fromPlanner && !c.boundDirect && (!requireNoId || !c.id) ? c : null
+  if (state.accounted.has(idx) || !c.fromPlanner || c.boundDirect || (requireNoId && c.id)) return null
+  if (args && c.args && JSON.stringify(c.args) !== JSON.stringify(args)) return null
+  return c
 }
 
 function findUniqueArgsMatchedUnboundPlannerCall(
@@ -478,14 +473,14 @@ function findUniqueArgsMatchedUnboundPlannerCall(
   if (!bucket) return null
   const { indices } = bucket
   while (bucket.head < indices.length) {
-    turnReductionCandidateVisitsForTests += 1
+    turnReductionMetricsForTests.candidateVisits += 1
     if (isUnboundPlannerCandidate(state, indices[bucket.head]!)) break
     bucket.head += 1
   }
   if (bucket.head >= indices.length) return null
   if (bucket.second <= bucket.head) bucket.second = bucket.head + 1
   while (bucket.second < indices.length) {
-    turnReductionCandidateVisitsForTests += 1
+    turnReductionMetricsForTests.candidateVisits += 1
     if (isUnboundPlannerCandidate(state, indices[bucket.second]!)) return null
     bucket.second += 1
   }
@@ -506,9 +501,10 @@ function bindIdDirectCall(
   if (fromPlanner || !hasPlannerRoot) return false
   const epochNormTotal = state.plannerEpochNormCounts.get(`${epoch}:${norm}`) ?? 0
   const unbound = epochNormTotal === 1
-    ? findUnboundPlannerCallByEpochNorm(state, epoch, norm, true)
+    ? findUnboundPlannerCallByEpochNorm(state, epoch, norm, true, args)
     : findUniqueArgsMatchedUnboundPlannerCall(state, epoch, norm, args)
   if (!unbound) return false
+  if (isRetirablePlannerNonBoard(state, unbound.idx)) adjustRetirableNonBoard(state, unbound.epoch, -1)
   unbound.id = id
   indexCallId(state, id, unbound.idx)
   unbound.boundDirect = true
@@ -524,9 +520,10 @@ function bindUnidDirectCall(
   if (fromPlanner || !hasPlannerRoot) return false
   const epochNormTotal = state.plannerEpochNormCounts.get(`${epoch}:${norm}`) ?? 0
   const unbound = epochNormTotal === 1
-    ? findUnboundPlannerCallByEpochNorm(state, epoch, norm, false)
+    ? findUnboundPlannerCallByEpochNorm(state, epoch, norm, false, args)
     : findUniqueArgsMatchedUnboundPlannerCall(state, epoch, norm, args)
   if (!unbound) return false
+  if (isRetirablePlannerNonBoard(state, unbound.idx)) adjustRetirableNonBoard(state, unbound.epoch, -1)
   unbound.boundDirect = true
   if (!unbound.args && args) unbound.args = args
   return true
@@ -536,17 +533,16 @@ function bindExistingOrPlannerCall(
   state: CallReductionState, norm: string, id: string, args: Record<string, unknown> | null,
   fromPlanner: boolean, hasPlannerRoot: boolean, epoch: number,
 ): boolean {
-  if (id) return bindIdDirectCall(state, norm, id, args, fromPlanner, hasPlannerRoot, epoch)
-  return bindUnidDirectCall(state, norm, args, fromPlanner, hasPlannerRoot, epoch)
+  return id
+    ? bindIdDirectCall(state, norm, id, args, fromPlanner, hasPlannerRoot, epoch)
+    : bindUnidDirectCall(state, norm, args, fromPlanner, hasPlannerRoot, epoch)
 }
-
 function registerTrackedCallStart(
   state: CallReductionState, rawName: string, id: string, args: Record<string, unknown> | null,
   fromPlanner: boolean, hasPlannerRoot: boolean, epoch: number,
 ): void {
   const norm = normTool(rawName)
-  if (!norm) return
-  if (bindExistingOrPlannerCall(state, norm, id, args, fromPlanner, hasPlannerRoot, epoch)) return
+  if (!norm || bindExistingOrPlannerCall(state, norm, id, args, fromPlanner, hasPlannerRoot, epoch)) return
   const idx = state.calls.length
   const isBoard = BOARD_COORD_TOOLS.has(norm)
   state.calls.push({ idx, name: rawName, norm, id, isBoard, args, fromPlanner, boundDirect: !fromPlanner, epoch })
@@ -554,10 +550,12 @@ function registerTrackedCallStart(
   pushBucketIndex(state.callsByEpoch, epoch, idx)
   pushBucketIndex(state.callsByEpochNorm, `${epoch}:${norm}`, idx)
   if (fromPlanner && !id && args !== null) pushArgsBucket(state, `${epoch}:${norm}:${JSON.stringify(args)}`, idx)
-  if (!isBoard) state.unaccountedNonBoard.add(idx)
+  if (!isBoard) {
+    state.unaccountedNonBoard.add(idx)
+    if (fromPlanner && !id) adjustRetirableNonBoard(state, epoch, 1)
+  }
   if (id) claimTerminalIdForCall(state, idx, id, norm, epoch)
 }
-
 function registerCallList(
   state: CallReductionState, rawCalls: readonly unknown[], fromPlanner: boolean, hasPlannerRoot: boolean, epoch: number,
 ): void {
@@ -572,14 +570,11 @@ function registerCallList(
         state.plannerEpochNormCounts.set(key, (state.plannerEpochNormCounts.get(key) ?? 0) + 1)
       }
     }
-    if (validPlannerCount > 0) {
-      state.plannerEpochCallCounts.set(epoch, (state.plannerEpochCallCounts.get(epoch) ?? 0) + validPlannerCount)
-    }
+    if (validPlannerCount > 0) state.plannerEpochCallCounts.set(epoch, (state.plannerEpochCallCounts.get(epoch) ?? 0) + validPlannerCount)
   }
   for (const raw of rawCalls) {
     const obj = recOf(raw)
-    if (!obj) continue
-    registerTrackedCallStart(state, strOf(obj.name || obj.tool_name), stepCallId(obj), recOf(obj.arguments ?? obj.args), fromPlanner, hasPlannerRoot, epoch)
+    if (obj) registerTrackedCallStart(state, strOf(obj.name || obj.tool_name), stepCallId(obj), recOf(obj.arguments ?? obj.args), fromPlanner, hasPlannerRoot, epoch)
   }
 }
 
@@ -629,10 +624,11 @@ function findUnambiguousNameFallbackIndex(
   if (state.idMatchedEpochNorms.has(key)) return -1
   const bucket = state.callsByEpochNorm.get(key)
   if (!bucket || bucket.length !== 1) return -1
-  turnReductionCandidateVisitsForTests += 1
+  turnReductionMetricsForTests.candidateVisits += 1
   const idx = bucket[0]!
   const c = state.calls[idx]!
   if (isCallAccounted(state, overlay, idx) || (term.id && c.id)) return -1
+  if (overlay?.genericCoveredEpochs.has(term.epoch) && isRetirablePlannerNonBoard(state, idx)) return -1
   return idx
 }
 
@@ -676,15 +672,23 @@ function resolveGenericEpochForOne(
 ): void {
   const bucket = state.callsByEpoch.get(epoch)
   if (!bucket || bucket.length === 0) return
-  const retirableTargets: number[] = []
-  for (const idx of bucket) {
-    turnReductionCandidateVisitsForTests += 1
-    const c = state.calls[idx]!
-    if (c.fromPlanner && !c.id && !c.boundDirect && !isCallAccounted(state, overlay, idx)) retirableTargets.push(idx)
-  }
   const possibleAnonymousSources = Math.max(bucket.length, state.plannerEpochCallCounts.get(epoch) ?? 0)
-  if (retirableTargets.length > 0 && genericCount >= possibleAnonymousSources) {
-    for (const idx of retirableTargets) recordFallbackMatch(state, overlay, idx)
+  if (genericCount < possibleAnonymousSources) return
+  if (overlay) {
+    let add = state.retirableNonBoardByEpoch.get(epoch) ?? 0
+    if (add > 0 && overlay.accounted.size > 0) {
+      for (const idx of overlay.accounted) {
+        if (state.calls[idx]!.epoch === epoch && isRetirablePlannerNonBoard(state, idx)) add -= 1
+      }
+    }
+    if (add > 0) overlay.nonBoardCovered += add
+    overlay.genericCoveredEpochs.add(epoch)
+    return
+  }
+  for (const idx of bucket) {
+    turnReductionMetricsForTests.candidateVisits += 1
+    const c = state.calls[idx]!
+    if (c.fromPlanner && !c.id && !c.boundDirect && !state.accounted.has(idx)) markCallAccounted(state, idx)
   }
 }
 
@@ -743,6 +747,7 @@ function resolveFallbackTerminals(state: CallReductionState, overlay: FallbackOv
   for (const [epoch, genericCount] of state.genericTerminalsByEpoch.entries()) {
     resolveGenericEpochForOne(state, epoch, genericCount, overlay)
   }
+  if (overlay) overlay.certainNonBoardCovered = overlay.nonBoardCovered
   const usedIds = deferredIdNamed.length > 0 ? new Set<string>() : null
   for (const term of deferredIdNamed) {
     if (usedIds!.has(term.id) || state.exactIdSettled.has(term.id) || !state.pendingIdFallbacks.has(term.id)) continue
@@ -754,12 +759,15 @@ function resolveFallbackTerminals(state: CallReductionState, overlay: FallbackOv
   }
 }
 
-function hasUnaccountedNonBoardToolSnapshot(state: CallReductionState): boolean {
-  if (state.unaccountedNonBoard.size === 0) return false
-  if (state.nonBoardNamedFallbackCount === 0 && state.genericTerminalsByEpoch.size === 0) return true
-  const overlay: FallbackOverlay = { accounted: new Set(), nonBoardCovered: 0 }
+function classifyNonBoardTurnEnd(state: CallReductionState): TurnEndKind {
+  if (state.unaccountedNonBoard.size === 0) return state.speculativeIdOwners.size > 0 ? 'speculative' : 'certain'
+  if (state.nonBoardNamedFallbackCount === 0 && state.genericTerminalsByEpoch.size === 0) return 'none'
+  const overlay: FallbackOverlay = { accounted: new Set(), genericCoveredEpochs: new Set(), nonBoardCovered: 0, certainNonBoardCovered: 0 }
   resolveFallbackTerminals(state, overlay)
-  return overlay.nonBoardCovered < state.unaccountedNonBoard.size
+  if (overlay.certainNonBoardCovered >= state.unaccountedNonBoard.size) {
+    return state.speculativeIdOwners.size > 0 ? 'speculative' : 'certain'
+  }
+  return overlay.nonBoardCovered >= state.unaccountedNonBoard.size ? 'speculative' : 'none'
 }
 
 export function findActiveNonBoardToolInTurn(
