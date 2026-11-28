@@ -50,6 +50,7 @@ import {
   type ComputeHostRow,
 } from "./types.js";
 import { decryptAgentPsk, isSelfPlaceholder } from "./crypto.js";
+import { bindStreamClientCancelCleanup, buildNodeAgentGetPathAndHeaders, pipeNodeAgentGetResponse } from "./nodeAgentRangeStream.js";
 import { getHostById } from "./queries.js";
 import { promises as fs } from "node:fs";
 import {
@@ -1066,20 +1067,20 @@ export async function streamFileTo(
   remotePath: string,
   dest: NodeJS.WritableStream,
   onReady: () => boolean,
-  opts?: { traceId?: string },
+  opts?: { traceId?: string; range?: { start: number; end: number } },
 ): Promise<"ok" | "missing" | "rejected"> {
   const master = await getMasterTls();
-  const headers: OutgoingHttpHeaders = {
-    accept: "application/octet-stream",
-  };
+  const headers: OutgoingHttpHeaders = { accept: "application/octet-stream" };
   headers[TRACE_ID_HEADER] = _resolveEffectiveTraceId(opts?.traceId, target.hostId, "/files");
   if (target.psk) headers.authorization = `Bearer ${target.psk.toString("hex")}`;
-  const path = `/files?path=${encodeURIComponent(remotePath)}`;
+  const path = buildNodeAgentGetPathAndHeaders(remotePath, headers, opts?.range);
   return new Promise((resolve, reject) => {
     let settled = false;
+    let unbindCancel: (() => void) | undefined;
     const finish = (err: Error | null, value?: "ok" | "missing" | "rejected") => {
       if (settled) return;
       settled = true;
+      unbindCancel?.();
       if (err) reject(err);
       else resolve(value ?? "ok");
     };
@@ -1128,19 +1129,15 @@ export async function streamFileTo(
               finish(null, "rejected");
               return;
             }
-            res.on("error", (err) => finish(err));
-            res.on("end", () => finish(null, "ok"));
-            res.pipe(dest);
-            res.resume();
+            pipeNodeAgentGetResponse(res, dest, opts?.range, finish);
           } catch (err) {
-            try {
-              res.destroy();
-            } catch { /* already closed */ }
+            try { res.destroy(); } catch { /* already closed */ }
             finish(err instanceof Error ? err : new Error(String(err)));
           }
         })();
       },
     );
+    unbindCancel = bindStreamClientCancelCleanup(dest, req);
     req.on("timeout", () => {
       req.destroy();
       finish(new AgentUnreachableError(target.hostId, `request timeout to ${target.host}:${target.agentPort}${path}`));

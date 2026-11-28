@@ -267,6 +267,10 @@ const HARDLINK_FALLBACK_CODES: ReadonlySet<string> = new Set<string>([
   'ENOSYS',
 ])
 
+let monotonicBlobSeq = 0
+function nextSortableBlobId(nowMs: number): string {
+  return `blob-${nowMs.toString(36).padStart(9, '0')}-${(++monotonicBlobSeq).toString(36).padStart(6, '0')}-${randomUUID().slice(0, 12)}`
+}
 function assertCondition(condition: unknown, code: string): asserts condition {
   if (!condition) throw new Error(code)
 }
@@ -585,8 +589,9 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
     mkdirSync(path.dirname(objectPath), { recursive: true })
     writeAtomicFileNoFollow(objectPath, input.bytes, 0o444)
 
-    const blobId = `blob-${randomUUID()}`
-    const createdAt = new Date(this.now()).toISOString()
+    const nowMs = this.now()
+    const blobId = nextSortableBlobId(nowMs)
+    const createdAt = new Date(nowMs).toISOString()
     const ref = validateArtifactBlobRef({
       blobId,
       tenantId: input.tenantId,
@@ -811,19 +816,12 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
     const assembledTmpPath = path.join(uploadDir, `assembled-${randomUUID()}.tmp`)
     const wholeHash = createHash('sha256')
     let totalBytes = 0
-    const outFd = openSync(
-      assembledTmpPath,
-      fsConstants.O_CREAT |
-        fsConstants.O_EXCL |
-        fsConstants.O_WRONLY |
-        (fsConstants.O_NOFOLLOW ?? 0),
-      0o600,
-    )
+    const openFlags = fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | (fsConstants.O_NOFOLLOW ?? 0)
+    const outFd = openSync(assembledTmpPath, openFlags, 0o600)
     try {
       for (let i = 0; i < manifest.chunkCount; i += 1) {
         const expectedPart = manifest.parts[String(i)]!
-        const partPath = path.join(uploadDir, `part-${i}`)
-        const partData = readRegularFileNoFollowAndHash(partPath)
+        const partData = readRegularFileNoFollowAndHash(path.join(uploadDir, `part-${i}`))
         assertCondition(
           partData.sha256 === expectedPart.sha256 && partData.sizeBytes === expectedPart.sizeBytes,
           'BLOB_PART_SHA256_MISMATCH',
@@ -840,16 +838,8 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
       }
       fsyncSync(outFd)
     } catch (err) {
-      try {
-        closeSync(outFd)
-      } catch {
-        // ignore
-      }
-      try {
-        unlinkSync(assembledTmpPath)
-      } catch {
-        // ignore
-      }
+      try { closeSync(outFd) } catch { /* ignore */ }
+      try { unlinkSync(assembledTmpPath) } catch { /* ignore */ }
       throw err
     }
     closeSync(outFd)
@@ -870,8 +860,9 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
     renameSync(assembledTmpPath, objectPath)
     syncDirectoryBestEffort(path.dirname(objectPath))
 
-    const blobId = input.blobId ?? `blob-${randomUUID()}`
-    const createdAt = new Date(this.now()).toISOString()
+    const nowMs = this.now()
+    const blobId = input.blobId ?? nextSortableBlobId(nowMs)
+    const createdAt = new Date(nowMs).toISOString()
     const ref = validateArtifactBlobRef({
       blobId,
       tenantId: manifest.tenantId,
@@ -1292,13 +1283,7 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
   }
 }
 
-/**
- * Bridges `userMedia.ts` `UserMediaLocation` with `ArtifactBlobStore`:
- * - `kind === 'ok'` -> local host volume direct path (`local_direct`)
- * - `kind === 'fail' && reason === 'remote-host'` -> cross-node transfer via
- *   `ArtifactBlobStore` (`blob_bridge`) instead of failing hard
- * - All other fail reasons stay fail-closed.
- */
+/** Bridges `userMedia.ts` `UserMediaLocation` with `ArtifactBlobStore`. */
 export function resolveMediaOrBlobBridge(
   location: UserMediaLocation,
   opts: ResolveMediaOrBlobBridgeOptions = {},

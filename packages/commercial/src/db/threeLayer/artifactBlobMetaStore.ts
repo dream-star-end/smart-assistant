@@ -478,7 +478,7 @@ export class PgArtifactBlobMetaStore {
                 logical_name, container_relative_path, storage_backend, storage_uri, created_at
            FROM artifact_blobs
           WHERE tenant_id = $1 AND kind = $2 AND deleted_at IS NULL
-          ORDER BY created_at DESC`,
+          ORDER BY created_at DESC, ctid DESC, blob_id DESC`,
         [tenantId, kind],
       )
       return Object.freeze(res.rows.map(mapBlobRow))
@@ -489,7 +489,7 @@ export class PgArtifactBlobMetaStore {
               logical_name, container_relative_path, storage_backend, storage_uri, created_at
          FROM artifact_blobs
         WHERE tenant_id = $1 AND deleted_at IS NULL
-        ORDER BY created_at DESC`,
+        ORDER BY created_at DESC, ctid DESC, blob_id DESC`,
       [tenantId],
     )
     return Object.freeze(res.rows.map(mapBlobRow))

@@ -45,7 +45,13 @@ export interface RemoteHostChunkHooks {
     hostUuid: string;
     remotePath: string;
     dest: NodeJS.WritableStream;
-    onReady: (info: { size: number }) => boolean;
+    resolveRange?: (totalSize: number) => { start: number; end: number } | null;
+    isHead?: boolean;
+    onReady: (info: {
+      size: number;
+      range?: { start: number; end: number } | null;
+      contentLength?: number;
+    }) => boolean;
   }) => Promise<"ok" | "missing" | "rejected">;
   openCasMediaFallback?: (args: {
     userId: string;
@@ -57,6 +63,9 @@ export interface RemoteHostChunkHooks {
       totalSize: number;
       range: { start: number; end: number } | null;
       contentLength: number;
+      sha256?: string;
+      isImmutableDigest?: boolean;
+      policyCheckPaths?: readonly string[];
     }) => boolean;
   }) => Promise<"ok" | "missing" | "rejected">;
 }
@@ -125,6 +134,42 @@ async function assembleRemoteUploadWithCasMirror(
   return assembled;
 }
 
+async function openRemoteHostMediaStreamOrHead(args: {
+  hostUuid: string;
+  remotePath: string;
+  dest: NodeJS.WritableStream;
+  resolveRange?: (totalSize: number) => { start: number; end: number } | null;
+  isHead?: boolean;
+  onReady: (info: {
+    size: number;
+    range?: { start: number; end: number } | null;
+    contentLength?: number;
+  }) => boolean;
+}): Promise<"ok" | "missing" | "rejected"> {
+  const target = await resolveServiceableHostTarget(args.hostUuid);
+  try {
+    const st = await statFile(target, args.remotePath, { hash: false });
+    if (!st.exists) return "missing";
+    const size = st.size ?? 0;
+    const range = args.isHead ? null : args.resolveRange ? args.resolveRange(size) : null;
+    const contentLength = range ? range.end - range.start + 1 : size;
+    if (args.isHead === true || contentLength === 0) {
+      if (!args.onReady({ size, range, contentLength })) return "rejected";
+      if (!args.isHead) (args.dest as NodeJS.WritableStream & { end: () => void }).end();
+      return "ok";
+    }
+    return await streamFileTo(
+      target,
+      args.remotePath,
+      args.dest,
+      () => args.onReady({ size, range, contentLength }),
+      range ? { range } : undefined,
+    );
+  } finally {
+    target.psk?.fill(0);
+  }
+}
+
 export function createRemoteHostChunkHooks(
   cas?: CasMediaChunkMirrorCallbacks,
 ): RemoteHostChunkHooks {
@@ -149,18 +194,7 @@ export function createRemoteHostChunkHooks(
         target.psk?.fill(0);
       }
     },
-    openRemoteHostMedia: async (args) => {
-      const target = await resolveServiceableHostTarget(args.hostUuid);
-      try {
-        const st = await statFile(target, args.remotePath, { hash: false });
-        if (!st.exists) return "missing";
-        return await streamFileTo(target, args.remotePath, args.dest, () =>
-          args.onReady({ size: st.size ?? 0 }),
-        );
-      } finally {
-        target.psk?.fill(0);
-      }
-    },
+    openRemoteHostMedia: openRemoteHostMediaStreamOrHead,
     openCasMediaFallback: cas?.openCasMediaFallback,
   };
 }

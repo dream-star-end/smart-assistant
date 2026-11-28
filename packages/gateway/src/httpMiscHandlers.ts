@@ -37,7 +37,11 @@ import {
   openAdvisorEngines,
 } from './advisorMode.js'
 import { CollaborationConfigError, resolveSessionCollab } from './advisorConfigStore.js'
-import { handleMediaGetFailLocation, tryServeCasMediaFallback } from './httpMediaCasFallback.js'
+import {
+  handleMediaGetFailLocation,
+  mediaCacheControlForFilename,
+  tryServeCasMediaFallback,
+} from './httpMediaCasFallback.js'
 import { serveFileFdWithRange } from './httpRange.js'
 import { isEngineLocalTurnExempt } from './modelAuthority.js'
 import { getLocalCatalogView } from './modelCatalogClient.js'
@@ -479,7 +483,7 @@ export async function handleMediaGet(
   const mediaContentType = mimeFor(realPath)
   const mediaHeaders: Record<string, string | number> = {
     'Content-Type': mediaContentType,
-    'Cache-Control': 'private, max-age=3600',
+    'Cache-Control': mediaCacheControlForFilename(filename),
   }
   mediaHeaders['Content-Disposition'] =
     `${shouldServeInline(mediaContentType) ? 'inline' : 'attachment'}; filename="${encodeURIComponent(basename(realPath) || 'file')}"`

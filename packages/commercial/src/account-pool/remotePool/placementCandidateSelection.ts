@@ -78,7 +78,7 @@ export async function collectEligibleV4Candidates(params: {
       !doesRemoteProfileSatisfyCapabilities({
         canonicalModel: params.canonicalModel,
         upstreamModelId: String(row.upstream_model_id ?? params.canonicalModel),
-        probeSnapshot: check.snapshot,
+        probeSnapshot: row.probe_snapshot ?? check.snapshot,
         reg: params.reg,
         requiredCapabilities: params.requiredCapabilities,
         observedAt: observedAtIso,

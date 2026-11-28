@@ -7,6 +7,7 @@
  * `authorities: ["crypto"]`). Must NOT value-import internal workspace packages.
  */
 import { timingSafeEqual } from 'node:crypto'
+import type { InferenceServiceTier, PlatformReasoningEffort } from '@openclaude/protocol'
 
 export const DEFAULT_REMOTE_RELAY_ACTIVE_SOCKET =
   '/run/openclaude-v5-selfhost/remote-relay-active.sock'
@@ -304,8 +305,14 @@ const HTTP_400_ERROR_CODES: ReadonlySet<string> = new Set([
   'INVALID_JSON',
 ])
 
-const RELAY_EFFORTS: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh'])
-const RELAY_TIERS: ReadonlySet<string> = new Set(['standard', 'priority', 'flex'])
+const RELAY_EFFORT_TUPLE = ['low', 'medium', 'high', 'xhigh', 'max'] as const satisfies readonly PlatformReasoningEffort[]
+const _ASSERT_ALL_EFFORTS: Exclude<PlatformReasoningEffort, (typeof RELAY_EFFORT_TUPLE)[number]> extends never ? true : never = true
+const RELAY_TIER_TUPLE = ['standard', 'fast', 'ultrafast'] as const satisfies readonly InferenceServiceTier[]
+const _ASSERT_ALL_TIERS: Exclude<InferenceServiceTier, (typeof RELAY_TIER_TUPLE)[number]> extends never ? true : never = true
+void _ASSERT_ALL_EFFORTS
+void _ASSERT_ALL_TIERS
+const RELAY_EFFORTS: ReadonlySet<string> = new Set<string>(RELAY_EFFORT_TUPLE)
+const RELAY_TIERS: ReadonlySet<string> = new Set<string>(RELAY_TIER_TUPLE)
 const RELAY_CAP_BOOL_KEYS = [
   'needsVision',
   'readOnly',

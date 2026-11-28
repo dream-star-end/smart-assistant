@@ -17,6 +17,7 @@ import {
   authorityEngineToInferenceFamily,
   checkCapabilitySuperset,
   resolveLogicalModelId,
+  supportedServiceTiers as protocolSupportedServiceTiers,
   validateDriverCapabilityManifest,
   validateRemoteProbeSnapshot,
   type DriverCapabilityManifest,
@@ -41,7 +42,25 @@ import {
 } from './unifiedPlacementRouter.js'
 
 const EFFORT_SET: ReadonlySet<string> = new Set<string>(PLATFORM_REASONING_EFFORTS)
-const DEFAULT_TIERS: readonly InferenceServiceTier[] = Object.freeze([...INFERENCE_SERVICE_TIERS])
+const TIER_SET: ReadonlySet<string> = new Set<string>(INFERENCE_SERVICE_TIERS)
+
+function deriveSupportedTiersForRemoteModel(
+  canonicalOrLogicalModel: string,
+  matchedProbeModel?: unknown,
+): readonly InferenceServiceTier[] {
+  const probeTiers =
+    matchedProbeModel && typeof matchedProbeModel === 'object' && 'supportedServiceTiers' in matchedProbeModel
+      ? (matchedProbeModel as { supportedServiceTiers?: unknown }).supportedServiceTiers
+      : undefined
+  if (Array.isArray(probeTiers)) {
+    const valid = probeTiers.filter((t): t is InferenceServiceTier => typeof t === 'string' && TIER_SET.has(t))
+    return Object.freeze(['standard', ...valid.filter((t) => t !== 'standard')] as const)
+  }
+  const extra = protocolSupportedServiceTiers(canonicalOrLogicalModel).filter(
+    (t): t is InferenceServiceTier => TIER_SET.has(t) && t !== 'standard',
+  )
+  return Object.freeze(['standard', ...extra] as const)
+}
 
 interface StickyBindingRow {
   readonly driver_id: string | null
@@ -112,6 +131,7 @@ function deriveModelCapabilityFromProbe(
   logicalModel: string,
   upstreamModelId: string,
   probeSnapshot: unknown,
+  canonicalModelId?: string,
 ): LogicalModelCapability {
   let supportsVision = false
   let supportedEfforts: readonly PlatformReasoningEffort[] = Object.freeze([
@@ -119,14 +139,22 @@ function deriveModelCapabilityFromProbe(
   ])
   let defaultEffort: PlatformReasoningEffort | null = 'medium'
   let supportsAdaptiveThinking = true
+  let matchedModelRaw: unknown
 
   if (probeSnapshot !== null && probeSnapshot !== undefined) {
     try {
       const snap = validateRemoteProbeSnapshot(probeSnapshot)
-      const matched =
-        snap.models.find((m) => m.upstreamModelId === upstreamModelId) ??
-        snap.models.find((m) => m.upstreamModelId === logicalModel) ??
-        snap.models[0]
+      const rawModels = Array.isArray((probeSnapshot as { models?: unknown }).models)
+        ? ((probeSnapshot as { models: readonly unknown[] }).models)
+        : []
+      const matchedIdx =
+        snap.models.findIndex((m) => m.upstreamModelId === upstreamModelId) >= 0
+          ? snap.models.findIndex((m) => m.upstreamModelId === upstreamModelId)
+          : snap.models.findIndex((m) => m.upstreamModelId === logicalModel) >= 0
+            ? snap.models.findIndex((m) => m.upstreamModelId === logicalModel)
+            : 0
+      const matched = snap.models[matchedIdx]
+      matchedModelRaw = rawModels[matchedIdx]
       if (matched) {
         supportsVision = matched.supportsVision
         const validEfforts = matched.supportedEfforts.filter((e): e is PlatformReasoningEffort =>
@@ -152,7 +180,10 @@ function deriveModelCapabilityFromProbe(
     supportsVision,
     supportedEfforts,
     defaultEffort,
-    supportedServiceTiers: DEFAULT_TIERS,
+    supportedServiceTiers: deriveSupportedTiersForRemoteModel(
+      canonicalModelId ?? logicalModel,
+      matchedModelRaw,
+    ),
     supportsReadOnly: true,
     supportsConsultTurn: true,
     supportsHermeticNoTools: true,
@@ -175,7 +206,12 @@ export function doesRemoteProfileSatisfyCapabilities(params: {
   const { logicalModel } = resolveLogicalModelId(params.canonicalModel)
   const normalizedUpstream =
     params.upstreamModelId.trim().length > 0 ? params.upstreamModelId.trim().toLowerCase() : logicalModel
-  const capability = deriveModelCapabilityFromProbe(logicalModel, normalizedUpstream, params.probeSnapshot)
+  const capability = deriveModelCapabilityFromProbe(
+    logicalModel,
+    normalizedUpstream,
+    params.probeSnapshot,
+    params.canonicalModel,
+  )
   const manifest: DriverCapabilityManifest = validateDriverCapabilityManifest({
     schemaVersion: 5,
     poolKind: 'remote_pool',
@@ -207,7 +243,14 @@ function buildRemoteCandidateDescriptor(params: {
     typeof row.upstream_model_id === 'string' && row.upstream_model_id.trim().length > 0
       ? row.upstream_model_id.trim().toLowerCase()
       : logicalModel
-  const capability = deriveModelCapabilityFromProbe(logicalModel, upstreamModelId, row.probe_snapshot)
+  const capability = deriveModelCapabilityFromProbe(
+    logicalModel,
+    upstreamModelId,
+    row.probe_snapshot,
+    typeof row.canonical_model_id === 'string' && row.canonical_model_id.length > 0
+      ? row.canonical_model_id
+      : logicalModel,
+  )
 
   const manifest: DriverCapabilityManifest = validateDriverCapabilityManifest({
     schemaVersion: 5,

@@ -1,8 +1,17 @@
 /**
  * Per-file CAS & Remote-Host Range media GET helpers for `httpMiscHandlers.ts` (`OCV5-928` B2/B4).
  *
- * Keeps physical volume routing (`remote-host` / `local_direct` / `volume-missing`) intact
- * while providing per-file CAS fallback and HTTP Range (`206 Partial Content`) parity.
+ * Invariants:
+ * - B2-a: Pre-header node-agent I/O/transport errors fall back to healthy per-file CAS replica
+ *   before returning 502; explicit policy rejections (`403`) never downgrade.
+ * - B2-b: Remote Range (`206`) and `HEAD` stream end-to-end via `openRemoteHostMedia` without
+ *   buffering whole files into Master memory.
+ * - B2-c: CAS stream handle is opened before `onReady` writes 200/206 headers; mid-stream errors
+ *   after headers destroy `res` cleanly instead of leaving un-ended sockets.
+ * - B2-d: CAS policy check evaluates all canonical paths (`/<uploads|generated>/<filename>`,
+ *   `logicalName`, `containerRelativePath`) identically to physical volume checks.
+ * - B4: Only content-addressed `<64-hex-sha256>[.<ext>]` URLs receive `immutable` caching;
+ *   mutable logical names emit `no-cache, must-revalidate` (plus `ETag` / `304` on CAS).
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename } from 'node:path'
@@ -11,21 +20,47 @@ import type { HttpMiscHandlersHost, ResolveMediaDirsResult } from './httpMiscHan
 import { parseByteRange } from './httpRange.js'
 import { mimeFor } from './httpUploadStatic.js'
 
+const IMMUTABLE_DIGEST_FILENAME_RE = /^[0-9a-f]{64}(?:\.[a-z0-9]{1,16})?$/i
+
 export interface MediaFallbackLookup {
   readonly userId: string
   readonly filename: string
   readonly isFileBlocked: (pathOrName: string) => boolean
 }
 
-function buildMediaBaseHeaders(pathOrName: string): Record<string, string | number> {
+export function mediaCacheControlForFilename(
+  pathOrName: string,
+  explicitImmutable?: boolean,
+): string {
+  const base = basename(pathOrName)
+  const immutable = explicitImmutable ?? IMMUTABLE_DIGEST_FILENAME_RE.test(base)
+  return immutable ? 'private, max-age=3600, immutable' : 'private, no-cache, must-revalidate'
+}
+
+function buildMediaBaseHeaders(
+  pathOrName: string,
+  opts?: { readonly isImmutableDigest?: boolean; readonly sha256?: string },
+): Record<string, string | number> {
   const contentType = mimeFor(pathOrName)
   const disposition = `${shouldServeInline(contentType) ? 'inline' : 'attachment'}; filename="${encodeURIComponent(basename(pathOrName) || 'file')}"`
   return {
     'Content-Type': contentType,
-    'Cache-Control': 'private, max-age=3600',
+    'Cache-Control': mediaCacheControlForFilename(pathOrName, opts?.isImmutableDigest),
     'Content-Disposition': disposition,
     'Accept-Ranges': 'bytes',
+    ...(opts?.sha256 ? { ETag: `"${opts.sha256}"` } : {}),
   }
+}
+
+function matchesIfNoneMatch(req: IncomingMessage, sha256: string | undefined): boolean {
+  if (!sha256 || req.headers.range) return false
+  const raw = req.headers['if-none-match']
+  if (typeof raw !== 'string' || raw.trim().length === 0) return false
+  const target = `"${sha256}"`
+  return raw
+    .split(',')
+    .map((part) => part.trim().replace(/^W\//, ''))
+    .some((tag) => tag === '*' || tag === target)
 }
 
 export function sendBufferMediaWithRange(
@@ -61,6 +96,7 @@ export async function tryServeCasMediaFallback(
   const openCas = host.deps.commercial?.openCasMediaFallback
   if (!openCas) return false
   const { userId, filename, isFileBlocked } = lookup
+  let responded304 = false
   try {
     const outcome = await openCas({
       userId,
@@ -69,13 +105,26 @@ export async function tryServeCasMediaFallback(
       resolveRange: (totalSize) => parseByteRange(req.headers.range, totalSize),
       isHead: req.method === 'HEAD',
       onReady: (info) => {
-        if (isFileBlocked(filename)) {
+        const checkPaths = info.policyCheckPaths ?? [`/uploads/${filename}`, `/generated/${filename}`]
+        if (checkPaths.some((p) => isFileBlocked(p))) {
           host.log.warn('media: CAS hit blocked by sensitive deny-list', { filename })
           res.writeHead(403)
           res.end('access denied')
           return false
         }
-        const baseHeaders = buildMediaBaseHeaders(filename)
+        const baseHeaders = buildMediaBaseHeaders(filename, {
+          isImmutableDigest: info.isImmutableDigest,
+          sha256: info.sha256,
+        })
+        if (matchesIfNoneMatch(req, info.sha256)) {
+          responded304 = true
+          res.writeHead(304, {
+            'Cache-Control': baseHeaders['Cache-Control']!,
+            ETag: `"${info.sha256}"`,
+          })
+          res.end()
+          return false
+        }
         if (info.range) {
           res.writeHead(206, {
             ...baseHeaders,
@@ -89,31 +138,44 @@ export async function tryServeCasMediaFallback(
         return true
       },
     })
+    if (responded304) return true
     return outcome !== 'missing'
   } catch (err) {
     host.log.warn('media: CAS fallback failed, continuing without CAS', { userId, filename }, err)
-    return res.headersSent
+    if (res.headersSent) {
+      if (!res.writableEnded && !res.destroyed) {
+        res.destroy(err instanceof Error ? err : undefined)
+      }
+      return true
+    }
+    return false
   }
 }
 
+type RemoteMediaAttemptOutcome = 'served' | 'missing' | 'upstream_error'
+
 async function streamRemoteHostMediaCandidates(
   host: HttpMiscHandlersHost,
+  req: IncomingMessage,
   res: ServerResponse,
   ctx: {
     readonly mediaLocation: Extract<ResolveMediaDirsResult, { kind: 'fail'; reason: 'remote-host' }>
     readonly remoteCandidates: readonly string[]
     readonly isFileBlocked: (pathOrName: string) => boolean
   },
-): Promise<boolean> {
+): Promise<RemoteMediaAttemptOutcome> {
   const openRemote = host.deps.commercial?.openRemoteHostMedia
-  if (!openRemote) return false
+  if (!openRemote) return 'missing'
   const { mediaLocation, remoteCandidates, isFileBlocked } = ctx
+  const isHead = req.method === 'HEAD'
   for (const remotePath of remoteCandidates) {
     try {
       const outcome = await openRemote({
         hostUuid: mediaLocation.hostUuid,
         remotePath,
         dest: res,
+        resolveRange: (totalSize) => parseByteRange(req.headers.range, totalSize),
+        isHead,
         onReady: (info) => {
           if (isFileBlocked(remotePath)) {
             host.log.warn('media: remote hit blocked by sensitive deny-list', { remotePath })
@@ -121,22 +183,44 @@ async function streamRemoteHostMediaCandidates(
             res.end('access denied')
             return false
           }
-          res.writeHead(200, { ...buildMediaBaseHeaders(remotePath), 'Content-Length': info.size })
+          const baseHeaders = buildMediaBaseHeaders(remotePath)
+          const effectiveRange =
+            info.range !== undefined
+              ? info.range
+              : isHead
+                ? null
+                : parseByteRange(req.headers.range, info.size)
+          if (effectiveRange) {
+            const len = info.contentLength ?? effectiveRange.end - effectiveRange.start + 1
+            res.writeHead(206, {
+              ...baseHeaders,
+              'Content-Range': `bytes ${effectiveRange.start}-${effectiveRange.end}/${info.size}`,
+              'Content-Length': len,
+            })
+          } else {
+            res.writeHead(200, { ...baseHeaders, 'Content-Length': info.size })
+            if (isHead) res.end()
+          }
           return true
         },
       })
-      if (outcome !== 'missing') return true
+      if (outcome !== 'missing') return 'served'
     } catch (err) {
       host.log.error(
         'media: remote-host pull failed',
         { hostUuid: mediaLocation.hostUuid, remotePath, ...mediaLocation.logCtx },
         err as Error,
       )
-      if (!res.headersSent) host.sendError(res, 502, 'remote storage pull failed')
-      return true
+      if (res.headersSent) {
+        if (!res.writableEnded && !res.destroyed) {
+          res.destroy(err instanceof Error ? err : undefined)
+        }
+        return 'served'
+      }
+      return 'upstream_error'
     }
   }
-  return false
+  return 'missing'
 }
 
 async function pullRemoteHostMediaCandidates(
@@ -148,9 +232,9 @@ async function pullRemoteHostMediaCandidates(
     readonly remoteCandidates: readonly string[]
     readonly isFileBlocked: (pathOrName: string) => boolean
   },
-): Promise<boolean> {
+): Promise<RemoteMediaAttemptOutcome> {
   const pullRemote = host.deps.commercial?.pullRemoteHostMedia
-  if (!pullRemote) return false
+  if (!pullRemote) return 'missing'
   const { mediaLocation, remoteCandidates, isFileBlocked } = ctx
   for (const remotePath of remoteCandidates) {
     try {
@@ -160,21 +244,20 @@ async function pullRemoteHostMediaCandidates(
         host.log.warn('media: remote hit blocked by sensitive deny-list', { hitPath: remotePath })
         res.writeHead(403)
         res.end('access denied')
-        return true
+        return 'served'
       }
       sendBufferMediaWithRange(req, res, remotePath, result)
-      return true
+      return 'served'
     } catch (err) {
       host.log.error(
         'media: remote-host pull failed',
         { hostUuid: mediaLocation.hostUuid, remotePath, ...mediaLocation.logCtx },
         err as Error,
       )
-      host.sendError(res, 502, 'remote storage pull failed')
-      return true
+      return res.headersSent ? 'served' : 'upstream_error'
     }
   }
-  return false
+  return 'missing'
 }
 
 export async function handleMediaGetFailLocation(
@@ -190,30 +273,39 @@ export async function handleMediaGetFailLocation(
     host.deps.commercial?.openRemoteHostMedia || host.deps.commercial?.pullRemoteHostMedia,
   )
   if (mediaLocation.reason === 'remote-host' && hasRemoteHook) {
-    const remoteCtx = {
-      mediaLocation,
-      remoteCandidates: [`${mediaLocation.uploads}/${ctx.filename}`, `${mediaLocation.generated}/${ctx.filename}`],
-      isFileBlocked: ctx.isFileBlocked,
+    const remoteCandidates = [
+      `${mediaLocation.uploads}/${ctx.filename}`,
+      `${mediaLocation.generated}/${ctx.filename}`,
+    ]
+    if (remoteCandidates.some((p) => ctx.isFileBlocked(p))) {
+      host.log.warn('media: remote request blocked by sensitive deny-list', { filename: ctx.filename })
+      res.writeHead(403)
+      res.end('access denied')
+      return
     }
-    const useRangePull = Boolean(req.headers.range && host.deps.commercial?.pullRemoteHostMedia)
-    const served = useRangePull
-      ? await pullRemoteHostMediaCandidates(host, req, res, remoteCtx)
-      : host.deps.commercial?.openRemoteHostMedia
-        ? await streamRemoteHostMediaCandidates(host, res, remoteCtx)
-        : await pullRemoteHostMediaCandidates(host, req, res, remoteCtx)
-    if (served) return
+    const remoteCtx = { mediaLocation, remoteCandidates, isFileBlocked: ctx.isFileBlocked }
+    const remoteOutcome = host.deps.commercial?.openRemoteHostMedia
+      ? await streamRemoteHostMediaCandidates(host, req, res, remoteCtx)
+      : await pullRemoteHostMediaCandidates(host, req, res, remoteCtx)
+    if (remoteOutcome === 'served') return
     if (await tryServeCasMediaFallback(host, req, res, ctx)) return
     if (!res.headersSent) {
-      res.writeHead(404)
-      res.end('not found')
+      if (remoteOutcome === 'upstream_error') {
+        host.sendError(res, 502, 'remote storage pull failed')
+      } else {
+        res.writeHead(404)
+        res.end('not found')
+      }
     }
     return
   }
-  if (
-    (mediaLocation.reason === 'remote-host' || mediaLocation.reason === 'volume-missing') &&
-    (await tryServeCasMediaFallback(host, req, res, ctx))
-  ) {
-    return
+  if (mediaLocation.reason === 'remote-host' || mediaLocation.reason === 'volume-missing') {
+    if ([`/uploads/${ctx.filename}`, `/generated/${ctx.filename}`].some((p) => ctx.isFileBlocked(p))) {
+      res.writeHead(403)
+      res.end('access denied')
+      return
+    }
+    if (await tryServeCasMediaFallback(host, req, res, ctx)) return
   }
   host._sendMediaResolveError(res, mediaLocation, 'media')
 }

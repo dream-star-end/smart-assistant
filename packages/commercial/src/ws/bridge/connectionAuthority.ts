@@ -2,8 +2,10 @@ import { WebSocket } from "ws";
 import {
   CODEX_SPEED_TIERS_CAPABILITY,
   DURABLE_TURN_DISPATCH_CAPABILITY,
+  INFERENCE_SERVICE_TIERS,
   isCc5TestModel,
   MODEL_AUTHORITY_CAPABILITY,
+  PLATFORM_REASONING_EFFORTS,
   projectContextWindowForCursorTier,
   SYSTEM_HELP_CAPABILITY,
   type AuthorityPoolMigrationGrant,
@@ -250,13 +252,14 @@ export function signAuthorityBundle(
   }).bundle;
 }
 
-const TRUSTED_TURN_EFFORTS: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh"]);
-const TRUSTED_SERVICE_TIERS: ReadonlySet<string> = new Set(["standard", "priority", "flex"]);
+const TRUSTED_TURN_EFFORTS: ReadonlySet<string> = new Set<string>(PLATFORM_REASONING_EFFORTS);
+const TRUSTED_SERVICE_TIERS: ReadonlySet<string> = new Set<string>(INFERENCE_SERVICE_TIERS);
 
-function isImageAttachmentObj(item: unknown): boolean {
+function isImageMediaItem(item: unknown): boolean {
   if (!item || typeof item !== "object") return false;
-  const mime = (item as { mimeType?: unknown }).mimeType;
-  return typeof mime === "string" && mime.toLowerCase().startsWith("image/");
+  const obj = item as { kind?: unknown; mimeType?: unknown };
+  if (obj.kind === "image") return true;
+  return typeof obj.mimeType === "string" && obj.mimeType.toLowerCase().startsWith("image/");
 }
 
 function frameHasVisionPayload(
@@ -265,16 +268,34 @@ function frameHasVisionPayload(
 ): boolean {
   if (forceNeedsVision === true) return true;
   if (!inboundFrame) return false;
+  const content = inboundFrame.content;
+  if (content && typeof content === "object" && !Array.isArray(content)) {
+    const contentObj = content as { media?: unknown; imageEdit?: unknown };
+    if (contentObj.imageEdit && typeof contentObj.imageEdit === "object") return true;
+    if (Array.isArray(contentObj.media) && contentObj.media.some(isImageMediaItem)) return true;
+  }
   if (Array.isArray(inboundFrame.images) && inboundFrame.images.length > 0) return true;
   if (Array.isArray(inboundFrame.imageAttachments) && inboundFrame.imageAttachments.length > 0) return true;
-  return Array.isArray(inboundFrame.attachments) && inboundFrame.attachments.some(isImageAttachmentObj);
+  if (Array.isArray(inboundFrame.media) && inboundFrame.media.some(isImageMediaItem)) return true;
+  return Array.isArray(inboundFrame.attachments) && inboundFrame.attachments.some(isImageMediaItem);
 }
 
 function pickEffortFromFrame(frame: Readonly<Record<string, unknown>> | undefined): string | undefined {
   if (!frame) return undefined;
-  for (const key of ["reasoningEffort", "effort", "thinkingEffort"] as const) {
+  for (const key of ["effortLevel", "reasoningEffort", "effort", "thinkingEffort"] as const) {
     const val = frame[key];
+    if (val === null) return undefined;
     if (typeof val === "string" && TRUSTED_TURN_EFFORTS.has(val)) return val;
+  }
+  return undefined;
+}
+
+function pickServiceTierFromFrame(frame: Readonly<Record<string, unknown>> | undefined): string | undefined {
+  if (!frame) return undefined;
+  for (const key of ["serviceTier", "speedTier"] as const) {
+    const val = frame[key];
+    if (val === null) return undefined;
+    if (typeof val === "string" && TRUSTED_SERVICE_TIERS.has(val)) return val;
   }
   return undefined;
 }
@@ -294,14 +315,13 @@ function deriveServerTrustedTurnRequirements(
   if (frameHasVisionPayload(inboundFrame, extra?.forceNeedsVision)) caps.needsVision = true;
   const effort = pickEffortFromFrame(inboundFrame);
   if (caps.reasoningEffort === undefined && effort !== undefined) caps.reasoningEffort = effort;
-  const tier = inboundFrame?.serviceTier;
-  if (caps.serviceTier === undefined && typeof tier === "string" && TRUSTED_SERVICE_TIERS.has(tier)) {
-    caps.serviceTier = tier;
-  }
+  const tier = pickServiceTierFromFrame(inboundFrame);
+  if (caps.serviceTier === undefined && tier !== undefined) caps.serviceTier = tier;
   const rawSwarm = inboundFrame?.swarmMode;
   if (rawSwarm === true || (typeof rawSwarm === "string" && rawSwarm !== "" && rawSwarm !== "off")) {
     caps.needsSwarm = true;
   }
+  if (inboundFrame?.collabMode === "advisor") caps.consultTurn = true;
   for (const flag of ["readOnly", "consultTurn", "hermeticNoTools"] as const) {
     if (inboundFrame?.[flag] === true) caps[flag] = true;
   }

@@ -16,7 +16,7 @@
  * Layer: app-container (L4). Zero `process.env` reads; `createHash` only.
  */
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, readdir, readFile, realpath, unlink } from 'node:fs/promises'
+import { lstat, mkdir, readdir, readFile, realpath, stat, unlink } from 'node:fs/promises'
 import * as path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { validateArtifactBlobRef, type ArtifactBlobRef } from '@openclaude/protocol'
@@ -233,23 +233,27 @@ async function listLocalCasDiskMediaBlobs(
   const dirStat = await lstatNoFollow(metaDir)
   if (!dirStat || dirStat.isSymbolicLink() || !dirStat.isDirectory()) return []
   const entries = await readdir(metaDir, { withFileTypes: true })
-  const out: ArtifactBlobRef[] = []
+  const rows: Array<{ readonly ref: ArtifactBlobRef; readonly ts: number; readonly mtimeNs: bigint }> = []
   for (const ent of entries) {
     if (!ent.isFile() || !ent.name.endsWith('.json')) continue
     try {
-      const raw = await readFile(path.join(metaDir, ent.name), 'utf8')
+      const fullPath = path.join(metaDir, ent.name)
+      const [raw, st] = await Promise.all([readFile(fullPath, 'utf8'), stat(fullPath, { bigint: true })])
       const parsed = validateArtifactBlobRef(JSON.parse(raw))
-      if (
-        parsed.tenantId === tenantId &&
-        (parsed.kind === 'upload' || parsed.kind === 'generated')
-      ) {
-        out.push(parsed)
+      if (parsed.tenantId === tenantId && (parsed.kind === 'upload' || parsed.kind === 'generated')) {
+        const ts = Date.parse(parsed.createdAt)
+        rows.push({ ref: parsed, ts: Number.isFinite(ts) ? ts : 0, mtimeNs: st.mtimeNs })
       }
     } catch (err) {
       void err
     }
   }
-  return out
+  rows.sort((a, b) => {
+    if (a.ts !== b.ts) return b.ts - a.ts
+    if (a.ref.blobId !== b.ref.blobId) return b.ref.blobId.localeCompare(a.ref.blobId)
+    return a.mtimeNs === b.mtimeNs ? 0 : a.mtimeNs > b.mtimeNs ? -1 : 1
+  })
+  return rows.map((r) => r.ref)
 }
 
 async function listMediaBlobsForTenant(
@@ -271,7 +275,9 @@ function isNewerMediaBlob(candidate: ArtifactBlobRef, incumbent: ArtifactBlobRef
   if (Number.isFinite(candTs) && Number.isFinite(incTs) && candTs !== incTs) {
     return candTs > incTs
   }
-  return true
+  // Input comes newest-first from PG (`ORDER BY created_at DESC, ctid DESC, blob_id DESC`)
+  // or sorted local CAS; keep the first-seen winner on identical millisecond timestamps.
+  return false
 }
 
 function selectNewestActiveMediaBlob(
@@ -407,15 +413,11 @@ export async function registerMasterMediaUploadInCas(opts: {
   const safeName = safeMediaBasename(opts.filename)
   if (!safeName) return null
   const sha256 = createHash('sha256').update(opts.bytes).digest('hex')
-  const head = await opts.blobStore.headBySha256(opts.tenantId, sha256)
-  if (head && head.kind === opts.kind && candidateFilenamesForMediaBlob(head).includes(safeName)) {
-    return head
-  }
   const tenantBlobs = await listMediaBlobsForTenant(opts.blobStore, opts.tenantId)
-  const matched = tenantBlobs.find(
-    (b) => b.kind === opts.kind && b.sha256 === sha256 && candidateFilenamesForMediaBlob(b).includes(safeName),
-  )
-  if (matched) return matched
+  const currentNewest = selectNewestActiveMediaBlob(tenantBlobs, safeName, opts.kind)
+  if (currentNewest && currentNewest.sha256 === sha256) {
+    return currentNewest
+  }
   const relDir = opts.kind === 'upload' ? 'uploads' : 'generated'
   return opts.blobStore.put({
     tenantId: opts.tenantId,
@@ -459,6 +461,14 @@ export async function readMasterMediaBytesFromCas(opts: {
 /**
  * Streams the newest active tenant media file from Master CAS with full HTTP Range & HEAD parity.
  */
+function buildCasPolicyCheckPaths(meta: ArtifactBlobRef, requestedName: string): readonly string[] {
+  const dirSeg = meta.kind === 'upload' ? 'uploads' : 'generated'
+  const paths = new Set<string>([`/${dirSeg}/${requestedName}`])
+  if (meta.logicalName) paths.add(`/${dirSeg}/${meta.logicalName}`)
+  if (meta.containerRelativePath) paths.add(`/${meta.containerRelativePath.replace(/^\/+/, '')}`)
+  return [...paths]
+}
+
 export async function openMasterCasMediaFallback(opts: {
   readonly blobStore?: LocalCasArtifactBlobStore
   readonly userId: string
@@ -470,6 +480,9 @@ export async function openMasterCasMediaFallback(opts: {
     readonly totalSize: number
     readonly range: { readonly start: number; readonly end: number } | null
     readonly contentLength: number
+    readonly sha256?: string
+    readonly isImmutableDigest?: boolean
+    readonly policyCheckPaths?: readonly string[]
   }) => boolean
 }): Promise<'ok' | 'missing' | 'rejected'> {
   if (!opts.blobStore || !/^c:[1-9][0-9]{0,18}$/.test(opts.userId)) return 'missing'
@@ -482,19 +495,47 @@ export async function openMasterCasMediaFallback(opts: {
   if (!picked) return 'missing'
   const meta = await opts.blobStore.stat(opts.userId, picked.blobId)
   if (!meta) return 'missing'
-  const range = opts.isHead ? null : (opts.resolveRange ? opts.resolveRange(meta.sizeBytes) : null)
-  const contentLength = range ? range.end - range.start + 1 : meta.sizeBytes
-  if (!opts.onReady({ totalSize: meta.sizeBytes, range, contentLength })) {
-    return 'rejected'
-  }
-  if (opts.isHead) return 'ok'
+  const range = opts.isHead ? null : opts.resolveRange ? opts.resolveRange(meta.sizeBytes) : null
   const handle = await opts.blobStore.openReadStream(
     opts.userId,
     meta.blobId,
     range ? { range } : undefined,
   )
-  await pipeline(handle.stream, opts.dest)
-  return 'ok'
+  if (!handle) return 'missing'
+  const contentLength = range ? range.end - range.start + 1 : meta.sizeBytes
+  const isImmutableDigest =
+    /^[0-9a-f]{64}(?:\.[a-z0-9]{1,16})?$/i.test(safeName) &&
+    safeName.toLowerCase().startsWith(meta.sha256.toLowerCase())
+  const accepted = opts.onReady({
+    totalSize: meta.sizeBytes,
+    range,
+    contentLength,
+    sha256: meta.sha256,
+    isImmutableDigest,
+    policyCheckPaths: buildCasPolicyCheckPaths(meta, safeName),
+  })
+  if (!accepted) {
+    handle.stream.destroy()
+    return 'rejected'
+  }
+  if (opts.isHead) {
+    handle.stream.destroy()
+    return 'ok'
+  }
+  const onClose = () => handle.stream.destroy()
+  opts.dest.once('close', onClose)
+  try {
+    await pipeline(handle.stream, opts.dest)
+    return 'ok'
+  } catch (err) {
+    const destroyable = opts.dest as { destroy?: (error?: Error) => void; destroyed?: boolean }
+    if (!destroyable.destroyed) {
+      destroyable.destroy?.(err instanceof Error ? err : new Error(String(err)))
+    }
+    throw err
+  } finally {
+    opts.dest.removeListener('close', onClose)
+  }
 }
 
 async function buildMaterializedBridgeLocation(

@@ -104,21 +104,16 @@ export interface CommercialHook {
   }) => Promise<{ sha256: string; size: number }>
   deleteRemoteHostUpload?: (args: { hostUuid: string; remotePath: string }) => Promise<void>
   openRemoteHostMedia?: (args: {
-    hostUuid: string
-    remotePath: string
-    dest: NodeJS.WritableStream
-    onReady: (info: { size: number }) => boolean
+    hostUuid: string; remotePath: string; dest: NodeJS.WritableStream
+    resolveRange?: (totalSize: number) => { start: number; end: number } | null; isHead?: boolean
+    onReady: (info: { size: number; range?: { start: number; end: number } | null; contentLength?: number }) => boolean
   }) => Promise<'ok' | 'missing' | 'rejected'>
   openCasMediaFallback?: (args: {
-    userId: string
-    filename: string
-    dest: NodeJS.WritableStream
-    resolveRange?: (totalSize: number) => { start: number; end: number } | null
-    isHead?: boolean
+    userId: string; filename: string; dest: NodeJS.WritableStream
+    resolveRange?: (totalSize: number) => { start: number; end: number } | null; isHead?: boolean
     onReady: (info: {
-      totalSize: number
-      range: { start: number; end: number } | null
-      contentLength: number
+      totalSize: number; range: { start: number; end: number } | null; contentLength: number
+      sha256?: string; isImmutableDigest?: boolean; policyCheckPaths?: readonly string[]
     }) => boolean
   }) => Promise<'ok' | 'missing' | 'rejected'>
   /**
