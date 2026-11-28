@@ -11,7 +11,7 @@
  */
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
@@ -802,6 +802,29 @@ describe("PermissionCard 关掉≠作答（pending-approval-bar）", () => {
   });
 });
 
+function collectGatewayTsSources(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  const files: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name !== "__tests__" && entry.name !== "__fixtures__") {
+        files.push(...collectGatewayTsSources(full));
+      }
+      continue;
+    }
+    if (
+      entry.isFile() &&
+      entry.name.endsWith(".ts") &&
+      !entry.name.endsWith(".test.ts") &&
+      !entry.name.endsWith(".d.ts")
+    ) {
+      files.push(full);
+    }
+  }
+  return files.sort((a, b) => a.localeCompare(b));
+}
+
 describe("跨包契约", () => {
   // 前端改不动 gateway 常量（那是容器内源码面 / runtime release 轴），只能镜像。数值一旦漂移,
   // 孤儿判定就会与服务端 sweep 错位:偏大 → 骚扰窗口回来;偏小 → 真正在等的 agent 被静默。
@@ -809,26 +832,58 @@ describe("跨包契约", () => {
   test("前端 TTL 必须等于 gateway 的 PENDING_PERMISSION_TTL_MS", () => {
     // vitest 下 import.meta.url 不是 file: scheme（vite 模块运行时），改从 cwd 向上找仓根 ——
     // CI 从仓根跑、本地从 packages/web-react 跑,两种 cwd 都要成立。
-    // OCV5-465: the constant moved out of server.ts into pendingPermissionSnapshot.ts.
-    const rel = join("packages", "gateway", "src", "pendingPermissionSnapshot.ts");
+    // 聚合扫描 gateway/src（含 server.ts、pendingPermissionSnapshot.ts 与 routes/**/*.ts），
+    // 并兼容未来下沉至 @openclaude/protocol 契约包。
     let dir = process.cwd();
-    let serverPath = "";
-    for (let i = 0; i < 6 && !serverPath; i += 1) {
-      if (existsSync(join(dir, rel))) serverPath = join(dir, rel);
+    let repoRoot = "";
+    for (let i = 0; i < 6 && !repoRoot; i += 1) {
+      if (existsSync(join(dir, "packages", "gateway", "src", "server.ts"))) repoRoot = dir;
       else dir = dirname(dir);
     }
-    expect(serverPath, `未能从 ${process.cwd()} 向上定位 ${rel}`).toBeTruthy();
-    const serverSrc = readFileSync(serverPath, "utf8");
-    const matched = /PENDING_PERMISSION_TTL_MS\s*=\s*([0-9_\s*]+)/.exec(serverSrc);
-    expect(matched, "gateway 侧 PENDING_PERMISSION_TTL_MS 定义未找到（被改名?）").toBeTruthy();
+    expect(repoRoot, `未能从 ${process.cwd()} 向上定位仓根`).toBeTruthy();
 
-    // 只支持乘法字面量（当前形态 `30 * 60_000`）。若 gateway 换成别的表达式,这里会红 —— 那是
-    // 需要人工确认语义的信号,不是脆断言。
-    const factors = matched![1].replace(/_/g, "").split("*").map((s) => Number(s.trim()));
-    expect(factors.every((n) => Number.isFinite(n))).toBe(true);
-    const serverTtl = factors.reduce((a, b) => a * b, 1);
+    const gatewaySrcDir = join(repoRoot, "packages", "gateway", "src");
+    const priorityFiles = [
+      join(gatewaySrcDir, "server.ts"),
+      join(gatewaySrcDir, "pendingPermissionSnapshot.ts"),
+      ...collectGatewayTsSources(join(gatewaySrcDir, "routes")),
+    ];
+    const gatewayFiles = [...new Set([...priorityFiles, ...collectGatewayTsSources(gatewaySrcDir)])]
+      .filter((filePath) => existsSync(filePath));
+    expect(gatewayFiles.length).toBeGreaterThan(0);
 
-    expect(serverTtl).toBe(PENDING_PERMISSION_TTL_MS);
+    const ttlDefRe = /\b(?:GATEWAY_)?PENDING_PERMISSION_TTL_MS\s*=\s*([0-9][0-9_\s*]*)/g;
+    const matches: Array<{ filePath: string; expr: string }> = [];
+    for (const filePath of gatewayFiles) {
+      const src = readFileSync(filePath, "utf8");
+      for (const m of src.matchAll(ttlDefRe)) {
+        matches.push({ filePath, expr: m[1] });
+      }
+    }
+
+    if (matches.length === 0) {
+      const protocolSrcDir = join(repoRoot, "packages", "protocol", "src");
+      for (const filePath of collectGatewayTsSources(protocolSrcDir)) {
+        const src = readFileSync(filePath, "utf8");
+        for (const m of src.matchAll(ttlDefRe)) {
+          matches.push({ filePath, expr: m[1] });
+        }
+      }
+    }
+
+    expect(
+      matches.length,
+      "gateway / protocol 侧 PENDING_PERMISSION_TTL_MS 定义未找到（被改名?）",
+    ).toBeGreaterThan(0);
+
+    for (const { filePath, expr } of matches) {
+      // 只支持乘法字面量（当前形态 `30 * 60_000`）。若 gateway 换成别的表达式,这里会红 —— 那是
+      // 需要人工确认语义的信号,不是脆断言。
+      const factors = expr.replace(/_/g, "").split("*").map((s) => Number(s.trim()));
+      expect(factors.length > 0 && factors.every((n) => Number.isFinite(n) && n > 0), `${filePath}: ${expr}`).toBe(true);
+      const serverTtl = factors.reduce((a, b) => a * b, 1);
+      expect(serverTtl, filePath).toBe(PENDING_PERMISSION_TTL_MS);
+    }
   });
 });
 

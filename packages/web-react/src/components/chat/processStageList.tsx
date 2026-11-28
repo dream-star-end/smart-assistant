@@ -319,7 +319,7 @@ function Fold({ testId, icon, head, meta, below, showChevron = false, children }
         type="button"
         aria-expanded={open}
         onClick={() => setOpen(!open)}
-        className="group/step -mx-1.5 flex min-h-8 w-[calc(100%+0.75rem)] items-center gap-2 rounded-md px-1.5 py-1.5 text-left outline-none transition-colors duration-150 hover:bg-hover/65 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-10"
+        className="group/step -mx-1.5 flex min-h-8 w-[calc(100%+0.75rem)] items-center gap-2 rounded-md px-1.5 py-1.5 text-left outline-none transition-colors duration-150 hover:bg-hover/65 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
       >
         {icon}
         {head}

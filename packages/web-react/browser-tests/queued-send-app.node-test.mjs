@@ -10,6 +10,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { build as viteBuild } from "vite";
 import { startPreviewServer } from "./process-disclosure-app-server.mjs";
 import { BOARD_SESSION } from "./process-disclosure-story.mjs";
+import { createSourceMutationPlugin, MODULE_FAMILIES } from "./helpers/sourceBundle.mjs";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
 const require = createRequire(import.meta.url);
 const { build } = require("esbuild");
@@ -17,8 +18,6 @@ const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
 const mode = process.env.OC_QUEUE_PROOF_RED || "";
 assert.ok(["", "stream", "list"].includes(mode));
-const appPath = resolve(here, "../src/App.tsx");
-const messagePath = resolve(here, "../src/components/MessageRenderer.tsx");
 const collect = dir => readdirSync(dir, { withFileTypes: true }).flatMap(e => e.isDirectory() ? collect(join(dir,e.name)) : [join(dir,e.name)]);
 const inputs = [resolve(here, "../src"), here].flatMap(collect).sort();
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -45,29 +44,60 @@ async function stored(page) {
 }
 test("INC-20260923-QUEUE-ABOVE-COMPOSER: real App queues, edits and stops before send-now", { timeout: 240000 }, async t => {
   const assets = mkdtempSync(join(tmpdir(), "queued-send-app-"));
-  const plugins = mode ? [{ name: "only-queue-display-guards", setup(b) {
-    b.onLoad({ filter: /\/(App|MessageRenderer)\.tsx$/ }, ({ path }) => {
-      const actual = resolve(path);
-      if (![appPath, messagePath].includes(actual)) return;
-      const text = readFileSync(actual, "utf8");
-      let needle;
-      let replacement;
-      if (mode === "stream" && actual === appPath) {
-        needle = '  const timelineMessages = wsMessages.filter(\n    (message) => message.role !== "user" || message.status !== "queued",\n  );';
-        replacement = "  const timelineMessages = wsMessages;";
-      } else if (mode === "stream" && actual === messagePath) {
-        needle = '  messages = messages.filter((message) => message.role !== "user" || message.status !== "queued");';
-        replacement = "  messages = messages;";
-      } else if (mode === "list" && actual === appPath) {
-        needle = "{!demo && !gated && queuedOutgoing.length > 0 && (";
-        replacement = "{false && !demo && !gated && queuedOutgoing.length > 0 && (";
-      } else return;
-      assert.equal(text.split(needle).length - 1, 1);
-      const red = text.replace(needle, replacement);
-      changes.push({ path: actual, before: hash(text), consumed: hash(red) });
-      return { contents: red, loader: "tsx" };
-    });
-  }}] : [];
+  const plugins = mode === "stream"
+    ? [
+        createSourceMutationPlugin({
+          name: "only-queue-display-guards-stream",
+          onTransform: ({ path: mutatedPath, before: beforeText, after: afterText }) => {
+            changes.push({ path: mutatedPath, before: hash(beforeText), consumed: hash(afterText) });
+          },
+          targets: [
+            {
+              label: "App timelineMessages queued filter",
+              ...MODULE_FAMILIES.app(),
+              mutations: [
+                {
+                  label: "wsMessages queued filter",
+                  needle: /wsMessages\.filter\(\s*\(?message\)?\s*=>\s*message\.role\s*!==\s*"user"\s*\|\|\s*message\.status\s*!==\s*"queued",?\s*\)/,
+                  replace: "wsMessages",
+                  exactCount: 1,
+                },
+              ],
+            },
+            {
+              label: "MessageRenderer queued filter",
+              ...MODULE_FAMILIES.messageRenderer(),
+              mutations: [
+                {
+                  label: "rawMessages/messages queued filter",
+                  needle: /(rawMessages|messages)\.filter\(\s*\(?message\)?\s*=>\s*message\.role\s*!==\s*"user"\s*\|\|\s*message\.status\s*!==\s*"queued",?\s*\)/,
+                  replace: "$1",
+                  exactCount: 1,
+                },
+              ],
+            },
+          ],
+        }),
+      ]
+    : mode === "list"
+      ? [
+          createSourceMutationPlugin({
+            name: "only-queue-display-guards-list",
+            ...MODULE_FAMILIES.app(),
+            onTransform: ({ path: mutatedPath, before: beforeText, after: afterText }) => {
+              changes.push({ path: mutatedPath, before: hash(beforeText), consumed: hash(afterText) });
+            },
+            mutations: [
+              {
+                label: "queuedOutgoing render gate",
+                needle: "{!demo && !gated && queuedOutgoing.length > 0 && (",
+                replace: "{false && !demo && !gated && queuedOutgoing.length > 0 && (",
+                exactCount: 1,
+              },
+            ],
+          }),
+        ]
+      : [];
   await build({ entryPoints:[join(here,"process-disclosure-app-harness.tsx")], bundle:true, splitting:true, format:"esm", outdir:assets, entryNames:"app", chunkNames:"chunks/[name]-[hash]", jsx:"automatic", loader:{".css":"empty",".svg":"dataurl",".png":"dataurl",".jpg":"dataurl",".webp":"dataurl"}, alias:{"node:crypto":join(here,"stubs/node-crypto.js")}, define:{"process.env.NODE_ENV":'"production"',"import.meta.env":'{"MODE":"production","PROD":true,"DEV":false}'}, plugins, logLevel:"warning" });
   assert.equal(changes.length, mode === "stream" ? 2 : mode === "list" ? 1 : 0);
   console.log("QUEUE_BUILD", JSON.stringify({ mode, digest, inputs:inputs.length, changes }));

@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import { build as viteBuild } from "vite";
 import { startPreviewServer } from "./process-disclosure-app-server.mjs";
+import { createSourceMutationPlugin, MODULE_FAMILIES } from "./helpers/sourceBundle.mjs";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
 
 // INC-20261012-TURN-DUPLICATE-ACTION-ROW in the real App (OCV5-390): one visible turn made of the
@@ -19,7 +20,6 @@ const require = createRequire(import.meta.url);
 const { build } = require("esbuild");
 const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
-const rendererPath = resolve(here, "../src/components/MessageRenderer.tsx");
 const red = process.env.OC_ACTION_ROW_RED === "1";
 let transformCount = 0;
 
@@ -58,23 +58,33 @@ test("INC-20261012-TURN-DUPLICATE-ACTION-ROW: real App shows one action row per 
     loader: { ".css": "empty", ".svg": "dataurl", ".png": "dataurl", ".jpg": "dataurl", ".webp": "dataurl" },
     alias: { "node:crypto": join(here, "stubs/node-crypto.js") },
     define: { "process.env.NODE_ENV": '"production"', "import.meta.env": '{"MODE":"production","PROD":true,"DEV":false}' },
-    plugins: red ? [{ name: "remove-turn-lineage-and-error-gate", setup(b) {
-      b.onLoad({ filter: /\/components\/MessageRenderer\.tsx$/ }, ({ path }) => {
-        assert.equal(resolve(path), rendererPath);
-        let contents = readFileSync(path, "utf8");
-        for (const [needle, replacement] of [
-          ["turnFinalAssistantFlags(renderableMessages, recoveryParents)", "turnFinalAssistantFlags(renderableMessages)"],
-          ["turnRatingFlags(renderableMessages, ratingFinal, recoveryParents)", "ratingFinal"],
-        ]) {
-          assert.equal(contents.split(needle).length - 1, 1, needle);
-          contents = contents.replace(needle, replacement);
-        }
-        transformCount += 1;
-        return { contents, loader: "tsx" };
-      });
-    }}] : [], logLevel: "warning",
+    plugins: red
+      ? [
+          createSourceMutationPlugin({
+            name: "remove-turn-lineage-and-error-gate",
+            ...MODULE_FAMILIES.messageRenderer(),
+            onTransform: ({ appliedCount }) => {
+              if (appliedCount > 0) transformCount += 1;
+            },
+            mutations: [
+              {
+                label: "turnFinalAssistantFlags lineage arg",
+                needle: /turnFinalAssistantFlags\(\s*renderableMessages\s*,\s*[A-Za-z_$][\w$]*\s*\)/,
+                replace: "turnFinalAssistantFlags(renderableMessages)",
+                exactCount: 1,
+              },
+              {
+                label: "turnRatingFlags call",
+                needle: /turnRatingFlags\(\s*renderableMessages\s*,\s*([A-Za-z_$][\w$]*)\s*,\s*[A-Za-z_$][\w$]*\s*\)/,
+                replace: "$1",
+                exactCount: 1,
+              },
+            ],
+          }),
+        ]
+      : [], logLevel: "warning",
   });
-  assert.equal(transformCount, red ? 1 : 0);
+  assert.ok(red ? transformCount >= 1 : transformCount === 0);
   const cssDir = join(assetDir, "css-build"); mkdirSync(cssDir);
   await viteBuild({ root: join(here, ".."), configFile: false, logLevel: "silent", plugins: [tailwindcss()], build: { outDir: cssDir, emptyOutDir: true, cssCodeSplit: false, rollupOptions: { input: join(here, "preview-styles.ts"), output: { assetFileNames: "styles[extname]" } } } });
   writeFileSync(join(assetDir, "styles.css"), readFileSync(join(cssDir, readdirSync(cssDir).find((n) => n.endsWith(".css")))));
