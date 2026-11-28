@@ -3142,6 +3142,71 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
     await writeFile(workerTranscript, `${postCutStaleActiveAfterDone.map((s) => JSON.stringify(s)).join('\n')}\n`)
     const r9StaleSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 146 })!
     assert.equal(r9StaleSnap.members.find((m) => m.name === 'parser')!.status, 'waiting', 'R9 guard: already-DONE ID must NOT be resurrected by stale ACTIVE')
+
+    // Steward R10 Blocker (1): restoring known pre-cut ID A whose post-cut ACTIVE omits args MUST preserve A's identity
+    // and NEVER bind A onto a newly declared post-cut unnamed call C (c.ts)! After DONE(A), C stays working/reclaim=0 until C finishes.
+    const r10OmitArgsSteps: Record<string, unknown>[] = [
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ id: 'cid-r10-a', name: 'read_file', arguments: { Path: '/repo/a.ts' } }] },
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [], content: 'handoff' },
+      { step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] wake' },
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', arguments: { Path: '/repo/c.ts' } }] },
+      { step_index: 5, type: 'TOOL_CALL', tool_call_id: 'cid-r10-a', tool_name: 'read_file', status: 'ACTIVE' },
+      { step_index: 6, type: 'TOOL_RESULT', tool_call_id: 'cid-r10-a', tool_name: 'read_file', status: 'DONE', content: 'a done' },
+      { step_index: 7, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    await writeFile(workerTranscript, `${r10OmitArgsSteps.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r10CSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 150 })!
+    const r10CWorker = r10CSnap.members.find((m) => m.name === 'parser')!
+    assert.equal(r10CWorker.status, 'working', 'R10 #1: ACTIVE(A) without args + DONE(A) must NOT steal unnamed call C')
+    assert.equal(r10CWorker.activity, '阅读 c.ts', 'R10 #1: active call must remain c.ts')
+    let r10CReclaims = 0
+    const r10CMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { r10CReclaims += 1 },
+    })
+    r10CMon.evaluate(r10CSnap, 1_000)
+    r10CMon.evaluate({ ...r10CSnap, revision: 151 }, 3_000)
+    r10CMon.evaluate({ ...r10CSnap, revision: 152 }, 5_000)
+    assert.equal(r10CReclaims, 0, 'R10 #1: unfinished C must block stall reclaim')
+    const r10CDoneSteps: Record<string, unknown>[] = [
+      ...r10OmitArgsSteps.slice(0, -1),
+      { step_index: 8, type: 'TOOL_RESULT', tool_call_id: 'cid-r10-c', tool_name: 'read_file', status: 'DONE', content: 'c done' },
+      r10OmitArgsSteps[r10OmitArgsSteps.length - 1]!,
+    ]
+    await writeFile(workerTranscript, `${r10CDoneSteps.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r10CDoneSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 153 })!
+    assert.equal(r10CDoneSnap.members.find((m) => m.name === 'parser')!.status, 'waiting', 'R10 #1 positive: C done -> waiting')
+    let r10CDoneReclaims = 0
+    const r10CDoneMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { r10CDoneReclaims += 1 },
+    })
+    r10CDoneMon.evaluate(r10CDoneSnap, 1_000)
+    r10CDoneMon.evaluate({ ...r10CDoneSnap, revision: 154 }, 3_000)
+    r10CDoneMon.evaluate({ ...r10CDoneSnap, revision: 155 }, 5_000)
+    assert.equal(r10CDoneReclaims, 1, 'R10 #1 positive: once C finishes, reclaim fires (1)')
+
+    // Steward R10 Blocker (2): replaying an identical pre-cut PLANNER_RESPONSE (same ID & step_index, NO executor ACTIVE)
+    // after a certain cut MUST be idempotent (waiting, reclaim=1), whereas a real executor ACTIVE still restores working/reclaim=0.
+    const r10ReplayPlannerSteps: Record<string, unknown>[] = [
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ id: 'cid-r10-rep', name: 'read_file', arguments: { Path: '/repo/rep.ts' } }] },
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [], content: 'handoff' },
+      { step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] wake' },
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ id: 'cid-r10-rep', name: 'read_file', arguments: { Path: '/repo/rep.ts' } }] },
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    await writeFile(workerTranscript, `${r10ReplayPlannerSteps.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r10RepSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 156 })!
+    assert.equal(r10RepSnap.members.find((m) => m.name === 'parser')!.status, 'waiting', 'R10 #2: replayed pre-cut PLANNER declaration must be idempotent (waiting)')
+    let r10RepReclaims = 0
+    const r10RepMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { r10RepReclaims += 1 },
+    })
+    r10RepMon.evaluate(r10RepSnap, 1_000)
+    r10RepMon.evaluate({ ...r10RepSnap, revision: 157 }, 3_000)
+    r10RepMon.evaluate({ ...r10RepSnap, revision: 158 }, 5_000)
+    assert.equal(r10RepReclaims, 1, 'R10 #2: replayed pre-cut PLANNER declaration must NOT block stall reclaim')
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }

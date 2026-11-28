@@ -148,6 +148,12 @@ function ingestTurnBoundaryStep(
     t.lastPlannerCallsLen = calls.length
     t.epoch += 1
     t.batch = createBatchDoneTracker()
+    const rawStepIdx = step.step_index
+    if (typeof rawStepIdx === 'number' && Number.isFinite(rawStepIdx) && calls.length > 0) {
+      const replayKey = `${rawStepIdx}:${canonicalJson(calls)}`
+      if (t.callState.seenPlannerStepKeys.has(replayKey)) return
+      t.callState.seenPlannerStepKeys.add(replayKey)
+    }
     registerCallList(t.callState, calls, true, true, t.epoch)
     return
   }
@@ -287,7 +293,8 @@ interface CallReductionState {
   readonly namedFallbacksByEpoch: Map<number, TerminalToolStep[]>; readonly seenUnidNamedEpochNorms: Set<string>
   readonly pendingIdFallbacks: Map<string, TerminalToolStep>; readonly speculativeIdOwners: Map<string, number>
   readonly backupSpeculativeNamedByIdx: Map<number, TerminalToolStep[]>; readonly exactIdSettled: Set<string>
-  readonly seenTerminalIds: Set<string>; readonly seenStepIndices: Set<number>; readonly seenUnindexedPayloads: Set<string>
+  readonly seenTerminalIds: Set<string>; readonly seenStepIndices: Set<number>
+  readonly seenUnindexedPayloads: Set<string>; readonly seenPlannerStepKeys: Set<string>
 }
 
 function createCallReductionState(): CallReductionState {
@@ -299,7 +306,8 @@ function createCallReductionState(): CallReductionState {
     idMatchedEpochNorms: new Set(), plannerEpochNormCounts: new Map(), plannerEpochCallCounts: new Map(),
     genericTerminalsByEpoch: new Map(), namedFallbacksByEpoch: new Map(), seenUnidNamedEpochNorms: new Set(),
     pendingIdFallbacks: new Map(), speculativeIdOwners: new Map(), backupSpeculativeNamedByIdx: new Map(),
-    exactIdSettled: new Set(), seenTerminalIds: new Set(), seenStepIndices: new Set(), seenUnindexedPayloads: new Set(),
+    exactIdSettled: new Set(), seenTerminalIds: new Set(), seenStepIndices: new Set(),
+    seenUnindexedPayloads: new Set(), seenPlannerStepKeys: new Set(),
   }
 }
 
@@ -469,25 +477,20 @@ function bindIdDirectCall(
   state: CallReductionState, norm: string, id: string, args: Record<string, unknown> | null, argsKey: string | null,
   fromPlanner: boolean, hasPlannerRoot: boolean, epoch: number,
 ): boolean {
-  const existingBucket = state.callIndicesById.get(id)
-  const existingIdx = existingBucket?.[existingBucket.length - 1]
-  if (existingBucket && existingIdx !== undefined) {
+  const existingIdx = state.callIndicesById.get(id)?.[0]
+  if (existingIdx !== undefined) {
     const existing = state.calls[existingIdx]!
-    const liveOrDone =
-      state.accounted.has(existingIdx) ||
-      state.unaccountedNonBoard.has(existingIdx) ||
-      existing.isBoard ||
-      state.seenTerminalIds.has(id)
-    if (liveOrDone) {
-      if (!existing.args && args) {
-        existing.args = args
-        existing.argsKey = argsKey
-      }
-      existing.boundDirect = true
-      return true
+    if (!existing.args && args) {
+      existing.args = args
+      existing.argsKey = argsKey
     }
-    state.accounted.add(existingIdx)
-    existingBucket.pop()
+    if (!fromPlanner) {
+      existing.boundDirect = true
+      if (!existing.isBoard && !state.accounted.has(existingIdx) && !state.seenTerminalIds.has(id)) {
+        state.unaccountedNonBoard.add(existingIdx)
+      }
+    }
+    return true
   }
   if (fromPlanner || !hasPlannerRoot) return false
   const epochNormTotal = state.plannerEpochNormCounts.get(`${epoch}:${norm}`) ?? 0
