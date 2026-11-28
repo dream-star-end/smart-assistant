@@ -139,8 +139,16 @@ export function createMockCasMetaPgPool(opts?: CasMetaMockPoolOptions) {
       const safeName = String(params[2])
       const relPaths = Array.isArray(params[3]) ? params[3].map(String) : []
       const digestPrefix = params[4] === null || params[4] === undefined ? null : String(params[4])
+      const explicitlyDeletedByName = rows.some(
+        (d) =>
+          d.tenant_id === tenantId &&
+          d.deleted_at !== null &&
+          (d.logical_name === safeName ||
+            (typeof d.container_relative_path === 'string' && relPaths.includes(d.container_relative_path))),
+      )
+      const effectiveDigest = explicitlyDeletedByName ? null : digestPrefix
       const hits = rows.filter((r) =>
-        rowMatchesMediaLookup(r, tenantId, kindFilter, safeName, relPaths, digestPrefix),
+        rowMatchesMediaLookup(r, tenantId, kindFilter, safeName, relPaths, effectiveDigest),
       )
       hits.sort((a, b) => {
         const ka = a.kind === 'upload' ? 0 : 1

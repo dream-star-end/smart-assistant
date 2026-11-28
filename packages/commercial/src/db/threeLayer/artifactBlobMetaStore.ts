@@ -516,7 +516,17 @@ export class PgArtifactBlobMetaStore {
           AND (
             logical_name = $3
             OR container_relative_path = ANY($4::text[])
-            OR ($5::text IS NOT NULL AND sha256 = $5)
+            OR (
+              $5::text IS NOT NULL
+              AND sha256 = $5
+              AND NOT EXISTS (
+                SELECT 1
+                  FROM artifact_blobs d
+                 WHERE d.tenant_id = $1
+                   AND d.deleted_at IS NOT NULL
+                   AND (d.logical_name = $3 OR d.container_relative_path = ANY($4::text[]))
+              )
+            )
           )
         ORDER BY CASE WHEN kind = 'upload' THEN 0 ELSE 1 END,
                  created_at DESC, ctid DESC, blob_id DESC
