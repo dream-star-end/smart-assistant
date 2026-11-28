@@ -484,349 +484,164 @@ _is_heavy_npx_tool() {
 # Sets _SEG_KIND (sanitized command/subcommand tag with NO raw args/secrets).
 # Returns 0 if HEAVY, 1 if LIGHT.
 _SEG_KIND=""
+_SKIP_POS=0
+_PKG_SUB=""
+_PKG_SUB2=""
 
-_classify_segment() {
-  local depth="$1"
-  shift
+# Advance _SKIP_POS past leading shell keywords, redirections, VAR=VAL assignments,
+# and transparent command wrappers (env/timeout/nice/ionice/setsid/stdbuf/sudo).
+_skip_command_wrappers() {
   local words=("$@")
-  local len=${#words[@]}
-  local pos=0 tok
-  _SEG_KIND=""
-
-  # Skip leading shell keywords, redirections, and VAR=VAL assignments
+  local len=${#words[@]} pos=0 tok base
   while (( pos < len )); do
     tok="${words[pos]}"
     case "$tok" in
       if|then|elif|else|fi|do|done|while|until|for|in|time|'!'|coproc|'{'|'}'|command|builtin|exec|nohup)
-        (( pos += 1 ))
-        continue
-        ;;
+        (( pos += 1 )); continue ;;
       '>'|'>>'|'<'|'<<'|'<<<'|'2>'|'2>>'|'&>'|'&>>'|'1>'|'1>>')
-        (( pos += 2 ))
-        continue
-        ;;
+        (( pos += 2 )); continue ;;
       '>'*|'<'*|'1>'*|'2>'*|'&>'*)
-        (( pos += 1 ))
-        continue
-        ;;
+        (( pos += 1 )); continue ;;
     esac
     if [[ "$tok" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-      (( pos += 1 ))
-      continue
+      (( pos += 1 )); continue
     fi
-
-    local base="${tok##*/}"
+    base="${tok##*/}"
     case "$base" in
-      env)
+      env|timeout|nice|ionice|setsid|stdbuf|sudo)
         (( pos += 1 ))
         while (( pos < len )); do
           tok="${words[pos]}"
-          case "$tok" in
-            --) (( pos += 1 )); break ;;
-            -u|-C|--unset|--chdir) (( pos += 2 )) ;;
-            -*) (( pos += 1 )) ;;
-            *)
-              if [[ "$tok" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-                (( pos += 1 ))
-              else
-                break
-              fi
-              ;;
-          esac
-        done
-        continue
-        ;;
-      timeout)
-        (( pos += 1 ))
-        while (( pos < len )); do
-          tok="${words[pos]}"
-          case "$tok" in
-            --) (( pos += 1 )); break ;;
-            -k|-s|--kill-after|--signal) (( pos += 2 )) ;;
-            -*) (( pos += 1 )) ;;
+          [[ "$tok" == "--" ]] && { (( pos += 1 )); break; }
+          if [[ "$base" == "env" && "$tok" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+            (( pos += 1 )); continue
+          fi
+          case "${base}:${tok}" in
+            env:-u|env:-C|env:--unset|env:--chdir|\
+            timeout:-k|timeout:-s|timeout:--kill-after|timeout:--signal|\
+            nice:-n|nice:--adjustment|\
+            ionice:-c|ionice:-n|ionice:-p|ionice:--class|ionice:--classdata|\
+            stdbuf:-i|stdbuf:-o|stdbuf:-e|stdbuf:--input|stdbuf:--output|stdbuf:--error|\
+            sudo:-u|sudo:-g|sudo:-C|sudo:-h|sudo:-p|sudo:-r|sudo:-t)
+              (( pos += 2 )) ;;
+            *:-*) (( pos += 1 )) ;;
             *) break ;;
           esac
         done
-        (( pos < len )) && (( pos += 1 ))
-        continue
-        ;;
-      nice)
-        (( pos += 1 ))
-        while (( pos < len )); do
-          tok="${words[pos]}"
-          case "$tok" in
-            --) (( pos += 1 )); break ;;
-            -n|--adjustment) (( pos += 2 )) ;;
-            -*) (( pos += 1 )) ;;
-            *) break ;;
-          esac
-        done
-        continue
-        ;;
-      ionice)
-        (( pos += 1 ))
-        while (( pos < len )); do
-          tok="${words[pos]}"
-          case "$tok" in
-            --) (( pos += 1 )); break ;;
-            -c|-n|-p|--class|--classdata) (( pos += 2 )) ;;
-            -*) (( pos += 1 )) ;;
-            *) break ;;
-          esac
-        done
-        continue
-        ;;
-      setsid)
-        (( pos += 1 ))
-        while (( pos < len )); do
-          tok="${words[pos]}"
-          case "$tok" in
-            --) (( pos += 1 )); break ;;
-            -*) (( pos += 1 )) ;;
-            *) break ;;
-          esac
-        done
-        continue
-        ;;
-      stdbuf)
-        (( pos += 1 ))
-        while (( pos < len )); do
-          tok="${words[pos]}"
-          case "$tok" in
-            --) (( pos += 1 )); break ;;
-            -i|-o|-e|--input|--output|--error) (( pos += 2 )) ;;
-            -*) (( pos += 1 )) ;;
-            *) break ;;
-          esac
-        done
-        continue
-        ;;
-      sudo)
-        (( pos += 1 ))
-        while (( pos < len )); do
-          tok="${words[pos]}"
-          case "$tok" in
-            --) (( pos += 1 )); break ;;
-            -u|-g|-C|-h|-p|-r|-t) (( pos += 2 )) ;;
-            -*) (( pos += 1 )) ;;
-            *) break ;;
-          esac
-        done
+        [[ "$base" == "timeout" ]] && (( pos < len )) && (( pos += 1 ))
         continue
         ;;
     esac
     break
   done
+  _SKIP_POS="$pos"
+}
 
-  (( pos < len )) || return 1
-
-  local cmd="${words[pos]}"
-  local cmd_base="${cmd##*/}"
-  local safe_cmd_base
-  safe_cmd_base="$(_sanitize_label "$cmd_base")"
-  _SEG_KIND="$safe_cmd_base"
-
-  # Shell wrappers: bash/sh/dash/zsh -c "<inner>" or script file
-  case "$cmd_base" in
-    bash|sh|dash|zsh)
-      local j=$(( pos + 1 ))
-      local saw_c=0
-      while (( j < len )); do
-        tok="${words[j]}"
-        case "$tok" in
-          --)
-            (( j += 1 ))
-            break
-            ;;
-          -o|+o)
-            (( j += 2 ))
-            continue
-            ;;
-          -*c*)
-            if [[ "$tok" != --* ]]; then
-              saw_c=1
-              (( j += 1 ))
-              break
-            fi
-            (( j += 1 ))
-            continue
-            ;;
-          -*)
-            (( j += 1 ))
-            continue
-            ;;
-          *)
-            break
-            ;;
-        esac
-      done
-      if (( saw_c )) && (( j < len )) && (( depth < 4 )); then
-        local _prev_match_kind="$_LAST_MATCH_KIND"
-        if _classify_cmd_is_heavy "${words[j]}" $(( depth + 1 )); then
-          if [[ -n "$_LAST_MATCH_KIND" ]]; then
-            _SEG_KIND="$_LAST_MATCH_KIND"
-          fi
-          return 0
+# Shared option/subcommand scanner for package runners (npm / bun / pnpm / yarn).
+# Args: <two_arg_opts_csv_with_colons> <args...>
+_scan_pkg_subcommands() {
+  local two_arg_opts="$1"
+  shift
+  _PKG_SUB=""
+  _PKG_SUB2=""
+  local words=("$@") len=${#words[@]} j=0 tok
+  while (( j < len )); do
+    tok="${words[j]}"
+    if [[ "$two_arg_opts" == *":${tok}:"* ]]; then
+      (( j += 2 )); continue
+    fi
+    case "$tok" in
+      --) break ;;
+      -*) (( j += 1 )); continue ;;
+      *)
+        if [[ -z "$_PKG_SUB" ]]; then
+          _PKG_SUB="$tok"
+        elif [[ -z "$_PKG_SUB2" ]]; then
+          _PKG_SUB2="$tok"
+          break
         fi
-        _LAST_MATCH_KIND="$_prev_match_kind"
-        return 1
-      elif (( !saw_c )) && (( j < len )); then
-        if _is_script_filename "${words[j]}"; then
-          _SEG_KIND="${safe_cmd_base}:$(_sanitize_label "${words[j]##*/}")"
-        fi
-        if _is_heavy_script_name "${words[j]}"; then
-          return 0
-        fi
-      fi
-      return 1
-      ;;
-  esac
+        (( j += 1 ))
+        ;;
+    esac
+  done
+}
 
-  # Direct heavy commands
-  case "$cmd_base" in
-    tsc|vitest|jest|playwright|chromium|chromium-headless-shell|chrome|google-chrome|vite|esbuild|webpack|tsx|pytest)
-      _SEG_KIND="$cmd_base"
+_classify_shell_wrapper() { # <depth> <safe_cmd_base> <args...>
+  local depth="$1" safe_cmd_base="$2"
+  shift 2
+  local words=("$@") len=${#words[@]} j=0 saw_c=0 tok
+  while (( j < len )); do
+    tok="${words[j]}"
+    case "$tok" in
+      --) (( j += 1 )); break ;;
+      -o|+o) (( j += 2 )); continue ;;
+      -*c*)
+        if [[ "$tok" != --* ]]; then
+          saw_c=1; (( j += 1 )); break
+        fi
+        (( j += 1 )); continue ;;
+      -*) (( j += 1 )); continue ;;
+      *) break ;;
+    esac
+  done
+  if (( saw_c )) && (( j < len )) && (( depth < 4 )); then
+    local _prev_match_kind="$_LAST_MATCH_KIND"
+    if _classify_cmd_is_heavy "${words[j]}" $(( depth + 1 )); then
+      [[ -n "$_LAST_MATCH_KIND" ]] && _SEG_KIND="$_LAST_MATCH_KIND"
       return 0
-      ;;
-  esac
-
-  # Heavy script invoked directly
-  if _is_heavy_script_name "$cmd_base"; then
-    _SEG_KIND="$safe_cmd_base"
-    return 0
+    fi
+    _LAST_MATCH_KIND="$_prev_match_kind"
+    return 1
+  elif (( !saw_c )) && (( j < len )); then
+    _is_script_filename "${words[j]}" && _SEG_KIND="${safe_cmd_base}:$(_sanitize_label "${words[j]##*/}")"
+    _is_heavy_script_name "${words[j]}" && return 0
   fi
+  return 1
+}
 
-  # Subcommand-sensitive tools (extract safe subcommand labels only)
+# Classify package/script runners (npm/npx/bun/bunx/pnpm/yarn).
+# Fail-closed policy for project scripts: any `npm run <script>` / `bun run <script>`
+# (including root `npm run check`) is heavy by default; only explicitly proven
+# read-only metadata/inspection subcommands pass through as light.
+_classify_pkg_runner() { # <cmd_base> <args...>
+  local cmd_base="$1"
+  shift
+  local words=("$@") len=${#words[@]}
   case "$cmd_base" in
-    git|gh|systemctl)
-      local j=$(( pos + 1 ))
-      while (( j < len )); do
-        tok="${words[j]}"
-        case "$tok" in
-          -C|-c|--git-dir|--work-tree) (( j += 2 )) ;;
-          -*) (( j += 1 )) ;;
-          *)
-            if _is_safe_subcmd_token "$tok"; then
-              _SEG_KIND="${cmd_base}:${tok}"
-            fi
-            break
-            ;;
-        esac
-      done
-      return 1
-      ;;
-
     npm)
-      local j=$(( pos + 1 )) sub="" sub2=""
-      while (( j < len )); do
-        tok="${words[j]}"
-        case "$tok" in
-          --prefix|-C|--workspace|-w|--userconfig|--cache)
-            (( j += 2 ))
-            continue
-            ;;
-          -*)
-            (( j += 1 ))
-            continue
-            ;;
-          *)
-            if [[ -z "$sub" ]]; then
-              sub="$tok"
-            elif [[ -z "$sub2" ]]; then
-              sub2="$tok"
-              break
-            fi
-            (( j += 1 ))
-            ;;
-        esac
-      done
+      _scan_pkg_subcommands ":--prefix:-C:--workspace:-w:--userconfig:--cache:" "${words[@]}"
+      local sub="$_PKG_SUB" sub2="$_PKG_SUB2"
       if _is_safe_subcmd_token "$sub"; then
         _SEG_KIND="npm:${sub}"
         if [[ "$sub" == "run" || "$sub" == "run-script" || "$sub" == "exec" ]] && _is_safe_subcmd_token "$sub2"; then
           _SEG_KIND="npm:${sub}:${sub2}"
         fi
       fi
+      # No subcommand (e.g. `npm --version` / `npm -v` / `npm -h`) -> light
+      [[ -n "$sub" ]] || return 1
       case "$sub" in
-        test|t|tst|ci|install|i|build)
-          return 0
+        help|root|prefix|bin|version|ls|list|ll|la|view|info|show|v|search|s|se|find|\
+        whoami|ping|config|c|outdated|explain|why|pkg|query|bugs|docs|home|repo|completion|doctor)
+          return 1
           ;;
         run|run-script)
-          case "$sub2" in
-            test|test:*|test-*|build|build:*|build-*|typecheck|typecheck:*|typecheck-*|check:*|lint|lint:*|lint-*)
-              return 0
-              ;;
-          esac
+          # Bare `npm run` lists available scripts (light); any named project script is heavy (fail-closed)
+          [[ -n "$sub2" ]] && return 0
+          return 1
           ;;
-        exec)
-          if [[ -n "$sub2" ]] && _is_heavy_npx_tool "$sub2"; then
-            return 0
-          fi
+        exec|x)
+          [[ -n "$sub2" ]] && return 0
+          return 1
+          ;;
+        *)
+          # test/ci/install/build/rebuild/pack/publish/audit/update/start/etc. -> heavy
+          return 0
           ;;
       esac
-      return 1
       ;;
-
-    npx)
-      local j=$(( pos + 1 )) tool=""
-      while (( j < len )); do
-        tok="${words[j]}"
-        case "$tok" in
-          --)
-            (( j += 1 ))
-            (( j < len )) && tool="${words[j]}"
-            break
-            ;;
-          -p|--package)
-            (( j += 2 ))
-            continue
-            ;;
-          -*)
-            (( j += 1 ))
-            continue
-            ;;
-          *)
-            tool="$tok"
-            break
-            ;;
-        esac
-      done
-      if [[ -n "$tool" ]]; then
-        local tool_base="${tool##*/}"
-        [[ "$tool_base" == *@* ]] && tool_base="${tool_base%%@*}"
-        if _is_safe_subcmd_token "$tool_base"; then
-          _SEG_KIND="npx:${tool_base}"
-        fi
-        if _is_heavy_npx_tool "$tool" || _is_heavy_script_name "$tool"; then
-          return 0
-        fi
-      fi
-      return 1
-      ;;
-
     bun)
-      local j=$(( pos + 1 )) sub="" sub2=""
-      while (( j < len )); do
-        tok="${words[j]}"
-        case "$tok" in
-          --cwd|-c|--config)
-            (( j += 2 ))
-            continue
-            ;;
-          -*)
-            (( j += 1 ))
-            continue
-            ;;
-          *)
-            if [[ -z "$sub" ]]; then
-              sub="$tok"
-            elif [[ -z "$sub2" ]]; then
-              sub2="$tok"
-              break
-            fi
-            (( j += 1 ))
-            ;;
-        esac
-      done
+      _scan_pkg_subcommands ":--cwd:-c:--config:" "${words[@]}"
+      local sub="$_PKG_SUB" sub2="$_PKG_SUB2"
       if _is_safe_subcmd_token "$sub"; then
         _SEG_KIND="bun:${sub}"
         if [[ "$sub" == "run" || "$sub" == "x" ]] && _is_safe_subcmd_token "$sub2"; then
@@ -835,85 +650,81 @@ _classify_segment() {
       elif _is_script_filename "$sub"; then
         _SEG_KIND="bun:$(_sanitize_label "${sub##*/}")"
       fi
+      [[ -n "$sub" ]] || return 1
       case "$sub" in
-        test|build|install|i)
-          return 0
+        help|pm)
+          return 1
           ;;
         run)
-          case "$sub2" in
-            test|test:*|test-*|build|build:*|build-*|typecheck|typecheck:*|check:*|lint|lint:*)
-              return 0
-              ;;
-          esac
+          [[ -n "$sub2" ]] && return 0
+          return 1
           ;;
-        x)
-          if [[ -n "$sub2" ]] && _is_heavy_npx_tool "$sub2"; then
-            return 0
-          fi
+        test|build|install|i|add|remove|rm|update|upgrade|ci|link|x)
+          return 0
           ;;
         *)
-          if [[ -n "$sub" ]] && _is_heavy_script_name "$sub"; then
-            return 0
-          fi
+          # Direct script invocation (`bun scripts/...` or `bun <pkg-script>`) -> heavy if script or non-flag
+          _is_heavy_script_name "$sub" && return 0
+          return 1
           ;;
       esac
-      return 1
       ;;
-
-    bunx)
-      local j=$(( pos + 1 ))
-      while (( j < len )) && [[ "${words[j]}" == -* ]]; do
-        (( j += 1 ))
+    npx|bunx)
+      local j=0 tool="" tok
+      while (( j < len )); do
+        tok="${words[j]}"
+        case "$tok" in
+          --) (( j += 1 )); (( j < len )) && tool="${words[j]}"; break ;;
+          -p|--package) (( j += 2 )); continue ;;
+          -*) (( j += 1 )); continue ;;
+          *) tool="$tok"; break ;;
+        esac
       done
-      if (( j < len )); then
-        local tool_base="${words[j]##*/}"
+      if [[ -n "$tool" ]]; then
+        local tool_base="${tool##*/}"
         [[ "$tool_base" == *@* ]] && tool_base="${tool_base%%@*}"
-        _is_safe_subcmd_token "$tool_base" && _SEG_KIND="bunx:${tool_base}"
-        if _is_heavy_npx_tool "${words[j]}"; then
+        _is_safe_subcmd_token "$tool_base" && _SEG_KIND="${cmd_base}:${tool_base}"
+        if _is_heavy_npx_tool "$tool" || _is_heavy_script_name "$tool"; then
           return 0
         fi
       fi
       return 1
       ;;
+    pnpm|yarn)
+      _scan_pkg_subcommands ":-C:--dir:--cwd:--filter:-F:" "${words[@]}"
+      local sub="$_PKG_SUB" sub2="$_PKG_SUB2"
+      _is_safe_subcmd_token "$sub" && _SEG_KIND="${cmd_base}:${sub}"
+      [[ -n "$sub" ]] || return 1
+      case "$sub" in
+        help|root|bin|ls|list|why|info|config|whoami|version) return 1 ;;
+        run) [[ -n "$sub2" ]] && return 0; return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+  esac
+  return 1
+}
 
+_classify_runtime_tool() { # <cmd_base> <args...>
+  local cmd_base="$1"
+  shift
+  local words=("$@") len=${#words[@]} j=0 tok sub="" sub2="" first_script=""
+  case "$cmd_base" in
     node)
-      local j=$(( pos + 1 )) first_script=""
       while (( j < len )); do
         tok="${words[j]}"
         case "$tok" in
-          --test|--test=*)
-            _SEG_KIND="node:test"
-            return 0
-            ;;
-          *build-container-gateway*)
-            _SEG_KIND="node:build-container-gateway"
-            return 0
-            ;;
-          *layout-invariants*)
-            _SEG_KIND="node:layout-invariants"
-            return 0
-            ;;
-          *playwright*)
-            _SEG_KIND="node:playwright"
-            return 0
-            ;;
-          -e|--eval|-p|--print|-r|--require|--import|--loader|--conditions)
-            (( j += 2 ))
-            continue
-            ;;
-          -*)
-            (( j += 1 ))
-            continue
-            ;;
+          --test|--test=*) _SEG_KIND="node:test"; return 0 ;;
+          *build-container-gateway*) _SEG_KIND="node:build-container-gateway"; return 0 ;;
+          *layout-invariants*) _SEG_KIND="node:layout-invariants"; return 0 ;;
+          *playwright*) _SEG_KIND="node:playwright"; return 0 ;;
+          -e|--eval|-p|--print|-r|--require|--import|--loader|--conditions) (( j += 2 )); continue ;;
+          -*) (( j += 1 )); continue ;;
           *)
             if [[ -z "$first_script" ]]; then
               first_script="$tok"
-              if _is_script_filename "$first_script"; then
-                _SEG_KIND="node:$(_sanitize_label "${first_script##*/}")"
-              fi
-              if _is_heavy_script_name "$first_script"; then
-                return 0
-              fi
+              _is_script_filename "$first_script" && _SEG_KIND="node:$(_sanitize_label "${first_script##*/}")"
+              _is_heavy_script_name "$first_script" && return 0
             fi
             (( j += 1 ))
             ;;
@@ -921,128 +732,65 @@ _classify_segment() {
       done
       return 1
       ;;
-
     docker)
-      local j=$(( pos + 1 )) sub="" sub2=""
       while (( j < len )); do
         tok="${words[j]}"
         case "$tok" in
-          -H|--host|--context|--config)
-            (( j += 2 ))
-            continue
-            ;;
-          -*)
-            (( j += 1 ))
-            continue
-            ;;
-          *)
-            sub="$tok"
-            (( j += 1 ))
-            break
-            ;;
+          -H|--host|--context|--config) (( j += 2 )); continue ;;
+          -*) (( j += 1 )); continue ;;
+          *) sub="$tok"; (( j += 1 )); break ;;
         esac
       done
       _is_safe_subcmd_token "$sub" && _SEG_KIND="docker:${sub}"
       case "$sub" in
-        build)
-          return 0
-          ;;
-        buildx)
+        build) return 0 ;;
+        buildx|compose)
           while (( j < len )); do
             tok="${words[j]}"
             case "$tok" in
-              --builder) (( j += 2 )) ;;
+              --builder|-f|--file|-p|--project-name|--env-file|--profile|--project-directory) (( j += 2 )) ;;
               -*) (( j += 1 )) ;;
               *) sub2="$tok"; break ;;
             esac
           done
-          [[ "$sub2" == "build" ]] && { _SEG_KIND="docker:buildx:build"; return 0; }
-          ;;
-        compose)
-          while (( j < len )); do
-            tok="${words[j]}"
-            case "$tok" in
-              -f|--file|-p|--project-name|--env-file|--profile|--project-directory)
-                (( j += 2 ))
-                ;;
-              -*)
-                (( j += 1 ))
-                ;;
-              *)
-                sub2="$tok"
-                break
-                ;;
-            esac
-          done
-          _is_safe_subcmd_token "$sub2" && _SEG_KIND="docker:compose:${sub2}"
+          _is_safe_subcmd_token "$sub2" && _SEG_KIND="docker:${sub}:${sub2}"
           [[ "$sub2" == "build" ]] && return 0
           ;;
       esac
       return 1
       ;;
-
-    go)
-      local j=$(( pos + 1 ))
-      while (( j < len )) && [[ "${words[j]}" == -* ]]; do
-        (( j += 1 ))
-      done
-      if (( j < len )); then
-        _is_safe_subcmd_token "${words[j]}" && _SEG_KIND="go:${words[j]}"
-        case "${words[j]}" in
-          build|test) return 0 ;;
-        esac
-      fi
-      return 1
-      ;;
-
-    cargo)
-      local j=$(( pos + 1 ))
+    go|cargo)
       while (( j < len )); do
         tok="${words[j]}"
-        case "$tok" in
-          +*|-*) (( j += 1 )) ;;
-          *) break ;;
-        esac
+        if [[ "$tok" == -* ]] || [[ "$cmd_base" == "cargo" && "$tok" == +* ]]; then
+          (( j += 1 ))
+        else
+          break
+        fi
       done
       if (( j < len )); then
-        _is_safe_subcmd_token "${words[j]}" && _SEG_KIND="cargo:${words[j]}"
+        _is_safe_subcmd_token "${words[j]}" && _SEG_KIND="${cmd_base}:${words[j]}"
         case "${words[j]}" in
           build|test) return 0 ;;
         esac
       fi
       return 1
       ;;
-
     python|python3)
-      local j=$(( pos + 1 ))
       while (( j < len )); do
         tok="${words[j]}"
         case "$tok" in
           -m)
             if (( j + 1 < len )); then
               _is_safe_subcmd_token "${words[j+1]}" && _SEG_KIND="${cmd_base}:${words[j+1]}"
-              if [[ "${words[j+1]}" == "pytest" ]]; then
-                return 0
-              fi
+              [[ "${words[j+1]}" == "pytest" ]] && return 0
             fi
-            (( j += 2 ))
-            continue
-            ;;
-          -c)
-            _SEG_KIND="${cmd_base}:inline"
-            return 1
-            ;;
-          -*)
-            (( j += 1 ))
-            continue
-            ;;
+            (( j += 2 )); continue ;;
+          -c) _SEG_KIND="${cmd_base}:inline"; return 1 ;;
+          -*) (( j += 1 )); continue ;;
           *)
-            if _is_script_filename "$tok"; then
-              _SEG_KIND="${cmd_base}:$(_sanitize_label "${tok##*/}")"
-            fi
-            if _is_heavy_script_name "$tok"; then
-              return 0
-            fi
+            _is_script_filename "$tok" && _SEG_KIND="${cmd_base}:$(_sanitize_label "${tok##*/}")"
+            _is_heavy_script_name "$tok" && return 0
             break
             ;;
         esac
@@ -1050,7 +798,61 @@ _classify_segment() {
       return 1
       ;;
   esac
+  return 1
+}
 
+_classify_segment() {
+  local depth="$1"
+  shift
+  local words=("$@") len=${#words[@]}
+  _SEG_KIND=""
+
+  _skip_command_wrappers "${words[@]}"
+  local pos="$_SKIP_POS"
+  (( pos < len )) || return 1
+
+  local cmd="${words[pos]}"
+  local cmd_base="${cmd##*/}"
+  local safe_cmd_base
+  safe_cmd_base="$(_sanitize_label "$cmd_base")"
+  _SEG_KIND="$safe_cmd_base"
+  local rest=("${words[@]:pos+1}")
+
+  case "$cmd_base" in
+    bash|sh|dash|zsh)
+      _classify_shell_wrapper "$depth" "$safe_cmd_base" "${rest[@]}"
+      return $?
+      ;;
+    tsc|vitest|jest|playwright|chromium|chromium-headless-shell|chrome|google-chrome|vite|esbuild|webpack|tsx|pytest)
+      _SEG_KIND="$cmd_base"
+      return 0
+      ;;
+    git|gh|systemctl)
+      local j=0 tok
+      while (( j < ${#rest[@]} )); do
+        tok="${rest[j]}"
+        case "$tok" in
+          -C|-c|--git-dir|--work-tree) (( j += 2 )) ;;
+          -*) (( j += 1 )) ;;
+          *) _is_safe_subcmd_token "$tok" && _SEG_KIND="${cmd_base}:${tok}"; break ;;
+        esac
+      done
+      return 1
+      ;;
+    npm|npx|bun|bunx|pnpm|yarn)
+      _classify_pkg_runner "$cmd_base" "${rest[@]}"
+      return $?
+      ;;
+    node|docker|go|cargo|python|python3)
+      _classify_runtime_tool "$cmd_base" "${rest[@]}"
+      return $?
+      ;;
+  esac
+
+  if _is_heavy_script_name "$cmd_base"; then
+    _SEG_KIND="$safe_cmd_base"
+    return 0
+  fi
   return 1
 }
 

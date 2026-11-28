@@ -2,13 +2,20 @@
 # OCV5-931 Layer 1: Idempotent installer and verifier for host systemd control-plane QoS
 # and cgroup v2 memory_recursiveprot ancestor-chain protection.
 #
-# Safety guarantees:
+# Architectural boundaries & safety guarantees:
+#   - Single-writer principle: ONLY manages `oc-host-cmd.slice` and dedicated
+#     `*.d/10-v5-selfhost-qos.conf` drop-ins. NEVER writes or overwrites full
+#     `/etc/systemd/system/*.service` unit files (those remain exclusively owned
+#     by the release/deploy pipeline holding the deploy lock for a pinned SHA).
 #   - Default mode is --dry-run (zero filesystem writes, zero systemctl calls).
-#   - --apply writes persistent files atomically (mktemp + chmod 0644 + mv -Tf) BEFORE
-#     cleaning up managed QoS runtime drop-in files under /run/systemd/system.control.
+#   - --apply installs persistent drop-ins atomically (mktemp + chmod 0644 + mv -Tf)
+#     BEFORE cleaning runtime properties under /run/systemd/system.control.
+#   - Verified-replacement cleanup: ONLY removes a `50-<Prop>.conf` runtime file
+#     when `<Prop>` is in the managed QoS set AND the unit's installed persistent
+#     `10-v5-selfhost-qos.conf` explicitly declares `<Prop>=`. Pre-existing runtime
+#     properties without a persistent replacement (e.g. postgresql MemoryMax or
+#     TasksMax) are preserved untouched.
 #   - NEVER runs `systemctl revert` and NEVER restarts/stops/enables any service.
-#   - Preserves unrelated drop-ins (e.g. openclaude.service.d/selfheal.conf) and
-#     non-QoS runtime drop-in files (e.g. 50-TasksMax.conf).
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,7 +32,6 @@ RUNTIME_CONTROL_DIR="/run/systemd/system.control"
 CGROUP_ROOT="/sys/fs/cgroup"
 TSC_QUEUE_SCRIPT="/run/v5-tsc-queue.py"
 SKIP_RELOAD=0
-SKIP_UNIT_TEMPLATES=0
 
 # Exact byte thresholds for cgroup v2 verification (1 MiB = 1048576, 1 GiB = 1073741824)
 BYTES_64M=67108864
@@ -55,41 +61,38 @@ DROPIN_MAPPINGS=(
   'openclaude.service.conf|openclaude.service'
   'cloudflared-oc.service.conf|cloudflared-oc.service'
   'ssh.service.conf|ssh.service'
+  'openclaude-v5-selfhost-frontdoor.service.conf|openclaude-v5-selfhost-frontdoor.service'
+  'openclaude-v5-selfhost@.service.conf|openclaude-v5-selfhost@.service'
+  'openclaude-v5-selfhost.service.conf|openclaude-v5-selfhost.service'
+  'cloudflared-v5-selfhost.service.conf|cloudflared-v5-selfhost.service'
+  'openclaude-v5-selfhost-egress@.service.conf|openclaude-v5-selfhost-egress@.service'
+  'openclaude-v5-selfhost-remote-relay@.service.conf|openclaude-v5-selfhost-remote-relay@.service'
 )
 
-# Static unit templates updated only when both source exists and target is already installed.
-STATIC_UNIT_TEMPLATES=(
-  'cloudflared-v5-selfhost.service'
-  'openclaude-v5-selfhost-egress@.service'
-  'openclaude-v5-selfhost-remote-relay@.service'
-  'openclaude-v5-selfhost.service'
+# Runtime drop-in dir -> authoritative persistent replacement unit name & repo source file.
+# Only properties actually declared by that unit's persistent drop-in may be cleaned.
+RUNTIME_MIGRATION_MAP=(
+  'cloudflared-oc.service.d|cloudflared-oc.service|cloudflared-oc.service.conf'
+  'cloudflared-v5-selfhost.service.d|cloudflared-v5-selfhost.service|cloudflared-v5-selfhost.service.conf'
+  'openclaude-v5-selfhost-egress@A.service.d|openclaude-v5-selfhost-egress@.service|openclaude-v5-selfhost-egress@.service.conf'
+  'openclaude-v5-selfhost-egress@B.service.d|openclaude-v5-selfhost-egress@.service|openclaude-v5-selfhost-egress@.service.conf'
+  'openclaude-v5-selfhost-frontdoor.service.d|openclaude-v5-selfhost-frontdoor.service|openclaude-v5-selfhost-frontdoor.service.conf'
+  'openclaude-v5-selfhost@A.service.d|openclaude-v5-selfhost@.service|openclaude-v5-selfhost@.service.conf'
+  'openclaude-v5-selfhost@B.service.d|openclaude-v5-selfhost@.service|openclaude-v5-selfhost@.service.conf'
+  'openclaude.service.d|openclaude.service|openclaude.service.conf'
+  'postgresql@16-main.service.d|postgresql@16-main.service|postgresql@16-main.service.conf'
+  'redis-server.service.d|redis-server.service|redis-server.service.conf'
+  'user-0.slice.d|user-0.slice|user-0.slice.conf'
 )
 
-# Temporary runtime drop-in directories owned by OCV5-931 migration.
-MANAGED_RUNTIME_DIRS=(
-  'cloudflared-oc.service.d'
-  'cloudflared-v5-selfhost.service.d'
-  'openclaude-v5-selfhost-egress@A.service.d'
-  'openclaude-v5-selfhost-egress@B.service.d'
-  'openclaude-v5-selfhost-frontdoor.service.d'
-  'openclaude-v5-selfhost@A.service.d'
-  'openclaude-v5-selfhost@B.service.d'
-  'openclaude.service.d'
-  'postgresql@16-main.service.d'
-  'redis-server.service.d'
-  'user-0.slice.d'
-)
-
-# Only these QoS property drop-in files are removed from MANAGED_RUNTIME_DIRS;
-# unrelated runtime property files (e.g. 50-TasksMax.conf) are preserved untouched.
-MANAGED_RUNTIME_QOS_FILES=(
-  '50-CPUWeight.conf'
-  '50-IOWeight.conf'
-  '50-MemoryLow.conf'
-  '50-MemoryMin.conf'
-  '50-MemoryHigh.conf'
-  '50-MemoryMax.conf'
-  '50-MemorySwapMax.conf'
+MANAGED_RUNTIME_QOS_PROPS=(
+  'CPUWeight'
+  'IOWeight'
+  'MemoryLow'
+  'MemoryMin'
+  'MemoryHigh'
+  'MemoryMax'
+  'MemorySwapMax'
 )
 
 usage() {
@@ -98,8 +101,8 @@ Usage: install-v5-selfhost-qos.sh [OPTIONS]
 
 Modes (default: --dry-run):
   --dry-run                    Print planned changes without writing files or reloading systemd
-  --apply                      Atomically install persistent QoS slice, drop-ins, and unit templates
-  --verify                     Verify persistent files, clean runtime control dir, and cgroup v2 hierarchy
+  --apply                      Atomically install persistent QoS slice & drop-ins (never modifies .service units)
+  --verify                     Verify persistent drop-ins, verified runtime cleanup, and cgroup v2 hierarchy
 
 Options:
   --systemd-dir <dir>          Systemd persistent unit dir (default: /etc/systemd/system)
@@ -107,7 +110,6 @@ Options:
   --cgroup-root <dir>          cgroup v2 mount root (default: /sys/fs/cgroup)
   --tsc-queue-script <path>    Legacy tsc queue script path (default: /run/v5-tsc-queue.py)
   --skip-reload                Skip `systemctl daemon-reload` and live systemd inspection
-  --skip-unit-templates        Skip syncing unit template files (frontdoor, master@, egress@, relay@, cloudflared)
   -h, --help                   Show this help
 EOF
 }
@@ -136,7 +138,6 @@ parse_args() {
       --tsc-queue-script) require_arg_value "$1" "${2:-}"; TSC_QUEUE_SCRIPT="$2"; shift 2 ;;
       --tsc-queue-script=*) TSC_QUEUE_SCRIPT="${1#*=}"; require_arg_value "--tsc-queue-script" "$TSC_QUEUE_SCRIPT"; shift ;;
       --skip-reload) SKIP_RELOAD=1; shift ;;
-      --skip-unit-templates) SKIP_UNIT_TEMPLATES=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown argument: $1 (use --help)" ;;
     esac
@@ -151,8 +152,7 @@ parse_args() {
 }
 
 file_mode_octal() {
-  local path="$1"
-  stat -c '%a' -- "$path" 2>/dev/null || true
+  stat -c '%a' -- "$1" 2>/dev/null || true
 }
 
 atomic_install_file() { # <src> <dst>
@@ -181,78 +181,42 @@ atomic_install_file() { # <src> <dst>
 }
 
 install_persistent_qos_files() {
-  local slice_src="${DEPLOY_DIR}/oc-host-cmd.slice"
-  local slice_dst="${SYSTEMD_DIR}/oc-host-cmd.slice"
-  atomic_install_file "$slice_src" "$slice_dst"
+  atomic_install_file "${DEPLOY_DIR}/oc-host-cmd.slice" "${SYSTEMD_DIR}/oc-host-cmd.slice"
 
-  local entry src_name unit_name src_path dst_path
+  local entry src_name unit_name
   for entry in "${DROPIN_MAPPINGS[@]}"; do
     src_name="${entry%%|*}"
     unit_name="${entry#*|}"
-    src_path="${QOS_SRC_DIR}/${src_name}"
-    dst_path="${SYSTEMD_DIR}/${unit_name}.d/${DROPIN_NAME}"
-    atomic_install_file "$src_path" "$dst_path"
+    atomic_install_file "${QOS_SRC_DIR}/${src_name}" "${SYSTEMD_DIR}/${unit_name}.d/${DROPIN_NAME}"
   done
 }
 
-sync_unit_templates() {
-  if (( SKIP_UNIT_TEMPLATES == 1 )); then
-    log "skip unit templates (--skip-unit-templates)"
-    return 0
-  fi
+# Check whether a managed runtime property `50-<Prop>.conf` has a verified persistent replacement.
+# In --apply/--verify, checks the ACTUAL installed persistent drop-in on disk;
+# in --dry-run, checks the installed drop-in or planned repo source drop-in.
+prop_has_verified_replacement() { # <unit_name> <src_name> <prop> <allow_planned_src:0|1>
+  local unit_name="$1" src_name="$2" prop="$3" allow_planned="${4:-0}"
+  local installed="${SYSTEMD_DIR}/${unit_name}.d/${DROPIN_NAME}"
+  local check_file=""
 
-  local dual_slot_lib="${REPO_ROOT}/scripts/v5-selfhost-dual-slot-lib.sh"
-  [[ -f "$dual_slot_lib" ]] || die "missing dual-slot lib: ${dual_slot_lib}"
-  # shellcheck source=scripts/v5-selfhost-dual-slot-lib.sh
-  source "$dual_slot_lib"
-
-  local fd_dst="${SYSTEMD_DIR}/${V5_FRONTDOOR_UNIT}"
-  local slot_dst="${SYSTEMD_DIR}/${V5_MASTER_SLOT_TPL}"
-  local fd_rendered slot_rendered fd_same=0 slot_same=0
-  fd_rendered="$(render_selfhost_frontdoor_unit)"
-  slot_rendered="$(render_selfhost_master_slot_unit)"
-
-  if [[ -f "$fd_dst" ]] && [[ "$(file_mode_octal "$fd_dst")" == "644" ]] \
-     && cmp -s -- "$fd_dst" <(printf '%s\n' "$fd_rendered"); then
-    fd_same=1
-  fi
-  if [[ -f "$slot_dst" ]] && [[ "$(file_mode_octal "$slot_dst")" == "644" ]] \
-     && cmp -s -- "$slot_dst" <(printf '%s\n' "$slot_rendered"); then
-    slot_same=1
-  fi
-
-  if (( fd_same == 1 && slot_same == 1 )); then
-    log "unchanged: ${fd_dst}"
-    log "unchanged: ${slot_dst}"
-  elif (( MODE_APPLY == 0 )); then
-    (( fd_same == 0 )) && log "[dry-run] would render unit template ${fd_dst}"
-    (( slot_same == 0 )) && log "[dry-run] would render unit template ${slot_dst}"
+  if [[ -f "$installed" ]]; then
+    check_file="$installed"
+  elif (( allow_planned == 1 )) && [[ -f "${QOS_SRC_DIR}/${src_name}" ]]; then
+    check_file="${QOS_SRC_DIR}/${src_name}"
   else
-    install_selfhost_dual_slot_units "$SYSTEMD_DIR" || die "install_selfhost_dual_slot_units failed"
-    log "installed: ${fd_dst}"
-    log "installed: ${slot_dst}"
+    return 1
   fi
 
-  local unit src dst
-  for unit in "${STATIC_UNIT_TEMPLATES[@]}"; do
-    src="${DEPLOY_DIR}/${unit}"
-    dst="${SYSTEMD_DIR}/${unit}"
-    if [[ ! -f "$src" ]]; then
-      warn "missing static unit template source: ${src}"
-      continue
-    fi
-    if [[ ! -f "$dst" ]]; then
-      log "skip (not installed): ${dst}"
-      continue
-    fi
-    atomic_install_file "$src" "$dst"
-  done
+  grep -Eq "^[[:space:]]*${prop}=" "$check_file"
 }
 
-is_managed_runtime_qos_file() {
-  local name="$1" f
-  for f in "${MANAGED_RUNTIME_QOS_FILES[@]}"; do
-    [[ "$name" == "$f" ]] && return 0
+runtime_file_will_be_removed() { # <unit_name> <src_name> <filename> <allow_planned:0|1>
+  local unit_name="$1" src_name="$2" fname="$3" allow_planned="$4" prop
+  for prop in "${MANAGED_RUNTIME_QOS_PROPS[@]}"; do
+    if [[ "$fname" == "50-${prop}.conf" ]]; then
+      prop_has_verified_replacement "$unit_name" "$src_name" "$prop" "$allow_planned"
+      return $?
+    fi
   done
   return 1
 }
@@ -261,32 +225,41 @@ cleanup_runtime_dropins() {
   [[ -n "$RUNTIME_CONTROL_DIR" && "$RUNTIME_CONTROL_DIR" != "/" ]] \
     || die "refusing unsafe --runtime-control-dir: '${RUNTIME_CONTROL_DIR}'"
 
-  local d dir f target
-  for d in "${MANAGED_RUNTIME_DIRS[@]}"; do
-    dir="${RUNTIME_CONTROL_DIR}/${d}"
+  local allow_planned=0
+  (( MODE_APPLY == 0 )) && allow_planned=1
+
+  local entry rt_dir unit_name src_name dir prop target removed_any
+  for entry in "${RUNTIME_MIGRATION_MAP[@]}"; do
+    IFS='|' read -r rt_dir unit_name src_name <<<"$entry"
+    dir="${RUNTIME_CONTROL_DIR}/${rt_dir}"
     [[ -d "$dir" ]] || continue
 
-    local removed_any=0
-    for f in "${MANAGED_RUNTIME_QOS_FILES[@]}"; do
-      target="${dir}/${f}"
-      if [[ -e "$target" || -L "$target" ]]; then
-        removed_any=1
-        if (( MODE_APPLY == 0 )); then
-          log "[dry-run] would remove runtime QoS drop-in: ${target}"
-        else
-          rm -f -- "$target" || die "failed to remove runtime QoS drop-in: ${target}"
-          log "removed runtime QoS drop-in: ${target}"
-        fi
+    removed_any=0
+    for prop in "${MANAGED_RUNTIME_QOS_PROPS[@]}"; do
+      target="${dir}/50-${prop}.conf"
+      [[ -e "$target" || -L "$target" ]] || continue
+
+      if ! prop_has_verified_replacement "$unit_name" "$src_name" "$prop" "$allow_planned"; then
+        log "preserving runtime drop-in without persistent ${prop}= replacement: ${target}"
+        continue
+      fi
+
+      removed_any=1
+      if (( MODE_APPLY == 0 )); then
+        log "[dry-run] would remove runtime QoS drop-in (replaced by ${unit_name}.d/${DROPIN_NAME}): ${target}"
+      else
+        rm -f -- "$target" || die "failed to remove runtime QoS drop-in: ${target}"
+        log "removed runtime QoS drop-in (replaced by ${unit_name}.d/${DROPIN_NAME}): ${target}"
       fi
     done
 
     if (( MODE_APPLY == 0 )); then
       if (( removed_any == 1 )); then
-        local has_other=0 entry base
+        local has_other=0 f_entry base
         shopt -s nullglob dotglob
-        for entry in "${dir}"/*; do
-          base="$(basename -- "$entry")"
-          if ! is_managed_runtime_qos_file "$base"; then
+        for f_entry in "${dir}"/*; do
+          base="$(basename -- "$f_entry")"
+          if ! runtime_file_will_be_removed "$unit_name" "$src_name" "$base" 1; then
             has_other=1
             break
           fi
@@ -295,14 +268,14 @@ cleanup_runtime_dropins() {
         if (( has_other == 0 )); then
           log "[dry-run] would rmdir empty runtime drop-in dir: ${dir}"
         else
-          log "[dry-run] would preserve runtime drop-in dir with non-QoS files: ${dir}"
+          log "[dry-run] would preserve runtime drop-in dir with unreplaced/non-QoS files: ${dir}"
         fi
       fi
     else
       if rmdir -- "$dir" 2>/dev/null; then
         log "removed empty runtime drop-in dir: ${dir}"
       elif (( removed_any == 1 )); then
-        log "preserved non-empty runtime drop-in dir (contains non-QoS files): ${dir}"
+        log "preserved non-empty runtime drop-in dir (contains unreplaced/non-QoS files): ${dir}"
       fi
     fi
   done
@@ -326,14 +299,11 @@ tsc_queue_service_state() {
 }
 
 tsc_queue_service_confirmed_stopped() {
-  local state="$1"
-  [[ "$state" == "inactive" || "$state" == "failed" ]]
+  [[ "$1" == "inactive" || "$1" == "failed" ]]
 }
 
 cleanup_tsc_queue_script() {
-  if [[ ! -e "$TSC_QUEUE_SCRIPT" && ! -L "$TSC_QUEUE_SCRIPT" ]]; then
-    return 0
-  fi
+  [[ -e "$TSC_QUEUE_SCRIPT" || -L "$TSC_QUEUE_SCRIPT" ]] || return 0
 
   local state
   state="$(tsc_queue_service_state)"
@@ -366,17 +336,13 @@ reload_systemd() {
   systemctl daemon-reload || die "systemctl daemon-reload failed"
   log "reloaded systemd manager configuration (daemon-reload; no services restarted)"
 
-  # Best-effort diagnostic readout of active slices after daemon-reload.
-  # On systemd 255, daemon-reload re-realizes cgroup v2 CPU/IO/Memory attributes immediately;
-  # OOMScoreAdjust takes effect on the unit's next process start.
-  local u
+  local u props
   for u in \
     'system.slice' \
     'system-openclaude\x2dv5\x2dselfhost.slice' \
     'system-postgresql.slice' \
     'user.slice' \
     'user-0.slice'; do
-    local props
     props="$(systemctl show "$u" \
       -p CPUWeight -p IOWeight -p MemoryMin -p MemoryLow -p MemoryHigh -p MemoryMax \
       2>/dev/null | tr '\n' ' ' || true)"
@@ -384,7 +350,7 @@ reload_systemd() {
   done
 }
 
-# ── Verification helpers ─────────────────────────────────────────────────
+# ── Verification helpers (decomposed by responsibility) ──────────────────
 
 VERIFY_PASS=0
 VERIFY_FAIL=0
@@ -399,45 +365,72 @@ v_fail() {
   printf 'FAIL - %s\n' "$*" >&2
 }
 
-read_cgroup_raw() { # <path>
-  local p="$1"
+read_cgroup_raw() {
+  local p="$1" val
   [[ -r "$p" ]] || return 1
-  local val
   IFS= read -r val <"$p" || return 1
   printf '%s' "$val"
 }
 
-is_uint() {
-  local v="${1:-}"
-  [[ "$v" =~ ^[0-9]+$ ]]
-}
+is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+is_positive_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 > 0 )); }
 
-is_positive_uint() {
-  local v="${1:-}"
-  [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 ))
-}
-
-verify_unit_directives() { # <file> <label> <directive...>
-  local file="$1" label="$2"; shift 2
-  if [[ ! -f "$file" ]]; then
-    v_fail "missing unit template ${label}: ${file}"
-    return 0
+verify_persistent_files() {
+  local slice_src="${DEPLOY_DIR}/oc-host-cmd.slice"
+  local slice_dst="${SYSTEMD_DIR}/oc-host-cmd.slice"
+  if [[ -f "$slice_dst" ]] && cmp -s -- "$slice_src" "$slice_dst"; then
+    v_ok "persistent slice matches repo: ${slice_dst}"
+  else
+    v_fail "persistent slice missing or drifted: ${slice_dst}"
   fi
-  local missing=() d
-  for d in "$@"; do
-    if ! grep -Fxq -- "$d" "$file"; then
-      missing+=("$d")
+
+  local entry src_name unit_name src_path dst_path
+  for entry in "${DROPIN_MAPPINGS[@]}"; do
+    src_name="${entry%%|*}"
+    unit_name="${entry#*|}"
+    src_path="${QOS_SRC_DIR}/${src_name}"
+    dst_path="${SYSTEMD_DIR}/${unit_name}.d/${DROPIN_NAME}"
+    if [[ -f "$dst_path" ]] && cmp -s -- "$src_path" "$dst_path"; then
+      v_ok "persistent drop-in matches repo: ${unit_name}.d/${DROPIN_NAME}"
+    else
+      v_fail "persistent drop-in missing or drifted: ${dst_path}"
     fi
   done
-  if (( ${#missing[@]} == 0 )); then
-    v_ok "unit template QoS directives present: ${label}"
-  else
-    v_fail "unit template ${label} missing directives: ${missing[*]}"
+}
+
+verify_runtime_clean() {
+  local entry rt_dir unit_name src_name prop rt_target leftover=0
+  for entry in "${RUNTIME_MIGRATION_MAP[@]}"; do
+    IFS='|' read -r rt_dir unit_name src_name <<<"$entry"
+    for prop in "${MANAGED_RUNTIME_QOS_PROPS[@]}"; do
+      rt_target="${RUNTIME_CONTROL_DIR}/${rt_dir}/50-${prop}.conf"
+      [[ -e "$rt_target" || -L "$rt_target" ]] || continue
+      if prop_has_verified_replacement "$unit_name" "$src_name" "$prop" 0; then
+        v_fail "leftover replaced runtime QoS drop-in: ${rt_target}"
+        leftover=1
+      fi
+    done
+  done
+  if (( leftover == 0 )); then
+    v_ok "no replaced runtime QoS drop-in files remaining under ${RUNTIME_CONTROL_DIR}"
   fi
 }
 
-# Verify a single active leaf service cgroup if its directory exists.
-# Populates LEAF_LAST_MIN and LEAF_LAST_LOW (0 when absent or unreadable) for parent-sum checks.
+verify_tsc_queue() {
+  if [[ -e "$TSC_QUEUE_SCRIPT" || -L "$TSC_QUEUE_SCRIPT" ]]; then
+    local tsc_state
+    tsc_state="$(tsc_queue_service_state)"
+    if tsc_queue_service_confirmed_stopped "$tsc_state"; then
+      v_fail "legacy script still present while v5-selfhost-tsc-queue.service is ${tsc_state}: ${TSC_QUEUE_SCRIPT}"
+    else
+      warn "legacy ${TSC_QUEUE_SCRIPT} preserved (v5-selfhost-tsc-queue.service state='${tsc_state}')"
+      v_ok "legacy tsc queue script preserved safely while service state='${tsc_state}'"
+    fi
+  else
+    v_ok "legacy tsc queue script absent: ${TSC_QUEUE_SCRIPT}"
+  fi
+}
+
 LEAF_LAST_MIN=0
 LEAF_LAST_LOW=0
 verify_active_leaf() { # <cg_dir> <label> <min_mem_min> <min_mem_low> <min_cpu>
@@ -451,24 +444,12 @@ verify_active_leaf() { # <cg_dir> <label> <min_mem_min> <min_mem_low> <min_cpu>
   got_low="$(read_cgroup_raw "${cg_dir}/memory.low" || true)"
   got_cpu="$(read_cgroup_raw "${cg_dir}/cpu.weight" || true)"
 
-  if is_uint "$got_min"; then LEAF_LAST_MIN="$got_min"; fi
-  if is_uint "$got_low"; then LEAF_LAST_LOW="$got_low"; fi
+  is_uint "$got_min" && LEAF_LAST_MIN="$got_min"
+  is_uint "$got_low" && LEAF_LAST_LOW="$got_low"
 
-  if (( want_min > 0 )); then
-    if ! is_positive_uint "$got_min" || (( got_min < want_min )); then
-      ok=0
-    fi
-  fi
-  if (( want_low > 0 )); then
-    if ! is_positive_uint "$got_low" || (( got_low < want_low )); then
-      ok=0
-    fi
-  fi
-  if (( want_cpu > 0 )); then
-    if ! is_positive_uint "$got_cpu" || (( got_cpu < want_cpu )); then
-      ok=0
-    fi
-  fi
+  if (( want_min > 0 )) && { ! is_positive_uint "$got_min" || (( got_min < want_min )); }; then ok=0; fi
+  if (( want_low > 0 )) && { ! is_positive_uint "$got_low" || (( got_low < want_low )); }; then ok=0; fi
+  if (( want_cpu > 0 )) && { ! is_positive_uint "$got_cpu" || (( got_cpu < want_cpu )); }; then ok=0; fi
 
   if (( ok == 1 )); then
     v_ok "active leaf ${label} meets thresholds (memory.min=${got_min:-0} memory.low=${got_low:-0} cpu.weight=${got_cpu:-0})"
@@ -477,100 +458,13 @@ verify_active_leaf() { # <cg_dir> <label> <min_mem_min> <min_mem_low> <min_cpu>
   fi
 }
 
-run_verify() {
-  VERIFY_PASS=0
-  VERIFY_FAIL=0
+# Populated by verify_cgroup_slices for verify_cgroup_leaves parent-sum assertions
+CG_SYS_MIN="" CG_SYS_LOW="" CG_SYS_CPU=""
+CG_MASTER_MIN="" CG_MASTER_LOW=""
+CG_PG_MIN="" CG_PG_LOW=""
+CG_EGRESS_LOW="" CG_RELAY_LOW=""
 
-  # 1. Persistent oc-host-cmd.slice
-  local slice_src="${DEPLOY_DIR}/oc-host-cmd.slice"
-  local slice_dst="${SYSTEMD_DIR}/oc-host-cmd.slice"
-  if [[ -f "$slice_dst" ]] && cmp -s -- "$slice_src" "$slice_dst"; then
-    v_ok "persistent slice matches repo: ${slice_dst}"
-  else
-    v_fail "persistent slice missing or drifted: ${slice_dst}"
-  fi
-
-  # 2. All 12 persistent drop-ins
-  local entry src_name unit_name src_path dst_path
-  for entry in "${DROPIN_MAPPINGS[@]}"; do
-    src_name="${entry%%|*}"
-    unit_name="${entry#*|}"
-    src_path="${QOS_SRC_DIR}/${src_name}"
-    dst_path="${SYSTEMD_DIR}/${unit_name}.d/${DROPIN_NAME}"
-    if [[ -f "$dst_path" ]] && cmp -s -- "$src_path" "$dst_path"; then
-      v_ok "persistent drop-in matches repo: ${unit_name}.d/${DROPIN_NAME}"
-    else
-      v_fail "persistent drop-in missing or drifted: ${dst_path}"
-    fi
-  done
-
-  # 3. Unit templates (unless --skip-unit-templates)
-  if (( SKIP_UNIT_TEMPLATES == 0 )); then
-    verify_unit_directives \
-      "${SYSTEMD_DIR}/openclaude-v5-selfhost-frontdoor.service" \
-      "openclaude-v5-selfhost-frontdoor.service" \
-      "CPUWeight=1000" "IOWeight=1000" "MemoryMin=64M" "MemoryLow=128M" "OOMScoreAdjust=-800"
-    verify_unit_directives \
-      "${SYSTEMD_DIR}/openclaude-v5-selfhost@.service" \
-      "openclaude-v5-selfhost@.service" \
-      "CPUWeight=1000" "IOWeight=1000" "MemoryMin=512M" "MemoryLow=768M" "OOMScoreAdjust=-800"
-
-    if [[ -f "${SYSTEMD_DIR}/openclaude-v5-selfhost.service" ]]; then
-      verify_unit_directives \
-        "${SYSTEMD_DIR}/openclaude-v5-selfhost.service" \
-        "openclaude-v5-selfhost.service" \
-        "CPUWeight=1000" "IOWeight=1000" "MemoryMin=512M" "MemoryLow=768M" "OOMScoreAdjust=-800"
-    fi
-    if [[ -f "${SYSTEMD_DIR}/cloudflared-v5-selfhost.service" ]]; then
-      verify_unit_directives \
-        "${SYSTEMD_DIR}/cloudflared-v5-selfhost.service" \
-        "cloudflared-v5-selfhost.service" \
-        "CPUWeight=1000" "IOWeight=1000" "MemoryMin=64M" "MemoryLow=128M" "OOMScoreAdjust=-800"
-    fi
-    if [[ -f "${SYSTEMD_DIR}/openclaude-v5-selfhost-egress@.service" ]]; then
-      verify_unit_directives \
-        "${SYSTEMD_DIR}/openclaude-v5-selfhost-egress@.service" \
-        "openclaude-v5-selfhost-egress@.service" \
-        "CPUWeight=600" "IOWeight=600" "MemoryLow=256M" "OOMScoreAdjust=-500"
-    fi
-    if [[ -f "${SYSTEMD_DIR}/openclaude-v5-selfhost-remote-relay@.service" ]]; then
-      verify_unit_directives \
-        "${SYSTEMD_DIR}/openclaude-v5-selfhost-remote-relay@.service" \
-        "openclaude-v5-selfhost-remote-relay@.service" \
-        "CPUWeight=500" "IOWeight=500" "MemoryLow=64M" "OOMScoreAdjust=-500"
-    fi
-  fi
-
-  # 4. Managed runtime QoS drop-in files must be absent (non-QoS runtime files allowed)
-  local d f rt_target leftover=0
-  for d in "${MANAGED_RUNTIME_DIRS[@]}"; do
-    for f in "${MANAGED_RUNTIME_QOS_FILES[@]}"; do
-      rt_target="${RUNTIME_CONTROL_DIR}/${d}/${f}"
-      if [[ -e "$rt_target" || -L "$rt_target" ]]; then
-        v_fail "leftover managed runtime QoS drop-in: ${rt_target}"
-        leftover=1
-      fi
-    done
-  done
-  if (( leftover == 0 )); then
-    v_ok "no managed runtime QoS drop-in files remaining under ${RUNTIME_CONTROL_DIR}"
-  fi
-
-  # 5. Legacy tsc queue script check (fail only when service is confirmed inactive/failed)
-  if [[ -e "$TSC_QUEUE_SCRIPT" || -L "$TSC_QUEUE_SCRIPT" ]]; then
-    local tsc_state
-    tsc_state="$(tsc_queue_service_state)"
-    if tsc_queue_service_confirmed_stopped "$tsc_state"; then
-      v_fail "legacy script still present while v5-selfhost-tsc-queue.service is ${tsc_state}: ${TSC_QUEUE_SCRIPT}"
-    else
-      warn "legacy ${TSC_QUEUE_SCRIPT} preserved (v5-selfhost-tsc-queue.service state='${tsc_state}')"
-      v_ok "legacy tsc queue script preserved safely while service state='${tsc_state}'"
-    fi
-  else
-    v_ok "legacy tsc queue script absent: ${TSC_QUEUE_SCRIPT}"
-  fi
-
-  # 6. Kernel cgroup v2 ancestor-chain, byte-threshold, priority, and active-leaf verification
+verify_cgroup_slices() {
   local sys_cg="${CGROUP_ROOT}/system.slice"
   local master_cg="${CGROUP_ROOT}/system.slice/system-openclaude\x2dv5\x2dselfhost.slice"
   local pg_cg="${CGROUP_ROOT}/system.slice/system-postgresql.slice"
@@ -579,118 +473,104 @@ run_verify() {
   local user_cg="${CGROUP_ROOT}/user.slice"
   local user0_cg="${CGROUP_ROOT}/user.slice/user-0.slice"
 
-  local sys_min="" sys_low="" sys_cpu=""
-  local master_min="" master_low="" master_cpu=""
-  local pg_min="" pg_low="" pg_cpu=""
-  local egress_low="" egress_cpu=""
-  local relay_low="" relay_cpu=""
-  local user_cpu=""
-  local user0_high="" user0_max="" user0_cpu=""
+  CG_SYS_MIN="$(read_cgroup_raw "${sys_cg}/memory.min" || true)"
+  CG_SYS_LOW="$(read_cgroup_raw "${sys_cg}/memory.low" || true)"
+  CG_SYS_CPU="$(read_cgroup_raw "${sys_cg}/cpu.weight" || true)"
 
-  # 6a. system.slice: memory.min >= 2304 MiB, memory.low >= 4608 MiB, cpu.weight >= 800
-  sys_min="$(read_cgroup_raw "${sys_cg}/memory.min" || true)"
-  sys_low="$(read_cgroup_raw "${sys_cg}/memory.low" || true)"
-  sys_cpu="$(read_cgroup_raw "${sys_cg}/cpu.weight" || true)"
-
-  if is_positive_uint "$sys_min" && (( sys_min >= BYTES_2304M )) \
-     && is_positive_uint "$sys_low" && (( sys_low >= BYTES_4608M )) \
-     && is_positive_uint "$sys_cpu" && (( sys_cpu >= 800 )); then
-    v_ok "cgroup system.slice meets thresholds (memory.min=${sys_min} memory.low=${sys_low} cpu.weight=${sys_cpu})"
+  if is_positive_uint "$CG_SYS_MIN" && (( CG_SYS_MIN >= BYTES_2304M )) \
+     && is_positive_uint "$CG_SYS_LOW" && (( CG_SYS_LOW >= BYTES_4608M )) \
+     && is_positive_uint "$CG_SYS_CPU" && (( CG_SYS_CPU >= 800 )); then
+    v_ok "cgroup system.slice meets thresholds (memory.min=${CG_SYS_MIN} memory.low=${CG_SYS_LOW} cpu.weight=${CG_SYS_CPU})"
   else
-    v_fail "cgroup system.slice below thresholds (got min='${sys_min:-<missing>}' low='${sys_low:-<missing>}' cpu='${sys_cpu:-<missing>}', want min>=${BYTES_2304M} low>=${BYTES_4608M} cpu>=800)"
+    v_fail "cgroup system.slice below thresholds (got min='${CG_SYS_MIN:-<missing>}' low='${CG_SYS_LOW:-<missing>}' cpu='${CG_SYS_CPU:-<missing>}', want min>=${BYTES_2304M} low>=${BYTES_4608M} cpu>=800)"
   fi
 
-  # 6b. system-openclaude\x2dv5\x2dselfhost.slice: memory.min >= 1024 MiB, memory.low >= 1536 MiB, cpu.weight >= 1000
-  master_min="$(read_cgroup_raw "${master_cg}/memory.min" || true)"
-  master_low="$(read_cgroup_raw "${master_cg}/memory.low" || true)"
+  local master_cpu pg_cpu egress_cpu relay_cpu user_cpu user0_high user0_max user0_cpu
+  CG_MASTER_MIN="$(read_cgroup_raw "${master_cg}/memory.min" || true)"
+  CG_MASTER_LOW="$(read_cgroup_raw "${master_cg}/memory.low" || true)"
   master_cpu="$(read_cgroup_raw "${master_cg}/cpu.weight" || true)"
-
-  if is_positive_uint "$master_min" && (( master_min >= BYTES_1024M )) \
-     && is_positive_uint "$master_low" && (( master_low >= BYTES_1536M )) \
+  if is_positive_uint "$CG_MASTER_MIN" && (( CG_MASTER_MIN >= BYTES_1024M )) \
+     && is_positive_uint "$CG_MASTER_LOW" && (( CG_MASTER_LOW >= BYTES_1536M )) \
      && is_positive_uint "$master_cpu" && (( master_cpu >= 1000 )); then
-    if is_positive_uint "$sys_min" && (( sys_min >= master_min )) \
-       && is_positive_uint "$sys_low" && (( sys_low >= master_low )); then
-      v_ok "cgroup system-openclaude\\x2dv5\\x2dselfhost.slice meets thresholds & ancestor chain (memory.min=${master_min} memory.low=${master_low} cpu.weight=${master_cpu})"
+    if is_positive_uint "$CG_SYS_MIN" && (( CG_SYS_MIN >= CG_MASTER_MIN )) \
+       && is_positive_uint "$CG_SYS_LOW" && (( CG_SYS_LOW >= CG_MASTER_LOW )); then
+      v_ok "cgroup system-openclaude\\x2dv5\\x2dselfhost.slice meets thresholds & ancestor chain"
     else
       v_fail "cgroup system-openclaude\\x2dv5\\x2dselfhost.slice truncated by system.slice ancestor (memory_recursiveprot)"
     fi
   else
-    v_fail "cgroup system-openclaude\\x2dv5\\x2dselfhost.slice below thresholds (got min='${master_min:-<missing>}' low='${master_low:-<missing>}' cpu='${master_cpu:-<missing>}', want min>=${BYTES_1024M} low>=${BYTES_1536M} cpu>=1000)"
+    v_fail "cgroup system-openclaude\\x2dv5\\x2dselfhost.slice below thresholds (got min='${CG_MASTER_MIN:-<missing>}' low='${CG_MASTER_LOW:-<missing>}' cpu='${master_cpu:-<missing>}')"
   fi
 
-  # 6c. system-postgresql.slice: memory.min >= 1024 MiB, memory.low >= 1536 MiB, cpu.weight >= 800
-  pg_min="$(read_cgroup_raw "${pg_cg}/memory.min" || true)"
-  pg_low="$(read_cgroup_raw "${pg_cg}/memory.low" || true)"
+  CG_PG_MIN="$(read_cgroup_raw "${pg_cg}/memory.min" || true)"
+  CG_PG_LOW="$(read_cgroup_raw "${pg_cg}/memory.low" || true)"
   pg_cpu="$(read_cgroup_raw "${pg_cg}/cpu.weight" || true)"
-
-  if is_positive_uint "$pg_min" && (( pg_min >= BYTES_1024M )) \
-     && is_positive_uint "$pg_low" && (( pg_low >= BYTES_1536M )) \
+  if is_positive_uint "$CG_PG_MIN" && (( CG_PG_MIN >= BYTES_1024M )) \
+     && is_positive_uint "$CG_PG_LOW" && (( CG_PG_LOW >= BYTES_1536M )) \
      && is_positive_uint "$pg_cpu" && (( pg_cpu >= 800 )); then
-    if is_positive_uint "$sys_min" && (( sys_min >= pg_min )) \
-       && is_positive_uint "$sys_low" && (( sys_low >= pg_low )); then
-      v_ok "cgroup system-postgresql.slice meets thresholds & ancestor chain (memory.min=${pg_min} memory.low=${pg_low} cpu.weight=${pg_cpu})"
+    if is_positive_uint "$CG_SYS_MIN" && (( CG_SYS_MIN >= CG_PG_MIN )) \
+       && is_positive_uint "$CG_SYS_LOW" && (( CG_SYS_LOW >= CG_PG_LOW )); then
+      v_ok "cgroup system-postgresql.slice meets thresholds & ancestor chain"
     else
       v_fail "cgroup system-postgresql.slice truncated by system.slice ancestor (memory_recursiveprot)"
     fi
   else
-    v_fail "cgroup system-postgresql.slice below thresholds (got min='${pg_min:-<missing>}' low='${pg_low:-<missing>}' cpu='${pg_cpu:-<missing>}', want min>=${BYTES_1024M} low>=${BYTES_1536M} cpu>=800)"
+    v_fail "cgroup system-postgresql.slice below thresholds (got min='${CG_PG_MIN:-<missing>}' low='${CG_PG_LOW:-<missing>}' cpu='${pg_cpu:-<missing>}')"
   fi
 
-  # 6d. user.slice: 0 < cpu.weight <= 50 and system.slice cpu.weight >= 8 * user.slice cpu.weight
   user_cpu="$(read_cgroup_raw "${user_cg}/cpu.weight" || true)"
   if is_positive_uint "$user_cpu" && (( user_cpu <= 50 )); then
     v_ok "cgroup user.slice cpu.weight=${user_cpu} (<= 50)"
   else
     v_fail "cgroup user.slice cpu.weight invalid or > 50 ('${user_cpu:-<missing>}')"
   fi
-
-  if is_positive_uint "$sys_cpu" && is_positive_uint "$user_cpu"; then
-    if (( sys_cpu >= 8 * user_cpu )); then
-      v_ok "cgroup CPU priority invariant: system.slice(${sys_cpu}) >= 8 * user.slice(${user_cpu})"
-    else
-      v_fail "cgroup CPU priority violated: system.slice(${sys_cpu}) < 8 * user.slice(${user_cpu})"
-    fi
+  if is_positive_uint "$CG_SYS_CPU" && is_positive_uint "$user_cpu" && (( CG_SYS_CPU >= 8 * user_cpu )); then
+    v_ok "cgroup CPU priority invariant: system.slice(${CG_SYS_CPU}) >= 8 * user.slice(${user_cpu})"
   else
-    v_fail "cgroup CPU priority check skipped due to missing cpu.weight"
+    v_fail "cgroup CPU priority violated: system.slice('${CG_SYS_CPU:-<missing>}') < 8 * user.slice('${user_cpu:-<missing>}')"
   fi
 
-  # 6e. user-0.slice: 0 < memory.high <= 7 GiB, 0 < memory.max <= 9 GiB, 0 < cpu.weight <= 20
   user0_high="$(read_cgroup_raw "${user0_cg}/memory.high" || true)"
   user0_max="$(read_cgroup_raw "${user0_cg}/memory.max" || true)"
   user0_cpu="$(read_cgroup_raw "${user0_cg}/cpu.weight" || true)"
-
   if is_positive_uint "$user0_high" && (( user0_high <= BYTES_7G )) \
      && is_positive_uint "$user0_max" && (( user0_max <= BYTES_9G )) \
      && is_positive_uint "$user0_cpu" && (( user0_cpu <= 20 )); then
     v_ok "cgroup user-0.slice bounded (memory.high=${user0_high} memory.max=${user0_max} cpu.weight=${user0_cpu})"
   else
-    v_fail "cgroup user-0.slice unbounded or above caps (got high='${user0_high:-<missing>}' max='${user0_max:-<missing>}' cpu='${user0_cpu:-<missing>}', want 0<high<=${BYTES_7G} 0<max<=${BYTES_9G} 0<cpu<=20)"
+    v_fail "cgroup user-0.slice unbounded or above caps (got high='${user0_high:-<missing>}' max='${user0_max:-<missing>}' cpu='${user0_cpu:-<missing>}')"
   fi
 
-  # 6f. Optional active sub-slices (egress & remote-relay)
+  CG_EGRESS_LOW=""
   if [[ -d "$egress_cg" ]]; then
-    egress_low="$(read_cgroup_raw "${egress_cg}/memory.low" || true)"
+    CG_EGRESS_LOW="$(read_cgroup_raw "${egress_cg}/memory.low" || true)"
     egress_cpu="$(read_cgroup_raw "${egress_cg}/cpu.weight" || true)"
-    if is_positive_uint "$egress_low" && (( egress_low >= BYTES_512M )) \
-       && is_positive_uint "$egress_cpu" && (( egress_cpu >= 600 )); then
-      v_ok "cgroup system-openclaude\\x2dv5\\x2dselfhost\\x2degress.slice meets thresholds (memory.low=${egress_low} cpu.weight=${egress_cpu})"
+    if is_positive_uint "$CG_EGRESS_LOW" && (( CG_EGRESS_LOW >= BYTES_512M )) && is_positive_uint "$egress_cpu" && (( egress_cpu >= 600 )); then
+      v_ok "cgroup egress slice meets thresholds (memory.low=${CG_EGRESS_LOW} cpu.weight=${egress_cpu})"
     else
-      v_fail "cgroup system-openclaude\\x2dv5\\x2dselfhost\\x2degress.slice below thresholds (got low='${egress_low:-<missing>}' cpu='${egress_cpu:-<missing>}', want low>=${BYTES_512M} cpu>=600)"
+      v_fail "cgroup egress slice below thresholds (got low='${CG_EGRESS_LOW:-<missing>}' cpu='${egress_cpu:-<missing>}')"
     fi
   fi
 
+  CG_RELAY_LOW=""
   if [[ -d "$relay_cg" ]]; then
-    relay_low="$(read_cgroup_raw "${relay_cg}/memory.low" || true)"
+    CG_RELAY_LOW="$(read_cgroup_raw "${relay_cg}/memory.low" || true)"
     relay_cpu="$(read_cgroup_raw "${relay_cg}/cpu.weight" || true)"
-    if is_positive_uint "$relay_low" && (( relay_low >= BYTES_128M )) \
-       && is_positive_uint "$relay_cpu" && (( relay_cpu >= 500 )); then
-      v_ok "cgroup system-openclaude\\x2dv5\\x2dselfhost\\x2dremote\\x2drelay.slice meets thresholds (memory.low=${relay_low} cpu.weight=${relay_cpu})"
+    if is_positive_uint "$CG_RELAY_LOW" && (( CG_RELAY_LOW >= BYTES_128M )) && is_positive_uint "$relay_cpu" && (( relay_cpu >= 500 )); then
+      v_ok "cgroup remote-relay slice meets thresholds (memory.low=${CG_RELAY_LOW} cpu.weight=${relay_cpu})"
     else
-      v_fail "cgroup system-openclaude\\x2dv5\\x2dselfhost\\x2dremote\\x2drelay.slice below thresholds (got low='${relay_low:-<missing>}' cpu='${relay_cpu:-<missing>}', want low>=${BYTES_128M} cpu>=500)"
+      v_fail "cgroup remote-relay slice below thresholds (got low='${CG_RELAY_LOW:-<missing>}' cpu='${relay_cpu:-<missing>}')"
     fi
   fi
+}
 
-  # 6g. Active leaf service verification + parent >= sum(active children) invariants
+verify_cgroup_leaves() {
+  local sys_cg="${CGROUP_ROOT}/system.slice"
+  local master_cg="${sys_cg}/system-openclaude\x2dv5\x2dselfhost.slice"
+  local pg_cg="${sys_cg}/system-postgresql.slice"
+  local egress_cg="${sys_cg}/system-openclaude\x2dv5\x2dselfhost\x2degress.slice"
+  local relay_cg="${sys_cg}/system-openclaude\x2dv5\x2dselfhost\x2dremote\x2drelay.slice"
+
   local sum_master_min=0 sum_master_low=0 slot
   for slot in A B; do
     if [[ -d "${master_cg}/openclaude-v5-selfhost@${slot}.service" ]]; then
@@ -701,25 +581,22 @@ run_verify() {
     fi
   done
   if (( sum_master_min > 0 || sum_master_low > 0 )); then
-    if is_uint "$master_min" && is_uint "$master_low" \
-       && (( master_min >= sum_master_min && master_low >= sum_master_low )); then
-      v_ok "parent master slice covers sum of active master slots (min: ${master_min}>=${sum_master_min}, low: ${master_low}>=${sum_master_low})"
+    if is_uint "$CG_MASTER_MIN" && is_uint "$CG_MASTER_LOW" \
+       && (( CG_MASTER_MIN >= sum_master_min && CG_MASTER_LOW >= sum_master_low )); then
+      v_ok "parent master slice covers sum of active master slots (min: ${CG_MASTER_MIN}>=${sum_master_min}, low: ${CG_MASTER_LOW}>=${sum_master_low})"
     else
-      v_fail "parent master slice budget < sum of active master slots (parent min=${master_min:-0} low=${master_low:-0}, sum min=${sum_master_min} low=${sum_master_low})"
+      v_fail "parent master slice budget < sum of active master slots (parent min=${CG_MASTER_MIN:-0} low=${CG_MASTER_LOW:-0}, sum min=${sum_master_min} low=${sum_master_low})"
     fi
   fi
 
-  local sum_pg_min=0 sum_pg_low=0
   if [[ -d "${pg_cg}/postgresql@16-main.service" ]]; then
     verify_active_leaf "${pg_cg}/postgresql@16-main.service" \
       "postgresql@16-main.service" "$BYTES_1024M" "$BYTES_1536M" 800
-    sum_pg_min=$((sum_pg_min + LEAF_LAST_MIN))
-    sum_pg_low=$((sum_pg_low + LEAF_LAST_LOW))
-    if is_uint "$pg_min" && is_uint "$pg_low" \
-       && (( pg_min >= sum_pg_min && pg_low >= sum_pg_low )); then
-      v_ok "parent postgresql slice covers active postgresql@16-main.service (min: ${pg_min}>=${sum_pg_min}, low: ${pg_low}>=${sum_pg_low})"
+    if is_uint "$CG_PG_MIN" && is_uint "$CG_PG_LOW" \
+       && (( CG_PG_MIN >= LEAF_LAST_MIN && CG_PG_LOW >= LEAF_LAST_LOW )); then
+      v_ok "parent postgresql slice covers active postgresql@16-main.service"
     else
-      v_fail "parent postgresql slice budget < active postgresql@16-main.service (parent min=${pg_min:-0} low=${pg_low:-0}, leaf min=${sum_pg_min} low=${sum_pg_low})"
+      v_fail "parent postgresql slice budget < active postgresql@16-main.service"
     fi
   fi
 
@@ -732,10 +609,10 @@ run_verify() {
     fi
   done
   if (( sum_egress_low > 0 )); then
-    if is_uint "$egress_low" && (( egress_low >= sum_egress_low )); then
-      v_ok "parent egress slice covers sum of active egress slots (low: ${egress_low}>=${sum_egress_low})"
+    if is_uint "$CG_EGRESS_LOW" && (( CG_EGRESS_LOW >= sum_egress_low )); then
+      v_ok "parent egress slice covers sum of active egress slots"
     else
-      v_fail "parent egress slice budget < sum of active egress slots (parent low=${egress_low:-0}, sum low=${sum_egress_low})"
+      v_fail "parent egress slice budget < sum of active egress slots"
     fi
   fi
 
@@ -748,15 +625,14 @@ run_verify() {
     fi
   done
   if (( sum_relay_low > 0 )); then
-    if is_uint "$relay_low" && (( relay_low >= sum_relay_low )); then
-      v_ok "parent remote-relay slice covers sum of active relay slots (low: ${relay_low}>=${sum_relay_low})"
+    if is_uint "$CG_RELAY_LOW" && (( CG_RELAY_LOW >= sum_relay_low )); then
+      v_ok "parent remote-relay slice covers sum of active relay slots"
     else
-      v_fail "parent remote-relay slice budget < sum of active relay slots (parent low=${relay_low:-0}, sum low=${sum_relay_low})"
+      v_fail "parent remote-relay slice budget < sum of active relay slots"
     fi
   fi
 
-  local sum_sys_leaf_min=0 sum_sys_leaf_low=0
-  local leaf_spec leaf_unit leaf_wmin leaf_wlow leaf_wcpu
+  local sum_sys_leaf_min=0 sum_sys_leaf_low=0 leaf_spec leaf_unit leaf_wmin leaf_wlow leaf_wcpu
   for leaf_spec in \
     "openclaude-v5-selfhost.service|${BYTES_512M}|${BYTES_768M}|1000" \
     "openclaude-v5-selfhost-frontdoor.service|${BYTES_64M}|${BYTES_128M}|1000" \
@@ -773,23 +649,30 @@ run_verify() {
     fi
   done
 
-  # Verify system.slice budget >= sum of all active direct child slices + active direct child services
-  local sum_sys_children_min="$sum_sys_leaf_min"
-  local sum_sys_children_low="$sum_sys_leaf_low"
-  is_uint "$master_min" && sum_sys_children_min=$((sum_sys_children_min + master_min))
-  is_uint "$master_low" && sum_sys_children_low=$((sum_sys_children_low + master_low))
-  is_uint "$pg_min" && sum_sys_children_min=$((sum_sys_children_min + pg_min))
-  is_uint "$pg_low" && sum_sys_children_low=$((sum_sys_children_low + pg_low))
-  is_uint "$egress_low" && sum_sys_children_low=$((sum_sys_children_low + egress_low))
-  is_uint "$relay_low" && sum_sys_children_low=$((sum_sys_children_low + relay_low))
+  local sum_sys_children_min="$sum_sys_leaf_min" sum_sys_children_low="$sum_sys_leaf_low"
+  is_uint "$CG_MASTER_MIN" && sum_sys_children_min=$((sum_sys_children_min + CG_MASTER_MIN))
+  is_uint "$CG_MASTER_LOW" && sum_sys_children_low=$((sum_sys_children_low + CG_MASTER_LOW))
+  is_uint "$CG_PG_MIN" && sum_sys_children_min=$((sum_sys_children_min + CG_PG_MIN))
+  is_uint "$CG_PG_LOW" && sum_sys_children_low=$((sum_sys_children_low + CG_PG_LOW))
+  is_uint "$CG_EGRESS_LOW" && sum_sys_children_low=$((sum_sys_children_low + CG_EGRESS_LOW))
+  is_uint "$CG_RELAY_LOW" && sum_sys_children_low=$((sum_sys_children_low + CG_RELAY_LOW))
 
-  if is_uint "$sys_min" && is_uint "$sys_low" \
-     && (( sys_min >= sum_sys_children_min && sys_low >= sum_sys_children_low )); then
-    v_ok "system.slice budget covers sum of active children (min: ${sys_min}>=${sum_sys_children_min}, low: ${sys_low}>=${sum_sys_children_low})"
+  if is_uint "$CG_SYS_MIN" && is_uint "$CG_SYS_LOW" \
+     && (( CG_SYS_MIN >= sum_sys_children_min && CG_SYS_LOW >= sum_sys_children_low )); then
+    v_ok "system.slice budget covers sum of active children (min: ${CG_SYS_MIN}>=${sum_sys_children_min}, low: ${CG_SYS_LOW}>=${sum_sys_children_low})"
   else
-    v_fail "system.slice budget < sum of active children (parent min=${sys_min:-0} low=${sys_low:-0}, children min=${sum_sys_children_min} low=${sum_sys_children_low})"
+    v_fail "system.slice budget < sum of active children (parent min=${CG_SYS_MIN:-0} low=${CG_SYS_LOW:-0}, children min=${sum_sys_children_min} low=${sum_sys_children_low})"
   fi
+}
 
+run_verify() {
+  VERIFY_PASS=0
+  VERIFY_FAIL=0
+  verify_persistent_files
+  verify_runtime_clean
+  verify_tsc_queue
+  verify_cgroup_slices
+  verify_cgroup_leaves
   log "verify summary: passed=${VERIFY_PASS} failed=${VERIFY_FAIL}"
   (( VERIFY_FAIL == 0 ))
 }
@@ -799,7 +682,6 @@ main() {
 
   if (( MODE_DRY_RUN == 1 || MODE_APPLY == 1 )); then
     install_persistent_qos_files
-    sync_unit_templates
     cleanup_runtime_dropins
     cleanup_tsc_queue_script
     reload_systemd

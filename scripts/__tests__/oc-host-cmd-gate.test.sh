@@ -93,9 +93,19 @@ check_class() {
 check_class heavy 'cd /wt && tsc -b'
 check_class heavy 'npx vitest'
 check_class heavy 'npx vitest run src/foo.test.ts'
+check_class heavy 'npm run check'
 check_class heavy 'npm run check:governance:fast'
+check_class heavy 'npm run format'
 check_class heavy 'npm run build'
+check_class heavy 'npm run custom-project-script'
 check_class heavy 'npm test'
+check_class heavy 'bun run check'
+check_class heavy 'pnpm run check'
+check_class light 'npm --version'
+check_class light 'npm root'
+check_class light 'npm ls'
+check_class light 'npm run'
+check_class light 'bun --version'
 check_class heavy 'playwright test'
 check_class heavy 'npx playwright test --grep smoke'
 check_class heavy 'cd /wt && git status && npx tsc -b'
@@ -378,10 +388,39 @@ err3="$(env -u OC_HOST_GATE_ACTIVE \
   SSH_ORIGINAL_COMMAND="SECRET_TOKEN=caller_secret_999 npx tsc -b --token=caller_tok_888" \
   "$GATE" 2>&1 >/dev/null)" || rc3=$?
 
+# Steward regression: root `npm run check` MUST be blocked under full heavy slots while read-only `git status` returns immediately
+rc3_npm_check=0
+err3_npm_check="$(env -u OC_HOST_GATE_ACTIVE \
+  OC_HOST_GATE_SLOTS_DIR="$SLOTS_3" \
+  OC_HOST_HEAVY_SLOTS=2 \
+  OC_HOST_MEMINFO_FILE="$MEMINFO_OK" \
+  OC_HOST_MIN_AVAIL_MB=2500 \
+  OC_HOST_WAIT_TIMEOUT_SEC=1 \
+  OC_HOST_POLL_INTERVAL_SEC=0.1 \
+  OC_HOST_SYSTEMD_RUN_BIN=none \
+  SSH_ORIGINAL_COMMAND="npm run check" \
+  "$GATE" 2>&1 >/dev/null)" || rc3_npm_check=$?
+
+rc3_ro_fast=0
+out3_ro_fast="$(env -u OC_HOST_GATE_ACTIVE \
+  OC_HOST_GATE_SLOTS_DIR="$SLOTS_3" \
+  OC_HOST_HEAVY_SLOTS=2 \
+  OC_HOST_MEMINFO_FILE="$MEMINFO_OK" \
+  OC_HOST_MIN_AVAIL_MB=2500 \
+  OC_HOST_WAIT_TIMEOUT_SEC=1 \
+  OC_HOST_SYSTEMD_RUN_BIN=none \
+  SSH_ORIGINAL_COMMAND="git --version" \
+  "$GATE")" || rc3_ro_fast=$?
+
 for pid in "${holder_pids[@]}"; do
   kill -TERM "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
 done
+
+assert_eq "root 'npm run check' blocked under full heavy slots (rc=75)" "75" "$rc3_npm_check"
+assert_contains "root 'npm run check' block reports slot_busy" "slot_busy" "$err3_npm_check"
+assert_eq "read-only 'git --version' bypasses full heavy slots immediately (rc=0)" "0" "$rc3_ro_fast"
+assert_contains "read-only 'git --version' returns git output" "git version" "$out3_ro_fast"
 
 assert_eq "3rd heavy task exits with EX_TEMPFAIL (75)" "75" "$rc3"
 assert_contains "stderr reports slot_busy" "slot_busy" "$err3"

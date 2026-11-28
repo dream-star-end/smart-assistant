@@ -106,10 +106,14 @@ Restart=always
 RestartSec=3
 EOF
 
-  # Pre-installed static units (egress@ and cloudflared installed; remote-relay@ NOT installed to test no-create rule)
-  printf '[Unit]\nDescription=old cloudflared\n[Service]\nExecStart=/bin/true\n' \
+  # Pre-installed newer release .service units (MUST remain 100% byte-for-byte untouched by QoS installer!)
+  printf '[Unit]\nDescription=newer frontdoor\n[Service]\nEnvironment="OC_FRONTDOOR_PORT=28790"\nExecStart=/opt/openclaude/rel-newer/frontdoor\n' \
+    >"${box}/systemd/openclaude-v5-selfhost-frontdoor.service"
+  printf '[Unit]\nDescription=newer master slot\n[Service]\nExecStart=/opt/openclaude/rel-newer/slot-exec.sh %%i\n' \
+    >"${box}/systemd/openclaude-v5-selfhost@.service"
+  printf '[Unit]\nDescription=newer cloudflared\n[Service]\nExecStart=/opt/openclaude/rel-newer/cloudflared\n' \
     >"${box}/systemd/cloudflared-v5-selfhost.service"
-  printf '[Unit]\nDescription=old egress\n[Service]\nExecStart=/bin/true\n' \
+  printf '[Unit]\nDescription=newer egress\n[Service]\nExecStart=/opt/openclaude/rel-newer/egress\n' \
     >"${box}/systemd/openclaude-v5-selfhost-egress@.service"
 
   # Managed runtime drop-in directories (all 11) + 1 UNMANAGED runtime dir
@@ -132,6 +136,8 @@ EOF
     printf '[Service]\nMemoryLow=64M\n' >"${box}/runtime/${d}/50-MemoryLow.conf"
   done
 
+  # Unreplaced QoS runtime cap on postgresql@16-main (postgresql@16-main.service.conf has NO MemoryMax= -> MUST be preserved!)
+  printf '[Service]\nMemoryMax=4G\n' >"${box}/runtime/postgresql@16-main.service.d/50-MemoryMax.conf"
   # Non-QoS runtime property file inside a MANAGED runtime directory (MUST be preserved!)
   printf '[Service]\nTasksMax=4096\n' >"${box}/runtime/openclaude.service.d/50-TasksMax.conf"
 
@@ -190,7 +196,7 @@ dry_out="$(PATH="${TMP}/fakebin:${PATH}" FAKE_SYSTEMCTL_LOG="$DRY_LOG" \
 
 [[ ! -e "${BOX1}/systemd/oc-host-cmd.slice" ]] \
   && [[ ! -e "${BOX1}/systemd/system.slice.d/10-v5-selfhost-qos.conf" ]] \
-  && [[ ! -e "${BOX1}/systemd/openclaude-v5-selfhost-frontdoor.service" ]] \
+  && [[ ! -e "${BOX1}/systemd/openclaude-v5-selfhost@.service.d/10-v5-selfhost-qos.conf" ]] \
   && [[ -f "${BOX1}/runtime/openclaude-v5-selfhost@A.service.d/50-CPUWeight.conf" ]] \
   && [[ -f "${BOX1}/run/v5-tsc-queue.py" ]] \
   && [[ "$dry_out" == *"[dry-run]"* ]] \
@@ -198,7 +204,15 @@ dry_out="$(PATH="${TMP}/fakebin:${PATH}" FAKE_SYSTEMCTL_LOG="$DRY_LOG" \
   && pass "dry-run (default) performs zero filesystem writes, zero deletions, and no daemon-reload" \
   || fail "dry-run modified filesystem or ran daemon-reload"
 
-# ── 3. --apply installs all files atomically, preserves selfheal.conf & non-QoS runtime files ──
+# Snapshot newer release .service files before --apply to prove single-writer invariance
+UNITS_BEFORE="${TMP}/units-before.sha256"
+sha256sum \
+  "${BOX1}/systemd/openclaude-v5-selfhost-frontdoor.service" \
+  "${BOX1}/systemd/openclaude-v5-selfhost@.service" \
+  "${BOX1}/systemd/cloudflared-v5-selfhost.service" \
+  "${BOX1}/systemd/openclaude-v5-selfhost-egress@.service" >"$UNITS_BEFORE"
+
+# ── 3. --apply installs all drop-ins atomically without modifying .service units ──
 APPLY_LOG="${TMP}/apply-systemctl.log"
 : >"$APPLY_LOG"
 
@@ -209,7 +223,7 @@ PATH="${TMP}/fakebin:${PATH}" FAKE_SYSTEMCTL_LOG="$APPLY_LOG" FAKE_TSC_QUEUE_STA
     --cgroup-root "${BOX1}/cgroup" \
     --tsc-queue-script "${BOX1}/run/v5-tsc-queue.py" >/dev/null
 
-# Verify oc-host-cmd.slice + all 12 drop-ins installed with exact escaped names
+# Verify oc-host-cmd.slice + all 18 drop-ins installed with exact escaped names
 all_dropins_ok=1
 [[ -f "${BOX1}/systemd/oc-host-cmd.slice" ]] || all_dropins_ok=0
 for u in \
@@ -224,13 +238,19 @@ for u in \
   'redis-server.service' \
   'openclaude.service' \
   'cloudflared-oc.service' \
-  'ssh.service'; do
+  'ssh.service' \
+  'openclaude-v5-selfhost-frontdoor.service' \
+  'openclaude-v5-selfhost@.service' \
+  'openclaude-v5-selfhost.service' \
+  'cloudflared-v5-selfhost.service' \
+  'openclaude-v5-selfhost-egress@.service' \
+  'openclaude-v5-selfhost-remote-relay@.service'; do
   [[ -f "${BOX1}/systemd/${u}.d/10-v5-selfhost-qos.conf" ]] || {
     printf 'missing drop-in for %s\n' "$u" >&2
     all_dropins_ok=0
   }
 done
-assert_eq "apply installs oc-host-cmd.slice and all 12 escaped drop-ins" "1" "$all_dropins_ok"
+assert_eq "apply installs oc-host-cmd.slice and all 18 escaped drop-ins" "1" "$all_dropins_ok"
 
 # Verify selfheal.conf preserved byte-for-byte
 grep -Fxq 'Restart=always' "${BOX1}/systemd/openclaude.service.d/selfheal.conf" \
@@ -239,30 +259,30 @@ grep -Fxq 'Restart=always' "${BOX1}/systemd/openclaude.service.d/selfheal.conf" 
   && pass "apply preserves existing openclaude.service.d/selfheal.conf alongside 10-v5-selfhost-qos.conf" \
   || fail "apply altered or removed selfheal.conf"
 
-# Verify installed static templates updated (with new dual-slot safe budgets), while uninstalled remote-relay@ NOT forcibly created
-grep -Fxq 'CPUWeight=1000' "${BOX1}/systemd/cloudflared-v5-selfhost.service" \
-  && grep -Fxq 'MemoryMin=64M' "${BOX1}/systemd/cloudflared-v5-selfhost.service" \
-  && grep -Fxq 'CPUWeight=600' "${BOX1}/systemd/openclaude-v5-selfhost-egress@.service" \
-  && grep -Fxq 'MemoryLow=256M' "${BOX1}/systemd/openclaude-v5-selfhost-egress@.service" \
-  && [[ ! -e "${BOX1}/systemd/openclaude-v5-selfhost-remote-relay@.service" ]] \
-  && pass "apply updates already-installed static units and skips uninstalled units" \
-  || fail "static unit template selective update invariant failed"
+# Single-writer regression: pre-existing newer release .service files MUST be byte-for-byte unchanged,
+# and no new .service files (e.g. remote-relay@.service) created by QoS installer!
+if sha256sum -c --status "$UNITS_BEFORE" && [[ ! -e "${BOX1}/systemd/openclaude-v5-selfhost-remote-relay@.service" ]]; then
+  pass "single-writer: QoS --apply leaves newer release .service unit files byte-for-byte untouched"
+else
+  fail "single-writer VIOLATED: QoS --apply altered or created full .service unit file"
+fi
 
-# Verify A/B dual-slot rendered templates contain embedded QoS (512M min / 768M low per Master slot)
-grep -Fxq 'CPUWeight=1000' "${BOX1}/systemd/openclaude-v5-selfhost-frontdoor.service" \
-  && grep -Fxq 'IOWeight=1000' "${BOX1}/systemd/openclaude-v5-selfhost-frontdoor.service" \
-  && grep -Fxq 'MemoryMin=64M' "${BOX1}/systemd/openclaude-v5-selfhost-frontdoor.service" \
-  && grep -Fxq 'MemoryLow=128M' "${BOX1}/systemd/openclaude-v5-selfhost-frontdoor.service" \
-  && grep -Fxq 'OOMScoreAdjust=-800' "${BOX1}/systemd/openclaude-v5-selfhost-frontdoor.service" \
-  && grep -Fxq 'CPUWeight=1000' "${BOX1}/systemd/openclaude-v5-selfhost@.service" \
-  && grep -Fxq 'IOWeight=1000' "${BOX1}/systemd/openclaude-v5-selfhost@.service" \
-  && grep -Fxq 'MemoryMin=512M' "${BOX1}/systemd/openclaude-v5-selfhost@.service" \
-  && grep -Fxq 'MemoryLow=768M' "${BOX1}/systemd/openclaude-v5-selfhost@.service" \
-  && grep -Fxq 'OOMScoreAdjust=-800' "${BOX1}/systemd/openclaude-v5-selfhost@.service" \
-  && pass "apply installs A/B dual-slot unit templates with dual-slot-safe QoS (512M/768M)" \
-  || fail "dual-slot unit templates missing embedded QoS"
+# Verify dual-slot service drop-ins carry exact dual-slot-safe QoS (512M/768M master, 256M egress, 64M relay)
+grep -Fxq 'MemoryMin=64M' "${BOX1}/systemd/openclaude-v5-selfhost-frontdoor.service.d/10-v5-selfhost-qos.conf" \
+  && grep -Fxq 'MemoryLow=128M' "${BOX1}/systemd/openclaude-v5-selfhost-frontdoor.service.d/10-v5-selfhost-qos.conf" \
+  && grep -Fxq 'MemoryMin=512M' "${BOX1}/systemd/openclaude-v5-selfhost@.service.d/10-v5-selfhost-qos.conf" \
+  && grep -Fxq 'MemoryLow=768M' "${BOX1}/systemd/openclaude-v5-selfhost@.service.d/10-v5-selfhost-qos.conf" \
+  && grep -Fxq 'MemoryLow=256M' "${BOX1}/systemd/openclaude-v5-selfhost-egress@.service.d/10-v5-selfhost-qos.conf" \
+  && grep -Fxq 'MemoryLow=64M' "${BOX1}/systemd/openclaude-v5-selfhost-remote-relay@.service.d/10-v5-selfhost-qos.conf" \
+  && pass "service drop-ins carry aligned dual-slot-safe QoS directives" \
+  || fail "service drop-ins missing expected QoS directives"
 
-# Verify managed QoS files removed, empty dirs removed, while 50-TasksMax.conf in openclaude.service.d AND unrelated-custom.service.d preserved!
+# Verified-replacement runtime cleanup:
+# - Replaced props removed and empty dirs rmdir'd
+# - user-0.slice.d/50-MemoryLow.conf NOT in user-0.slice.conf -> preserved! (only CPUWeight replaced)
+# - postgresql@16-main.service.d/50-MemoryMax.conf NOT in postgresql@16-main.service.conf -> preserved!
+# - openclaude.service.d/50-TasksMax.conf (non-QoS) -> preserved!
+# - unrelated-custom.service.d -> preserved!
 rt_ok=1
 for d in \
   cloudflared-oc.service.d \
@@ -272,17 +292,21 @@ for d in \
   openclaude-v5-selfhost-frontdoor.service.d \
   openclaude-v5-selfhost@A.service.d \
   openclaude-v5-selfhost@B.service.d \
-  postgresql@16-main.service.d \
-  redis-server.service.d \
-  user-0.slice.d; do
+  redis-server.service.d; do
   [[ ! -e "${BOX1}/runtime/${d}" ]] || rt_ok=0
 done
+[[ ! -e "${BOX1}/runtime/postgresql@16-main.service.d/50-CPUWeight.conf" ]] || rt_ok=0
+[[ ! -e "${BOX1}/runtime/postgresql@16-main.service.d/50-MemoryLow.conf" ]] || rt_ok=0
+[[ -f "${BOX1}/runtime/postgresql@16-main.service.d/50-MemoryMax.conf" ]] || rt_ok=0
+grep -Fxq 'MemoryMax=4G' "${BOX1}/runtime/postgresql@16-main.service.d/50-MemoryMax.conf" || rt_ok=0
+[[ ! -e "${BOX1}/runtime/user-0.slice.d/50-CPUWeight.conf" ]] || rt_ok=0
+[[ -f "${BOX1}/runtime/user-0.slice.d/50-MemoryLow.conf" ]] || rt_ok=0
 [[ ! -e "${BOX1}/runtime/openclaude.service.d/50-CPUWeight.conf" ]] || rt_ok=0
 [[ ! -e "${BOX1}/runtime/openclaude.service.d/50-MemoryLow.conf" ]] || rt_ok=0
 [[ -f "${BOX1}/runtime/openclaude.service.d/50-TasksMax.conf" ]] || rt_ok=0
 grep -Fxq 'TasksMax=4096' "${BOX1}/runtime/openclaude.service.d/50-TasksMax.conf" || rt_ok=0
 [[ -f "${BOX1}/runtime/unrelated-custom.service.d/50-CPUWeight.conf" ]] || rt_ok=0
-assert_eq "apply removes only managed QoS runtime files, rmdirs empty dirs, and preserves 50-TasksMax.conf & unrelated dirs" "1" "$rt_ok"
+assert_eq "verified-replacement cleanup preserves unreplaced postgresql MemoryMax, user-0 MemoryLow, TasksMax & unrelated dirs" "1" "$rt_ok"
 
 # Verify legacy /run/v5-tsc-queue.py removed when service confirmed inactive
 [[ ! -e "${BOX1}/run/v5-tsc-queue.py" ]] \
@@ -311,7 +335,7 @@ second_out="$(PATH="${TMP}/fakebin:${PATH}" FAKE_SYSTEMCTL_LOG="$APPLY_LOG" \
 # ── 5. v5-selfhost-tsc-queue.service fail-safe guard (active, unknown, unavailable -> keep + warn; failed -> remove) ──
 printf '#!/usr/bin/env python3\n' >"${BOX1}/run/v5-tsc-queue.py"
 active_err="$(PATH="${TMP}/fakebin:${PATH}" FAKE_TSC_QUEUE_STATE="active" \
-  bash "$INSTALLER" --apply --skip-reload --skip-unit-templates \
+  bash "$INSTALLER" --apply --skip-reload \
     --systemd-dir "${BOX1}/systemd" \
     --runtime-control-dir "${BOX1}/runtime" \
     --cgroup-root "${BOX1}/cgroup" \
@@ -321,7 +345,7 @@ active_err="$(PATH="${TMP}/fakebin:${PATH}" FAKE_TSC_QUEUE_STATE="active" \
   || fail "active tsc-queue guard failed"
 
 unknown_err="$(PATH="${TMP}/fakebin:${PATH}" FAKE_TSC_QUEUE_STATE="__EMPTY__" \
-  bash "$INSTALLER" --apply --skip-reload --skip-unit-templates \
+  bash "$INSTALLER" --apply --skip-reload \
     --systemd-dir "${BOX1}/systemd" \
     --runtime-control-dir "${BOX1}/runtime" \
     --cgroup-root "${BOX1}/cgroup" \
@@ -338,7 +362,7 @@ for cmd in bash cat cmp cp dirname basename grep mkdir mktemp mv rm rmdir stat c
   [[ -n "$cpath" ]] && ln -sf "$cpath" "${NO_SYSCTL_BIN}/${cmd}"
 done
 unavail_err="$(PATH="$NO_SYSCTL_BIN" \
-  bash "$INSTALLER" --apply --skip-reload --skip-unit-templates \
+  bash "$INSTALLER" --apply --skip-reload \
     --systemd-dir "${BOX1}/systemd" \
     --runtime-control-dir "${BOX1}/runtime" \
     --cgroup-root "${BOX1}/cgroup" \
@@ -349,7 +373,7 @@ unavail_err="$(PATH="$NO_SYSCTL_BIN" \
 
 # Confirmed 'failed' terminal state removes the script
 PATH="${TMP}/fakebin:${PATH}" FAKE_TSC_QUEUE_STATE="failed" \
-  bash "$INSTALLER" --apply --skip-reload --skip-unit-templates \
+  bash "$INSTALLER" --apply --skip-reload \
     --systemd-dir "${BOX1}/systemd" \
     --runtime-control-dir "${BOX1}/runtime" \
     --cgroup-root "${BOX1}/cgroup" \
