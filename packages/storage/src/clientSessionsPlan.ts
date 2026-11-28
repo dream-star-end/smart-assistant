@@ -22,20 +22,24 @@
 
 import type { MessageUsageDelegate } from '@openclaude/protocol/teamCards'
 import {
-  _warnSeqAnomaly,
   appendServerAuthoredPure,
-  ARCHIVE_CHUNK_MAX_BYTES,
-  ARCHIVE_CHUNK_MAX_MSGS,
-  compareMessagesByOrder,
-  MAX_SESSION_BYTES,
-  type MessageLike,
   mergePreservingServerAuthored,
+} from './sessions/mergeAndStrip.js'
+import {
+  _warnSeqAnomaly,
+  compareMessagesByOrder,
   normalizeAndAssignOrderSeqs,
   normalizeAndAssignSeqs,
+} from './sessions/orderAndSeq.js'
+import {
+  ARCHIVE_CHUNK_MAX_BYTES,
+  ARCHIVE_CHUNK_MAX_MSGS,
+  MAX_SESSION_BYTES,
+  type MessageLike,
   SESSION_SOFT_TRIM_BYTES,
   SESSION_TAIL_MIN_MSGS,
   SESSION_TAIL_TARGET_BYTES,
-} from './sessionsDb.js'
+} from './sessions/types.js'
 
 // ── spill 变更集 ─────────────────────────────────────────────────────────────
 

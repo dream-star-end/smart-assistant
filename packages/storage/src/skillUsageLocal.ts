@@ -6,7 +6,7 @@
  * mode and commercial containers without depending on master telemetry.
  */
 
-import { getSessionsDb } from './sessionsDb.js'
+import { getSessionsDb } from './sessions/sqliteHandle.js'
 
 export interface LocalSkillUsageRecord {
   slug: string
