@@ -149,10 +149,11 @@
      "rank": 2,
      "match": [
       "packages/commercial/src/db/pgSessionsBackend.ts",
+      "packages/commercial/src/db/sessions/**",
       "packages/commercial/src/db/ccbTranscriptRestoreReader.ts",
       "packages/commercial/src/db/refusedRecoveryCards.ts"
      ],
-     "note": "Sessions backend facade & restore readers"
+     "note": "Sessions backend facade & domain stores"
     }
    },
    "note": "pgSessionsBackend.ts splits into domain stores in P6",
@@ -716,6 +717,7 @@
    "layer": "L3",
    "match": [
     "packages/gateway/src/session*.ts",
+    "packages/gateway/src/session/**",
     "packages/gateway/src/resumeStore.ts",
     "packages/gateway/src/runContextPersist.ts",
     "packages/gateway/src/eventPersist.ts",
@@ -1041,9 +1043,10 @@
     "ws-chat-bridge": {
      "rank": 2,
      "match": [
-      "packages/commercial/src/ws/userChatBridge.ts"
+      "packages/commercial/src/ws/userChatBridge.ts",
+      "packages/commercial/src/ws/bridge/**"
      ],
-     "note": "User chat WS bridge orchestrator"
+     "note": "User chat WS bridge orchestrator & submodules"
     },
     "ws-preview-browser": {
      "rank": 2,
