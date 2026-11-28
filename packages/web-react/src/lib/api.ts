@@ -30,7 +30,7 @@ import type {
   User,
   VerifyEmailResult,
 } from "./types";
-import { captureIdentityAttempt, resolveIdentity, type ResolvedIdentity } from './resolvedIdentity';
+import { assertResolvedIdentity, captureIdentityAttempt, resolveIdentity, type ResolvedIdentity } from './resolvedIdentity';
 import type { ContainerPreviewViewport } from "@openclaude/protocol/containerPreview";
 import {
   type RefreshSurface,
@@ -896,17 +896,15 @@ export const api = {
       ),
     ),
 
-  /** 改偏好（PATCH /api/me/preferences，Bearer）→ 新快照。 */
-  patchPreferences: (a: AuthSession, patch: Preferences) =>
+  /** 改偏好（PATCH /api/me/preferences，Bearer）→ 新快照。传 identity 时在每次发请求（含续期/401重放）前复验归属。 */
+  patchPreferences: (a: AuthSession, patch: Preferences, identity?: ResolvedIdentity) =>
     jsonOrThrow<Preferences>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/me/preferences", {
-          method: "PATCH",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(patch),
-        }),
-      ),
+      callWithRefresh(a, (t) => {
+        if (identity) { assertResolvedIdentity(identity, a); if (a.snapshot().token !== t) throw new AuthEpochStaleError(); }
+        return fetch("/api/me/preferences", {
+          method: "PATCH", credentials: "include", headers: bearerHeaders(t, true), body: JSON.stringify(patch),
+        });
+      }),
     ),
 
   ...secondaryAccountApiProxy,

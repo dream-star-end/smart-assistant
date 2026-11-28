@@ -11,6 +11,12 @@ import { offloadPayloadIfOversized } from './payloadOffloadGate.js'
 import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
 import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import {
+  DEFAULT_CGROUP_V1_STAT_PATH,
+  DEFAULT_CGROUP_V2_STAT_PATH,
+  readCgroupMemoryUsageSync,
+  type CgroupMemoryPaths,
+} from './cgroupMemoryGuard.js'
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http'
 import { join, resolve } from 'node:path'
 import {
@@ -215,35 +221,34 @@ export interface DelegateRuntimeHost {
   sessions: Gateway['sessions']
 }
 
-const DELEGATE_MEMORY_CURRENT_FILES = [
-  '/sys/fs/cgroup/memory.current',
-  '/sys/fs/cgroup/memory/memory.usage_in_bytes',
-]
-
-const DELEGATE_MEMORY_MAX_FILES = [
-  '/sys/fs/cgroup/memory.max',
-  '/sys/fs/cgroup/memory/memory.limit_in_bytes',
-]
-
-function readFirstCgroupByteValue(files: readonly string[]): number | null {
-  for (const file of files) {
-    try {
-      const text = readFileSync(file, 'utf8').trim()
-      if (!text || text === 'max') continue
-      const n = Number(text)
-      if (Number.isFinite(n) && n > 0) return n
-    } catch {}
-  }
-  return null
+const DELEGATE_CGROUP_MEMORY_PATHS: CgroupMemoryPaths = {
+  v2CurrentPath: '/sys/fs/cgroup/memory.current',
+  v2MaxPath: '/sys/fs/cgroup/memory.max',
+  v2StatPath: DEFAULT_CGROUP_V2_STAT_PATH,
+  v1CurrentPath: '/sys/fs/cgroup/memory/memory.usage_in_bytes',
+  v1MaxPath: '/sys/fs/cgroup/memory/memory.limit_in_bytes',
+  v1StatPath: DEFAULT_CGROUP_V1_STAT_PATH,
 }
 
-function readDelegateMemoryPressure(): { current: number; max: number; ratio: number } | null {
-  const current = readFirstCgroupByteValue(DELEGATE_MEMORY_CURRENT_FILES)
-  const max = readFirstCgroupByteValue(DELEGATE_MEMORY_MAX_FILES)
-  if (!current || !max) return null
-  // Docker/cgroup v1 sometimes reports a huge sentinel for "unlimited".
-  if (max > Number.MAX_SAFE_INTEGER / 4) return null
-  return { current, max, ratio: current / max }
+function readCgroupTextOrNull(filePath: string): string | null {
+  try {
+    return readFileSync(filePath, 'utf8')
+  } catch (err) {
+    void err
+    return null
+  }
+}
+
+export function readDelegateMemoryPressure(
+  paths?: CgroupMemoryPaths,
+): { current: number; max: number; ratio: number } | null {
+  const reading = readCgroupMemoryUsageSync(paths ?? DELEGATE_CGROUP_MEMORY_PATHS, readCgroupTextOrNull)
+  if (!reading) return null
+  return {
+    current: reading.currentBytes,
+    max: reading.maxBytes,
+    ratio: reading.ratio,
+  }
 }
 
 /** After a delegate timeout, first allow the cooperative interrupt to drain

@@ -9,7 +9,7 @@ import { randomUUID } from 'node:crypto'
 import type { ActionPolicyEvaluation, ExecEnvHostKind, ExecutionPolicyEnvelope } from '@openclaude/protocol'
 import type { FrameLinkLike, ToolBrokerWireFrame } from '@openclaude/protocol/exec-env'
 import { evaluateActionPolicy, type AiReviewHook, type LoadedActionPolicy } from './actionPolicyEngine.js'
-import { evaluateShellForHook, type GuardMode } from './agentEfficiencyGuard.js'
+import { evaluateShellForHook, resolveShellHookLintOptions, type GuardMode } from './agentEfficiencyGuard.js'
 import {
   ContainerLinkToolBrokerHost,
   ToolBrokerPolicyError,
@@ -109,6 +109,7 @@ export interface HookEvaluateInput {
   readonly callId?: string
   readonly mintCapabilityToken?: boolean
   readonly guardMode?: GuardMode
+  readonly engine?: string
 }
 
 export interface HookEvaluateResult {
@@ -312,6 +313,16 @@ export class ToolBrokerApprovalCoordinator {
       return true
     }
     return false
+  }
+
+  listActiveTurnIds(sessionKey: string): string[] {
+    const turnIds = new Set<string>()
+    for (const waiter of this.activeApprovalWaiters.values()) {
+      if (waiter.sessionKey === sessionKey && waiter.phase === 'waiting' && waiter.turnId) {
+        turnIds.add(waiter.turnId)
+      }
+    }
+    return [...turnIds]
   }
 
   cancelTurnWaiters(sessionKey: string, turnId: string, reason: string, grantId?: string): number {
@@ -545,7 +556,11 @@ export async function evaluateHookShellAndPolicy(params: {
   const command = input.command ?? (shellTool ? extractShellCommand(effectiveArgs) : undefined)
   let effMessage: string | undefined
   if (shellTool && command) {
-    const eff = evaluateShellForHook(command, input.guardMode ?? params.shellHookGuardMode)
+    const eff = evaluateShellForHook(
+      command,
+      input.guardMode ?? params.shellHookGuardMode,
+      resolveShellHookLintOptions(effectiveName, input.engine),
+    )
     if (eff.decision === 'deny') {
       return {
         denied: denyHookResponse(
@@ -670,6 +685,16 @@ export class PendingHookEvaluationTracker {
         if (cur.size === 0) this.bySession.delete(sessionKey)
       },
     }
+  }
+
+  listActiveTurnIds(sessionKey: string): string[] {
+    const set = this.bySession.get(sessionKey)
+    if (!set) return []
+    const turnIds = new Set<string>()
+    for (const entry of set) {
+      if (!entry.controller.signal.aborted && entry.turnId) turnIds.add(entry.turnId)
+    }
+    return [...turnIds]
   }
 
   cancelTurn(sessionKey: string, turnId: string, reason: string, grantId?: string): number {

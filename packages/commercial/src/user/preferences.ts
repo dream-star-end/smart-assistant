@@ -16,6 +16,7 @@ import { isPluginAvailable } from '../plugins/catalogPolicy.js'
  *   theme           : 'light' | 'dark' | 'auto'
  *   default_model   : string (1..64 chars;不强校 model_id 是否在 model_pricing)
  *   default_effort  : 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+ *   default_swarm_mode : boolean —— Antigravity 蜂群协作模式默认偏好(OCV5-927);缺省视为关
  *   notify_email    : boolean
  *   notify_telegram : boolean
  *   wechat_show_tool_calls : boolean
@@ -72,6 +73,7 @@ export const PreferencesSchema = z
     theme: themeSchema.optional(),
     default_model: modelSchema.optional(),
     default_effort: effortSchema.optional(),
+    default_swarm_mode: z.boolean().optional(),
     notify_email: z.boolean().optional(),
     notify_telegram: z.boolean().optional(),
     qq_proactive_push: z.boolean().optional(),
@@ -99,6 +101,7 @@ export const PreferencesPatchSchema = z
     theme: themeSchema.nullable().optional(),
     default_model: modelSchema.nullable().optional(),
     default_effort: effortSchema.nullable().optional(),
+    default_swarm_mode: z.boolean().nullable().optional(),
     notify_email: z.boolean().nullable().optional(),
     notify_telegram: z.boolean().nullable().optional(),
     qq_proactive_push: z.boolean().nullable().optional(),

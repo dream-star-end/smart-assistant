@@ -544,6 +544,14 @@ export class TurnScopedTokenStore {
     }
   }
 
+  listActiveTurnIds(sessionKey: string): string[] {
+    const turnIds = new Set<string>()
+    for (const entry of this.activeTokens.values()) {
+      if (entry.sessionKey === sessionKey && entry.turnId) turnIds.add(entry.turnId)
+    }
+    return [...turnIds]
+  }
+
   revokeTurn(sessionKey: string, turnId: string): number {
     let count = 0
     for (const [tokenId, entry] of [...this.activeTokens]) {
@@ -703,17 +711,11 @@ export class SessionLeaseStore {
     const policy = validatedPolicy ?? this.getBaselinePolicy(sessionKey)
     const lease = this.deps.leaseManager.issueLease({
       ...(opts?.leaseId ? { leaseId: opts.leaseId } : {}),
-      execEnvId: this.deps.execEnvId,
-      incarnationId: `inc_${randomUUID().slice(0, 12)}`,
-      tenantId: opts?.tenantId ?? 'default',
-      sessionKey,
-      hostKind: this.deps.hostKind,
-      brainGen,
+      execEnvId: this.deps.execEnvId, incarnationId: `inc_${randomUUID().slice(0, 12)}`,
+      tenantId: opts?.tenantId ?? 'default', sessionKey, hostKind: this.deps.hostKind, brainGen,
       ...(opts?.ttlMs ? { ttlMs: opts.ttlMs } : {}),
     })
-    try {
-      this.deps.onPolicyApplied(lease.leaseId, policy)
-    } catch (err) {
+    try { this.deps.onPolicyApplied(lease.leaseId, policy) } catch (err) {
       try { this.deps.leaseManager.closeLease(lease.leaseId) } catch (closeErr) { void closeErr }
       throw err
     }
@@ -739,30 +741,19 @@ export class SpillOwnershipStore {
   recordOwnership(blobId: string, sessionKey: string, leaseId: string): Promise<void> {
     if (!blobId || !sessionKey) return Promise.resolve()
     let bySession = this.memoryOwners.get(blobId)
-    if (!bySession) {
-      bySession = new Map()
-      this.memoryOwners.set(blobId, bySession)
-    }
+    if (!bySession) { bySession = new Map(); this.memoryOwners.set(blobId, bySession) }
     bySession.set(sessionKey, { sessionKey, leaseId, recordedAtMs: Math.floor(this.clock()) })
     const sidecarPath = join(this.ownersDir, `${blobId.replace(/[^A-Za-z0-9._-]/g, '_')}.owners.json`)
-    return this.persistMergedSidecar(sidecarPath, blobId, {
-      schemaVersion: 1,
-      blobId,
-      owners: [...bySession.values()],
-    }).catch(ignoreBestEffortError)
+    return this.persistMergedSidecar(sidecarPath, blobId, { schemaVersion: 1, blobId, owners: [...bySession.values()] }).catch(ignoreBestEffortError)
   }
 
   async isAuthorized(blobId: string, sessionKey: string): Promise<boolean> {
     if (!blobId || !sessionKey) return false
     if (this.memoryOwners.get(blobId)?.has(sessionKey)) return true
-    const sidecarPath = join(this.ownersDir, `${blobId.replace(/[^A-Za-z0-9._-]/g, '_')}.owners.json`)
-    const loaded = await this.readSidecar(sidecarPath)
+    const loaded = await this.readSidecar(join(this.ownersDir, `${blobId.replace(/[^A-Za-z0-9._-]/g, '_')}.owners.json`))
     if (!loaded || loaded.blobId !== blobId) return false
     let bySession = this.memoryOwners.get(blobId)
-    if (!bySession) {
-      bySession = new Map()
-      this.memoryOwners.set(blobId, bySession)
-    }
+    if (!bySession) { bySession = new Map(); this.memoryOwners.set(blobId, bySession) }
     for (const owner of loaded.owners) bySession.set(owner.sessionKey, owner)
     return bySession.has(sessionKey)
   }

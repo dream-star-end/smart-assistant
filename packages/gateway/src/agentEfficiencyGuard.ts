@@ -99,7 +99,8 @@ const HEARTBEAT_LOOP_RE =
 const HOST_PREFIX_RE = /(?:^|[\s;|&])(?:export\s+\w+=\S+\s+)*\S*host\s+/
 const HEREDOC_OR_REDIRECT_RE = /\bcat\s*(?:<<|>>?)/
 const LOCAL_READ_RE =
-  /(?:^|[;&|\n])\s*(?:sudo\s+)?(cat|sed\s+-n|head|tail|rg|grep)\b([^\n;|&]*)/
+  /^\s*(?:(?:then|do|else)\s+)?(?:(?:sudo|env)\s+)*(?:\w+=\S+\s+)*(cat|sed\s+-n|head|tail|rg|grep)\b([^\n;|&]*)/
+const NATIVE_SEARCH_CLI_RE = /^(?:rg|grep)$/
 const SOURCE_EXT_RE = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|md|json|ya?ml|toml|sh)\b/
 const CODE_ROOT_RE = /(?:^|[\s"'=])(?:\/opt\/openclaude|\/home\/agent|\/run\/oc|\.\/|src\/|packages\/)/
 const PROC_PATH_RE = /(?:^|[\s"'=])(?:\/proc\/|\/sys\/|\/dev\/)/
@@ -195,6 +196,7 @@ function sleepSeconds(value: string, unit?: string): number {
 
 function splitSegments(command: string): string[] {
   return command
+    .replace(/\|\s*\n/g, '| ')
     .split(/(?:&&|\|\||;|\n)/)
     .map((s) => s.trim())
     .filter(Boolean)
@@ -218,7 +220,50 @@ export function hasEfficiencyEscape(command: string): boolean {
   return command.includes(EFFICIENCY_ESCAPE_TOKEN)
 }
 
-export function suggestAlternative(hit: LintHit, engine?: string): string {
+export interface ShellLintOptions {
+  /** Allow `rg`/`grep` via shell (Antigravity native `run_command` has no built-in Grep/Glob and native swarm workers have no MCP tools). */
+  readonly allowNativeSearchCli?: boolean
+}
+
+export interface EvaluateShellHookOptions extends ShellLintOptions {
+  readonly engine?: string
+}
+
+/** Resolve engine & native search CLI capability for a shell tool call (single source of truth for hook & broker). */
+export function resolveShellHookLintOptions(
+  toolName: string,
+  engine?: string,
+): EvaluateShellHookOptions | undefined {
+  const normalizedName = toolName.trim().toLowerCase()
+  const normalizedEngine =
+    engine?.trim().toLowerCase() || (normalizedName === 'run_command' ? 'antigravity' : undefined)
+  const allowNativeSearchCli = normalizedEngine === 'antigravity' && normalizedName === 'run_command'
+  if (!normalizedEngine && !allowNativeSearchCli) return undefined
+  return {
+    ...(normalizedEngine ? { engine: normalizedEngine } : {}),
+    ...(allowNativeSearchCli ? { allowNativeSearchCli: true } : {}),
+  }
+}
+
+function formatLocalFileViaShellMessage(
+  cmdName: string,
+  engine?: string,
+  opts?: ShellLintOptions,
+): string {
+  if (engine === 'antigravity') {
+    if (opts?.allowNativeSearchCli) {
+      return `本容器内文件请用原生 read_file 读取，不要 \`${cmdName}\` 隔空读。宿主文件仍用 host。`
+    }
+    return `本容器内文件请用 MCP oc_grep / oc_glob（call_mcp_tool, ServerName openclaude-memory），不要 \`${cmdName}\` 隔空读。宿主文件仍用 host。长命令用 oc_bash。`
+  }
+  return `本容器内文件请用原生 Read/Grep/Glob,不要 \`${cmdName}\` 隔空读。host 读宿主文件可以保留。`
+}
+
+export function suggestAlternative(
+  hit: LintHit,
+  engine?: string,
+  opts?: ShellLintOptions,
+): string {
   switch (hit.code) {
     case 'sleep_ge_60':
       return '替代: `nohup <长任务> >/tmp/oc-job.log 2>&1 & echo $!; tail -n 50 /tmp/oc-job.log`'
@@ -228,6 +273,9 @@ export function suggestAlternative(hit: LintHit, engine?: string): string {
       return '替代: 后台跑任务并 `tail` 日志,不要 `while true` + renew/heartbeat'
     case 'local_file_via_shell':
       if (engine === 'antigravity') {
+        if (opts?.allowNativeSearchCli) {
+          return '替代: 用原生 `read_file` 读容器内文件;宿主文件才用 `host cat/rg`'
+        }
         return '替代: MCP `oc_grep` / `oc_glob`（call_mcp_tool, ServerName `openclaude-memory`）读容器内文件;宿主文件才用 `host cat/rg`;长命令用 `oc_bash`'
       }
       return '替代: 用原生 Read/Grep/Glob 读容器内文件;宿主文件才用 `host cat/rg`'
@@ -238,7 +286,12 @@ export function suggestAlternative(hit: LintHit, engine?: string): string {
   }
 }
 
-export function lintBashCommand(command: string, mode: GuardMode = 'warn', engine?: string): LintHit[] {
+export function lintBashCommand(
+  command: string,
+  mode: GuardMode = 'warn',
+  engine?: string,
+  opts?: ShellLintOptions,
+): LintHit[] {
   if (mode === 'off' || !command) return []
   const hits: LintHit[] = []
   const act = actionOf(mode)
@@ -289,14 +342,14 @@ export function lintBashCommand(command: string, mode: GuardMode = 'warn', engin
     if (TAIL_FOLLOW_RE.test(seg)) continue
     const read = LOCAL_READ_RE.exec(seg)
     if (!read) continue
+    const cmdName = read[1].trim()
+    if (opts?.allowNativeSearchCli && NATIVE_SEARCH_CLI_RE.test(cmdName)) continue
     const args = read[2] ?? ''
     if (!looksLikeSourcePath(args)) continue
     hits.push({
       code: 'local_file_via_shell',
       action: act,
-      message: engine === 'antigravity'
-        ? `本容器内文件请用 MCP oc_grep / oc_glob（call_mcp_tool, ServerName openclaude-memory），不要 \`${read[1].trim()}\` 隔空读。宿主文件仍用 host。长命令用 oc_bash。`
-        : `本容器内文件请用原生 Read/Grep/Glob,不要 \`${read[1].trim()}\` 隔空读。host 读宿主文件可以保留。`,
+      message: formatLocalFileViaShellMessage(cmdName, engine, opts),
     })
     break
   }
@@ -593,6 +646,7 @@ export interface HookDecision {
 export function evaluateShellForHook(
   command: string,
   mode: GuardMode = resolveGuardMode(),
+  opts?: EvaluateShellHookOptions,
 ): HookDecision {
   if (mode === 'off' || !command) {
     return { decision: 'allow', escaped: false, hits: [], message: null }
@@ -600,9 +654,9 @@ export function evaluateShellForHook(
   if (hasEfficiencyEscape(command)) {
     return { decision: 'allow', escaped: true, hits: [], message: null }
   }
-  const hits = lintBashCommand(command, mode)
+  const hits = lintBashCommand(command, mode, opts?.engine, opts)
   if (hits.length === 0) return { decision: 'allow', escaped: false, hits: [], message: null }
-  const lines = hits.map((h) => `${h.message} ${suggestAlternative(h)}`)
+  const lines = hits.map((h) => `${h.message} ${suggestAlternative(h, opts?.engine, opts)}`)
   if (mode === 'deny') {
     lines.push(`逃生: 命令中加 ${EFFICIENCY_ESCAPE_TOKEN} 可单次豁免(会记审计日志)。`)
     return { decision: 'deny', escaped: false, hits, message: lines.join('\n') }

@@ -507,15 +507,9 @@ export class GatewayToolBrokerRuntime {
     const pending = this.pendingHooks.begin(initial.claims.sessionKey, initial.claims.turnId, initial.claims.tokenId)
     try {
       const evalRes = await evaluateHookShellAndPolicy({
-        sessionKey: initial.claims.sessionKey,
-        effectiveName: initial.effectiveName,
-        effectiveArgs: initial.effectiveArgs,
-        input,
-        shellHookGuardMode: this.shellHookGuardMode,
-        defaultMainModel: this.defaultMainModel,
-        loadActionPolicy: () => this.loadAuthoritativeActionPolicy(),
-        trustedStrongModels: this.trustedStrongModels,
-        aiReviewHook: this.aiReviewHook,
+        sessionKey: initial.claims.sessionKey, effectiveName: initial.effectiveName, effectiveArgs: initial.effectiveArgs,
+        input, shellHookGuardMode: this.shellHookGuardMode, defaultMainModel: this.defaultMainModel,
+        loadActionPolicy: () => this.loadAuthoritativeActionPolicy(), trustedStrongModels: this.trustedStrongModels, aiReviewHook: this.aiReviewHook,
       })
       if (evalRes.denied) return evalRes.denied
       const postPolicy = this.authorizeHookRequest(hookToken, input.toolName, rawArgs, pending.signal)
@@ -524,16 +518,9 @@ export class GatewayToolBrokerRuntime {
       let approvalStatus: HookEvaluateResult['approvalStatus'] = 'not_required'
       if (evalRes.policyEval.tier === 'human_approval') {
         const denied = await this.approvals.resolveHookHumanApproval({
-          lease: postPolicy.lease,
-          sessionKey: postPolicy.claims.sessionKey,
-          turnId: postPolicy.claims.turnId,
-          grantId: postPolicy.claims.tokenId,
-          signal: pending.signal,
-          callId: input.callId ?? `hook_${randomUUID().slice(0, 12)}`,
-          effectiveName: postPolicy.effectiveName,
-          effectiveArgs: postPolicy.effectiveArgs,
-          command: evalRes.command,
-          policyEval: evalRes.policyEval,
+          lease: postPolicy.lease, sessionKey: postPolicy.claims.sessionKey, turnId: postPolicy.claims.turnId,
+          grantId: postPolicy.claims.tokenId, signal: pending.signal, callId: input.callId ?? `hook_${randomUUID().slice(0, 12)}`,
+          effectiveName: postPolicy.effectiveName, effectiveArgs: postPolicy.effectiveArgs, command: evalRes.command, policyEval: evalRes.policyEval,
         })
         if (denied) return denied
         approvalStatus = 'approved'
@@ -543,20 +530,14 @@ export class GatewayToolBrokerRuntime {
       if (!finalAuth.ok) return finalAuth.response
       const mintedToken = input.mintCapabilityToken
         ? this.capabilityAuthority.issueToken({
-            callId: input.callId ?? `hook_${randomUUID().slice(0, 12)}`,
-            toolName: finalAuth.effectiveName,
-            sessionKey: finalAuth.claims.sessionKey,
-            leaseId: finalAuth.lease.leaseId,
-            brainGen: finalAuth.lease.brainGen,
+            callId: input.callId ?? `hook_${randomUUID().slice(0, 12)}`, toolName: finalAuth.effectiveName,
+            sessionKey: finalAuth.claims.sessionKey, leaseId: finalAuth.lease.leaseId, brainGen: finalAuth.lease.brainGen,
           }).token
         : undefined
       return {
         status: 200,
         body: {
-          ok: true,
-          decision: 'allow',
-          approvalStatus,
-          evaluation: evalRes.policyEval,
+          ok: true, decision: 'allow', approvalStatus, evaluation: evalRes.policyEval,
           ...(evalRes.effMessage ? { message: evalRes.effMessage } : {}),
           ...(mintedToken ? { capabilityToken: mintedToken } : {}),
         },
@@ -567,23 +548,14 @@ export class GatewayToolBrokerRuntime {
   }
 
   private checkMcpModeAccess(
-    sessionKey: string,
-    tokenMode: ExecutionPolicyMode,
-    toolName: string,
-    args: Readonly<Record<string, unknown>>,
+    sessionKey: string, tokenMode: ExecutionPolicyMode, toolName: string, args: Readonly<Record<string, unknown>>,
   ): { readonly status: number; readonly body: { readonly ok: false; readonly errorCode: string; readonly errorMessage: string } } | null {
     const effectiveMode = stricterPolicyMode(this.sessionLeases.getBaselinePolicy(sessionKey).mode, tokenMode)
     if (effectiveMode === 'hermetic_no_tools') {
-      return {
-        status: 403,
-        body: { ok: false, errorCode: 'EXEC_POLICY_HERMETIC_NO_TOOLS', errorMessage: `Tool "${toolName}" blocked in hermetic_no_tools mode` },
-      }
+      return { status: 403, body: { ok: false, errorCode: 'EXEC_POLICY_HERMETIC_NO_TOOLS', errorMessage: `Tool "${toolName}" blocked in hermetic_no_tools mode` } }
     }
     if (effectiveMode === 'read_only' && !isReadOnlyAllowedCanonicalTool(toolName, args)) {
-      return {
-        status: 403,
-        body: { ok: false, errorCode: 'EXEC_POLICY_READ_ONLY_DENIED', errorMessage: `Tool "${toolName}" is forbidden in read_only mode` },
-      }
+      return { status: 403, body: { ok: false, errorCode: 'EXEC_POLICY_READ_ONLY_DENIED', errorMessage: `Tool "${toolName}" is forbidden in read_only mode` } }
     }
     return null
   }
@@ -759,6 +731,36 @@ export class GatewayToolBrokerRuntime {
 
   isToolBrokerApprovalRequestId(requestId: string): boolean {
     return requestId.startsWith(TOOL_BROKER_APPROVAL_REQUEST_PREFIX)
+  }
+
+  captureActiveTurnIds(sessionKey: string): string[] {
+    const turnIds = new Set<string>([
+      ...this.turnTokens.listActiveTurnIds(sessionKey),
+      ...this.pendingHooks.listActiveTurnIds(sessionKey),
+      ...this.approvals.listActiveTurnIds(sessionKey),
+      ...this.bashJobs.listActiveEphemeralTurnIds(sessionKey),
+      ...this.server.listActiveTurnIds(sessionKey),
+    ])
+    return [...turnIds]
+  }
+
+  cancelTurnCalls(sessionKey: string, turnIds: Iterable<string>, reason = 'user_stop'): number {
+    let count = 0
+    for (const turnId of turnIds) {
+      if (!turnId) continue
+      count += this.turnTokens.revokeTurn(sessionKey, turnId)
+      this.pendingHooks.cancelTurn(sessionKey, turnId, reason)
+      this.approvals.cancelTurnWaiters(sessionKey, turnId, reason)
+      this.server.cancelTurn(sessionKey, turnId, reason)
+      this.bashJobs.reapTurn(sessionKey, turnId)
+    }
+    return count
+  }
+
+  cancelActiveTurnCalls(sessionKey: string, reason = 'user_stop'): string[] {
+    const turnIds = this.captureActiveTurnIds(sessionKey)
+    if (turnIds.length > 0) this.cancelTurnCalls(sessionKey, turnIds, reason)
+    return turnIds
   }
 
   cancelSessionCalls(sessionKey: string, reason = 'session_stopped'): void {

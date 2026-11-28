@@ -36,7 +36,10 @@ import {
   scrubToolBrokerEnv,
   type ToolBrokerApprovalBridge,
 } from '../../toolBrokerRuntime.js'
-import { isGatewayToolBrokerSelfhostEnabled } from '../../remoteSwarmLocal.js'
+import {
+  createGatewayToolBrokerRuntime,
+  isGatewayToolBrokerSelfhostEnabled,
+} from '../../remoteSwarmLocal.js'
 import { Gateway } from '../../server.js'
 import { handlePermissionResponse, type AskUserPermissionsHost } from '../../askUserPermissions.js'
 import {
@@ -3311,6 +3314,218 @@ test('Steward S9: Rejected policy relaxation never mutates session baseline, blo
     assert.throws(() => runtime.setSessionPolicy(sessAllow, normalPolicy), { code: 'EXEC_POLICY_RELAXATION_FORBIDDEN' })
   } finally {
     runtime.dispose()
+    await rm(workDir, { recursive: true, force: true })
+  }
+})
+
+test('R2 P1-4: handleStop(M1) revokes ONLY M1 turn tokens/jobs/waiters synchronously and preserves successor M2 token issued while remote swarm stop is still awaiting', async () => {
+  const workDir = await mkdtemp(join(tmpdir(), 'oc-p32-p14-stop-'))
+  const runtime = new GatewayToolBrokerRuntime({ homeDir: workDir })
+  const { handleStop } = await import('../../wsConnection.js')
+  try {
+    const sessionKey = 'agent:main:webchat:dm:p32-p14-race'
+    const scope1 = { sessionKey, turnEpoch: 1, turnId: 'tb_turn_1_m1' }
+    const t1Hook = runtime.issueTurnHookToken(scope1)
+    const t1Mcp = runtime.issueTurnMcpToken(scope1)
+
+    // Start an ephemeral_turn bash job bound to M1's turnId
+    const abortCtrl = new AbortController()
+    const bashStart = await runtime.bashJobs.execute({
+      sessionKey,
+      turnId: scope1.turnId,
+      leaseId: t1Mcp.lease.leaseId,
+      command: 'sleep 30',
+      timeoutMs: 25,
+      killOnTimeout: false,
+      lifecycleClass: 'ephemeral_turn',
+      env: { PATH: '/usr/bin:/bin' },
+      signal: abortCtrl.signal,
+    })
+    assert.equal(bashStart.kind, 'running')
+    assert.ok(bashStart.jobId)
+
+    let releaseRemoteSwarmStop!: () => void
+    const remoteSwarmPending = new Promise<boolean>((resolve) => {
+      releaseRemoteSwarmStop = () => resolve(true)
+    })
+
+    let activeCmid = 'm-p14-turn-1'
+    const host = {
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+      sessions: {
+        list: () => [{ sessionKey, _runningClientMessageId: activeCmid }],
+        interruptClientTurn: (sk: string, cmid: string) => sk === sessionKey && cmid === activeCmid,
+        interrupt: () => false,
+        fencePreStartStop: () => {},
+      },
+      router: { route: () => ({ sessionKey }) },
+      _interruptDelegationsForParent: () => false,
+      _interruptRemoteSwarmForSession: () => remoteSwarmPending,
+      _settlePendingPermissionsForStop: () => {},
+      _cancelToolBrokerSession: (sk: string, reason = 'user_stop') => {
+        if (reason === 'user_stop') {
+          runtime.cancelActiveTurnCalls(sk, reason)
+          return
+        }
+        runtime.cancelSessionCalls(sk, reason)
+      },
+    }
+
+    const stopPromise = handleStop.call(host as never, {
+      type: 'inbound.control.stop',
+      channel: 'webchat',
+      peer: { id: 'p32-p14-race', kind: 'dm' },
+      clientMessageId: 'm-p14-turn-1',
+    })
+
+    // M1's tokens and ephemeral job are ALREADY revoked synchronously before remoteSwarmPending resolves!
+    assert.throws(
+      () => runtime.verifyTurnScopedToken(t1Hook.token, 'hook'),
+      { code: 'TOOL_BROKER_TURN_TOKEN_REVOKED' },
+    )
+    assert.throws(
+      () => runtime.verifyTurnScopedToken(t1Mcp.token, 'mcp'),
+      { code: 'TOOL_BROKER_TURN_TOKEN_REVOKED' },
+    )
+    const m1JobAfterStop = await runtime.bashJobs.execute({
+      sessionKey,
+      jobId: bashStart.jobId,
+      action: 'status',
+      timeoutMs: 1_000,
+      killOnTimeout: false,
+      lifecycleClass: 'ephemeral_turn',
+      env: {},
+      signal: abortCtrl.signal,
+    })
+    assert.equal(m1JobAfterStop.kind, 'not_found', 'M1 ephemeral_turn job must be reaped')
+
+    // While remote swarm stop is still awaiting, successor turn M2 starts on the same session and gets T2!
+    activeCmid = 'm-p14-turn-2'
+    const scope2 = { sessionKey, turnEpoch: 2, turnId: 'tb_turn_2_m2' }
+    const t2Hook = runtime.issueTurnHookToken(scope2)
+    const t2Mcp = runtime.issueTurnMcpToken(scope2)
+
+    // Now remote swarm stop completes late:
+    releaseRemoteSwarmStop()
+    const stopOk = await stopPromise
+    assert.equal(stopOk, true)
+
+    // M2's tokens MUST remain valid and usable!
+    const verifiedHook2 = runtime.verifyTurnScopedToken(t2Hook.token, 'hook')
+    const verifiedMcp2 = runtime.verifyTurnScopedToken(t2Mcp.token, 'mcp')
+    assert.equal(verifiedHook2.turnId, 'tb_turn_2_m2')
+    assert.equal(verifiedMcp2.turnId, 'tb_turn_2_m2')
+    const hookEval = await runtime.handleHookEvaluate(t2Hook.token, {
+      toolName: 'Read',
+      arguments: { file_path: 'README.md' },
+    })
+    assert.equal(hookEval.body.decision, 'allow')
+  } finally {
+    runtime.dispose()
+    await rm(workDir, { recursive: true, force: true })
+  }
+})
+
+test('OCV5-930: Antigravity broker PreToolUse honors default warn mode and never blocks native swarm rg/grep or pipe filters even in deny mode', async () => {
+  const workDir = await mkdtemp(join(tmpdir(), 'oc-p32-930-'))
+  const origGuard = process.env.OPENCLAUDE_EFFICIENCY_GUARD
+  Reflect.deleteProperty(process.env, 'OPENCLAUDE_EFFICIENCY_GUARD')
+  const warnRuntime = createGatewayToolBrokerRuntime({ homeDir: workDir })
+  const denyRuntime = createGatewayToolBrokerRuntime({
+    homeDir: join(workDir, 'deny'),
+    shellHookGuardMode: 'deny',
+  })
+  const warnSrv = await startPreAuthBrokerServer(warnRuntime)
+  const denySrv = await startPreAuthBrokerServer(denyRuntime)
+  try {
+    const sess = 'agent:main:webchat:dm:p32-ocv5-930'
+    const launchWarn = join(workDir, 'launch-warn')
+    const cfgWarn = join(launchWarn, '.gemini', 'config')
+    await mkdir(cfgWarn, { recursive: true })
+    const warnTok = warnRuntime.issueTurnHookToken({ sessionKey: sess, mode: 'normal' })
+    const warnHook = installAntigravityBrokerHook({
+      launchHome: launchWarn,
+      configDir: cfgWarn,
+      mode: 'normal',
+      brokerUrl: warnSrv.baseUrl,
+      hookToken: warnTok.token,
+    })
+
+    const runPy = async (pythonBin: string, scriptPath: string, payload: Record<string, unknown>) => {
+      const res = await runCmd(pythonBin, ['-I', '-B', scriptPath], { input: JSON.stringify(payload) })
+      assert.equal(res.code, 0, `hook stderr=${res.stderr}`)
+      return JSON.parse(res.stdout.trim()) as { decision: string; reason?: string }
+    }
+
+    // 1. Default runtime (OPENCLAUDE_EFFICIENCY_GUARD unset -> warn): never denies efficiency hints, still denies destructive ActionPolicy
+    const swarmGrepCmd =
+      'grep -rn "pgSessionsBackend" /home/agent/.openclaude/workspace/wt-b1-cs1/packages/commercial/src/__tests__/ | head -n 60 && rg "HYDRATE" packages/gateway/src/ || true'
+    assert.equal(
+      (await runPy(warnHook.pythonBin, warnHook.guardScriptPath, {
+        tool_name: 'run_command',
+        tool_input: { CommandLine: swarmGrepCmd },
+      })).decision,
+      'allow',
+    )
+    assert.equal(
+      (await runPy(warnHook.pythonBin, warnHook.guardScriptPath, {
+        tool_name: 'run_command',
+        tool_input: { CommandLine: 'cat packages/gateway/src/server.ts' },
+      })).decision,
+      'allow',
+    )
+    const destructiveRes = await runPy(warnHook.pythonBin, warnHook.guardScriptPath, {
+      tool_name: 'run_command',
+      tool_input: { CommandLine: 'rm -rf /' },
+    })
+    assert.equal(destructiveRes.decision, 'deny')
+
+    // 2. Explicit deny mode: Antigravity run_command rg/grep & pipe filters stay allowed; cat points at read_file; sleep >= 60 stays denied
+    const launchDeny = join(workDir, 'launch-deny')
+    const cfgDeny = join(launchDeny, '.gemini', 'config')
+    await mkdir(cfgDeny, { recursive: true })
+    const denyTok = denyRuntime.issueTurnHookToken({ sessionKey: sess, mode: 'normal' })
+    const denyHook = installAntigravityBrokerHook({
+      launchHome: launchDeny,
+      configDir: cfgDeny,
+      mode: 'normal',
+      brokerUrl: denySrv.baseUrl,
+      hookToken: denyTok.token,
+    })
+    assert.equal(
+      (await runPy(denyHook.pythonBin, denyHook.guardScriptPath, {
+        tool_name: 'run_command',
+        tool_input: { CommandLine: swarmGrepCmd },
+      })).decision,
+      'allow',
+    )
+    assert.equal(
+      (await runPy(denyHook.pythonBin, denyHook.guardScriptPath, {
+        tool_name: 'run_command',
+        tool_input: { CommandLine: 'git diff --name-only | grep packages/gateway/src/server.ts' },
+      })).decision,
+      'allow',
+    )
+    const denyCat = await runPy(denyHook.pythonBin, denyHook.guardScriptPath, {
+      tool_name: 'run_command',
+      tool_input: { CommandLine: 'cat packages/gateway/src/server.ts' },
+    })
+    assert.equal(denyCat.decision, 'deny')
+    assert.match(String(denyCat.reason ?? ''), /read_file/)
+    assert.equal(String(denyCat.reason ?? '').includes('Read/Grep/Glob'), false)
+
+    const denySleep = await runPy(denyHook.pythonBin, denyHook.guardScriptPath, {
+      tool_name: 'run_command',
+      tool_input: { CommandLine: 'sleep 120' },
+    })
+    assert.equal(denySleep.decision, 'deny')
+  } finally {
+    if (origGuard === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_EFFICIENCY_GUARD')
+    else process.env.OPENCLAUDE_EFFICIENCY_GUARD = origGuard
+    warnRuntime.dispose()
+    denyRuntime.dispose()
+    await warnSrv.close()
+    await denySrv.close()
     await rm(workDir, { recursive: true, force: true })
   }
 })

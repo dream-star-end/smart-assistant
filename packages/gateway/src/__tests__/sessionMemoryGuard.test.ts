@@ -311,6 +311,50 @@ describe('runEvictionPass — memory watermark & resident runner cap (OCV5-825)'
     assert.equal(host.sessions.has('agent:main:webchat:dm:s1'), true)
   })
 
+  it('uses working-set memory (subtracting reclaimable inactive_file) so page cache alone does not trigger eviction (OCV5-923)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-cgroup-evict-'))
+    try {
+      const v2Cur = join(dir, 'memory.current')
+      const v2Max = join(dir, 'memory.max')
+      const v2Stat = join(dir, 'memory.stat')
+      const v1Cur = join(dir, 'v1.missing.usage')
+      const v1Max = join(dir, 'v1.missing.limit')
+
+      // 95% raw memory.current, but 30% is reclaimable inactive_file -> 65% working set (<= 75% threshold)
+      await writeFile(v2Cur, '950000000\n')
+      await writeFile(v2Max, '1000000000\n')
+      await writeFile(v2Stat, 'anon 650000000\ninactive_file 300000000\n')
+
+      const now = Date.now()
+      const s1 = makeSession({ key: 'agent:main:webchat:dm:cache-s1', peerId: 'cache-s1', lastUsedAt: now - 30_000 })
+      const { host } = makeHost({
+        sessions: [s1.session],
+        maxRunners: 6,
+        memThreshold: 0.75,
+        readCgroupMemory: () =>
+          readCgroupMemoryUsage({
+            v2CurrentPath: v2Cur,
+            v2MaxPath: v2Max,
+            v2StatPath: v2Stat,
+            v1CurrentPath: v1Cur,
+            v1MaxPath: v1Max,
+          }),
+      })
+
+      const resCached = await runEvictionPass.call(host)
+      assert.equal(resCached.pressureRetired, 0, '65% working set must not evict idle runners')
+      assert.equal(host.sessions.has('agent:main:webchat:dm:cache-s1'), true)
+
+      // Now 95% anon memory (inactive_file = 0) -> 95% working set (> 75% threshold) -> must evict
+      await writeFile(v2Stat, 'anon 950000000\ninactive_file 0\n')
+      const resAnon = await runEvictionPass.call(host)
+      assert.equal(resAnon.pressureRetired, 1, '95% anon working set must still trigger eviction')
+      assert.deepEqual(resAnon.retiredKeys, ['agent:main:webchat:dm:cache-s1'])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('B5: never evicts sessions in preparing/unconsumed prepared model-switch transition, pending CCB callbacks, or pending agent groups', async () => {
     const now = Date.now()
     resetCcbLocalAgentCallbackDedupeForTest()

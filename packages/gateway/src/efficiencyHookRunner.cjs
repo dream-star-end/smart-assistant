@@ -380,7 +380,7 @@ function runBrokerEvaluation(protocol, mode, brokerCfg, timeoutMs) {
       ...(command ? { command } : {}),
       ...(target ? { target } : {}),
       ...(typeof parsed.model === 'string' ? { mainModel: parsed.model } : {}),
-      guardMode: mode === 'off' || mode === 'warn' || mode === 'deny' ? mode : 'deny',
+      guardMode: mode === 'off' || mode === 'warn' || mode === 'deny' ? mode : 'warn',
     })
     const url = `${brokerCfg.brokerUrl}${TOOL_BROKER_HOOK_EVAL_PATH}`
     req = http.request(
