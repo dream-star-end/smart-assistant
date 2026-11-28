@@ -1,8 +1,9 @@
 // OCV5-432: pure policy for the selfhost release's OpenCode Go prompt-cache check.
 // Importing this module never opens a socket or reads secrets.
-// OCV5-527: Go Luna is retired as a duplicate of Codex Luna. Keep the proof on a retained
-// model using the same Responses bridge. Fixed on purpose; no model override.
-export const GO_CACHE_MODEL = 'muse-spark-1.3-go'
+// OCV5-929: all weak OpenCode Go models (including muse-spark-1.3-go) are disabled;
+// keep the proof on the sole retained active OpenCode Go model (deepseek-v4-flash).
+// Fixed on purpose; no model override.
+export const GO_CACHE_MODEL = 'deepseek-v4-flash'
 export const GO_CACHE_TURNS = 3
 // Each later turn re-sends the earlier prompt, so with a working cache roughly (n-1)/n of the
 // prompt tokens are cache reads (3 turns ≈ 0.67). Before OCV5-432, Muse read only part
