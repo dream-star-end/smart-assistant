@@ -798,5 +798,28 @@ else
   fail "B03: standby ready timeout default/override/sanitization check failed"
 fi
 
+# ── 13. OCV5-931: Dual-slot frontdoor & master@ unit templates embed control-plane QoS ──
+QOS_UNIT_OUT="$TMP/systemd-qos"
+(
+  unset __OC_SELFHOST_DUAL_SLOT_LIB_LOADED
+  source "$ROOT/scripts/v5-selfhost-dual-slot-lib.sh"
+  install_selfhost_dual_slot_units "$QOS_UNIT_OUT"
+)
+grep -Fxq 'CPUWeight=1000' "$QOS_UNIT_OUT/openclaude-v5-selfhost-frontdoor.service" \
+  && grep -Fxq 'IOWeight=1000' "$QOS_UNIT_OUT/openclaude-v5-selfhost-frontdoor.service" \
+  && grep -Fxq 'MemoryMin=64M' "$QOS_UNIT_OUT/openclaude-v5-selfhost-frontdoor.service" \
+  && grep -Fxq 'MemoryLow=128M' "$QOS_UNIT_OUT/openclaude-v5-selfhost-frontdoor.service" \
+  && grep -Fxq 'OOMScoreAdjust=-800' "$QOS_UNIT_OUT/openclaude-v5-selfhost-frontdoor.service" \
+  && pass "OCV5-931: frontdoor unit template embeds control-plane QoS directives" \
+  || fail "OCV5-931: frontdoor unit template missing QoS directives"
+
+grep -Fxq 'CPUWeight=1000' "$QOS_UNIT_OUT/openclaude-v5-selfhost@.service" \
+  && grep -Fxq 'IOWeight=1000' "$QOS_UNIT_OUT/openclaude-v5-selfhost@.service" \
+  && grep -Fxq 'MemoryMin=512M' "$QOS_UNIT_OUT/openclaude-v5-selfhost@.service" \
+  && grep -Fxq 'MemoryLow=768M' "$QOS_UNIT_OUT/openclaude-v5-selfhost@.service" \
+  && grep -Fxq 'OOMScoreAdjust=-800' "$QOS_UNIT_OUT/openclaude-v5-selfhost@.service" \
+  && pass "OCV5-931: master@.service template embeds control-plane QoS directives" \
+  || fail "OCV5-931: master@.service template missing QoS directives"
+
 printf 'passed=%d failed=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
