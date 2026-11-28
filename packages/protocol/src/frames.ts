@@ -916,8 +916,7 @@ export const OutboundContentBlock = Type.Union([
           inputTokens: Type.Optional(Type.Integer({ minimum: 0 })),
           outputTokens: Type.Optional(Type.Integer({ minimum: 0 })),
           toolCalls: Type.Optional(Type.Integer({ minimum: 0 })),
-          telemetryPartial: Type.Optional(Type.Boolean()),
-          livenessEvidencePartial: Type.Optional(Type.Boolean()),
+          telemetryPartial: Type.Optional(Type.Boolean()), livenessEvidencePartial: Type.Optional(Type.Boolean()),
         }),
       ),
       channels: Type.Array(
