@@ -1,11 +1,9 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import path from "node:path";
 import { describe, test } from "node:test";
-import { fileURLToPath } from "node:url";
 
 import { notifyRecoveryJobTerminals } from "../db/pgSessionsBackend.js";
 import type { RecoveryJobTerminalRow } from "../dispatch/turnRecoveryStore.js";
+import { readPgSessionsBackendSource } from "./helpers/pgSessionsSource.js";
 
 describe("notifyRecoveryJobTerminals", () => {
   test("invokes the hook for completed/paused even when no recovery decision exists", async () => {
@@ -66,11 +64,7 @@ describe("notifyRecoveryJobTerminals", () => {
 
 describe("finalizeLosslessTurnTape recovery-job hook wiring", () => {
   test("post-commit hook runs on applied=finalized independently of recoveryDecision", () => {
-    const srcPath = path.resolve(
-      path.dirname(fileURLToPath(import.meta.url)),
-      "../db/pgSessionsBackend.ts",
-    );
-    const src = readFileSync(srcPath, "utf8");
+    const src = readPgSessionsBackendSource();
     const finalizeAt = src.indexOf("async finalizeLosslessTurnTape(");
     assert.ok(finalizeAt >= 0);
     const slice = src.slice(finalizeAt, finalizeAt + 80_000);

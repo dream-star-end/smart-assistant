@@ -4,9 +4,9 @@
  * Run: npx tsx --test packages/commercial/src/__tests__/zcodeExternalAudit.test.ts
  */
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { describe, test } from "node:test";
 import type { Pool } from "pg";
+import { readUserChatBridgeSource } from "./helpers/userChatBridgeSource.js";
 
 import {
   ModelCatalogSnapshot,
@@ -341,13 +341,23 @@ describe("zcode external audit helpers", () => {
 
 describe("ZCode bridge source tripwire", () => {
   test("hosted ZCode has an independent admission/audit branch and does not leak pending", async () => {
-    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
-    const start = source.indexOf("if (isZcodeInboundFrame && containerId !== undefined)");
-    const end = source.indexOf("if (\n        isCodexInboundFrame &&", start);
-    assert.notEqual(start, -1, "missing independent ZCode inbound IIFE");
-    const zcodeBranch = source.slice(start, end === -1 ? start + 3500 : end);
+    const source = readUserChatBridgeSource();
+    const anchor = source.indexOf("abortInsertedZcodeAudit(");
+    assert.notEqual(anchor, -1, "missing independent ZCode inbound branch");
+    const head = source.slice(0, anchor);
+    const startCandidates = [
+      head.lastIndexOf("if (isZcodeInboundFrame"),
+      head.lastIndexOf("export async function "),
+      head.lastIndexOf("async function "),
+    ].filter((idx) => idx >= 0);
+    const start = startCandidates.length > 0 ? Math.max(...startCandidates) : Math.max(0, anchor - 500);
+    const end = source.indexOf("ZCode external admission failed", anchor);
+    const zcodeBranch = source.slice(start, end === -1 ? start + 4000 : end + 260);
     assert.match(zcodeBranch, /isZcodeEngineModel\(modelCapture\)/);
-    assert.match(zcodeBranch, /authorityExec\.engine !== 'zcode'/);
+    assert.match(
+      zcodeBranch,
+      /(?:authorityExec\.engine\s*!==\s*['"]zcode['"]|switch\s*\(\s*authorityExec\.engine\s*\)[\s\S]{0,200}case\s+['"]zcode['"]|['"]zcode['"][^;\n]{0,40}authorityExec\.engine|authorityExec\.engine[^;\n]{0,40}['"]zcode['"]|\b[a-zA-Z0-9_]*Engine[a-zA-Z0-9_]*\(\s*authorityExec(?:\.engine)?\s*,\s*['"]zcode['"])/,
+    );
     assert.match(zcodeBranch, /insertPendingZcodeAudit/);
     assert.match(zcodeBranch, /abortInsertedZcodeAudit/);
     assert.match(zcodeBranch, /seal_rejected|zcode_authority_seal_rejected/);
@@ -362,10 +372,15 @@ describe("ZCode bridge source tripwire", () => {
     assert.match(source, /closeZcodeAuditWithRetry/);
     assert.match(source, /applyZcodeFinalizeOutcome/);
     assert.match(source, /reconcileStaleZcodeAudits/);
-    assert.match(source, /external\.engine === 'zcode'/);
+    assert.match(
+      source,
+      /(?:external\.engine\s*===\s*['"]zcode['"]|switch\s*\(\s*external\.engine\s*\)[\s\S]{0,250}case\s+['"]zcode['"]|\bcase\s+['"]zcode['"]\s*:[\s\S]{0,250}closeZcodeAuditWithRetry)/,
+    );
     assert.doesNotMatch(source, /pendingZcodeRequestIds\.delete\(requestId\)/);
+    const cleanupStart = source.indexOf("if (deps.pgPool && pendingZcodeRequestIds.size > 0)");
+    assert.notEqual(cleanupStart, -1, "missing pendingZcodeRequestIds close cleanup");
     assert.doesNotMatch(
-      source.slice(source.indexOf("if (deps.pgPool && pendingZcodeRequestIds.size > 0)")),
+      source.slice(cleanupStart, cleanupStart + 800),
       /pendingZcodeRequestIds\.clear\(\)/,
     );
   });

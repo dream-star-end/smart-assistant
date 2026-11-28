@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import path from "node:path";
 import { describe, test } from "node:test";
-import { fileURLToPath } from "node:url";
 import { enqueueMaterializationJob } from "../db/turnTapeJobs.js";
+import { readPgSessionsBackendSource } from "./helpers/pgSessionsSource.js";
 
 function inListStatuses(sql: string, column: "status" | "next_attempt_at"): string[] {
   const pattern = new RegExp(
@@ -44,11 +42,7 @@ describe("enqueueMaterializationJob SQL", () => {
 
 describe("Phase B enqueue wiring", () => {
   test("finalizeLosslessTurnTape only enqueues on HTTP materialize:false, not on worker Phase B", () => {
-    const srcPath = path.resolve(
-      path.dirname(fileURLToPath(import.meta.url)),
-      "../db/pgSessionsBackend.ts",
-    );
-    const src = readFileSync(srcPath, "utf8");
+    const src = readPgSessionsBackendSource();
     const marker = "async finalizeLosslessTurnTape(";
     const start = src.indexOf(marker);
     assert.ok(start >= 0, "finalizeLosslessTurnTape missing");

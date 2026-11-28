@@ -2,13 +2,14 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { readUserChatBridgeSource } from "./helpers/userChatBridgeSource.js";
 
 const ROOT = resolve(import.meta.dirname, "../../../..");
 const read = (path: string): string => readFileSync(resolve(ROOT, path), "utf8");
 
 describe("V5 release verification wiring", () => {
   test("CCB bridge persists the freshly minted turn id before forwarding the sealed frame", () => {
-    const source = read("packages/commercial/src/ws/userChatBridge.ts");
+    const source = readUserChatBridgeSource();
     const ccb = source.indexOf("dispatchRecordC = lookupAdmittedDispatch(enrichedParsed)");
     const mint = source.indexOf("signer.mintAuthorityTurnId()", ccb);
     const seal = source.indexOf("sealAuthorityFieldsOrReject", mint);
@@ -23,7 +24,7 @@ describe("V5 release verification wiring", () => {
   });
 
   test("Cursor bridge persists the freshly minted turn id before sealing the same id", () => {
-    const source = read("packages/commercial/src/ws/userChatBridge.ts");
+    const source = readUserChatBridgeSource();
     const cursor = source.indexOf("failDispatchPreForward(dispatchRecord, 'cursor_authority_rejected')");
     const mint = source.indexOf("signer.mintAuthorityTurnId()", cursor);
     const admit = source.indexOf("bindAuthorityTurnDispatch", mint);
