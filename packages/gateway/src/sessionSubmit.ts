@@ -459,7 +459,7 @@ async function syncRunnerConfigBeforeTurn(args: {
   if (effortChanged) session.runner.setEffortLevel(desiredEffort)
   if (modelChanged) {
     session.runner.setModel(model)
-    session.model = model ?? host.config.defaults.model ?? 'deepseek-v4-flash'
+    session.model = model ?? host.config.defaults.model ?? session.model
   }
   if (toolsetsChanged) maybeSetToolsets.call(session.runner, desiredToolsets)
   const serviceTierChanged = applyRunnerServiceTier(session, opts, modelChanged, model)
