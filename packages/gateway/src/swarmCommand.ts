@@ -28,12 +28,21 @@ import {
 } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
+import { SWARM_MAX_POST_CHARS, type SwarmMemberRole, extractSwarmMentions } from "@openclaude/protocol";
 import {
-  SWARM_MAX_POST_CHARS,
-  type SwarmMemberRole,
-  extractSwarmMentions,
-} from "@openclaude/protocol";
+  createNativeSwarmWakeTarget,
+  extractMemberConversationId,
+  invokeSwarmWakeTarget,
+  lookupActiveNativeSwarmWakeHandler,
+  type SwarmWakeDeliveryStatus,
+  type SwarmWakeOutcome,
+  type SwarmWakeTargetContext,
+  type SwarmWakeTargetHandler,
+} from "./engine/nativeSwarmWake.js";
 import { formatBoardTimestamp } from "./remoteSwarmLocks.js";
+
+export { createNativeSwarmWakeTarget, lookupActiveNativeSwarmWakeHandler };
+export type { SwarmWakeDeliveryStatus, SwarmWakeOutcome, SwarmWakeTargetContext, SwarmWakeTargetHandler };
 
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_MEMBER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -92,6 +101,8 @@ export interface InjectSwarmDirectiveOptions {
   lockTimeoutMs?: number;
   /** 可选取消围栏:在获得文件锁后、真正写入 `board.jsonl` 前做最后一次校验,返回 true 时放弃写入并返回 `ABORTED`。 */
   shouldAbort?: () => boolean;
+  /** 可选实时唤醒回调:讨论板追加成功后触发,异常会被安全捕获为 `board_only_unwoken` 而不破坏已落盘消息。 */
+  wakeTarget?: SwarmWakeTargetHandler;
 }
 
 export interface InjectSwarmDirectiveSuccess {
@@ -103,6 +114,8 @@ export interface InjectSwarmDirectiveSuccess {
   text: string;
   mentions: string[];
   time: string;
+  wakeDelivery?: SwarmWakeDeliveryStatus;
+  wakeDetail?: string;
 }
 
 export type InjectSwarmDirectiveResult = InjectSwarmDirectiveSuccess | SwarmCommandFailure;
@@ -114,13 +127,12 @@ export interface TerminateSwarmMemberOptions {
   reason?: string;
   sender?: string;
   now?: number;
-  /**
-   * 可选权威执行器回执回调:仅当真实会话执行器确认目标实例已停止并返回 `true` 时,
-   * 才返回 `status: 'confirmed'`;否则诚实返回 `status: 'requested'`。
-   */
+  /** 可选权威执行器回执回调:仅当真实会话执行器确认目标实例已停止并返回 `true` 时,才返回 `status: 'confirmed'`;否则诚实返回 `status: 'requested'`。 */
   confirmByExecutor?: (memberName: string, reason: string) => boolean | Promise<boolean>;
   /** 可选测试钩子:覆盖 `.board.lock` 异步等待上限(默认 5000ms)。 */
   lockTimeoutMs?: number;
+  /** 可选实时唤醒回调:通知写入讨论板后触发,用于唤醒 coordinator 或诚实回传 `board_only_unwoken`。 */
+  wakeTarget?: SwarmWakeTargetHandler;
 }
 
 export type TerminateSwarmStatus = "requested" | "confirmed" | "already_killed";
@@ -132,6 +144,8 @@ export interface TerminateSwarmMemberSuccess {
   alreadyKilled: boolean;
   noticeSeq?: number;
   time: string;
+  wakeDelivery?: SwarmWakeDeliveryStatus;
+  wakeDetail?: string;
 }
 
 export type TerminateSwarmMemberResult = TerminateSwarmMemberSuccess | SwarmCommandFailure;
@@ -502,6 +516,12 @@ function normalizeTargetName(raw: string): string {
   return raw.trim().replace(/^@+/, "");
 }
 
+function formatDirectedSwarmText(target: string, rawMsg: string): string {
+  if (extractSwarmMentions(rawMsg).includes(target.toLowerCase())) return rawMsg;
+  const sep = /^[ \t>]*(`{3,}|~{3,})/.test(rawMsg) ? "\n" : " ";
+  return `@${target}${sep}${rawMsg}`;
+}
+
 /**
  * 向活跃 Swarm board 注入人工纠偏指令(`@coordinator` / `@member` / `@all`)。
  */
@@ -551,9 +571,7 @@ export async function injectSwarmDirective(
     }
   }
 
-  const existingMentions = extractSwarmMentions(rawMsg);
-  const needsPrefix = !existingMentions.includes(target.toLowerCase());
-  const fullText = needsPrefix ? `@${target} ${rawMsg}` : rawMsg;
+  const fullText = formatDirectedSwarmText(target, rawMsg);
   if (fullText.length > SWARM_MAX_POST_CHARS) {
     return {
       ok: false,
@@ -566,30 +584,16 @@ export async function injectSwarmDirective(
   const time = formatBoardTimestamp(new Date(now));
   const controlKind = (opts.controlKind ?? "steer").trim() || "steer";
   const appended = await appendBoardPostLocked(
-    dirRes.dir,
-    now,
-    {
-      agent,
-      channel,
-      text: fullText,
-      time,
-      control: { kind: controlKind, target },
-    },
-    opts.lockTimeoutMs,
-    opts.shouldAbort,
+    dirRes.dir, now,
+    { agent, channel, text: fullText, time, control: { kind: controlKind, target } },
+    opts.lockTimeoutMs, opts.shouldAbort,
   );
   if (!appended.ok) return appended;
-
-  return {
-    ok: true,
-    seq: appended.seq,
-    target,
-    channel,
-    agent,
-    text: fullText,
-    mentions: extractSwarmMentions(fullText),
-    time,
-  };
+  const wake = await invokeSwarmWakeTarget(opts.wakeTarget, {
+    target, seq: appended.seq, channel, text: fullText, controlKind,
+    targetConversationId: extractMemberConversationId(members, target),
+  });
+  return { ok: true, seq: appended.seq, target, channel, agent, text: fullText, mentions: extractSwarmMentions(fullText), time, ...wake };
 }
 
 /**
@@ -657,34 +661,19 @@ export async function terminateSwarmMember(
     : `@coordinator [control:kill:requested] 人工请求单点终止成员 @${memberName}（原因：${reason}）。请调用 swarm{action:"kill", name:"${memberName}"} 安全回收并确认状态。`;
 
   const appended = await appendBoardPostLocked(
-    dirRes.dir,
-    now,
+    dirRes.dir, now,
     {
-      agent: sender,
-      channel: "main",
-      text: noticeText,
-      time,
-      control: {
-        kind: "terminate",
-        target: memberName,
-        status: confirmed ? "confirmed" : "requested",
-        reason,
-      },
+      agent: sender, channel: "main", text: noticeText, time,
+      control: { kind: "terminate", target: memberName, status: confirmed ? "confirmed" : "requested", reason },
     },
     opts.lockTimeoutMs,
   );
-  if (!appended.ok) {
-    return appended;
-  }
-
-  return {
-    ok: true,
-    status: confirmed ? "confirmed" : "requested",
-    memberName,
-    alreadyKilled: false,
-    noticeSeq: appended.seq,
-    time,
-  };
+  if (!appended.ok) return appended;
+  const wake = await invokeSwarmWakeTarget(opts.wakeTarget, {
+    target: "coordinator", seq: appended.seq, channel: "main", text: noticeText, controlKind: "terminate",
+    targetConversationId: extractMemberConversationId(members, "coordinator"),
+  });
+  return { ok: true, status: confirmed ? "confirmed" : "requested", memberName, alreadyKilled: false, noticeSeq: appended.seq, time, ...wake };
 }
 
 // ── 高阶剧本库(7 套内置科研/工程默认模板) ─────────────────────────────────────
@@ -1248,6 +1237,7 @@ export interface ResolvedSessionSwarmTarget {
   brainDir: string;
   conversationId: string;
   confirmByExecutor?: (memberName: string, reason: string) => boolean;
+  wakeTarget?: SwarmWakeTargetHandler;
 }
 
 export interface SwarmCommandRouteDeps {
@@ -1416,13 +1406,8 @@ export async function handleSwarmCommandRoute(
 
   if (action === "steer") {
     const result = await injectSwarmDirective({
-      brainDir: targetSwarm.brainDir,
-      conversationId: targetSwarm.conversationId,
-      target,
-      message,
-      channel: typeof body.channel === "string" ? body.channel : undefined,
-      sender,
-      now,
+      brainDir: targetSwarm.brainDir, conversationId: targetSwarm.conversationId, target, message,
+      channel: typeof body.channel === "string" ? body.channel : undefined, sender, now, wakeTarget: targetSwarm.wakeTarget,
     });
     sendRouteJson(res, result.ok ? 200 : mapSwarmFailureStatus(result.code), result);
     return;
@@ -1430,13 +1415,8 @@ export async function handleSwarmCommandRoute(
 
   if (action === "kill" || action === "terminate") {
     const result = await terminateSwarmMember({
-      brainDir: targetSwarm.brainDir,
-      conversationId: targetSwarm.conversationId,
-      memberName,
-      reason,
-      sender,
-      now,
-      confirmByExecutor: targetSwarm.confirmByExecutor,
+      brainDir: targetSwarm.brainDir, conversationId: targetSwarm.conversationId, memberName, reason, sender, now,
+      confirmByExecutor: targetSwarm.confirmByExecutor, wakeTarget: targetSwarm.wakeTarget,
     });
     sendRouteJson(res, result.ok ? 200 : mapSwarmFailureStatus(result.code), result);
     return;
@@ -1451,17 +1431,12 @@ export async function handleSwarmCommandRoute(
       sendRouteJson(res, 400, { ok: false, code: "INVALID_PLAYBOOK", error: "unknown playbook template or empty task" });
       return;
     }
-    const kickoff =
-      body.postKickoff === true
-        ? await injectSwarmDirective({
-            brainDir: targetSwarm.brainDir,
-            conversationId: targetSwarm.conversationId,
-            target: "all",
-            message: expanded.kickoffBoardMessage,
-            sender,
-            now,
-          })
-        : undefined;
+    const kickoff = body.postKickoff === true
+      ? await injectSwarmDirective({
+          brainDir: targetSwarm.brainDir, conversationId: targetSwarm.conversationId,
+          target: "all", message: expanded.kickoffBoardMessage, sender, now, wakeTarget: targetSwarm.wakeTarget,
+        })
+      : undefined;
     sendRouteJson(res, 200, { ok: true, playbook: expanded, ...(kickoff ? { kickoff } : {}) });
     return;
   }

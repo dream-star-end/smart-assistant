@@ -36,6 +36,7 @@ import {
   isCoordinatorDonePost,
   isMemberEffectivelyWaiting,
   isMonitorPost,
+  isProgressUpdatePost,
   isSwarmAuxiliaryRole,
   isSwarmMonitorAgentName,
   mentionMatchesWorker,
@@ -60,6 +61,7 @@ export {
   DEFAULT_SWARM_WORKING_STALL_THRESHOLD_MS,
   GATEWAY_STALL_MONITOR_AGENT,
   isMemberEffectivelyWaiting,
+  isProgressUpdatePost,
   isSwarmAuxiliaryRole,
   isSwarmMonitorAgentName,
   type SwarmStallAlert,
@@ -107,6 +109,7 @@ export class SwarmStallMonitor {
   private prevAlertAt = 0
   private exhaustedEmitted = false
   private lastWorkingMembers: readonly string[] = []
+  private lastIncompleteEvidence = false
   private readonly repingedMentions = new Map<string, number>()
   private lastDiagnosticKind: SwarmStallDiagnosticKind | null = null
   private lastDiagnosticAt = 0
@@ -129,9 +132,14 @@ export class SwarmStallMonitor {
     )
   }
 
-  /** True iff the active stage has exhausted all stall alerts and zero core members are working. */
+  /** True iff the active stage has exhausted all stall alerts, zero core members are working, and transcript evidence is complete. */
   isStallSuppressedAllParked(): boolean {
-    return !this.stageDone && this.alertCount >= this.maxAlerts && this.lastWorkingMembers.length === 0
+    return (
+      !this.stageDone &&
+      !this.lastIncompleteEvidence &&
+      this.alertCount >= this.maxAlerts &&
+      this.lastWorkingMembers.length === 0
+    )
   }
 
   /** Clear all state on turn end, user stop, or swarm teardown. */
@@ -145,6 +153,7 @@ export class SwarmStallMonitor {
     this.lastActivityKey = null
     this.lastQuietSince = 0
     this.lastWorkingMembers = []
+    this.lastIncompleteEvidence = false
     this.lastDiagnosticKind = null
     this.lastDiagnosticAt = 0
     this.clearAlertState()
@@ -240,6 +249,7 @@ export class SwarmStallMonitor {
       this.lastActivityKey = null
       this.lastQuietSince = now
       this.lastWorkingMembers = []
+      this.lastIncompleteEvidence = false
       this.clearAlertState()
       this.emitDiagnostic(now, {
         kind: 'skipped_no_workers',
@@ -256,6 +266,11 @@ export class SwarmStallMonitor {
 
     const { workingMembers, waitingMembers } = classifyWork(liveCoreMembers)
     this.lastWorkingMembers = workingMembers
+    this.lastIncompleteEvidence = liveCoreMembers.some(
+      (m) =>
+        m.livenessEvidencePartial === true ||
+        (m.livenessEvidencePartial === undefined && m.telemetryPartial === true),
+    )
 
     let newestDoneSeq = this.lastDoneSeq
     for (const post of nonMonitorPosts) {
@@ -477,7 +492,12 @@ export class SwarmStallMonitor {
     workingMembers: readonly string[],
     waitingMembers: readonly string[],
   ): null {
-    if (workingMembers.length === 0 && now - this.lastAlertAt >= this.exhaustedGraceMs && !this.exhaustedEmitted) {
+    if (
+      workingMembers.length === 0 &&
+      !this.lastIncompleteEvidence &&
+      now - this.lastAlertAt >= this.exhaustedGraceMs &&
+      !this.exhaustedEmitted
+    ) {
       this.exhaustedEmitted = true
       this.emitDiagnostic(
         now,
@@ -604,6 +624,7 @@ export class SwarmStallMonitor {
     const coordLastReadSeq = Math.max(0, boardHeadSeq - (coordinator?.unreadCount ?? boardHeadSeq))
     const unclaimedPosts = coordinatorRequests.length > 0 ? coordinatorRequests : outstanding.filter((post) =>
       !peerHandoffs?.coveredSeqs.has(post.seq) &&
+      !(post.mentions.length === 0 && isProgressUpdatePost(post)) &&
       (post.seq > coordLastReadSeq || !postHasLiveCoreRecipient(post, liveCoreMembers)),
     )
     if (unclaimedPosts.length > 0) {

@@ -19,6 +19,7 @@ import {
   listSwarmPlaybooks,
   parseSwarmControlCommand,
   terminateSwarmMember,
+  type SwarmWakeTargetContext,
 } from "../swarmCommand.js";
 
 const COORD_CONV = "11111111-1111-4111-8111-111111111111";
@@ -609,5 +610,323 @@ describe("Swarm playbook templates & command parser", () => {
       task: "审查 gateway 鉴权边界",
     });
     assert.equal(parseSwarmControlCommand("ordinary message"), null);
+  });
+});
+
+describe("OCV5-932 honest wakeTarget contract across steer, terminate, and playbook", () => {
+  it("extracts validated targetConversationId, reports wakeDelivery honestly, catches wake errors without failing board posts, and keeps legacy callers compatible", async () => {
+    const brainDir = mkdtempSync(path.join(tmpdir(), "oc-swarm-wake-"));
+    try {
+      const swarmDir = setupSwarmFixture(brainDir);
+      // Add a member with an invalid conversation_id to verify strict UUID validation
+      const rosterPath = path.join(swarmDir, "members.json");
+      const roster = JSON.parse(readFileSync(rosterPath, "utf8")) as {
+        title: string;
+        members: Record<string, Record<string, unknown>>;
+      };
+      roster.members["bad-conv-worker"] = { conversation_id: "not-a-uuid", role: "worker", killed: false };
+      writeFileSync(rosterPath, JSON.stringify(roster, null, 2));
+
+      // 1) Legacy caller omitting wakeTarget omits wakeDelivery/wakeDetail
+      const legacyRes = await injectSwarmDirective({
+        brainDir,
+        conversationId: COORD_CONV,
+        target: "worker-1",
+        message: "legacy check",
+      });
+      assert.equal(legacyRes.ok, true);
+      if (legacyRes.ok) {
+        assert.equal("wakeDelivery" in legacyRes, false);
+        assert.equal("wakeDetail" in legacyRes, false);
+      }
+
+      // 2) Woken callback receives validated targetConversationId from members.json
+      const seenCtxs: SwarmWakeTargetContext[] = [];
+      const wokenRes = await injectSwarmDirective({
+        brainDir,
+        conversationId: COORD_CONV,
+        target: "worker-1",
+        message: "check tests",
+        wakeTarget: async (ctx) => {
+          seenCtxs.push(ctx);
+          return { status: "woken", detail: "remote_swarm_runtime" };
+        },
+      });
+      assert.equal(wokenRes.ok, true);
+      if (wokenRes.ok) {
+        assert.equal(wokenRes.wakeDelivery, "woken");
+        assert.equal(wokenRes.wakeDetail, "remote_swarm_runtime");
+      }
+      assert.equal(seenCtxs.length, 1);
+      assert.equal(seenCtxs[0]?.target, "worker-1");
+      assert.equal(seenCtxs[0]?.controlKind, "steer");
+      assert.equal(seenCtxs[0]?.targetConversationId, "22222222-2222-4222-8222-222222222222");
+
+      // 3) Invalid conversation_id is filtered out -> targetConversationId === undefined
+      const invalidConvRes = await injectSwarmDirective({
+        brainDir,
+        conversationId: COORD_CONV,
+        target: "bad-conv-worker",
+        message: "hello",
+        wakeTarget: (ctx) => {
+          seenCtxs.push(ctx);
+          return { status: "board_only_unwoken", detail: "native_worker_no_external_wake_channel" };
+        },
+      });
+      assert.equal(invalidConvRes.ok, true);
+      if (invalidConvRes.ok) {
+        assert.equal(invalidConvRes.wakeDelivery, "board_only_unwoken");
+        assert.equal(invalidConvRes.wakeDetail, "native_worker_no_external_wake_channel");
+      }
+      assert.equal(seenCtxs[1]?.targetConversationId, undefined);
+
+      // 4) Throwing wakeTarget is caught cleanly -> board post stays ok with board_only_unwoken
+      const throwRes = await injectSwarmDirective({
+        brainDir,
+        conversationId: COORD_CONV,
+        target: "coordinator",
+        message: "survive wake crash",
+        wakeTarget: async () => {
+          throw new Error("boom_wake_transport");
+        },
+      });
+      assert.equal(throwRes.ok, true);
+      if (throwRes.ok) {
+        assert.equal(throwRes.wakeDelivery, "board_only_unwoken");
+        assert.match(throwRes.wakeDetail ?? "", /^wake_handler_error:boom_wake_transport/);
+      }
+      assert.ok(readFileSync(path.join(swarmDir, "board.jsonl"), "utf8").includes("survive wake crash"));
+
+      // 5) terminateSwarmMember invokes wakeTarget for coordinator on requested/confirmed, skips on already_killed
+      const termSeen: SwarmWakeTargetContext[] = [];
+      const termReq = await terminateSwarmMember({
+        brainDir,
+        conversationId: COORD_CONV,
+        memberName: "worker-1",
+        reason: "stuck",
+        wakeTarget: (ctx) => {
+          termSeen.push(ctx);
+          return { status: "board_only_unwoken", detail: "native_cli_stdin_queued_until_result" };
+        },
+      });
+      assert.equal(termReq.ok, true);
+      if (termReq.ok) {
+        assert.equal(termReq.status, "requested");
+        assert.equal(termReq.wakeDelivery, "board_only_unwoken");
+        assert.equal(termReq.wakeDetail, "native_cli_stdin_queued_until_result");
+      }
+      assert.equal(termSeen.length, 1);
+      assert.equal(termSeen[0]?.target, "coordinator");
+      assert.equal(termSeen[0]?.controlKind, "terminate");
+      assert.equal(termSeen[0]?.targetConversationId, COORD_CONV);
+
+      const termThrow = await terminateSwarmMember({
+        brainDir,
+        conversationId: COORD_CONV,
+        memberName: "worker-1",
+        reason: "wake throws",
+        wakeTarget: () => {
+          throw new Error("kill_wake_failed");
+        },
+      });
+      assert.equal(termThrow.ok, true);
+      if (termThrow.ok) {
+        assert.equal(termThrow.wakeDelivery, "board_only_unwoken");
+        assert.match(termThrow.wakeDetail ?? "", /^wake_handler_error:kill_wake_failed/);
+      }
+
+      const deadTerm = await terminateSwarmMember({
+        brainDir,
+        conversationId: COORD_CONV,
+        memberName: "dead-worker",
+        wakeTarget: () => {
+          throw new Error("must not run for already_killed");
+        },
+      });
+      assert.equal(deadTerm.ok, true);
+      if (deadTerm.ok) {
+        assert.equal(deadTerm.status, "already_killed");
+        assert.equal("wakeDelivery" in deadTerm, false);
+      }
+    } finally {
+      rmSync(brainDir, { recursive: true, force: true });
+    }
+  });
+
+  it("handleSwarmCommandRoute threads ResolvedSessionSwarmTarget.wakeTarget into steer, terminate, and playbook kickoff", async () => {
+    const brainDir = mkdtempSync(path.join(tmpdir(), "oc-swarm-route-wake-"));
+    try {
+      setupSwarmFixture(brainDir);
+      const calls: SwarmWakeTargetContext[] = [];
+      const deps = {
+        authenticate: async () => ({ id: "user-a" }),
+        resolveSessionSwarm: async () => ({
+          brainDir,
+          conversationId: COORD_CONV,
+          wakeTarget: (ctx: SwarmWakeTargetContext) => {
+            calls.push(ctx);
+            return { status: "board_only_unwoken" as const, detail: `unwoken:${ctx.controlKind}:${ctx.target}` };
+          },
+        }),
+      };
+
+      const rSteer = makeRes();
+      await handleSwarmCommandRoute(
+        makeReq({
+          method: "POST",
+          url: "/api/sessions/sess-1/swarm/command",
+          userId: "user-a",
+          body: { action: "steer", target: "worker-1", message: "focus" },
+        }),
+        rSteer.res,
+        deps,
+      );
+      assert.equal(rSteer.status(), 200);
+      assert.equal((rSteer.json() as { wakeDelivery?: string }).wakeDelivery, "board_only_unwoken");
+      assert.equal((rSteer.json() as { wakeDetail?: string }).wakeDetail, "unwoken:steer:worker-1");
+
+      const rTerm = makeRes();
+      await handleSwarmCommandRoute(
+        makeReq({
+          method: "POST",
+          url: "/api/sessions/sess-1/swarm/command",
+          userId: "user-a",
+          body: { action: "terminate", memberName: "worker-1", reason: "looping" },
+        }),
+        rTerm.res,
+        deps,
+      );
+      assert.equal(rTerm.status(), 200);
+      assert.equal((rTerm.json() as { wakeDelivery?: string }).wakeDelivery, "board_only_unwoken");
+      assert.equal((rTerm.json() as { wakeDetail?: string }).wakeDetail, "unwoken:terminate:coordinator");
+
+      const rPlaybook = makeRes();
+      await handleSwarmCommandRoute(
+        makeReq({
+          method: "POST",
+          url: "/api/sessions/sess-1/swarm/command",
+          userId: "user-a",
+          body: { action: "playbook", templateId: "parallel-impl-verify", task: "deliver fix", postKickoff: true },
+        }),
+        rPlaybook.res,
+        deps,
+      );
+      assert.equal(rPlaybook.status(), 200);
+      const pbJson = rPlaybook.json() as { kickoff?: { wakeDelivery?: string; wakeDetail?: string } };
+      assert.equal(pbJson.kickoff?.wakeDelivery, "board_only_unwoken");
+      assert.equal(pbJson.kickoff?.wakeDetail, "unwoken:steer:all");
+      assert.deepEqual(
+        calls.map((c) => `${c.controlKind}:${c.target}`),
+        ["steer:worker-1", "terminate:coordinator", "steer:all"],
+      );
+    } finally {
+      rmSync(brainDir, { recursive: true, force: true });
+    }
+  });
+
+  it("P1-5: steer starting with Markdown code fence puts @target on its own line so fenced @all never broadcasts to bystanders", async () => {
+    const agyRoot = mkdtempSync(path.join(tmpdir(), "oc-swarm-p1-5-"));
+    const wsDir = mkdtempSync(path.join(tmpdir(), "oc-swarm-p1-5-ws-"));
+    const { RemoteSwarmRuntime } = await import("../remoteSwarmRuntime.js");
+    const rt = new RemoteSwarmRuntime({ rootBase: agyRoot });
+    const runCalls: string[] = [];
+    rt.setExecutor({
+      runWorkerTurn: async (input) => {
+        runCalls.push(input.workerName);
+        return { text: "ok" };
+      },
+      releaseWorkerSession: async () => ({ released: true, state: "released" }),
+    });
+    const sessionKey = "agent:main:webchat:dm:p1-5-fence";
+    try {
+      rt.registerSession({
+        sessionKey,
+        model: "antigravity-gemini-4-neon-remote",
+        workspaceCwd: wsDir,
+      });
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: "coordinator",
+        tool: "swarm",
+        args: { action: "add", name: "worker-a", brief: "work a" },
+      });
+      await rt.handleToolCall({
+        sessionKey,
+        callerMember: "coordinator",
+        tool: "swarm",
+        args: { action: "add", name: "bystander", brief: "idle" },
+      });
+      // Wait for initial add-brief turns to finish before parking bystander
+      for (let i = 0; i < 40 && runCalls.length < 2; i += 1) {
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      const boardState = (await rt.handleToolCall({
+        sessionKey,
+        callerMember: "coordinator",
+        tool: "read_board",
+        args: { limit: 20 },
+      })) as { head_seq?: number };
+      const headBefore = boardState.head_seq ?? 2;
+      const loc = rt.getActiveSwarmLocation(sessionKey)!;
+      const workerABefore = runCalls.filter((n) => n === "worker-a").length;
+      const bystanderBefore = runCalls.filter((n) => n === "bystander").length;
+
+      // Park bystander waiting only for its own mentions
+      const bystanderWait = rt.handleToolCall({
+        sessionKey,
+        callerMember: "bystander",
+        tool: "swarm_wait",
+        args: { since: headBefore, mentions_only: true, timeout_ms: 5_000 },
+      });
+      await new Promise((r) => setTimeout(r, 30));
+
+      const fencedRes = await injectSwarmDirective({
+        brainDir: loc.brainDir,
+        conversationId: loc.swarmId,
+        target: "worker-a",
+        message: "```sh\necho @all\n```",
+        wakeTarget: (ctx) => {
+          const out = rt.onExternalBoardWrite(sessionKey, { seq: ctx.seq, target: ctx.target });
+          return out.woke ? { status: "woken" } : { status: "board_only_unwoken" };
+        },
+      });
+      assert.equal(fencedRes.ok, true);
+      if (fencedRes.ok) {
+        assert.equal(fencedRes.text, "@worker-a\n```sh\necho @all\n```");
+        assert.deepEqual(fencedRes.mentions, ["worker-a"], "fenced @all must NOT leak into mentions");
+        assert.equal(fencedRes.wakeDelivery, "woken");
+      }
+
+      const tildeRes = await injectSwarmDirective({
+        brainDir: loc.brainDir,
+        conversationId: loc.swarmId,
+        target: "worker-a",
+        message: "~~~bash\necho @all\n~~~",
+      });
+      assert.equal(tildeRes.ok, true);
+      if (tildeRes.ok) {
+        assert.equal(tildeRes.text, "@worker-a\n~~~bash\necho @all\n~~~");
+        assert.deepEqual(tildeRes.mentions, ["worker-a"]);
+      }
+
+      const raceResult = await Promise.race([
+        bystanderWait.then((res) => ({ kind: "resolved" as const, res })),
+        new Promise<{ kind: "still_parked" }>((r) => setTimeout(() => r({ kind: "still_parked" }), 120)),
+      ]);
+      assert.equal(raceResult.kind, "still_parked", "bystander waiting mentions_only must NOT be woken by fenced @all");
+      assert.ok(
+        runCalls.filter((n) => n === "worker-a").length > workerABefore,
+        "targeted worker-a should still be woken by the fenced steer",
+      );
+      assert.equal(
+        runCalls.filter((n) => n === "bystander").length,
+        bystanderBefore,
+        "bystander must NOT execute a new turn from fenced @all",
+      );
+    } finally {
+      await rt.shutdownAll();
+      rmSync(agyRoot, { recursive: true, force: true });
+      rmSync(wsDir, { recursive: true, force: true });
+    }
   });
 });

@@ -44,6 +44,8 @@ export interface SwarmMemberSnapshot {
   toolCalls?: number
   /** True when telemetry scanning still has unread backlog or hit its per-file budget/line cap. */
   telemetryPartial?: boolean
+  /** True when current-epoch liveness/background-task transcript evidence is incomplete (blocks stall-exhausted auto-kill). */
+  livenessEvidencePartial?: boolean
 }
 
 export interface SwarmChannelSnapshot {
@@ -85,17 +87,116 @@ export interface SwarmSnapshot {
 }
 
 /** Extract `@name`, `@all`, and `@#channel` mentions matching Antigravity board rules. */
-const MENTION_RE = /(?:^|[^A-Za-z0-9_#-])@(#?[A-Za-z0-9][A-Za-z0-9._-]{0,63})(?![A-Za-z0-9._-])/g
+const MENTION_RE = /(?:^|[^A-Za-z0-9_.+#-])@(#?[A-Za-z0-9][A-Za-z0-9._-]{0,63})(?![A-Za-z0-9._/-])/g
+
+function matchSwarmFenceOpen(line: string): { ch: string; len: number } | null {
+  let i = 0
+  while (i < line.length && (line[i] === ' ' || line[i] === '\t' || line[i] === '>')) i += 1
+  const ch = line[i]
+  if (ch !== '`' && ch !== '~') return null
+  let len = 0
+  while (i + len < line.length && line[i + len] === ch) len += 1
+  if (len < 3) return null
+  if (ch === '`' && line.indexOf('`', i + len) !== -1) return null
+  return { ch, len }
+}
+
+function isSwarmFenceClose(line: string, ch: string, minLen: number): boolean {
+  let i = 0
+  while (i < line.length && (line[i] === ' ' || line[i] === '\t' || line[i] === '>')) i += 1
+  let len = 0
+  while (i + len < line.length && line[i + len] === ch) len += 1
+  if (len < minLen) return false
+  for (let j = i + len; j < line.length; j += 1) {
+    if (line[j] !== ' ' && line[j] !== '\t' && line[j] !== '\r') return false
+  }
+  return true
+}
+
+function stripInlineCodeInParagraph(para: string): string {
+  if (para.indexOf('`') === -1) return para
+  const runs: Array<{ start: number; len: number }> = []
+  const byLen = new Map<number, number[]>()
+  for (let i = 0; i < para.length; ) {
+    if (para[i] !== '`') {
+      i += 1
+      continue
+    }
+    let len = 1
+    while (i + len < para.length && para[i + len] === '`') len += 1
+    const idx = runs.length
+    runs.push({ start: i, len })
+    const bucket = byLen.get(len)
+    if (bucket) bucket.push(idx)
+    else byLen.set(len, [idx])
+    i += len
+  }
+  const ptrByLen = new Map<number, number>()
+  let out = ''
+  let textPos = 0
+  for (let r = 0; r < runs.length; ) {
+    const open = runs[r]!
+    const bucket = byLen.get(open.len)!
+    let ptr = ptrByLen.get(open.len) ?? 0
+    while (ptr < bucket.length && bucket[ptr]! <= r) ptr += 1
+    ptrByLen.set(open.len, ptr)
+    if (ptr < bucket.length) {
+      const close = runs[bucket[ptr]!]!
+      out += `${para.slice(textPos, open.start)} `
+      textPos = close.start + close.len
+      ptrByLen.set(open.len, ptr + 1)
+      r = bucket[ptr]! + 1
+    } else {
+      r += 1
+    }
+  }
+  return textPos === 0 ? para : out + para.slice(textPos)
+}
+
+function stripSwarmMarkdownCode(text: string): string {
+  if (text.indexOf('`') === -1 && text.indexOf('~') === -1) return text
+  const lines = text.split('\n')
+  const kept: string[] = []
+  let paraLines: string[] = []
+  let fence: { ch: string; len: number } | null = null
+  const flushPara = () => {
+    if (paraLines.length === 0) return
+    kept.push(stripInlineCodeInParagraph(paraLines.join('\n')))
+    paraLines = []
+  }
+  for (const line of lines) {
+    if (fence) {
+      if (isSwarmFenceClose(line, fence.ch, fence.len)) fence = null
+      continue
+    }
+    const opened = matchSwarmFenceOpen(line)
+    if (opened) {
+      flushPara()
+      kept.push('')
+      fence = opened
+      continue
+    }
+    if (line.trim().length === 0) {
+      flushPara()
+      kept.push('')
+      continue
+    }
+    paraLines.push(line)
+  }
+  flushPara()
+  return kept.join('\n')
+}
 
 export function extractSwarmMentions(text: string): string[] {
   if (!text) return []
+  const cleaned = stripSwarmMarkdownCode(text)
   const seen = new Set<string>()
   const out: string[] = []
   MENTION_RE.lastIndex = 0
   let match: RegExpExecArray | null
-  while ((match = MENTION_RE.exec(text)) !== null) {
-    const raw = match[1]?.toLowerCase()
-    if (!raw || seen.has(raw)) continue
+  while ((match = MENTION_RE.exec(cleaned)) !== null) {
+    const raw = match[1]?.replace(/\.+$/, '').toLowerCase()
+    if (!raw || raw === '#' || seen.has(raw)) continue
     seen.add(raw)
     out.push(raw)
   }

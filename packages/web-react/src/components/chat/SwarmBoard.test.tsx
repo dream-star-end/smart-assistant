@@ -8,9 +8,15 @@ import { applyOutboundMessage } from "../../lib/chat/reducer";
 import { isInteractiveToolMessage } from "./ProcessDisclosure";
 import { PinnedSwarmDock } from "./PinnedSwarmDock";
 import { SwarmBoardDrawer } from "./SwarmBoardDrawer";
+import { hasRichMarkdown, linkifySwarmMarkdownTokens } from "./SwarmBoardRows";
 import { SwarmInlineCard } from "./SwarmInlineCard";
 import { isAntigravityModelForUi } from "./swarmDetect";
-import { extractSwarmSnapshotFromMessage, humanizeSwarmModel, latestSwarmSnapshot } from "./swarmUtils";
+import {
+  extractSwarmSnapshotFromMessage,
+  humanizeSwarmModel,
+  latestSwarmSnapshot,
+  tokenizeSwarmInlineText,
+} from "./swarmUtils";
 
 afterEach(cleanup);
 
@@ -892,5 +898,48 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     expect(humanizeSwarmModel("claude-opus-5-5-high")).toBe("Claude Opus 5.5 · High");
     expect(humanizeSwarmModel("claude-sonnet-5-5-low")).toBe("Claude Sonnet 5.5 · Low");
     expect(humanizeSwarmModel("gpt-oss-120b-medium")).toBe("GPT-OSS 120B");
+  });
+
+  it("OCV5-932 Defect #3A: tokenizeSwarmInlineText and board views do not mis-tokenize @scope/pkg or inline code as mentions", () => {
+    const tokens = tokenizeSwarmInlineText(
+      "请 @b1-integrator 核对 @openclaude/protocol、`@worker`、a.b@example.com 与 #48 @#parser\n~~~sh\necho @bystander @all\n~~~\n```ts\nconst x = '@ghost'\n```",
+    );
+    const mentions = tokens.filter((t) => t.kind === "mention");
+    const channels = tokens.filter((t) => t.kind === "channel_mention");
+    const seqs = tokens.filter((t) => t.kind === "seq");
+    expect(mentions).toEqual([{ kind: "mention", value: "@b1-integrator", target: "b1-integrator" }]);
+    expect(channels).toEqual([{ kind: "channel_mention", value: "@#parser", channel: "parser" }]);
+    expect(seqs).toEqual([{ kind: "seq", value: "#48", seq: 48 }]);
+
+    const snap = makeSnapshot({
+      posts: [
+        {
+          seq: 48,
+          agent: "parser",
+          channel: "main",
+          text: "@b1-integrator 已对齐 `@openclaude/protocol` 与 @sinclair/typebox 导出",
+          mentions: ["b1-integrator"],
+        },
+      ],
+      totalPosts: 1,
+    });
+    render(
+      <div>
+        <SwarmInlineCard snapshot={snap} cardId="m-48" blockId="b-48" onOpenBoard={vi.fn()} />
+        <SwarmBoardDrawer open onOpenChange={vi.fn()} snapshot={snap} />
+      </div>,
+    );
+    expect(screen.queryByRole("button", { name: "@openclaude" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "@sinclair" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "@openclaude" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "@sinclair" })).toBeNull();
+
+    // R2 P2-2: rich-text Markdown linkifier preserves tilde fence containing backticks + @worker and linkifies @real outside
+    const tildeFenceMd = "~~~sh\n`pwd`\necho @worker\n~~~\n@real";
+    expect(hasRichMarkdown(tildeFenceMd)).toBe(true);
+    const linked = linkifySwarmMarkdownTokens(tildeFenceMd);
+    expect(linked).toContain("~~~sh\n`pwd`\necho @worker\n~~~");
+    expect(linked).not.toContain("#swarm-mention:worker");
+    expect(linked).toContain("[@real](#swarm-mention:real)");
   });
 });

@@ -445,6 +445,48 @@ export function summarizeSwarmCounts(members: readonly SwarmMemberSnapshot[]): {
   };
 }
 
+function isAuxiliarySwarmPost(post: SwarmBoardPost, members: readonly SwarmMemberSnapshot[]): boolean {
+  const agentLower = post.agent.trim().toLowerCase();
+  if (agentLower === "gateway-monitor" || /^monitor(?:-\d+)?$/.test(agentLower)) {
+    return true;
+  }
+  if (post.text.trimStart().startsWith("[stall]")) return true;
+  const member = members.find((m) => m.name.toLowerCase() === agentLower);
+  return member?.role === "monitor" || member?.role === "narrator";
+}
+
+/**
+ * 格式化底部 LiveAgentCapsule 的蜂群运行态摘要，严格区分「正在运行的核心成员」与「待命时最新发言者」，
+ * 杜绝将刚发完预警帖的 `gateway-monitor` 拼接在 `运行中` 后造成误导（OCV5-932 Defect #4）。
+ */
+export function formatSwarmCapsuleDetail(snapshot: SwarmSnapshot): string {
+  if (!isSwarmActive(snapshot.phase)) {
+    return swarmPhaseMeta(snapshot.phase).label;
+  }
+  const allWorking = snapshot.members.filter((m) => m.status === "working");
+  const coreWorking = allWorking.filter((m) => m.role !== "monitor" && m.role !== "narrator");
+  const activeWorking = coreWorking.length > 0 ? coreWorking : allWorking;
+  if (activeWorking.length === 1) {
+    return `1 运行中：${activeWorking[0]!.name}`;
+  }
+  if (activeWorking.length > 1) {
+    const names = activeWorking
+      .slice(0, 2)
+      .map((m) => m.name)
+      .join("、");
+    return `${activeWorking.length} 运行中：${names}${activeWorking.length > 2 ? " 等" : ""}`;
+  }
+  const counts = summarizeSwarmCounts(snapshot.members);
+  if (counts.live === 0) {
+    return swarmPhaseMeta(snapshot.phase).label;
+  }
+  const latestPost = snapshot.posts[snapshot.posts.length - 1] ?? null;
+  if (latestPost && !isAuxiliarySwarmPost(latestPost, snapshot.members)) {
+    return `${counts.live} 成员待命 · 最新 ${latestPost.agent}`;
+  }
+  return `${counts.live} 成员待命`;
+}
+
 export function postMatchesMember(post: SwarmBoardPost, memberName: string): boolean {
   const target = memberName.toLowerCase();
   if (post.agent.toLowerCase() === target) return true;
@@ -463,8 +505,104 @@ export type SwarmTextToken =
 
 const TOKEN_RE = /(@#[A-Za-z0-9][A-Za-z0-9._-]{0,63}|@[A-Za-z0-9][A-Za-z0-9._-]{0,63}|#\d{1,5})\b/g;
 
+function matchFenceOpenLine(line: string): { ch: string; len: number } | null {
+  let i = 0;
+  while (i < line.length && (line[i] === " " || line[i] === "\t" || line[i] === ">")) i += 1;
+  const ch = line[i];
+  if (ch !== "`" && ch !== "~") return null;
+  let len = 0;
+  while (i + len < line.length && line[i + len] === ch) len += 1;
+  if (len < 3) return null;
+  if (ch === "`" && line.indexOf("`", i + len) !== -1) return null;
+  return { ch, len };
+}
+
+function isFenceCloseLine(line: string, ch: string, minLen: number): boolean {
+  let i = 0;
+  while (i < line.length && (line[i] === " " || line[i] === "\t" || line[i] === ">")) i += 1;
+  let len = 0;
+  while (i + len < line.length && line[i + len] === ch) len += 1;
+  if (len < minLen) return false;
+  for (let j = i + len; j < line.length; j += 1) {
+    if (line[j] !== " " && line[j] !== "\t" && line[j] !== "\r") return false;
+  }
+  return true;
+}
+
+function collectInlineRangesInSlice(text: string, sliceStart: number, sliceEnd: number, out: Array<readonly [number, number]>): void {
+  const runs: Array<{ start: number; len: number }> = [];
+  const byLen = new Map<number, number[]>();
+  for (let i = sliceStart; i < sliceEnd; ) {
+    if (text[i] !== "`") {
+      i += 1;
+      continue;
+    }
+    let len = 1;
+    while (i + len < sliceEnd && text[i + len] === "`") len += 1;
+    const idx = runs.length;
+    runs.push({ start: i, len });
+    const bucket = byLen.get(len);
+    if (bucket) bucket.push(idx);
+    else byLen.set(len, [idx]);
+    i += len;
+  }
+  const ptrByLen = new Map<number, number>();
+  for (let r = 0; r < runs.length; ) {
+    const open = runs[r]!;
+    const bucket = byLen.get(open.len)!;
+    let ptr = ptrByLen.get(open.len) ?? 0;
+    while (ptr < bucket.length && bucket[ptr]! <= r) ptr += 1;
+    ptrByLen.set(open.len, ptr);
+    if (ptr < bucket.length) {
+      const close = runs[bucket[ptr]!]!;
+      out.push([open.start, close.start + close.len]);
+      ptrByLen.set(open.len, ptr + 1);
+      r = bucket[ptr]! + 1;
+    } else {
+      r += 1;
+    }
+  }
+}
+
+export function collectSwarmCodeRanges(text: string): Array<readonly [number, number]> {
+  if (text.indexOf("`") === -1 && text.indexOf("~") === -1) return [];
+  const ranges: Array<readonly [number, number]> = [];
+  let fence: { ch: string; len: number; start: number } | null = null;
+  let plainStart = 0;
+  let lineStart = 0;
+  while (lineStart <= text.length) {
+    const nl = text.indexOf("\n", lineStart);
+    const lineEnd = nl >= 0 ? nl : text.length;
+    const nextStart = nl >= 0 ? nl + 1 : text.length + 1;
+    const line = text.slice(lineStart, lineEnd);
+    if (fence) {
+      if (isFenceCloseLine(line, fence.ch, fence.len)) {
+        ranges.push([fence.start, Math.min(text.length, nextStart)]);
+        fence = null;
+        plainStart = Math.min(text.length, nextStart);
+      }
+    } else {
+      const opened = matchFenceOpenLine(line);
+      if (opened) {
+        if (lineStart > plainStart) collectInlineRangesInSlice(text, plainStart, lineStart, ranges);
+        fence = { ch: opened.ch, len: opened.len, start: lineStart };
+      }
+    }
+    if (nl < 0) break;
+    lineStart = nextStart;
+  }
+  if (fence) {
+    ranges.push([fence.start, text.length]);
+  } else if (plainStart < text.length) {
+    collectInlineRangesInSlice(text, plainStart, text.length, ranges);
+  }
+  return ranges;
+}
+
 export function tokenizeSwarmInlineText(text: string): SwarmTextToken[] {
   if (!text) return [];
+  const codeRanges = collectSwarmCodeRanges(text);
+  let rangeIdx = 0;
   const out: SwarmTextToken[] = [];
   let lastIndex = 0;
   TOKEN_RE.lastIndex = 0;
@@ -472,9 +610,13 @@ export function tokenizeSwarmInlineText(text: string): SwarmTextToken[] {
   while ((match = TOKEN_RE.exec(text)) !== null) {
     const start = match.index;
     const raw = match[1]!;
-    // Only treat as token at start of line or after non-word char (avoid emails).
+    while (rangeIdx < codeRanges.length && codeRanges[rangeIdx]![1] <= start) rangeIdx += 1;
+    if (rangeIdx < codeRanges.length && start >= codeRanges[rangeIdx]![0]) continue;
+    // Only treat as token at start of line or after non-word char (avoid emails & scoped paths).
     const prevChar = start > 0 ? text[start - 1]! : "";
-    if (prevChar && /[A-Za-z0-9_.-]/.test(prevChar)) continue;
+    if (prevChar && /[A-Za-z0-9_.+-]/.test(prevChar)) continue;
+    const nextChar = text[start + raw.length] ?? "";
+    if (raw.startsWith("@") && nextChar === "/") continue;
     if (start > lastIndex) {
       out.push({ kind: "text", value: text.slice(lastIndex, start) });
     }

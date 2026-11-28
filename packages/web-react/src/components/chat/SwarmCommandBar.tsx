@@ -11,7 +11,12 @@ import type { SwarmBoardPost, SwarmMemberSnapshot } from "@openclaude/protocol/b
 import { AlertTriangle, Check, ChevronDown, Lock, OctagonX, Quote, Send, ShieldAlert } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useState } from "react";
 import { apiErrorMessage } from "../../lib/api";
-import { requestSwarmTerminate, sendSwarmSteer } from "../../lib/api/wave4Api";
+import {
+  type SwarmSteerSuccess,
+  type SwarmTerminateSuccess,
+  requestSwarmTerminate,
+  sendSwarmSteer,
+} from "../../lib/api/wave4Api";
 import type { AuthSession } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import {
@@ -21,8 +26,39 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
   Spinner,
+  type ToastTone,
   useToast,
 } from "../ui";
+
+export function formatSwarmSteerToast(res: SwarmSteerSuccess): { message: string; tone: ToastTone } {
+  if (res.wakeDelivery === "board_only_unwoken") {
+    return {
+      message: `已写入讨论板（#${res.seq}），未即时唤醒目标成员（将在其下次读板时可见）`,
+      tone: "info",
+    };
+  }
+  return {
+    message: `已向 @${res.target} 发送指令（#${res.seq}）`,
+    tone: "success",
+  };
+}
+
+export function formatSwarmTerminateToast(res: SwarmTerminateSuccess): { message: string; tone: ToastTone } {
+  if (res.status === "confirmed") {
+    return { message: `已停止 @${res.memberName}`, tone: "success" };
+  }
+  if (res.status === "already_killed") {
+    return { message: `@${res.memberName} 已停止`, tone: "info" };
+  }
+  if (res.wakeDelivery === "board_only_unwoken") {
+    const seqSuffix = typeof res.noticeSeq === "number" ? `（#${res.noticeSeq}）` : "";
+    return {
+      message: `已写入停止 @${res.memberName} 请求${seqSuffix}，未即时唤醒协调者（将在其下次读板时可见）`,
+      tone: "info",
+    };
+  }
+  return { message: `已请求停止 @${res.memberName}`, tone: "info" };
+}
 
 export type SwarmCommandBarProps = {
   sessionId?: string | null;
@@ -146,7 +182,8 @@ export function SwarmCommandBar({
         time: res.time || new Date().toISOString(),
         mentions: res.mentions?.length ? res.mentions : [res.target],
       });
-      toast(`已向 @${res.target} 发送指令（#${res.seq}）`, "success");
+      const feedback = formatSwarmSteerToast(res);
+      toast(feedback.message, feedback.tone);
     } catch (err: unknown) {
       toast(apiErrorMessage(err, "发送指令失败，请稍后重试"), "error");
     } finally {
@@ -164,13 +201,8 @@ export function SwarmCommandBar({
       });
       setConfirmKill(false);
       setKillReason("");
-      if (res.status === "confirmed") {
-        toast(`已停止 @${res.memberName}`, "success");
-      } else if (res.status === "already_killed") {
-        toast(`@${res.memberName} 已停止`, "info");
-      } else {
-        toast(`已请求停止 @${res.memberName}`, "info");
-      }
+      const feedback = formatSwarmTerminateToast(res);
+      toast(feedback.message, feedback.tone);
     } catch (err: unknown) {
       toast(apiErrorMessage(err, "停止成员失败，请稍后重试"), "error");
     } finally {

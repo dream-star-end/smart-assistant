@@ -28,13 +28,17 @@ import {
   type SwarmSnapshot,
 } from '@openclaude/protocol'
 import {
+  analyzeBackgroundTasksInSteps,
   buildDurableSwarmBoardInput,
   compactSwarmSnapshotForPersistence,
   describeToolActivity,
   findActiveNonBoardToolInTurn,
+  findTurnStartIndex,
   formatSwarmWorkingDetail,
+  mergeBackgroundTaskStates,
   normalizeSwarmToolName,
   settleSwarmSnapshotTerminal,
+  type BackgroundTaskTelemetrySummary,
   type DurableSwarmBoardInput,
 } from './antigravitySwarmFormat.js'
 import {
@@ -80,32 +84,14 @@ export const SWARM_FULL_KEYFRAME_INTERVAL_EMITS = 120
 export const SWARM_FULL_KEYFRAME_INTERVAL_MS = 300_000
 
 interface RawRosterMember {
-  conversation_id?: unknown
-  model?: unknown
-  role?: unknown
-  phase?: unknown
-  wake_mode?: unknown
-  wait_since?: unknown
-  last_read_seq?: unknown
-  killed?: unknown
-  channels?: unknown
-  workspace?: unknown
-  workspace_mode?: unknown
-  desired_state?: unknown
-  desired_model?: unknown
-  applied_model?: unknown
-  last_nudged_seq?: unknown
-  last_park_blocked_seq?: unknown
-  added_by?: unknown
-  runtime?: unknown
+  conversation_id?: unknown; model?: unknown; role?: unknown; phase?: unknown
+  wake_mode?: unknown; wait_since?: unknown; last_read_seq?: unknown; killed?: unknown
+  channels?: unknown; workspace?: unknown; workspace_mode?: unknown; desired_state?: unknown
+  desired_model?: unknown; applied_model?: unknown; last_nudged_seq?: unknown
+  last_park_blocked_seq?: unknown; added_by?: unknown; runtime?: unknown
 }
 
-interface RawRoster {
-  title?: unknown
-  runtime?: unknown
-  members?: unknown
-  channels?: unknown
-}
+interface RawRoster { title?: unknown; runtime?: unknown; members?: unknown; channels?: unknown }
 
 interface TranscriptSummary {
   stepCount: number
@@ -113,6 +99,7 @@ interface TranscriptSummary {
   activity?: string
   waitingOnBoard?: boolean
   hasActiveNonWaitTool?: boolean
+  incompleteBgEvidence?: boolean
   failed?: boolean
   lastError?: string
   firstStepAt?: number
@@ -191,15 +178,12 @@ function buildErrorTranscriptSummary(
  * status, step count, current activity, error state, and lightweight telemetry
  * (mirrors Antigravity CLI `board.StateOf`).
  */
-export function parseMemberTranscriptTail(text: string | null): TranscriptSummary {
+export function parseMemberTranscriptTail(
+  text: string | null,
+  opts?: { incBgTasks?: BackgroundTaskTelemetrySummary; incPartial?: boolean; tailTruncated?: boolean },
+): TranscriptSummary {
   const empty: TranscriptSummary = {
-    stepCount: 0,
-    status: null,
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadTokens: 0,
-    thinkingTokens: 0,
-    toolCalls: 0,
+    stepCount: 0, status: null, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, thinkingTokens: 0, toolCalls: 0,
   }
   if (!text) return empty
   const lines = text.split('\n').filter((l) => l.trim().length > 0)
@@ -240,7 +224,11 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
     thinkingTokens += tel.thinkingTokens
     toolCalls += tel.toolCalls
   }
-  const telBase = {
+  const bgTasks = analyzeBackgroundTasksInSteps(steps, { truncatedStart: opts?.tailTruncated })
+  const mergedBg = mergeBackgroundTaskStates(bgTasks, opts?.incBgTasks, {
+    tailTruncated: opts?.tailTruncated,
+  })
+  const telBase: Omit<TranscriptSummary, 'stepCount' | 'status'> = {
     ...(firstStepAt !== undefined ? { firstStepAt } : {}),
     ...(lastActiveAt !== undefined ? { lastActiveAt } : {}),
     inputTokens,
@@ -248,16 +236,9 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
     cacheReadTokens,
     thinkingTokens,
     toolCalls,
+    ...(mergedBg.incompleteEvidence ? { incompleteBgEvidence: true } : {}),
   }
-
-  let turnStart = 0
-  for (let i = steps.length - 1; i >= 0; i -= 1) {
-    const t = asStr(steps[i]?.type).toUpperCase()
-    if (t === 'USER_INPUT' || t === 'SYSTEM_MESSAGE') {
-      turnStart = i
-      break
-    }
-  }
+  const turnStart = findTurnStartIndex(steps, bgTasks)
   const turnSteps = steps.slice(turnStart)
   const last = turnSteps[turnSteps.length - 1]!
   const lastType = asStr(last.type).toUpperCase()
@@ -266,13 +247,23 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
   if (lastType === 'ERROR_MESSAGE') return buildErrorTranscriptSummary(telBase, maxStepIndex, last)
 
   const { lastPlanner, lastPlannerIdx, lastPlannerCalls } = findLastPlannerInTurn(turnSteps)
-  const activeNonBoardTool = findActiveNonBoardToolInTurn(turnSteps, lastPlannerIdx, lastPlannerCalls)
+  const activeNonBoardTool = findActiveNonBoardToolInTurn(turnSteps, lastPlannerIdx, lastPlannerCalls, bgTasks)
   if (activeNonBoardTool) {
     return {
       ...telBase,
       stepCount: maxStepIndex,
       status: 'working',
       activity: describeToolActivity(activeNonBoardTool.name, activeNonBoardTool.args),
+      waitingOnBoard: false,
+      hasActiveNonWaitTool: true,
+    }
+  }
+  if (mergedBg.activeIds.size > 0 || mergedBg.overflowed) {
+    return {
+      ...telBase,
+      stepCount: maxStepIndex,
+      status: 'working',
+      activity: '后台运行命令',
       waitingOnBoard: false,
       hasActiveNonWaitTool: true,
     }
@@ -296,7 +287,7 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
         return {
           ...telBase,
           stepCount: maxStepIndex,
-          status: lastStatus === 'DONE' ? 'waiting' : 'working',
+          status: 'waiting',
           activity: '等待讨论板消息',
           waitingOnBoard: true,
         }
@@ -347,7 +338,7 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
     return {
       ...telBase,
       stepCount: maxStepIndex,
-      status: isSwarmWait && lastStatus === 'DONE' ? 'waiting' : 'working',
+      status: isSwarmWait ? 'waiting' : 'working',
       activity: describeToolActivity(directTool, recordOf(last.arguments ?? last.args)),
       ...(isSwarmWait ? { waitingOnBoard: true } : {}),
     }
@@ -357,7 +348,7 @@ export function parseMemberTranscriptTail(text: string | null): TranscriptSummar
       return {
         ...telBase,
         stepCount: maxStepIndex,
-        status: lastStatus === 'DONE' ? 'waiting' : 'working',
+        status: 'waiting',
         activity: '等待讨论板消息',
         waitingOnBoard: true,
       }
@@ -587,6 +578,7 @@ interface LoadedMemberData {
   name: string
   member: RawRosterMember
   transcriptText: string | null
+  tailTruncated?: boolean
   incTelemetry: MemberTelemetrySnapshot | null
 }
 
@@ -602,11 +594,15 @@ function resolveActiveMemberStatus(
     if (rawPhase === 'RUNNING') return transcript.failed ? 'waiting' : 'working'
     return transcript.status ?? defaultStatus
   }
-  if (wakeModeLower === 'mentions' || wakeModeLower === 'all') return 'waiting'
-  if (wakeModeLower === 'working' || (!wakeMode && rawPhase === 'RUNNING')) {
-    return transcript.failed ? 'waiting' : 'working'
+  if (transcript.failed) return 'waiting'
+  if (transcript.status !== null) return transcript.status
+  if (wakeModeLower === 'mentions' || wakeModeLower === 'all' || wakeModeLower === 'anything') {
+    return 'waiting'
   }
-  return transcript.status ?? defaultStatus
+  if (wakeModeLower === 'working' || (!wakeMode && rawPhase === 'RUNNING')) {
+    return 'working'
+  }
+  return defaultStatus
 }
 
 function resolveMemberStatusFromRoster(
@@ -670,9 +666,13 @@ function buildSwarmSnapshotFromLoadedData(
   const memberCountByChannel = new Map<string, number>()
   const members: SwarmMemberSnapshot[] = []
 
-  for (const { name, member: m, transcriptText, incTelemetry } of loadedMembers) {
+  for (const { name, member: m, transcriptText, tailTruncated, incTelemetry } of loadedMembers) {
     const killed = m.killed === true
-    const transcript = parseMemberTranscriptTail(transcriptText)
+    const transcript = parseMemberTranscriptTail(transcriptText, {
+      incBgTasks: incTelemetry?.bgTasks,
+      incPartial: incTelemetry?.partial === true,
+      tailTruncated,
+    })
     const wakeMode = asStr(m.wake_mode) || undefined
     const wakeModeLower = wakeMode?.toLowerCase()
     const rawPhase = asStr(m.phase).toUpperCase()
@@ -688,13 +688,15 @@ function buildSwarmSnapshotFromLoadedData(
 
     const firstStepAt = incTelemetry?.firstStepAt ?? transcript.firstStepAt
     const lastActiveAt = incTelemetry?.lastActiveAt ?? transcript.lastActiveAt
-    // When incremental cache is active, use its monotonic byte-0..offset counts directly (never Math.max with tail).
     const inputTokens = incTelemetry ? incTelemetry.inputTokens : transcript.inputTokens
     const outputTokens = incTelemetry ? incTelemetry.outputTokens : transcript.outputTokens
     const cacheReadTokens = incTelemetry ? incTelemetry.cacheReadTokens : transcript.cacheReadTokens
     const thinkingTokens = incTelemetry ? incTelemetry.thinkingTokens : transcript.thinkingTokens
     const toolCalls = incTelemetry ? incTelemetry.toolCalls : transcript.toolCalls
-    const telemetryPartial = incTelemetry?.partial === true
+    const telemetryPartial =
+      incTelemetry?.partial === true ||
+      (!incTelemetry && tailTruncated === true)
+    const livenessEvidencePartial = transcript.incompleteBgEvidence === true
     const snapshotNow = opts.now ?? Date.now()
     let elapsedMs: number | undefined
     if (firstStepAt !== undefined) {
@@ -747,6 +749,11 @@ function buildSwarmSnapshotFromLoadedData(
       ...(thinkingTokens > 0 ? { thinkingTokens } : {}),
       ...(toolCalls > 0 ? { toolCalls } : {}),
       ...(telemetryPartial ? { telemetryPartial: true } : {}),
+      ...(livenessEvidencePartial
+        ? { livenessEvidencePartial: true }
+        : telemetryPartial
+          ? { livenessEvidencePartial: false }
+          : {}),
     })
   }
 
@@ -846,19 +853,20 @@ export function readAntigravitySwarmSnapshot(opts: {
     const memberConvId = asStr(m.conversation_id)
     const validConvId = Boolean(memberConvId && CONVERSATION_ID_RE.test(memberConvId))
     if (validConvId) opts.outMemberConvIds?.push(memberConvId)
+    let tailTruncated = false
     const transcriptText = validConvId
       ? readBoundedFileWithinRoot(
           opts.brainDir,
           [memberConvId, '.system_generated', 'logs', 'transcript.jsonl'],
           TRANSCRIPT_TAIL_BYTES,
-          { maxAdaptiveBytes: TRANSCRIPT_TAIL_ADAPTIVE_MAX_BYTES },
+          { maxAdaptiveBytes: TRANSCRIPT_TAIL_ADAPTIVE_MAX_BYTES, onTruncated: () => { tailTruncated = true } },
         )
       : null
     const incTelemetry =
       opts.telemetryCache && validConvId
         ? opts.telemetryCache.scan(opts.brainDir, memberConvId, { drainAll: opts.drainTelemetry })
         : null
-    loadedMembers.push({ name, member: m, transcriptText, incTelemetry })
+    loadedMembers.push({ name, member: m, transcriptText, tailTruncated, incTelemetry })
   }
   return buildSwarmSnapshotFromLoadedData(opts, roster, boardRaw, loadedMembers)
 }
@@ -906,20 +914,21 @@ async function readAntigravitySwarmSnapshotAsync(opts: {
         const memberConvId = asStr(m.conversation_id)
         const validConvId = Boolean(memberConvId && CONVERSATION_ID_RE.test(memberConvId))
         if (validConvId) opts.outMemberConvIds?.push(memberConvId)
+        let tailTruncated = false
         const [transcriptText, incTelemetry] = validConvId
           ? await Promise.all([
               readBoundedFileWithinRootAsync(
                 opts.brainDir,
                 [memberConvId, '.system_generated', 'logs', 'transcript.jsonl'],
                 TRANSCRIPT_TAIL_BYTES,
-                { maxAdaptiveBytes: TRANSCRIPT_TAIL_ADAPTIVE_MAX_BYTES },
+                { maxAdaptiveBytes: TRANSCRIPT_TAIL_ADAPTIVE_MAX_BYTES, onTruncated: () => { tailTruncated = true } },
               ),
               opts.telemetryCache
                 ? opts.telemetryCache.scanAsync(opts.brainDir, memberConvId, { drainAll: opts.drainTelemetry })
                 : Promise.resolve(null),
             ])
           : [null, null]
-        return { name, member: m, transcriptText, incTelemetry }
+        return { name, member: m, transcriptText, tailTruncated, incTelemetry }
       }),
     ),
   ])
@@ -946,6 +955,7 @@ function stripActivationVolatileMemberFields(m: SwarmMemberSnapshot) {
     thinkingTokens: _tt,
     toolCalls: _tc,
     telemetryPartial: _tp,
+    livenessEvidencePartial: _lep,
     ...rest
   } = m
   return rest

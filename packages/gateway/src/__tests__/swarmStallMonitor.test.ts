@@ -21,11 +21,13 @@ import {
   GATEWAY_STALL_MONITOR_AGENT,
   SwarmStallMonitor,
   isMemberEffectivelyWaiting,
+  isProgressUpdatePost,
   isSwarmMonitorAgentName,
   type SwarmStallAlert,
   type SwarmStallDiagnosticEvent,
   type SwarmStallExhaustion,
 } from '../engine/swarmStallMonitor.js'
+import { findPeerHandoffs } from '../engine/swarmStallBoard.js'
 import { injectSwarmDirective } from '../swarmCommand.js'
 
 const CONV_ID = '11111111-2222-3333-4444-555555555555'
@@ -1011,7 +1013,7 @@ test('OCV5-916: native peer handoff survives parked planner tails and monitor po
     assert.equal(mon.evaluate(read(ready), 20_000), null)
     const snap = read(accepted)
     const verifier = snap.members.find((m) => m.role === 'verifier')!
-    assert.equal(verifier.status, 'working')
+    assert.equal(verifier.status, 'waiting', 'OCV5-932: transcript DONE/no-tools takes precedence over stale wake_mode=working')
     assert.equal(verifier.waitingOnBoard, true, 'native DONE/no-tools planner looks parked')
     assert.ok(verifier.toolCalls)
     assert.equal(mon.evaluate(snap, 30_000), null)
@@ -1322,6 +1324,205 @@ test('OCV5-923: AntigravitySwarmWatcher exposes isStallSuppressedAllParked() and
     assert.equal(exhausted.length, 1)
     watcher.stop()
     assert.equal(watcher.isStallSuppressedAllParked(), false)
+  } finally {
+    rmSync(brainDir, { recursive: true, force: true })
+  }
+})
+
+test('OCV5-932 Defect #1A/#1B/#3B: real #48/@openclaude/protocol handoff + [progress] updates + background task-713 prevent false unclaimed_result and false OCV5-923 auto-kill', () => {
+  // 1. isProgressUpdatePost matches [progress] / **[progress]** prefixes and rejects mid-prose
+  assert.equal(isProgressUpdatePost({ seq: 50, agent: 'b1-integrator', text: '[progress] 开始验证', mentions: [] }), true)
+  assert.equal(isProgressUpdatePost({ seq: 54, agent: 'b1-integrator', text: '**[progress]** task-713 运行中', mentions: [] }), true)
+  assert.equal(isProgressUpdatePost({ seq: 56, agent: 'b1-integrator', text: '**[progress]:** 阶段 2/3', mentions: [] }), true)
+  assert.equal(isProgressUpdatePost({ seq: 57, agent: 'b1-integrator', text: '已完成 [progress] 汇总', mentions: [] }), false)
+
+  // 2. End-to-end reproduction of #48 (b1-p0-fe -> @b1-integrator mentioning `@openclaude/protocol`)
+  //    + #50/#54/#56 ([progress] broadcasts from b1-integrator) + background task-713 with wake_mode=mentions
+  const brainDir = mkdtempSync(join(tmpdir(), 'oc-stall-932-e2e-'))
+  try {
+    const feConvId = 'cccccccc-1111-4222-8333-444444444444'
+    const intConvId = '62ae2b5b-1111-4222-8333-555555555555'
+    const taskId713 = `${intConvId}/task-713`
+    const swarmDir = join(brainDir, CONV_ID, '.system_generated', 'swarm')
+    const coordLogs = join(brainDir, CONV_ID, '.system_generated', 'logs')
+    const feLogs = join(brainDir, feConvId, '.system_generated', 'logs')
+    const intLogs = join(brainDir, intConvId, '.system_generated', 'logs')
+    mkdirSync(swarmDir, { recursive: true })
+    mkdirSync(coordLogs, { recursive: true })
+    mkdirSync(feLogs, { recursive: true })
+    mkdirSync(intLogs, { recursive: true })
+
+    writeFileSync(
+      join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'OCV5-932 真实现场复现',
+        members: {
+          coordinator: {
+            conversation_id: CONV_ID,
+            role: 'coordinator',
+            desired_state: 'RUNNING',
+            phase: 'RUNNING',
+            wake_mode: 'mentions',
+            last_read_seq: 1,
+            killed: false,
+          },
+          'b1-p0-fe': {
+            conversation_id: feConvId,
+            role: 'worker',
+            desired_state: 'RUNNING',
+            phase: 'RUNNING',
+            wake_mode: 'mentions',
+            last_read_seq: 48,
+            killed: false,
+          },
+          'b1-integrator': {
+            conversation_id: intConvId,
+            role: 'worker',
+            desired_state: 'RUNNING',
+            phase: 'RUNNING',
+            wake_mode: 'mentions',
+            last_read_seq: 56,
+            killed: false,
+          },
+        },
+      }),
+    )
+
+    writeFileSync(
+      join(swarmDir, 'board.jsonl'),
+      `${[
+        JSON.stringify({ seq: 1, agent: 'coordinator', channel: 'main', text: '@b1-p0-fe 完成后交接给 @b1-integrator' }),
+        JSON.stringify({
+          seq: 48,
+          agent: 'b1-p0-fe',
+          channel: 'main',
+          text: '@b1-integrator 已完成 `@openclaude/protocol` 类型改造，请合入并跑全量验证。',
+        }),
+        JSON.stringify({ seq: 50, agent: 'b1-integrator', channel: 'main', text: '[progress] 已接手 #48，开始合入并跑全量测试' }),
+        JSON.stringify({ seq: 54, agent: 'b1-integrator', channel: 'main', text: '[progress] 构建通过，task-713 全量测试仍在运行' }),
+        JSON.stringify({ seq: 56, agent: 'b1-integrator', channel: 'main', text: '**[progress]** 继续等待 task-713 完成' }),
+      ].join('\n')}\n`,
+    )
+
+    writeFileSync(
+      join(coordLogs, 'transcript.jsonl'),
+      `${[
+        JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', args: { since: 1 } }] }),
+        JSON.stringify({ step_index: 1, type: 'GENERIC', status: 'DONE', content: 'Waiting...' }),
+      ].join('\n')}\n`,
+    )
+    writeFileSync(
+      join(feLogs, 'transcript.jsonl'),
+      `${JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] })}\n`,
+    )
+    const intRunningSteps = [
+      JSON.stringify({ step_index: 0, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[swarm] new board message #48' }),
+      JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm test' } }] }),
+      JSON.stringify({
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Created At: 2026-11-28T16:00:00+08:00\nTool is running as a background task with task id: ${taskId713}\nTask Description: full verify`,
+      }),
+      JSON.stringify({ step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>\nReminder: work efficiently.\n</SYSTEM_MESSAGE>' }),
+      JSON.stringify({ step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'post_message', args: { text: '[progress] 已接手 #48' } }] }),
+      JSON.stringify({ step_index: 5, type: 'GENERIC', status: 'DONE', content: '{"seq":50}' }),
+      JSON.stringify({ step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+      JSON.stringify({
+        step_index: 7,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-28T08:07:00Z sender=${taskId713} priority=MESSAGE_PRIORITY_HIGH content=Background command is still running after 420s:\n</SYSTEM_MESSAGE>`,
+      }),
+      JSON.stringify({ step_index: 8, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+    ]
+    writeFileSync(join(intLogs, 'transcript.jsonl'), `${intRunningSteps.join('\n')}\n`)
+
+    const snapRunning = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: CONV_ID,
+      phase: 'running',
+      revision: 1,
+      now: 10_000,
+    })
+    assert.ok(snapRunning)
+
+    // Verify extractSwarmMentions + findPeerHandoffs recognize #48 -> #50 despite `@openclaude/protocol`
+    const post48 = snapRunning.posts.find((p) => p.seq === 48)!
+    assert.deepEqual(post48.mentions, ['b1-integrator'])
+    const liveWorkers = snapRunning.members.filter((m) => m.role !== 'coordinator')
+    const handoffs = findPeerHandoffs(snapRunning.posts.filter((p) => p.seq > 1), liveWorkers)
+    assert.equal(handoffs.coveredSeqs.has(48), true, 'findPeerHandoffs must cover #48')
+    assert.equal(handoffs.coveredSeqs.has(50), true, 'findPeerHandoffs must cover receipt #50')
+    assert.equal(handoffs.receiptSeq, 50)
+
+    // Verify b1-integrator is classified as working despite wake_mode=mentions + turn-end text reply
+    const integratorRunning = snapRunning.members.find((m) => m.name === 'b1-integrator')!
+    assert.equal(integratorRunning.status, 'working')
+    assert.equal(integratorRunning.waitingOnBoard, false)
+    assert.equal(integratorRunning.activity, '后台运行命令')
+
+    // OCV5-923 protection: healthy long background command NEVER alerts at 3m..30m and NEVER exhausts/auto-kills
+    const exhaustedRunning: SwarmStallExhaustion[] = []
+    const monRunning = new SwarmStallMonitor({ onStallExhausted: (e) => exhaustedRunning.push(e) })
+    assert.equal(monRunning.evaluate(snapRunning, 0), null)
+    assert.equal(monRunning.evaluate(snapRunning, 180_000), null)
+    assert.equal(monRunning.evaluate(snapRunning, 1_800_000), null)
+    assert.equal(monRunning.isStallSuppressedAllParked(), false)
+    const slowReminder = monRunning.evaluate(snapRunning, 2_400_000)
+    assert.equal(slowReminder?.reason, 'working_member_stalled')
+    assert.equal(monRunning.evaluate(snapRunning, 2_940_000)?.reason, 'working_member_stalled')
+    assert.equal(monRunning.evaluate(snapRunning, 3_480_000)?.reason, 'working_member_stalled')
+    assert.equal(monRunning.evaluate(snapRunning, 7_200_000), null)
+    assert.equal(exhaustedRunning.length, 0, 'active background task-713 must NEVER trigger onStallExhausted')
+
+    // Once task-713 finishes and b1-integrator genuinely parks without mentioning coordinator:
+    // #54/#56 [progress] broadcasts must NOT be flagged as unclaimed_result; step 5 idle_waiting fires cleanly!
+    writeFileSync(
+      join(intLogs, 'transcript.jsonl'),
+      `${[
+        ...intRunningSteps,
+        JSON.stringify({
+          step_index: 9,
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-28T08:15:00Z sender=${taskId713} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId713}" finished with result:\nCommand exited with code 0.\n</SYSTEM_MESSAGE>`,
+        }),
+        JSON.stringify({ step_index: 10, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+      ].join('\n')}\n`,
+    )
+    const snapParked = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: CONV_ID,
+      phase: 'running',
+      revision: 2,
+      now: 20_000,
+    })
+    assert.ok(snapParked)
+    assert.equal(snapParked.members.find((m) => m.name === 'b1-integrator')?.status, 'waiting')
+
+    const monParked = new SwarmStallMonitor({ stallThresholdMs: 180_000 })
+    assert.equal(monParked.evaluate(snapParked, 0), null)
+    const parkedAlert = monParked.evaluate(snapParked, 180_000)
+    assert.ok(parkedAlert)
+    assert.equal(parkedAlert.reason, 'idle_waiting', '[progress] posts #54/#56 must NOT trigger unclaimed_result')
+    assert.equal(parkedAlert.target, 'coordinator')
+
+    // Directed @coordinator [progress] post (mentions.length > 0) MUST still trigger unclaimed_result!
+    const directedProgressSnap: SwarmSnapshot = {
+      ...snapParked,
+      revision: 3,
+      posts: [
+        ...snapParked.posts,
+        { seq: 58, agent: 'b1-integrator', channel: 'main', text: '@coordinator [progress] 遇到阻塞请拍板', mentions: ['coordinator'] },
+      ],
+      totalPosts: 58,
+    }
+    const monDirected = new SwarmStallMonitor({ stallThresholdMs: 180_000 })
+    assert.equal(monDirected.evaluate(directedProgressSnap, 0), null)
+    const directedAlert = monDirected.evaluate(directedProgressSnap, 180_000)
+    assert.equal(directedAlert?.reason, 'unclaimed_result')
+    assert.deepEqual(directedAlert?.citedSeqs, [58])
   } finally {
     rmSync(brainDir, { recursive: true, force: true })
   }

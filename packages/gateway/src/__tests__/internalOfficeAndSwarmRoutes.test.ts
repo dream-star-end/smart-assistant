@@ -34,6 +34,11 @@ import {
   resolveAuthoritativeSessionSwarm,
 } from '../routes/swarmCommandRoute.js'
 import {
+  activeNativeSwarmWakeHandlerCountForTests,
+  clearActiveNativeSwarmWakeHandlersForTests,
+  registerActiveNativeSwarmWakeHandler,
+} from '../engine/nativeSwarmWake.js'
+import {
   RemoteSwarmRuntime,
   lookupRemoteSwarmMcpContext,
   remoteSwarmLocationForSession,
@@ -1110,6 +1115,243 @@ describe('internal swarm command route (B6 + B7)', () => {
       )
     } finally {
       await coldRemoteRt.shutdownAll()
+      rmSync(agyRoot, { recursive: true, force: true })
+      rmSync(wsDir, { recursive: true, force: true })
+    }
+  })
+
+  it('OCV5-932: internal swarm route wires live/cold native wake registry (with token isolation) and single-call remote wakeDelivery', async () => {
+    const agyRoot = mkdtempSync(path.join(tmpdir(), 'oc-int-wake-'))
+    const wsDir = mkdtempSync(path.join(tmpdir(), 'oc-int-wake-ws-'))
+    const replayCache = new InternalBridgeReplayCache()
+    clearActiveNativeSwarmWakeHandlersForTests()
+
+    const nativeSid = 'sess-native-wake-1'
+    const nativeSessionKey = `agent:main:webchat:dm:${nativeSid}`
+    const nativeBrainDir = antigravitySessionBrainDir(agyRoot, nativeSessionKey)
+    const workerConv = '22222222-3333-4444-8555-666666666666'
+    const nativeSwarmDir = path.join(nativeBrainDir, COORD_CONV, '.system_generated', 'swarm')
+    mkdirSync(nativeSwarmDir, { recursive: true })
+    writeFileSync(
+      path.join(nativeSwarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Native Wake Swarm',
+        members: {
+          coordinator: { conversation_id: COORD_CONV, role: 'coordinator', killed: false },
+          'worker-1': { conversation_id: workerConv, role: 'worker', killed: false },
+        },
+      }),
+    )
+    writeFileSync(path.join(nativeSwarmDir, 'board.jsonl'), '')
+
+    const remoteSid = 'sess-remote-wake-1'
+    const remoteSessionKey = `agent:main:webchat:dm:${remoteSid}`
+    let releaseRemoteWorker!: () => void
+    let workerHold = new Promise<void>((resolve) => { releaseRemoteWorker = resolve })
+    const rt = new RemoteSwarmRuntime({ rootBase: agyRoot })
+    let rtCold: RemoteSwarmRuntime | null = null
+    let activeRemoteRt: RemoteSwarmRuntime = rt
+    rt.setExecutor({
+      runWorkerTurn: async () => {
+        await workerHold
+        return { text: 'ok' }
+      },
+      releaseWorkerSession: async () => ({ released: true, state: 'released' }),
+    })
+    rt.registerSession({
+      sessionKey: remoteSessionKey,
+      model: 'antigravity-gemini-4-neon-remote',
+      workspaceCwd: wsDir,
+    })
+    await rt.handleToolCall({
+      sessionKey: remoteSessionKey,
+      callerMember: 'coordinator',
+      tool: 'swarm',
+      args: { action: 'add', name: 'remote-w1', brief: 'work' },
+    })
+
+    const lookupSessionTarget = (sid: string) => {
+      if (sid === nativeSid) return { sessionKey: nativeSessionKey, brainDir: nativeBrainDir, conversationId: COORD_CONV }
+      if (sid === remoteSid) return { sessionKey: remoteSessionKey }
+      return null
+    }
+
+    const postCmd = async (sid: string, body: Record<string, unknown>) => {
+      const url = `/internal/swarm/command?sessionId=${sid}`
+      const r = makeRes()
+      await handleInternalSwarmCommand(
+        makeReq({
+          method: 'POST',
+          url,
+          headers: signedAuthHeaders({
+            method: 'POST',
+            url,
+            body,
+            extra: { [INTERNAL_SWARM_USER_ID_HEADER]: '42' },
+          }),
+          body,
+        }),
+        r.res,
+        new URL(url, 'http://x'),
+        {
+          env: AUTH_ENV,
+          replayCache,
+          antigravityRootDir: () => agyRoot,
+          lookupSessionTarget,
+          getRemoteSwarmRuntime: () => activeRemoteRt,
+        },
+      )
+      return r
+    }
+
+    try {
+      // 1) Cold native swarm (no registered live handler) -> board_only_unwoken / no_active_native_swarm_process
+      const rColdSteer = await postCmd(nativeSid, { action: 'steer', target: 'worker-1', message: 'cold steer' })
+      assert.equal(rColdSteer.status(), 200)
+      assert.equal((rColdSteer.json() as { wakeDelivery?: string }).wakeDelivery, 'board_only_unwoken')
+      assert.equal((rColdSteer.json() as { wakeDetail?: string }).wakeDetail, 'no_active_native_swarm_process')
+
+      const rColdTerm = await postCmd(nativeSid, { action: 'terminate', memberName: 'worker-1', reason: 'cold kill' })
+      assert.equal(rColdTerm.status(), 200)
+      assert.equal((rColdTerm.json() as { wakeDelivery?: string }).wakeDelivery, 'board_only_unwoken')
+      assert.equal((rColdTerm.json() as { wakeDetail?: string }).wakeDetail, 'no_active_native_swarm_process')
+
+      // 2) Live native swarm with registered handler (uppercase convId normalized, token isolation verified)
+      const wakeCalls: Array<{ turn: number; target: string; conv?: string }> = []
+      const unregTurn1 = registerActiveNativeSwarmWakeHandler(nativeBrainDir, COORD_CONV.toUpperCase(), (ctx) => {
+        wakeCalls.push({ turn: 1, target: ctx.target, conv: ctx.targetConversationId })
+        return { status: 'board_only_unwoken', detail: 'native_worker_no_external_wake_channel' }
+      })
+      const unregTurn2 = registerActiveNativeSwarmWakeHandler(nativeBrainDir, COORD_CONV, (ctx) => {
+        wakeCalls.push({ turn: 2, target: ctx.target, conv: ctx.targetConversationId })
+        return { status: 'woken', detail: 'turn2_live_handler' }
+      })
+      // Stale turn1 cleanup MUST NOT delete turn2's handler!
+      unregTurn1()
+      assert.equal(activeNativeSwarmWakeHandlerCountForTests(), 1)
+
+      const rLiveSteer = await postCmd(nativeSid, { action: 'steer', target: 'worker-1', message: 'live steer' })
+      assert.equal(rLiveSteer.status(), 200)
+      assert.equal((rLiveSteer.json() as { wakeDelivery?: string }).wakeDelivery, 'woken')
+      assert.equal((rLiveSteer.json() as { wakeDetail?: string }).wakeDetail, 'turn2_live_handler')
+      assert.deepEqual(wakeCalls, [{ turn: 2, target: 'worker-1', conv: workerConv }])
+
+      unregTurn2()
+      assert.equal(activeNativeSwarmWakeHandlerCountForTests(), 0)
+
+      // 3) Remote binding: honest wakeDelivery based on real receiver wakeup, invoking onExternalBoardWrite EXACTLY ONCE (0 on 400)!
+      let externalBoardWriteCalls = 0
+      const origOnExternal = rt.onExternalBoardWrite.bind(rt)
+      rt.onExternalBoardWrite = (sk: string, opts?: { seq?: number; target?: string }) => {
+        externalBoardWriteCalls += 1
+        return origOnExternal(sk, opts)
+      }
+
+      const rRemoteBad = await postCmd(remoteSid, { action: 'steer', target: 'remote-w1', message: '   ' })
+      assert.equal(rRemoteBad.status(), 400)
+      assert.equal(externalBoardWriteCalls, 0, 'failed command must not call onExternalBoardWrite')
+
+      // P1-4 negative control: cold/idle coordinator with 0 waiters & 0 matching workers -> board_only_unwoken (NOT woken!)
+      const rRemoteColdCoord = await postCmd(remoteSid, { action: 'steer', target: 'coordinator', message: 'cold coord steer' })
+      assert.equal(rRemoteColdCoord.status(), 200)
+      assert.equal((rRemoteColdCoord.json() as { wakeDelivery?: string }).wakeDelivery, 'board_only_unwoken')
+      assert.equal((rRemoteColdCoord.json() as { wakeDetail?: string }).wakeDetail, 'remote_swarm_no_active_receiver')
+      assert.equal(externalBoardWriteCalls, 1)
+
+      // P1-4 positive control: live coordinator waiter parked in swarm_wait -> HTTP 200 wakeDelivery='woken' & waiter resolves
+      const coordSeqBefore = (rRemoteColdCoord.json() as { seq: number }).seq
+      const waitPromise = rt.handleToolCall({
+        sessionKey: remoteSessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm_wait',
+        args: { since: coordSeqBefore, mentions_only: true, timeout_ms: 3_000 },
+      })
+      await new Promise((r) => setTimeout(r, 30))
+      const rRemoteLiveCoord = await postCmd(remoteSid, { action: 'steer', target: 'coordinator', message: 'live coord steer' })
+      assert.equal(rRemoteLiveCoord.status(), 200)
+      assert.equal((rRemoteLiveCoord.json() as { wakeDelivery?: string }).wakeDelivery, 'woken')
+      assert.equal((rRemoteLiveCoord.json() as { wakeDetail?: string }).wakeDetail, 'remote_swarm_runtime')
+      assert.equal(externalBoardWriteCalls, 2, 'remote steer must invoke onExternalBoardWrite exactly once per command')
+      const waitRes = (await waitPromise) as { woke?: boolean; reason?: string }
+      assert.equal(waitRes.woke, true)
+      assert.equal(waitRes.reason, 'new_post')
+
+      // Remote worker steer schedules executor -> wakeDelivery='woken'
+      const rRemoteWorker = await postCmd(remoteSid, { action: 'steer', target: 'remote-w1', message: 'ping remote' })
+      assert.equal(rRemoteWorker.status(), 200)
+      assert.equal((rRemoteWorker.json() as { wakeDelivery?: string }).wakeDelivery, 'woken')
+      assert.equal((rRemoteWorker.json() as { wakeDetail?: string }).wakeDetail, 'remote_swarm_runtime')
+      assert.equal(externalBoardWriteCalls, 3)
+
+      // R2 P1-D: Concurrent HTTP steers to two live mentions_only waiters must BOTH report wakeDelivery='woken'
+      await rt.handleToolCall({
+        sessionKey: remoteSessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'remote-wa', brief: 'wait a' },
+      })
+      await rt.handleToolCall({
+        sessionKey: remoteSessionKey,
+        callerMember: 'coordinator',
+        tool: 'swarm',
+        args: { action: 'add', name: 'remote-wb', brief: 'wait b' },
+      })
+      const headBeforeConcurrent = ((await rt.handleToolCall({
+        sessionKey: remoteSessionKey,
+        callerMember: 'coordinator',
+        tool: 'read_board',
+        args: { limit: 20 },
+      })) as { head_seq?: number }).head_seq ?? 0
+      const waitA = rt.handleToolCall({
+        sessionKey: remoteSessionKey,
+        callerMember: 'remote-wa',
+        tool: 'swarm_wait',
+        args: { since: headBeforeConcurrent, mentions_only: true, timeout_ms: 3_000 },
+      })
+      const waitB = rt.handleToolCall({
+        sessionKey: remoteSessionKey,
+        callerMember: 'remote-wb',
+        tool: 'swarm_wait',
+        args: { since: headBeforeConcurrent, mentions_only: true, timeout_ms: 3_000 },
+      })
+      await new Promise((r) => setTimeout(r, 30))
+      const [rConcA, rConcB] = await Promise.all([
+        postCmd(remoteSid, { action: 'steer', target: 'remote-wa', message: 'concurrent ping a' }),
+        postCmd(remoteSid, { action: 'steer', target: 'remote-wb', message: 'concurrent ping b' }),
+      ])
+      const [waitARes, waitBRes] = (await Promise.all([waitA, waitB])) as Array<{ woke?: boolean; reason?: string }>
+      assert.equal(waitARes.woke, true)
+      assert.equal(waitARes.reason, 'new_post')
+      assert.equal(waitBRes.woke, true)
+      assert.equal(waitBRes.reason, 'new_post')
+      assert.equal(rConcA.status(), 200)
+      assert.equal((rConcA.json() as { wakeDelivery?: string }).wakeDelivery, 'woken')
+      assert.equal((rConcA.json() as { wakeDetail?: string }).wakeDetail, 'remote_swarm_runtime')
+      assert.equal(rConcB.status(), 200)
+      assert.equal((rConcB.json() as { wakeDelivery?: string }).wakeDelivery, 'woken')
+      assert.equal((rConcB.json() as { wakeDetail?: string }).wakeDetail, 'remote_swarm_runtime')
+
+      releaseRemoteWorker()
+      workerHold = Promise.resolve()
+      await rt.shutdownAll()
+
+      // P1-4 cold-disk hydration negative control: fresh RemoteSwarmRuntime hydrated from disk
+      // (no registerSession, no executor, 0 waiters) must NEVER report wakeDelivery='woken'
+      rtCold = new RemoteSwarmRuntime({ rootBase: agyRoot })
+      activeRemoteRt = rtCold
+      const rColdHydratedCoord = await postCmd(remoteSid, { action: 'steer', target: 'coordinator', message: 'after restart coord' })
+      assert.equal(rColdHydratedCoord.status(), 200)
+      assert.equal((rColdHydratedCoord.json() as { wakeDelivery?: string }).wakeDelivery, 'board_only_unwoken')
+      assert.equal((rColdHydratedCoord.json() as { wakeDetail?: string }).wakeDetail, 'remote_swarm_no_active_receiver')
+      const rColdHydratedWorker = await postCmd(remoteSid, { action: 'steer', target: 'remote-w1', message: 'after restart worker' })
+      assert.equal(rColdHydratedWorker.status(), 200)
+      assert.equal((rColdHydratedWorker.json() as { wakeDelivery?: string }).wakeDelivery, 'board_only_unwoken')
+      assert.equal((rColdHydratedWorker.json() as { wakeDetail?: string }).wakeDetail, 'remote_swarm_no_active_receiver')
+    } finally {
+      releaseRemoteWorker()
+      clearActiveNativeSwarmWakeHandlersForTests()
+      await rt.shutdownAll()
+      if (rtCold) await rtCold.shutdownAll()
       rmSync(agyRoot, { recursive: true, force: true })
       rmSync(wsDir, { recursive: true, force: true })
     }

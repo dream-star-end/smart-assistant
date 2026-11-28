@@ -1783,3 +1783,700 @@ test('OCV5-887 P2-05: bounded tail reads landing exactly on a line boundary pres
     await rm(brainDir, { recursive: true, force: true })
   }
 })
+
+test('OCV5-932 Defect #1A: native resolveActiveMemberStatus trusts transcript over stale wake_mode and falls back to wake_mode only when transcript is absent', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-932-1a-'))
+  try {
+    const swarmDir = path.join(brainDir, COORD_CONV, '.system_generated', 'swarm')
+    const activeMentionsLogs = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs')
+    const parkedWorkingLogs = path.join(brainDir, VERIFIER_CONV, '.system_generated', 'logs')
+    await mkdir(swarmDir, { recursive: true })
+    await mkdir(activeMentionsLogs, { recursive: true })
+    await mkdir(parkedWorkingLogs, { recursive: true })
+
+    await writeFile(
+      path.join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'OCV5-932 状态真值',
+        members: {
+          coordinator: {
+            conversation_id: COORD_CONV,
+            role: 'coordinator',
+            desired_state: 'RUNNING',
+            phase: 'RUNNING',
+            wake_mode: 'mentions',
+            last_read_seq: 1,
+            killed: false,
+          },
+          'bg-woken': {
+            conversation_id: WORKER_CONV,
+            role: 'worker',
+            desired_state: 'RUNNING',
+            phase: 'RUNNING',
+            wake_mode: 'mentions',
+            last_read_seq: 1,
+            killed: false,
+          },
+          'rung-parked': {
+            conversation_id: VERIFIER_CONV,
+            role: 'verifier',
+            desired_state: 'RUNNING',
+            phase: 'RUNNING',
+            wake_mode: 'working',
+            last_read_seq: 1,
+            killed: false,
+          },
+          'no-tx-anything': {
+            conversation_id: OTHER_CONV,
+            role: 'worker',
+            desired_state: 'RUNNING',
+            phase: 'RUNNING',
+            wake_mode: 'anything',
+            last_read_seq: 1,
+            killed: false,
+          },
+        },
+      }),
+    )
+
+    // bg-woken has wake_mode='mentions', yet its transcript is actively thinking (PLANNER_RESPONSE RUNNING)
+    await writeFile(
+      path.join(activeMentionsLogs, 'transcript.jsonl'),
+      `${[
+        JSON.stringify({ step_index: 0, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[swarm] #1' }),
+        JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'RUNNING' }),
+      ].join('\n')}\n`,
+    )
+    // rung-parked has wake_mode='working', yet its transcript ended cleanly (PLANNER_RESPONSE DONE tool_calls: [])
+    await writeFile(
+      path.join(parkedWorkingLogs, 'transcript.jsonl'),
+      `${[
+        JSON.stringify({ step_index: 0, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[swarm] #1' }),
+        JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+      ].join('\n')}\n`,
+    )
+
+    const snap = readAntigravitySwarmSnapshot({
+      brainDir,
+      conversationId: COORD_CONV,
+      phase: 'running',
+      revision: 1,
+      now: 10_000,
+    })
+    assert.ok(snap)
+
+    const bgWoken = snap.members.find((m) => m.name === 'bg-woken')!
+    assert.equal(bgWoken.status, 'working', 'active transcript must override stale wake_mode=mentions')
+    assert.equal(bgWoken.activity, '思考与规划中…')
+    assert.notEqual(bgWoken.waitingOnBoard, true)
+
+    const rungParked = snap.members.find((m) => m.name === 'rung-parked')!
+    assert.equal(rungParked.status, 'waiting', 'completed transcript must override stale wake_mode=working')
+    assert.equal(rungParked.activity, '已完成本轮思考')
+    assert.equal(rungParked.waitingOnBoard, true)
+
+    // No transcript on disk -> falls back cleanly to wake_mode ('mentions' / 'anything' -> waiting)
+    const coord = snap.members.find((m) => m.name === 'coordinator')!
+    assert.equal(coord.status, 'waiting', 'missing transcript falls back to wake_mode=mentions -> waiting')
+    const noTxAnything = snap.members.find((m) => m.name === 'no-tx-anything')!
+    assert.equal(noTxAnything.status, 'waiting', 'missing transcript falls back to wake_mode=anything -> waiting')
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})
+
+test('OCV5-932 Defect #1B: mid-turn SYSTEM_MESSAGE and cross-turn background task lifecycle (T2 four-quadrant matrix)', () => {
+  const taskId1 = `${WORKER_CONV}/task-713`
+  const taskId2 = `${WORKER_CONV}/task-714`
+
+  // 1. Mid-turn efficiency Reminder SYSTEM_MESSAGE does NOT truncate turnStart or hide unfinished non-board tool
+  const midTurnReminder = `${[
+    JSON.stringify({
+      step_index: 10,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm test' } }],
+    }),
+    JSON.stringify({
+      step_index: 11,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: '<SYSTEM_MESSAGE>\nReminder: work efficiently.\n</SYSTEM_MESSAGE>',
+    }),
+  ].join('\n')}\n`
+  const parsedReminder = parseMemberTranscriptTail(midTurnReminder)
+  assert.equal(parsedReminder.status, 'working')
+  assert.equal(parsedReminder.hasActiveNonWaitTool, true)
+  assert.equal(parsedReminder.waitingOnBoard, false)
+  assert.equal(parsedReminder.activity, '运行命令')
+
+  // 2. Real b1-integrator background task lifecycle across Reminder, post_message, turn-end reply, still-running, manage_task RUNNING, and finish
+  const bgStartSteps = [
+    JSON.stringify({
+      step_index: 20,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm run test:all' } }],
+    }),
+    JSON.stringify({
+      step_index: 21,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Created At: 2026-11-28T16:00:00+08:00\nTool is running as a background task with task id: ${taskId1}\nTask Description: full suite`,
+    }),
+    JSON.stringify({
+      step_index: 22,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: '<SYSTEM_MESSAGE>\nReminder: work efficiently.\n</SYSTEM_MESSAGE>',
+    }),
+    JSON.stringify({
+      step_index: 23,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'post_message', args: { text: '[progress] 正在运行全量单测' } }],
+    }),
+    JSON.stringify({ step_index: 24, type: 'GENERIC', status: 'DONE', content: '{"seq":50}' }),
+    JSON.stringify({ step_index: 25, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+  ]
+  const parsedAcrossTurnEnd = parseMemberTranscriptTail(`${bgStartSteps.join('\n')}\n`)
+  assert.equal(parsedAcrossTurnEnd.status, 'working')
+  assert.equal(parsedAcrossTurnEnd.waitingOnBoard, false)
+  assert.equal(parsedAcrossTurnEnd.hasActiveNonWaitTool, true)
+  assert.equal(parsedAcrossTurnEnd.activity, '后台运行命令')
+
+  // Still-running notification + manage_task Status: RUNNING + another turn-end reply -> MUST STAY WORKING!
+  const bgStillRunningSteps = [
+    ...bgStartSteps,
+    JSON.stringify({
+      step_index: 26,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-28T08:07:00Z sender=${taskId1} priority=MESSAGE_PRIORITY_HIGH content=Background command is still running after 420s:\n0 failed, 12 passed so far\n</SYSTEM_MESSAGE>`,
+    }),
+    JSON.stringify({
+      step_index: 27,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'manage_task', args: { Action: 'status', TaskId: taskId1 } }],
+    }),
+    JSON.stringify({
+      step_index: 28,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: `Created At: 2026-11-28T16:07:02+08:00\nCompleted At: 2026-11-28T16:07:02+08:00\nTask: ${taskId1}\nStatus: RUNNING\nElapsed: 422s`,
+    }),
+    JSON.stringify({ step_index: 29, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+  ]
+  const parsedStillRunning = parseMemberTranscriptTail(`${bgStillRunningSteps.join('\n')}\n`)
+  assert.equal(parsedStillRunning.status, 'working')
+  assert.equal(parsedStillRunning.waitingOnBoard, false)
+  assert.equal(parsedStillRunning.hasActiveNonWaitTool, true)
+  assert.equal(parsedStillRunning.activity, '后台运行命令')
+
+  // Completion notification arrives -> retires task-713, wakes member as working ('启动处理中…') until next planner settles
+  const bgFinishedWake = [
+    ...bgStillRunningSteps,
+    JSON.stringify({
+      step_index: 30,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-28T08:10:00Z sender=${taskId1} priority=MESSAGE_PRIORITY_HIGH content=Task id "${taskId1}" finished with result:\nCommand exited with code 0.\nBackground command is still running test passed\n</SYSTEM_MESSAGE>`,
+    }),
+  ]
+  const parsedFinishedWake = parseMemberTranscriptTail(`${bgFinishedWake.join('\n')}\n`)
+  assert.equal(parsedFinishedWake.status, 'working')
+  assert.equal(parsedFinishedWake.activity, '启动处理中…')
+  assert.notEqual(parsedFinishedWake.hasActiveNonWaitTool, true)
+
+  // Member finishes post-completion turn -> cleanly transitions to waiting!
+  const bgFinishedSettled = [
+    ...bgFinishedWake,
+    JSON.stringify({ step_index: 31, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+  ]
+  const parsedSettled = parseMemberTranscriptTail(`${bgFinishedSettled.join('\n')}\n`)
+  assert.equal(parsedSettled.status, 'waiting')
+  assert.equal(parsedSettled.waitingOnBoard, true)
+  assert.notEqual(parsedSettled.hasActiveNonWaitTool, true)
+
+  // 3. T2 Quadrant 2: Two concurrent background tasks -> stays working until BOTH finish
+  const twoTasksOneDone = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'run_command' }, { name: 'run_command' }],
+    }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${taskId1}`,
+    }),
+    JSON.stringify({
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${taskId2}`,
+    }),
+    JSON.stringify({ step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+    JSON.stringify({
+      step_index: 4,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `Task id "${taskId1}" finished with result: ok`,
+    }),
+    JSON.stringify({ step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+  ]
+  const parsedOneRemaining = parseMemberTranscriptTail(`${twoTasksOneDone.join('\n')}\n`)
+  assert.equal(parsedOneRemaining.status, 'working', 'must stay working while task-714 is still running')
+  assert.equal(parsedOneRemaining.hasActiveNonWaitTool, true)
+
+  const bothTasksDone = [
+    ...twoTasksOneDone,
+    JSON.stringify({
+      step_index: 6,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `Task id "${taskId2}" finished with result: ok`,
+    }),
+    JSON.stringify({ step_index: 7, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+  ]
+  const parsedBothDone = parseMemberTranscriptTail(`${bothTasksDone.join('\n')}\n`)
+  assert.equal(parsedBothDone.status, 'waiting', 'once all concurrent background tasks finish, member parks')
+  assert.equal(parsedBothDone.waitingOnBoard, true)
+
+  // 4. T2 Quadrant 3: Bounded tail with orphan finish + out-of-order/duplicate RUNNING/still-running are idempotent
+  const outOfOrderAndOrphan = [
+    JSON.stringify({
+      step_index: 100,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `Task id "${taskId1}" finished with result: ok`,
+    }),
+    JSON.stringify({
+      step_index: 101,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `sender=${taskId1} content=Background command is still running after 60s:`,
+    }),
+    JSON.stringify({
+      step_index: 102,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${taskId1}`,
+    }),
+    JSON.stringify({ step_index: 103, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+  ]
+  const parsedOutOfOrder = parseMemberTranscriptTail(`${outOfOrderAndOrphan.join('\n')}\n`)
+  assert.equal(parsedOutOfOrder.status, 'waiting', 'retired taskId must never resurrect on out-of-order RUNNING/still-running')
+  assert.equal(parsedOutOfOrder.waitingOnBoard, true)
+
+  // 5. T2 Quadrant 4: Server restart notice and manage_task kill / terminal Status cleanly release tasks
+  const serverRestartCleared = [
+    ...bgStartSteps,
+    JSON.stringify({
+      step_index: 26,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: '<SYSTEM_MESSAGE>\nAll your subagents and background tasks have been stopped due to server restart.\n</SYSTEM_MESSAGE>',
+    }),
+    JSON.stringify({ step_index: 27, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+  ]
+  const parsedRestart = parseMemberTranscriptTail(`${serverRestartCleared.join('\n')}\n`)
+  assert.equal(parsedRestart.status, 'waiting', 'server restart notice must clear all tracked background tasks')
+  assert.equal(parsedRestart.waitingOnBoard, true)
+
+  const manageTaskKilled = [
+    ...bgStartSteps,
+    JSON.stringify({
+      step_index: 26,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: `Created At: 2026-11-28T16:12:00+08:00\nTask: ${taskId1}\nStatus: KILLED`,
+    }),
+    JSON.stringify({ step_index: 27, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+  ]
+  const parsedKilled = parseMemberTranscriptTail(`${manageTaskKilled.join('\n')}\n`)
+  assert.equal(parsedKilled.status, 'waiting', 'manage_task Status: KILLED must release tracked background task')
+  assert.equal(parsedKilled.waitingOnBoard, true)
+
+  // Explicit manage_task kill confirmation & sender=<taskId> terminal notice also release tracked task
+  const killConfirmSteps = [
+    ...bgStartSteps,
+    JSON.stringify({
+      step_index: 26,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: `Created At: 2026-11-28T16:12:00+08:00\nKilled task "${taskId1}".`,
+    }),
+    JSON.stringify({ step_index: 27, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+  ]
+  assert.equal(parseMemberTranscriptTail(`${killConfirmSteps.join('\n')}\n`).status, 'waiting')
+
+  const senderExitedSteps = [
+    ...bgStartSteps,
+    JSON.stringify({
+      step_index: 26,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `[Message] timestamp=2026-11-28T08:13:00Z sender=${taskId1} priority=MESSAGE_PRIORITY_HIGH content=Background command exited with code 1`,
+    }),
+    JSON.stringify({ step_index: 27, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }),
+  ]
+  assert.equal(parseMemberTranscriptTail(`${senderExitedSteps.join('\n')}\n`).status, 'waiting')
+
+  // DoS safety: >64 background tasks stay bounded without throwing
+  const floodSteps = Array.from({ length: 80 }, (_, idx) =>
+    JSON.stringify({
+      step_index: idx,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      content: `Tool is running as a background task with task id: ${WORKER_CONV}/task-${idx + 1}`,
+    }),
+  )
+  floodSteps.push(JSON.stringify({ step_index: 81, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }))
+  const parsedFlood = parseMemberTranscriptTail(`${floodSteps.join('\n')}\n`)
+  assert.equal(parsedFlood.status, 'working')
+  assert.equal(parsedFlood.activity, '后台运行命令')
+
+  // Mixed [read_file, swarm_wait] batch that completed DONE followed by a waking SYSTEM_MESSAGE must mark working
+  const mixedBatchThenWoken = [
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'read_file', arguments: { Path: '/tmp/a.ts' } }, { name: 'swarm_wait', arguments: { since: 4 } }],
+    }),
+    JSON.stringify({ step_index: 2, type: 'GENERIC', status: 'DONE', content: 'file contents' }),
+    JSON.stringify({ step_index: 3, type: 'GENERIC', status: 'DONE', content: 'parked' }),
+    JSON.stringify({
+      step_index: 4,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: '[Message] sender=system content=[swarm] new board message #8',
+    }),
+  ]
+  const parsedWoken = parseMemberTranscriptTail(`${mixedBatchThenWoken.join('\n')}\n`)
+  assert.equal(parsedWoken.status, 'working', 'SYSTEM_MESSAGE waking a member after mixed [read_file, swarm_wait] DONE batch must be working')
+})
+
+test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, duplicate DONE wait batch, and 17-segment SYSTEM_MESSAGE', async () => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), 'oc-swarm-932-r1-'))
+  try {
+    await writeSwarmFixture(brainDir)
+    const swarmDir = path.join(brainDir, COORD_CONV, '.system_generated', 'swarm')
+    await writeFile(
+      path.join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'OCV5-932 R1 P1-1',
+        members: {
+          coordinator: { conversation_id: COORD_CONV, role: 'coordinator', phase: 'RUNNING', wake_mode: 'mentions', last_read_seq: 1, killed: false },
+          parser: { conversation_id: WORKER_CONV, role: 'worker', phase: 'RUNNING', wake_mode: 'mentions', last_read_seq: 1, killed: false },
+        },
+      }),
+    )
+    const workerTranscript = path.join(brainDir, WORKER_CONV, '.system_generated', 'logs', 'transcript.jsonl')
+    const task71 = `${WORKER_CONV}/task-71`
+    const fillerPayload = 'x'.repeat(4096)
+    const largeLines: string[] = [
+      JSON.stringify({ step_index: 1, type: 'USER_INPUT', status: 'DONE', content: 'run long job' }),
+      JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', arguments: { CommandLine: 'long' } }] }),
+      JSON.stringify({ step_index: 3, type: 'GENERIC', status: 'RUNNING', content: `Created At: 2026-11-28T16:00:00+08:00\nTool is running as a background task with task id: ${task71}\nTask Description: long` }),
+    ]
+    let stepIdx = 4
+    for (let i = 0; i < 70; i += 1) {
+      largeLines.push(JSON.stringify({ step_index: stepIdx++, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', arguments: { Path: `/tmp/f${i}.ts` } }] }))
+      largeLines.push(JSON.stringify({ step_index: stepIdx++, type: 'GENERIC', status: 'DONE', content: fillerPayload }))
+    }
+    largeLines.push(JSON.stringify({ step_index: stepIdx++, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [], content: 'waiting on task-71' }))
+    const largeText = `${largeLines.join('\n')}\n`
+    assert.ok(Buffer.byteLength(largeText, 'utf8') > 280 * 1024, 'fixture must exceed 256 KiB tail window')
+    await writeFile(workerTranscript, largeText)
+
+    // P1-1a: With real IncrementalTranscriptTelemetryCache, task-71 stays tracked past 256 KiB tail scrollout
+    const cache = new IncrementalTranscriptTelemetryCache()
+    let snap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 1, telemetryCache: cache })!
+    // Drain full file across ticks (simulating real watcher catchup)
+    for (let rev = 2; rev <= 5 && cache.hasAnyBacklog(); rev += 1) {
+      snap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: rev, telemetryCache: cache })!
+    }
+    const workerActive = snap.members.find((m) => m.name === 'parser')!
+    assert.equal(workerActive.status, 'working', 'P1-1: unfinished task-71 outside 256 KiB tail must remain working with telemetryCache')
+    assert.equal(workerActive.waitingOnBoard, false)
+
+    // P1-1b: Stateless truncated read without telemetryCache marks telemetryPartial=true so SwarmStallMonitor refuses auto-kill
+    const statelessSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 6 })!
+    const statelessWorker = statelessSnap.members.find((m) => m.name === 'parser')!
+    assert.equal(statelessWorker.telemetryPartial, true, 'P1-1: truncated tail without telemetryCache must mark telemetryPartial=true')
+    let statelessExhausted = 0
+    const { SwarmStallMonitor } = await import('../engine/swarmStallMonitor.js')
+    const guardMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000,
+      retryCooldownMs: 1_000,
+      exhaustedGraceMs: 1_000,
+      maxAlerts: 1,
+      onStallExhausted: () => { statelessExhausted += 1 },
+    })
+    guardMon.evaluate(statelessSnap, 1_000)
+    guardMon.evaluate({ ...statelessSnap, revision: 7 }, 3_000)
+    guardMon.evaluate({ ...statelessSnap, revision: 8 }, 5_000)
+    assert.equal(statelessExhausted, 0, 'P1-1: incomplete transcript evidence must block onStallExhausted')
+    assert.equal(guardMon.isStallSuppressedAllParked(), false)
+
+    // P1-1c: Positive control — once task-71 genuinely finishes, worker becomes waiting & deadlock reclaim resumes
+    const finishedLine = JSON.stringify({
+      step_index: stepIdx++,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `[Message] timestamp=2026-11-28T08:15:00Z sender=${task71} priority=MESSAGE_PRIORITY_HIGH content=Task id "${task71}" finished with result: ok`,
+    })
+    const finalReplyLine = JSON.stringify({ step_index: stepIdx++, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [], content: 'done' })
+    await writeFile(workerTranscript, `${largeText}${finishedLine}\n${finalReplyLine}\n`)
+    const settledSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 10, telemetryCache: cache, drainTelemetry: true })!
+    const settledWorker = settledSnap.members.find((m) => m.name === 'parser')!
+    assert.equal(settledWorker.status, 'waiting', 'P1-1 positive control: finished task-71 must restore waiting')
+    assert.equal(settledWorker.telemetryPartial, undefined)
+    let resumedExhausted = 0
+    const resumeMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000,
+      retryCooldownMs: 1_000,
+      exhaustedGraceMs: 1_000,
+      maxAlerts: 1,
+      onStallExhausted: () => { resumedExhausted += 1 },
+    })
+    resumeMon.evaluate(settledSnap, 1_000)
+    resumeMon.evaluate({ ...settledSnap, revision: 11 }, 3_000)
+    resumeMon.evaluate({ ...settledSnap, revision: 12 }, 5_000)
+    assert.equal(resumedExhausted, 1, 'P1-1 positive control: genuine deadlock reclamation resumes after task completion')
+
+    // P1-1d: Capacity boundary — 65 live tasks started, tasks 2..65 finished -> task-1 STILL alive (never evicted) -> working!
+    const capSteps: string[] = []
+    for (let i = 1; i <= 65; i += 1) {
+      capSteps.push(JSON.stringify({
+        step_index: i,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${WORKER_CONV}/task-${i}`,
+      }))
+    }
+    for (let i = 2; i <= 65; i += 1) {
+      capSteps.push(JSON.stringify({
+        step_index: 100 + i,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: `[Message] sender=${WORKER_CONV}/task-${i} content=Task id "${WORKER_CONV}/task-${i}" finished with result: ok`,
+      }))
+    }
+    capSteps.push(JSON.stringify({ step_index: 200, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }))
+    const capParsed = parseMemberTranscriptTail(`${capSteps.join('\n')}\n`)
+    assert.equal(capParsed.status, 'working', 'P1-1 capacity: finishing tasks 2..65 must NOT lose still-running task-1')
+    assert.equal(capParsed.incompleteBgEvidence, true)
+    // Server restart clears overflow + all active tasks cleanly
+    capSteps.push(JSON.stringify({ step_index: 201, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>\nAll your subagents and background tasks have been stopped due to server restart.\n</SYSTEM_MESSAGE>' }))
+    capSteps.push(JSON.stringify({ step_index: 202, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }))
+    assert.equal(parseMemberTranscriptTail(`${capSteps.join('\n')}\n`).status, 'waiting')
+
+    // R2 P1-B: 65 concurrent tasks with IncrementalTranscriptTelemetryCache —
+    // finishing tasks 1..64 leaves overflowed task-65 alive (working, 0 reclaims);
+    // finishing task-65 WITHOUT server restart proves 0 live tasks -> waiting & reclaimable!
+    const cap65Lines: string[] = []
+    for (let i = 1; i <= 65; i += 1) {
+      cap65Lines.push(JSON.stringify({
+        step_index: i,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${WORKER_CONV}/cap65-task-${i}`,
+      }))
+    }
+    for (let i = 1; i <= 64; i += 1) {
+      cap65Lines.push(JSON.stringify({
+        step_index: 100 + i,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        content: `[Message] sender=${WORKER_CONV}/cap65-task-${i} content=Task id "${WORKER_CONV}/cap65-task-${i}" finished with result: ok`,
+      }))
+    }
+    cap65Lines.push(JSON.stringify({ step_index: 200, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }))
+    const capCache = new IncrementalTranscriptTelemetryCache()
+    await writeFile(workerTranscript, `${cap65Lines.join('\n')}\n`)
+    const cap64DoneSnap = readAntigravitySwarmSnapshot({
+      brainDir, conversationId: COORD_CONV, phase: 'running', revision: 30, telemetryCache: capCache, drainTelemetry: true,
+    })!
+    const cap64Worker = cap64DoneSnap.members.find((m) => m.name === 'parser')!
+    assert.equal(cap64Worker.status, 'working', 'P1-B: overflowed task-65 still running must stay working after 1..64 finish')
+    let cap64Reclaimed = 0
+    const cap64Mon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { cap64Reclaimed += 1 },
+    })
+    cap64Mon.evaluate(cap64DoneSnap, 1_000)
+    cap64Mon.evaluate({ ...cap64DoneSnap, revision: 31 }, 3_000)
+    cap64Mon.evaluate({ ...cap64DoneSnap, revision: 32 }, 5_000)
+    assert.equal(cap64Reclaimed, 0, 'P1-B: must NOT reclaim while overflowed task-65 is still running')
+
+    // Now finish task-65 (NO server restart) -> bounded reverse re-verification clears overflow!
+    cap65Lines.push(JSON.stringify({
+      step_index: 201,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: `[Message] sender=${WORKER_CONV}/cap65-task-65 content=Task id "${WORKER_CONV}/cap65-task-65" finished with result: ok`,
+    }))
+    cap65Lines.push(JSON.stringify({ step_index: 202, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }))
+    await writeFile(workerTranscript, `${cap65Lines.join('\n')}\n`)
+    const cap65DoneSnap = readAntigravitySwarmSnapshot({
+      brainDir, conversationId: COORD_CONV, phase: 'running', revision: 33, telemetryCache: capCache, drainTelemetry: true,
+    })!
+    const cap65Worker = cap65DoneSnap.members.find((m) => m.name === 'parser')!
+    assert.equal(cap65Worker.status, 'waiting', 'P1-B: finishing all 65 tasks without restart must recover waiting')
+    assert.notEqual(cap65Worker.livenessEvidencePartial, true)
+    let cap65Reclaimed = 0
+    const cap65Mon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { cap65Reclaimed += 1 },
+    })
+    cap65Mon.evaluate(cap65DoneSnap, 1_000)
+    cap65Mon.evaluate({ ...cap65DoneSnap, revision: 34 }, 3_000)
+    cap65Mon.evaluate({ ...cap65DoneSnap, revision: 35 }, 5_000)
+    assert.equal(cap65Reclaimed, 1, 'P1-B: after all 65 tasks finish, stalled swarm must be reclaimable')
+
+    // R2 P1-C: 2.4 MiB oversized historical line poisons cumulative telemetryPartial=true,
+    // blocks reclaim BEFORE restart, but recovers reclaim eligibility AFTER SERVER_RESTART!
+    const hugeLine = JSON.stringify({
+      step_index: 1,
+      type: 'GENERIC',
+      status: 'DONE',
+      content: 'X'.repeat(2_400_000),
+    })
+    const postHugeReply = JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] })
+    const restartLine = JSON.stringify({
+      step_index: 3,
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      content: '<SYSTEM_MESSAGE>\nAll your subagents and background tasks have been stopped due to server restart.\n</SYSTEM_MESSAGE>',
+    })
+    const postRestartReply = JSON.stringify({ step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] })
+
+    const hugeCache = new IncrementalTranscriptTelemetryCache()
+    await writeFile(workerTranscript, `${hugeLine}\n${postHugeReply}\n`)
+    const preRestartSnap = readAntigravitySwarmSnapshot({
+      brainDir, conversationId: COORD_CONV, phase: 'running', revision: 40, telemetryCache: hugeCache, drainTelemetry: true,
+    })!
+    const preRestartWorker = preRestartSnap.members.find((m) => m.name === 'parser')!
+    assert.equal(preRestartWorker.telemetryPartial, true, 'P1-C: oversized line marks historical telemetryPartial=true')
+    assert.equal(preRestartWorker.livenessEvidencePartial, true, 'P1-C: unverified gap before restart blocks liveness certainty')
+    let preRestartReclaimed = 0
+    const preRestartMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { preRestartReclaimed += 1 },
+    })
+    preRestartMon.evaluate(preRestartSnap, 1_000)
+    preRestartMon.evaluate({ ...preRestartSnap, revision: 41 }, 3_000)
+    preRestartMon.evaluate({ ...preRestartSnap, revision: 42 }, 5_000)
+    assert.equal(preRestartReclaimed, 0, 'P1-C: oversized gap with no server restart must still block reclaim')
+
+    await writeFile(workerTranscript, `${hugeLine}\n${postHugeReply}\n${restartLine}\n${postRestartReply}\n`)
+    const postRestartSnap = readAntigravitySwarmSnapshot({
+      brainDir, conversationId: COORD_CONV, phase: 'running', revision: 43, telemetryCache: hugeCache, drainTelemetry: true,
+    })!
+    const postRestartWorker = postRestartSnap.members.find((m) => m.name === 'parser')!
+    assert.equal(postRestartWorker.status, 'waiting')
+    assert.equal(postRestartWorker.telemetryPartial, true, 'P1-C: historical token subtotal remains honestly partial')
+    assert.equal(postRestartWorker.livenessEvidencePartial, false, 'P1-C: post-restart lifecycle evidence is complete')
+    let postRestartReclaimed = 0
+    const postRestartMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { postRestartReclaimed += 1 },
+    })
+    postRestartMon.evaluate(postRestartSnap, 1_000)
+    postRestartMon.evaluate({ ...postRestartSnap, revision: 44 }, 3_000)
+    postRestartMon.evaluate({ ...postRestartSnap, revision: 45 }, 5_000)
+    assert.equal(postRestartReclaimed, 1, 'P1-C: clean post-restart phase must restore reclaim eligibility')
+
+    // R2 P1-A (1): Plannerless direct TOOL_CALL ACTIVE (cmd-a + swarm_wait), only swarm_wait DONE,
+    // followed by reminder SYSTEM_MESSAGE + next planner swarm_wait -> cmd-a MUST stay active (working)!
+    const plannerlessDirect = [
+      JSON.stringify({ step_index: 1, type: 'TOOL_CALL', tool_call_id: 'cmd-a', tool_name: 'run_command', status: 'ACTIVE', arguments: { CommandLine: 'npm test' } }),
+      JSON.stringify({ step_index: 2, type: 'TOOL_CALL', tool_call_id: 'wait-w', tool_name: 'swarm_wait', status: 'ACTIVE', arguments: { since: 1 } }),
+      JSON.stringify({ step_index: 3, type: 'TOOL_RESULT', tool_call_id: 'wait-w', tool_name: 'swarm_wait', status: 'DONE', content: 'parked' }),
+      JSON.stringify({ step_index: 4, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>\nReminder: work efficiently.\n</SYSTEM_MESSAGE>' }),
+      JSON.stringify({ step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 2 } }] }),
+    ]
+    await writeFile(workerTranscript, `${plannerlessDirect.join('\n')}\n`)
+    const directSnap = readAntigravitySwarmSnapshot({
+      brainDir, conversationId: COORD_CONV, phase: 'running', revision: 50,
+    })!
+    const directWorker = directSnap.members.find((m) => m.name === 'parser')!
+    assert.equal(directWorker.status, 'working', 'P1-A: plannerless direct unfinished cmd-a must NOT be cut by reminder SYSTEM_MESSAGE')
+    let directReclaimed = 0
+    const directMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { directReclaimed += 1 },
+    })
+    directMon.evaluate(directSnap, 1_000)
+    directMon.evaluate({ ...directSnap, revision: 51 }, 3_000)
+    directMon.evaluate({ ...directSnap, revision: 52 }, 5_000)
+    assert.equal(directReclaimed, 0, 'P1-A: unfinished direct sibling cmd-a must block stall reclamation')
+
+    // R2 P1-A (2): Reverse control — planner emits W, W transitions ACTIVE -> DONE (same id), then waking SYSTEM_MESSAGE -> working ('启动处理中…')!
+    const activeToDoneWake = [
+      JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ id: 'w-1', name: 'swarm_wait', arguments: { since: 1 } }] }),
+      JSON.stringify({ step_index: 2, type: 'TOOL_CALL', tool_call_id: 'w-1', tool_name: 'swarm_wait', status: 'ACTIVE', arguments: { since: 1 } }),
+      JSON.stringify({ step_index: 3, type: 'TOOL_RESULT', tool_call_id: 'w-1', tool_name: 'swarm_wait', status: 'DONE', content: 'woken' }),
+      JSON.stringify({ step_index: 4, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] new board message #9' }),
+    ]
+    const activeToDoneParsed = parseMemberTranscriptTail(`${activeToDoneWake.join('\n')}\n`)
+    assert.equal(activeToDoneParsed.status, 'working', 'P1-A reverse control: same-ID ACTIVE->DONE settles W so wake SYSTEM_MESSAGE starts working turn')
+    assert.equal(activeToDoneParsed.activity, '启动处理中…')
+
+    // P1-2: Duplicate DONE for cmdB + anonymous DONE must NOT cut turn at mid-turn SYSTEM_MESSAGE while cmdA is still active
+    const dupDoneSteps = [
+      JSON.stringify({
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          { id: 'call-a', name: 'run_command', arguments: { CommandLine: 'cmd-a' } },
+          { id: 'call-b', name: 'run_command', arguments: { CommandLine: 'cmd-b' } },
+          { id: 'call-w', name: 'swarm_wait', arguments: { since: 1 } },
+        ],
+      }),
+      JSON.stringify({ step_index: 2, type: 'TOOL_RESULT', tool_call_id: 'call-b', tool_name: 'run_command', status: 'DONE', content: 'b done' }),
+      JSON.stringify({ step_index: 3, type: 'TOOL_RESULT', tool_call_id: 'call-b', tool_name: 'run_command', status: 'DONE', content: 'b done dup' }),
+      JSON.stringify({ step_index: 4, type: 'GENERIC', status: 'DONE', content: 'parked' }),
+      JSON.stringify({ step_index: 5, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '<SYSTEM_MESSAGE>\nReminder: work efficiently.\n</SYSTEM_MESSAGE>' }),
+      JSON.stringify({ step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 2 } }] }),
+    ]
+    const dupParsed = parseMemberTranscriptTail(`${dupDoneSteps.join('\n')}\n`)
+    assert.equal(dupParsed.status, 'working', 'P1-2: duplicate DONE must NOT cut turn and drop unfinished sibling call-a')
+    assert.equal(dupParsed.hasActiveNonWaitTool, true)
+
+    // P1-2 positive control: all 3 calls genuinely DONE -> waking SYSTEM_MESSAGE cleanly starts new working turn
+    const allDoneThenWake = [
+      dupDoneSteps[0]!,
+      JSON.stringify({ step_index: 2, type: 'TOOL_RESULT', tool_call_id: 'call-a', tool_name: 'run_command', status: 'DONE', content: 'a done' }),
+      JSON.stringify({ step_index: 3, type: 'TOOL_RESULT', tool_call_id: 'call-b', tool_name: 'run_command', status: 'DONE', content: 'b done' }),
+      JSON.stringify({ step_index: 4, type: 'TOOL_RESULT', tool_call_id: 'call-w', tool_name: 'swarm_wait', status: 'DONE', content: 'wait done' }),
+      JSON.stringify({ step_index: 5, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] new board message #9' }),
+    ]
+    const allDoneParsed = parseMemberTranscriptTail(`${allDoneThenWake.join('\n')}\n`)
+    assert.equal(allDoneParsed.status, 'working', 'P1-2 positive control: waking SYSTEM_MESSAGE after truly settled wait batch starts working turn')
+    assert.equal(allDoneParsed.activity, '启动处理中…')
+
+    // P1-3: 17 task completions batched in a single SYSTEM_MESSAGE must NOT drop the 17th completion
+    const batch17Steps: string[] = []
+    const batch17Msgs: string[] = []
+    for (let i = 1; i <= 17; i += 1) {
+      const tid = `${WORKER_CONV}/task-${500 + i}`
+      batch17Steps.push(JSON.stringify({ step_index: i, type: 'GENERIC', status: 'RUNNING', content: `Tool is running as a background task with task id: ${tid}` }))
+      batch17Msgs.push(`[Message] timestamp=2026-11-28T08:20:00Z sender=${tid} priority=MESSAGE_PRIORITY_HIGH content=Task id "${tid}" finished with result: ok`)
+    }
+    batch17Steps.push(JSON.stringify({ step_index: 20, type: 'SYSTEM_MESSAGE', status: 'DONE', content: `<SYSTEM_MESSAGE>\n${batch17Msgs.join('\n')}\n</SYSTEM_MESSAGE>` }))
+    batch17Steps.push(JSON.stringify({ step_index: 21, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }))
+    const batch17Parsed = parseMemberTranscriptTail(`${batch17Steps.join('\n')}\n`)
+    assert.equal(batch17Parsed.status, 'waiting', 'P1-3: all 17 batched finish notifications must be folded without dropping #17')
+    assert.equal(batch17Parsed.waitingOnBoard, true)
+  } finally {
+    await rm(brainDir, { recursive: true, force: true })
+  }
+})
