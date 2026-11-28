@@ -14,64 +14,49 @@ export {
 }
 
 let turnReductionCandidateVisitsForTests = 0
-export function resetTurnReductionCandidateVisitsForTests(): void { turnReductionCandidateVisitsForTests = 0 }
+let turnReductionSetCopiesForTests = 0
+let turnReductionBucketWritesForTests = 0
+export function resetTurnReductionCandidateVisitsForTests(): void {
+  turnReductionCandidateVisitsForTests = 0
+  turnReductionSetCopiesForTests = 0
+  turnReductionBucketWritesForTests = 0
+}
 export function getTurnReductionCandidateVisitsForTests(): number { return turnReductionCandidateVisitsForTests }
+export function getTurnReductionMetricsForTests(): { candidateVisits: number; setCopies: number; bucketWrites: number } {
+  return { candidateVisits: turnReductionCandidateVisitsForTests, setCopies: turnReductionSetCopiesForTests, bucketWrites: turnReductionBucketWritesForTests }
+}
 
 const SWARM_MCP_TOOL_PREFIX = 'mcp_openclaude-memory_'
 
 /** Strip the container MCP prefix (`mcp_openclaude-memory_`) so remote swarm tools
- *  (`mcp_openclaude-memory_swarm_wait` / `_post_message` / `_read_board` / `_swarm`)
  *  normalize to the same canonical names as native Antigravity CLI tools. */
 export function normalizeSwarmToolName(raw: string): string {
   const trimmed = raw.trim()
-  if (trimmed.toLowerCase().startsWith(SWARM_MCP_TOOL_PREFIX)) {
-    return trimmed.slice(SWARM_MCP_TOOL_PREFIX.length)
-  }
-  return trimmed
+  return trimmed.toLowerCase().startsWith(SWARM_MCP_TOOL_PREFIX) ? trimmed.slice(SWARM_MCP_TOOL_PREFIX.length) : trimmed
 }
 
 function shortFileTarget(args: Record<string, unknown> | null): string {
   if (!args) return ''
-  const raw =
-    strOf(args.Path) ||
-    strOf(args.AbsolutePath) ||
-    strOf(args.TargetFile) ||
-    strOf(args.file_path) ||
-    strOf(args.path)
-  if (!raw) return ''
-  return basename(raw) || raw
+  const raw = strOf(args.Path) || strOf(args.AbsolutePath) || strOf(args.TargetFile) || strOf(args.file_path) || strOf(args.path)
+  return raw ? (basename(raw) || raw) : ''
 }
 
 const FILE_VERB_BY_TOOL: Readonly<Record<string, [string, string]>> = {
-  read_file: ['阅读 ', '阅读文件'],
-  view_file: ['阅读 ', '阅读文件'],
-  write_file: ['写入 ', '写入文件'],
-  write_to_file: ['写入 ', '写入文件'],
-  edit_file: ['编辑 ', '编辑文件'],
-  replace_file_content: ['编辑 ', '编辑文件'],
-  multi_replace_file_content: ['编辑 ', '编辑文件'],
-  sed_file: ['编辑 ', '编辑文件'],
+  read_file: ['阅读 ', '阅读文件'], view_file: ['阅读 ', '阅读文件'],
+  write_file: ['写入 ', '写入文件'], write_to_file: ['写入 ', '写入文件'],
+  edit_file: ['编辑 ', '编辑文件'], replace_file_content: ['编辑 ', '编辑文件'],
+  multi_replace_file_content: ['编辑 ', '编辑文件'], sed_file: ['编辑 ', '编辑文件'],
 }
 
 const STATIC_LABEL_BY_TOOL: Readonly<Record<string, string>> = {
-  run_command: '运行命令',
-  oc_bash: '运行命令',
-  grep_search: '检索代码',
-  oc_grep: '检索代码',
-  find_by_name: '浏览目录',
-  list_dir: '浏览目录',
-  oc_glob: '浏览目录',
-  search_web: '联网检索',
-  read_url_content: '抓取网页',
-  post_message: '发送讨论消息',
-  read_board: '查看讨论板',
-  swarm_wait: '等待讨论板消息',
+  run_command: '运行命令', oc_bash: '运行命令', grep_search: '检索代码', oc_grep: '检索代码',
+  find_by_name: '浏览目录', list_dir: '浏览目录', oc_glob: '浏览目录',
+  search_web: '联网检索', read_url_content: '抓取网页',
+  post_message: '发送讨论消息', read_board: '查看讨论板', swarm_wait: '等待讨论板消息',
 }
 
 const SWARM_ACTION_LABEL: Readonly<Record<string, string>> = {
-  add: '招募蜂群成员',
-  status: '检查蜂群状态',
-  kill: '回收蜂群成员',
+  add: '招募蜂群成员', status: '检查蜂群状态', kill: '回收蜂群成员',
 }
 
 export function describeToolActivity(toolName: string, args: Record<string, unknown> | null): string {
@@ -84,10 +69,7 @@ export function describeToolActivity(toolName: string, args: Record<string, unkn
   }
   const staticLabel = STATIC_LABEL_BY_TOOL[name]
   if (staticLabel) return staticLabel
-  if (name === 'swarm') {
-    const action = args ? strOf(args.action) : ''
-    return SWARM_ACTION_LABEL[action] ?? '调度蜂群'
-  }
+  if (name === 'swarm') return SWARM_ACTION_LABEL[args ? strOf(args.action) : ''] ?? '调度蜂群'
   if (rawName.startsWith('mcp_')) return `调用 ${rawName.split('_').slice(-1)[0] || rawName}`
   return name ? `执行 ${name}` : '处理中…'
 }
@@ -95,14 +77,8 @@ export function describeToolActivity(toolName: string, args: Record<string, unkn
 export function settleSwarmSnapshotTerminal(snap: SwarmSnapshot, phase: SwarmPhase): SwarmSnapshot {
   const { postsMode: _pm, deltaBaseSeq: _dbs, ...clean } = structuredClone(snap)
   return {
-    ...clean,
-    phase,
-    revision: snap.revision + 1,
-    updatedAt: Date.now(),
-    members: snap.members.map((m) => ({
-      ...m,
-      status: m.status === 'killed' ? 'killed' : 'waiting',
-    })),
+    ...clean, phase, revision: snap.revision + 1, updatedAt: Date.now(),
+    members: snap.members.map((m) => ({ ...m, status: m.status === 'killed' ? 'killed' : 'waiting' })),
   }
 }
 
@@ -110,25 +86,20 @@ export function settleSwarmSnapshotTerminal(snap: SwarmSnapshot, phase: SwarmPha
 export function formatSwarmWorkingDetail(snap: SwarmSnapshot): string {
   const working = snap.members.filter((m) => m.status === 'working' && m.role !== 'monitor' && m.role !== 'narrator').length
   const live = snap.members.filter((m) => m.status !== 'killed').length
-  const parts: string[] = [`蜂群「${snap.title}」`]
-  if (working > 0) parts.push(`${working} 成员运行中`)
-  else parts.push(`${live} 成员协作中`)
+  const parts: string[] = [`蜂群「${snap.title}」`, working > 0 ? `${working} 成员运行中` : `${live} 成员协作中`]
   if (snap.totalPosts > 0) parts.push(`${snap.totalPosts} 条讨论`)
   return parts.join(' · ')
 }
 
 export interface DurableSwarmBoardInput { swarmId: string; title: string; phase: SwarmPhase; snapshot: SwarmSnapshot }
 
-function durableEnvelopeFor(snapshot: SwarmSnapshot): DurableSwarmBoardInput {
-  return { swarmId: snapshot.swarmId, title: snapshot.title, phase: snapshot.phase, snapshot }
-}
-
 export function compactSwarmSnapshotForPersistence(snap: SwarmSnapshot, maxBytes = 13_000): SwarmSnapshot {
   return structuredClone(compactSwarmSnapshotToByteBudget(snap, maxBytes))
 }
 
 export function buildDurableSwarmBoardInput(snap: SwarmSnapshot, maxBytes = 13_000): DurableSwarmBoardInput {
-  return durableEnvelopeFor(compactSwarmSnapshotForPersistence(snap, maxBytes))
+  const snapshot = compactSwarmSnapshotForPersistence(snap, maxBytes)
+  return { swarmId: snapshot.swarmId, title: snapshot.title, phase: snapshot.phase, snapshot }
 }
 
 const BOARD_COORD_TOOLS = new Set(['swarm_wait', 'post_message', 'read_board'])
@@ -327,16 +298,11 @@ export function findTurnStartIndex(
 function recOf(v: unknown): Record<string, unknown> | null {
   return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null
 }
-
-function strOf(v: unknown): string {
-  return typeof v === 'string' ? v.trim() : ''
-}
-
+function strOf(v: unknown): string { return typeof v === 'string' ? v.trim() : '' }
 function normTool(raw: string): string {
   const t = raw.trim().toLowerCase()
   return t.startsWith('mcp_openclaude-memory_') ? t.slice('mcp_openclaude-memory_'.length) : t
 }
-
 export function firstNonBoardToolCall(calls: readonly unknown[]): Record<string, unknown> | null {
   for (const c of calls) {
     const obj = recOf(c)
@@ -345,41 +311,24 @@ export function firstNonBoardToolCall(calls: readonly unknown[]): Record<string,
   }
   return null
 }
-
-function stepCallId(obj: Record<string, unknown> | null): string {
-  if (!obj) return ''
-  return strOf(obj.tool_call_id || obj.call_id || obj.id)
-}
-
-function stepToolName(obj: Record<string, unknown> | null): string {
-  if (!obj) return ''
-  return normTool(strOf(obj.tool_name || obj.name))
-}
+function stepCallId(obj: Record<string, unknown> | null): string { return obj ? strOf(obj.tool_call_id || obj.call_id || obj.id) : '' }
+function stepToolName(obj: Record<string, unknown> | null): string { return obj ? normTool(strOf(obj.tool_name || obj.name)) : '' }
 
 interface TrackedToolCall {
-  readonly idx: number
-  name: string
-  readonly norm: string
-  id: string
-  readonly isBoard: boolean
-  args: Record<string, unknown> | null
-  readonly fromPlanner: boolean
-  boundDirect: boolean
-  readonly epoch: number
+  readonly idx: number; name: string; readonly norm: string; id: string; readonly isBoard: boolean
+  args: Record<string, unknown> | null; readonly fromPlanner: boolean; boundDirect: boolean; readonly epoch: number
 }
+interface TerminalToolStep { readonly id: string; readonly norm: string; readonly epoch: number }
 
-interface TerminalToolStep {
-  readonly id: string
-  readonly norm: string
-  readonly epoch: number
-}
+interface ArgsBucket { readonly indices: number[]; head: number; second: number }
+interface FallbackOverlay { readonly accounted: Set<number>; readonly idMatched: Set<string>; nonBoardCovered: number }
 
 interface CallReductionState {
   readonly calls: TrackedToolCall[]
   readonly callIndicesById: Map<string, number[]>
   readonly callsByEpoch: Map<number, number[]>
   readonly callsByEpochNorm: Map<string, number[]>
-  readonly unboundByEpochNormArgs: Map<string, number[]>
+  readonly unboundByEpochNormArgs: Map<string, ArgsBucket>
   readonly accounted: Set<number>
   readonly unaccountedNonBoard: Set<number>
   readonly idMatchedEpochNorms: Set<string>
@@ -387,7 +336,10 @@ interface CallReductionState {
   readonly plannerEpochCallCounts: Map<number, number>
   readonly genericTerminalsByEpoch: Map<number, number>
   readonly namedFallbacksByEpoch: Map<number, TerminalToolStep[]>
+  nonBoardNamedFallbackCount: number
   readonly pendingIdFallbacks: Map<string, TerminalToolStep>
+  readonly speculativeIdOwners: Map<string, number>
+  readonly exactIdSettled: Set<string>
   readonly seenTerminalIds: Set<string>
   readonly seenStepIndices: Set<number>
   readonly seenUnindexedPayloads: Set<string>
@@ -398,7 +350,8 @@ function createCallReductionState(): CallReductionState {
     calls: [], callIndicesById: new Map(), callsByEpoch: new Map(), callsByEpochNorm: new Map(),
     unboundByEpochNormArgs: new Map(), accounted: new Set(), unaccountedNonBoard: new Set(),
     idMatchedEpochNorms: new Set(), plannerEpochNormCounts: new Map(), plannerEpochCallCounts: new Map(),
-    genericTerminalsByEpoch: new Map(), namedFallbacksByEpoch: new Map(), pendingIdFallbacks: new Map(),
+    genericTerminalsByEpoch: new Map(), namedFallbacksByEpoch: new Map(), nonBoardNamedFallbackCount: 0,
+    pendingIdFallbacks: new Map(), speculativeIdOwners: new Map(), exactIdSettled: new Set(),
     seenTerminalIds: new Set(), seenStepIndices: new Set(), seenUnindexedPayloads: new Set(),
   }
 }
@@ -407,6 +360,18 @@ function pushBucketIndex<K, V = number>(map: Map<K, V[]>, key: K, item: V): void
   const bucket = map.get(key)
   if (bucket) bucket.push(item)
   else map.set(key, [item])
+}
+
+function pushArgsBucket(state: CallReductionState, key: string, idx: number): void {
+  turnReductionBucketWritesForTests += 1
+  const bucket = state.unboundByEpochNormArgs.get(key)
+  if (bucket) bucket.indices.push(idx)
+  else state.unboundByEpochNormArgs.set(key, { indices: [idx], head: 0, second: 1 })
+}
+
+function pushNamedFallback(state: CallReductionState, epoch: number, term: TerminalToolStep): void {
+  pushBucketIndex(state.namedFallbacksByEpoch, epoch, term)
+  if (!BOARD_COORD_TOOLS.has(term.norm)) state.nonBoardNamedFallbackCount += 1
 }
 
 function indexCallId(state: CallReductionState, id: string, idx: number): void {
@@ -418,17 +383,70 @@ function markCallAccounted(state: CallReductionState, idx: number): void {
   state.unaccountedNonBoard.delete(idx)
 }
 
+function unmarkCallAccounted(state: CallReductionState, idx: number): void {
+  state.accounted.delete(idx)
+  const c = state.calls[idx]
+  if (c && !c.isBoard) state.unaccountedNonBoard.add(idx)
+}
+
+function isCallAccounted(state: CallReductionState, overlay: FallbackOverlay | null, idx: number): boolean {
+  return state.accounted.has(idx) || (overlay?.accounted.has(idx) ?? false)
+}
+
+function recordFallbackMatch(state: CallReductionState, overlay: FallbackOverlay | null, idx: number): void {
+  if (!overlay) {
+    markCallAccounted(state, idx)
+    return
+  }
+  if (overlay.accounted.has(idx)) return
+  overlay.accounted.add(idx)
+  if (!state.calls[idx]!.isBoard) overlay.nonBoardCovered += 1
+}
+
+function recordFallbackIdMatched(state: CallReductionState, overlay: FallbackOverlay | null, key: string): void {
+  if (overlay) overlay.idMatched.add(key)
+  else state.idMatchedEpochNorms.add(key)
+}
+
+function claimTerminalIdForCall(
+  state: CallReductionState, idx: number, id: string, norm: string, epoch: number,
+): void {
+  if (!id || state.exactIdSettled.has(id)) return
+  const pending = state.pendingIdFallbacks.get(id)
+  if (pending) {
+    state.pendingIdFallbacks.delete(id)
+    state.exactIdSettled.add(id)
+    markCallAccounted(state, idx)
+    state.idMatchedEpochNorms.add(`${epoch}:${norm}`)
+    state.idMatchedEpochNorms.add(`${pending.epoch}:${norm}`)
+    return
+  }
+  const prevIdx = state.speculativeIdOwners.get(id)
+  if (prevIdx !== undefined) {
+    state.speculativeIdOwners.delete(id)
+    state.exactIdSettled.add(id)
+    if (prevIdx !== idx) unmarkCallAccounted(state, prevIdx)
+    markCallAccounted(state, idx)
+    state.idMatchedEpochNorms.add(`${epoch}:${norm}`)
+    const prevCall = state.calls[prevIdx]
+    if (prevCall) state.idMatchedEpochNorms.add(`${prevCall.epoch}:${prevCall.norm}`)
+  }
+}
+
 function findUnaccountedIndexById(
-  state: CallReductionState,
-  id: string,
-  accounted: ReadonlySet<number> = state.accounted,
+  state: CallReductionState, id: string, overlay: FallbackOverlay | null = null,
 ): number {
   const bucket = state.callIndicesById.get(id)
   if (!bucket) return -1
   for (const idx of bucket) {
-    if (!accounted.has(idx)) return idx
+    if (!isCallAccounted(state, overlay, idx)) return idx
   }
   return -1
+}
+
+function isUnboundPlannerCandidate(state: CallReductionState, idx: number): boolean {
+  const c = state.calls[idx]!
+  return !state.accounted.has(idx) && c.fromPlanner && !c.id && !c.boundDirect
 }
 
 function findUnboundPlannerCallByEpochNorm(
@@ -448,26 +466,22 @@ function findUniqueArgsMatchedUnboundPlannerCall(
   state: CallReductionState, epoch: number, norm: string, args: Record<string, unknown> | null,
 ): TrackedToolCall | null {
   if (!args) return null
-  const key = `${epoch}:${norm}:${JSON.stringify(args)}`
-  const bucket = state.unboundByEpochNormArgs.get(key)
-  if (!bucket || bucket.length === 0) return null
-  let matched: TrackedToolCall | null = null
-  let write = 0
-  for (let r = 0; r < bucket.length; r += 1) {
+  const bucket = state.unboundByEpochNormArgs.get(`${epoch}:${norm}:${JSON.stringify(args)}`)
+  if (!bucket) return null
+  const { indices } = bucket
+  while (bucket.head < indices.length) {
     turnReductionCandidateVisitsForTests += 1
-    const idx = bucket[r]!
-    const c = state.calls[idx]!
-    if (state.accounted.has(idx) || !c.fromPlanner || c.id || c.boundDirect) continue
-    bucket[write++] = idx
-    if (matched) {
-      while (++r < bucket.length) bucket[write++] = bucket[r]!
-      bucket.length = write
-      return null
-    }
-    matched = c
+    if (isUnboundPlannerCandidate(state, indices[bucket.head]!)) break
+    bucket.head += 1
   }
-  bucket.length = write
-  return matched
+  if (bucket.head >= indices.length) return null
+  if (bucket.second <= bucket.head) bucket.second = bucket.head + 1
+  while (bucket.second < indices.length) {
+    turnReductionCandidateVisitsForTests += 1
+    if (isUnboundPlannerCandidate(state, indices[bucket.second]!)) return null
+    bucket.second += 1
+  }
+  return state.calls[indices[bucket.head]!]!
 }
 
 function bindIdDirectCall(
@@ -491,11 +505,7 @@ function bindIdDirectCall(
   indexCallId(state, id, unbound.idx)
   unbound.boundDirect = true
   if (!unbound.args && args) unbound.args = args
-  if (state.seenTerminalIds.has(id)) {
-    markCallAccounted(state, unbound.idx)
-    state.idMatchedEpochNorms.add(`${unbound.epoch}:${norm}`)
-    state.pendingIdFallbacks.delete(id)
-  }
+  claimTerminalIdForCall(state, unbound.idx, id, norm, unbound.epoch)
   return true
 }
 
@@ -515,13 +525,8 @@ function bindUnidDirectCall(
 }
 
 function bindExistingOrPlannerCall(
-  state: CallReductionState,
-  norm: string,
-  id: string,
-  args: Record<string, unknown> | null,
-  fromPlanner: boolean,
-  hasPlannerRoot: boolean,
-  epoch: number,
+  state: CallReductionState, norm: string, id: string, args: Record<string, unknown> | null,
+  fromPlanner: boolean, hasPlannerRoot: boolean, epoch: number,
 ): boolean {
   if (id) return bindIdDirectCall(state, norm, id, args, fromPlanner, hasPlannerRoot, epoch)
   return bindUnidDirectCall(state, norm, args, fromPlanner, hasPlannerRoot, epoch)
@@ -540,13 +545,9 @@ function registerTrackedCallStart(
   indexCallId(state, id, idx)
   pushBucketIndex(state.callsByEpoch, epoch, idx)
   pushBucketIndex(state.callsByEpochNorm, `${epoch}:${norm}`, idx)
-  if (fromPlanner && !id && args !== null) pushBucketIndex(state.unboundByEpochNormArgs, `${epoch}:${norm}:${JSON.stringify(args)}`, idx)
+  if (fromPlanner && !id && args !== null) pushArgsBucket(state, `${epoch}:${norm}:${JSON.stringify(args)}`, idx)
   if (!isBoard) state.unaccountedNonBoard.add(idx)
-  if (id && state.seenTerminalIds.has(id)) {
-    markCallAccounted(state, idx)
-    state.idMatchedEpochNorms.add(`${epoch}:${norm}`)
-    state.pendingIdFallbacks.delete(id)
-  }
+  if (id) claimTerminalIdForCall(state, idx, id, norm, epoch)
 }
 
 function registerCallList(
@@ -601,29 +602,30 @@ function recordTerminalToolEvent(state: CallReductionState, step: Record<string,
     if (idx >= 0) {
       const matched = state.calls[idx]!
       markCallAccounted(state, idx)
+      state.exactIdSettled.add(cid)
       state.idMatchedEpochNorms.add(`${matched.epoch}:${matched.norm}`)
       state.idMatchedEpochNorms.add(`${epoch}:${matched.norm}`)
       return
     }
     const term: TerminalToolStep = { id: cid, norm: tname, epoch }
     state.pendingIdFallbacks.set(cid, term)
-    if (tname) pushBucketIndex(state.namedFallbacksByEpoch, epoch, term)
+    if (tname) pushNamedFallback(state, epoch, term)
     return
   }
-  if (tname) pushBucketIndex(state.namedFallbacksByEpoch, epoch, { id: '', norm: tname, epoch })
+  if (tname) pushNamedFallback(state, epoch, { id: '', norm: tname, epoch })
 }
 
 function findUnambiguousNameFallbackIndex(
-  state: CallReductionState, accounted: ReadonlySet<number>, idMatchedEpochNorms: ReadonlySet<string>, term: TerminalToolStep,
+  state: CallReductionState, overlay: FallbackOverlay | null, term: TerminalToolStep,
 ): number {
   const key = `${term.epoch}:${term.norm}`
-  if (idMatchedEpochNorms.has(key)) return -1
+  if (state.idMatchedEpochNorms.has(key) || overlay?.idMatched.has(key)) return -1
   const bucket = state.callsByEpochNorm.get(key)
   if (!bucket || bucket.length !== 1) return -1
   turnReductionCandidateVisitsForTests += 1
   const idx = bucket[0]!
   const c = state.calls[idx]!
-  if (accounted.has(idx) || (term.id && c.id)) return -1
+  if (isCallAccounted(state, overlay, idx) || (term.id && c.id)) return -1
   return idx
 }
 
@@ -635,12 +637,8 @@ function extractBatchCallsIfToolStep(step: Record<string, unknown>, stepType: st
 }
 
 function ingestTurnStep(
-  state: CallReductionState,
-  step: Record<string, unknown>,
-  hasPlannerRoot: boolean,
-  epoch: number,
-  bgTasks?: BackgroundTaskState,
-  knownStepType?: string,
+  state: CallReductionState, step: Record<string, unknown>, hasPlannerRoot: boolean, epoch: number,
+  bgTasks?: BackgroundTaskState, knownStepType?: string,
 ): void {
   const stepType = knownStepType ?? strOf(step.type).toUpperCase()
   if (stepType === 'SYSTEM_MESSAGE' || stepType === 'USER_INPUT') return
@@ -670,7 +668,7 @@ function ingestTurnStep(
 }
 
 function resolveGenericEpochForOne(
-  state: CallReductionState, epoch: number, genericCount: number, accounted: Set<number>, syncUnaccounted: boolean,
+  state: CallReductionState, epoch: number, genericCount: number, overlay: FallbackOverlay | null,
 ): void {
   const bucket = state.callsByEpoch.get(epoch)
   if (!bucket || bucket.length === 0) return
@@ -678,14 +676,11 @@ function resolveGenericEpochForOne(
   for (const idx of bucket) {
     turnReductionCandidateVisitsForTests += 1
     const c = state.calls[idx]!
-    if (c.fromPlanner && !c.id && !c.boundDirect && !accounted.has(idx)) retirableTargets.push(idx)
+    if (c.fromPlanner && !c.id && !c.boundDirect && !isCallAccounted(state, overlay, idx)) retirableTargets.push(idx)
   }
   const possibleAnonymousSources = Math.max(bucket.length, state.plannerEpochCallCounts.get(epoch) ?? 0)
   if (retirableTargets.length > 0 && genericCount >= possibleAnonymousSources) {
-    for (const idx of retirableTargets) {
-      accounted.add(idx)
-      if (syncUnaccounted) state.unaccountedNonBoard.delete(idx)
-    }
+    for (const idx of retirableTargets) recordFallbackMatch(state, overlay, idx)
   }
 }
 
@@ -693,69 +688,63 @@ function settleCompletedEpoch(state: CallReductionState, epoch: number): void {
   const named = state.namedFallbacksByEpoch.get(epoch)
   if (named) {
     for (const term of named) {
-      if (term.id && !state.pendingIdFallbacks.has(term.id)) continue
-      const idx = findUnambiguousNameFallbackIndex(state, state.accounted, state.idMatchedEpochNorms, term)
+      if (!BOARD_COORD_TOOLS.has(term.norm)) state.nonBoardNamedFallbackCount -= 1
+      if (term.id && (state.exactIdSettled.has(term.id) || !state.pendingIdFallbacks.has(term.id))) continue
+      const idx = findUnambiguousNameFallbackIndex(state, null, term)
       if (idx >= 0) {
         markCallAccounted(state, idx)
-        if (term.id) state.pendingIdFallbacks.delete(term.id)
+        if (term.id) {
+          state.pendingIdFallbacks.delete(term.id)
+          state.speculativeIdOwners.set(term.id, idx)
+        }
       }
     }
     state.namedFallbacksByEpoch.delete(epoch)
   }
   const genericCount = state.genericTerminalsByEpoch.get(epoch)
   if (genericCount !== undefined) {
-    resolveGenericEpochForOne(state, epoch, genericCount, state.accounted, true)
+    resolveGenericEpochForOne(state, epoch, genericCount, null)
     state.genericTerminalsByEpoch.delete(epoch)
   }
 }
 
-function resolveFallbackTerminals(
-  state: CallReductionState,
-  accounted: Set<number> = state.accounted,
-  idMatchedEpochNorms: Set<string> = state.idMatchedEpochNorms,
-  nonBoardOnly = false,
-): void {
-  const sync = accounted === state.accounted
-  const resolvedIds = new Set<string>()
+function resolveFallbackTerminals(state: CallReductionState, overlay: FallbackOverlay | null = null): void {
+  const nonBoardOnly = overlay !== null
+  const resolvedIds = state.pendingIdFallbacks.size > 0 ? new Set<string>() : null
   for (const term of state.pendingIdFallbacks.values()) {
-    const idx = findUnaccountedIndexById(state, term.id, accounted)
+    const idx = findUnaccountedIndexById(state, term.id, overlay)
     if (idx >= 0) {
       const matched = state.calls[idx]!
-      accounted.add(idx)
-      if (sync) state.unaccountedNonBoard.delete(idx)
-      idMatchedEpochNorms.add(`${matched.epoch}:${matched.norm}`)
-      idMatchedEpochNorms.add(`${term.epoch}:${matched.norm}`)
-      resolvedIds.add(term.id)
+      recordFallbackMatch(state, overlay, idx)
+      recordFallbackIdMatched(state, overlay, `${matched.epoch}:${matched.norm}`)
+      recordFallbackIdMatched(state, overlay, `${term.epoch}:${matched.norm}`)
+      resolvedIds!.add(term.id)
     }
   }
   for (const list of state.namedFallbacksByEpoch.values()) {
     for (const term of list) {
       if (nonBoardOnly && BOARD_COORD_TOOLS.has(term.norm)) continue
-      if (term.id && (resolvedIds.has(term.id) || !state.pendingIdFallbacks.has(term.id))) continue
-      const fallbackIdx = findUnambiguousNameFallbackIndex(state, accounted, idMatchedEpochNorms, term)
+      if (term.id && (resolvedIds?.has(term.id) || !state.pendingIdFallbacks.has(term.id))) continue
+      const fallbackIdx = findUnambiguousNameFallbackIndex(state, overlay, term)
       if (fallbackIdx >= 0) {
-        accounted.add(fallbackIdx)
-        if (sync) state.unaccountedNonBoard.delete(fallbackIdx)
+        recordFallbackMatch(state, overlay, fallbackIdx)
+        if (term.id && resolvedIds) resolvedIds.add(term.id)
       }
     }
   }
   for (const [epoch, genericCount] of state.genericTerminalsByEpoch.entries()) {
-    resolveGenericEpochForOne(state, epoch, genericCount, accounted, sync)
+    resolveGenericEpochForOne(state, epoch, genericCount, overlay)
   }
 }
 
 function hasUnaccountedNonBoardToolSnapshot(state: CallReductionState): boolean {
   if (state.unaccountedNonBoard.size === 0) return false
-  if (state.pendingIdFallbacks.size === 0 && state.namedFallbacksByEpoch.size === 0 && state.genericTerminalsByEpoch.size === 0) {
+  if (state.pendingIdFallbacks.size === 0 && state.nonBoardNamedFallbackCount === 0 && state.genericTerminalsByEpoch.size === 0) {
     return true
   }
-  const accounted = new Set(state.accounted)
-  const idMatched = new Set(state.idMatchedEpochNorms)
-  resolveFallbackTerminals(state, accounted, idMatched, true)
-  for (const idx of state.unaccountedNonBoard) {
-    if (!accounted.has(idx)) return true
-  }
-  return false
+  const overlay: FallbackOverlay = { accounted: new Set(), idMatched: new Set(), nonBoardCovered: 0 }
+  resolveFallbackTerminals(state, overlay)
+  return overlay.nonBoardCovered < state.unaccountedNonBoard.size
 }
 
 export function findActiveNonBoardToolInTurn(

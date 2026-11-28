@@ -2653,9 +2653,13 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
     assert.ok(measureAnonGenericVisits(64) <= 72, 'anonymous GENERIC DONE epochs must settle in O(N) (N=64)')
     assert.ok(measureAnonGenericVisits(128) <= 140, 'anonymous GENERIC DONE epochs must settle in O(N) (N=128)')
 
-    // Steward R4 Blocker (1): unfinished parallel tool across 32/64/128 epochs of named-without-ID swarm_wait + SYSTEM_MESSAGE
-    // must keep unfinished tool active AND settle named fallbacks in O(N) without replaying prior epochs
-    const measureUnfinishedWithNamedWaits = (nEpochs: number): number => {
+    // Steward R4/R5 Blocker (1): unfinished parallel tool across 32/64/128 epochs of named-without-ID swarm_wait + SYSTEM_MESSAGE
+    // must keep unfinished tool active with O(N) candidate visits AND zero historical set copies
+    const {
+      findActiveNonBoardToolInTurn,
+      getTurnReductionMetricsForTests,
+    } = await import('../engine/antigravitySwarmFormat.js')
+    const measureUnfinishedWithNamedWaits = (nEpochs: number) => {
       const seq: Record<string, unknown>[] = [
         { step_index: 0, type: 'USER_INPUT', status: 'DONE' },
         { step_index: 1, type: 'TOOL_CALL', tool_call_id: 'long-sibling', tool_name: 'run_command', status: 'ACTIVE', arguments: { CommandLine: 'sleep 999' } },
@@ -2668,36 +2672,126 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
       }
       resetTurnReductionCandidateVisitsForTests()
       assert.equal(findTurnStartIndex(seq), 0, 'unfinished parallel tool must remain active across named swarm_wait + SYSTEM_MESSAGE epochs')
-      return getTurnReductionCandidateVisitsForTests()
+      return getTurnReductionMetricsForTests()
     }
-    assert.ok(measureUnfinishedWithNamedWaits(32) <= 40, 'named fallback wait replay must be O(N) (N=32)')
-    assert.ok(measureUnfinishedWithNamedWaits(64) <= 72, 'named fallback wait replay must be O(N) (N=64)')
-    assert.ok(measureUnfinishedWithNamedWaits(128) <= 140, 'named fallback wait replay must be O(N) (N=128)')
+    for (const [n, maxVisits] of [[32, 40], [64, 72], [128, 140]] as const) {
+      const m = measureUnfinishedWithNamedWaits(n)
+      assert.ok(m.candidateVisits <= maxVisits, `named fallback wait visits must be O(N) (N=${n}, got=${m.candidateVisits})`)
+      assert.equal(m.setCopies, 0, `boundary snapshot must NEVER clone historical accounted set (N=${n})`)
+      assert.equal(m.bucketWrites, n, `wait-only epochs must have at most 1 bucket write/epoch (N=${n})`)
+    }
+    // Also verify non-board pending fallback during SYSTEM_MESSAGE uses delta overlay with 0 historical set copies
+    const measureNonBoardOverlaySnapshot = (nEpochs: number) => {
+      const seq: Record<string, unknown>[] = [
+        { step_index: 0, type: 'USER_INPUT', status: 'DONE' },
+        { step_index: 1, type: 'TOOL_CALL', tool_call_id: 'long-sibling', tool_name: 'run_command', status: 'ACTIVE', arguments: { CommandLine: 'sleep 999' } },
+      ]
+      let si = 2
+      for (let e = 0; e < nEpochs; e += 1) {
+        seq.push({ step_index: si++, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', arguments: { Path: `f${e}.ts` } }, { name: 'swarm_wait', arguments: { since: e + 1 } }] })
+        seq.push({ step_index: si++, type: 'TOOL_RESULT', tool_name: 'read_file', status: 'DONE', content: 'ok' })
+        seq.push({ step_index: si++, type: 'TOOL_RESULT', tool_name: 'swarm_wait', status: 'DONE', content: 'parked' })
+        seq.push({ step_index: si++, type: 'SYSTEM_MESSAGE', status: 'DONE', content: `tick ${e}` })
+      }
+      resetTurnReductionCandidateVisitsForTests()
+      assert.equal(findTurnStartIndex(seq), 0)
+      return getTurnReductionMetricsForTests()
+    }
+    for (const n of [32, 64, 128] as const) {
+      const m = measureNonBoardOverlaySnapshot(n)
+      assert.ok(m.candidateVisits <= 3 * n + 8, `non-board overlay visits must scale linearly (N=${n}, got=${m.candidateVisits})`)
+      assert.equal(m.setCopies, 0, `non-board overlay snapshot must do 0 historical set copies (N=${n})`)
+    }
 
-    // Steward R4 Blocker (2): single planner batch with 32/64/128 same-name distinct-args calls binding late direct IDs
-    // must index by (epoch, norm, argsJson) for O(N) visits while still refusing ambiguous identical-args binds
-    const measureSameNameBatchLateIds = (nCalls: number): number => {
+    // Steward R4/R5 Blocker (2): single planner batch with 32/64/128 same-name distinct-args OR ambiguous identical-args calls
+    // must keep BOTH candidate visits and bucket writes strictly O(N) (zero tail shifting on ambiguity)
+    const measureSameNameBatchLateIds = (nCalls: number, identicalArgs: boolean) => {
       const seq: Record<string, unknown>[] = [
         { step_index: 0, type: 'USER_INPUT', status: 'DONE' },
         {
           step_index: 1,
           type: 'PLANNER_RESPONSE',
           status: 'DONE',
-          tool_calls: Array.from({ length: nCalls }, (_, k) => ({ name: 'run_command', arguments: { CommandLine: `echo ${k}` } })),
+          tool_calls: Array.from({ length: nCalls }, (_, k) => ({
+            name: 'run_command',
+            arguments: { CommandLine: identicalArgs ? 'echo same' : `echo ${k}` },
+          })),
         },
       ]
       let si = 2
       for (let k = 0; k < nCalls; k += 1) {
-        seq.push({ step_index: si++, type: 'TOOL_CALL', tool_call_id: `batch-id-${k}`, tool_name: 'run_command', status: 'ACTIVE', arguments: { CommandLine: `echo ${k}` } })
+        const cmd = identicalArgs ? 'echo same' : `echo ${k}`
+        seq.push({ step_index: si++, type: 'TOOL_CALL', tool_call_id: `batch-id-${k}`, tool_name: 'run_command', status: 'ACTIVE', arguments: { CommandLine: cmd } })
         seq.push({ step_index: si++, type: 'TOOL_RESULT', tool_call_id: `batch-id-${k}`, tool_name: 'run_command', status: 'DONE', content: 'ok' })
       }
       resetTurnReductionCandidateVisitsForTests()
       assert.equal(findTurnStartIndex(seq), 0)
-      return getTurnReductionCandidateVisitsForTests()
+      return getTurnReductionMetricsForTests()
     }
-    assert.equal(measureSameNameBatchLateIds(32), 32, 'same-name distinct-args batch late ID bind must be 1 visit/call (N=32)')
-    assert.equal(measureSameNameBatchLateIds(64), 64, 'same-name distinct-args batch late ID bind must be 1 visit/call (N=64)')
-    assert.equal(measureSameNameBatchLateIds(128), 128, 'same-name distinct-args batch late ID bind must be 1 visit/call (N=128)')
+    for (const n of [32, 64, 128] as const) {
+      const distinct = measureSameNameBatchLateIds(n, false)
+      assert.equal(distinct.candidateVisits, n, `distinct-args batch visits must be 1*N (N=${n})`)
+      assert.equal(distinct.bucketWrites, n, `distinct-args batch bucket writes must be 1*N (N=${n})`)
+      const ambiguous = measureSameNameBatchLateIds(n, true)
+      assert.equal(ambiguous.candidateVisits, 2 * n, `ambiguous identical-args batch visits must be 2*N (N=${n})`)
+      assert.equal(ambiguous.bucketWrites, n, `ambiguous identical-args batch must NOT rewrite bucket tail (writes must be 1*N, N=${n})`)
+    }
+
+    // Steward R5 Blocker (boundaryIntegrity): ONE DONE credential with ID must NEVER settle two different calls across epochs.
+    // Five-step out-of-order record: Epoch 1 call A (no ID) + DONE(cid-B, run_command) -> Epoch 2 call B (no ID) + TOOL_CALL ACTIVE(cid-B, args B)
+    // must reassign cid-B to call B, keep call A active (working), and trigger 0 SwarmStallMonitor reclaims!
+    const crossEpochOutOfOrderSteps: Record<string, unknown>[] = [
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', arguments: { CommandLine: 'cmd-A' } }] },
+      { step_index: 2, type: 'TOOL_RESULT', tool_call_id: 'cid-B', tool_name: 'run_command', status: 'DONE', content: 'b done early' },
+      { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', arguments: { CommandLine: 'cmd-B' } }] },
+      { step_index: 4, type: 'TOOL_CALL', tool_call_id: 'cid-B', tool_name: 'run_command', status: 'ACTIVE', arguments: { CommandLine: 'cmd-B' } },
+      { step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    const activeA = findActiveNonBoardToolInTurn(crossEpochOutOfOrderSteps, 4, [{ name: 'swarm_wait', arguments: { since: 1 } }])
+    assert.deepEqual(activeA, { name: 'run_command', args: { CommandLine: 'cmd-A' } }, 'R5: single DONE(cid-B) must NOT settle both call A and call B')
+    await writeFile(workerTranscript, `${crossEpochOutOfOrderSteps.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r5Snap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 80 })!
+    const r5Worker = r5Snap.members.find((m) => m.name === 'parser')!
+    assert.equal(r5Worker.status, 'working', 'R5: watcher must classify worker as working while call A remains active')
+    let r5Reclaimed = 0
+    const r5Mon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { r5Reclaimed += 1 },
+    })
+    r5Mon.evaluate(r5Snap, 1_000)
+    r5Mon.evaluate({ ...r5Snap, revision: 81 }, 3_000)
+    r5Mon.evaluate({ ...r5Snap, revision: 82 }, 5_000)
+    assert.equal(r5Reclaimed, 0, 'R5: single DONE(cid-B) must NOT trigger SwarmStallMonitor reclaim while call A is active')
+    // Also verify direct-start variant (no planner call B in epoch 2, direct TOOL_CALL ACTIVE with cid-B)
+    const crossEpochDirectSteps: Record<string, unknown>[] = [
+      crossEpochOutOfOrderSteps[0]!,
+      crossEpochOutOfOrderSteps[1]!,
+      { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+      { step_index: 4, type: 'TOOL_CALL', tool_call_id: 'cid-B', tool_name: 'run_command', status: 'ACTIVE', arguments: { CommandLine: 'cmd-B' } },
+    ]
+    const activeADirect = findActiveNonBoardToolInTurn(crossEpochDirectSteps, 2, [{ name: 'swarm_wait', arguments: { since: 1 } }])
+    assert.deepEqual(activeADirect, { name: 'run_command', args: { CommandLine: 'cmd-A' } }, 'R5 direct variant: call A must stay active when direct call B claims cid-B')
+    // Positive control: once call A also receives its own DONE (in epoch 1), worker returns to waiting and reclaimable (1)
+    const crossEpochBothDone = [
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ id: 'cid-A', name: 'run_command', arguments: { CommandLine: 'cmd-A' } }] },
+      { step_index: 2, type: 'TOOL_RESULT', tool_call_id: 'cid-B', tool_name: 'run_command', status: 'DONE', content: 'b done early' },
+      { step_index: 3, type: 'TOOL_RESULT', tool_call_id: 'cid-A', tool_name: 'run_command', status: 'DONE', content: 'a done' },
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', arguments: { CommandLine: 'cmd-B' } }] },
+      { step_index: 5, type: 'TOOL_CALL', tool_call_id: 'cid-B', tool_name: 'run_command', status: 'ACTIVE', arguments: { CommandLine: 'cmd-B' } },
+      { step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    await writeFile(workerTranscript, `${crossEpochBothDone.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r5DoneSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 83 })!
+    assert.equal(r5DoneSnap.members.find((m) => m.name === 'parser')!.status, 'waiting', 'R5 positive control: settling both calls restores waiting')
+    let r5DoneReclaimed = 0
+    const r5DoneMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { r5DoneReclaimed += 1 },
+    })
+    r5DoneMon.evaluate(r5DoneSnap, 1_000)
+    r5DoneMon.evaluate({ ...r5DoneSnap, revision: 84 }, 3_000)
+    r5DoneMon.evaluate({ ...r5DoneSnap, revision: 85 }, 5_000)
+    assert.equal(r5DoneReclaimed, 1, 'R5 positive control: genuine deadlock reclaims once both calls settle')
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }
