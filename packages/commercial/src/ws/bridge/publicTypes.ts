@@ -86,6 +86,8 @@ export interface UserChatBridgeDeps {
     canonicalModel: string;
     engine: string;
     placement: "local" | "remote_pool";
+    requiredCapabilities?: import("@openclaude/protocol").RequiredTurnCapabilities;
+    systemPromptSha256?: string;
   }) => Promise<RemoteExecutionBackend | undefined>;
   crossPoolFallbackSelector?: RemotePoolSealDeps<SealExecLike>["crossPoolFallbackSelector"];
   returnToRemoteGrantResolver?: RemotePoolSealDeps<SealExecLike>["returnToRemoteGrantResolver"];

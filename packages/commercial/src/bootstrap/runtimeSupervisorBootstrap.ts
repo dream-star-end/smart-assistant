@@ -1,9 +1,4 @@
-/**
- * Plugins runtime, Grok relay route allocation, V3 container supervisor wiring,
- * remote sshMux/media/preheat helpers, direct preview, and ChatGPT proxy bootstrap.
- *
- * Extracted from packages/commercial/src/index.ts (OCV5-830).
- */
+/** Plugins runtime, Grok relay, V3 supervisor, sshMux/media/preheat, and preview bootstrap (OCV5-830). */
 import { homedir } from "node:os";
 import * as path from "node:path";
 import Docker from "dockerode";
@@ -183,6 +178,7 @@ export function createCasAwareUserMediaResolver(deps: {
   docker: DockerLike;
   getBlobStore?: () => LocalCasArtifactBlobStore | undefined;
   bridgeRootDir?: string;
+  preserveRemoteHost?: boolean;
 }): (userId: string) => Promise<UserMediaLocation> {
   return createCasBridgedUserMediaResolver({
     ...deps,

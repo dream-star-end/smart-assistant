@@ -186,7 +186,8 @@ import {
   type V3SupervisorDeps,
 } from "./agent-sandbox/index.js";
 import * as computeQueries from "./compute-pool/queries.js";
-import { resolveServiceableHostTarget, getFile as nodeAgentGetFile } from "./compute-pool/nodeAgentClient.js";
+import { createCasAwareRemoteMediaPuller } from "./bootstrap/runtimeSupervisorBootstrap.js";
+import { createCasMediaChunkMirrorCallbacks } from "./agent-sandbox/artifactBlobRuntime.js";
 import { createRemoteHostChunkHooks } from "./compute-pool/remoteHostChunkHooks.js";
 import { initComputePool } from "./compute-pool/poolInit.js";
 import { getImagePromoteScheduler } from "./compute-pool/imagePromote.js";
@@ -1205,7 +1206,7 @@ export async function registerCommercial(
   knowledgePlanetMediaResolverRef.current = userMediaResolver;
   museDeliveryRefs.pushRemote = pushRemoteHostUpload;
 
-  const chunkHooks = createRemoteHostChunkHooks();
+  const chunkHooks = createRemoteHostChunkHooks(createCasMediaChunkMirrorCallbacks(() => artifactBlobStore));
   const dockerEnsureRunning: ResolveContainerEndpoint =
     makeInboundChannelResolver(sharedEnsureRunning);
   const resolveContainerEndpoint: ResolveContainerEndpoint =
@@ -1829,17 +1830,7 @@ export async function registerCommercial(
       : undefined,
     preheatUserContainer,
     pushRemoteHostUpload,
-    pullRemoteHostMedia: async (args: {
-      hostUuid: string;
-      remotePath: string;
-    }) => {
-      const target = await resolveServiceableHostTarget(args.hostUuid);
-      try {
-        return await nodeAgentGetFile(target, args.remotePath);
-      } finally {
-        target.psk?.fill(0);
-      }
-    },
+    pullRemoteHostMedia: createCasAwareRemoteMediaPuller(() => artifactBlobStore),
     ...chunkHooks,
     probeDeps: createCommercialProbeDeps(redis),
     wechatBroker: wechatBroker

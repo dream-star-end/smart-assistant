@@ -146,6 +146,7 @@ async function mintAuditSealAndForwardZcode(args: {
     const sealed = await sealAuthorityFieldsOrReject(ctx, {
       exec: authorityExec,
       billingRequestId: requestId,
+      inboundFrame: enriched,
       log: logCapture,
       onReject: rejectPromptQueueDispatch,
       turn: zcodeTurnIdentity,

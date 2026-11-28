@@ -355,6 +355,8 @@ export interface RemotePoolSealDeps<TExec extends SealExecLike> {
   readonly exec: TExec;
   readonly billingRequestId?: string;
   readonly authorityTurnId?: string;
+  readonly requiredCapabilities?: import("@openclaude/protocol").RequiredTurnCapabilities;
+  readonly systemPromptSha256?: string;
   readonly log: Logger | null;
   readonly cc5BackendSelector?: (input: {
     uid: number;
@@ -363,6 +365,8 @@ export interface RemotePoolSealDeps<TExec extends SealExecLike> {
     canonicalModel: string;
     engine: string;
     placement: "local" | "remote_pool";
+    requiredCapabilities?: import("@openclaude/protocol").RequiredTurnCapabilities;
+    systemPromptSha256?: string;
   }) => Promise<RemoteExecutionBackend | undefined>;
   readonly crossPoolFallbackSelector?: (args: {
     uid: number;
@@ -373,6 +377,7 @@ export interface RemotePoolSealDeps<TExec extends SealExecLike> {
     engine: string;
     cause: unknown;
     expectedSecurityEpoch?: number;
+    requiredCapabilities?: import("@openclaude/protocol").RequiredTurnCapabilities;
     historicalMessages?: readonly unknown[];
     excludeClientMessageId?: string;
     prepareRollingCheckpoint?: PrepareRollingCheckpointCallback;
@@ -449,22 +454,13 @@ export interface RemotePoolSealDeps<TExec extends SealExecLike> {
     readonly operationId: string;
     readonly profileId?: string;
   }) => Promise<void>;
-  /**
-   * Mints authentic local billing + transport route credentials for non-egress-billed
-   * engines (`codex` / `antigravity`) BEFORE PG `placementEpoch` commit.
-   * Must return `null` (or throw) if local billing/route cannot be established.
-   */
+  /** Mints local billing + route credentials BEFORE PG `placementEpoch` commit. */
   readonly prepareLocalFallbackTransport?: (args: {
     readonly localExec: TExec;
     readonly billingRequestId?: string;
     readonly authorityTurnId?: string;
   }) => Promise<PreparedLocalFallbackTransport | null>;
-  /**
-   * Exposes the idempotent compensation + forward lifecycle handle to the outer bridge
-   * ONLY when fallback sealing succeeds and commits, so post-seal failures (`cleaned`,
-   * `ERR_FRAME_TOO_BIG`, container forward rejection, prompt-queue cancel) still unwind
-   * all local billing/route resources with zero leakage.
-   */
+  /** Exposes idempotent compensation + wire lifecycle handle once fallback commits. */
   readonly onLocalFallbackCommitted?: (handle: LocalFallbackCommittedHandle) => void;
   readonly resolveLocalExec?: (canonicalModel: string) => Promise<TExec | null>;
   readonly isModelAllowed?: (canonicalModel: string) => boolean;
@@ -479,12 +475,23 @@ export interface RemotePoolSealDeps<TExec extends SealExecLike> {
   readonly reject: (code: string, message: string, reason: string) => Promise<null>;
 }
 
-/**
- * Resolves the remote execution backend (including return-to-remote migration grant
- * and two-phase cross-pool fallback to local CCB/Codex/Antigravity) and seals the
- * model authority fields.
- * Extracted from `userChatBridge.ts` to keep the bridge under the file-size ratchet cap.
- */
+function buildCc5SelectorRequest<TExec extends SealExecLike>(
+  input: RemotePoolSealDeps<TExec>,
+  containerId: number,
+  sessionKey: string,
+) {
+  return {
+    uid: input.uid,
+    containerId,
+    sessionKey,
+    canonicalModel: input.exec.canonicalModel,
+    engine: input.exec.engine,
+    placement: input.exec.placement,
+    ...(input.requiredCapabilities !== undefined ? { requiredCapabilities: input.requiredCapabilities } : {}),
+    ...(input.systemPromptSha256 !== undefined ? { systemPromptSha256: input.systemPromptSha256 } : {}),
+  };
+}
+
 export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike>(
   input: RemotePoolSealDeps<TExec>,
 ): Promise<Record<string, unknown> | null> {
@@ -518,14 +525,9 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
       if (!input.sessionKey || !input.cc5BackendSelector || input.containerId === undefined) {
         throw new Error("REMOTE_LANE_UNAVAILABLE");
       }
-      executionBackend = await input.cc5BackendSelector({
-        uid: input.uid,
-        containerId: input.containerId,
-        sessionKey: input.sessionKey,
-        canonicalModel: input.exec.canonicalModel,
-        engine: input.exec.engine,
-        placement: input.exec.placement,
-      });
+      executionBackend = await input.cc5BackendSelector(
+        buildCc5SelectorRequest(input, input.containerId, input.sessionKey),
+      );
       if (!executionBackend) throw new Error("REMOTE_LANE_UNAVAILABLE");
       if (input.returnToRemoteGrantResolver) {
         let returnEpochDrifted = false;
@@ -831,18 +833,11 @@ export async function resolveRemotePoolBackendAndSeal<TExec extends SealExecLike
               engine: input.exec.engine,
               cause: err,
               expectedSecurityEpoch: input.exec.securityEpoch,
-              ...(input.historicalMessages !== undefined
-                ? { historicalMessages: input.historicalMessages }
-                : {}),
-              ...(input.excludeClientMessageId !== undefined
-                ? { excludeClientMessageId: input.excludeClientMessageId }
-                : {}),
-              ...(input.prepareRollingCheckpoint !== undefined
-                ? { prepareRollingCheckpoint: input.prepareRollingCheckpoint }
-                : {}),
-              ...(continuityVerifier !== undefined
-                ? { verifyContinuityApplied: continuityVerifier }
-                : {}),
+              requiredCapabilities: input.requiredCapabilities,
+              historicalMessages: input.historicalMessages,
+              excludeClientMessageId: input.excludeClientMessageId,
+              prepareRollingCheckpoint: input.prepareRollingCheckpoint,
+              verifyContinuityApplied: continuityVerifier,
               validateTargetSignable: async (target) => {
                 if (
                   engineRequiresLocalFallbackTransport(target.engine) &&

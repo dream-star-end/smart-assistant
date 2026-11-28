@@ -131,6 +131,10 @@ export async function placeSelfhostRemoteLaneOnce(
   const pool = deps.getPool()
   const selected = await resolveSelfhostDriverV4Selection(pool, request, deps)
   if (selected.driverId) {
+    const rankedCandidateKeys =
+      selected.routeResult && selected.routeResult.ok
+        ? selected.routeResult.rankedCandidateKeys
+        : undefined
     const v4 = await placeRemoteDriverLane(
       {
         uid: request.uid,
@@ -139,6 +143,12 @@ export async function placeSelfhostRemoteLaneOnce(
         sessionKey: request.sessionKey,
         canonicalModel: request.canonicalModel,
         driverId: selected.driverId,
+        ...(selected.selectedProfileId ? { preferredProfileId: selected.selectedProfileId } : {}),
+        ...(selected.selectedNodeId ? { preferredNodeId: selected.selectedNodeId } : {}),
+        ...(rankedCandidateKeys ? { rankedCandidateKeys } : {}),
+        ...(request.requiredCapabilities
+          ? { requiredCapabilities: request.requiredCapabilities }
+          : {}),
       },
       {
         pool,

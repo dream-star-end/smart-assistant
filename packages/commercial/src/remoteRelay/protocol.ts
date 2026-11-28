@@ -299,9 +299,57 @@ const HTTP_503_ERROR_CODES: ReadonlySet<string> = new Set([
 
 const HTTP_400_ERROR_CODES: ReadonlySet<string> = new Set([
   'CC5_FRESH_CONTAINER_BINDING_REJECTED',
+  'CAPABILITY_UNSATISFIED',
   'INVALID_REQUEST',
   'INVALID_JSON',
 ])
+
+const RELAY_EFFORTS: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh'])
+const RELAY_TIERS: ReadonlySet<string> = new Set(['standard', 'priority', 'flex'])
+const RELAY_CAP_BOOL_KEYS = [
+  'needsVision',
+  'readOnly',
+  'consultTurn',
+  'hermeticNoTools',
+  'needsSwarm',
+] as const
+
+export function parseRelayRequiredTurnCapabilities(raw: unknown): Record<string, unknown> | undefined {
+  if (raw === undefined) return undefined
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('INVALID_REQUIRED_CAPABILITIES')
+  }
+  const obj = raw as Record<string, unknown>
+  for (const key of Object.keys(obj)) {
+    if (
+      key !== 'reasoningEffort' &&
+      key !== 'serviceTier' &&
+      !(RELAY_CAP_BOOL_KEYS as readonly string[]).includes(key)
+    ) {
+      throw new Error('INVALID_REQUIRED_CAPABILITIES')
+    }
+  }
+  const out: Record<string, unknown> = {}
+  for (const bKey of RELAY_CAP_BOOL_KEYS) {
+    if (obj[bKey] !== undefined) {
+      if (typeof obj[bKey] !== 'boolean') throw new Error('INVALID_REQUIRED_CAPABILITIES')
+      out[bKey] = obj[bKey]
+    }
+  }
+  if (obj.reasoningEffort !== undefined) {
+    if (typeof obj.reasoningEffort !== 'string' || !RELAY_EFFORTS.has(obj.reasoningEffort)) {
+      throw new Error('INVALID_REQUIRED_CAPABILITIES')
+    }
+    out.reasoningEffort = obj.reasoningEffort
+  }
+  if (obj.serviceTier !== undefined) {
+    if (typeof obj.serviceTier !== 'string' || !RELAY_TIERS.has(obj.serviceTier)) {
+      throw new Error('INVALID_REQUIRED_CAPABILITIES')
+    }
+    out.serviceTier = obj.serviceTier
+  }
+  return out
+}
 
 export function httpStatusForRpcError(code: string): number {
   if (code === 'UNAUTHORIZED') return 401

@@ -15,6 +15,7 @@ import {
   INFERENCE_SERVICE_TIERS,
   PLATFORM_REASONING_EFFORTS,
   authorityEngineToInferenceFamily,
+  checkCapabilitySuperset,
   resolveLogicalModelId,
   validateDriverCapabilityManifest,
   validateRemoteProbeSnapshot,
@@ -158,6 +159,34 @@ function deriveModelCapabilityFromProbe(
     supportsSwarm: true,
     supportsAdaptiveThinking,
   })
+}
+
+export function doesRemoteProfileSatisfyCapabilities(params: {
+  readonly canonicalModel: string
+  readonly upstreamModelId: string
+  readonly probeSnapshot: unknown
+  readonly reg: RemoteDriverRegistryEntry
+  readonly requiredCapabilities?: RequiredTurnCapabilities
+  readonly observedAt?: string
+}): boolean {
+  if (!params.requiredCapabilities || Object.keys(params.requiredCapabilities).length === 0) {
+    return true
+  }
+  const { logicalModel } = resolveLogicalModelId(params.canonicalModel)
+  const normalizedUpstream =
+    params.upstreamModelId.trim().length > 0 ? params.upstreamModelId.trim().toLowerCase() : logicalModel
+  const capability = deriveModelCapabilityFromProbe(logicalModel, normalizedUpstream, params.probeSnapshot)
+  const manifest: DriverCapabilityManifest = validateDriverCapabilityManifest({
+    schemaVersion: 5,
+    poolKind: 'remote_pool',
+    engineFamily: authorityEngineToInferenceFamily(params.reg.authorityEngine),
+    authorityEngine: params.reg.authorityEngine,
+    driverId: params.reg.driverId,
+    driverVersion: params.reg.driverVersion,
+    observedAt: params.observedAt ?? '2026-01-01T00:00:00.000Z',
+    models: [capability],
+  })
+  return checkCapabilitySuperset(manifest, logicalModel, params.requiredCapabilities).satisfied
 }
 
 function buildRemoteCandidateDescriptor(params: {

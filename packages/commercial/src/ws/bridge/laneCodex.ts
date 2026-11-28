@@ -250,6 +250,7 @@ async function sealAndForwardUnbilledCodexTurn(args: {
   if (authorityExec !== null) {
     const sealed = await sealAuthorityFieldsOrReject(ctx, {
       exec: authorityExec,
+      inboundFrame: preparedInbound,
       log: turnLogCapture,
       onReject: lane.rejectPromptQueueDispatch,
       turn: turnIdentity,

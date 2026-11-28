@@ -1,14 +1,5 @@
 /**
- * OCV5-890 Wave 1B — Content-Addressed Artifact Blob Store & Remote Media Bridge.
- *
- * Implements L0 `ArtifactBlobStore` backed by a local content-addressed store
- * (`objects/<sha[0..2]>/<sha>`), multipart chunked staging (`staging/<uploadId>`),
- * safe hardlink/copy materialization (`O_NOFOLLOW` + sha256 verification),
- * short-lived RFC 2104 SHA-256 signed tickets, fail-closed GC, and the
- * `resolveMediaOrBlobBridge` bridge for `userMedia.ts`.
- *
- * Layer: app-container (L4). Zero `process.env` reads; zero forbidden `R3-crypto`
- * calls (`createHash` + `randomUUID` only); zero engine/provider literal special cases.
+ * OCV5-890 Wave 1B — Content-Addressed Artifact Blob Store & Remote Media Bridge (`app-container` L4).
  */
 import { createHash, randomUUID } from 'node:crypto'
 import {
@@ -26,12 +17,12 @@ import {
   readFileSync,
   readdirSync,
   readSync,
-  realpathSync,
   renameSync,
   rmSync,
   unlinkSync,
   writeSync,
 } from 'node:fs'
+import { lstat, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import {
@@ -122,19 +113,14 @@ export interface MaterializeBlobInput {
   readonly blobId: string
   readonly targetDir: string
   readonly relativePath: string
-  /**
-   * Optional strategy (`'copy'` | `'hardlink_or_copy'`) or numeric POSIX file mode
-   * (e.g. `0o444`, `0o600`). Default materialization is ALWAYS safe copy.
-   */
+  /** Strategy (`'copy'` | `'hardlink_or_copy'`) or POSIX mode; defaults to safe copy. */
   readonly mode?: 'hardlink_or_copy' | 'copy' | number
-  /**
-   * Opt-in hardlink permission (default: `false`). Even when `true`, hardlink is
-   * ONLY permitted when the requested target file mode is explicitly non-writable
-   * (`(mode & 0o222) === 0`) AND the CAS object on disk is read-only (`0o444`).
-   */
+  /** Opt-in hardlink (only when target & CAS object are both read-only `(mode & 0o222) === 0`). */
   readonly allowHardlink?: boolean
   readonly fileMode?: number
   readonly overwrite?: boolean
+  /** Optional trusted root directory; `targetDir` must resolve strictly inside it without symlinks. */
+  readonly trustedRootDir?: string
 }
 
 export interface MaterializeBlobResult {
@@ -382,20 +368,40 @@ function readRegularFileNoFollowAndHash(filePath: string): {
   }
 }
 
+async function lstatExistingOrNull(targetPath: string) {
+  try {
+    return await lstat(targetPath)
+  } catch (err: unknown) {
+    if (typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT') return null
+    throw err
+  }
+}
+
+async function resolveVerifiedMaterializeTargetDir(targetDir: string, trustedRootDir?: string): Promise<string> {
+  assertCondition(typeof targetDir === 'string' && targetDir.length > 0, 'BLOB_MATERIALIZE_TARGET_DIR_INVALID')
+  const targetDirLstat = await lstatExistingOrNull(targetDir)
+  assertCondition(targetDirLstat !== null, 'BLOB_MATERIALIZE_TARGET_DIR_INVALID')
+  assertCondition(!targetDirLstat.isSymbolicLink(), 'BLOB_MATERIALIZE_SYMLINK_FORBIDDEN')
+  assertCondition(targetDirLstat.isDirectory(), 'BLOB_MATERIALIZE_TARGET_DIR_INVALID')
+  const realTargetDir = await realpath(targetDir)
+  if (trustedRootDir !== undefined) {
+    assertCondition(typeof trustedRootDir === 'string' && trustedRootDir.length > 0, 'BLOB_MATERIALIZE_UNTRUSTED_TARGET_DIR')
+    const rootLstat = await lstatExistingOrNull(trustedRootDir)
+    assertCondition(rootLstat !== null && !rootLstat.isSymbolicLink() && rootLstat.isDirectory(), 'BLOB_MATERIALIZE_UNTRUSTED_TARGET_DIR')
+    const realTrustedRoot = await realpath(trustedRootDir)
+    assertCondition(realTargetDir === realTrustedRoot || realTargetDir.startsWith(`${realTrustedRoot}${path.sep}`), 'BLOB_MATERIALIZE_UNTRUSTED_TARGET_DIR')
+  }
+  return realTargetDir
+}
+
 function syncDirectoryBestEffort(dirPath: string): void {
   let fd: number | undefined
   try {
     fd = openSync(dirPath, fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0))
     fsyncSync(fd)
-  } catch {
-    // Some filesystems do not support directory fsync; file fsync already succeeded.
-  } finally {
+  } catch { /* unsupported fsync */ } finally {
     if (fd !== undefined) {
-      try {
-        closeSync(fd)
-      } catch {
-        // ignore
-      }
+      try { closeSync(fd) } catch { /* ignore */ }
     }
   }
 }
@@ -1009,13 +1015,7 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
     assertCondition(existsSync(objectPath), 'BLOB_OBJECT_MISSING')
 
     const segments = parseSafeRelativeSegments(input.relativePath)
-    assertCondition(
-      typeof input.targetDir === 'string' &&
-        input.targetDir.length > 0 &&
-        existsSync(input.targetDir),
-      'BLOB_MATERIALIZE_TARGET_DIR_INVALID',
-    )
-    const realTargetDir = realpathSync(input.targetDir)
+    const realTargetDir = await resolveVerifiedMaterializeTargetDir(input.targetDir, input.trustedRootDir)
 
     let currentDir = realTargetDir
     for (let i = 0; i < segments.length - 1; i += 1) {
@@ -1328,9 +1328,5 @@ export function resolveMediaOrBlobBridge(
       tenantId: `c:${location.uid}`,
     })
   }
-  return Object.freeze({
-    kind: 'fail',
-    reason: location.reason,
-    logCtx: location.logCtx,
-  })
+  return Object.freeze({ kind: 'fail', reason: location.reason, logCtx: location.logCtx })
 }

@@ -512,6 +512,7 @@ test('W2-CS2: remote-host container without local Master volume serves HTTP 200 
       pool: containerPool,
       docker: missingVolumeDocker,
       getBlobStore: () => activeStore,
+      preserveRemoteHost: false,
     })
 
     const unbridged = resolveMasterMediaWithBlobBridge(await prodResolver('c:42'), undefined)
@@ -562,6 +563,7 @@ test('W2-CS2: pushRemoteHostUpload idempotently registers CAS blobs, pullRemoteH
       pool: createContainerPlacementPgPool(),
       docker: missingVolumeDocker,
       getBlobStore: () => blobStore,
+      preserveRemoteHost: false,
     })
 
     let nodeAgentPuts = 0
@@ -629,10 +631,8 @@ test('W2-CS2: pushRemoteHostUpload idempotently registers CAS blobs, pullRemoteH
       { blobStore },
     )
     assert.equal(localBridged.kind, 'ok')
-    assert.equal(
-      (await readFile(path.join(localGenerated, 'report.txt'))).toString('utf8'),
-      'local-backfill-ok',
-    )
+    // B1 invariant: Master NEVER backfills CAS blobs into user-writable local volume dirs.
+    await assert.rejects(() => stat(path.join(localGenerated, 'report.txt')), /ENOENT/)
   } finally {
     await rm(tmpRoot, { recursive: true, force: true })
   }

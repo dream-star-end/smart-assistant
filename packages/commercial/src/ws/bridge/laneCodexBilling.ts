@@ -513,6 +513,7 @@ export async function sealAndForwardBilledCodexTurn(args: {
         exec: authorityExec,
         billingRequestId: billing.requestId,
         ...(billing.authorityTurnId === null ? {} : { authorityTurnId: billing.authorityTurnId }),
+        inboundFrame: preparedInbound,
         log: turnLogCapture,
         onReject: lane.rejectPromptQueueDispatch,
         turn: turnIdentity,

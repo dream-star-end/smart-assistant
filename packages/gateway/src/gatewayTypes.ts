@@ -109,6 +109,18 @@ export interface CommercialHook {
     dest: NodeJS.WritableStream
     onReady: (info: { size: number }) => boolean
   }) => Promise<'ok' | 'missing' | 'rejected'>
+  openCasMediaFallback?: (args: {
+    userId: string
+    filename: string
+    dest: NodeJS.WritableStream
+    resolveRange?: (totalSize: number) => { start: number; end: number } | null
+    isHead?: boolean
+    onReady: (info: {
+      totalSize: number
+      range: { start: number; end: number } | null
+      contentLength: number
+    }) => boolean
+  }) => Promise<'ok' | 'missing' | 'rejected'>
   /**
    * **textual** 谓词:判定 `resolvedPath` 是否长得像
    * `/var/lib/docker/volumes/oc-v3-data-u<digits>/_data/(uploads|generated)[/<file>]`。

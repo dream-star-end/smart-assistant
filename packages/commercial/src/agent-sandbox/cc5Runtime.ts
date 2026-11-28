@@ -11,6 +11,7 @@ import {
   CC5_TEST_UID_ENV,
   type Cc5PolicyEnvironment,
   type RemoteExecutionBackend,
+  type RequiredTurnCapabilities,
   canUseCc5TestModel,
   isRemoteBackendAuthority,
 } from '@openclaude/protocol'
@@ -322,6 +323,8 @@ export async function selectMasterCc5Backend(
     engine: string
     placement: 'local' | 'remote_pool'
     allowStickyFailover?: boolean
+    requiredCapabilities?: RequiredTurnCapabilities
+    systemPromptSha256?: string
   },
   selfhost: boolean,
   env: Cc5PolicyEnvironment,
@@ -348,6 +351,12 @@ export async function selectMasterCc5Backend(
     canonicalModel: input.canonicalModel,
     ...(laneEngine ? { engine: laneEngine } : {}),
     ...(input.allowStickyFailover === true ? { allowStickyFailover: true } : {}),
+    ...(input.requiredCapabilities !== undefined
+      ? { requiredCapabilities: input.requiredCapabilities }
+      : {}),
+    ...(input.systemPromptSha256 !== undefined
+      ? { systemPromptSha256: input.systemPromptSha256 }
+      : {}),
   }
   const backend = await runtime.ensureLane(laneRequest)
   if (

@@ -78,6 +78,8 @@ async function sealAndForwardAnnotatedFrame(
     const sealed = await sealAuthorityFieldsOrRejectImpl(ctx, {
       exec: authorityExec,
       billingRequestId: requestId,
+      inboundFrame: enrichedParsed,
+      forceNeedsVision: true,
       log: turnLogCapture,
       onReject: rejectPromptQueueDispatch,
       turn: annotatedTurnIdentity,
@@ -345,6 +347,7 @@ async function sealBindAndForwardCcbTurn(args: {
         exec: authorityExec,
         ...(authorityBillingRequestId === undefined ? {} : { billingRequestId: authorityBillingRequestId }),
         ...(authorityTurnId === undefined ? {} : { authorityTurnId }),
+        inboundFrame: enrichedParsed,
         log: turnLogCapture,
         onReject: rejectPromptQueueDispatch,
         turn: ccbTurnIdentity,

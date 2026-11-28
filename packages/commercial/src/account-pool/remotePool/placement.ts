@@ -1,17 +1,5 @@
 /**
  * Generic `remote-driver-v4` lane placement and binding lifecycle (`AC-4`, `AC-5`, `AC-6`).
- *
- * Key invariants:
- * - Zero per-engine branches (`AC-6`): driver metadata, resource caps, and digests come from
- *   `scripts/agent-remote/drivers/registry.json`.
- * - Independent `(node, engine, profile)` pool concurrency (`min(row.max_concurrent_lanes,
- *   reg.profileMaxLanes)`, default 5) with NO account-wide exclusive lock, so 2+ concurrent
- *   sessions on the same account overlap cleanly while cross-engine profiles on the same node
- *   never starve each other.
- * - Unready or fingerprint-drifted profiles fail closed with `REMOTE_DRIVER_REVERIFY_REQUIRED`
- *   for user traffic while permitting bounded leased verification runs (`AC-3`).
- * - Respects `RemoteReleaseDrainCoordinator` (`REMOTE_POOL_DRAINING_RETRY_LATER`) during R1
- *   cutover (`AC-5`) and seamlessly upgrades sticky v1/v3 bindings to v4 on the next generation.
  */
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
@@ -26,6 +14,7 @@ import {
   REMOTE_DRIVER_BACKEND,
   REMOTE_DRIVER_PROTOCOL_VERSION,
   type RemoteProbeSnapshot,
+  type RequiredTurnCapabilities,
   computeStickyHomeKey,
   remoteCanonicalSha256,
   validateRemoteProbeSnapshot,
@@ -56,6 +45,10 @@ import {
   verifyProfileReadyForV4,
 } from './driftCoordinator.js'
 import { buildDefaultDriverContextForNode, resolveProbedUpstreamModel } from './modelResolution.js'
+import {
+  collectEligibleV4Candidates,
+  selectEligibleV4ProfileOrThrow,
+} from './placementCandidateSelection.js'
 import {
   legacyBindingEngineForAuthority,
   legacyProfileEngineForAuthority,
@@ -93,6 +86,10 @@ export interface PlaceRemoteDriverLaneInput {
   readonly sessionKey?: string
   readonly canonicalModel: string
   readonly driverId: string
+  readonly preferredProfileId?: string
+  readonly preferredNodeId?: string
+  readonly rankedCandidateKeys?: readonly string[]
+  readonly requiredCapabilities?: RequiredTurnCapabilities
   readonly driverContext?: Record<string, unknown>
   readonly verificationRun?: {
     readonly runId: string
@@ -218,29 +215,15 @@ export async function assertNoPendingRemoteBillingForSession(
     typeof exclude.profileId === 'string' &&
     exclude.profileId.trim().length > 0
 
-  // B06 + B01: Query ALL non-released bindings directly (zero LIMIT truncation).
-  // Only excuse the exact (operation_id, generation, profile_id/profile_name) triple prepared
-  // for this turn when in ('preparing', 'running'); any other non-released row fails closed.
+  // B06 + B01: Query ALL non-released bindings; only excuse the exact prepared triple.
   const activeBindingsRes = await client.query(
-    `SELECT operation_id::text AS operation_id,
-            generation::text AS generation,
-            profile_id::text AS profile_id,
-            recovery_spec#>>'{spec,manifest,profileId}' AS profile_name,
-            state
-       FROM remote_agent_bindings
-      WHERE uid = $1
-        AND session_key = $2
-        AND state <> 'released'`,
+    `SELECT operation_id::text AS operation_id, generation::text AS generation,
+            profile_id::text AS profile_id, recovery_spec#>>'{spec,manifest,profileId}' AS profile_name, state
+       FROM remote_agent_bindings WHERE uid = $1 AND session_key = $2 AND state <> 'released'`,
     [uidStr, sessionKey],
   )
   for (const raw of activeBindingsRes.rows) {
-    const row = raw as {
-      operation_id?: unknown
-      generation?: unknown
-      profile_id?: unknown
-      profile_name?: unknown
-      state?: unknown
-    }
+    const row = raw as { operation_id?: unknown; generation?: unknown; profile_id?: unknown; profile_name?: unknown; state?: unknown }
     const matchesCurrentPrepared =
       hasValidExclude &&
       (row.state === 'preparing' || row.state === 'running') &&
@@ -248,13 +231,8 @@ export async function assertNoPendingRemoteBillingForSession(
       String(row.generation ?? '') === exclude.generation.trim() &&
       (String(row.profile_id ?? '') === exclude.profileId.trim() ||
         String(row.profile_name ?? '') === exclude.profileId.trim())
-    if (!matchesCurrentPrepared) {
-      throw new Error('REMOTE_LANE_STOP_UNPROVEN')
-    }
+    if (!matchesCurrentPrepared) throw new Error('REMOTE_LANE_STOP_UNPROVEN')
   }
-
-  // Never skip unsettled billing journal verification for ANY operation (including current or
-  // arbitrarily old historical bindings resolved via EXISTS over remote_agent_bindings).
   await assertNoPendingBillingJournal(client, uidStr, operationId ?? null, sessionKey)
 }
 
@@ -498,147 +476,37 @@ export async function placeRemoteDriverLane(
           )
         ).rows[0]
 
-        const readyMap = new Map<
-          string,
-          { snapshot: RemoteProbeSnapshot; fingerprint: string; effectiveCap: number }
-        >()
-        const eligible: Array<Record<string, any>> = []
-        const fullProfiles = new Set<string>()
-        const reverifyProfiles = new Set<string>()
-        const staleProfiles = new Set<string>()
-
-        for (const row of candidates) {
-          const pid = String(row.profile_id)
-          const check = verifyProfileReadyForV4(
-            row,
-            reg.driverDigest,
-            reg.coreDigest,
-            nowMs,
-            maxProbeAgeMs,
-          )
-          if (!check.ready) {
-            if (check.reason === 'reverify') reverifyProfiles.add(pid)
-            else staleProfiles.add(pid)
-            continue
-          }
-          const used = Number(
-            (
-              await client.query<{ profile_used: number }>(
-                options.testFaultSandboxMode === 'shared_node_cap_5'
-                  ? `SELECT COUNT(*)::int AS profile_used
-                     FROM remote_agent_bindings
-                    WHERE node_id = $1 AND state <> 'released'`
-                  : `SELECT COUNT(*)::int AS profile_used
-                     FROM remote_agent_bindings
-                    WHERE profile_id = $1 AND state <> 'released'`,
-                [
-                  options.testFaultSandboxMode === 'shared_node_cap_5'
-                    ? row.node_id
-                    : row.profile_id,
-                ],
-              )
-            ).rows[0]?.profile_used ?? 0,
-          )
-          const effectiveCap =
-            options.testFaultSandboxMode === 'account_mutex'
-              ? 1
-              : options.testFaultSandboxMode === 'shared_node_cap_5'
-                ? 5
-                : Math.min(Number(row.max_concurrent_lanes), reg.profileMaxLanes)
-          if (used >= effectiveCap) {
-            fullProfiles.add(pid)
-            continue
-          }
-          readyMap.set(pid, {
-            snapshot: check.snapshot,
-            fingerprint: check.fingerprint,
-            effectiveCap,
-          })
-          eligible.push(row)
-        }
-
-        const exhausted = (profiles: string[]) =>
-          Object.assign(new Error('REMOTE_LANE_CAPACITY_EXHAUSTED'), { profiles })
-
-        const priorStickyOperationId = sticky?.operation_id
-        let effectiveSticky: typeof sticky | undefined = sticky
-        if (sticky) {
-          selectedRow = eligible.find((r) => String(r.profile_id) === sticky.profile_id)
-          if (!selectedRow && options.allowStickyFailover === true && eligible.length > 0) {
-            migratedFromProfileId = sticky.profile_id
-            effectiveSticky = undefined
-          } else if (!selectedRow) {
-            // B06: Unconditionally check unsettled billing BEFORE reporting profile/capacity
-            // unavailability so cross-pool fallback never treats a billing-pending session as eligible.
-            await assertNoPendingBillingJournal(
-              client,
-              uidStr,
-              priorStickyOperationId ?? null,
-              effectiveSessionKey,
-            )
-            if (reverifyProfiles.has(sticky.profile_id)) {
-              throw new Error('REMOTE_DRIVER_REVERIFY_REQUIRED')
-            }
-            if (staleProfiles.has(sticky.profile_id)) {
-              throw new Error('REMOTE_DRIVER_PROBE_STALE')
-            }
-            if (fullProfiles.has(sticky.profile_id)) {
-              throw exhausted([sticky.profile_id])
-            }
-            throw new Error('REMOTE_LANE_PROFILE_UNAVAILABLE')
-          }
-        }
-        if (!effectiveSticky) {
-          const ranked = rankRemotePoolCandidates(
-            eligible.map((r) => ({
-              profileId: String(r.profile_id),
-              nodeId: String(r.node_id),
-              engine: (r.engine as RemoteBrainEngine) ?? legacyProfileEngine,
-              profileName: String(r.profile_name),
-              weight: Number(r.weight ?? 100),
-              healthScore:
-                r.node_status === 'degraded'
-                  ? Math.min(Number(r.health_score ?? 100), 60)
-                  : Number(r.health_score ?? 100),
-              hotSlots: Number(r.hot_slots ?? 0),
-              activeSlots: Number(r.active_slots ?? 0),
-              maxHotSlots: Math.max(Number(r.max_hot_slots ?? 8), reg.profileMaxLanes),
-              maxActiveSlots: readyMap.get(String(r.profile_id))!.effectiveCap,
-              nodeRttMsP50: r.rtt_ms_p50 == null ? null : Number(r.rtt_ms_p50),
-            })),
-            `${uidStr}:${effectiveSessionKey}:${input.canonicalModel}`,
-          )
-          selectedRow = eligible.find((r) => String(r.profile_id) === ranked[0]?.profileId)
-          if (!selectedRow) {
-            await assertNoPendingBillingJournal(
-              client,
-              uidStr,
-              priorStickyOperationId ?? null,
-              effectiveSessionKey,
-            )
-            if (fullProfiles.size > 0) throw exhausted([...fullProfiles])
-            if (reverifyProfiles.size > 0) throw new Error('REMOTE_DRIVER_REVERIFY_REQUIRED')
-            if (staleProfiles.size > 0) throw new Error('REMOTE_DRIVER_PROBE_STALE')
-            throw new Error('NO_ELIGIBLE_REMOTE_PROFILE')
-          }
-        }
-
-        need(selectedRow !== undefined, 'NO_ELIGIBLE_REMOTE_PROFILE')
-        const info = readyMap.get(String(selectedRow.profile_id))!
-        verifiedProbe = info.snapshot
-        activeFingerprint = info.fingerprint
-
-        // B06: Unconditionally guard prior unsettled billing for this session/operation
-        // before admitting or creating any new operation, even when allowStickyFailover
-        // cleared effectiveSticky to migrate onto another profile.
-        await assertNoPendingBillingJournal(
+        const collected = await collectEligibleV4Candidates({
           client,
+          candidates,
+          reg,
+          canonicalModel: input.canonicalModel,
+          requiredCapabilities: input.requiredCapabilities,
+          nowMs,
+          maxProbeAgeMs,
+          testFaultSandboxMode: options.testFaultSandboxMode,
+        })
+        const chosen = await selectEligibleV4ProfileOrThrow({
+          collected,
+          sticky,
+          allowStickyFailover: options.allowStickyFailover,
+          reg,
+          legacyProfileEngine,
           uidStr,
-          priorStickyOperationId ?? null,
           effectiveSessionKey,
-        )
-        if (effectiveSticky) {
-          selectedRow._sticky = effectiveSticky
+          canonicalModel: input.canonicalModel,
+          preferredProfileId: input.preferredProfileId,
+          preferredNodeId: input.preferredNodeId,
+          rankedCandidateKeys: input.rankedCandidateKeys,
+          guardPendingBilling: (priorOpId) =>
+            assertNoPendingBillingJournal(client, uidStr, priorOpId, effectiveSessionKey),
+        })
+        selectedRow = chosen.selectedRow
+        verifiedProbe = chosen.verifiedProbe
+        activeFingerprint = chosen.activeFingerprint
+        migratedFromProfileId = chosen.migratedFromProfileId
+        if (chosen.effectiveSticky) {
+          selectedRow._sticky = chosen.effectiveSticky
         }
       }
 

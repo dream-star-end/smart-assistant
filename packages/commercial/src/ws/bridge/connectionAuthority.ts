@@ -250,27 +250,98 @@ export function signAuthorityBundle(
   }).bundle;
 }
 
+const TRUSTED_TURN_EFFORTS: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh"]);
+const TRUSTED_SERVICE_TIERS: ReadonlySet<string> = new Set(["standard", "priority", "flex"]);
+
+function isImageAttachmentObj(item: unknown): boolean {
+  if (!item || typeof item !== "object") return false;
+  const mime = (item as { mimeType?: unknown }).mimeType;
+  return typeof mime === "string" && mime.toLowerCase().startsWith("image/");
+}
+
+function frameHasVisionPayload(
+  inboundFrame: Readonly<Record<string, unknown>> | undefined,
+  forceNeedsVision?: boolean,
+): boolean {
+  if (forceNeedsVision === true) return true;
+  if (!inboundFrame) return false;
+  if (Array.isArray(inboundFrame.images) && inboundFrame.images.length > 0) return true;
+  if (Array.isArray(inboundFrame.imageAttachments) && inboundFrame.imageAttachments.length > 0) return true;
+  return Array.isArray(inboundFrame.attachments) && inboundFrame.attachments.some(isImageAttachmentObj);
+}
+
+function pickEffortFromFrame(frame: Readonly<Record<string, unknown>> | undefined): string | undefined {
+  if (!frame) return undefined;
+  for (const key of ["reasoningEffort", "effort", "thinkingEffort"] as const) {
+    const val = frame[key];
+    if (typeof val === "string" && TRUSTED_TURN_EFFORTS.has(val)) return val;
+  }
+  return undefined;
+}
+
+function deriveServerTrustedTurnRequirements(
+  inboundFrame: Readonly<Record<string, unknown>> | undefined,
+  extra?: {
+    readonly forceNeedsVision?: boolean;
+    readonly requiredCapabilities?: import("@openclaude/protocol").RequiredTurnCapabilities;
+    readonly systemPromptSha256?: string;
+  },
+): {
+  readonly requiredCapabilities?: import("@openclaude/protocol").RequiredTurnCapabilities;
+  readonly systemPromptSha256?: string;
+} {
+  const caps: Record<string, unknown> = { ...(extra?.requiredCapabilities ?? {}) };
+  if (frameHasVisionPayload(inboundFrame, extra?.forceNeedsVision)) caps.needsVision = true;
+  const effort = pickEffortFromFrame(inboundFrame);
+  if (caps.reasoningEffort === undefined && effort !== undefined) caps.reasoningEffort = effort;
+  const tier = inboundFrame?.serviceTier;
+  if (caps.serviceTier === undefined && typeof tier === "string" && TRUSTED_SERVICE_TIERS.has(tier)) {
+    caps.serviceTier = tier;
+  }
+  const rawSwarm = inboundFrame?.swarmMode;
+  if (rawSwarm === true || (typeof rawSwarm === "string" && rawSwarm !== "" && rawSwarm !== "off")) {
+    caps.needsSwarm = true;
+  }
+  for (const flag of ["readOnly", "consultTurn", "hermeticNoTools"] as const) {
+    if (inboundFrame?.[flag] === true) caps[flag] = true;
+  }
+  const rawSha = extra?.systemPromptSha256 ?? inboundFrame?.systemPromptSha256;
+  const sha = typeof rawSha === "string" && /^[a-f0-9]{64}$/.test(rawSha) ? rawSha : undefined;
+  return {
+    ...(Object.keys(caps).length > 0
+      ? { requiredCapabilities: caps as import("@openclaude/protocol").RequiredTurnCapabilities }
+      : {}),
+    ...(sha !== undefined ? { systemPromptSha256: sha } : {}),
+  };
+}
+
+export interface SealAuthorityFieldsArgs {
+  exec: ResolvedTurnExecution;
+  billingRequestId?: string;
+  authorityTurnId?: string;
+  inboundFrame?: Readonly<Record<string, unknown>>;
+  forceNeedsVision?: boolean;
+  requiredCapabilities?: import("@openclaude/protocol").RequiredTurnCapabilities;
+  systemPromptSha256?: string;
+  log: Logger | null;
+  onReject?: (code: string) => void;
+  turn?: InboundTurnIdentity;
+  compensate?: (reason: string) => Promise<void> | void;
+  sessionId?: string;
+  historicalMessages?: readonly unknown[];
+  excludeClientMessageId?: string;
+  enableCrossPoolCheckpoint?: boolean;
+  prepareLocalFallbackTransport?: (p: {
+    readonly localExec: ResolvedTurnExecution;
+    readonly billingRequestId?: string;
+    readonly authorityTurnId?: string;
+  }) => Promise<PreparedLocalFallbackTransport | null>;
+  onLocalFallbackCommitted?: (h: LocalFallbackCommittedHandle) => void;
+}
+
 export async function sealAuthorityFieldsOrReject(
   ctx: BridgeConnectionCtx,
-  args: {
-    exec: ResolvedTurnExecution;
-    billingRequestId?: string;
-    authorityTurnId?: string;
-    log: Logger | null;
-    onReject?: (code: string) => void;
-    turn?: InboundTurnIdentity;
-    compensate?: (reason: string) => Promise<void> | void;
-    sessionId?: string;
-    historicalMessages?: readonly unknown[];
-    excludeClientMessageId?: string;
-    enableCrossPoolCheckpoint?: boolean;
-    prepareLocalFallbackTransport?: (p: {
-      readonly localExec: ResolvedTurnExecution;
-      readonly billingRequestId?: string;
-      readonly authorityTurnId?: string;
-    }) => Promise<PreparedLocalFallbackTransport | null>;
-    onLocalFallbackCommitted?: (h: LocalFallbackCommittedHandle) => void;
-  },
+  args: SealAuthorityFieldsArgs,
 ): Promise<Record<string, unknown> | null> {
   const userWs = ctx.userWs;
   const reject = async (code: string, message: string, reason: string): Promise<null> => {
@@ -312,6 +383,11 @@ export async function sealAuthorityFieldsOrReject(
     );
   }
   const { deps } = ctx.shared;
+  const turnReqs = deriveServerTrustedTurnRequirements(args.inboundFrame, {
+    forceNeedsVision: args.forceNeedsVision,
+    requiredCapabilities: args.requiredCapabilities,
+    systemPromptSha256: args.systemPromptSha256,
+  });
   return await resolveRemotePoolBackendAndSeal({
     uid: Number(ctx.uid),
     containerId: ctx.containerId,
@@ -324,6 +400,7 @@ export async function sealAuthorityFieldsOrReject(
     exec: args.exec,
     billingRequestId: args.billingRequestId,
     authorityTurnId: args.authorityTurnId,
+    ...turnReqs,
     log: args.log,
     cc5BackendSelector: deps.cc5BackendSelector,
     crossPoolFallbackSelector: deps.crossPoolFallbackSelector,
