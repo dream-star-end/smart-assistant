@@ -46,27 +46,26 @@ import {
   canUseCc5TestModel,
 } from '@openclaude/protocol'
 import {
-  placeRemoteLane,
   recordRemoteLaneState,
   recordRemoteNativeThread,
   recordRemoteStartAttempt,
 } from '../account-pool/remoteBrainPool.js'
 import {
-  reconcileRemoteChat,
-  reconcileStaleContainerLanes,
-} from '../account-pool/remoteLaneRecovery.js'
-import {
   RemoteReleaseDrainCoordinator,
   bootstrapLegacyRetirementGateAsync,
-  isReservedVerificationSessionKey,
-  legacyBindingEngineForAuthority,
-  legacyProfileEngineForAuthority,
-  loadRemoteDriverRegistry,
-  placeRemoteDriverLane,
   recordRemoteDriverLaneState,
   recordRemoteDriverNativeSession,
   recordRemoteDriverStartAttempt,
+  type SelectSelfhostRemoteDriverOptions,
+  type SelfhostRemoteDriverSelectionResult,
 } from '../account-pool/remotePool/index.js'
+import {
+  placeSelfhostRemoteLaneWithRetry,
+  resolveSelfhostDriverV4Selection,
+  type SharedLanePlacementDeps,
+  type SharedLanePlacementRequest,
+  type SharedLaneSelectionRequest,
+} from '../account-pool/remotePool/sharedLanePlacementRuntime.js'
 import { createRemoteRelayPeerClient } from '../agent-sandbox/remoteRelayClient.js'
 import { makeLoadUserModelAuthz } from '../auth/userModelAuthz.js'
 import { configureModelAvailability } from '../billing/modelAvailability.js'
@@ -114,11 +113,6 @@ const DEFAULT_BASE_ROOT = '/run/oc-cc5-t1555u'
 const DEFAULT_EVIDENCE_ROOT = '/var/lib/openclaude/remote-native'
 const DEFAULT_DRAIN_MS = 30 * 60_000
 export const REMOTE_RELAY_DRAIN_TIMEOUT_EXIT_CODE = 79
-const LEGACY_SUPPORTED_ENGINES: ReadonlySet<string> = new Set(['ccb', 'codex'])
-
-function isLegacyRemoteEngine(value: string): value is 'ccb' | 'codex' {
-  return LEGACY_SUPPORTED_ENGINES.has(value)
-}
 
 function parseDrainMs(raw: string | undefined): number {
   if (!raw || raw.trim().length === 0) return DEFAULT_DRAIN_MS
@@ -684,77 +678,33 @@ export async function executeGracefulShutdownDrain(args: {
   }
 }
 
-async function resolveDriverV4Selection(
+/**
+ * Standalone `remote-relay` v4 driver selection aligned onto `UnifiedPlacementRouter`
+ * via `sharedLanePlacementRuntime.ts` (OCV5-928 W2-CS1).
+ */
+export async function resolveRemoteRelayDriverV4Selection(
   pool: Pool,
-  request: {
-    uid: number
-    sessionKey: string
-    canonicalModel: string
-    engine?: 'ccb' | 'codex' | 'antigravity'
-  },
-): Promise<string | null> {
-  const authEngine = request.engine ?? 'ccb'
-  const legacyBindEngine = legacyBindingEngineForAuthority(authEngine)
-  const legacyProfEngine = legacyProfileEngineForAuthority(authEngine)
-  const regMap = loadRemoteDriverRegistry()
-  const stickyRows = (
-    await pool.query<{ driver_id: string | null }>(
-      `SELECT driver_id
-         FROM remote_agent_bindings
-        WHERE uid = $1
-          AND session_key = $2
-          AND driver_id IS NOT NULL
-          AND engine = $3
-        ORDER BY updated_at DESC
-        LIMIT 8`,
-      [String(request.uid), request.sessionKey, legacyBindEngine],
-    )
-  ).rows
-  for (const sticky of stickyRows) {
-    const did = sticky?.driver_id ? String(sticky.driver_id) : ''
-    if (did && regMap.get(did)?.authorityEngine === authEngine) {
-      return did
-    }
-  }
+  request: SharedLaneSelectionRequest,
+  routerOptions?: SelectSelfhostRemoteDriverOptions,
+): Promise<SelfhostRemoteDriverSelectionResult> {
+  return resolveSelfhostDriverV4Selection(pool, request, {
+    routerOptions,
+    onBindingReadWarning: (meta) => {
+      log.warn('remote_relay_logical_binding_read_error', meta)
+    },
+  })
+}
 
-  const offer = (
-    await pool.query<{ driver_id: string }>(
-      `SELECT p.driver_id
-         FROM remote_model_offers o
-         JOIN remote_agent_profiles p ON p.id = o.profile_id
-         JOIN remote_agent_nodes n ON n.id = p.node_id
-        WHERE o.canonical_model_id = $1
-          AND o.enabled = TRUE
-          AND p.driver_id IS NOT NULL
-          AND p.engine = $2
-          AND p.status IN ('active', 'degraded')
-          AND (p.disabled_by IS NULL OR p.disabled_by <> 'admin')
-          AND n.status IN ('active', 'degraded')
-          AND (n.disabled_by IS NULL OR n.disabled_by <> 'admin')
-          AND (
-            p.execution_ready = TRUE
-            OR p.verified_fingerprint IS NOT NULL
-            OR NOT EXISTS (
-              SELECT 1
-                FROM remote_model_offers o_leg
-                JOIN remote_agent_profiles p_leg ON p_leg.id = o_leg.profile_id
-                JOIN remote_agent_nodes n_leg ON n_leg.id = p_leg.node_id
-               WHERE o_leg.canonical_model_id = $1
-                 AND o_leg.enabled = TRUE
-                 AND p_leg.driver_id IS NULL
-                 AND p_leg.engine = $2
-                 AND p_leg.status IN ('active', 'degraded')
-                 AND (p_leg.disabled_by IS NULL OR p_leg.disabled_by <> 'admin')
-                 AND n_leg.status IN ('active', 'degraded')
-                 AND (n_leg.disabled_by IS NULL OR n_leg.disabled_by <> 'admin')
-            )
-          )
-        ORDER BY p.execution_ready DESC, p.weight DESC, p.id ASC
-        LIMIT 1`,
-      [request.canonicalModel, legacyProfEngine],
-    )
-  ).rows[0]
-  return offer?.driver_id ?? null
+export function createRemoteRelayPlaceHook(deps: SharedLanePlacementDeps) {
+  return (request: SharedLanePlacementRequest) =>
+    placeSelfhostRemoteLaneWithRetry(request, {
+      ...deps,
+      onBindingReadWarning:
+        deps.onBindingReadWarning ??
+        ((meta) => {
+          log.warn('remote_relay_logical_binding_read_error', meta)
+        }),
+    })
 }
 
 type DualSlotConfiguration = ReturnType<
@@ -832,65 +782,16 @@ export async function startRemoteRelayDaemon(): Promise<void> {
   const ownLaneGenerations = new OwnLaneGenerationTracker()
   const legacyRetirementGate = await bootstrapLegacyRetirementGateAsync({ queryable: pool, rawFlag: process.env.OC_LEGACY_REMOTE_TRACKS_RETIRED, isSelfhostV5: true, log })
   let shuttingDown = false
-
-  const runPlaceOnce = async (request: {
-    engine?: 'ccb' | 'codex' | 'antigravity'
-    uid: number
-    containerDbId: string
-    dockerId: string
-    sessionKey: string
-    canonicalModel: string
-    allowStickyFailover?: boolean
-  }) => {
-    if (isReservedVerificationSessionKey(request.sessionKey)) {
-      throw new Error('REMOTE_SESSION_KEY_RESERVED')
-    }
-    if (shuttingDown) {
-      throw new Error('REMOTE_POOL_DRAINING_RETRY_LATER')
-    }
-    drainGate.assertAdmissionOpen()
-    const driverId = await resolveDriverV4Selection(pool, request)
-    if (driverId) {
-      const v4 = await placeRemoteDriverLane(
-        {
-          uid: request.uid,
-          containerDbId: request.containerDbId,
-          dockerId: request.dockerId,
-          sessionKey: request.sessionKey,
-          canonicalModel: request.canonicalModel,
-          driverId,
-        },
-        {
-          pool,
-          drainGate,
-          ...(request.allowStickyFailover === true ? { allowStickyFailover: true } : {}),
-        },
-      )
-      ownLaneGenerations.record(v4.binding.operationId, v4.generation)
-      return {
-        target: v4.sshTarget,
-        taskRoot: v4.spec.manifest.root,
-        operationId: v4.binding.operationId,
-        runId: v4.binding.runId,
-        provisionPacket: Buffer.alloc(0),
-        profileId: v4.profileUuid,
-        generation: v4.generation,
-        v4: {
-          binding: v4.binding,
-          spec: v4.spec,
-          sshTarget: v4.sshTarget,
-        },
-      }
-    }
-    const requestedEngine = request.engine
-    if (requestedEngine !== undefined && !isLegacyRemoteEngine(requestedEngine)) {
-      throw new Error('REMOTE_LANE_UNAVAILABLE')
-    }
-    await legacyRetirementGate.assertLegacyPlacementAllowedAsync()
-    const legacy = await placeRemoteLane({ ...request, engine: requestedEngine }, { controllerPath, pool })
-    ownLaneGenerations.record(legacy.operationId, legacy.generation)
-    return legacy
-  }
+  const placeLane = createRemoteRelayPlaceHook({
+    getPool: () => pool,
+    drainGate,
+    controllerPath,
+    isShuttingDown: () => shuttingDown,
+    legacyRetirementGate,
+    onPlacedGeneration: (operationId, generation) => {
+      ownLaneGenerations.record(operationId, generation)
+    },
+  })
 
   // B6: Distinguish intentionally-disabled feature from enabled-but-broken runtime init.
   const policyEnv = process.env as Cc5PolicyEnvironment
@@ -946,22 +847,7 @@ export async function startRemoteRelayDaemon(): Promise<void> {
             : {}),
         }),
         hooks: {
-          place: async (request) => {
-            try {
-              return await runPlaceOnce(request)
-            } catch (error) {
-              const code = error instanceof Error ? error.message : ''
-              if (code === 'REMOTE_LANE_STOP_UNPROVEN') {
-                await reconcileRemoteChat(pool, request.uid, request.sessionKey)
-              } else if (
-                code !== 'REMOTE_LANE_CAPACITY_EXHAUSTED' ||
-                !(await reconcileStaleContainerLanes(pool, request.uid, request.dockerId))
-              ) {
-                throw error
-              }
-              return runPlaceOnce(request)
-            }
-          },
+          place: placeLane,
           onState: async (operationId, state, generation, isV4) => {
             if (isV4) {
               await recordRemoteDriverLaneState(operationId, generation!, state, pool)

@@ -10,6 +10,7 @@
  * - Zero `process.env`, zero `syncIo`, zero `emptyCatch`, zero `typeEscape`, zero `export *`.
  */
 import {
+  defaultCapabilitiesForHostKind,
   openExecEnvToolBrokerChannel,
   type ContainerLinkToolBrokerClient,
   type ExecEnvAttachmentDigest,
@@ -21,6 +22,8 @@ import {
   type FrameLinkLike,
   type OpenToolBrokerChannelRequest,
 } from '@openclaude/protocol/exec-env'
+
+export { defaultCapabilitiesForHostKind }
 
 export interface ComputePoolContainerDescriptor {
   readonly envId: string
@@ -53,46 +56,6 @@ export interface AttachComputePoolExecEnvHandleInput {
   readonly attachment: ExecEnvAttachmentDigest
   readonly capabilities?: ExecEnvCapabilities
   readonly openFrameLink: ComputePoolFrameLinkOpener
-}
-
-export function defaultCapabilitiesForHostKind(
-  hostKind: ExecEnvHostKind,
-): ExecEnvCapabilities {
-  switch (hostKind) {
-    case 'local-docker':
-      return {
-        hostKind,
-        supportedChannels: ['ws_tunnel', 'loopback_http'],
-        supportsManagedJobs: true,
-        supportsDaemonServices: true,
-        supportsWorkspaceSnapshots: true,
-        supportsNetworkIsolation: true,
-        supportsSeccompProfile: true,
-        maxConcurrentJobs: 16,
-      }
-    case 'compute-pool-docker':
-      return {
-        hostKind,
-        supportedChannels: ['ws_tunnel'],
-        supportsManagedJobs: true,
-        supportsDaemonServices: true,
-        supportsWorkspaceSnapshots: true,
-        supportsNetworkIsolation: true,
-        supportsSeccompProfile: true,
-        maxConcurrentJobs: 16,
-      }
-    case 'desktop-virtual':
-      return {
-        hostKind,
-        supportedChannels: ['ws_tunnel', 'uds_jsonrpc'],
-        supportsManagedJobs: true,
-        supportsDaemonServices: false,
-        supportsWorkspaceSnapshots: false,
-        supportsNetworkIsolation: false,
-        supportsSeccompProfile: false,
-        maxConcurrentJobs: 8,
-      }
-  }
 }
 
 export function attachComputePoolExecEnvHandle(

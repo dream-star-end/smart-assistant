@@ -12,6 +12,7 @@
  * - Imports ONLY L0 `@openclaude/protocol/exec-env` and `../runtimeChannel.js`.
  */
 import {
+  defaultCapabilitiesForHostKind,
   isReservedToolBrokerFrame,
   isToolBrokerWireFrame,
   openExecEnvToolBrokerChannel,
@@ -26,6 +27,8 @@ import {
   type OpenToolBrokerChannelRequest,
 } from '@openclaude/protocol/exec-env'
 import { getRuntimeChannel } from '../runtimeChannel.js'
+
+export { defaultCapabilitiesForHostKind }
 
 export class ToolBrokerBridgeError extends Error {
   constructor(
@@ -386,16 +389,8 @@ export function attachContainerLinkExecEnvHandle(
     )
   }
   const activeChannels = new Set<ManagedContainerLinkToolBrokerChannel>()
-  const capabilities: ExecEnvCapabilities = deps.capabilities ?? {
-    hostKind: deps.descriptor.hostKind,
-    supportedChannels: deps.descriptor.hostKind === 'local-docker' ? ['ws_tunnel', 'loopback_http'] : ['ws_tunnel'],
-    supportsManagedJobs: true,
-    supportsDaemonServices: deps.descriptor.hostKind !== 'desktop-virtual',
-    supportsWorkspaceSnapshots: deps.descriptor.hostKind !== 'desktop-virtual',
-    supportsNetworkIsolation: deps.descriptor.hostKind !== 'desktop-virtual',
-    supportsSeccompProfile: deps.descriptor.hostKind !== 'desktop-virtual',
-    maxConcurrentJobs: deps.descriptor.hostKind === 'desktop-virtual' ? 8 : 16,
-  }
+  const capabilities: ExecEnvCapabilities =
+    deps.capabilities ?? defaultCapabilitiesForHostKind(deps.descriptor.hostKind)
 
   return {
     envId: deps.descriptor.envId,
