@@ -6,9 +6,9 @@
     "maxNesting": 5
   },
   "summary": {
-    "exceedingFunctions": 1916,
-    "overLines": 1225,
-    "overCcDirect": 1295,
+    "exceedingFunctions": 1914,
+    "overLines": 1224,
+    "overCcDirect": 1293,
     "overMaxNesting": 55
   },
   "functions": {
@@ -4602,11 +4602,6 @@
       "ccDirect": 21,
       "maxNesting": 3
     },
-    "packages/gateway/src/engine/antigravityAdapter.ts::AntigravityAdapter.closeTurn": {
-      "lines": 51,
-      "ccDirect": 28,
-      "maxNesting": 3
-    },
     "packages/gateway/src/engine/antigravityAdapter.ts::AntigravityAdapter.handleStep": {
       "lines": 73,
       "ccDirect": 41,
@@ -4623,7 +4618,7 @@
       "maxNesting": 4
     },
     "packages/gateway/src/engine/antigravityAdapter.ts::AntigravityAdapter.spawnTurn": {
-      "lines": 226,
+      "lines": 222,
       "ccDirect": 37,
       "maxNesting": 1
     },
@@ -4703,18 +4698,13 @@
       "maxNesting": 4
     },
     "packages/gateway/src/engine/antigravitySwarmWatcher.ts::buildSwarmSnapshotFromLoadedData": {
-      "lines": 176,
-      "ccDirect": 69,
-      "maxNesting": 3
-    },
-    "packages/gateway/src/engine/antigravitySwarmWatcher.ts::describeToolActivity": {
-      "lines": 48,
-      "ccDirect": 32,
+      "lines": 150,
+      "ccDirect": 40,
       "maxNesting": 2
     },
     "packages/gateway/src/engine/antigravitySwarmWatcher.ts::parseMemberTranscriptTail": {
-      "lines": 227,
-      "ccDirect": 65,
+      "lines": 218,
+      "ccDirect": 60,
       "maxNesting": 3
     },
     "packages/gateway/src/engine/antigravityToolBackfill.ts::AntigravityToolBackfiller.refreshFromDisk": {
@@ -5028,7 +5018,7 @@
       "maxNesting": 2
     },
     "packages/gateway/src/engine/swarmStallMonitor.ts::SwarmStallMonitor.evaluate": {
-      "lines": 268,
+      "lines": 260,
       "ccDirect": 27,
       "maxNesting": 2
     },
@@ -5088,7 +5078,7 @@
       "maxNesting": 3
     },
     "packages/gateway/src/execEnv/toolBroker.ts::ToolBrokerServer.executeInternal": {
-      "lines": 443,
+      "lines": 447,
       "ccDirect": 82,
       "maxNesting": 4
     },
@@ -6303,8 +6293,8 @@
       "maxNesting": 3
     },
     "packages/gateway/src/wsConnection.ts::handleStop": {
-      "lines": 117,
-      "ccDirect": 32,
+      "lines": 75,
+      "ccDirect": 24,
       "maxNesting": 4
     },
     "packages/gateway/src/wsConnection.ts::handleWsConnection": {
@@ -6873,7 +6863,7 @@
       "maxNesting": 4
     },
     "packages/web-react/src/App.tsx::App": {
-      "lines": 2734,
+      "lines": 2736,
       "ccDirect": 355,
       "maxNesting": 1
     },
@@ -9148,7 +9138,7 @@
       "maxNesting": 0
     },
     "packages/web-react/src/hooks/useAppNavigationActions.tsx::useAppNavigationActions": {
-      "lines": 389,
+      "lines": 377,
       "ccDirect": 4,
       "maxNesting": 0
     },
@@ -9193,13 +9183,13 @@
       "maxNesting": 1
     },
     "packages/web-react/src/hooks/useComposerSend.ts::useComposerSend": {
-      "lines": 573,
+      "lines": 571,
       "ccDirect": 8,
       "maxNesting": 0
     },
     "packages/web-react/src/hooks/useComposerSend.ts::useComposerSend.send": {
-      "lines": 335,
-      "ccDirect": 93,
+      "lines": 333,
+      "ccDirect": 90,
       "maxNesting": 3
     },
     "packages/web-react/src/hooks/useContainerPreview.ts::parseDirectMessage": {

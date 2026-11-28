@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-28",
+  "generatedAt": "2026-11-26",
   "note": "Zero-net-increase ratchet for 4 AI code smells (emptyCatch, typeEscape, syncIo, lintSuppress). Monotonic shrink-only per file and in total (OCV5-904).",
   "categories": [
     "emptyCatch",
@@ -9,11 +9,11 @@
     "lintSuppress"
   ],
   "totals": {
-    "emptyCatch": 1407,
+    "emptyCatch": 1404,
     "typeEscape": 894,
-    "syncIo": 2254,
+    "syncIo": 2251,
     "lintSuppress": 165,
-    "all": 4720
+    "all": 4714
   },
   "files": {
     "packages/channels/feishu/src/client.ts": {
@@ -2357,7 +2357,7 @@
       "lintSuppress": 0
     },
     "packages/gateway/src/delegateRuntime.ts": {
-      "emptyCatch": 3,
+      "emptyCatch": 2,
       "typeEscape": 1,
       "syncIo": 1,
       "lintSuppress": 0
@@ -2381,9 +2381,9 @@
       "lintSuppress": 0
     },
     "packages/gateway/src/engine/antigravityAdapter.ts": {
-      "emptyCatch": 4,
+      "emptyCatch": 3,
       "typeEscape": 0,
-      "syncIo": 6,
+      "syncIo": 3,
       "lintSuppress": 0
     },
     "packages/gateway/src/engine/antigravityNativeTrajectory.ts": {
@@ -4746,12 +4746,6 @@
     },
     "packages/web-react/src/lib/sessionServiceTier.ts": {
       "emptyCatch": 2,
-      "typeEscape": 0,
-      "syncIo": 0,
-      "lintSuppress": 0
-    },
-    "packages/web-react/src/lib/sessionSwarmMode.ts": {
-      "emptyCatch": 1,
       "typeEscape": 0,
       "syncIo": 0,
       "lintSuppress": 0
