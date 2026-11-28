@@ -218,8 +218,8 @@ export function scanSwarmMentionSpans(text: string): SwarmMentionSpan[] {
   while ((match = MENTION_RE.exec(text)) !== null) {
     const rawBody = match[1]
     if (!rawBody) continue
-    const atOffset = match[0].indexOf('@')
-    if (atOffset < 0) continue
+    const atOffset = match[0].length - rawBody.length - 1
+    if (atOffset < 0 || match[0][atOffset] !== '@') continue
     const start = match.index + atOffset
     while (rangeIdx < codeRanges.length && codeRanges[rangeIdx]![1] <= start) rangeIdx += 1
     if (rangeIdx < codeRanges.length && start >= codeRanges[rangeIdx]![0]) continue

@@ -2,31 +2,20 @@
  * Pure SwarmSnapshot formatting, terminal settlement, and durable persistence helpers.
  */
 import { basename } from 'node:path'
+import { compactSwarmSnapshotToByteBudget, type SwarmPhase, type SwarmSnapshot } from '@openclaude/protocol'
 import {
-  compactSwarmSnapshotToByteBudget,
-  type SwarmPhase,
-  type SwarmSnapshot,
-} from '@openclaude/protocol'
-import {
-  analyzeBackgroundTasksInSteps,
-  createBackgroundTaskState,
-  extractGenericBgTaskStartId,
-  mergeBackgroundTaskStates,
-  type BackgroundTaskState,
-  type BackgroundTaskTelemetrySummary,
-  type MergedBackgroundTaskState,
-  type TrackedBackgroundTask,
+  analyzeBackgroundTasksInSteps, createBackgroundTaskState, extractGenericBgTaskStartId, mergeBackgroundTaskStates,
+  type BackgroundTaskState, type BackgroundTaskTelemetrySummary, type MergedBackgroundTaskState, type TrackedBackgroundTask,
 } from './antigravitySwarmBgTasks.js'
 
 export {
-  analyzeBackgroundTasksInSteps,
-  createBackgroundTaskState,
-  mergeBackgroundTaskStates,
-  type BackgroundTaskState,
-  type BackgroundTaskTelemetrySummary,
-  type MergedBackgroundTaskState,
-  type TrackedBackgroundTask,
+  analyzeBackgroundTasksInSteps, createBackgroundTaskState, mergeBackgroundTaskStates,
+  type BackgroundTaskState, type BackgroundTaskTelemetrySummary, type MergedBackgroundTaskState, type TrackedBackgroundTask,
 }
+
+let turnReductionCandidateVisitsForTests = 0
+export function resetTurnReductionCandidateVisitsForTests(): void { turnReductionCandidateVisitsForTests = 0 }
+export function getTurnReductionCandidateVisitsForTests(): number { return turnReductionCandidateVisitsForTests }
 
 const SWARM_MCP_TOOL_PREFIX = 'mcp_openclaude-memory_'
 
@@ -290,6 +279,7 @@ function ingestTurnBoundaryStep(
   t.lastType = stepType
   t.lastSt = strOf(step.status).toUpperCase()
   if (stepType === 'PLANNER_RESPONSE') {
+    if (t.epoch > 0) settleCompletedGenericEpoch(t.callState, t.epoch)
     const calls = Array.isArray(step.tool_calls) ? step.tool_calls : []
     t.lastCallsLen = calls.length
     t.lastToolName = ''
@@ -419,6 +409,8 @@ interface TerminalToolStep {
 interface CallReductionState {
   readonly calls: TrackedToolCall[]
   readonly callIndicesById: Map<string, number[]>
+  readonly callsByEpoch: Map<number, number[]>
+  readonly callsByEpochNorm: Map<string, number[]>
   readonly accounted: Set<number>
   readonly unaccountedNonBoard: Set<number>
   readonly idMatchedEpochNorms: Set<string>
@@ -433,18 +425,21 @@ interface CallReductionState {
 
 function createCallReductionState(): CallReductionState {
   return {
-    calls: [], callIndicesById: new Map(), accounted: new Set(), unaccountedNonBoard: new Set(),
-    idMatchedEpochNorms: new Set(), plannerEpochNormCounts: new Map(), plannerEpochCallCounts: new Map(),
-    genericTerminalsByEpoch: new Map(), seenTerminalIds: new Set(), seenStepIndices: new Set(),
-    seenUnindexedPayloads: new Set(), fallbackTerminals: [],
+    calls: [], callIndicesById: new Map(), callsByEpoch: new Map(), callsByEpochNorm: new Map(),
+    accounted: new Set(), unaccountedNonBoard: new Set(), idMatchedEpochNorms: new Set(),
+    plannerEpochNormCounts: new Map(), plannerEpochCallCounts: new Map(), genericTerminalsByEpoch: new Map(),
+    seenTerminalIds: new Set(), seenStepIndices: new Set(), seenUnindexedPayloads: new Set(), fallbackTerminals: [],
   }
 }
 
-function indexCallId(state: CallReductionState, id: string, idx: number): void {
-  if (!id) return
-  const bucket = state.callIndicesById.get(id)
+function pushBucketIndex<K>(map: Map<K, number[]>, key: K, idx: number): void {
+  const bucket = map.get(key)
   if (bucket) bucket.push(idx)
-  else state.callIndicesById.set(id, [idx])
+  else map.set(key, [idx])
+}
+
+function indexCallId(state: CallReductionState, id: string, idx: number): void {
+  if (id) pushBucketIndex(state.callIndicesById, id, idx)
 }
 
 function markCallAccounted(state: CallReductionState, idx: number): void {
@@ -465,36 +460,41 @@ function findUnaccountedIndexById(
   return -1
 }
 
+function findUnboundPlannerCallByEpochNorm(
+  state: CallReductionState, epoch: number, norm: string, requireNoId: boolean,
+): TrackedToolCall | null {
+  const bucket = state.callsByEpochNorm.get(`${epoch}:${norm}`)
+  if (!bucket) return null
+  for (const idx of bucket) {
+    turnReductionCandidateVisitsForTests += 1
+    const c = state.calls[idx]!
+    if (!state.accounted.has(idx) && c.fromPlanner && !c.boundDirect && (!requireNoId || !c.id)) return c
+  }
+  return null
+}
+
 function findUniqueArgsMatchedUnboundPlannerCall(
-  state: CallReductionState,
-  epoch: number,
-  norm: string,
-  args: Record<string, unknown> | null,
+  state: CallReductionState, epoch: number, norm: string, args: Record<string, unknown> | null,
 ): TrackedToolCall | null {
   if (!args) return null
+  const bucket = state.callsByEpochNorm.get(`${epoch}:${norm}`)
+  if (!bucket) return null
   const targetJson = JSON.stringify(args)
-  const matches = state.calls.filter(
-    (c, i) =>
-      !state.accounted.has(i) &&
-      c.epoch === epoch &&
-      c.fromPlanner &&
-      !c.id &&
-      !c.boundDirect &&
-      c.norm === norm &&
-      c.args !== null &&
-      JSON.stringify(c.args) === targetJson,
-  )
-  return matches.length === 1 ? matches[0]! : null
+  let matched: TrackedToolCall | null = null
+  for (const idx of bucket) {
+    turnReductionCandidateVisitsForTests += 1
+    const c = state.calls[idx]!
+    if (state.accounted.has(idx) || !c.fromPlanner || c.id || c.boundDirect || c.args === null) continue
+    if (JSON.stringify(c.args) !== targetJson) continue
+    if (matched) return null
+    matched = c
+  }
+  return matched
 }
 
 function bindIdDirectCall(
-  state: CallReductionState,
-  norm: string,
-  id: string,
-  args: Record<string, unknown> | null,
-  fromPlanner: boolean,
-  hasPlannerRoot: boolean,
-  epoch: number,
+  state: CallReductionState, norm: string, id: string, args: Record<string, unknown> | null,
+  fromPlanner: boolean, hasPlannerRoot: boolean, epoch: number,
 ): boolean {
   const existingIdx = state.callIndicesById.get(id)?.[0]
   if (existingIdx !== undefined) {
@@ -505,12 +505,9 @@ function bindIdDirectCall(
   }
   if (fromPlanner || !hasPlannerRoot) return false
   const epochNormTotal = state.plannerEpochNormCounts.get(`${epoch}:${norm}`) ?? 0
-  const unbound =
-    epochNormTotal === 1
-      ? state.calls.find(
-          (c, i) => !state.accounted.has(i) && c.epoch === epoch && c.fromPlanner && !c.id && !c.boundDirect && c.norm === norm,
-        )
-      : findUniqueArgsMatchedUnboundPlannerCall(state, epoch, norm, args)
+  const unbound = epochNormTotal === 1
+    ? findUnboundPlannerCallByEpochNorm(state, epoch, norm, true)
+    : findUniqueArgsMatchedUnboundPlannerCall(state, epoch, norm, args)
   if (!unbound) return false
   unbound.id = id
   indexCallId(state, id, unbound.idx)
@@ -520,21 +517,14 @@ function bindIdDirectCall(
 }
 
 function bindUnidDirectCall(
-  state: CallReductionState,
-  norm: string,
-  args: Record<string, unknown> | null,
-  fromPlanner: boolean,
-  hasPlannerRoot: boolean,
-  epoch: number,
+  state: CallReductionState, norm: string, args: Record<string, unknown> | null,
+  fromPlanner: boolean, hasPlannerRoot: boolean, epoch: number,
 ): boolean {
   if (fromPlanner || !hasPlannerRoot) return false
   const epochNormTotal = state.plannerEpochNormCounts.get(`${epoch}:${norm}`) ?? 0
-  const unbound =
-    epochNormTotal === 1
-      ? state.calls.find(
-          (c, i) => !state.accounted.has(i) && c.epoch === epoch && c.fromPlanner && !c.boundDirect && c.norm === norm,
-        )
-      : findUniqueArgsMatchedUnboundPlannerCall(state, epoch, norm, args)
+  const unbound = epochNormTotal === 1
+    ? findUnboundPlannerCallByEpochNorm(state, epoch, norm, false)
+    : findUniqueArgsMatchedUnboundPlannerCall(state, epoch, norm, args)
   if (!unbound) return false
   unbound.boundDirect = true
   if (!unbound.args && args) unbound.args = args
@@ -565,6 +555,8 @@ function registerTrackedCallStart(
   const isBoard = BOARD_COORD_TOOLS.has(norm)
   state.calls.push({ idx, name: rawName, norm, id, isBoard, args, fromPlanner, boundDirect: !fromPlanner, epoch })
   indexCallId(state, id, idx)
+  pushBucketIndex(state.callsByEpoch, epoch, idx)
+  pushBucketIndex(state.callsByEpochNorm, `${epoch}:${norm}`, idx)
   if (!isBoard) state.unaccountedNonBoard.add(idx)
   if (id && state.seenTerminalIds.has(id)) {
     markCallAccounted(state, idx)
@@ -633,24 +625,17 @@ function recordTerminalToolEvent(state: CallReductionState, step: Record<string,
 }
 
 function findUnambiguousNameFallbackIndex(
-  calls: readonly TrackedToolCall[],
-  accounted: ReadonlySet<number>,
-  idMatchedEpochNorms: ReadonlySet<string>,
-  term: TerminalToolStep,
+  state: CallReductionState, accounted: ReadonlySet<number>, idMatchedEpochNorms: ReadonlySet<string>, term: TerminalToolStep,
 ): number {
-  if (idMatchedEpochNorms.has(`${term.epoch}:${term.norm}`)) return -1
-  let sameNormTotal = 0
-  const candidates: number[] = []
-  for (let i = 0; i < calls.length; i += 1) {
-    const c = calls[i]!
-    if (c.epoch !== term.epoch || c.norm !== term.norm) continue
-    sameNormTotal += 1
-    if (accounted.has(i)) continue
-    if (term.id && c.id) continue
-    candidates.push(i)
-  }
-  if (sameNormTotal !== 1 || candidates.length !== 1) return -1
-  return candidates[0]!
+  const key = `${term.epoch}:${term.norm}`
+  if (idMatchedEpochNorms.has(key)) return -1
+  const bucket = state.callsByEpochNorm.get(key)
+  if (!bucket || bucket.length !== 1) return -1
+  turnReductionCandidateVisitsForTests += 1
+  const idx = bucket[0]!
+  const c = state.calls[idx]!
+  if (accounted.has(idx) || (term.id && c.id)) return -1
+  return idx
 }
 
 function extractBatchCallsIfToolStep(step: Record<string, unknown>, stepType: string): readonly unknown[] | null {
@@ -695,22 +680,37 @@ function ingestTurnStep(
   }
 }
 
+function resolveGenericEpochForOne(
+  state: CallReductionState, epoch: number, genericCount: number, accounted: Set<number>, syncUnaccounted: boolean,
+): void {
+  const bucket = state.callsByEpoch.get(epoch)
+  if (!bucket || bucket.length === 0) return
+  const retirableTargets: number[] = []
+  for (const idx of bucket) {
+    turnReductionCandidateVisitsForTests += 1
+    const c = state.calls[idx]!
+    if (c.fromPlanner && !c.id && !c.boundDirect && !accounted.has(idx)) retirableTargets.push(idx)
+  }
+  const possibleAnonymousSources = Math.max(bucket.length, state.plannerEpochCallCounts.get(epoch) ?? 0)
+  if (retirableTargets.length > 0 && genericCount >= possibleAnonymousSources) {
+    for (const idx of retirableTargets) {
+      accounted.add(idx)
+      if (syncUnaccounted) state.unaccountedNonBoard.delete(idx)
+    }
+  }
+}
+
+function settleCompletedGenericEpoch(state: CallReductionState, epoch: number): void {
+  const genericCount = state.genericTerminalsByEpoch.get(epoch)
+  if (genericCount === undefined) return
+  resolveGenericEpochForOne(state, epoch, genericCount, state.accounted, true)
+  state.genericTerminalsByEpoch.delete(epoch)
+}
+
 function resolveGenericEpochTerminals(state: CallReductionState, accounted: Set<number> = state.accounted): void {
+  const sync = accounted === state.accounted
   for (const [epoch, genericCount] of state.genericTerminalsByEpoch.entries()) {
-    let epochCallCount = 0
-    const retirableTargets: number[] = []
-    for (let i = 0; i < state.calls.length; i += 1) {
-      const c = state.calls[i]!
-      if (c.epoch !== epoch) continue
-      epochCallCount += 1
-      if (c.fromPlanner && !c.id && !c.boundDirect && !accounted.has(i)) {
-        retirableTargets.push(i)
-      }
-    }
-    const possibleAnonymousSources = Math.max(epochCallCount, state.plannerEpochCallCounts.get(epoch) ?? 0)
-    if (retirableTargets.length > 0 && genericCount >= possibleAnonymousSources) {
-      for (const idx of retirableTargets) accounted.add(idx)
-    }
+    resolveGenericEpochForOne(state, epoch, genericCount, accounted, sync)
   }
 }
 
@@ -731,7 +731,7 @@ function resolveFallbackTerminals(
       }
     }
     if (!term.norm) continue
-    const fallbackIdx = findUnambiguousNameFallbackIndex(state.calls, accounted, idMatchedEpochNorms, term)
+    const fallbackIdx = findUnambiguousNameFallbackIndex(state, accounted, idMatchedEpochNorms, term)
     if (fallbackIdx >= 0) accounted.add(fallbackIdx)
   }
   resolveGenericEpochTerminals(state, accounted)
@@ -766,13 +766,15 @@ export function findActiveNonBoardToolInTurn(
   let epoch = 0
   for (let i = 0; i < turnSteps.length; i += 1) {
     const step = turnSteps[i]!
-    if (strOf(step.type).toUpperCase() === 'PLANNER_RESPONSE') {
+    const stepType = strOf(step.type).toUpperCase()
+    if (stepType === 'PLANNER_RESPONSE') {
+      if (epoch > 0) settleCompletedGenericEpoch(state, epoch)
       epoch += 1
       const calls = i === lastPlannerIdx ? lastPlannerCalls : (Array.isArray(step.tool_calls) ? step.tool_calls : [])
       registerCallList(state, calls, true, true, epoch)
       continue
     }
-    ingestTurnStep(state, step, epoch > 0, epoch, bgTasks)
+    ingestTurnStep(state, step, epoch > 0, epoch, bgTasks, stepType)
   }
   resolveFallbackTerminals(state)
   for (let i = 0; i < state.calls.length; i += 1) {

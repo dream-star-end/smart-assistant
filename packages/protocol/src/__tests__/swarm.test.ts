@@ -12,6 +12,7 @@ import {
   isSwarmSnapshot,
   mergeSwarmSnapshotsStrict,
   parseSwarmSlashCommand,
+  scanSwarmMentionSpans,
 } from '../swarm.js'
 
 describe('parseSwarmSlashCommand', () => {
@@ -157,5 +158,20 @@ describe('extractSwarmMentions (OCV5-932 Defect #3A)', () => {
     const elapsed = Date.now() - t0
     assert.equal(mentions.includes('b1-integrator'), true)
     assert.equal(elapsed < 200, true)
+  })
+
+  it('computes exact mention spans for @@reviewer and trailing-hyphen member names (@all-, @worker-)', () => {
+    const text = '复核 @@reviewer 以及 @all- 与 @worker- 和 @#chan-1.'
+    const spans = scanSwarmMentionSpans(text)
+    assert.deepEqual(
+      spans.map((s) => ({ raw: s.raw, kind: s.kind, target: s.target, sliced: text.slice(s.start, s.end) })),
+      [
+        { raw: '@reviewer', kind: 'mention', target: 'reviewer', sliced: '@reviewer' },
+        { raw: '@all-', kind: 'mention', target: 'all-', sliced: '@all-' },
+        { raw: '@worker-', kind: 'mention', target: 'worker-', sliced: '@worker-' },
+        { raw: '@#chan-1', kind: 'channel_mention', target: 'chan-1', sliced: '@#chan-1' },
+      ],
+    )
+    assert.deepEqual(extractSwarmMentions(text), ['reviewer', 'all-', 'worker-', '#chan-1'])
   })
 })

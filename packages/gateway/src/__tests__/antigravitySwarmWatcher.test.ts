@@ -2611,6 +2611,47 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
     const i64 = measureToolPairOps(64, true)
     const i128 = measureToolPairOps(128, true)
     assert.ok(i128 - i64 <= (i64 - i32) * 2.5 + 16, `interleaved tool+sys ops must scale linearly (i32=${i32}, i64=${i64}, i128=${i128})`)
+
+    // Steward R3 Blocker: internal candidate visit counts across ALL 3 paths
+    // (direct ID, planner-no-ID -> direct-ID bind, and anonymous GENERIC DONE + final swarm_wait)
+    const {
+      resetTurnReductionCandidateVisitsForTests,
+      getTurnReductionCandidateVisitsForTests,
+    } = await import('../engine/antigravitySwarmFormat.js')
+    const measurePlannerBindVisits = (nEpochs: number): number => {
+      const seq: Record<string, unknown>[] = [{ step_index: 0, type: 'USER_INPUT', status: 'DONE' }]
+      let si = 1
+      for (let e = 0; e < nEpochs; e += 1) {
+        seq.push({ step_index: si++, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', arguments: { CommandLine: `cmd-${e}` } }] })
+        seq.push({ step_index: si++, type: 'TOOL_CALL', tool_call_id: `late-id-${e}`, tool_name: 'run_command', status: 'ACTIVE', arguments: { CommandLine: `cmd-${e}` } })
+        seq.push({ step_index: si++, type: 'TOOL_RESULT', tool_call_id: `late-id-${e}`, tool_name: 'run_command', status: 'DONE', content: 'ok' })
+      }
+      resetTurnReductionCandidateVisitsForTests()
+      assert.equal(findTurnStartIndex(seq), 0)
+      return getTurnReductionCandidateVisitsForTests()
+    }
+    assert.equal(measurePlannerBindVisits(32), 32, 'planner-no-ID -> direct-ID bind must visit 1 candidate per epoch (N=32)')
+    assert.equal(measurePlannerBindVisits(64), 64, 'planner-no-ID -> direct-ID bind must visit 1 candidate per epoch (N=64)')
+    assert.equal(measurePlannerBindVisits(128), 128, 'planner-no-ID -> direct-ID bind must visit 1 candidate per epoch (N=128)')
+
+    const measureAnonGenericVisits = (nEpochs: number): number => {
+      const seq: Record<string, unknown>[] = [{ step_index: 0, type: 'USER_INPUT', status: 'DONE' }]
+      let si = 1
+      for (let e = 0; e < nEpochs; e += 1) {
+        seq.push({ step_index: si++, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', arguments: { CommandLine: `anon-${e}` } }] })
+        seq.push({ step_index: si++, type: 'GENERIC', status: 'DONE', content: `out-${e}` })
+      }
+      const waitSysIdx = si + 2
+      seq.push({ step_index: si++, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] })
+      seq.push({ step_index: si++, type: 'GENERIC', status: 'DONE', content: 'parked' })
+      seq.push({ step_index: si++, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] wake' })
+      resetTurnReductionCandidateVisitsForTests()
+      assert.equal(findTurnStartIndex(seq), waitSysIdx)
+      return getTurnReductionCandidateVisitsForTests()
+    }
+    assert.ok(measureAnonGenericVisits(32) <= 40, 'anonymous GENERIC DONE epochs must settle in O(N) (N=32)')
+    assert.ok(measureAnonGenericVisits(64) <= 72, 'anonymous GENERIC DONE epochs must settle in O(N) (N=64)')
+    assert.ok(measureAnonGenericVisits(128) <= 140, 'anonymous GENERIC DONE epochs must settle in O(N) (N=128)')
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }
