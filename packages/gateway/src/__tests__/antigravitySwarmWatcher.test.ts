@@ -2962,6 +2962,131 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
       const m = measureSameEpochGenericAlternating(n)
       assert.ok(m.candidateVisits <= n + 8, `R7 same-epoch alternating GENERIC+SYSTEM_MESSAGE must be O(N) (N=${n}, got=${m.candidateVisits})`)
     }
+
+    // Steward R8 Blocker (1) boundaryIntegrity: replaying a pre-cut consumed DONE (same ID & step_index) after SYSTEM_MESSAGE
+    // MUST NOT settle a newly started post-cut call C (both with and without replay -> C stays working & 0 reclaims, until C's own DONE)
+    for (const [withReplay, revBase] of [[true, 120], [false, 126]] as const) {
+      const replaySteps: Record<string, unknown>[] = [
+        {
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            { name: 'read_file', arguments: { Path: '/repo/a.ts' } },
+            { name: 'swarm_wait', arguments: { since: 1 } },
+          ],
+        },
+        { step_index: 2, type: 'TOOL_RESULT', tool_call_id: 'cid-A', tool_name: 'read_file', status: 'DONE', content: 'a done' },
+        { step_index: 3, type: 'TOOL_RESULT', tool_name: 'swarm_wait', status: 'DONE', content: 'parked' },
+        { step_index: 4, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] wake' },
+        { step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', arguments: { Path: '/repo/c.ts' } }] },
+        ...(withReplay ? [{ step_index: 2, type: 'TOOL_RESULT', tool_call_id: 'cid-A', tool_name: 'read_file', status: 'DONE', content: 'a done' }] : []),
+        { step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 2 } }] },
+      ]
+      await writeFile(workerTranscript, `${replaySteps.map((s) => JSON.stringify(s)).join('\n')}\n`)
+      const snap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: revBase })!
+      assert.equal(snap.members.find((m) => m.name === 'parser')!.status, 'working', `R8 replay=${withReplay}: C must remain working`)
+      let reclaims = 0
+      const mon = new SwarmStallMonitor({
+        stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+        onStallExhausted: () => { reclaims += 1 },
+      })
+      mon.evaluate(snap, 1_000)
+      mon.evaluate({ ...snap, revision: revBase + 1 }, 3_000)
+      mon.evaluate({ ...snap, revision: revBase + 2 }, 5_000)
+      assert.equal(reclaims, 0, `R8 replay=${withReplay}: C must block stall reclaim`)
+
+      // Positive control: once C receives its own DONE, worker becomes waiting and reclaims (1)
+      const cDoneSteps = [
+        ...replaySteps.slice(0, -1),
+        { step_index: 7, type: 'TOOL_RESULT', tool_call_id: 'cid-C', tool_name: 'read_file', status: 'DONE', content: 'c done' },
+        replaySteps[replaySteps.length - 1]!,
+      ]
+      await writeFile(workerTranscript, `${cDoneSteps.map((s) => JSON.stringify(s)).join('\n')}\n`)
+      const doneSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: revBase + 3 })!
+      assert.equal(doneSnap.members.find((m) => m.name === 'parser')!.status, 'waiting', `R8 replay=${withReplay} positive: C done -> waiting`)
+      let doneReclaims = 0
+      const doneMon = new SwarmStallMonitor({
+        stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+        onStallExhausted: () => { doneReclaims += 1 },
+      })
+      doneMon.evaluate(doneSnap, 1_000)
+      doneMon.evaluate({ ...doneSnap, revision: revBase + 4 }, 3_000)
+      doneMon.evaluate({ ...doneSnap, revision: revBase + 5 }, 5_000)
+      assert.equal(doneReclaims, 1, `R8 replay=${withReplay} positive: once C finishes, reclaim fires (1)`)
+    }
+
+    // Steward R8 Blocker (2) boundaryIntegrity: canonical JSON args matching ignores object key order
+    // (swapped {Path, StartLine} vs {StartLine, Path} binds & settles cleanly -> waiting/reclaim=1; distinct Path stays separate -> working/reclaim=0)
+    const swappedKeyOrderSteps = [
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', arguments: { Path: '/repo/a.ts', StartLine: 10 } }] },
+      { step_index: 2, type: 'TOOL_CALL', tool_call_id: 'cid-swap', tool_name: 'read_file', status: 'ACTIVE', arguments: { StartLine: 10, Path: '/repo/a.ts' } },
+      { step_index: 3, type: 'TOOL_RESULT', tool_call_id: 'cid-swap', tool_name: 'read_file', status: 'DONE', content: 'ok' },
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    await writeFile(workerTranscript, `${swappedKeyOrderSteps.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const swapSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 132 })!
+    assert.equal(swapSnap.members.find((m) => m.name === 'parser')!.status, 'waiting', 'R8 swapped JSON key order must bind same planner call -> waiting')
+    let swapReclaims = 0
+    const swapMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { swapReclaims += 1 },
+    })
+    swapMon.evaluate(swapSnap, 1_000)
+    swapMon.evaluate({ ...swapSnap, revision: 133 }, 3_000)
+    swapMon.evaluate({ ...swapSnap, revision: 134 }, 5_000)
+    assert.equal(swapReclaims, 1, 'R8 swapped JSON key order must allow genuine deadlock reclaim (1)')
+    // Also verify multi-call ArgsBucket matches swapped key order in same batch
+    const batchSwapSteps = [
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        tool_calls: [
+          { name: 'read_file', arguments: { Path: '/repo/a.ts', StartLine: 1 } },
+          { name: 'read_file', arguments: { Path: '/repo/b.ts', StartLine: 2 } },
+        ],
+      },
+      { step_index: 2, type: 'TOOL_CALL', tool_call_id: 'bs-1', tool_name: 'read_file', status: 'ACTIVE', arguments: { StartLine: 1, Path: '/repo/a.ts' } },
+      { step_index: 3, type: 'TOOL_RESULT', tool_call_id: 'bs-1', tool_name: 'read_file', status: 'DONE', content: 'a ok' },
+      { step_index: 4, type: 'TOOL_CALL', tool_call_id: 'bs-2', tool_name: 'read_file', status: 'ACTIVE', arguments: { StartLine: 2, Path: '/repo/b.ts' } },
+      { step_index: 5, type: 'TOOL_RESULT', tool_call_id: 'bs-2', tool_name: 'read_file', status: 'DONE', content: 'b ok' },
+      { step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    assert.equal(findActiveNonBoardToolInTurn(batchSwapSteps, 5, [{ name: 'swarm_wait', arguments: { since: 1 } }]), null, 'R8 multi-call ArgsBucket must match swapped key order')
+
+    // Steward R8 complexityDrift concern: same-epoch N distinct-tool named DONEs + 1 unfinished call + N alternating SYSTEM_MESSAGE
+    // must keep boundary queries strictly O(1) (0 named rescan visits per SYSTEM_MESSAGE, total O(N) not O(N^2))
+    const measureSameEpochNamedAlternating = (nTools: number) => {
+      const seq: Record<string, unknown>[] = [
+        { step_index: 0, type: 'USER_INPUT', status: 'DONE' },
+        {
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: [
+            ...Array.from({ length: nTools }, (_, k) => ({ name: `custom_tool_${k}`, arguments: { idx: k } })),
+            { name: 'still_running_tool', arguments: { keep: true } },
+            { name: 'swarm_wait', arguments: { since: 1 } },
+          ],
+        },
+      ]
+      let si = 2
+      for (let k = 0; k < nTools; k += 1) {
+        seq.push({ step_index: si++, type: 'TOOL_RESULT', tool_name: `custom_tool_${k}`, status: 'DONE', content: 'ok' })
+      }
+      for (let k = 0; k < nTools; k += 1) {
+        seq.push({ step_index: si++, type: 'TOOL_RESULT', tool_name: 'swarm_wait', status: 'DONE', content: 'parked' })
+        seq.push({ step_index: si++, type: 'SYSTEM_MESSAGE', status: 'DONE', content: `tick-${k}` })
+      }
+      resetTurnReductionCandidateVisitsForTests()
+      assert.equal(findTurnStartIndex(seq), 0)
+      return getTurnReductionMetricsForTests()
+    }
+    for (const n of [32, 64, 128] as const) {
+      const m = measureSameEpochNamedAlternating(n)
+      assert.ok(m.candidateVisits <= n + 8, `R8 same-epoch N distinct named DONEs + N SYSTEM_MESSAGE must be O(N) (N=${n}, got=${m.candidateVisits})`)
+    }
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }

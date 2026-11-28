@@ -29,12 +29,11 @@ import {
 } from '@openclaude/protocol'
 import {
   analyzeBackgroundTasksInSteps,
+  analyzeTurnWindow,
   buildDurableSwarmBoardInput,
   compactSwarmSnapshotForPersistence,
   createBackgroundTaskState,
   describeToolActivity,
-  findActiveNonBoardToolInTurn,
-  findTurnStartIndex,
   formatSwarmWorkingDetail,
   mergeBackgroundTaskStates,
   normalizeSwarmToolName,
@@ -247,7 +246,7 @@ export function parseMemberTranscriptTail(
     toolCalls,
     ...(mergedBg.incompleteEvidence ? { incompleteBgEvidence: true } : {}),
   }
-  const turnStart = findTurnStartIndex(steps, bgTasks)
+  const { turnStart, activeNonBoardTool } = analyzeTurnWindow(steps, bgTasks)
   const turnSteps = steps.slice(turnStart)
   const last = turnSteps[turnSteps.length - 1]!
   const lastType = asStr(last.type).toUpperCase()
@@ -255,8 +254,7 @@ export function parseMemberTranscriptTail(
 
   if (lastType === 'ERROR_MESSAGE') return { ...buildErrorTranscriptSummary(telBase, maxStepIndex, last), ...(mergedBg.activeIds.size > 0 || mergedBg.overflowed ? { incompleteBgEvidence: true } : {}) }
 
-  const { lastPlanner, lastPlannerIdx, lastPlannerCalls } = findLastPlannerInTurn(turnSteps)
-  const activeNonBoardTool = findActiveNonBoardToolInTurn(turnSteps, lastPlannerIdx, lastPlannerCalls, bgTasks)
+  const { lastPlanner, lastPlannerCalls } = findLastPlannerInTurn(turnSteps)
   if (activeNonBoardTool) {
     return {
       ...telBase,
