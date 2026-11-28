@@ -14,12 +14,44 @@ import {
   writeSessionSwarmMode,
 } from "../lib/sessionSwarmMode";
 import type { PublicModel } from "../lib/types";
+import { useAccountDefaultSwarmSync, usePersistDefaultSwarmMode } from "./useSwarmDefaultSync";
 
-export function useSwarmMode(opts: {
+export { usePersistDefaultSwarmMode };
+
+export type SetSwarmModeOptions = {
+  /** Persist as the account's default collaboration mode for future sessions/reloads (default: true). Pass false for automatic non-Antigravity fallback. */
+  persistDefault?: boolean;
+};
+
+function resolveEffectiveSwarmEnabled(opts: {
+  persistedId: string | undefined;
+  sessionKey: string;
+  persistedMap: Record<string, boolean | null>;
+  draftSwarm: Record<string, boolean>;
+  detectedSwarm: boolean;
+  resolvedDefault: boolean;
+}): boolean {
+  const { persistedId, sessionKey, persistedMap, draftSwarm, detectedSwarm, resolvedDefault } = opts;
+  if (!persistedId) {
+    return typeof draftSwarm[sessionKey] === "boolean" ? draftSwarm[sessionKey] : resolvedDefault;
+  }
+  const explicitValue =
+    persistedId in persistedMap ? (persistedMap[persistedId] ?? undefined) : readSessionSwarmMode(persistedId);
+  const promotedDraft = typeof draftSwarm[persistedId] === "boolean" ? draftSwarm[persistedId] : undefined;
+  return explicitValue ?? promotedDraft ?? (detectedSwarm ? true : resolvedDefault);
+}
+
+export type UseSwarmModeOptions = {
   demo: boolean;
   sessionKey: string;
   /** Persisted session id when viewing a materialized session; undefined on a fresh draft. */
   activeSessionId?: string;
+  /** Authenticated user id for account-scoped default persistence; undefined never writes unscoped global storage. */
+  userId?: string;
+  /** Server-persisted default collaboration mode (`user_preferences.default_swarm_mode`). */
+  defaultSwarmMode?: boolean;
+  /** Callback to persist account default collaboration mode to the server (`/api/me/preferences`). */
+  onPersistDefaultSwarmMode?: (enabled: boolean) => void;
   /** True when the active session already contains a live or historical SwarmBoard card. */
   hasSessionSwarm?: boolean;
   /** Optional session messages + monotonic version to detect existing SwarmBoard cards without extra caller wiring. */
@@ -27,20 +59,25 @@ export function useSwarmMode(opts: {
   messagesVersion?: number;
   modelId: string | undefined;
   models: PublicModel[];
-}) {
-  const { demo, sessionKey, activeSessionId, hasSessionSwarm = false, wsMessages, messagesVersion = 0, modelId, models } = opts;
+};
+
+export function useSwarmMode(opts: UseSwarmModeOptions) {
+  const {
+    demo, sessionKey, activeSessionId, userId, defaultSwarmMode, onPersistDefaultSwarmMode,
+    hasSessionSwarm = false, wsMessages, messagesVersion = 0, modelId, models,
+  } = opts;
+  const accountId = !demo ? userId : undefined;
   const persistedId = !demo ? activeSessionId : undefined;
   const [draftSwarm, setDraftSwarm] = useState<Record<string, boolean>>({});
   const [persistedMap, setPersistedMap] = useState<Record<string, boolean | null>>({});
+  const { resolvedDefault, markLocalDefault } = useAccountDefaultSwarmSync(accountId, defaultSwarmMode);
 
   const detectedSwarm = useMemo(() => {
     void messagesVersion;
     if (hasSessionSwarm) return true;
     if (!persistedId || !wsMessages?.length) return false;
     const card = latestSwarmCard(wsMessages);
-    return Boolean(
-      card && (card.snapshot.phase === "starting" || card.snapshot.phase === "running"),
-    );
+    return Boolean(card && (card.snapshot.phase === "starting" || card.snapshot.phase === "running"));
   }, [hasSessionSwarm, persistedId, wsMessages, messagesVersion]);
 
   useEffect(() => {
@@ -50,9 +87,10 @@ export function useSwarmMode(opts: {
       setPersistedMap((prev) => (prev[persistedId] === next ? prev : { ...prev, [persistedId]: next }));
     };
     const stored = readSessionSwarmMode(persistedId);
-    if (stored === undefined && draftSwarm[persistedId] === true) {
-      writeSessionSwarmMode(persistedId, true);
-      set(true);
+    const draftVal = draftSwarm[persistedId];
+    if (stored === undefined && typeof draftVal === "boolean") {
+      writeSessionSwarmMode(persistedId, draftVal);
+      set(draftVal);
       setDraftSwarm((prev) => {
         if (!(persistedId in prev)) return prev;
         const copy = { ...prev };
@@ -66,30 +104,46 @@ export function useSwarmMode(opts: {
   }, [persistedId, draftSwarm]);
 
   const swarmSupported = !demo && isAntigravityModelForUi(modelId, models);
-  const explicitValue = persistedId
-    ? persistedId in persistedMap
-      ? (persistedMap[persistedId] ?? undefined)
-      : readSessionSwarmMode(persistedId)
-    : undefined;
-  const promotedDraft = persistedId && draftSwarm[persistedId] === true ? true : undefined;
-  const effectiveEnabled = persistedId ? (explicitValue ?? promotedDraft ?? detectedSwarm) : Boolean(draftSwarm[sessionKey]);
+  const effectiveEnabled = resolveEffectiveSwarmEnabled({
+    persistedId,
+    sessionKey,
+    persistedMap,
+    draftSwarm,
+    detectedSwarm,
+    resolvedDefault,
+  });
   const swarmMode = swarmSupported && effectiveEnabled;
 
   const setSwarmMode = useCallback(
-    (next: boolean) => {
+    (next: boolean, setOpts?: SetSwarmModeOptions) => {
+      const persistDefault = setOpts?.persistDefault !== false;
       if (persistedId) {
         writeSessionSwarmMode(persistedId, next);
         setPersistedMap((prev) => ({ ...prev, [persistedId]: next }));
+      } else if (persistDefault && accountId) {
+        setDraftSwarm((prev) => {
+          if (!(sessionKey in prev)) return prev;
+          const copy = { ...prev };
+          delete copy[sessionKey];
+          return copy;
+        });
       } else {
         setDraftSwarm((prev) => ({ ...prev, [sessionKey]: next }));
       }
+      if (persistDefault && accountId) {
+        markLocalDefault(next);
+        onPersistDefaultSwarmMode?.(next);
+      }
     },
-    [persistedId, sessionKey],
+    [persistedId, sessionKey, accountId, markLocalDefault, onPersistDefaultSwarmMode],
   );
 
-  const toggleSwarmMode = useCallback(() => {
-    setSwarmMode(!effectiveEnabled);
-  }, [effectiveEnabled, setSwarmMode]);
+  const toggleSwarmMode = useCallback(
+    (setOpts?: SetSwarmModeOptions) => {
+      setSwarmMode(!effectiveEnabled, setOpts);
+    },
+    [effectiveEnabled, setSwarmMode],
+  );
 
   return { swarmSupported, swarmMode, setSwarmMode, toggleSwarmMode };
 }

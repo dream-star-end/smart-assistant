@@ -152,6 +152,20 @@ describe("intelligent_ui(OCV5-361)", () => {
   });
 });
 
+describe("default_swarm_mode (OCV5-927)", () => {
+  test("full schema accepts boolean and rejects non-boolean values", () => {
+    assert.equal(PreferencesSchema.safeParse({ default_swarm_mode: true }).success, true);
+    assert.equal(PreferencesSchema.safeParse({ default_swarm_mode: false }).success, true);
+    assert.equal(PreferencesSchema.safeParse({ default_swarm_mode: "true" }).success, false);
+  });
+  test("patch accepts true/false/null and rejects invalid types", () => {
+    for (const v of [true, false, null]) {
+      assert.equal(PreferencesPatchSchema.safeParse({ default_swarm_mode: v }).success, true, String(v));
+    }
+    assert.equal(PreferencesPatchSchema.safeParse({ default_swarm_mode: 1 }).success, false);
+  });
+});
+
 describe('system assistant consent', () => {
   test('absent means no extra consent; exact profile object is validated and removable', () => {
     assert.deepEqual(PreferencesSchema.parse({}), {})

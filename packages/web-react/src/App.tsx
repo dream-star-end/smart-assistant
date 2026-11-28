@@ -36,7 +36,7 @@ import {
 } from "./components/chat/imageEditActions";
 import { extractLatestTodos } from "./components/chat/todoExtract";
 import { QueuedSendListLazy, SwarmBoardDrawer } from "./components/chat/lazyTimelineCards";
-import { useSwarmBoard, useSwarmMode } from "./hooks/useSwarmUi";
+import { usePersistDefaultSwarmMode, useSwarmBoard, useSwarmMode } from "./hooks/useSwarmUi";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState, greetingName } from "./components/EmptyState";
 import type { ChatError } from "./components/ErrorBanner";
@@ -1189,15 +1189,17 @@ export function App() {
 
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
+  const persistDefaultSwarmMode = usePersistDefaultSwarmMode({ demo, auth, authRef, resolvedIdentity, setModelPrefs });
   const { swarmSupported, swarmMode, setSwarmMode, toggleSwarmMode } = useSwarmMode({
-    demo, sessionKey: activeId ?? draftSessionId, activeSessionId: activeId,
+    demo, sessionKey: activeId ?? draftSessionId, activeSessionId: activeId, userId: user?.id,
+    defaultSwarmMode: modelPrefs.default_swarm_mode, onPersistDefaultSwarmMode: persistDefaultSwarmMode,
     wsMessages, messagesVersion: chat.version, modelId, models,
   });
   const swarmUi = useSwarmBoard({ sessionKey: activeId ?? draftSessionId, wsMessages, messagesVersion: chat.version });
   const swarmRunning = Boolean(
     swarmUi.latestSwarm && (swarmUi.latestSwarm.phase === "starting" || swarmUi.latestSwarm.phase === "running"),
   );
-  swarmStateRef.current = { swarmMode, swarmRunning, disableSwarm: () => setSwarmMode(false) };
+  swarmStateRef.current = { swarmMode, swarmRunning, disableSwarm: () => setSwarmMode(false, { persistDefault: false }) };
   // 分享对话框只针对打开时的会话;切会话(返回键/深链)就关掉,不拿旧快照配新标题。
   // biome-ignore lint/correctness/useExhaustiveDependencies: activeId 是触发条件
   useEffect(() => {
@@ -2618,7 +2620,7 @@ export function App() {
             placeholder={swarmMode ? undefined : `和「${agent.name}」对话…`}
             swarmSupported={swarmSupported}
             swarmMode={swarmMode}
-            onToggleSwarmMode={toggleSwarmMode}
+            onToggleSwarmMode={() => toggleSwarmMode({ persistDefault: false })}
             onUpload={demo ? undefined : uploadMedia}
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}

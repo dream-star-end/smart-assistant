@@ -22,6 +22,7 @@ export type PrefsView = {
   /** 本次会话期内用户在设置/系统助手显式修改 default_model 的本地时刻（epoch ms）。 */
   default_model_updated_at?: number;
   default_effort?: PreferenceEffort;
+  default_swarm_mode?: boolean;
   notify_email?: boolean;
   notify_telegram?: boolean;
   qq_proactive_push?: boolean;

@@ -31,6 +31,30 @@ import type { TutorialTab } from "./useAppRoute";
 import type { UseChatSocket } from "./useChatSocket";
 import type { ToastFn } from "../components/ui/Toast";
 
+function mergeModelPrefsUpdate(
+  prev: PrefsView,
+  prefs: PrefsView,
+  patch?: Record<string, unknown>,
+): PrefsView {
+  const modelPatched =
+    (patch !== undefined && "default_model" in patch) ||
+    (prev.default_model !== undefined && prefs.default_model !== prev.default_model);
+  const defaultModelChangedAt = modelPatched
+    ? prefs.default_model
+      ? Date.now()
+      : undefined
+    : prev.default_model_updated_at;
+  const preservedSwarm =
+    prefs.default_swarm_mode === undefined &&
+    !(patch !== undefined && "default_swarm_mode" in patch) &&
+    prev.default_swarm_mode !== undefined
+      ? { default_swarm_mode: prev.default_swarm_mode }
+      : {};
+  return defaultModelChangedAt !== undefined
+    ? { ...preservedSwarm, ...prefs, default_model_updated_at: defaultModelChangedAt }
+    : { ...preservedSwarm, ...prefs };
+}
+
 export type AppNavigationActionsInput = {
   activeId: string | undefined;
   agent: Agent;
@@ -253,19 +277,7 @@ export function useAppNavigationActions({
       // default_model 变更经 modelPrefs → resolver effect 传导:只影响「无自有持久化选择」
       // 的会话与空会话态;已显式选过模型的会话保持自身选择(per-session 隔离语义)。
       // 仅当设置/系统助手显式修改 default_model 时打本地变更戳,打开设置重读或改 theme 不改此水位。
-      setModelPrefs((prev) => {
-        const modelPatched =
-          (patch !== undefined && "default_model" in patch) ||
-          (prev.default_model !== undefined && prefs.default_model !== prev.default_model);
-        const defaultModelChangedAt = modelPatched
-          ? prefs.default_model
-            ? Date.now()
-            : undefined
-          : prev.default_model_updated_at;
-        return defaultModelChangedAt !== undefined
-          ? { ...prefs, default_model_updated_at: defaultModelChangedAt }
-          : prefs;
-      });
+      setModelPrefs((prev) => mergeModelPrefsUpdate(prev, prefs, patch));
     },
     [],
   );
