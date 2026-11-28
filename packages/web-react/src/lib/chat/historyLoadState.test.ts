@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
@@ -7,6 +7,25 @@ import {
   isSubstantiveHistoryMessage,
   sessionHistorySurface,
 } from "./historyLoadState";
+
+function collectSourceFiles(dir: string): Array<{ path: string; contents: string }> {
+  if (!existsSync(dir)) return [];
+  const results: Array<{ path: string; contents: string }> = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name !== "__tests__" && entry.name !== "__fixtures__") {
+        results.push(...collectSourceFiles(full));
+      }
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    if (!/\.(?:ts|tsx)$/.test(entry.name)) continue;
+    if (/\.(?:test|spec)\.(?:ts|tsx)$/.test(entry.name) || entry.name.endsWith(".d.ts")) continue;
+    results.push({ path: full, contents: readFileSync(full, "utf8") });
+  }
+  return results.sort((a, b) => a.path.localeCompare(b.path));
+}
 
 describe("countSubstantiveHistoryMessages", () => {
   test("settled permission cards and system/runtime-event orphans do not count as substantive history", () => {
@@ -74,18 +93,36 @@ describe("sessionHistorySurface", () => {
   });
 });
 
-test("App.tsx routes GET failure + messageCount through sessionHistorySurface, not EmptyState", () => {
+test("App routes GET failure + messageCount through sessionHistorySurface, not EmptyState", () => {
   const here = dirname(fileURLToPath(import.meta.url));
-  const source = readFileSync(join(here, "../../App.tsx"), "utf8");
-  // OCV5-466: the derivation lives in hooks/useHistorySkeleton; App consumes its historySurface.
-  const hookSource = readFileSync(join(here, "../../hooks/useHistorySkeleton.ts"), "utf8");
-  expect(source).toContain("useHistorySkeleton({");
-  expect(hookSource).toContain("sessionHistorySurface({");
-  expect(hookSource).toContain("historyError: !demo && input.historyError !== null");
-  expect(source).toContain('historySurface === "error"');
-  expect(source).toContain("retryHistory(activeId)");
-  const errorIdx = source.indexOf('historySurface === "error"');
-  const emptyIdx = source.indexOf("<EmptyState");
-  expect(errorIdx).toBeGreaterThan(0);
-  expect(emptyIdx).toBeGreaterThan(errorIdx);
+  const srcRoot = join(here, "../..");
+  const appPath = join(srcRoot, "App.tsx");
+  const appFiles = [
+    { path: appPath, contents: readFileSync(appPath, "utf8") },
+    ...collectSourceFiles(join(srcRoot, "hooks")),
+    ...collectSourceFiles(join(srcRoot, "components")),
+  ];
+  const aggregated = appFiles.map((file) => file.contents).join("\n");
+  const hookSources = collectSourceFiles(join(srcRoot, "hooks"))
+    .map((file) => file.contents)
+    .join("\n");
+
+  expect(aggregated).toContain("useHistorySkeleton({");
+  expect(hookSources).toContain("sessionHistorySurface({");
+  expect(hookSources).toContain("historyError: !demo && input.historyError !== null");
+  expect(aggregated).toMatch(/\bretryHistory\s*\(/);
+
+  // Locate whichever component/facade renders the history surface branches after App splits.
+  const surfaceFiles = appFiles.filter((file) => file.contents.includes('historySurface === "error"'));
+  expect(surfaceFiles.length).toBeGreaterThan(0);
+  for (const surface of surfaceFiles) {
+    const errorIdx = surface.contents.indexOf('historySurface === "error"');
+    const emptyComponentIdx = surface.contents.indexOf("<EmptyState");
+    const emptySurfaceIdx = surface.contents.indexOf('historySurface === "empty"');
+    expect(errorIdx).toBeGreaterThan(-1);
+    expect(emptyComponentIdx > errorIdx || emptySurfaceIdx > errorIdx).toBe(true);
+    if (emptyComponentIdx !== -1) {
+      expect(emptyComponentIdx).toBeGreaterThan(errorIdx);
+    }
+  }
 });

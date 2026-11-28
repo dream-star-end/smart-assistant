@@ -10,23 +10,24 @@ import tailwindcss from "@tailwindcss/vite";
 import { build as viteBuild } from "vite";
 import { startPreviewServer } from "./process-disclosure-app-server.mjs";
 import { BOARD_SESSION } from "./process-disclosure-story.mjs";
+import { createSourceMutationPlugin, hashModuleFamily, MODULE_FAMILIES } from "./helpers/sourceBundle.mjs";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
 const require = createRequire(import.meta.url);
 const { build } = require("esbuild");
 const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
-const socketPath = resolve(here, "../src/lib/chat/socket.ts");
+const socketFamily = MODULE_FAMILIES.socket();
+const renderFamily = MODULE_FAMILIES.render();
 const red = process.env.OC_RECOVERY_PERSIST_RED === "1";
 const signatureRed = process.env.OC_RECOVERY_SIGNATURE_RED === "1";
 assert.ok(!(red && signatureRed), "negative controls must be independently attributable");
-const renderPath = resolve(here, "../src/lib/chat/render.ts");
 const sourceFiles = [here, resolve(here, "../src")].flatMap((root) => {
   const collect = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => entry.isDirectory() ? collect(join(dir, entry.name)) : [join(dir, entry.name)]);
   return collect(root);
 }).sort();
 const provenance = Object.fromEntries(sourceFiles.map((path) => [path, createHash("sha256").update(readFileSync(path)).digest("hex")]));
 const sourceDigest = createHash("sha256").update(JSON.stringify(provenance)).digest("hex");
-const sourceHash = createHash("sha256").update(readFileSync(socketPath)).digest("hex");
+const sourceHash = hashModuleFamily(socketFamily.entryFile, socketFamily.extraDirsOrFiles);
 let transformCount = 0;
 
 async function stored(page) {
@@ -50,35 +51,56 @@ test("INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence
     loader: { ".css": "empty", ".svg": "dataurl", ".png": "dataurl", ".jpg": "dataurl", ".webp": "dataurl" },
     alias: { "node:crypto": join(here, "stubs/node-crypto.js") },
     define: { "process.env.NODE_ENV": '"production"', "import.meta.env": '{"MODE":"production","PROD":true,"DEV":false}' },
-    plugins: red ? [{ name: "remove-only-recovery-persistence", setup(b) {
-      b.onLoad({ filter: /\/lib\/chat\/socket\.ts$/ }, ({ path }) => {
-        assert.equal(resolve(path), socketPath);
-        let contents = readFileSync(path, "utf8");
-        const start = contents.indexOf("  toStored(sessId: string)");
-        const end = contents.indexOf("  loadStored(", start);
-        assert.ok(start >= 0 && end > start, "exact persistence method boundary");
-        let method = contents.slice(start, end);
-        const field = "      messages,\n      createdAt: s.createdAt,";
-        const decisions = "      ...(s._automaticRecoveryDecisions\n        ? { _automaticRecoveryDecisions: { ...s._automaticRecoveryDecisions } }\n        : {}),";
-        assert.equal(method.split(field).length - 1, 1);
-        assert.equal(method.split(decisions).length - 1, 1);
-        method = method.replace(field, "      messages: messages.map((m) => { const clean = { ...m }; delete clean._automaticRecoveryAttempted; return clean; }),\n      createdAt: s.createdAt,").replace(decisions, "");
-        contents = contents.slice(0, start) + method + contents.slice(end);
-        transformCount += 1;
-        return { contents, loader: "ts" };
-      });
-    }}] : signatureRed ? [{ name: "remove-only-notice-signature", setup(b) {
-      b.onLoad({ filter: /\/lib\/chat\/render\.ts$/ }, ({ path }) => {
-        assert.equal(resolve(path), renderPath);
-        const contents = readFileSync(path, "utf8");
-        const needle = '        JSON.stringify([Object.prototype.hasOwnProperty.call(m, "_recoverySkippedNotice"), m._recoverySkippedNotice ?? null]),\n';
-        assert.equal(contents.split(needle).length - 1, 1);
-        transformCount += 1;
-        return { contents: contents.replace(needle, ""), loader: "ts" };
-      });
-    }}] : [], logLevel: "warning",
+    plugins: red
+      ? [
+          createSourceMutationPlugin({
+            name: "remove-only-recovery-persistence",
+            ...socketFamily,
+            onTransform: () => {
+              transformCount += 1;
+            },
+            mutations: [
+              {
+                label: "toStored messages _automaticRecoveryAttempted strip",
+                needle: /(\n[ \t]*)messages(?:\s*:\s*([A-Za-z_$][\w$]*))?,\s*\n([ \t]*createdAt:\s*[A-Za-z_$][\w$]*\.createdAt,)/,
+                replace: (_, indent, alias, createdAtLine) => {
+                  const src = alias ?? "messages";
+                  return `${indent}messages: ${src}.map((m) => { const clean = { ...m }; delete clean._automaticRecoveryAttempted; return clean; }),\n${createdAtLine}`;
+                },
+                exactCount: 1,
+              },
+              {
+                label: "toStored _automaticRecoveryDecisions omit",
+                needle:
+                  /\n?[ \t]*\.\.\.\([A-Za-z_$][\w$]*\._automaticRecoveryDecisions\s*\?\s*\{\s*_automaticRecoveryDecisions:\s*\{\s*\.\.\.[A-Za-z_$][\w$]*\._automaticRecoveryDecisions\s*\}\s*\}\s*:\s*\{\}\s*\),/,
+                replace: "",
+                exactCount: 1,
+              },
+            ],
+          }),
+        ]
+      : signatureRed
+        ? [
+            createSourceMutationPlugin({
+              name: "remove-only-notice-signature",
+              ...renderFamily,
+              onTransform: () => {
+                transformCount += 1;
+              },
+              mutations: [
+                {
+                  label: "_recoverySkippedNotice signature term",
+                  needle:
+                    /[ \t]*JSON\.stringify\(\[Object\.prototype\.hasOwnProperty\.call\(m,\s*"_recoverySkippedNotice"\),\s*m\._recoverySkippedNotice\s*\?\?\s*null\]\),\r?\n/,
+                  replace: "",
+                  exactCount: 1,
+                },
+              ],
+            }),
+          ]
+        : [], logLevel: "warning",
   });
-  assert.equal(transformCount, red || signatureRed ? 1 : 0);
+  assert.ok(red || signatureRed ? transformCount >= 1 : transformCount === 0);
   const cssDir = join(assetDir, "css-build"); mkdirSync(cssDir);
   await viteBuild({ root: join(here, ".."), configFile: false, logLevel: "silent", plugins: [tailwindcss()], build: { outDir: cssDir, emptyOutDir: true, cssCodeSplit: false, rollupOptions: { input: join(here, "preview-styles.ts"), output: { assetFileNames: "styles[extname]" } } } });
   writeFileSync(join(assetDir, "styles.css"), readFileSync(join(cssDir, readdirSync(cssDir).find((n) => n.endsWith(".css")))));

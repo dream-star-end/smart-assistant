@@ -9,6 +9,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { build as viteBuild } from "vite";
 import { startPreviewServer } from "./process-disclosure-app-server.mjs";
 import { BOARD_SESSION } from "./process-disclosure-story.mjs";
+import { createSourceMutationPlugin, MODULE_FAMILIES } from "./helpers/sourceBundle.mjs";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
 
 // INC-20261006-DOUBLE-FAILURE-CARD in the real App: one turn that never started
@@ -19,7 +20,6 @@ const require = createRequire(import.meta.url);
 const { build } = require("esbuild");
 const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
-const rendererPath = resolve(here, "../src/components/MessageRenderer.tsx");
 const red = process.env.OC_DOUBLE_CARD_RED === "1";
 let transformCount = 0;
 
@@ -38,16 +38,25 @@ test("INC-20261006-DOUBLE-FAILURE-CARD: real App shows one failure card and one 
     loader: { ".css": "empty", ".svg": "dataurl", ".png": "dataurl", ".jpg": "dataurl", ".webp": "dataurl" },
     alias: { "node:crypto": join(here, "stubs/node-crypto.js") },
     define: { "process.env.NODE_ENV": '"production"', "import.meta.env": '{"MODE":"production","PROD":true,"DEV":false}' },
-    plugins: red ? [{ name: "remove-only-superseded-error-clause", setup(b) {
-      b.onLoad({ filter: /\/components\/MessageRenderer\.tsx$/ }, ({ path }) => {
-        assert.equal(resolve(path), rendererPath);
-        const contents = readFileSync(path, "utf8");
-        const needle = "!isErrorCardSupersededByTurnStatus(m, statusRecordTurnIds)";
-        assert.equal(contents.split(needle).length - 1, 1);
-        transformCount += 1;
-        return { contents: contents.replace(needle, "true"), loader: "tsx" };
-      });
-    }}] : [], logLevel: "warning",
+    plugins: red
+      ? [
+          createSourceMutationPlugin({
+            name: "remove-only-superseded-error-clause",
+            ...MODULE_FAMILIES.messageRenderer(),
+            onTransform: () => {
+              transformCount += 1;
+            },
+            mutations: [
+              {
+                label: "isErrorCardSupersededByTurnStatus guard",
+                needle: /!isErrorCardSupersededByTurnStatus\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*\s*\)/,
+                replace: "true",
+                exactCount: 1,
+              },
+            ],
+          }),
+        ]
+      : [], logLevel: "warning",
   });
   assert.equal(transformCount, red ? 1 : 0);
   const cssDir = join(assetDir, "css-build"); mkdirSync(cssDir);

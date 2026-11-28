@@ -10,6 +10,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { build as viteBuild } from "vite";
 import { startPreviewServer } from "./process-disclosure-app-server.mjs";
 import { BOARD_SESSION } from "./process-disclosure-story.mjs";
+import { createSourceMutationPlugin, MODULE_FAMILIES } from "./helpers/sourceBundle.mjs";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
 const require = createRequire(import.meta.url);
 const { build } = require("esbuild");
@@ -18,8 +19,6 @@ const here = dirname(fileURLToPath(import.meta.url));
 const ownerRed = process.env.OC_STRAY_OWNER_RED === "1";
 const quietRed = process.env.OC_STRAY_QUIET_RED === "1";
 assert.ok(!(ownerRed && quietRed));
-const renderer = resolve(here, "../src/components/MessageRenderer.tsx");
-const toolPath = resolve(here, "../src/components/ToolCard.tsx");
 const sourcePaths = [here, resolve(here,"../src")].flatMap(root=>{
  const collect=dir=>readdirSync(dir,{withFileTypes:true}).flatMap(entry=>entry.isDirectory()?collect(join(dir,entry.name)):[join(dir,entry.name)]);
  return collect(root);
@@ -30,13 +29,43 @@ test("OCV5-313: actual App refresh preserves owner isolation and quiet failed st
  const assetDir = mkdtempSync(join(tmpdir(), "oc-stray-owner-browser-"));
  await build({ entryPoints: [join(here, "process-disclosure-app-harness.tsx")], bundle: true, splitting: true, format: "esm", outdir: assetDir, entryNames: "app", chunkNames: "chunks/[name]-[hash]", jsx: "automatic",
  loader: { ".css": "empty", ".svg": "dataurl", ".png": "dataurl", ".jpg": "dataurl", ".webp": "dataurl" }, alias: { "node:crypto": join(here, "stubs/node-crypto.js") }, define: { "process.env.NODE_ENV": '"production"', "import.meta.env": '{"MODE":"production","PROD":true,"DEV":false}' },
- plugins: ownerRed || quietRed ? [{ name: "one-causal-stray-consumer-ablation", setup(b) { b.onLoad({ filter: ownerRed ? /MessageRenderer\.tsx$/ : /ToolCard\.tsx$/ }, ({path}) => {
-   assert.equal(resolve(path), ownerRed ? renderer : toolPath);
-   const contents=readFileSync(path,"utf8");
-   const needle=ownerRed ? "returnStrayRowsToOwnerTurn(continuationViewMessages.filter(" : '<span className="text-faint">{status.label}</span>';
-   assert.equal(contents.split(needle).length-1,1); transforms++;
-   return {contents:contents.replace(needle, ownerRed ? "((rows) => rows)(continuationViewMessages.filter(" : '<span className="text-danger">{status.label}</span>'),loader:"tsx"};
- }); }}] : [], logLevel:"warning" });
+ plugins: ownerRed
+   ? [
+       createSourceMutationPlugin({
+         name: "one-causal-stray-consumer-ablation",
+         ...MODULE_FAMILIES.messageRenderer(),
+         onTransform: () => {
+           transforms += 1;
+         },
+         mutations: [
+           {
+             label: "returnStrayRowsToOwnerTurn call",
+             needle: /returnStrayRowsToOwnerTurn\(\s*continuationViewMessages\.filter\(/,
+             replace: "((rows: typeof continuationViewMessages) => rows)(continuationViewMessages.filter(",
+             exactCount: 1,
+           },
+         ],
+       }),
+     ]
+   : quietRed
+     ? [
+         createSourceMutationPlugin({
+           name: "one-causal-stray-consumer-ablation",
+           ...MODULE_FAMILIES.toolCard(),
+           onTransform: () => {
+             transforms += 1;
+           },
+           mutations: [
+             {
+               label: "quiet failed step status color",
+               needle: '<span className="text-faint">{status.label}</span>',
+               replace: '<span className="text-danger">{status.label}</span>',
+               exactCount: 1,
+             },
+           ],
+         }),
+       ]
+     : [], logLevel:"warning" });
  assert.equal(transforms,ownerRed || quietRed ? 1 : 0);
  const cssDir=join(assetDir,"css-build");mkdirSync(cssDir);
  await viteBuild({root:join(here,".."),configFile:false,logLevel:"silent",plugins:[tailwindcss()],build:{outDir:cssDir,emptyOutDir:true,cssCodeSplit:false,rollupOptions:{input:join(here,"preview-styles.ts"),output:{assetFileNames:"styles[extname]"}}}});
