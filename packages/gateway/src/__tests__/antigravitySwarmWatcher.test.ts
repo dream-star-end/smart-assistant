@@ -3087,6 +3087,61 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
       const m = measureSameEpochNamedAlternating(n)
       assert.ok(m.candidateVisits <= n + 8, `R8 same-epoch N distinct named DONEs + N SYSTEM_MESSAGE must be O(N) (N=${n}, got=${m.candidateVisits})`)
     }
+
+    // Steward R9 Blocker (boundaryIntegrity): after a certain cut (empty PLANNER DONE + SYSTEM_MESSAGE),
+    // an explicit ACTIVE report for a previously declared call ID that NEVER received a tool DONE
+    // MUST restore active liveness (working, 0 reclaims), while receiving A's own DONE restores waiting/reclaim=1.
+    const postCutActiveSteps: Record<string, unknown>[] = [
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ id: 'cid-r9-a', name: 'read_file', arguments: { Path: '/repo/r9.ts' } }] },
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [], content: 'handoff' },
+      { step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] wake' },
+      { step_index: 4, type: 'TOOL_CALL', tool_call_id: 'cid-r9-a', tool_name: 'read_file', status: 'ACTIVE', arguments: { Path: '/repo/r9.ts' } },
+      { step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    await writeFile(workerTranscript, `${postCutActiveSteps.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r9ActiveSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 140 })!
+    assert.equal(r9ActiveSnap.members.find((m) => m.name === 'parser')!.status, 'working', 'R9: post-certain-cut explicit ACTIVE for unsettled ID must restore working')
+    let r9ActiveReclaims = 0
+    const r9ActiveMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { r9ActiveReclaims += 1 },
+    })
+    r9ActiveMon.evaluate(r9ActiveSnap, 1_000)
+    r9ActiveMon.evaluate({ ...r9ActiveSnap, revision: 141 }, 3_000)
+    r9ActiveMon.evaluate({ ...r9ActiveSnap, revision: 142 }, 5_000)
+    assert.equal(r9ActiveReclaims, 0, 'R9: post-certain-cut ACTIVE call without tool DONE must trigger 0 reclaims')
+
+    // Positive control: once cid-r9-a receives its own DONE, worker returns to waiting and reclaims (1)
+    const postCutActiveDoneSteps: Record<string, unknown>[] = [
+      ...postCutActiveSteps.slice(0, 4),
+      { step_index: 5, type: 'TOOL_RESULT', tool_call_id: 'cid-r9-a', tool_name: 'read_file', status: 'DONE', content: 'ok' },
+      { step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    await writeFile(workerTranscript, `${postCutActiveDoneSteps.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r9DoneSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 143 })!
+    assert.equal(r9DoneSnap.members.find((m) => m.name === 'parser')!.status, 'waiting', 'R9 positive: once A receives its own DONE -> waiting')
+    let r9DoneReclaims = 0
+    const r9DoneMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { r9DoneReclaims += 1 },
+    })
+    r9DoneMon.evaluate(r9DoneSnap, 1_000)
+    r9DoneMon.evaluate({ ...r9DoneSnap, revision: 144 }, 3_000)
+    r9DoneMon.evaluate({ ...r9DoneSnap, revision: 145 }, 5_000)
+    assert.equal(r9DoneReclaims, 1, 'R9 positive: settled A restores deadlock reclaim (1)')
+
+    // Guard control: if cid-r9-a ALREADY received DONE before the certain cut, a stale post-cut ACTIVE must NOT resurrect it
+    const postCutStaleActiveAfterDone: Record<string, unknown>[] = [
+      postCutActiveSteps[0]!,
+      { step_index: 2, type: 'TOOL_RESULT', tool_call_id: 'cid-r9-a', tool_name: 'read_file', status: 'DONE', content: 'already done' },
+      { step_index: 3, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [], content: 'handoff' },
+      { step_index: 4, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] wake' },
+      { step_index: 5, type: 'TOOL_CALL', tool_call_id: 'cid-r9-a', tool_name: 'read_file', status: 'ACTIVE', arguments: { Path: '/repo/r9.ts' } },
+      { step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    await writeFile(workerTranscript, `${postCutStaleActiveAfterDone.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r9StaleSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 146 })!
+    assert.equal(r9StaleSnap.members.find((m) => m.name === 'parser')!.status, 'waiting', 'R9 guard: already-DONE ID must NOT be resurrected by stale ACTIVE')
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }

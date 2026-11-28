@@ -469,15 +469,25 @@ function bindIdDirectCall(
   state: CallReductionState, norm: string, id: string, args: Record<string, unknown> | null, argsKey: string | null,
   fromPlanner: boolean, hasPlannerRoot: boolean, epoch: number,
 ): boolean {
-  const existingIdx = state.callIndicesById.get(id)?.[0]
-  if (existingIdx !== undefined) {
+  const existingBucket = state.callIndicesById.get(id)
+  const existingIdx = existingBucket?.[existingBucket.length - 1]
+  if (existingBucket && existingIdx !== undefined) {
     const existing = state.calls[existingIdx]!
-    if (!existing.args && args) {
-      existing.args = args
-      existing.argsKey = argsKey
+    const liveOrDone =
+      state.accounted.has(existingIdx) ||
+      state.unaccountedNonBoard.has(existingIdx) ||
+      existing.isBoard ||
+      state.seenTerminalIds.has(id)
+    if (liveOrDone) {
+      if (!existing.args && args) {
+        existing.args = args
+        existing.argsKey = argsKey
+      }
+      existing.boundDirect = true
+      return true
     }
-    existing.boundDirect = true
-    return true
+    state.accounted.add(existingIdx)
+    existingBucket.pop()
   }
   if (fromPlanner || !hasPlannerRoot) return false
   const epochNormTotal = state.plannerEpochNormCounts.get(`${epoch}:${norm}`) ?? 0
