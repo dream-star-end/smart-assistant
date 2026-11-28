@@ -64,7 +64,7 @@ test('OCV5-432: prompts are unique per run and the proven model is fixed', () =>
   assert.equal(p.length, 3)
   assert.equal(new Set(p).size, 3)
   assert.throws(() => goCachePrompts('bad nonce'))
-  assert.equal(GO_CACHE_MODEL, 'muse-spark-1.3-go')
+  assert.equal(GO_CACHE_MODEL, 'deepseek-v4-flash')
 })
 
 test('OCV5-432 Codex r1: the release check has no model override', () => {
