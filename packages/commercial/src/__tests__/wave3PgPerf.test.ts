@@ -383,7 +383,7 @@ describe('Wave 3 PG perf, model projection, Auto-Dream, Law 2 & tutorial batchin
     const bridgeSrc = readUserChatBridgeSource()
     assert.match(
       bridgeSrc,
-      /delete enriched\._masterHistoricalMessages;/,
+      /(?:delete enriched\._masterHistoricalMessages;|Reflect\.deleteProperty\(enriched,\s*['"]_masterHistoricalMessages['"]\))/,
       'userChatBridge must unconditionally strip client _masterHistoricalMessages before master backfill',
     )
     assert.match(
@@ -393,7 +393,7 @@ describe('Wave 3 PG perf, model projection, Auto-Dream, Law 2 & tutorial batchin
     )
     assert.match(
       bridgeSrc,
-      /delete parsedObj\._masterHistoricalMessages;/,
+      /(?:delete parsedObj\._masterHistoricalMessages;|Reflect\.deleteProperty\(parsedObj,\s*['"]_masterHistoricalMessages['"]\))/,
       'userChatBridge text JSON entry must strip _masterHistoricalMessages for all frames',
     )
     const autoDreamSrc = readFileSync(new URL('../user/autoDream.ts', import.meta.url), 'utf8')
