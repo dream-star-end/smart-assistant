@@ -321,7 +321,7 @@
     "packages/web-react/src/components/tutorials/QuickLookupView.tsx": 1059,
     "packages/web-react/src/hooks/useChatSocket.ts": 1272,
     "packages/web-react/src/hooks/useSessionList.ts": 1201,
-    "packages/web-react/src/lib/api.ts": 1510,
+    "packages/web-react/src/lib/api.ts": 1394,
     "packages/web-react/src/lib/api/integrationsLazyImpl.ts": 1112,
     "packages/web-react/src/lib/chat/model.ts": 1089,
     "packages/web-react/src/lib/chat/pure.ts": 1084,

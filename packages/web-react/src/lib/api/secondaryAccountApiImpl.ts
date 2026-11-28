@@ -5,6 +5,7 @@
  * the first-screen static closure.
  */
 import type { ContainerPreviewViewport } from "@openclaude/protocol/containerPreview";
+import type { ModelSwitchCostQuote, ModelSwitchCostRequest } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import type {
   AgentCancelResult,
@@ -39,72 +40,41 @@ import type {
   SessionRatingSnapshot,
   SessionRatingsMap,
 } from "../api";
-import { bearerHeaders, callWithRefresh, fetchWithExecutionGuard, jsonOrThrow } from "./http";
+import { ApiError, bearerHeaders, callWithRefresh, fetchWithExecutionGuard, jsonOrThrow } from "./http";
+
+const MODEL_SWITCH_ESTIMATE_TIMEOUT_MS = 5_000;
 
 /** /api/me/api-keys 线上形状（snake_case）；list / PATCH 共用。 */
 type ApiKeyWire = {
-  id: string;
-  label: string;
-  key_prefix: string;
-  created_at: string;
-  last_used_at: string | null;
-  disabled_at?: string | null;
-  credit_limit?: string | null;
-  spent_credits?: string;
+  id: string; label: string; key_prefix: string; created_at: string;
+  last_used_at: string | null; disabled_at?: string | null; credit_limit?: string | null; spent_credits?: string;
 };
 
 function apiKeyFromWire(k: ApiKeyWire): ApiKeySummary {
   return {
-    id: k.id,
-    label: k.label,
-    keyPrefix: k.key_prefix,
-    createdAt: k.created_at,
-    lastUsedAt: k.last_used_at,
-    disabledAt: k.disabled_at ?? null,
-    creditLimit: k.credit_limit ?? null,
-    spentCredits: k.spent_credits ?? "0",
+    id: k.id, label: k.label, keyPrefix: k.key_prefix, createdAt: k.created_at, lastUsedAt: k.last_used_at,
+    disabledAt: k.disabled_at ?? null, creditLimit: k.credit_limit ?? null, spentCredits: k.spent_credits ?? "0",
   };
 }
 
 export const secondaryAccountApiImpl = {
   getQqBinding: (a: AuthSession) =>
     jsonOrThrow<QqBindingStatus>(
-      callWithRefresh(a, (t) =>
-        fetchWithExecutionGuard("/api/me/qq-binding", {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
+      callWithRefresh(a, (t) => fetchWithExecutionGuard("/api/me/qq-binding", { credentials: "include", headers: bearerHeaders(t) })),
     ),
 
   startQqBinding: (a: AuthSession) =>
     jsonOrThrow<QqBindingStart>(
       callWithRefresh(a, (t) =>
-        fetchWithExecutionGuard("/api/me/qq-binding/start", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: "{}",
-        }),
+        fetchWithExecutionGuard("/api/me/qq-binding/start", { method: "POST", credentials: "include", headers: bearerHeaders(t, true), body: "{}" }),
       ),
     ),
 
   deleteQqBinding: (a: AuthSession) =>
     jsonOrThrow<{ ok: boolean; unbound: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetchWithExecutionGuard("/api/me/qq-binding", {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
+      callWithRefresh(a, (t) => fetchWithExecutionGuard("/api/me/qq-binding", { method: "DELETE", credentials: "include", headers: bearerHeaders(t) })),
     ),
 
-  /**
-   * 自由文本反馈（POST /api/feedback）。缺 Bearer 的公共调用仍可匿名；浏览器登录态提供
-   * 无效 Bearer 时后端返回 401，callWithRefresh 刷新重放，避免把登录用户静默记成匿名。
-   * 两种 source 分支分别重建 payload，消息上下文不会意外泄漏到设置反馈，反之亦然。
-   */
   submitFeedback: (a: AuthSession, input: FeedbackSubmitInput): Promise<FeedbackSubmitResult> =>
     jsonOrThrow<FeedbackSubmitResult>(
       callWithRefresh(a, (t) =>
@@ -706,4 +676,102 @@ export const secondaryAccountApiImpl = {
         }),
       ),
     ).then((b) => ({ ratings: b.ratings || {}, nudges: b.nudges || {} })),
+
+  async modelSwitchCost(
+    auth: AuthSession,
+    input: ModelSwitchCostRequest,
+    proof?: { consent?: string; quoteToken?: string },
+  ): Promise<ModelSwitchCostQuote> {
+    const ac = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        ac.abort();
+        reject(new ApiError({ status: 503, code: "MODEL_SWITCH_UNAVAILABLE", message: "费用确认暂不可用，请重试" }));
+      }, MODEL_SWITCH_ESTIMATE_TIMEOUT_MS);
+    });
+    const work = jsonOrThrow<ModelSwitchCostQuote>(
+      callWithRefresh(auth, (token) =>
+        fetchWithExecutionGuard(`/api/me/sessions/${encodeURIComponent(input.sessionId)}/model-switch-estimate`, {
+          method: "POST",
+          credentials: "include",
+          signal: ac.signal,
+          headers: { ...bearerHeaders(token), "content-type": "application/json" },
+          body: JSON.stringify({ ...input, ...proof }),
+        }),
+      ),
+    );
+    void work.catch(() => {});
+    try {
+      return await Promise.race([work, timeout]);
+    } catch (err) {
+      if (ac.signal.aborted) {
+        throw new ApiError({ status: 503, code: "MODEL_SWITCH_UNAVAILABLE", message: "费用确认暂不可用，请重试" });
+      }
+      throw err;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  },
+
+  putCollaborationConfig: (
+    a: AuthSession,
+    body: {
+      sessionId?: string;
+      mode: "solo" | "advisor" | "team";
+      advisorModel?: string | null;
+      expectedRev?: number;
+      asDefault?: boolean;
+    },
+  ) =>
+    jsonOrThrow<{
+      rev: number;
+      defaultMode: "solo" | "advisor" | "team";
+      defaultAdvisorModel: string | null;
+      session: {
+        mode: "solo" | "advisor" | "team";
+        advisorModel: string | null;
+        configVersion: string;
+        source: "session" | "default";
+      };
+      advisorModels?: Array<{ id: string; label: string; engine: string }>;
+      advisorUnavailableReason?: string;
+      advisorConsultParents?: string[];
+      advisorConsultParentReason?: string;
+      advisorConsultAllowed?: boolean;
+      parentEngine?: string;
+    }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard("/api/collaboration-config", {
+          method: "PUT", credentials: "include", headers: bearerHeaders(t, true), body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  patchSessionModel: (a: AuthSession, id: string, modelId: string): Promise<{ ok: true; updatedAt: number }> =>
+    jsonOrThrow<{ ok: true; updatedAt: number }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "PATCH", credentials: "include", headers: bearerHeaders(t, true), body: JSON.stringify({ modelId }),
+        }),
+      ),
+    ),
+
+  deleteSession: (a: AuthSession, id: string): Promise<void> =>
+    jsonOrThrow<{ ok: true }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "DELETE", credentials: "include", headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
+
+  getMediaCapabilities: (a: AuthSession): Promise<{ available?: boolean }> =>
+    jsonOrThrow<{ available?: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard("/api/media-generation/capabilities", {
+          credentials: "include", headers: bearerHeaders(t),
+        }),
+      ),
+    ),
 };

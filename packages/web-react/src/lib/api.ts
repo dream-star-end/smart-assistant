@@ -1,4 +1,3 @@
-import type {ModelSwitchCostRequest,ModelSwitchCostQuote} from '@openclaude/protocol/browser';
 export interface WorkspaceDraftHint {
   viewId: string
   revision: number
@@ -645,35 +644,15 @@ const secondaryAccountApiProxy = createLazyApiDomain<SecondaryAccountApiImpl>(
     "submitResponseRating",
     "submitResponseRatingNudge",
     "getSessionRatings",
+    "modelSwitchCost",
+    "putCollaborationConfig",
+    "patchSessionModel",
+    "deleteSession",
+    "getMediaCapabilities",
   ],
 );
 
-const MODEL_SWITCH_ESTIMATE_TIMEOUT_MS = 5_000;
-
 export const api = {
-  async modelSwitchCost(auth:AuthSession,input:ModelSwitchCostRequest,proof?:{consent?:string;quoteToken?:string}):Promise<ModelSwitchCostQuote>{
-    const ac=new AbortController();
-    let timer:ReturnType<typeof setTimeout>|undefined;
-    const timeout=new Promise<never>((_,reject)=>{
-      timer=setTimeout(()=>{
-        ac.abort();
-        reject(new ApiError({status:503,code:'MODEL_SWITCH_UNAVAILABLE',message:'费用确认暂不可用，请重试'}));
-      },MODEL_SWITCH_ESTIMATE_TIMEOUT_MS);
-    });
-    const work=jsonOrThrow<ModelSwitchCostQuote>(callWithRefresh(auth,token=>fetch(`/api/me/sessions/${encodeURIComponent(input.sessionId)}/model-switch-estimate`,{
-      method:'POST',credentials:'include',signal:ac.signal,
-      headers:{...bearerHeaders(token),'content-type':'application/json'},body:JSON.stringify({...input,...proof}),
-    })));
-    void work.catch(()=>{});
-    try{
-      return await Promise.race([work,timeout]);
-    }catch(err){
-      if(ac.signal.aborted)throw new ApiError({status:503,code:'MODEL_SWITCH_UNAVAILABLE',message:'费用确认暂不可用，请重试'});
-      throw err;
-    }finally{
-      if(timer!==undefined)clearTimeout(timer);
-    }
-  },
   // ── 鉴权 ───────────────────────────────────────────────────────────
 
   /**
@@ -856,43 +835,6 @@ export const api = {
           `/api/collaboration-config${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ""}`,
           { credentials: "include", headers: bearerHeaders(t), signal: opts?.signal },
         ),
-      ),
-    ),
-
-  putCollaborationConfig: (
-    a: AuthSession,
-    body: {
-      sessionId?: string
-      mode: "solo" | "advisor" | "team"
-      advisorModel?: string | null
-      expectedRev?: number
-      asDefault?: boolean
-    },
-  ) =>
-    jsonOrThrow<{
-      rev: number
-      defaultMode: "solo" | "advisor" | "team"
-      defaultAdvisorModel: string | null
-      session: {
-        mode: "solo" | "advisor" | "team"
-        advisorModel: string | null
-        configVersion: string
-        source: "session" | "default"
-      }
-      advisorModels?: Array<{ id: string; label: string; engine: string }>
-      advisorUnavailableReason?: string
-      advisorConsultParents?: string[]
-      advisorConsultParentReason?: string
-      advisorConsultAllowed?: boolean
-      parentEngine?: string
-    }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/collaboration-config", {
-          method: "PUT",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(body),
-        }),
       ),
     ),
 
@@ -1410,28 +1352,6 @@ export const api = {
   ): Promise<{ ok: true; updatedAt: number }> => api.patchSessionMeta(a, id, { title }),
 
   /**
-   * 会话级模型选择持久化（PATCH /api/sessions/:id，Bearer，元数据专用，与 rename 同款）。
-   * best-effort 失败契约同 rename：本地已改,服务端失败则下次 listSessions server-wins
-   * 盖回,用户重选即重试。会话行尚未建（新会话未发首条消息）时 404,同样吞掉——建行
-   * PUT(ensureServerSession)会随体携带 modelId 收敛。
-   */
-  patchSessionModel: (
-    a: AuthSession,
-    id: string,
-    modelId: string,
-  ): Promise<{ ok: true; updatedAt: number }> =>
-    jsonOrThrow<{ ok: true; updatedAt: number }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/sessions/${encodeURIComponent(id)}`, {
-          method: "PATCH",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ modelId }),
-        }),
-      ),
-    ),
-
-  /**
    * 跨设备持久化「用户发送的消息」（POST /api/sessions/:id/user-message，Bearer）。
    * 带前端 client 消息 id；服务端直写(role:'user',绕乐观并发,scoped by userId),
    * getSession 回带同 id → 前端合并去重。best-effort，调用方吞错不阻断发送。
@@ -1467,44 +1387,8 @@ export const api = {
         }),
       ),
     ).then(() => undefined),
-
-  /** 删除会话（DELETE /api/sessions/:id，Bearer）。幂等，恒 200。 */
-  deleteSession: (a: AuthSession, id: string): Promise<void> =>
-    jsonOrThrow<{ ok: true }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/sessions/${encodeURIComponent(id)}`, {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then(() => undefined),
   ...projectsApi,
   ...memorySkillsApi,
   ...integrationsApi,
   ...orgApiProxy,
-
-  /**
-   * 视频生成能力（GET /api/media-generation/capabilities，Bearer）。仅用于账号菜单
-   * 「视频任务」入口门控：`available:false` 时不渲染入口，未知/失败保持入口可见
-   * （由任务中心内部兜底提示），避免网络抖动误藏功能。
-   */
-  getMediaCapabilities: (a: AuthSession): Promise<{ available?: boolean }> =>
-    jsonOrThrow<{ available?: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/media-generation/capabilities", {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
-
-  // ── 对话传输（P4 已接入：WS user-chat-bridge） ────────────────────────
-  //
-  // v5 对话传输走 WebSocket（/ws/user-chat-bridge，bearer 子协议
-  // `new WebSocket(url, ['bearer', accessJWT])`，inbound.message 帧），不再是
-  // v4-trial 的 SSE。实现不在 api.ts（REST 专属），而在渲染树之外的单例 service
-  // `lib/chat/socket.ts`（ChatSocket：safeWsSend 2MB 背压 + per-sessionKey frameSeq
-  // 去重 + 三层断点续传 + 离线队列三段式 drain），由 React 绑定 `hooks/useChatSocket.ts`
-  // 消费。会话历史的 REST 全量 sync（断点续传最终权威源）走上面的 getSession。
 };
