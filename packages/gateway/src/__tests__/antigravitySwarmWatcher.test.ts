@@ -2652,6 +2652,52 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
     assert.ok(measureAnonGenericVisits(32) <= 40, 'anonymous GENERIC DONE epochs must settle in O(N) (N=32)')
     assert.ok(measureAnonGenericVisits(64) <= 72, 'anonymous GENERIC DONE epochs must settle in O(N) (N=64)')
     assert.ok(measureAnonGenericVisits(128) <= 140, 'anonymous GENERIC DONE epochs must settle in O(N) (N=128)')
+
+    // Steward R4 Blocker (1): unfinished parallel tool across 32/64/128 epochs of named-without-ID swarm_wait + SYSTEM_MESSAGE
+    // must keep unfinished tool active AND settle named fallbacks in O(N) without replaying prior epochs
+    const measureUnfinishedWithNamedWaits = (nEpochs: number): number => {
+      const seq: Record<string, unknown>[] = [
+        { step_index: 0, type: 'USER_INPUT', status: 'DONE' },
+        { step_index: 1, type: 'TOOL_CALL', tool_call_id: 'long-sibling', tool_name: 'run_command', status: 'ACTIVE', arguments: { CommandLine: 'sleep 999' } },
+      ]
+      let si = 2
+      for (let e = 0; e < nEpochs; e += 1) {
+        seq.push({ step_index: si++, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: e + 1 } }] })
+        seq.push({ step_index: si++, type: 'TOOL_RESULT', tool_name: 'swarm_wait', status: 'DONE', content: 'parked' })
+        seq.push({ step_index: si++, type: 'SYSTEM_MESSAGE', status: 'DONE', content: `reminder ${e}` })
+      }
+      resetTurnReductionCandidateVisitsForTests()
+      assert.equal(findTurnStartIndex(seq), 0, 'unfinished parallel tool must remain active across named swarm_wait + SYSTEM_MESSAGE epochs')
+      return getTurnReductionCandidateVisitsForTests()
+    }
+    assert.ok(measureUnfinishedWithNamedWaits(32) <= 40, 'named fallback wait replay must be O(N) (N=32)')
+    assert.ok(measureUnfinishedWithNamedWaits(64) <= 72, 'named fallback wait replay must be O(N) (N=64)')
+    assert.ok(measureUnfinishedWithNamedWaits(128) <= 140, 'named fallback wait replay must be O(N) (N=128)')
+
+    // Steward R4 Blocker (2): single planner batch with 32/64/128 same-name distinct-args calls binding late direct IDs
+    // must index by (epoch, norm, argsJson) for O(N) visits while still refusing ambiguous identical-args binds
+    const measureSameNameBatchLateIds = (nCalls: number): number => {
+      const seq: Record<string, unknown>[] = [
+        { step_index: 0, type: 'USER_INPUT', status: 'DONE' },
+        {
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: Array.from({ length: nCalls }, (_, k) => ({ name: 'run_command', arguments: { CommandLine: `echo ${k}` } })),
+        },
+      ]
+      let si = 2
+      for (let k = 0; k < nCalls; k += 1) {
+        seq.push({ step_index: si++, type: 'TOOL_CALL', tool_call_id: `batch-id-${k}`, tool_name: 'run_command', status: 'ACTIVE', arguments: { CommandLine: `echo ${k}` } })
+        seq.push({ step_index: si++, type: 'TOOL_RESULT', tool_call_id: `batch-id-${k}`, tool_name: 'run_command', status: 'DONE', content: 'ok' })
+      }
+      resetTurnReductionCandidateVisitsForTests()
+      assert.equal(findTurnStartIndex(seq), 0)
+      return getTurnReductionCandidateVisitsForTests()
+    }
+    assert.equal(measureSameNameBatchLateIds(32), 32, 'same-name distinct-args batch late ID bind must be 1 visit/call (N=32)')
+    assert.equal(measureSameNameBatchLateIds(64), 64, 'same-name distinct-args batch late ID bind must be 1 visit/call (N=64)')
+    assert.equal(measureSameNameBatchLateIds(128), 128, 'same-name distinct-args batch late ID bind must be 1 visit/call (N=128)')
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }
