@@ -1,13 +1,12 @@
 /**
  * SQLite sessions store: chat projects (CRUD, soft delete / restore, templates, bindings, project instructions, session meta patch) and project assets (versions, search, pinned injection).
- *
- * Moved verbatim out of sessionsDb.ts — FINDINGS §8 (cc2), OCV5-485. sessionsDb.ts
- * imports these back and re-exports its former exports, so its import surface is unchanged.
+ * Moved out of sessionsDb.ts — OCV5-485 / OCV5-928.
  */
 import { randomUUID } from 'node:crypto'
 import type Database from 'better-sqlite3'
 import { assetsRevision, isUniqueConstraintError, parseBoardProjectId } from './projectContext.js'
-import { getSessionsDb, escapeLikePattern } from './sessionsDb.js'
+import { getSessionsDb } from './sessions/sqliteHandle.js'
+import { escapeLikePattern } from './sessions/types.js'
 
 export const CHAT_PROJECT_NAME_MAX = 60
 

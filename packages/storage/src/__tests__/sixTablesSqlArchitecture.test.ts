@@ -58,7 +58,13 @@ const SQL_CONTEXT = new RegExp(
 // 白名单(相对 REPO_ROOT 的 POSIX 路径)。理由见文件顶注。
 const WHITELIST = new Set<string>([
   "packages/storage/src/sessionsDb.ts",
-  // sessionsDb.ts 的拆分模块(OCV5-485):同一 SQLite sessions 权威,只是按职责分文件。
+  // sessionsDb.ts 的拆分模块(OCV5-485 / OCV5-928):同一 SQLite sessions 权威,只是按职责分文件。
+  "packages/storage/src/sessions/schemaClientSessions.ts",
+  "packages/storage/src/sessions/clientSessionsWrite.ts",
+  "packages/storage/src/sessions/clientSessionsRead.ts",
+  "packages/storage/src/sessions/clientSessionsTimeline.ts",
+  "packages/storage/src/sessions/usageAggregation.ts",
+  "packages/storage/src/sessions/wechatBindingsSqlite.ts",
   "packages/storage/src/sessionsDbProjects.ts",
   "packages/storage/src/sessionsDbSidebar.ts",
   "packages/storage/src/wechatBindings.ts",
@@ -138,6 +144,15 @@ const WHITELIST = new Set<string>([
   "scripts/v5-selfhost-backfill-output-assets.ts",
 ])
 
+// 权威 backend 拆分目录白名单前缀(OCV5-928:PG sessions backend 拆分模块与 pgSessionsBackend.ts 同属单一 PG 权威)。
+const WHITELIST_DIR_PREFIXES = [
+  "packages/commercial/src/db/sessions/",
+] as const
+
+function isWhitelistedPath(rel: string): boolean {
+  return WHITELIST.has(rel) || WHITELIST_DIR_PREFIXES.some((prefix) => rel.startsWith(prefix))
+}
+
 // This operator pins every journal/finalizer query to one client and proves all
 // financial relations resolve to pg_temp before admission. Only these two TEMP
 // DDL statements are legal; this does NOT whitelist future persistent SQL, the
@@ -186,7 +201,7 @@ describe("架构:master 六张权威表 SQL 字面量白名单(RFC D6b)", () => 
     const violations: string[] = []
     for (const abs of files) {
       const rel = relative(REPO_ROOT, abs).split("\\").join("/")
-      if (WHITELIST.has(rel)) continue
+      if (isWhitelistedPath(rel)) continue
       let text: string
       try {
         text = readFileSync(abs, "utf8")
