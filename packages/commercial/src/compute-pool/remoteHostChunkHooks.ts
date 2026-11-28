@@ -14,6 +14,7 @@ import {
   streamFileTo,
   usageForDir,
 } from "./nodeAgentClient.js";
+import { isNodeAgentExplicitDenialError } from "./nodeAgentRangeStream.js";
 
 const MAX_CAS_MIRROR_BYTES = 64 * 1024 * 1024;
 
@@ -52,13 +53,14 @@ export interface RemoteHostChunkHooks {
       range?: { start: number; end: number } | null;
       contentLength?: number;
     }) => boolean;
-  }) => Promise<"ok" | "missing" | "rejected">;
+  }) => Promise<"ok" | "missing" | "rejected" | "denied">;
   openCasMediaFallback?: (args: {
     userId: string;
     filename: string;
     dest: NodeJS.WritableStream;
     resolveRange?: (totalSize: number) => { start: number; end: number } | null;
     isHead?: boolean;
+    isFileBlocked?: (pathOrName: string) => boolean;
     onReady: (info: {
       totalSize: number;
       range: { start: number; end: number } | null;
@@ -72,6 +74,7 @@ export interface RemoteHostChunkHooks {
 
 export interface CasMediaChunkMirrorCallbacks {
   readonly mirrorRemotePathBytes?: (remotePath: string, bytes: Uint8Array) => Promise<void>;
+  readonly deleteRemotePathInCas?: (remotePath: string) => Promise<void>;
   readonly openCasMediaFallback?: RemoteHostChunkHooks["openCasMediaFallback"];
 }
 
@@ -145,7 +148,7 @@ async function openRemoteHostMediaStreamOrHead(args: {
     range?: { start: number; end: number } | null;
     contentLength?: number;
   }) => boolean;
-}): Promise<"ok" | "missing" | "rejected"> {
+}): Promise<"ok" | "missing" | "rejected" | "denied"> {
   const target = await resolveServiceableHostTarget(args.hostUuid);
   try {
     const st = await statFile(target, args.remotePath, { hash: false });
@@ -165,6 +168,9 @@ async function openRemoteHostMediaStreamOrHead(args: {
       () => args.onReady({ size, range, contentLength }),
       range ? { range } : undefined,
     );
+  } catch (err) {
+    if (isNodeAgentExplicitDenialError(err)) return "denied";
+    throw err;
   } finally {
     target.psk?.fill(0);
   }
@@ -187,6 +193,7 @@ export function createRemoteHostChunkHooks(
     assembleRemoteHostUpload: (args) =>
       assembleRemoteUploadWithCasMirror(cas?.mirrorRemotePathBytes, args),
     deleteRemoteHostUpload: async (args) => {
+      await cas?.deleteRemotePathInCas?.(args.remotePath);
       const target = await resolveServiceableHostTarget(args.hostUuid);
       try {
         await deleteFile(target, args.remotePath);

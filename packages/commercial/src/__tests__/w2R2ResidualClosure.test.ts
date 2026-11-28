@@ -48,6 +48,7 @@ import { parseRelayRequiredTurnCapabilities } from '../remoteRelay/protocol.js'
 import { createRemoteRelayRpcServer } from '../remoteRelay/server.js'
 import { sealAuthorityFieldsOrReject } from '../ws/bridge/connectionAuthority.js'
 import type { BridgeConnectionCtx } from '../ws/bridge/types.js'
+import { createMockCasMetaPgPool } from './casMetaTestPool.js'
 
 const HEX64_A = 'a'.repeat(64)
 const PROFILE_A_LIMITED = '11111111-1111-4111-8111-111111111111'
@@ -56,51 +57,7 @@ const NODE_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const NODE_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 
 function createOrderedCasMetaPool(fixedIso?: string) {
-  const rows: Array<Record<string, unknown>> = []
-  const pool = new pg.Pool({ max: 1, idleTimeoutMillis: 1 })
-  Reflect.set(pool, 'query', async (sql: string, params: readonly unknown[] = []) => {
-    const norm = sql.replace(/\s+/g, ' ').trim()
-    if (norm.startsWith('INSERT INTO artifact_blobs')) {
-      const row: Record<string, unknown> = {
-        blob_id: String(params[0]),
-        tenant_id: String(params[1]),
-        sha256: String(params[2]),
-        size_bytes: Number(params[3]),
-        mime_type: String(params[4]),
-        kind: String(params[5]),
-        logical_name: params[6] === null ? null : String(params[6]),
-        container_relative_path: params[7] === null ? null : String(params[7]),
-        storage_backend: String(params[8]),
-        storage_uri: String(params[9]),
-        created_at: fixedIso ?? new Date().toISOString(),
-        deleted_at: null,
-      }
-      rows.unshift(row)
-      return { rows: [row], rowCount: 1 }
-    }
-    if (norm.startsWith('UPDATE artifact_blobs SET deleted_at')) {
-      const hit = rows.find((r) => r.tenant_id === String(params[0]) && r.blob_id === String(params[1]) && r.deleted_at === null)
-      if (!hit) return { rows: [], rowCount: 0 }
-      hit.deleted_at = new Date().toISOString()
-      return { rows: [{ blob_id: hit.blob_id }], rowCount: 1 }
-    }
-    if (norm.includes('FROM artifact_blobs WHERE tenant_id = $1 AND blob_id = $2')) {
-      const hit = rows.find((r) => r.tenant_id === String(params[0]) && r.blob_id === String(params[1]) && r.deleted_at === null)
-      return { rows: hit ? [hit] : [], rowCount: hit ? 1 : 0 }
-    }
-    if (norm.includes('FROM artifact_blobs WHERE tenant_id = $1 AND sha256 = $2')) {
-      const active = rows.filter(
-        (r) => r.tenant_id === String(params[0]) && r.sha256 === String(params[1]) && r.deleted_at === null,
-      )
-      return { rows: active.slice(0, 1), rowCount: active.length > 0 ? 1 : 0 }
-    }
-    if (norm.includes('FROM artifact_blobs WHERE tenant_id = $1 AND deleted_at IS NULL')) {
-      const active = rows.filter((r) => r.tenant_id === String(params[0]) && r.deleted_at === null)
-      return { rows: active, rowCount: active.length }
-    }
-    return { rows: [], rowCount: 0 }
-  })
-  return { pool, rows }
+  return createMockCasMetaPgPool(fixedIso ? { fixedIso } : undefined)
 }
 
 function makeGatewayHost(commercial: NonNullable<HttpMiscHandlersHost['deps']['commercial']>): HttpMiscHandlersHost {

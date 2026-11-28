@@ -1120,7 +1120,7 @@ export async function streamFileTo(
             if (status >= 400) {
               res.resume();
               res.destroy();
-              finish(new AgentAppError(target.hostId, status, null, `agent returned ${status}`));
+              finish(status === 401 || status === 403 ? new AgentAuthError(target.hostId, status, `agent auth failed (${status})`) : new AgentAppError(target.hostId, status, null, `agent returned ${status}`));
               return;
             }
             if (!onReady()) {

@@ -2,12 +2,49 @@
  * In-transaction `remote-driver-v4` candidate readiness, capability re-verification, and
  * sticky/router selection helpers (`OCV5-928` B5, `accounts` L3).
  */
-import type { RemoteProbeSnapshot, RequiredTurnCapabilities } from '@openclaude/protocol'
+import {
+  resolveLogicalModelId,
+  type RemoteProbeSnapshot,
+  type RequiredTurnCapabilities,
+} from '@openclaude/protocol'
 import type { PoolClient } from 'pg'
+import { PgLogicalModelBindingStore, type PgQueryable } from '../../db/threeLayerStateStore.js'
 import { type RemoteBrainEngine, rankRemotePoolCandidates } from '../remoteBrainPool.js'
 import { verifyProfileReadyForV4 } from './driftCoordinator.js'
 import type { RemoteDriverRegistryEntry } from './registry.js'
 import { doesRemoteProfileSatisfyCapabilities } from './remoteDriverRouterSelection.js'
+
+async function assertLogicalModelBindingInTx(
+  client: PoolClient,
+  canonicalModel: string,
+  driverId: string,
+): Promise<void> {
+  await client.query('SAVEPOINT oc_lmb_chk')
+  let inspected: Awaited<ReturnType<PgLogicalModelBindingStore['inspectLogicalModelBindings']>> | null = null
+  try {
+    const store = new PgLogicalModelBindingStore({
+      query: (text, values) => client.query(text, values ? [...values] : undefined),
+    } satisfies PgQueryable)
+    inspected = await store.inspectLogicalModelBindings(canonicalModel)
+    await client.query('RELEASE SAVEPOINT oc_lmb_chk')
+  } catch (err) {
+    await client.query('ROLLBACK TO SAVEPOINT oc_lmb_chk').catch(() => undefined)
+    await client.query('RELEASE SAVEPOINT oc_lmb_chk').catch(() => undefined)
+    const code = (err as { readonly code?: unknown })?.code
+    if (code === '42P01' || code === '42703') {
+      void resolveLogicalModelId(canonicalModel)
+      return
+    }
+    throw err
+  }
+  if (!inspected.hasConfiguredBindings) return
+  const allowed = inspected.enabledBindings.some(
+    (b) => b.poolKind === 'remote_pool' && (!b.driverId || b.driverId === driverId),
+  )
+  if (!allowed) {
+    throw new Error('CAPABILITY_UNSATISFIED')
+  }
+}
 
 export interface StickyBindingSummary {
   readonly operation_id: string
@@ -52,6 +89,7 @@ export async function collectEligibleV4Candidates(params: {
   readonly maxProbeAgeMs: number
   readonly testFaultSandboxMode?: 'account_mutex' | 'shared_node_cap_5'
 }): Promise<CollectedV4Candidates> {
+  await assertLogicalModelBindingInTx(params.client, params.canonicalModel, params.reg.driverId)
   const readyMap = new Map<string, ReadyProfileEntry>()
   const eligible: Array<Record<string, unknown>> = []
   const fullProfiles = new Set<string>()

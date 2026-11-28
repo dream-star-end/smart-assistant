@@ -1,27 +1,38 @@
 /**
- * OCV5-907 / OCV5-928 — Master runtime assembly for `LocalCasArtifactBlobStore`.
+ * OCV5-907 / OCV5-928 — Master runtime assembly & directory bridge for `LocalCasArtifactBlobStore`.
  *
- * Security & correctness invariants (OCV5-928 R1 B1–B4):
+ * Security & correctness invariants (OCV5-928 R1/R2 + Arch Steward):
  * - B1: NEVER materializes CAS blobs into user-writable Docker volume directories; any
  *   on-disk cache lives exclusively under Master-owned `<casRootDir>/media-bridge/u<uid>`
  *   with `lstat` symlink rejection and `trustedRootDir` realpath containment.
  * - B2: Physical volume ownership (`remote-host` / `local_direct`) stays intact in
  *   `createCasBridgedUserMediaResolver` so Gateway preserves remote `hostUuid`, remote
  *   reads/uploads, remote quota, and local resilience when CAS metadata is unavailable.
- * - B3: Zero reverse upload ingestion on read paths; write-side CAS registration is
- *   strictly idempotent by `(tenantId, kind, filename, sha256)`.
- * - B4: Resolves the newest active blob version per `(tenantId, kind, filename)` and
- *   prunes/overwrites stale cache entries so `v1 -> v2` updates and deletes take effect immediately.
+ * - B3/B4: Per-file mirror, authorization, atomic registration, and durable soft-delete live
+ *   in `./artifactBlobMediaMirror.js` and are re-exported explicitly here.
  *
- * Layer: app-container (L4). Zero `process.env` reads; `createHash` only.
+ * Layer: app-container (L4). Zero `process.env` reads; `0` `syncIo`.
  */
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, readdir, readFile, realpath, stat, unlink } from 'node:fs/promises'
+import { mkdir, readdir, readFile, realpath, unlink } from 'node:fs/promises'
 import * as path from 'node:path'
-import { pipeline } from 'node:stream/promises'
-import { validateArtifactBlobRef, type ArtifactBlobRef } from '@openclaude/protocol'
+import type { ArtifactBlobRef } from '@openclaude/protocol'
 import type { FlavorIdentity } from '../flavor/assertFlavor.js'
+import { PgArtifactBlobMetaStore, type PgTransactionPool } from '../db/threeLayerStateStore.js'
 import { isMasterArtifactCasEnabled } from './artifactCasEnv.js'
+import {
+  candidateFilenamesForMediaBlob,
+  inferMediaMimeType,
+  isNewerMediaBlob,
+  listLocalCasDiskMediaBlobs,
+  lstatNoFollow,
+  masterCasBindings,
+  resolveCasStoreRuntimeBinding,
+  safeMediaBasename,
+  selectNewestActiveMediaBlob,
+  type MasterCasRuntimeBinding,
+  type TenantBlobLister,
+} from './artifactBlobCore.js'
 import {
   LocalCasArtifactBlobStore,
   resolveMediaOrBlobBridge,
@@ -35,35 +46,32 @@ import {
   type PoolLike,
   type UserMediaLocation,
 } from './userMedia.js'
-import { PgArtifactBlobMetaStore, type PgTransactionPool } from '../db/threeLayerStateStore.js'
+
+export {
+  candidateFilenamesForMediaBlob,
+  inferMediaMimeType,
+  listLocalCasDiskMediaBlobs,
+  resolveCasStoreRuntimeBinding,
+  safeMediaBasename,
+  selectNewestActiveMediaBlob,
+  type MasterCasRuntimeBinding,
+  type TenantBlobLister,
+}
+export {
+  MediaAccessDeniedError,
+  buildCasPolicyCheckPaths,
+  createCasBridgedRemoteHostUploadPusher,
+  createCasBridgedRemoteMediaPuller,
+  createCasMediaChunkMirrorCallbacks,
+  deleteMasterMediaUploadInCas,
+  openMasterCasMediaFallback,
+  readMasterMediaBytesFromCas,
+  registerMasterMediaUploadInCas,
+  resolveAuthorizedCasMediaBlob,
+} from './artifactBlobMediaMirror.js'
 
 const ARTIFACT_BLOB_TICKET_DOMAIN = 'openclaude:v5:artifact-blob-ticket:v1:'
-const SAFE_MEDIA_FILENAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/
 const DOCKER_VOLUME_DATA_SEGMENT_RE = /(?:^|\/)_data(?:\/|$)/
-
-interface TenantBlobLister {
-  listTenantBlobs(tenantId: string): Promise<readonly ArtifactBlobRef[]>
-}
-
-interface MasterCasRuntimeBinding {
-  readonly rootDir: string
-  readonly metaStore?: TenantBlobLister
-}
-
-const masterCasBindings = new WeakMap<LocalCasArtifactBlobStore, MasterCasRuntimeBinding>()
-
-const MEDIA_MIME_BY_EXT: Readonly<Record<string, string>> = {
-  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
-  '.webp': 'image/webp', '.svg': 'image/svg+xml', '.pdf': 'application/pdf', '.mp3': 'audio/mpeg',
-  '.wav': 'audio/wav', '.mp4': 'video/mp4', '.webm': 'video/webm', '.json': 'application/json', '.txt': 'text/plain',
-}
-
-function defaultExtForMimeType(mime: string): string {
-  for (const [ext, candidate] of Object.entries(MEDIA_MIME_BY_EXT)) {
-    if (candidate === mime && ext !== '.jpeg') return ext
-  }
-  return ''
-}
 
 export interface MasterArtifactBlobStoreOptions {
   readonly openClaudeHome: string
@@ -166,96 +174,6 @@ export function resolveMasterMediaWithBlobBridge(
   })
 }
 
-function isTenantBlobLister(candidate: unknown): candidate is TenantBlobLister {
-  if (!candidate || typeof candidate !== 'object') return false
-  const fn = Reflect.get(candidate, 'listTenantBlobs')
-  return typeof fn === 'function'
-}
-
-function resolveCasStoreRuntimeBinding(
-  blobStore: LocalCasArtifactBlobStore,
-): MasterCasRuntimeBinding | null {
-  const bound = masterCasBindings.get(blobStore)
-  if (bound) return bound
-  const rawRoot = Reflect.get(blobStore, 'rootDir')
-  if (typeof rawRoot !== 'string' || rawRoot.length === 0) return null
-  const rawMeta = Reflect.get(blobStore, 'metaStore')
-  const binding: MasterCasRuntimeBinding = {
-    rootDir: rawRoot,
-    ...(isTenantBlobLister(rawMeta) ? { metaStore: rawMeta } : {}),
-  }
-  masterCasBindings.set(blobStore, binding)
-  return binding
-}
-
-function inferMediaMimeType(filename: string): string {
-  const ext = path.extname(filename).toLowerCase()
-  return MEDIA_MIME_BY_EXT[ext] ?? 'application/octet-stream'
-}
-
-function safeMediaBasename(rawPath: string | undefined): string | null {
-  if (!rawPath) return null
-  const normalized = rawPath.replaceAll('\\', '/').trim()
-  if (normalized.includes('..') || normalized.startsWith('/')) return null
-  const base = path.posix.basename(normalized)
-  return SAFE_MEDIA_FILENAME_RE.test(base) ? base : null
-}
-
-function candidateFilenamesForMediaBlob(blob: ArtifactBlobRef): readonly string[] {
-  const names = new Set<string>()
-  const fromLogical = safeMediaBasename(blob.logicalName)
-  const fromRel = safeMediaBasename(blob.containerRelativePath)
-  if (fromLogical) names.add(fromLogical)
-  if (fromRel) names.add(fromRel)
-  const extFromName = path.extname(fromLogical ?? fromRel ?? '').toLowerCase()
-  const ext =
-    extFromName && /^[.][a-z0-9]{1,10}$/.test(extFromName)
-      ? extFromName
-      : defaultExtForMimeType(blob.mimeType.toLowerCase())
-  const digestName = `${blob.sha256}${ext}`
-  if (SAFE_MEDIA_FILENAME_RE.test(digestName)) names.add(digestName)
-  return [...names]
-}
-
-async function lstatNoFollow(targetPath: string) {
-  try {
-    return await lstat(targetPath)
-  } catch (err) {
-    void err
-    return null
-  }
-}
-
-async function listLocalCasDiskMediaBlobs(
-  metaDir: string,
-  tenantId: string,
-): Promise<readonly ArtifactBlobRef[]> {
-  const dirStat = await lstatNoFollow(metaDir)
-  if (!dirStat || dirStat.isSymbolicLink() || !dirStat.isDirectory()) return []
-  const entries = await readdir(metaDir, { withFileTypes: true })
-  const rows: Array<{ readonly ref: ArtifactBlobRef; readonly ts: number; readonly mtimeNs: bigint }> = []
-  for (const ent of entries) {
-    if (!ent.isFile() || !ent.name.endsWith('.json')) continue
-    try {
-      const fullPath = path.join(metaDir, ent.name)
-      const [raw, st] = await Promise.all([readFile(fullPath, 'utf8'), stat(fullPath, { bigint: true })])
-      const parsed = validateArtifactBlobRef(JSON.parse(raw))
-      if (parsed.tenantId === tenantId && (parsed.kind === 'upload' || parsed.kind === 'generated')) {
-        const ts = Date.parse(parsed.createdAt)
-        rows.push({ ref: parsed, ts: Number.isFinite(ts) ? ts : 0, mtimeNs: st.mtimeNs })
-      }
-    } catch (err) {
-      void err
-    }
-  }
-  rows.sort((a, b) => {
-    if (a.ts !== b.ts) return b.ts - a.ts
-    if (a.ref.blobId !== b.ref.blobId) return b.ref.blobId.localeCompare(a.ref.blobId)
-    return a.mtimeNs === b.mtimeNs ? 0 : a.mtimeNs > b.mtimeNs ? -1 : 1
-  })
-  return rows.map((r) => r.ref)
-}
-
 async function listMediaBlobsForTenant(
   blobStore: LocalCasArtifactBlobStore,
   tenantId: string,
@@ -267,33 +185,6 @@ async function listMediaBlobsForTenant(
     return all.filter((b) => b.kind === 'upload' || b.kind === 'generated')
   }
   return listLocalCasDiskMediaBlobs(path.join(binding.rootDir, 'meta'), tenantId)
-}
-
-function isNewerMediaBlob(candidate: ArtifactBlobRef, incumbent: ArtifactBlobRef): boolean {
-  const candTs = Date.parse(candidate.createdAt)
-  const incTs = Date.parse(incumbent.createdAt)
-  if (Number.isFinite(candTs) && Number.isFinite(incTs) && candTs !== incTs) {
-    return candTs > incTs
-  }
-  // Input comes newest-first from PG (`ORDER BY created_at DESC, ctid DESC, blob_id DESC`)
-  // or sorted local CAS; keep the first-seen winner on identical millisecond timestamps.
-  return false
-}
-
-function selectNewestActiveMediaBlob(
-  blobs: readonly ArtifactBlobRef[],
-  safeName: string,
-  kind?: 'upload' | 'generated',
-): ArtifactBlobRef | null {
-  let winner: ArtifactBlobRef | null = null
-  for (const blob of blobs) {
-    if (kind !== undefined && blob.kind !== kind) continue
-    if (!candidateFilenamesForMediaBlob(blob).includes(safeName)) continue
-    if (winner === null || isNewerMediaBlob(blob, winner)) {
-      winner = blob
-    }
-  }
-  return winner
 }
 
 function selectActiveMediaBlobMap(
@@ -396,148 +287,6 @@ async function syncMaterializedKindDir(opts: {
   }
 }
 
-/**
- * Idempotently registers a user/container media payload in Master CAS (`artifact_blobs`).
- * Deduplicates across all active tenant blobs matching `(kind, filename, sha256)` so
- * multi-alias files sharing a digest never accumulate duplicate metadata rows.
- */
-export async function registerMasterMediaUploadInCas(opts: {
-  readonly blobStore?: LocalCasArtifactBlobStore
-  readonly tenantId: string
-  readonly kind: 'upload' | 'generated'
-  readonly filename: string
-  readonly bytes: Uint8Array
-  readonly mimeType?: string
-}): Promise<ArtifactBlobRef | null> {
-  if (!opts.blobStore) return null
-  const safeName = safeMediaBasename(opts.filename)
-  if (!safeName) return null
-  const sha256 = createHash('sha256').update(opts.bytes).digest('hex')
-  const tenantBlobs = await listMediaBlobsForTenant(opts.blobStore, opts.tenantId)
-  const currentNewest = selectNewestActiveMediaBlob(tenantBlobs, safeName, opts.kind)
-  if (currentNewest && currentNewest.sha256 === sha256) {
-    return currentNewest
-  }
-  const relDir = opts.kind === 'upload' ? 'uploads' : 'generated'
-  return opts.blobStore.put({
-    tenantId: opts.tenantId,
-    kind: opts.kind,
-    bytes: opts.bytes,
-    mimeType: opts.mimeType ?? inferMediaMimeType(safeName),
-    logicalName: safeName,
-    containerRelativePath: `${relDir}/${safeName}`,
-  })
-}
-
-/**
- * Reads the newest active tenant media file directly from Master CAS (`artifact_blobs`)
- * by filename (`logicalName`, `basename(containerRelativePath)`, or `<sha256>.<ext>`).
- */
-export async function readMasterMediaBytesFromCas(opts: {
-  readonly blobStore?: LocalCasArtifactBlobStore
-  readonly tenantId: string
-  readonly filename: string
-  readonly kind?: 'upload' | 'generated'
-}): Promise<Buffer | null> {
-  if (!opts.blobStore) return null
-  const safeName = safeMediaBasename(opts.filename)
-  if (!safeName) return null
-  const blobs = await listMediaBlobsForTenant(opts.blobStore, opts.tenantId)
-  if (opts.kind !== undefined) {
-    const picked = selectNewestActiveMediaBlob(blobs, safeName, opts.kind)
-    if (!picked) return null
-    const bytes = await opts.blobStore.getBytes(opts.tenantId, picked.blobId)
-    return bytes ? Buffer.from(bytes) : null
-  }
-  // Match Gateway media precedence: uploads first, then generated.
-  const picked =
-    selectNewestActiveMediaBlob(blobs, safeName, 'upload') ??
-    selectNewestActiveMediaBlob(blobs, safeName, 'generated')
-  if (!picked) return null
-  const bytes = await opts.blobStore.getBytes(opts.tenantId, picked.blobId)
-  return bytes ? Buffer.from(bytes) : null
-}
-
-/**
- * Streams the newest active tenant media file from Master CAS with full HTTP Range & HEAD parity.
- */
-function buildCasPolicyCheckPaths(meta: ArtifactBlobRef, requestedName: string): readonly string[] {
-  const dirSeg = meta.kind === 'upload' ? 'uploads' : 'generated'
-  const paths = new Set<string>([`/${dirSeg}/${requestedName}`])
-  if (meta.logicalName) paths.add(`/${dirSeg}/${meta.logicalName}`)
-  if (meta.containerRelativePath) paths.add(`/${meta.containerRelativePath.replace(/^\/+/, '')}`)
-  return [...paths]
-}
-
-export async function openMasterCasMediaFallback(opts: {
-  readonly blobStore?: LocalCasArtifactBlobStore
-  readonly userId: string
-  readonly filename: string
-  readonly dest: NodeJS.WritableStream
-  readonly resolveRange?: (totalSize: number) => { readonly start: number; readonly end: number } | null
-  readonly isHead?: boolean
-  readonly onReady: (info: {
-    readonly totalSize: number
-    readonly range: { readonly start: number; readonly end: number } | null
-    readonly contentLength: number
-    readonly sha256?: string
-    readonly isImmutableDigest?: boolean
-    readonly policyCheckPaths?: readonly string[]
-  }) => boolean
-}): Promise<'ok' | 'missing' | 'rejected'> {
-  if (!opts.blobStore || !/^c:[1-9][0-9]{0,18}$/.test(opts.userId)) return 'missing'
-  const safeName = safeMediaBasename(opts.filename)
-  if (!safeName) return 'missing'
-  const blobs = await listMediaBlobsForTenant(opts.blobStore, opts.userId)
-  const picked =
-    selectNewestActiveMediaBlob(blobs, safeName, 'upload') ??
-    selectNewestActiveMediaBlob(blobs, safeName, 'generated')
-  if (!picked) return 'missing'
-  const meta = await opts.blobStore.stat(opts.userId, picked.blobId)
-  if (!meta) return 'missing'
-  const range = opts.isHead ? null : opts.resolveRange ? opts.resolveRange(meta.sizeBytes) : null
-  const handle = await opts.blobStore.openReadStream(
-    opts.userId,
-    meta.blobId,
-    range ? { range } : undefined,
-  )
-  if (!handle) return 'missing'
-  const contentLength = range ? range.end - range.start + 1 : meta.sizeBytes
-  const isImmutableDigest =
-    /^[0-9a-f]{64}(?:\.[a-z0-9]{1,16})?$/i.test(safeName) &&
-    safeName.toLowerCase().startsWith(meta.sha256.toLowerCase())
-  const accepted = opts.onReady({
-    totalSize: meta.sizeBytes,
-    range,
-    contentLength,
-    sha256: meta.sha256,
-    isImmutableDigest,
-    policyCheckPaths: buildCasPolicyCheckPaths(meta, safeName),
-  })
-  if (!accepted) {
-    handle.stream.destroy()
-    return 'rejected'
-  }
-  if (opts.isHead) {
-    handle.stream.destroy()
-    return 'ok'
-  }
-  const onClose = () => handle.stream.destroy()
-  opts.dest.once('close', onClose)
-  try {
-    await pipeline(handle.stream, opts.dest)
-    return 'ok'
-  } catch (err) {
-    const destroyable = opts.dest as { destroy?: (error?: Error) => void; destroyed?: boolean }
-    if (!destroyable.destroyed) {
-      destroyable.destroy?.(err instanceof Error ? err : new Error(String(err)))
-    }
-    throw err
-  } finally {
-    opts.dest.removeListener('close', onClose)
-  }
-}
-
 async function buildMaterializedBridgeLocation(
   blobStore: LocalCasArtifactBlobStore,
   uid: number,
@@ -569,15 +318,6 @@ async function buildMaterializedBridgeLocation(
   return { kind: 'ok', uid, uploads, generated }
 }
 
-/**
- * Master CAS media directory bridge:
- * - NEVER writes into user-writable Docker volume dirs (`B1`).
- * - Zero reverse upload ingestion on read (`B3`).
- * - Updates/prunes Master's private `<casRootDir>/media-bridge/u<uid>` cache by active digest (`B4`).
- * - When `preserveRemoteHost` is `true` (default in `createCasBridgedUserMediaResolver`),
- *   keeps `remote-host` & healthy `local_direct` physical locations untouched (`B2`) so Gateway
- *   preserves `hostUuid`, remote node reads/uploads, remote quota, and local resilience.
- */
 async function resolveLocalDirectMediaWithCas(
   location: UserMediaLocation,
   bridged: Extract<MediaOrBlobBridgeResolution, { readonly kind: 'local_direct' }>,
@@ -660,8 +400,6 @@ export function createCasBridgedUserMediaResolver(deps: {
   const baseResolver = createUserMediaResolver({ pool: deps.pool, docker: deps.docker })
   return async (userId: string): Promise<UserMediaLocation> => {
     const rawLocation = await baseResolver(userId)
-    // Production default: preserve physical `remote-host` and healthy `local_direct` ownership
-    // so Gateway handles per-file CAS fallback without losing `hostUuid` or remote upload/quota.
     const preserveRemoteHost = deps.preserveRemoteHost ?? true
     if (preserveRemoteHost) {
       return rawLocation
@@ -671,99 +409,5 @@ export function createCasBridgedUserMediaResolver(deps: {
       preserveRemoteHost: false,
       ...(deps.bridgeRootDir ? { bridgeRootDir: deps.bridgeRootDir } : {}),
     })
-  }
-}
-
-export function createCasBridgedRemoteMediaPuller(deps: {
-  readonly getBlobStore: () => LocalCasArtifactBlobStore | undefined
-  readonly pullFromNodeAgent: (args: {
-    readonly hostUuid: string
-    readonly remotePath: string
-  }) => Promise<Buffer | null>
-}) {
-  return async (args: { hostUuid: string; remotePath: string }): Promise<Buffer | null> => {
-    let remoteErr: unknown
-    let hasRemoteErr = false
-    try {
-      const hit = await deps.pullFromNodeAgent(args)
-      if (hit !== null) return hit
-    } catch (err) {
-      remoteErr = err
-      hasRemoteErr = true
-    }
-    const blobStore = deps.getBlobStore()
-    const parsed = parseUserVolumeMediaFilePath(args.remotePath)
-    if (blobStore && parsed) {
-      try {
-        const casBytes = await readMasterMediaBytesFromCas({
-          blobStore,
-          tenantId: `c:${parsed.uid}`,
-          filename: parsed.filename,
-          kind: parsed.kind === 'uploads' ? 'upload' : 'generated',
-        })
-        if (casBytes !== null) return casBytes
-      } catch (err) {
-        void err
-      }
-    }
-    if (hasRemoteErr) {
-      throw remoteErr instanceof Error ? remoteErr : new Error(String(remoteErr))
-    }
-    return null
-  }
-}
-
-export function createCasBridgedRemoteHostUploadPusher(deps: {
-  readonly getBlobStore: () => LocalCasArtifactBlobStore | undefined
-  readonly putToNodeAgent: (args: {
-    readonly hostUuid: string
-    readonly remotePath: string
-    readonly content: Buffer
-  }) => Promise<void>
-}) {
-  return async (args: {
-    hostUuid: string
-    remotePath: string
-    content: Buffer
-  }): Promise<void> => {
-    // B2: Only report upload success AFTER remote host (`node-agent`) persists the bytes
-    // so the remote container is guaranteed able to read the uploaded file.
-    await deps.putToNodeAgent(args)
-    const blobStore = deps.getBlobStore()
-    const parsed = parseUserVolumeMediaFilePath(args.remotePath)
-    if (blobStore && parsed) {
-      try {
-        await registerMasterMediaUploadInCas({
-          blobStore,
-          tenantId: `c:${parsed.uid}`,
-          kind: parsed.kind === 'uploads' ? 'upload' : 'generated',
-          filename: parsed.filename,
-          bytes: args.content,
-        })
-      } catch (err) {
-        void err
-      }
-    }
-  }
-}
-
-export function createCasMediaChunkMirrorCallbacks(
-  getBlobStore: () => LocalCasArtifactBlobStore | undefined,
-): import('../compute-pool/remoteHostChunkHooks.js').CasMediaChunkMirrorCallbacks {
-  return {
-    mirrorRemotePathBytes: async (remotePath, bytes) => {
-      const blobStore = getBlobStore()
-      const parsed = parseUserVolumeMediaFilePath(remotePath)
-      if (!blobStore || !parsed) return
-      await registerMasterMediaUploadInCas({
-        blobStore,
-        tenantId: `c:${parsed.uid}`,
-        kind: parsed.kind === 'uploads' ? 'upload' : 'generated',
-        filename: parsed.filename,
-        bytes,
-      })
-    },
-    openCasMediaFallback: (args) =>
-      openMasterCasMediaFallback({ blobStore: getBlobStore(), ...args }),
   }
 }

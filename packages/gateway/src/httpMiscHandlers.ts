@@ -41,6 +41,7 @@ import {
   handleMediaGetFailLocation,
   mediaCacheControlForFilename,
   tryServeCasMediaFallback,
+  tryServeRemoteHostApiFile,
 } from './httpMediaCasFallback.js'
 import { serveFileFdWithRange } from './httpRange.js'
 import { isEngineLocalTurnExempt } from './modelAuthority.js'
@@ -251,51 +252,14 @@ export async function handleApiFile(
     if (
       mediaLoc.kind === 'fail' &&
       mediaLoc.reason === 'remote-host' &&
-      this.deps.commercial?.pullRemoteHostMedia
+      (await tryServeRemoteHostApiFile(this, res, {
+        resolvedPath: resolved,
+        mediaLocation: mediaLoc,
+        isScopedMediaPath: makeUserScopedMediaPredicate(mediaLoc.uploads, mediaLoc.generated),
+        isFileBlocked,
+      }))
     ) {
-      const remoteScoped = makeUserScopedMediaPredicate(mediaLoc.uploads, mediaLoc.generated)
-      if (remoteScoped(resolved)) {
-        let buf: Buffer | null = null
-        try {
-          buf = await this.deps.commercial.pullRemoteHostMedia({
-            hostUuid: mediaLoc.hostUuid,
-            remotePath: resolved,
-          })
-        } catch (err) {
-          this.log.error(
-            'api/file: remote-host pull failed',
-            { hostUuid: mediaLoc.hostUuid, remotePath: resolved, ...mediaLoc.logCtx },
-            err as Error,
-          )
-          this.sendError(res, 502, 'remote storage pull failed')
-          return
-        }
-        if (buf === null) {
-          // Codex review #1 (Phase 2): null 表示远端 404;空 Buffer(0 字节文件)
-          // 是合法命中,不能被 falsy 吞掉。
-          res.writeHead(404)
-          res.end('not found')
-          return
-        }
-        if (isFileBlocked(resolved)) {
-          this.log.warn('api/file: remote hit blocked by sensitive deny-list', { path: resolved })
-          res.writeHead(403)
-          res.end('access denied')
-          return
-        }
-        const remoteFileContentType = mimeFor(resolved)
-        const remoteFileDispositionMode = shouldServeInline(remoteFileContentType)
-          ? 'inline'
-          : 'attachment'
-        res.writeHead(200, {
-          'Content-Type': remoteFileContentType,
-          'Content-Length': buf.length,
-          'Cache-Control': 'private, max-age=3600',
-          'Content-Disposition': `${remoteFileDispositionMode}; filename="${encodeURIComponent(basename(resolved) || 'file')}"`,
-        })
-        res.end(buf)
-        return
-      }
+      return
     }
     res.writeHead(404)
     res.end('not found')

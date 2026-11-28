@@ -495,6 +495,95 @@ export class PgArtifactBlobMetaStore {
     return Object.freeze(res.rows.map(mapBlobRow))
   }
 
+  async findNewestMediaBlob(
+    tenantId: string,
+    safeName: string,
+    kind?: 'upload' | 'generated',
+  ): Promise<ArtifactBlobRef | null> {
+    assertCondition(TENANT_ID_RE.test(tenantId), 'BLOB_TENANT_ID_INVALID')
+    assertNonEmptyString(safeName, 'BLOB_FILENAME_INVALID', 256)
+    const digestMatch = /^([0-9a-f]{64})(?:\.[a-z0-9]{1,16})?$/i.exec(safeName)
+    const digestPrefix = digestMatch ? digestMatch[1]!.toLowerCase() : null
+    const relPaths = [`uploads/${safeName}`, `generated/${safeName}`]
+    const res = await this.pool.query<BlobRow>(
+      `SELECT blob_id, tenant_id, sha256, size_bytes, mime_type, kind,
+              logical_name, container_relative_path, storage_backend, storage_uri, created_at
+         FROM artifact_blobs
+        WHERE tenant_id = $1
+          AND deleted_at IS NULL
+          AND ($2::text IS NULL OR kind = $2)
+          AND kind IN ('upload', 'generated')
+          AND (
+            logical_name = $3
+            OR container_relative_path = ANY($4::text[])
+            OR ($5::text IS NOT NULL AND sha256 = $5)
+          )
+        ORDER BY CASE WHEN kind = 'upload' THEN 0 ELSE 1 END,
+                 created_at DESC, ctid DESC, blob_id DESC
+        LIMIT 1`,
+      [tenantId, kind ?? null, safeName, relPaths, digestPrefix],
+    )
+    return res.rows[0] ? mapBlobRow(res.rows[0]) : null
+  }
+
+  async registerLogicalMediaBlobAtomically(
+    blobRow: CompleteBlobRowInput,
+    ensureObjectStored: () => Promise<void>,
+  ): Promise<ArtifactBlobRef> {
+    const validated = validateBlobRowInput(blobRow)
+    const logicalName = validated.logicalName
+    assertNonEmptyString(logicalName, 'BLOB_FILENAME_INVALID', 256)
+    await ensureObjectStored()
+    return withTransaction(this.pool, async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+        `cas-media:${validated.tenantId}:${validated.kind}:${logicalName}`,
+      ])
+      const cur = await client.query<BlobRow>(
+        `SELECT blob_id, tenant_id, sha256, size_bytes, mime_type, kind,
+                logical_name, container_relative_path, storage_backend, storage_uri, created_at
+           FROM artifact_blobs
+          WHERE tenant_id = $1
+            AND kind = $2
+            AND logical_name = $3
+            AND deleted_at IS NULL
+          ORDER BY created_at DESC, ctid DESC, blob_id DESC
+          LIMIT 1`,
+        [validated.tenantId, validated.kind, logicalName],
+      )
+      if (cur.rows[0] && String(cur.rows[0].sha256) === validated.sha256) {
+        return mapBlobRow(cur.rows[0])
+      }
+      return insertArtifactBlobRow(client, validated)
+    })
+  }
+
+  async softDeleteLogicalMediaBlobs(
+    tenantId: string,
+    kind: 'upload' | 'generated',
+    safeName: string,
+  ): Promise<number> {
+    assertCondition(TENANT_ID_RE.test(tenantId), 'BLOB_TENANT_ID_INVALID')
+    assertNonEmptyString(safeName, 'BLOB_FILENAME_INVALID', 256)
+    const digestMatch = /^([0-9a-f]{64})(?:\.[a-z0-9]{1,16})?$/i.exec(safeName)
+    const digestPrefix = digestMatch ? digestMatch[1]!.toLowerCase() : null
+    const relPath = `${kind === 'upload' ? 'uploads' : 'generated'}/${safeName}`
+    const res = await this.pool.query<{ blob_id: string }>(
+      `UPDATE artifact_blobs
+          SET deleted_at = NOW()
+        WHERE tenant_id = $1
+          AND kind = $2
+          AND deleted_at IS NULL
+          AND (
+            logical_name = $3
+            OR container_relative_path = $4
+            OR ($5::text IS NOT NULL AND sha256 = $5)
+          )
+        RETURNING blob_id`,
+      [tenantId, kind, safeName, relPath, digestPrefix],
+    )
+    return res.rows.length
+  }
+
   async gcUnreferencedBlobs(opts: GcUnreferencedBlobsOptions): Promise<GcUnreferencedBlobsResult> {
     if (opts.completeReferenceProof !== true) throw new Error('BLOB_GC_INCOMPLETE_REFERENCE_PROOF')
     assertCondition(

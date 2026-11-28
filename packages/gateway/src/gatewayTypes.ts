@@ -83,6 +83,7 @@ export interface CommercialHook {
   pullRemoteHostMedia?: (args: {
     hostUuid: string
     remotePath: string
+    isFileBlocked?: (pathOrName: string) => boolean
   }) => Promise<Buffer | null>
   pushRemoteHostUploadFromPath?: (args: {
     hostUuid: string
@@ -107,10 +108,11 @@ export interface CommercialHook {
     hostUuid: string; remotePath: string; dest: NodeJS.WritableStream
     resolveRange?: (totalSize: number) => { start: number; end: number } | null; isHead?: boolean
     onReady: (info: { size: number; range?: { start: number; end: number } | null; contentLength?: number }) => boolean
-  }) => Promise<'ok' | 'missing' | 'rejected'>
+  }) => Promise<'ok' | 'missing' | 'rejected' | 'denied'>
   openCasMediaFallback?: (args: {
     userId: string; filename: string; dest: NodeJS.WritableStream
     resolveRange?: (totalSize: number) => { start: number; end: number } | null; isHead?: boolean
+    isFileBlocked?: (pathOrName: string) => boolean
     onReady: (info: {
       totalSize: number; range: { start: number; end: number } | null; contentLength: number
       sha256?: string; isImmutableDigest?: boolean; policyCheckPaths?: readonly string[]

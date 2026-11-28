@@ -466,18 +466,53 @@ function filterEligibleOfferRows(
   return { eligibleRows, blockedByUncommissionedGuard, hasCommissionedV4 }
 }
 
+async function filterStickyByConfiguredBindings(
+  bindingResolution: ResolvedBindingReaderResult,
+  canonicalModel: string,
+  stickyMatch: StickyDriverMatch | null,
+  allowStickyFailover: boolean,
+): Promise<StickyDriverMatch | null> {
+  if (bindingResolution.status !== 'configured' || !bindingResolution.reader) {
+    return stickyMatch
+  }
+  const resolved = await bindingResolution.reader.resolveBindingsForModel(canonicalModel)
+  const enabledRemote = resolved.bindings.filter(
+    (b) => b.enabled !== false && b.poolKind === 'remote_pool',
+  )
+  if (enabledRemote.length === 0) {
+    throw new Error('CAPABILITY_UNSATISFIED')
+  }
+  if (!stickyMatch) return null
+  const stickyAllowed = enabledRemote.some(
+    (b) => !b.driverId || b.driverId === stickyMatch.driverId,
+  )
+  if (!stickyAllowed) {
+    if (!allowStickyFailover) throw new Error('CAPABILITY_UNSATISFIED')
+    return null
+  }
+  return stickyMatch
+}
+
 async function routeEligibleOfferCandidates(params: {
-  readonly pool: Pool
   readonly request: SelectSelfhostRemoteDriverInput
   readonly options: SelectSelfhostRemoteDriverOptions
+  readonly bindingResolution: ResolvedBindingReaderResult
   readonly logicalModel: string
   readonly observedAt: string
   readonly eligibleRows: readonly OfferCandidateRow[]
   readonly regMap: ReadonlyMap<string, RemoteDriverRegistryEntry>
   readonly stickyMatch: StickyDriverMatch | null
 }): Promise<{ readonly routeResult: RouteTurnResult; readonly bindingMeta: BindingMeta }> {
-  const { pool, request, options, logicalModel, observedAt, eligibleRows, regMap, stickyMatch } =
-    params
+  const {
+    request,
+    options,
+    bindingResolution,
+    logicalModel,
+    observedAt,
+    eligibleRows,
+    regMap,
+    stickyMatch,
+  } = params
   const candidates: PoolCandidateDescriptor[] = eligibleRows.map((row) =>
     buildRemoteCandidateDescriptor({
       row,
@@ -486,12 +521,6 @@ async function routeEligibleOfferCandidates(params: {
       observedAt,
       cachedAffinityByProfile: options.cachedAffinityByProfile,
     }),
-  )
-  const bindingResolution = await resolveOptionalBindingReader(
-    pool,
-    request.canonicalModel,
-    options.bindingStore,
-    options.onBindingReadError,
   )
   const bindingMeta: BindingMeta = {
     bindingStatus: bindingResolution.status,
@@ -554,10 +583,10 @@ function finalizeSelectionFromRoute(params: {
   if (routeResult.code === 'CAPABILITY_UNSATISFIED') {
     throw new Error('CAPABILITY_UNSATISFIED')
   }
-  if (stickyMatch && !allowStickyFailover) {
+  if (stickyMatch && !allowStickyFailover && bindingMeta.bindingStatus !== 'configured') {
     return buildStickyResult(stickyMatch, { routeResult, bindingMeta })
   }
-  if (hasCommissionedV4) {
+  if (hasCommissionedV4 && bindingMeta.bindingStatus !== 'configured') {
     const primary = eligibleRows[0]!
     return Object.freeze({
       driverId: String(primary.driver_id),
@@ -599,22 +628,38 @@ export async function selectSelfhostRemoteDriverViaUnifiedRouter(
   const observedAt = new Date((options.now ?? Date.now)()).toISOString()
   const allowStickyFailover = request.allowStickyFailover === true
 
-  const stickyMatch = await queryStickyDriverMatch(
+  const bindingResolution = await resolveOptionalBindingReader(
+    pool,
+    request.canonicalModel,
+    options.bindingStore,
+    options.onBindingReadError,
+  )
+  const bindingMeta: BindingMeta = {
+    bindingStatus: bindingResolution.status,
+    ...(bindingResolution.error === undefined ? {} : { bindingReadError: bindingResolution.error }),
+  }
+  const rawStickyMatch = await queryStickyDriverMatch(
     pool,
     request,
     legacyBindEngine,
     authEngine,
     regMap,
   )
-  if (stickyMatch && !allowStickyFailover && !request.requiredCapabilities) {
-    return buildStickyResult(stickyMatch)
+  const stickyMatch = await filterStickyByConfiguredBindings(
+    bindingResolution,
+    request.canonicalModel,
+    rawStickyMatch,
+    allowStickyFailover,
+  )
+  if (stickyMatch && !allowStickyFailover && !request.requiredCapabilities && bindingResolution.status !== 'configured') {
+    return buildStickyResult(stickyMatch, { bindingMeta })
   }
 
   const offerRows = await queryRemoteOfferCandidates(pool, request.canonicalModel, legacyProfEngine)
   if (offerRows.length === 0) {
     return stickyMatch && !allowStickyFailover
-      ? buildStickyResult(stickyMatch)
-      : Object.freeze({ driverId: null, source: 'no_eligible_candidate' as const })
+      ? buildStickyResult(stickyMatch, { bindingMeta })
+      : Object.freeze({ driverId: null, source: 'no_eligible_candidate' as const, ...bindingMeta })
   }
 
   const { eligibleRows, blockedByUncommissionedGuard, hasCommissionedV4 } = filterEligibleOfferRows(
@@ -623,19 +668,20 @@ export async function selectSelfhostRemoteDriverViaUnifiedRouter(
     regMap,
   )
   if (eligibleRows.length === 0) {
-    if (stickyMatch && !allowStickyFailover) return buildStickyResult(stickyMatch)
+    if (stickyMatch && !allowStickyFailover) return buildStickyResult(stickyMatch, { bindingMeta })
     return Object.freeze({
       driverId: null,
       source: blockedByUncommissionedGuard
         ? ('legacy_uncommissioned_guard' as const)
         : ('no_eligible_candidate' as const),
+      ...bindingMeta,
     })
   }
 
-  const { routeResult, bindingMeta } = await routeEligibleOfferCandidates({
-    pool,
+  const { routeResult } = await routeEligibleOfferCandidates({
     request,
     options,
+    bindingResolution,
     logicalModel: resolvedModel.logicalModel,
     observedAt,
     eligibleRows,

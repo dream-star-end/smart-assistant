@@ -10,6 +10,28 @@ export interface NodeAgentByteRange {
   readonly end: number;
 }
 
+export function isNodeAgentExplicitDenialError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as {
+    readonly name?: unknown;
+    readonly httpStatus?: unknown;
+    readonly statusCode?: unknown;
+    readonly reason?: unknown;
+  };
+  if (
+    e.name === "AgentAuthError" ||
+    e.name === "MediaAccessDeniedError" ||
+    e.name === "CertVerifyError"
+  ) {
+    return true;
+  }
+  if (e.name === "HostNotServiceableError" && e.reason === "revoked") {
+    return true;
+  }
+  const st = typeof e.httpStatus === "number" ? e.httpStatus : e.statusCode;
+  return st === 400 || st === 401 || st === 403;
+}
+
 export function buildNodeAgentGetPathAndHeaders(
   remotePath: string,
   headers: OutgoingHttpHeaders,

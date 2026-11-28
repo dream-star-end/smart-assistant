@@ -38,67 +38,10 @@ import {
   createCasAwareRemoteHostUploadPusher,
   createCasAwareUserMediaResolver,
 } from '../bootstrap/runtimeSupervisorBootstrap.js'
+import { createMockCasMetaPgPool } from './casMetaTestPool.js'
 
 function createStatefulCasMetaPool(opts?: { throwOnSelect?: () => boolean }) {
-  const rows = new Map<string, Record<string, unknown>>()
-  let insertCalls = 0
-  const pool = new pg.Pool({ max: 1, idleTimeoutMillis: 1 })
-  Reflect.set(pool, 'query', async (sql: string, params: readonly unknown[] = []) => {
-    const norm = sql.replace(/\s+/g, ' ').trim()
-    if (opts?.throwOnSelect?.() && norm.startsWith('SELECT')) {
-      throw new Error('CAS_PG_METADATA_DOWN')
-    }
-    if (norm.startsWith('INSERT INTO artifact_blobs')) {
-      insertCalls += 1
-      const row: Record<string, unknown> = {
-        blob_id: String(params[0]),
-        tenant_id: String(params[1]),
-        sha256: String(params[2]),
-        size_bytes: Number(params[3]),
-        mime_type: String(params[4]),
-        kind: String(params[5]),
-        logical_name: params[6] === null ? null : String(params[6]),
-        container_relative_path: params[7] === null ? null : String(params[7]),
-        storage_backend: String(params[8]),
-        storage_uri: String(params[9]),
-        created_at: new Date(Date.now() + insertCalls).toISOString(),
-        deleted_at: null,
-      }
-      rows.set(String(row.blob_id), row)
-      return { rows: [row], rowCount: 1 }
-    }
-    if (norm.startsWith('UPDATE artifact_blobs SET deleted_at')) {
-      const hit = rows.get(String(params[1]))
-      if (hit && hit.tenant_id === String(params[0]) && hit.deleted_at === null) {
-        hit.deleted_at = new Date().toISOString()
-        return { rows: [{ blob_id: hit.blob_id }], rowCount: 1 }
-      }
-      return { rows: [], rowCount: 0 }
-    }
-    if (norm.includes('FROM artifact_blobs WHERE tenant_id = $1 AND blob_id = $2')) {
-      const hit = rows.get(String(params[1]))
-      const out = hit && hit.tenant_id === String(params[0]) && hit.deleted_at === null ? [hit] : []
-      return { rows: out, rowCount: out.length }
-    }
-    if (norm.includes('FROM artifact_blobs WHERE tenant_id = $1 AND sha256 = $2')) {
-      const active = [...rows.values()]
-        .filter((r) => r.tenant_id === String(params[0]) && r.sha256 === String(params[1]) && r.deleted_at === null)
-        .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
-      return { rows: active.slice(0, 1), rowCount: active.length > 0 ? 1 : 0 }
-    }
-    if (norm.includes('FROM artifact_blobs WHERE tenant_id = $1 AND deleted_at IS NULL')) {
-      const active = [...rows.values()]
-        .filter((r) => r.tenant_id === String(params[0]) && r.deleted_at === null)
-        .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
-      return { rows: active, rowCount: active.length }
-    }
-    return { rows: [], rowCount: 0 }
-  })
-  return {
-    pool,
-    getActiveCount: () => [...rows.values()].filter((r) => r.deleted_at === null).length,
-    getInsertCalls: () => insertCalls,
-  }
+  return createMockCasMetaPgPool({ stepMsPerInsert: true, throwOnSelect: opts?.throwOnSelect })
 }
 
 function buildGatewayHost(

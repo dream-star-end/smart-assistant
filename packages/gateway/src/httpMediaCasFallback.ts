@@ -87,6 +87,29 @@ export function sendBufferMediaWithRange(
   else res.end(buf)
 }
 
+function classifyExplicitDenialStatus(err: unknown): 403 | 502 | null {
+  if (!err || typeof err !== 'object') return null
+  const e = err as {
+    readonly name?: unknown
+    readonly httpStatus?: unknown
+    readonly statusCode?: unknown
+    readonly reason?: unknown
+  }
+  if (e.name === 'MediaAccessDeniedError') return 403
+  const st = typeof e.httpStatus === 'number' ? e.httpStatus : e.statusCode
+  if (st === 403) return 403
+  if (
+    st === 400 ||
+    st === 401 ||
+    e.name === 'AgentAuthError' ||
+    e.name === 'CertVerifyError' ||
+    (e.name === 'HostNotServiceableError' && e.reason === 'revoked')
+  ) {
+    return 502
+  }
+  return null
+}
+
 export async function tryServeCasMediaFallback(
   host: HttpMiscHandlersHost,
   req: IncomingMessage,
@@ -104,6 +127,7 @@ export async function tryServeCasMediaFallback(
       dest: res,
       resolveRange: (totalSize) => parseByteRange(req.headers.range, totalSize),
       isHead: req.method === 'HEAD',
+      isFileBlocked,
       onReady: (info) => {
         const checkPaths = info.policyCheckPaths ?? [`/uploads/${filename}`, `/generated/${filename}`]
         if (checkPaths.some((p) => isFileBlocked(p))) {
@@ -139,6 +163,11 @@ export async function tryServeCasMediaFallback(
       },
     })
     if (responded304) return true
+    if (outcome === 'rejected' && !res.headersSent) {
+      res.writeHead(403)
+      res.end('access denied')
+      return true
+    }
     return outcome !== 'missing'
   } catch (err) {
     host.log.warn('media: CAS fallback failed, continuing without CAS', { userId, filename }, err)
@@ -152,7 +181,7 @@ export async function tryServeCasMediaFallback(
   }
 }
 
-type RemoteMediaAttemptOutcome = 'served' | 'missing' | 'upstream_error'
+type RemoteMediaAttemptOutcome = 'served' | 'missing' | 'denied' | 'upstream_error'
 
 async function streamRemoteHostMediaCandidates(
   host: HttpMiscHandlersHost,
@@ -204,6 +233,10 @@ async function streamRemoteHostMediaCandidates(
           return true
         },
       })
+      if (outcome === 'denied') {
+        host.sendError(res, 502, 'remote storage pull denied')
+        return 'denied'
+      }
       if (outcome !== 'missing') return 'served'
     } catch (err) {
       host.log.error(
@@ -216,6 +249,16 @@ async function streamRemoteHostMediaCandidates(
           res.destroy(err instanceof Error ? err : undefined)
         }
         return 'served'
+      }
+      const denialStatus = classifyExplicitDenialStatus(err)
+      if (denialStatus !== null) {
+        if (denialStatus === 403) {
+          res.writeHead(403)
+          res.end('access denied')
+        } else {
+          host.sendError(res, 502, 'remote storage pull denied')
+        }
+        return 'denied'
       }
       return 'upstream_error'
     }
@@ -238,7 +281,11 @@ async function pullRemoteHostMediaCandidates(
   const { mediaLocation, remoteCandidates, isFileBlocked } = ctx
   for (const remotePath of remoteCandidates) {
     try {
-      const result = await pullRemote({ hostUuid: mediaLocation.hostUuid, remotePath })
+      const result = await pullRemote({
+        hostUuid: mediaLocation.hostUuid,
+        remotePath,
+        isFileBlocked,
+      })
       if (result === null) continue
       if (isFileBlocked(remotePath)) {
         host.log.warn('media: remote hit blocked by sensitive deny-list', { hitPath: remotePath })
@@ -254,10 +301,80 @@ async function pullRemoteHostMediaCandidates(
         { hostUuid: mediaLocation.hostUuid, remotePath, ...mediaLocation.logCtx },
         err as Error,
       )
-      return res.headersSent ? 'served' : 'upstream_error'
+      if (res.headersSent) return 'served'
+      const denialStatus = classifyExplicitDenialStatus(err)
+      if (denialStatus !== null) {
+        if (denialStatus === 403) {
+          res.writeHead(403)
+          res.end('access denied')
+        } else {
+          host.sendError(res, 502, 'remote storage pull denied')
+        }
+        return 'denied'
+      }
+      return 'upstream_error'
     }
   }
   return 'missing'
+}
+
+export async function tryServeRemoteHostApiFile(
+  host: HttpMiscHandlersHost,
+  res: ServerResponse,
+  ctx: {
+    readonly resolvedPath: string
+    readonly mediaLocation: ResolveMediaDirsResult
+    readonly isScopedMediaPath: (p: string) => boolean
+    readonly isFileBlocked: (pathOrName: string) => boolean
+  },
+): Promise<boolean> {
+  const pullRemote = host.deps.commercial?.pullRemoteHostMedia
+  if (ctx.mediaLocation.kind !== 'fail' || ctx.mediaLocation.reason !== 'remote-host' || !pullRemote) {
+    return false
+  }
+  if (!ctx.isScopedMediaPath(ctx.resolvedPath)) return false
+  if (ctx.isFileBlocked(ctx.resolvedPath)) {
+    host.log.warn('api/file: remote hit blocked by sensitive deny-list', { path: ctx.resolvedPath })
+    res.writeHead(403)
+    res.end('access denied')
+    return true
+  }
+  let buf: Buffer | null = null
+  try {
+    buf = await pullRemote({
+      hostUuid: ctx.mediaLocation.hostUuid,
+      remotePath: ctx.resolvedPath,
+      isFileBlocked: ctx.isFileBlocked,
+    })
+  } catch (err) {
+    if (classifyExplicitDenialStatus(err) === 403) {
+      res.writeHead(403)
+      res.end('access denied')
+      return true
+    }
+    host.log.error(
+      'api/file: remote-host pull failed',
+      { hostUuid: ctx.mediaLocation.hostUuid, remotePath: ctx.resolvedPath, ...ctx.mediaLocation.logCtx },
+      err as Error,
+    )
+    host.sendError(res, 502, 'remote storage pull failed')
+    return true
+  }
+  if (buf === null) {
+    res.writeHead(404)
+    res.end('not found')
+    return true
+  }
+  const contentType = mimeFor(ctx.resolvedPath)
+  const disposition = shouldServeInline(contentType) ? 'inline' : 'attachment'
+  res.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Length': buf.length,
+    'Cache-Control': 'private, max-age=3600',
+    'Content-Disposition': `${disposition}; filename="${encodeURIComponent(basename(ctx.resolvedPath) || 'file')}"`,
+  })
+  res.end(buf)
+  return true
 }
 
 export async function handleMediaGetFailLocation(
@@ -287,7 +404,7 @@ export async function handleMediaGetFailLocation(
     const remoteOutcome = host.deps.commercial?.openRemoteHostMedia
       ? await streamRemoteHostMediaCandidates(host, req, res, remoteCtx)
       : await pullRemoteHostMediaCandidates(host, req, res, remoteCtx)
-    if (remoteOutcome === 'served') return
+    if (remoteOutcome === 'served' || remoteOutcome === 'denied') return
     if (await tryServeCasMediaFallback(host, req, res, ctx)) return
     if (!res.headersSent) {
       if (remoteOutcome === 'upstream_error') {

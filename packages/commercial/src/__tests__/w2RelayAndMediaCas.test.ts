@@ -75,6 +75,7 @@ import {
   shouldMarkInstallFromDispatchReceipt,
   type MigrationInstallDispatchLookupRecord,
 } from '../ws/userChatBridgeRemotePoolSeal.js'
+import { createMockCasMetaPgPool } from './casMetaTestPool.js'
 
 const VALID_HEX64 = 'a'.repeat(64)
 
@@ -146,38 +147,8 @@ function makeOfferRow(overrides: {
 }
 
 function createInMemoryCasPgPool(): { readonly pool: pg.Pool; readonly getInsertCount: () => number } {
-  const blobs = new Map<string, Record<string, unknown>>()
-  const pool = new pg.Pool({ max: 1, idleTimeoutMillis: 1 })
-  Reflect.set(pool, 'query', async (sql: string, params: readonly unknown[] = []) => {
-    const norm = sql.replace(/\s+/g, ' ').trim()
-    if (norm.startsWith('INSERT INTO artifact_blobs')) {
-      const row: Record<string, unknown> = {
-        blob_id: String(params[0]), tenant_id: String(params[1]), sha256: String(params[2]),
-        size_bytes: Number(params[3]), mime_type: String(params[4]), kind: String(params[5]),
-        logical_name: params[6] === null ? null : String(params[6]),
-        container_relative_path: params[7] === null ? null : String(params[7]),
-        storage_backend: String(params[8]), storage_uri: String(params[9]),
-        created_at: new Date().toISOString(), deleted_at: null,
-      }
-      blobs.set(String(row.blob_id), row)
-      return { rows: [row], rowCount: 1 }
-    }
-    if (norm.includes('FROM artifact_blobs WHERE tenant_id = $1 AND blob_id = $2')) {
-      const hit = blobs.get(String(params[1]))
-      const rows = hit && hit.tenant_id === String(params[0]) && hit.deleted_at === null ? [hit] : []
-      return { rows, rowCount: rows.length }
-    }
-    if (norm.includes('FROM artifact_blobs WHERE tenant_id = $1 AND sha256 = $2')) {
-      const rows = [...blobs.values()].filter((r) => r.tenant_id === String(params[0]) && r.sha256 === String(params[1]) && r.deleted_at === null)
-      return { rows: rows.slice(0, 1), rowCount: rows.length }
-    }
-    if (norm.includes('FROM artifact_blobs WHERE tenant_id = $1 AND deleted_at IS NULL')) {
-      const rows = [...blobs.values()].filter((r) => r.tenant_id === String(params[0]) && r.deleted_at === null)
-      return { rows, rowCount: rows.length }
-    }
-    return { rows: [], rowCount: 0 }
-  })
-  return { pool, getInsertCount: () => blobs.size }
+  const m = createMockCasMetaPgPool({ stepMsPerInsert: true })
+  return { pool: m.pool, getInsertCount: m.getInsertCalls }
 }
 
 function createContainerPlacementPgPool(): pg.Pool {
