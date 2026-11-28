@@ -9,7 +9,7 @@ import { randomUUID } from 'node:crypto'
 import type { ActionPolicyEvaluation, ExecEnvHostKind, ExecutionPolicyEnvelope } from '@openclaude/protocol'
 import type { FrameLinkLike, ToolBrokerWireFrame } from '@openclaude/protocol/exec-env'
 import { evaluateActionPolicy, type AiReviewHook, type LoadedActionPolicy } from './actionPolicyEngine.js'
-import { evaluateShellForHook, type GuardMode } from './agentEfficiencyGuard.js'
+import { evaluateShellForHook, resolveShellHookLintOptions, type GuardMode } from './agentEfficiencyGuard.js'
 import {
   ContainerLinkToolBrokerHost,
   ToolBrokerPolicyError,
@@ -109,6 +109,7 @@ export interface HookEvaluateInput {
   readonly callId?: string
   readonly mintCapabilityToken?: boolean
   readonly guardMode?: GuardMode
+  readonly engine?: string
 }
 
 export interface HookEvaluateResult {
@@ -545,7 +546,11 @@ export async function evaluateHookShellAndPolicy(params: {
   const command = input.command ?? (shellTool ? extractShellCommand(effectiveArgs) : undefined)
   let effMessage: string | undefined
   if (shellTool && command) {
-    const eff = evaluateShellForHook(command, input.guardMode ?? params.shellHookGuardMode)
+    const eff = evaluateShellForHook(
+      command,
+      input.guardMode ?? params.shellHookGuardMode,
+      resolveShellHookLintOptions(effectiveName, input.engine),
+    )
     if (eff.decision === 'deny') {
       return {
         denied: denyHookResponse(

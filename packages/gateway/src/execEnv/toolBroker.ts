@@ -54,7 +54,7 @@ import {
 export function loadAuthoritativeBrokerActionPolicy(): LoadedActionPolicy {
   return loadActionPolicy()
 }
-import { evaluateShellForHook, type GuardMode } from '../agentEfficiencyGuard.js'
+import { evaluateShellForHook, resolveShellHookLintOptions, type GuardMode } from '../agentEfficiencyGuard.js'
 import { ExecEnvLeaseError, type ExecEnvLeaseManager } from './execEnvLease.js'
 import {
   ScopedCapabilityTokenError,
@@ -1063,7 +1063,11 @@ export class ToolBrokerServer implements ToolBrokerTransport {
       const shellTool = isShellTool(call.canonicalName, toolDef)
       const command = shellTool ? extractShellCommand(call.arguments) : undefined
       if (shellTool && command) {
-        const hookDecision = evaluateShellForHook(command, this.shellHookGuardMode)
+        const hookDecision = evaluateShellForHook(
+          command,
+          this.shellHookGuardMode,
+          resolveShellHookLintOptions(call.canonicalName),
+        )
         if (hookDecision.decision === 'deny') {
           return makeResult({ status: 'denied', errorCode: 'SHELL_EFFICIENCY_GUARD_DENIED', errorMessage: hookDecision.message ?? 'Shell command blocked by efficiency guard' })
         }

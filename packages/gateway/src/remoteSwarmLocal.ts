@@ -37,6 +37,7 @@ import {
 } from './remoteSwarmRuntime.js'
 import type { SessionManager } from './sessionManager.js'
 import { isEngineLocalTurnExempt } from './modelAuthority.js'
+import { resolveGuardMode } from './agentEfficiencyGuard.js'
 import {
   GatewayToolBrokerRuntime,
   type GatewayToolBrokerRuntimeOptions,
@@ -66,7 +67,10 @@ export function isGatewayToolBrokerSelfhostEnabled(explicit?: boolean): boolean 
 export function createGatewayToolBrokerRuntime(
   opts: GatewayToolBrokerRuntimeOptions = {},
 ): GatewayToolBrokerRuntime {
-  return new GatewayToolBrokerRuntime(opts)
+  return new GatewayToolBrokerRuntime({
+    shellHookGuardMode: resolveGuardMode(),
+    ...opts,
+  })
 }
 
 export const REMOTE_SWARM_SESSION_HEADER = 'x-oc-remote-swarm-session'

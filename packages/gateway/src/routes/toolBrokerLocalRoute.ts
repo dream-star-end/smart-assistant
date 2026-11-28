@@ -48,6 +48,7 @@ export interface ToolBrokerLocalHttpRuntime {
       readonly callId?: string
       readonly mintCapabilityToken?: boolean
       readonly guardMode?: 'off' | 'warn' | 'deny'
+      readonly engine?: string
     },
   ): Promise<{ readonly status: number; readonly body: unknown }>
   handleMcpExecute(
@@ -175,6 +176,8 @@ async function handleHookEvaluateAction({ req, res, parsed, sendJson, runtime }:
   const guardModeRaw = parsed.guardMode
   const guardMode =
     guardModeRaw === 'off' || guardModeRaw === 'warn' || guardModeRaw === 'deny' ? guardModeRaw : undefined
+  const engineRaw = typeof parsed.engine === 'string' ? parsed.engine.trim().toLowerCase() : ''
+  const engine = engineRaw && engineRaw.length <= 32 ? engineRaw : undefined
   const out = await runtime.handleHookEvaluate(hookToken, {
     toolName,
     arguments: isPlainObject(parsed.arguments) ? parsed.arguments : undefined,
@@ -184,6 +187,7 @@ async function handleHookEvaluateAction({ req, res, parsed, sendJson, runtime }:
     callId: typeof parsed.callId === 'string' ? parsed.callId : undefined,
     mintCapabilityToken: parsed.mintCapabilityToken === true,
     guardMode,
+    ...(engine ? { engine } : {}),
   })
   sendJson(res, out.status, out.body)
 }
