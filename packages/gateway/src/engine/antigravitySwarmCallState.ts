@@ -56,12 +56,12 @@ interface ArgsBucket { readonly indices: number[]; head: number; second: number 
 export interface CallReductionState {
   openEpoch: number; readonly calls: TrackedToolCall[]; readonly callIndicesById: Map<string, number[]>
   readonly callsByEpoch: Map<number, number[]>; readonly callsByEpochNorm: Map<string, number[]>
-  readonly restoredByEpochNorm: Map<string, number[]>; readonly unboundByEpochNormArgs: Map<string, ArgsBucket>
+  readonly restoredByEpochNorm: Map<string, Set<number>>; readonly unboundByEpochNormArgs: Map<string, ArgsBucket>
   readonly accounted: Set<number>; readonly unaccountedNonBoard: Set<number>
   readonly retirableNonBoardByEpoch: Map<number, number>
   readonly openCertainNamedNonBoard: Set<number>; readonly openSpecNamedNonBoard: Set<number>
   readonly openCertainRetirable: Set<number>; readonly openSpecRetirable: Set<number>
-  readonly openIdNamedCountByKey: Map<string, number>
+  readonly openCoveredIdxByKey: Map<string, number>; readonly openIdNamedCountByKey: Map<string, number>
   readonly idMatchedEpochNorms: Set<string>; readonly plannerEpochNormCounts: Map<string, number>
   readonly plannerEpochCallCounts: Map<number, number>; readonly genericTerminalsByEpoch: Map<number, number>
   readonly namedFallbacksByEpoch: Map<number, TerminalToolStep[]>; readonly seenUnidNamedEpochNorms: Set<string>
@@ -75,11 +75,12 @@ export function createCallReductionState(): CallReductionState {
     openEpoch: 0, calls: [], callIndicesById: new Map(), callsByEpoch: new Map(), callsByEpochNorm: new Map(),
     restoredByEpochNorm: new Map(), unboundByEpochNormArgs: new Map(), accounted: new Set(), unaccountedNonBoard: new Set(),
     retirableNonBoardByEpoch: new Map(), openCertainNamedNonBoard: new Set(), openSpecNamedNonBoard: new Set(),
-    openCertainRetirable: new Set(), openSpecRetirable: new Set(), openIdNamedCountByKey: new Map(),
-    idMatchedEpochNorms: new Set(), plannerEpochNormCounts: new Map(), plannerEpochCallCounts: new Map(),
-    genericTerminalsByEpoch: new Map(), namedFallbacksByEpoch: new Map(), seenUnidNamedEpochNorms: new Set(),
-    pendingIdFallbacks: new Map(), speculativeIdOwners: new Map(), backupSpeculativeNamedByIdx: new Map(),
-    exactIdSettled: new Set(), seenTerminalIds: new Set(), seenStepIndices: new Set(), seenUnindexedPayloads: new Set(),
+    openCertainRetirable: new Set(), openSpecRetirable: new Set(), openCoveredIdxByKey: new Map(),
+    openIdNamedCountByKey: new Map(), idMatchedEpochNorms: new Set(), plannerEpochNormCounts: new Map(),
+    plannerEpochCallCounts: new Map(), genericTerminalsByEpoch: new Map(), namedFallbacksByEpoch: new Map(),
+    seenUnidNamedEpochNorms: new Set(), pendingIdFallbacks: new Map(), speculativeIdOwners: new Map(),
+    backupSpeculativeNamedByIdx: new Map(), exactIdSettled: new Set(), seenTerminalIds: new Set(),
+    seenStepIndices: new Set(), seenUnindexedPayloads: new Set(),
   }
 }
 
@@ -87,6 +88,15 @@ function pushBucketIndex<K, V = number>(map: Map<K, V[]>, key: K, item: V): void
   const bucket = map.get(key)
   if (bucket) bucket.push(item)
   else map.set(key, [item])
+}
+function addRestoredCandidate(state: CallReductionState, epoch: number, norm: string, idx: number): void {
+  const key = `${epoch}:${norm}`
+  let set = state.restoredByEpochNorm.get(key)
+  if (!set) {
+    set = new Set()
+    state.restoredByEpochNorm.set(key, set)
+  }
+  set.add(idx)
 }
 function pushArgsBucket(state: CallReductionState, key: string, idx: number): void {
   turnReductionMetricsForTests.bucketWrites += 1
@@ -99,7 +109,7 @@ function findSoleNameFallbackCandidate(
 ): number {
   const key = `${epoch}:${norm}`
   const nativeBucket = state.callsByEpochNorm.get(key)
-  const restoredBucket = state.restoredByEpochNorm.get(key)
+  const restoredSet = state.restoredByEpochNorm.get(key)
   if (nativeBucket && nativeBucket.length > 1) return -1
   let candidate = -1
   if (nativeBucket && nativeBucket.length === 1 && !state.idMatchedEpochNorms.has(key)) {
@@ -108,10 +118,11 @@ function findSoleNameFallbackCandidate(
     const c = state.calls[idx]!
     if (!state.accounted.has(idx) && !(hasTermId && c.id)) candidate = idx
   }
-  if (restoredBucket && !hasTermId) {
-    for (const rIdx of restoredBucket) {
-      if (countVisit) turnReductionMetricsForTests.candidateVisits += 1
-      if (state.accounted.has(rIdx) || !state.unaccountedNonBoard.has(rIdx)) continue
+  if (restoredSet && restoredSet.size > 0 && !hasTermId) {
+    if (restoredSet.size > 1) return -1
+    if (countVisit) turnReductionMetricsForTests.candidateVisits += 1
+    const rIdx = restoredSet.values().next().value as number
+    if (!state.accounted.has(rIdx) && state.unaccountedNonBoard.has(rIdx)) {
       if (candidate >= 0 && candidate !== rIdx) return -1
       candidate = rIdx
     }
@@ -127,22 +138,23 @@ function clearOpenCoverageForIdx(state: CallReductionState, idx: number): void {
 function syncOpenNamedCoverage(state: CallReductionState, epoch: number, norm: string): void {
   if (epoch !== state.openEpoch || BOARD_COORD_TOOLS.has(norm)) return
   const key = `${epoch}:${norm}`
-  const nativeBucket = state.callsByEpochNorm.get(key)
-  const restoredBucket = state.restoredByEpochNorm.get(key)
-  if (nativeBucket && nativeBucket.length > 0) clearOpenCoverageForIdx(state, nativeBucket[0]!)
-  if (restoredBucket) {
-    for (const rIdx of restoredBucket) clearOpenCoverageForIdx(state, rIdx)
+  const prevIdx = state.openCoveredIdxByKey.get(key)
+  if (prevIdx !== undefined) {
+    clearOpenCoverageForIdx(state, prevIdx)
+    state.openCoveredIdxByKey.delete(key)
   }
   if (state.seenUnidNamedEpochNorms.has(key)) {
     const idx = findSoleNameFallbackCandidate(state, epoch, norm, false, false)
     if (idx >= 0) {
       state.openCertainNamedNonBoard.add(idx)
+      state.openCoveredIdxByKey.set(key, idx)
       if (isRetirablePlannerNonBoard(state, idx)) state.openCertainRetirable.add(idx)
     }
   } else if ((state.openIdNamedCountByKey.get(key) ?? 0) > 0) {
     const idx = findSoleNameFallbackCandidate(state, epoch, norm, true, false)
     if (idx >= 0) {
       state.openSpecNamedNonBoard.add(idx)
+      state.openCoveredIdxByKey.set(key, idx)
       if (isRetirablePlannerNonBoard(state, idx)) state.openSpecRetirable.add(idx)
     }
   }
@@ -178,6 +190,7 @@ function markCallAccounted(state: CallReductionState, idx: number): void {
   if (isRetirablePlannerNonBoard(state, idx)) adjustRetirableNonBoard(state, c!.epoch, -1)
   state.accounted.add(idx)
   state.unaccountedNonBoard.delete(idx)
+  if (c && c.restoredEpoch >= 0) state.restoredByEpochNorm.get(`${c.restoredEpoch}:${c.norm}`)?.delete(idx)
   syncCallCoverage(state, c)
 }
 function unmarkCallAccounted(state: CallReductionState, idx: number): void {
@@ -185,6 +198,7 @@ function unmarkCallAccounted(state: CallReductionState, idx: number): void {
   const c = state.calls[idx]
   if (c && !c.isBoard) state.unaccountedNonBoard.add(idx)
   if (isRetirablePlannerNonBoard(state, idx)) adjustRetirableNonBoard(state, c!.epoch, 1)
+  if (c && c.restoredEpoch >= 0) addRestoredCandidate(state, c.restoredEpoch, c.norm, idx)
   syncCallCoverage(state, c)
 }
 
@@ -296,16 +310,16 @@ function bindIdDirectCall(
     }
     if (!fromPlanner) {
       existing.boundDirect = true
-      if (
-        !existing.isBoard &&
-        !state.accounted.has(existingIdx) &&
-        !state.unaccountedNonBoard.has(existingIdx) &&
-        !state.seenTerminalIds.has(id)
-      ) {
-        state.unaccountedNonBoard.add(existingIdx)
-        existing.restoredEpoch = epoch
-        pushBucketIndex(state.restoredByEpochNorm, `${epoch}:${existing.norm}`, existingIdx)
-        syncOpenNamedCoverage(state, epoch, existing.norm)
+      if (!existing.isBoard && !state.accounted.has(existingIdx) && !state.seenTerminalIds.has(id)) {
+        if (!state.unaccountedNonBoard.has(existingIdx)) state.unaccountedNonBoard.add(existingIdx)
+        if (existing.epoch !== epoch && existing.restoredEpoch !== epoch) {
+          if (existing.restoredEpoch >= 0) {
+            state.restoredByEpochNorm.get(`${existing.restoredEpoch}:${existing.norm}`)?.delete(existingIdx)
+          }
+          existing.restoredEpoch = epoch
+          addRestoredCandidate(state, epoch, existing.norm, existingIdx)
+          syncOpenNamedCoverage(state, epoch, existing.norm)
+        }
       }
     }
     return true
@@ -532,6 +546,7 @@ export function settleCompletedEpoch(state: CallReductionState, epoch: number): 
   state.openSpecNamedNonBoard.clear()
   state.openCertainRetirable.clear()
   state.openSpecRetirable.clear()
+  state.openCoveredIdxByKey.clear()
   state.openIdNamedCountByKey.clear()
   state.openEpoch = epoch + 1
 }

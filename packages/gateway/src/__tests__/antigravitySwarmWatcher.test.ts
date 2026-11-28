@@ -3289,6 +3289,99 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
     r11AmbMon.evaluate({ ...r11AmbSnap, revision: 172 }, 3_000)
     r11AmbMon.evaluate({ ...r11AmbSnap, revision: 173 }, 5_000)
     assert.equal(r11AmbReclaims, 0, 'R11 #2 ambiguous restored A + unnamed C must trigger 0 reclaims')
+
+    // Steward R12 Blocker (1): same step_index PLANNER_RESPONSE transitioning RUNNING -> DONE with unchanged tool_calls
+    // updates status without opening a duplicate epoch or duplicating unnamed calls (waiting, reclaim=1)
+    const r12StatusUpdateSteps: Record<string, unknown>[] = [
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'RUNNING', tool_calls: [{ name: 'read_file', arguments: { Path: '/repo/c.ts' } }] },
+      { step_index: 5, type: 'TOOL_CALL', tool_call_id: 'cid-r12-c', tool_name: 'read_file', status: 'ACTIVE', arguments: { Path: '/repo/c.ts' } },
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', arguments: { Path: '/repo/c.ts' } }] },
+      { step_index: 6, type: 'TOOL_RESULT', tool_call_id: 'cid-r12-c', tool_name: 'read_file', status: 'DONE', content: 'c done' },
+      { step_index: 7, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    await writeFile(workerTranscript, `${r12StatusUpdateSteps.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r12StatusSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 175 })!
+    assert.equal(r12StatusSnap.members.find((m) => m.name === 'parser')!.status, 'waiting', 'R12 #1: RUNNING->DONE planner update must not duplicate call C')
+    let r12StatusReclaims = 0
+    const r12StatusMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { r12StatusReclaims += 1 },
+    })
+    r12StatusMon.evaluate(r12StatusSnap, 1_000)
+    r12StatusMon.evaluate({ ...r12StatusSnap, revision: 176 }, 3_000)
+    r12StatusMon.evaluate({ ...r12StatusSnap, revision: 177 }, 5_000)
+    assert.equal(r12StatusReclaims, 1, 'R12 #1: RUNNING->DONE planner update must preserve reclaim (1)')
+
+    // Steward R12 Blocker (2): restored A reporting ACTIVE again in a NEW epoch (after intermediate swarm_wait)
+    // registers idempotently in that new epoch: sole candidate settles on unnamed DONE (waiting/1), ambiguous A+C refuses to guess (working/0)
+    const r12CrossEpochSole: Record<string, unknown>[] = [
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ id: 'cid-r12-a', name: 'read_file', arguments: { Path: '/repo/a.ts' } }] },
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [], content: 'handoff' },
+      { step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] wake' },
+      { step_index: 4, type: 'TOOL_CALL', tool_call_id: 'cid-r12-a', tool_name: 'read_file', status: 'ACTIVE' },
+      { step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+      { step_index: 6, type: 'TOOL_CALL', tool_call_id: 'cid-r12-a', tool_name: 'read_file', status: 'ACTIVE' },
+      { step_index: 7, type: 'TOOL_RESULT', tool_name: 'read_file', status: 'DONE', content: 'a done' },
+      { step_index: 8, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 2 } }] },
+    ]
+    await writeFile(workerTranscript, `${r12CrossEpochSole.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r12SoleSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 178 })!
+    assert.equal(r12SoleSnap.members.find((m) => m.name === 'parser')!.status, 'waiting', 'R12 #2 sole: cross-epoch re-ACTIVE A settles on unnamed DONE')
+    let r12SoleReclaims = 0
+    const r12SoleMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { r12SoleReclaims += 1 },
+    })
+    r12SoleMon.evaluate(r12SoleSnap, 1_000)
+    r12SoleMon.evaluate({ ...r12SoleSnap, revision: 179 }, 3_000)
+    r12SoleMon.evaluate({ ...r12SoleSnap, revision: 180 }, 5_000)
+    assert.equal(r12SoleReclaims, 1, 'R12 #2 sole: settled cross-epoch A restores reclaim (1)')
+
+    const r12CrossEpochAmb: Record<string, unknown>[] = [
+      ...r12CrossEpochSole.slice(0, 4),
+      { step_index: 5, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', arguments: { Path: '/repo/c.ts' } }] },
+      { step_index: 6, type: 'TOOL_CALL', tool_call_id: 'cid-r12-a', tool_name: 'read_file', status: 'ACTIVE' },
+      { step_index: 7, type: 'TOOL_RESULT', tool_name: 'read_file', status: 'DONE', content: 'amb done' },
+      { step_index: 8, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 2 } }] },
+    ]
+    await writeFile(workerTranscript, `${r12CrossEpochAmb.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r12AmbSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 181 })!
+    assert.equal(r12AmbSnap.members.find((m) => m.name === 'parser')!.status, 'working', 'R12 #2 ambiguous: cross-epoch re-ACTIVE A + unnamed C must NOT guess')
+    let r12AmbReclaims = 0
+    const r12AmbMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { r12AmbReclaims += 1 },
+    })
+    r12AmbMon.evaluate(r12AmbSnap, 1_000)
+    r12AmbMon.evaluate({ ...r12AmbSnap, revision: 182 }, 3_000)
+    r12AmbMon.evaluate({ ...r12AmbSnap, revision: 183 }, 5_000)
+    assert.equal(r12AmbReclaims, 0, 'R12 #2 ambiguous: must trigger 0 reclaims')
+
+    // Steward R12 complexityDrift concern: restoring 32/64/128 same-name pre-cut calls in one epoch must stay O(N) (no N*(N+1)/2 bucket scans)
+    const measureManySameNameRestores = (nCalls: number) => {
+      const seq: Record<string, unknown>[] = [
+        {
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          tool_calls: Array.from({ length: nCalls }, (_, k) => ({ id: `rest-${k}`, name: 'read_file', arguments: { Path: `/repo/r-${k}.ts` } })),
+        },
+        { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [], content: 'handoff' },
+        { step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] wake' },
+      ]
+      let si = 4
+      for (let k = 0; k < nCalls; k += 1) {
+        seq.push({ step_index: si++, type: 'TOOL_CALL', tool_call_id: `rest-${k}`, tool_name: 'read_file', status: 'ACTIVE' })
+      }
+      seq.push({ step_index: si++, type: 'TOOL_RESULT', tool_name: 'read_file', status: 'DONE', content: 'amb' })
+      resetTurnReductionCandidateVisitsForTests()
+      assert.equal(findTurnStartIndex(seq), 2)
+      return getTurnReductionMetricsForTests()
+    }
+    for (const n of [32, 64, 128] as const) {
+      const m = measureManySameNameRestores(n)
+      assert.ok(m.candidateVisits <= 4, `R12 same-name restores must reject ambiguity in O(1) (N=${n}, got=${m.candidateVisits})`)
+    }
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }

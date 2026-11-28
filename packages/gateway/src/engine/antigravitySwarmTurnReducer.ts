@@ -86,16 +86,16 @@ function batchHasUnsettled(b: BatchDoneTracker): boolean { return b.unsettledIds
 interface TurnBoundaryState {
   hasSteps: boolean; lastType: string; lastSt: string; lastToolName: string; lastCallsLen: number
   hasPlanner: boolean; lastPlannerSt: string; lastPlannerHasWait: boolean; lastPlannerCallsLen: number
-  epoch: number; readonly callState: CallReductionState; batch: BatchDoneTracker
-  cachedEnded: TurnEndKind | null; lastCutPending: boolean
+  lastPlannerStepIdx: number | null; epoch: number; readonly callState: CallReductionState
+  batch: BatchDoneTracker; cachedEnded: TurnEndKind | null; lastCutPending: boolean
 }
 
 function createTurnBoundaryState(): TurnBoundaryState {
   return {
     hasSteps: false, lastType: '', lastSt: '', lastToolName: '', lastCallsLen: 0,
     hasPlanner: false, lastPlannerSt: '', lastPlannerHasWait: false, lastPlannerCallsLen: 0,
-    epoch: 0, callState: createCallReductionState(), batch: createBatchDoneTracker(),
-    cachedEnded: null, lastCutPending: false,
+    lastPlannerStepIdx: null, epoch: 0, callState: createCallReductionState(),
+    batch: createBatchDoneTracker(), cachedEnded: null, lastCutPending: false,
   }
 }
 
@@ -116,6 +116,7 @@ function ingestTurnBoundaryStep(
     t.lastPlannerSt = t.lastSt
     t.lastPlannerHasWait = plannerBatchHasSwarmWait(calls)
     t.lastPlannerCallsLen = calls.length
+    t.lastPlannerStepIdx = typeof step.step_index === 'number' && Number.isFinite(step.step_index) ? step.step_index : null
     t.epoch += 1
     t.batch = createBatchDoneTracker()
     registerCallList(t.callState, calls, true, true, t.epoch)
@@ -135,27 +136,35 @@ function advanceTurnSegmentOnCertainCut(t: TurnBoundaryState, step: Record<strin
   Object.assign(t, {
     hasSteps: true, cachedEnded: null, lastCutPending: false, lastType: stepType, lastSt: strOf(step.status).toUpperCase(),
     lastCallsLen: 0, lastToolName: '', hasPlanner: false, lastPlannerSt: '', lastPlannerHasWait: false, lastPlannerCallsLen: 0,
-    batch: createBatchDoneTracker(),
+    lastPlannerStepIdx: null, batch: createBatchDoneTracker(),
   })
 }
 
-function isExactDuplicatePlannerStep(
-  step: Record<string, unknown>, stepType: string, seenByIndex: Map<number, Set<string>>,
-): boolean {
-  if (stepType !== 'PLANNER_RESPONSE') return false
+interface SeenPlannerStep {
+  readonly callsKey: string
+  lastStatus: string
+  lastContent: string
+}
+
+function classifyPlannerReplayOrUpdate(
+  step: Record<string, unknown>, stepType: string, seenByIndex: Map<number, SeenPlannerStep>,
+): 'normal' | 'exact_replay' | 'status_update' {
+  if (stepType !== 'PLANNER_RESPONSE') return 'normal'
   const rawIdx = step.step_index
-  if (typeof rawIdx !== 'number' || !Number.isFinite(rawIdx)) return false
+  if (typeof rawIdx !== 'number' || !Number.isFinite(rawIdx)) return 'normal'
   const calls = Array.isArray(step.tool_calls) ? step.tool_calls : []
   const st = strOf(step.status).toUpperCase()
-  const key = calls.length > 0 ? `${st}:${canonicalJson(calls)}` : `${st}:[]:${strOf(step.content)}`
-  let bucket = seenByIndex.get(rawIdx)
-  if (bucket?.has(key)) return true
-  if (!bucket) {
-    bucket = new Set()
-    seenByIndex.set(rawIdx, bucket)
+  const callsKey = canonicalJson(calls)
+  const content = calls.length === 0 ? strOf(step.content) : ''
+  const prev = seenByIndex.get(rawIdx)
+  if (prev && prev.callsKey === callsKey) {
+    if (prev.lastStatus === st && prev.lastContent === content) return 'exact_replay'
+    prev.lastStatus = st
+    prev.lastContent = content
+    return 'status_update'
   }
-  bucket.add(key)
-  return false
+  seenByIndex.set(rawIdx, { callsKey, lastStatus: st, lastContent: content })
+  return 'normal'
 }
 
 function isTurnEndedIncremental(t: TurnBoundaryState): TurnEndKind {
@@ -200,12 +209,24 @@ export function analyzeTurnWindow(
   let turnStartEff = 0
   let tracker = createTurnBoundaryState()
   const effectiveSteps: Record<string, unknown>[] = []
-  const seenPlannerByIndex = new Map<number, Set<string>>()
+  const seenPlannerByIndex = new Map<number, SeenPlannerStep>()
   const pendingCuts: Array<{ origIdx: number; effIdx: number; preCutCallCount: number }> = []
   for (let i = 0; i < steps.length; i += 1) {
     const step = steps[i]!
     const stepType = strOf(step.type).toUpperCase()
-    if (isExactDuplicatePlannerStep(step, stepType, seenPlannerByIndex)) continue
+    const plannerKind = classifyPlannerReplayOrUpdate(step, stepType, seenPlannerByIndex)
+    if (plannerKind === 'exact_replay') continue
+    if (plannerKind === 'status_update') {
+      if (tracker.lastPlannerStepIdx === step.step_index) {
+        const st = strOf(step.status).toUpperCase()
+        tracker.lastPlannerSt = st
+        tracker.cachedEnded = null
+        tracker.lastCutPending = false
+        if (tracker.lastType === 'PLANNER_RESPONSE') tracker.lastSt = st
+        effectiveSteps.push(step)
+      }
+      continue
+    }
     const effIdx = effectiveSteps.length
     effectiveSteps.push(step)
     if (stepType === 'USER_INPUT') {
