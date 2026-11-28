@@ -362,9 +362,13 @@ export {
   computeToolIdempotencyKey,
   filterArgsByInputSchema,
   isExecutionPolicyMonotonicTightening,
+  isParsedProcAlive,
   isReadOnlyAllowedCanonicalTool,
+  parseProcStatFull,
+  parseProcStatStartTimeTicks,
   validateExecutionPolicyEnvelope,
   validateToolCallEnvelope,
+  verifyProcGroupByStartTicks,
 } from './exec-env/index.js'
 export type {
   DualPoolParityDimension,
@@ -382,6 +386,8 @@ export type {
   JobOutputDelta,
   JobStartResult,
   ManagedJobSummary,
+  ParsedProcStat,
+  ProcGroupVerifyReader,
   ProcessJobSeam,
   SandboxRedControlId,
   SchemaFilteredHashGoldenVector,

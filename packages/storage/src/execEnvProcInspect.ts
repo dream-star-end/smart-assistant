@@ -4,6 +4,16 @@
  */
 import type { ChildProcess } from 'node:child_process'
 import { readdir, readFile } from 'node:fs/promises'
+import {
+  isParsedProcAlive,
+  parseProcStatFull,
+  parseProcStatStartTimeTicks,
+  verifyProcGroupByStartTicks,
+  type ParsedProcStat,
+} from '@openclaude/protocol'
+
+export { isParsedProcAlive, parseProcStatFull, parseProcStatStartTimeTicks, verifyProcGroupByStartTicks }
+export type { ParsedProcStat }
 
 export const EXEC_ENV_JOB_MAX_OUTPUT_BYTES = 200 * 1024
 export const EXEC_ENV_JOB_HEAD_BYTES = 64 * 1024
@@ -72,42 +82,6 @@ export function clipUtf8Tail(text: string, maxBytes: number): { text: string; by
   return { text: out, byteLength: Buffer.byteLength(out, 'utf8') }
 }
 
-export interface ParsedProcStat {
-  state: string
-  pgrp: number
-  startTimeTicks: number
-}
-
-/**
- * Parse Linux `/proc/<pid>/stat` extracting field 3 (`state`), field 5 (`pgrp`), and field 22 (`starttime`).
- */
-export function parseProcStatFull(statLine: string): ParsedProcStat | null {
-  const rparen = statLine.lastIndexOf(')')
-  if (rparen < 0) return null
-  const rest = statLine.slice(rparen + 1).trim()
-  if (!rest) return null
-  const fields = rest.split(/\s+/)
-  const state = fields[0]
-  const rawPgrp = fields[2]
-  const rawTicks = fields[19]
-  if (!state || !rawPgrp || !rawTicks) return null
-  if (!/^-?\d+$/.test(rawPgrp) || !/^\d+$/.test(rawTicks)) return null
-  const pgrp = Number(rawPgrp)
-  const startTimeTicks = Number(rawTicks)
-  if (!Number.isSafeInteger(pgrp) || !Number.isSafeInteger(startTimeTicks) || startTimeTicks < 0) {
-    return null
-  }
-  return { state, pgrp, startTimeTicks }
-}
-
-export function parseProcStatStartTimeTicks(statLine: string): number | null {
-  return parseProcStatFull(statLine)?.startTimeTicks ?? null
-}
-
-export function isParsedProcAlive(stat: ParsedProcStat | null): stat is ParsedProcStat {
-  return stat !== null && stat.state !== 'Z' && stat.state !== 'X' && stat.state !== 'x'
-}
-
 export async function readProcStatFullAsync(pid: number): Promise<ParsedProcStat | null> {
   if (!Number.isInteger(pid) || pid <= 1 || process.platform !== 'linux') return null
   try {
@@ -153,26 +127,6 @@ function probeGroupAlive(pgid: number, customProbe?: (p: number) => boolean): bo
   }
 }
 
-function scanSyncGroupMembers(
-  pgid: number,
-  minStartTicks: number,
-  readStat: (pid: number) => ParsedProcStat | null,
-  listPids: () => number[],
-): boolean {
-  const leaderStat = readStat(pgid)
-  if (isParsedProcAlive(leaderStat)) {
-    return leaderStat.pgrp === pgid && leaderStat.startTimeTicks === minStartTicks
-  }
-  for (const pid of listPids()) {
-    if (pid === pgid || !Number.isInteger(pid) || pid <= 1) continue
-    const stat = readStat(pid)
-    if (isParsedProcAlive(stat) && stat.pgrp === pgid && stat.startTimeTicks >= minStartTicks) {
-      return true
-    }
-  }
-  return false
-}
-
 let defaultSyncProcOps: VerifyProcessGroupOps | null = null
 
 /**
@@ -208,7 +162,10 @@ export function hasAliveVerifiedProcessGroup(
     return false
   }
   const listPids = ops.listProcPids ?? defaultSyncProcOps?.listProcPids ?? (() => [pgid])
-  return scanSyncGroupMembers(pgid, minStartTicks, readStat, listPids)
+  return verifyProcGroupByStartTicks(pgid, minStartTicks, {
+    readProcStat: readStat,
+    listProcPids: listPids,
+  })
 }
 
 export async function hasAliveVerifiedProcessGroupAsync(

@@ -315,6 +315,16 @@ export class ToolBrokerApprovalCoordinator {
     return false
   }
 
+  listActiveTurnIds(sessionKey: string): string[] {
+    const turnIds = new Set<string>()
+    for (const waiter of this.activeApprovalWaiters.values()) {
+      if (waiter.sessionKey === sessionKey && waiter.phase === 'waiting' && waiter.turnId) {
+        turnIds.add(waiter.turnId)
+      }
+    }
+    return [...turnIds]
+  }
+
   cancelTurnWaiters(sessionKey: string, turnId: string, reason: string, grantId?: string): number {
     let count = 0
     for (const [reqId, waiter] of [...this.activeApprovalWaiters]) {
@@ -675,6 +685,16 @@ export class PendingHookEvaluationTracker {
         if (cur.size === 0) this.bySession.delete(sessionKey)
       },
     }
+  }
+
+  listActiveTurnIds(sessionKey: string): string[] {
+    const set = this.bySession.get(sessionKey)
+    if (!set) return []
+    const turnIds = new Set<string>()
+    for (const entry of set) {
+      if (!entry.controller.signal.aborted && entry.turnId) turnIds.add(entry.turnId)
+    }
+    return [...turnIds]
   }
 
   cancelTurn(sessionKey: string, turnId: string, reason: string, grantId?: string): number {

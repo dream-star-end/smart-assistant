@@ -78,3 +78,12 @@ export type {
   ToolBrokerRebindAck,
   ToolBrokerWireFrame,
 } from './brokerChannel.js'
+
+export {
+  isParsedProcAlive,
+  parseProcStatFull,
+  parseProcStatStartTimeTicks,
+  verifyProcGroupByStartTicks,
+} from './procGroupIdentity.js'
+
+export type { ParsedProcStat, ProcGroupVerifyReader } from './procGroupIdentity.js'
