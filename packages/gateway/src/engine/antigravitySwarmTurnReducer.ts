@@ -141,9 +141,9 @@ function advanceTurnSegmentOnCertainCut(t: TurnBoundaryState, step: Record<strin
 }
 
 interface SeenPlannerStep {
-  readonly callsKey: string
-  lastStatus: string
-  lastContent: string
+  callsKey: string
+  readonly seenFingerprints: Set<string>
+  sawDone: boolean
 }
 
 function classifyPlannerReplayOrUpdate(
@@ -155,15 +155,18 @@ function classifyPlannerReplayOrUpdate(
   const calls = Array.isArray(step.tool_calls) ? step.tool_calls : []
   const st = strOf(step.status).toUpperCase()
   const callsKey = canonicalJson(calls)
-  const content = calls.length === 0 ? strOf(step.content) : ''
+  const fp = calls.length > 0 ? `${st}:${callsKey}` : `${st}:[]:${strOf(step.content)}`
   const prev = seenByIndex.get(rawIdx)
-  if (prev && prev.callsKey === callsKey) {
-    if (prev.lastStatus === st && prev.lastContent === content) return 'exact_replay'
-    prev.lastStatus = st
-    prev.lastContent = content
-    return 'status_update'
+  if (prev) {
+    if (prev.seenFingerprints.has(fp)) return 'exact_replay'
+    if (prev.sawDone && st !== 'DONE' && st !== 'ERROR') return 'exact_replay'
+    prev.seenFingerprints.add(fp)
+    if (st === 'DONE') prev.sawDone = true
+    if (prev.callsKey === callsKey) return 'status_update'
+    prev.callsKey = callsKey
+    return 'normal'
   }
-  seenByIndex.set(rawIdx, { callsKey, lastStatus: st, lastContent: content })
+  seenByIndex.set(rawIdx, { callsKey, seenFingerprints: new Set([fp]), sawDone: st === 'DONE' })
   return 'normal'
 }
 

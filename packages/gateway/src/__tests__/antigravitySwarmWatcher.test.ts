@@ -3382,6 +3382,31 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
       const m = measureManySameNameRestores(n)
       assert.ok(m.candidateVisits <= 4, `R12 same-name restores must reject ambiguity in O(1) (N=${n}, got=${m.candidateVisits})`)
     }
+
+    // Steward R13 Blocker (boundaryIntegrity): once a PLANNER_RESPONSE at step_index reaches DONE
+    // (both empty calls and swarm_wait calls), replaying the earlier RUNNING snapshot MUST be ignored (waiting, reclaim=1)
+    for (const [label, calls, revBase] of [
+      ['R13 empty-calls RUNNING->DONE->replay RUNNING', [], 190],
+      ['R13 swarm_wait RUNNING->DONE->replay RUNNING', [{ name: 'swarm_wait', arguments: { since: 1 } }], 198],
+    ] as const) {
+      const runningStep = { step_index: 10, type: 'PLANNER_RESPONSE', status: 'RUNNING', tool_calls: calls }
+      const doneStep = { step_index: 10, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: calls }
+      for (const [withReplay, offset] of [[false, 0], [true, 4]] as const) {
+        const seq = withReplay ? [runningStep, doneStep, runningStep] : [runningStep, doneStep]
+        await writeFile(workerTranscript, `${seq.map((s) => JSON.stringify(s)).join('\n')}\n`)
+        const snap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: revBase + offset })!
+        assert.equal(snap.members.find((m) => m.name === 'parser')!.status, 'waiting', `${label} replay=${withReplay}: must stay waiting`)
+        let reclaims = 0
+        const mon = new SwarmStallMonitor({
+          stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+          onStallExhausted: () => { reclaims += 1 },
+        })
+        mon.evaluate(snap, 1_000)
+        mon.evaluate({ ...snap, revision: revBase + offset + 1 }, 3_000)
+        mon.evaluate({ ...snap, revision: revBase + offset + 2 }, 5_000)
+        assert.equal(reclaims, 1, `${label} replay=${withReplay}: must preserve deadlock reclaim (1)`)
+      }
+    }
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }
