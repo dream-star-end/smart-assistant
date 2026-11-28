@@ -92,6 +92,29 @@ import { executeTurnWithRetryLoop, type TurnRetryLoopDeps } from './session/turn
 
 export { waitForRetryDelay }
 
+export function isNativeEngineTransientContinuationSafe(input: {
+  providerTag: string | undefined
+  nativeSessionId: string | null | undefined
+  ccbSessionId: string | null | undefined
+  permissionCount: number
+  tools: readonly { completed?: boolean }[]
+}): boolean {
+  if (input.providerTag !== 'ccb' && input.providerTag !== 'codex') return false
+  if (!input.nativeSessionId && !input.ccbSessionId) return false
+  if (input.permissionCount !== 0) return false
+  return input.tools.every((tool) => tool.completed !== false)
+}
+
+// Native continuation is not a replay: TRANSIENT_RETRY_INPUT resumes
+// the same engine session. Completed Bash is therefore safe here.
+export function isTransientContinuationSafe(
+  turnPermissionCount: number,
+  checkpointSafe: boolean,
+  nativeContinuationSafe: boolean,
+): boolean {
+  return turnPermissionCount === 0 && (checkpointSafe || nativeContinuationSafe)
+}
+
 export interface TurnRunnerHost {
   getByKey: SessionManager['getByKey']
   _awaitBoundedOutputDrain: SessionManager['_awaitBoundedOutputDrain']
@@ -263,6 +286,8 @@ function buildTurnRunnerDeps(
     wireTerminalCodeForTape: _wireTerminalCodeForTape,
     tapeErrorCodeForGenericFailure: _tapeErrorCodeForGenericFailure,
     classifyRunError,
+    isNativeEngineTransientContinuationSafe,
+    isTransientContinuationSafe,
     normalizeAssistantOutputUiFences,
     emptyCompletedTurnAssistantText,
     shouldFailClosedEmptyModelTurn,

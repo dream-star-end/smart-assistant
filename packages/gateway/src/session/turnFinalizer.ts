@@ -9,10 +9,7 @@ import type { TurnSummary } from '../engine/engineEvents.js'
 import { triggerLocalCatalogRefreshOnConfigChanged } from '../modelCatalogClient.js'
 import { markCheckpointTurnOutcome } from '../sessionCheckpointStore.js'
 import { log } from '../sessionManagerLog.js'
-import {
-  SESSION_PERSIST_QUEUED_NOTICE,
-  isNativeEngineTransientContinuationSafe,
-} from './sessionUtils.js'
+import { SESSION_PERSIST_QUEUED_NOTICE } from './sessionUtils.js'
 import { persistCompletedTurnResult } from './turnCompletedPersist.js'
 import {
   SafeCcbContextRebuildRetryError,
@@ -260,7 +257,7 @@ async function tryRetryableAttemptRejection(args: {
   transientErrorClass: string
 }): Promise<boolean> {
   const { state, params, deps, result, transientErrorClass } = args
-  if (!result?.isError || state.turnPermissionCount !== 0) return false
+  if (!result?.isError) return false
   const { session } = params
   const checkpointSafe = assessTurnRecoveryTape(
     freezeToolsWithCallUsage(result.tools, state.callUsageByTarget).map((tool) => ({
@@ -269,14 +266,16 @@ async function tryRetryableAttemptRejection(args: {
       _completed: tool.completed !== false,
     })),
   ).checkpointSafe
-  const nativeContinuationSafe = isNativeEngineTransientContinuationSafe({
+  const nativeContinuationSafe = deps.isNativeEngineTransientContinuationSafe({
     providerTag: session.providerTag,
     nativeSessionId: session.runner.nativeSessionId,
     ccbSessionId: session.ccbSessionId,
     permissionCount: state.turnPermissionCount,
     tools: result.tools,
   })
-  if (!checkpointSafe && !nativeContinuationSafe) return false
+  if (!deps.isTransientContinuationSafe(state.turnPermissionCount, checkpointSafe, nativeContinuationSafe)) {
+    return false
+  }
   const hasUsage = hasAnyObservedUsage(state, result)
   const ccbDiag = isCcbSingleOverflowDiagnostic(session, result)
   const contextOverflowSafe = isContextOverflowSafeToRetry(

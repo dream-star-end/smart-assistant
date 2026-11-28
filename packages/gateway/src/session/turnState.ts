@@ -182,6 +182,18 @@ export interface TurnRunnerDeps {
   wireTerminalCodeForTape: (code: string | undefined) => GatewayTerminalErrorCode | undefined
   tapeErrorCodeForGenericFailure: (detail: string | undefined) => string
   classifyRunError: (detail: string | undefined) => { code: string }
+  isNativeEngineTransientContinuationSafe: (input: {
+    providerTag: string | undefined
+    nativeSessionId: string | null | undefined
+    ccbSessionId: string | null | undefined
+    permissionCount: number
+    tools: readonly { completed?: boolean }[]
+  }) => boolean
+  isTransientContinuationSafe: (
+    turnPermissionCount: number,
+    checkpointSafe: boolean,
+    nativeContinuationSafe: boolean,
+  ) => boolean
   normalizeAssistantOutputUiFences: (input: {
     text: string
     segments: SegmentRecord[]

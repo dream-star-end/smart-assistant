@@ -156,19 +156,6 @@ export function preStartStopKey(peerId: string, clientMessageId: string): string
   return `${peerId.replace(/[^a-zA-Z0-9_-]/g, '_')}\u0000${clientMessageId}`
 }
 
-export function isNativeEngineTransientContinuationSafe(input: {
-  providerTag: string | undefined
-  nativeSessionId: string | null | undefined
-  ccbSessionId: string | null | undefined
-  permissionCount: number
-  tools: readonly { completed?: boolean }[]
-}): boolean {
-  if (input.providerTag !== 'ccb' && input.providerTag !== 'codex') return false
-  if (!input.nativeSessionId && !input.ccbSessionId) return false
-  if (input.permissionCount !== 0) return false
-  return input.tools.every((tool) => tool.completed !== false)
-}
-
 export function activeGoalAttribution(session: AgentSession):
   | {
       goalId: string
