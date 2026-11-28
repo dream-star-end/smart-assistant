@@ -41,16 +41,20 @@ describe('session sidebar PG/SQLite 契约对齐', () => {
       'listClientSessions',
       'patchClientSessionMeta',
     ]) {
-      assert.ok(backendSrc.includes(`async ${method}(`), `PG 缺 ${method}`)
+      assert.match(
+        backendSrc,
+        new RegExp(`(?:async\\s+${method}\\s*\\(|\\b${method}\\s*:\\s*(?:async\\s*)?\\()`),
+        `PG 缺 ${method}`,
+      )
       assert.ok(sqliteSrc.includes(`${method}:`), `sqliteBackend 缺 ${method}`)
     }
   })
 
   test('list 默认排除归档,SQL 侧截 last preview,不 N+1 拉 messages blob', () => {
-    const pgList = backendSrc.slice(
-      backendSrc.indexOf('async listClientSessions'),
-      backendSrc.indexOf('async listClientSessions') + 4500,
-    )
+    const pgListStart = backendSrc.indexOf('function buildListClientSessionsSql(')
+    const pgListEnd = backendSrc.indexOf('function projectFilterSql(', pgListStart + 1)
+    assert.ok(pgListStart >= 0 && pgListEnd > pgListStart, 'PG 缺 buildListClientSessionsSql/listClientSessionsImpl')
+    const pgList = backendSrc.slice(pgListStart, pgListEnd)
     const sqliteList = sqliteSrc.slice(
       sqliteSrc.indexOf('async function _sqliteListClientSessions'),
       sqliteSrc.indexOf('async function _sqliteListClientSessions') + 3500,

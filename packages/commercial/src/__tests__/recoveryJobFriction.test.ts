@@ -65,14 +65,24 @@ describe("notifyRecoveryJobTerminals", () => {
 describe("finalizeLosslessTurnTape recovery-job hook wiring", () => {
   test("post-commit hook runs on applied=finalized independently of recoveryDecision", () => {
     const src = readPgSessionsBackendSource();
-    const finalizeAt = src.indexOf("async finalizeLosslessTurnTape(");
-    assert.ok(finalizeAt >= 0);
-    const slice = src.slice(finalizeAt, finalizeAt + 80_000);
-    assert.match(slice, /if \(result\.applied === "finalized"\) \{\s*\/\/ Includes recoveryDecision == null/);
-    assert.match(slice, /await notifyRecoveryJobTerminals\(/);
+    const callbacksAt = src.indexOf("async function publishFinalizePostCommitCallbacks(");
+    assert.ok(callbacksAt >= 0, "publishFinalizePostCommitCallbacks missing");
+    const callbacksSlice = src.slice(callbacksAt, callbacksAt + 1200);
+    assert.match(callbacksSlice, /if \(outcome\.result\.applied !== "finalized"\) return;/);
+    assert.match(callbacksSlice, /\/\/ Includes recoveryDecision == null/);
+    assert.match(callbacksSlice, /await notifyRecoveryJobTerminals\(/);
+    const finalizeAt = src.indexOf("async function runFinalizeLosslessTurnTape(");
+    assert.ok(finalizeAt >= 0, "runFinalizeLosslessTurnTape missing");
     assert.match(
-      slice,
-      /if \(billingUserId !== null\) \{\s*if \(turn\.payload\.continuationOfTurnKey\)/,
+      src.slice(finalizeAt, finalizeAt + 3500),
+      /await publishFinalizePostCommitCallbacks\(/,
+    );
+    const recoveryAt = src.indexOf("async function settleOrScheduleAutomaticRecovery(");
+    assert.ok(recoveryAt >= 0, "settleOrScheduleAutomaticRecovery missing");
+    const recoverySlice = src.slice(recoveryAt, recoveryAt + 1500);
+    assert.match(
+      recoverySlice,
+      /if \(billingUserId === null\)\s*\{[\s\S]{0,120}\}\s*if \(turn\.payload\.continuationOfTurnKey\)/,
     );
   });
 });

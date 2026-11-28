@@ -43,13 +43,20 @@ describe("enqueueMaterializationJob SQL", () => {
 describe("Phase B enqueue wiring", () => {
   test("finalizeLosslessTurnTape only enqueues on HTTP materialize:false, not on worker Phase B", () => {
     const src = readPgSessionsBackendSource();
-    const marker = "async finalizeLosslessTurnTape(";
-    const start = src.indexOf(marker);
-    assert.ok(start >= 0, "finalizeLosslessTurnTape missing");
+    const runMarker = "async function runFinalizeLosslessTurnTape(";
+    const start = src.indexOf(runMarker);
+    assert.ok(start >= 0, "runFinalizeLosslessTurnTape missing");
     const slice = src.slice(start, start + 2500);
     assert.ok(
       slice.includes("enqueueMaterialization: finalizeOptions?.materialize === false"),
       "Phase B must pass enqueueMaterialization based on materialize:false (HTTP create) vs worker suppress",
+    );
+    const entryMarker = "async finalizeLosslessTurnTape(";
+    const entryStart = src.indexOf(entryMarker);
+    assert.ok(entryStart >= 0, "finalizeLosslessTurnTape missing");
+    assert.ok(
+      src.slice(entryStart, entryStart + 600).includes("runFinalizeLosslessTurnTape("),
+      "finalizeLosslessTurnTape must delegate to runFinalizeLosslessTurnTape",
     );
     const visibleMarker = "async commitVisibleLosslessTurnTape(";
     const visibleStart = src.indexOf(visibleMarker);

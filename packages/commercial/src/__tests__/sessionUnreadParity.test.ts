@@ -40,17 +40,21 @@ describe("0240 client_sessions.last_read_at", () => {
 
   test("两条 backend 覆盖 markRead / readAll,list SQL 派生 unread;无 unread-migrate", () => {
     for (const method of ["markClientSessionRead", "markAllClientSessionsRead"]) {
-      assert.ok(backendSrc.includes(`async ${method}(`), `PG 缺 ${method}`);
+      assert.match(
+        backendSrc,
+        new RegExp(`(?:async\\s+${method}\\s*\\(|\\b${method}\\s*:\\s*(?:async\\s*)?\\()`),
+        `PG 缺 ${method}`,
+      );
       assert.ok(sqliteSrc.includes(`${method}:`), `sqliteBackend 缺 ${method}`);
     }
     assert.doesNotMatch(backendSrc, /migrateClientSessionsUnread/);
     assert.doesNotMatch(sqliteSrc, /migrateClientSessionsUnread/);
-    const pgList = backendSrc.slice(
-      backendSrc.indexOf("async listClientSessions"),
-      backendSrc.indexOf("async listClientSessions") + 5500,
-    );
+    const pgListStart = backendSrc.indexOf("function buildListClientSessionsSql(");
+    const pgListEnd = backendSrc.indexOf("function projectFilterSql(", pgListStart + 1);
+    assert.ok(pgListStart >= 0 && pgListEnd > pgListStart, "PG 缺 buildListClientSessionsSql");
+    const pgList = backendSrc.slice(pgListStart, pgListEnd);
     assert.match(pgList, /last_d\.outcome IN \(/);
-    assert.match(pgList, /LAST_READ_AT_MS_SQL/);
+    assert.match(pgList, /(?:LAST_READ_AT_MS_SQL|buildLastReadAtMsSql)/);
     assert.match(pgList, /AS unread/);
     assert.match(sqliteSrc, /LAST_READ_AT_MS_SQL/);
     assert.match(sqliteSrc, /THEN 1 ELSE 0 END AS unread/);

@@ -46,7 +46,11 @@ describe('project_assets PG/SQLite 契约对齐', () => {
       'listPinnedProjectAssetsForSession',
       'searchChatProjectAssets',
     ]) {
-      assert.ok(backendSrc.includes(`async ${method}(`), `PG 缺 ${method}`)
+      assert.match(
+        backendSrc,
+        new RegExp(`(?:async\\s+${method}\\s*\\(|\\b${method}\\s*:\\s*(?:async\\s*)?\\()`),
+        `PG 缺 ${method}`,
+      )
       assert.ok(sqliteSrc.includes(`${method}:`), `sqliteBackend 缺 ${method}`)
     }
   })
@@ -57,8 +61,8 @@ describe('project_assets PG/SQLite 契约对齐', () => {
   })
 
   test('create/update 在计数前取事务级 advisory lock,防 READ COMMITTED 突破 500 上限', () => {
-    const createSrc = extractMethod(backendSrc, 'createProjectAsset', 'updateProjectAsset')
-    const updateSrc = extractMethod(backendSrc, 'updateProjectAsset', 'deleteProjectAsset')
+    const createSrc = extractPgSection(backendSrc, 'async function runCreateProjectAssetTx(', 'async function createProjectAssetImpl(')
+    const updateSrc = extractPgSection(backendSrc, 'async function runUpdateProjectAssetTx(', 'async function updateProjectAssetImpl(')
     for (const [name, src] of [
       ['createProjectAsset', createSrc],
       ['updateProjectAsset', updateSrc],
@@ -85,33 +89,50 @@ describe('project_assets PG/SQLite 契约对齐', () => {
     assert.match(sqliteSrc, /Math\.max\(versionBase, latest\.createdAt \+ 1\)/)
     assert.match(backendSrc, /createdAtFloor = latest\.createdAt \+ 1/)
     assert.match(backendSrc, /GREATEST\(LEAST\(\$\{CLOCK_MS_SQL\}, \$15::bigint\), \$14::bigint\)/)
-    assert.match(backendSrc, /parsed\.value\.source === "output" \? parsed\.value\.capturedAt : null/)
+    assert.match(backendSrc, /parsed(?:\.value)?\.source === "output" \? parsed(?:\.value)?\.capturedAt : null/)
   })
 
   test('重放识别:两侧都只在 capturedAt 不晚于最新版本时复用旧版本', () => {
     assert.match(sqliteSrc, /capturedAt !== null && capturedAt <= latest\.createdAt/)
     assert.match(backendSrc, /capturedAt !== null && capturedAt <= latest\.createdAt/)
     assert.match(sqliteSrc, /parsed\.value\.capturedAt,\n    \)/)
-    assert.match(backendSrc, /parsed\.value\.capturedAt,\n        \)/)
+    assert.match(backendSrc, /parsed(?:\.value)?\.capturedAt,\n\s+\)/)
   })
 
   test('常用只挂最新版本:两侧继承+取消旧版本,注入查询只认最新版本', () => {
     assert.match(sqliteSrc, /pinned = pinned \|\| latest\.pinned/)
     assert.match(backendSrc, /pinned = pinned \|\| latest\.pinned/)
     assert.match(sqliteSrc, /UPDATE project_assets SET pinned = 0[\s\S]{0,200}container_path = \? AND pinned = 1/)
-    assert.match(backendSrc, /UPDATE project_assets SET pinned = FALSE[\s\S]{0,260}container_path = \$3 AND pinned IS TRUE/)
+    assert.match(backendSrc, /UPDATE project_assets[\s\S]{0,40}SET pinned = FALSE[\s\S]{0,260}container_path = \$3 AND pinned IS TRUE/)
     assert.equal(sqliteSrc.split('AND ${SQLITE_ASSET_IS_LATEST_VERSION}').length - 1, 2)
-    assert.equal(backendSrc.split('AND ${PG_ASSET_IS_LATEST_VERSION}').length - 1, 2)
+    assert.ok(
+      backendSrc.includes('const LIST_PINNED_ASSETS_SQL =') &&
+        backendSrc.includes('AND ${PG_ASSET_IS_LATEST_VERSION}'),
+      'PG LIST_PINNED_ASSETS_SQL 必须只认最新版本',
+    )
+    const chatPinned = extractPgSection(
+      backendSrc,
+      'async function listPinnedProjectAssetsForChatProjectImpl(',
+      'async function listProjectAssetsImpl(',
+    )
+    const sessionPinned = extractPgSection(
+      backendSrc,
+      'async function listPinnedProjectAssetsForSessionImpl(',
+      'async function searchChatProjectAssetsImpl(',
+    )
     for (const [name, src] of [
-      ['listPinnedProjectAssetsForChatProject', extractMethod(backendSrc, 'listPinnedProjectAssetsForChatProject', 'searchClientSessions')],
-      ['listPinnedProjectAssetsForSession', extractMethod(backendSrc, 'listPinnedProjectAssetsForSession', 'bumpClientSessionHistoryRevision')],
+      ['listPinnedProjectAssetsForChatProject', chatPinned],
+      ['listPinnedProjectAssetsForSession', sessionPinned],
     ] as const) {
-      assert.ok(src.includes('PG_ASSET_IS_LATEST_VERSION'), `${name} 必须只认最新版本`)
+      assert.ok(
+        src.includes('PG_ASSET_IS_LATEST_VERSION') || src.includes('listPinnedAssetsForProject('),
+        `${name} 必须只认最新版本`,
+      )
     }
   })
 
   test('PG create 在去重之前取锁(并发的两个新版本不会互相看不见)', () => {
-    const createSrc = extractMethod(backendSrc, 'createProjectAsset', 'updateProjectAsset')
+    const createSrc = extractPgSection(backendSrc, 'async function runCreateProjectAssetTx(', 'async function createProjectAssetImpl(')
     const lockAt = createSrc.indexOf('pg_advisory_xact_lock')
     const dupAt = createSrc.indexOf('pgFindDuplicateAsset(')
     assert.ok(lockAt >= 0 && dupAt > lockAt)
@@ -119,7 +140,9 @@ describe('project_assets PG/SQLite 契约对齐', () => {
 })
 
 test('searchProjectAssets: both backends escape LIKE, scope by user_id, skip deleted, cap the limit', () => {
-  const pg = extractMethod(backendSrc, 'searchProjectAssets', 'createProjectAsset')
+  const pgSql = extractPgSection(backendSrc, 'function buildSearchProjectAssetsSql(', 'function buildSearchChatProjectAssetsSql(')
+  const pgImpl = extractPgSection(backendSrc, 'async function searchProjectAssetsImpl(', 'async function inheritLatestOutputPin(')
+  const pg = `${pgSql}\n${pgImpl}`
   const lite = sqliteSrc.slice(
     sqliteSrc.indexOf('async function _sqliteSearchProjectAssets('),
     sqliteSrc.indexOf('async function _sqliteCreateProjectAsset('),
@@ -136,7 +159,9 @@ test('searchProjectAssets: both backends escape LIKE, scope by user_id, skip del
   assert.match(pg, /ILIKE/, 'PG search is case-insensitive')
 })
 test('searchChatProjectAssets: same normaliser, user + project scope, latest version only, escaped LIKE', () => {
-  const pg = extractMethod(backendSrc, 'searchChatProjectAssets', 'bumpClientSessionHistoryRevision')
+  const pgSql = extractPgSection(backendSrc, 'function buildSearchChatProjectAssetsSql(', 'function buildUpdateProjectAssetSql(')
+  const pgImpl = extractPgSection(backendSrc, 'async function searchChatProjectAssetsImpl(', 'export function createPgProjectAssetsStore(')
+  const pg = `${pgSql}\n${pgImpl}`
   const lite = sqliteSrc.slice(
     sqliteSrc.indexOf('async function _sqliteSearchChatProjectAssets('),
     sqliteSrc.indexOf('export function rankSessionSearchHits<'),
@@ -154,10 +179,10 @@ test('searchChatProjectAssets: same normaliser, user + project scope, latest ver
   assert.match(pg, /ILIKE/, 'PG search is case-insensitive')
 })
 
-function extractMethod(src: string, name: string, nextName: string): string {
-  const start = src.indexOf(`async ${name}(`)
-  const end = src.indexOf(`async ${nextName}(`, start + 1)
-  assert.ok(start >= 0, `missing ${name}`)
-  assert.ok(end > start, `missing successor ${nextName}`)
+function extractPgSection(src: string, startMarker: string, endMarker: string): string {
+  const start = src.indexOf(startMarker)
+  const end = src.indexOf(endMarker, start + 1)
+  assert.ok(start >= 0, `missing ${startMarker}`)
+  assert.ok(end > start, `missing successor ${endMarker}`)
   return src.slice(start, end)
 }
