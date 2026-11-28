@@ -1,7 +1,9 @@
 import { withUserError } from '@openclaude/protocol'
 import { getSystemHelpRelay, installSystemHelpRelay } from './systemHelpRelay.js'
 import { handleSystemHelpLocal } from './systemHelpHttp.js'
-import { createGatewayRemoteSwarmRuntime, handleGatewayRemoteSwarmHttp, interruptGatewayRemoteSwarmSession, reconcileGatewayRemoteSwarmOnBoot, setDefaultRemoteSwarmRuntimeFactory, type RemoteSwarmRuntime } from './remoteSwarmLocal.js'
+import { createGatewayRemoteSwarmRuntime, createGatewayToolBrokerRuntime, handleGatewayRemoteSwarmHttp, interruptGatewayRemoteSwarmSession, isGatewayToolBrokerSelfhostEnabled, reconcileGatewayRemoteSwarmOnBoot, setDefaultRemoteSwarmRuntimeFactory, type GatewayToolBrokerRuntime, type RemoteSwarmRuntime, type ToolBrokerApprovalBridge, type ToolBrokerApprovalCardContext } from './remoteSwarmLocal.js'
+import { handleToolBrokerLocalHttp } from './routes/toolBrokerLocalRoute.js'
+import type { ToolBrokerWireFrame } from '@openclaude/protocol/exec-env'
 import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
 export { runSessionPreheat, validateEnginePreheatBody } from './sessionPreheat.js'
 export type { EnginePreheatBody, EnginePreheatValidation, SessionPreheatHost } from './sessionPreheat.js'
@@ -231,7 +233,7 @@ import type { CommercialHook } from './gatewayTypes.js'
 import { type GatewayLifecycleHost, start as startImpl, _doShutdown as _doShutdownImpl, shutdown as shutdownImpl, bootAutoResume as bootAutoResumeImpl, _recoverTurnDispatchInbox as _recoverTurnDispatchInboxImpl, _startTurnDispatchRecoveryLoop as _startTurnDispatchRecoveryLoopImpl, _runTurnDispatchRecoverySweep as _runTurnDispatchRecoverySweepImpl, _ensureEngineNotifier as _ensureEngineNotifierImpl, _armNotifyRetryScheduler as _armNotifyRetrySchedulerImpl, _tickScheduledTasks as _tickScheduledTasksImpl } from './gatewayLifecycle.js'
 import { type GatewayHttpHost, handleHttp as handleHttpImpl, _handleHttpAfterCommercial as _handleHttpAfterCommercialImpl, _serveStaticCached as _serveStaticCachedImpl, _staticCacheFreshOnDisk as _staticCacheFreshOnDiskImpl, openFileHardened as openFileHardenedImpl, setSessionCookie as setSessionCookieImpl, _refreshToken as _refreshTokenImpl, verifyCommercialJwt as verifyCommercialJwtImpl, checkHttpAuth as checkHttpAuthImpl, extractToken as extractTokenImpl, isHttps as isHttpsImpl, getUserId as getUserIdImpl, readBody as readBodyImpl } from './gatewayHttp.js'
 import { type SessionRepoBindingHost, _handleSessionRepoBind as _handleSessionRepoBindImpl, _handleSessionRepoUnbind as _handleSessionRepoUnbindImpl, _checkRepoBindSession as _checkRepoBindSessionImpl, _flushPendingRepoBinds as _flushPendingRepoBindsImpl } from './sessionRepoBinding.js'
-import { type TurnDispatchHost, _notifyDispatchHooks as _notifyDispatchHooksImpl, _acquireSyntheticTurnBarrier as _acquireSyntheticTurnBarrierImpl, _rejectAuthority as _rejectAuthorityImpl, _sendTurnDispatchReceipt as _sendTurnDispatchReceiptImpl, _consumeDispatchAuthority as _consumeDispatchAuthorityImpl, _buildStatusCallback as _buildStatusCallbackImpl, _dispatchAdmittedClientTurn as _dispatchAdmittedClientTurnImpl, _recordSettlement as _recordSettlementImpl, _lookupSettlement as _lookupSettlementImpl } from './turnDispatch.js'
+import { type AdmittedClientTurnMeta, type TurnDispatchHost, _notifyDispatchHooks as _notifyDispatchHooksImpl, _acquireSyntheticTurnBarrier as _acquireSyntheticTurnBarrierImpl, _rejectAuthority as _rejectAuthorityImpl, _sendTurnDispatchReceipt as _sendTurnDispatchReceiptImpl, _consumeDispatchAuthority as _consumeDispatchAuthorityImpl, _buildStatusCallback as _buildStatusCallbackImpl, _dispatchAdmittedClientTurn as _dispatchAdmittedClientTurnImpl, _recordSettlement as _recordSettlementImpl, _lookupSettlement as _lookupSettlementImpl } from './turnDispatch.js'
 import { type PromptQueueDispatchHost, _promptQueueContext as _promptQueueContextImpl, _registerPromptQueueClient as _registerPromptQueueClientImpl, _sendPromptQueueGrantCancellation as _sendPromptQueueGrantCancellationImpl, _broadcastPromptQueueSnapshot as _broadcastPromptQueueSnapshotImpl, _sendPromptQueueSnapshotToClient as _sendPromptQueueSnapshotToClientImpl, _sendPromptQueueDispatch as _sendPromptQueueDispatchImpl } from './promptQueueDispatch.js'
 import { type SkillTrainRunsHost, _collectGenSessionExcerpts as _collectGenSessionExcerptsImpl, _trainingAgent as _trainingAgentImpl, _ownedTrainRun as _ownedTrainRunImpl, _onTrainEvent as _onTrainEventImpl, _maybeAutoEvalTrainRun as _maybeAutoEvalTrainRunImpl } from './skillTrainRuns.js'
 import { type AgentMessageHost, handleAgentMessage as handleAgentMessageImpl, _sendAdapterOutboundMessage as _sendAdapterOutboundMessageImpl, checkBridgeBypass as checkBridgeBypassImpl, _preheatSessionOnOpen as _preheatSessionOnOpenImpl } from './agentMessage.js'
@@ -358,6 +360,8 @@ export interface GatewayDeps {
   channelFactories?: Array<(deps: { config: OpenClaudeConfig }) => ChannelAdapter>
   /** V3 2H: 商业化模块挂载点(undefined = 未启用)。由 cli launcher 在 COMMERCIAL_ENABLED=1 时注入。 */
   commercial?: CommercialHook
+  /** OCV5-915 B05-P32: explicit selfhost identity gate for ToolBroker assembly (defaults to OC_SELFHOST_ENGINE_LOCAL_TURNS). */
+  toolBrokerSelfhostEnabled?: boolean
 }
 
 export function makePeerKey(userId: string, channel: string, peerId: string): string {
@@ -595,6 +599,7 @@ export class Gateway {
   private _bridgeConnections = new WeakSet<WebSocket>()
   private _promptQueueCoordinator: PromptQueueCoordinator | null = null
   private _remoteSwarmRuntime: RemoteSwarmRuntime | null = null
+  private _toolBrokerRuntime: GatewayToolBrokerRuntime | null = null
   private _promptQueueLifecycleByFrame = new WeakMap<object, PromptQueueTurnLifecycle>()
   private _promptQueueExecutionFenceByFrame = new WeakMap<object, PromptQueueExecutionFence>()
   private _promptQueueClientSessions = new WeakMap<WebSocket, Set<string>>()
@@ -837,17 +842,57 @@ export class Gateway {
       )
       this.log.info('prompt queue coordinator enabled', { baseUrl: promptQueueConfig.baseUrl })
     }
-    // 2026-04-21 Medium#G1:被 sessionManager 内部驱逐/shutdown 的 sessionKey
-    // 由此 callback 统一走 outboundRing.clear,防 ring 内存长期泄漏。server.ts
-    // 其他已有的 destroySession 调用点仍然显式 clear(幂等 double-clear 无副作用)。
     this.sessions.onSessionDestroyed = (sessionKey) => {
       try { this._outboundRing.clear(sessionKey); outboundRingSizeBytes.value = this._outboundRing.totalBytes() } catch {}
       clearCcbLocalAgentPendingForSession(sessionKey)
       void this._remoteSwarmRuntime?.shutdownSession(sessionKey).catch(() => {})
+      this._toolBrokerRuntime?.cancelSessionCalls(sessionKey, 'session_destroyed')
     }
     setDefaultRemoteSwarmRuntimeFactory(() => this._ensureRemoteSwarmRuntime())
   }
   private _ensureRemoteSwarmRuntime(): RemoteSwarmRuntime { return (this._remoteSwarmRuntime ??= createGatewayRemoteSwarmRuntime({ sessions: this.sessions, getAgentsConfig: () => this._getAgentsConfig(), defaultModel: this.deps.config.defaults.model, log: this.log })) }
+  private _toolBrokerApprovalBridge(): ToolBrokerApprovalBridge {
+    const resolveTarget = (sessionKey: string) => {
+      const s = this.sessions.getByKey(sessionKey)
+      const parts = sessionKey.split(':')
+      const agentId = s?.agentId ?? (parts[1] || 'main')
+      const channel = s?.channel ?? (parts[2] || 'webchat')
+      const peerKind: 'dm' | 'group' = sessionKey.includes(':group:') ? 'group' : 'dm'
+      const peerId = s?.peerId ?? (parts.slice(4).join(':') || sessionKey)
+      const userId = s?.userId ?? 'default'
+      return { agentId, channel, peer: { id: peerId, kind: peerKind }, userId, peerKey: makePeerKey(userId, channel, peerId) }
+    }
+    return {
+      openApprovalCard: async (ctx: ToolBrokerApprovalCardContext) => {
+        const t = resolveTarget(ctx.sessionKey)
+        const questions = [{ question: `Approve tool "${ctx.toolName}"? ${ctx.reason}`, header: 'ToolBroker Approval', options: [{ label: 'Approve' }, { label: 'Deny' }] }]
+        const input = { questions, toolName: ctx.toolName, ...(ctx.command ? { command: ctx.command } : {}), approvalId: ctx.approvalId }
+        this._pendingPermissions.set(ctx.requestId, { sessionKey: ctx.sessionKey, toolName: ctx.toolName, input, peerKey: t.peerKey, userId: t.userId, channel: t.channel, peer: t.peer, expiresAt: ctx.expiresAt, detachedAskUser: true })
+        await this._persistDetachedAskUserCard({ requestId: ctx.requestId, questions, sessionKey: ctx.sessionKey, userId: t.userId, channel: t.channel, peer: t.peer, expiresAt: ctx.expiresAt, agentId: t.agentId })
+        this._sendStampedSessionFrame(ctx.sessionKey, t.peerKey, { type: 'outbound.permission_request', sessionKey: ctx.sessionKey, channel: t.channel, peer: t.peer, requestId: ctx.requestId, toolName: ctx.toolName, inputPreview: JSON.stringify(input).slice(0, 400), inputJson: input, expiresAt: ctx.expiresAt, detachedAskUser: true })
+      },
+      settleApprovalCard: async (s) => {
+        const p = this._pendingPermissions.get(s.requestId)
+        this._pendingPermissions.delete(s.requestId)
+        const t = p ? { userId: p.userId, channel: p.channel, peer: p.peer, peerKey: p.peerKey } : resolveTarget(s.sessionKey)
+        this._recordSettlement(s.requestId, { behavior: s.behavior, channel: t.channel, peer: t.peer, sessionKey: s.sessionKey, userId: t.userId })
+        this._broadcastPermissionSettled(t.peerKey, { sessionKey: s.sessionKey, channel: t.channel, peer: t.peer, requestId: s.requestId, behavior: s.behavior, reason: s.reason })
+        await this._patchDetachedAskUserResolved({ peer: t.peer, userId: t.userId, sessionKey: s.sessionKey, channel: t.channel }, s.requestId, { _resolved: true, _behavior: s.behavior, _settledReason: s.reason })
+      },
+    }
+  }
+  private _isToolBrokerEnabled(): boolean { return isGatewayToolBrokerSelfhostEnabled(this.deps.toolBrokerSelfhostEnabled) }
+  private _ensureToolBrokerRuntime(): GatewayToolBrokerRuntime { return (this._toolBrokerRuntime ??= createGatewayToolBrokerRuntime({ homeDir: paths.home, defaultMainModel: this.deps.config.defaults.model, approvalBridge: this._toolBrokerApprovalBridge(), registerAntigravityHook: true, registerEfficiencyHook: true, registerRemoteLaneBroker: true, log: this.log })) }
+  private _ensureToolBrokerRuntimeOrNull(): GatewayToolBrokerRuntime | null { return this._isToolBrokerEnabled() ? this._ensureToolBrokerRuntime() : null }
+  private _handleToolBrokerBridgeFrame(ws: WebSocket, frame: ToolBrokerWireFrame): void { this._ensureToolBrokerRuntimeOrNull()?.handleBridgeWireFrame(ws, frame, (raw) => { if (ws.readyState === ws.OPEN) ws.send(raw) }) }
+  private _detachToolBrokerBridgeSocket(ws: WebSocket): void { this._toolBrokerRuntime?.detachBridgeSocket(ws) }
+  private _cancelToolBrokerSession(sessionKey: string, reason = 'user_stop'): void {
+    if (reason === 'user_stop') {
+      this._toolBrokerRuntime?.cancelActiveTurnCalls(sessionKey, reason)
+      return
+    }
+    this._toolBrokerRuntime?.cancelSessionCalls(sessionKey, reason)
+  }
   private _interruptRemoteSwarmForSession(sessionKey: string, reason = 'user_stop'): Promise<boolean> { return interruptGatewayRemoteSwarmSession(this._remoteSwarmRuntime, sessionKey, reason) }
   private _recordRingEvictions(stats: EvictionStats): void {
     if (stats.entries) outboundRingEvictedTotal.inc({ cause: 'entries' }, stats.entries)
@@ -855,7 +900,7 @@ export class Gateway {
     if (stats.bytes) outboundRingEvictedTotal.inc({ cause: 'bytes' }, stats.bytes)
     outboundRingSizeBytes.value = this._outboundRing.totalBytes()
   }
-  async start(): Promise<void> { await reconcileGatewayRemoteSwarmOnBoot({ agentsConfig: this.deps.agentsConfig, log: this.log }); return startImpl.call(this as unknown as GatewayLifecycleHost) }
+  async start(): Promise<void> { if (this._isToolBrokerEnabled()) this._ensureToolBrokerRuntime(); await reconcileGatewayRemoteSwarmOnBoot({ agentsConfig: this.deps.agentsConfig, log: this.log }); return startImpl.call(this as unknown as GatewayLifecycleHost) }
 
   /**
    * Public, idempotent shutdown. Safe to call from signal handlers, fatal
@@ -876,6 +921,7 @@ export class Gateway {
   }
 
   private _doShutdown(exit: boolean): Promise<void> {
+    this._toolBrokerRuntime?.dispose()
     return _doShutdownImpl.call(this as unknown as GatewayLifecycleHost, exit)
   }
 
@@ -886,6 +932,7 @@ export class Gateway {
   private readonly preAuthRoutesIo: PreAuthRoutesIo = ((gw: Gateway): PreAuthRoutesIo => ({
     handleSystemHelp: (req, res) => handleSystemHelpLocal(req, res, getSystemHelpRelay(gw.sessions)),
     handleRemoteSwarmLocal: (req, res, url) => handleGatewayRemoteSwarmHttp({ req, res, url, extractToken: (r) => gw.extractToken(r), accessToken: gw.deps.config.gateway.accessToken, readBody: (r, m) => gw.readBody(r, m), sendJson: (r, c, b) => gw.sendJson(r, c, b), runtime: gw._ensureRemoteSwarmRuntime(), sessions: gw.sessions }),
+    handleToolBrokerLocal: (req, res, url) => { const rt = gw._ensureToolBrokerRuntimeOrNull(); if (!rt) { gw.sendJson(res, 404, { ok: false, errorCode: 'TOOL_BROKER_DISABLED' }); return Promise.resolve() } return handleToolBrokerLocalHttp({ req, res, url, readBody: (r, m) => gw.readBody(r, m), sendJson: (r, c, b) => gw.sendJson(r, c, b), runtime: rt }) },
     delegateJobs: () => gw._delegateJobs, ensureDelegateInflightSurface: () => gw._ensureDelegateInflightSurface(), delegateCancelHost: () => gw._delegateCancelHost(), listCronJobsWithMeta: () => gw.cron?.listJobsWithMeta() ?? Promise.resolve([]),
     _handleSkillEvalGenStart: (...args) => gw._handleSkillEvalGenStart(...args),
     _handleSkillEvalGenStatus: (...args) => gw._handleSkillEvalGenStatus(...args),
@@ -2034,9 +2081,9 @@ export class Gateway {
     done: Promise<void>
     release: () => void
   }> | undefined
-  /** OCV5-435 — webchat turns between ws admission and settlement
-   * (preStartStopKey → live dispatch count). Lazy for Object.create scaffolds. */
+  /** OCV5-435/923 — admitted webchat turns (count + session/seq meta). Lazy for Object.create scaffolds. */
   private _admittedClientTurns: Map<string, number> | undefined
+  private _admittedClientTurnMeta: Map<string, AdmittedClientTurnMeta> | undefined
   /** HTTP/MCP delegate 续跑绑定。测试脚手架 Object.create 不跑字段初始化,使用处惰性 ??=。 */
   private _delegateResume: DelegateResumeRegistry | undefined
 
@@ -2721,8 +2768,8 @@ export class Gateway {
     return handleStopImpl.call(this as unknown as WsConnectionHost, frame)
   }
 
-  /** Handle permission approval/denial from the web frontend */
   private handlePermissionResponse(frame: HandlePermissionResponseFrame): Promise<void> {
+    if (this._toolBrokerRuntime?.handlePermissionResponse(frame)) return Promise.resolve()
     return handlePermissionResponseImpl.call(this as unknown as AskUserPermissionsHost, frame)
   }
 
@@ -2848,83 +2895,32 @@ export class Gateway {
     return _forceDenyPendingPermissionImpl.call(this as unknown as AskUserPermissionsHost, requestId, reason, denyMessage)
   }
 
-  /**
-   * Reap ordinary pending permission requests after a session crash so the
-   * map does not leak and connected tabs dismiss their stuck modal.
-   *
-   * Detached ask_user cards are the exception: they are not bound to the
-   * subprocess lifetime. The card stays answerable for 24h even after crash,
-   * turn end, or session eviction; the user's answer is delivered as a later
-   * inbound message (possibly to a new session). Same contract as
-   * `_autoDenyPendingPermissions` and `_sweepStalePendingPermissions`.
-   */
   private _reapCrashedSessionPendingPermissions(sessionKey: string): void {
     _reapCrashedSessionPendingPermissionsImpl.call(this as unknown as AskUserPermissionsHost, sessionKey)
   }
 
-  /**
-   * Settle pending permission requests for a turn the user just stopped.
-   *
-   * `interruptClientTurn` / `sessions.interrupt` only abort the CCB turn; the
-   * `_pendingPermissions` entry created for a blocking `can_use_tool` (incl.
-   * AskUserQuestion) otherwise survives until the 10-minute janitor. During
-   * that window every hello replays the dead card to the browser (which
-   * renders it read-only since the turn is no longer `sending`) and the
-   * durable master row stays `pending` until the reconciler runs. Force-deny
-   * here so the runtime map, the master row and every connected tab converge
-   * on the same `user_stop` settlement the moment Stop is acknowledged.
-   *
-   * Detached ask_user cards are exempt (same contract as crash/disconnect/
-   * sweep): they outlive the turn by design and are answered later as a new
-   * inbound message.
-   *
-   * When `clientMessageId` is given, only entries owned by that browser turn
-   * are settled (entries recorded without a clientMessageId are assumed to
-   * belong to the stopped turn — the runtime never holds two blocking
-   * permissions for different turns of one session at once). Returns the
-   * number of settled requests.
-   */
   private _settlePendingPermissionsForStop(sessionKey: string, clientMessageId?: string): number {
     return _settlePendingPermissionsForStopImpl.call(this as unknown as AskUserPermissionsHost, sessionKey, clientMessageId)
   }
 
-  /** Auto-deny all pending permission requests associated with a peerKey (on disconnect) */
   private _autoDenyPendingPermissions(peerKey: string): void {
     _autoDenyPendingPermissionsImpl.call(this as unknown as AskUserPermissionsHost, peerKey)
   }
 
-  /** Periodic janitor: auto-deny permissions whose wait has exceeded the TTL.
-   *  Also cleans up entries whose session no longer exists (subprocess was
-   *  evicted or destroyed without going through the crash event path). */
   private _sweepStalePendingPermissions(): void {
     _sweepStalePendingPermissionsImpl.call(this as unknown as AskUserPermissionsHost)
   }
 
-  /** Pre-warm webchat sessions on boot so they respond instantly to the first user message */
   private bootAutoResume(): Promise<void> {
     return bootAutoResumeImpl.call(this as unknown as GatewayLifecycleHost)
   }
 
-  /**
-   * GET /api/sessions/:id 成功(full 与 ?since= 两条 200 路径)后的 fire-and-forget
-   * 引擎预热(INC-20260824-FIRST-TEXT-LATENCY;gate: OC_ENGINE_PREHEAT=1,默认关)。
-   *
-   * 选中会话必打这条 GET(useSessionList.selectSession → loadHistory),粒度恰好是
-   * "用户正在看的那一个会话" —— 明确不挂 bootAutoResume / 全量 hello(那两处是
-   * 全量扇出,spawn 会打满内存/fork)。agentId/modelId 取自本次已读出的
-   * client_sessions 权威行;执行授权走 prewarm 投影,失败即跳过,不绕 fail-closed。
-   */
-  /** session-open 预热去抖戳。`.call(fake)` 测试路径下可能缺省,惰性建。 */
   private _sessionOpenPreheatAt = new Map<string, number>()
 
   private _preheatSessionOnOpen(sessId: string, userId: string, row: { agentId?: string; modelId?: string }): void {
     _preheatSessionOnOpenImpl.call(this as unknown as AgentMessageHost, sessId, userId, row)
   }
 
-  /**
-   * POST /internal/v3/engine-preheat。先 200 再异步 spawn:master POST 3s 超时
-   * 不能卡在 CCB ~20s 冷启动上。失败只 warn,不再写响应。
-   */
   private handleEnginePreheat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return handleEnginePreheatImpl.call(this as unknown as ChannelHandlersHost, req, res)
   }
@@ -2941,36 +2937,12 @@ export class Gateway {
     return _sendAdapterOutboundMessageImpl.call(this as unknown as AgentMessageHost, out, adapter)
   }
 
-  /**
-   * Outbound frame egress — WS broadcast + outboundRing + optional adapter fan-out.
-   *
-   * 入参 union 反映协议演化:历史上只发 OutboundMessage,后续加了 OutboundError /
-   * OutboundCodexBilling / OutboundTurnStatus(后两个是 sideband:不带 .blocks,
-   * adapter (Telegram / 微信) 假设的 OutboundMessage 形状)。union 起来后:
-   *   - sideband type literal 比较 (`wire.type === 'outbound.turn_status'`) 合法
-   *   - caller 不再需要 `as unknown as OutboundMessage` 强转(那是协议演化债,
-   *     现在统一清掉,deliver 类型签名直接承认所有合法 deliverable shape)
-   *
-   * 内部访问的只是 `.type / .channel / .peer / .sessionKey`,这些字段在 union 的
-   * 四个成员上都有(交集字段),所以 narrowing 不需要,直接读即可。
-   */
-  private deliver(out:
-      DeliverOut, adapter?: ChannelAdapter): void {
+  private deliver(out: DeliverOut, adapter?: ChannelAdapter): void {
     deliverImpl.call(this as unknown as WsConnectionHost, out, adapter)
   }
 }
 
-/** Known project roots that agents may work in (intentionally empty — broad source dirs removed) */
 const AGENT_CWD_ROOTS: string[] = []
-
-/**
- * Validate a parsed `wechat-inbound-compensate` body. Caller is responsible
- * for `JSON.parse` + body-size cap upstream — this function only deals with
- * a `unknown` value that resulted from successful parse.
- *
- * Error strings are stable: `handleWechatInboundCompensate` returns them
- * verbatim to the broker, so changing wording is a contract change.
- */
 
 export const SESSION_OPEN_PREHEAT_DEBOUNCE_MS = 30_000
 

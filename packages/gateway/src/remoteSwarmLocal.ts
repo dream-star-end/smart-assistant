@@ -36,9 +36,38 @@ import {
   setDefaultRemoteSwarmRuntimeFactory,
 } from './remoteSwarmRuntime.js'
 import type { SessionManager } from './sessionManager.js'
+import { isEngineLocalTurnExempt } from './modelAuthority.js'
+import {
+  GatewayToolBrokerRuntime,
+  type GatewayToolBrokerRuntimeOptions,
+  type ToolBrokerApprovalBridge,
+  type ToolBrokerApprovalCardContext,
+} from './toolBrokerRuntime.js'
 
-export { REMOTE_SWARM_LOCAL_PREFIX, setDefaultRemoteSwarmRuntimeFactory }
-export type { RemoteSwarmRuntime }
+export { REMOTE_SWARM_LOCAL_PREFIX, setDefaultRemoteSwarmRuntimeFactory, GatewayToolBrokerRuntime }
+export type {
+  RemoteSwarmRuntime,
+  GatewayToolBrokerRuntimeOptions,
+  ToolBrokerApprovalBridge,
+  ToolBrokerApprovalCardContext,
+}
+
+/**
+ * B05-P32 single-authority Gateway selfhost gate for ToolBroker assembly:
+ * enabled ONLY when explicitly opted in via proven product identity (`explicit === true`)
+ * or when selfhost exemption (`OC_SELFHOST_ENGINE_LOCAL_TURNS=1`) is set.
+ * Commercial deployments (including Aurora v5) evaluate to `false` with zero side effects.
+ */
+export function isGatewayToolBrokerSelfhostEnabled(explicit?: boolean): boolean {
+  if (typeof explicit === 'boolean') return explicit
+  return isEngineLocalTurnExempt()
+}
+
+export function createGatewayToolBrokerRuntime(
+  opts: GatewayToolBrokerRuntimeOptions = {},
+): GatewayToolBrokerRuntime {
+  return new GatewayToolBrokerRuntime(opts)
+}
 
 export const REMOTE_SWARM_SESSION_HEADER = 'x-oc-remote-swarm-session'
 export const REMOTE_SWARM_MEMBER_HEADER = 'x-oc-remote-swarm-member'

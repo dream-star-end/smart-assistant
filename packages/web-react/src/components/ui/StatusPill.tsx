@@ -71,6 +71,26 @@ export type StatusPillProps = StatusSource &
     decorative?: boolean;
   };
 
+function buildDotClass(
+  mark: "dot" | "ring" | "question",
+  size: "sm" | "md",
+  dotTone: SemanticTone,
+  breathe?: boolean,
+): string {
+  if (mark === "ring") {
+    // 透明右边框必须排在颜色类之后:tailwind-merge 让后写的 border-color 吃掉先写的 border-r-color,
+    // 缺口没了,旋转就看不出来。
+    return cn("size-2.5 rounded-full border-[1.5px] oc-session-running", BORDER[dotTone], "border-r-transparent");
+  }
+  return cn(
+    "rounded-full",
+    size === "md" ? "size-[7px]" : "size-1.5",
+    BG[dotTone],
+    size === "md" && HALO[dotTone],
+    breathe && "oc-status-breathe",
+  );
+}
+
 export function StatusPill({
   status,
   tone: toneProp,
@@ -84,45 +104,31 @@ export function StatusPill({
 }: StatusPillProps) {
   const spec = status ? STATUS[status] : undefined;
   const tone = spec?.tone ?? toneProp ?? "idle";
+  const dotTone = spec?.iconTone ?? tone;
   const text = label ?? spec?.label;
-  const dot =
-    mark === "ring"
-      ? // 透明右边框必须排在颜色类之后:tailwind-merge 让后写的 border-color 吃掉先写的 border-r-color,
-        // 缺口没了,旋转就看不出来。
-        cn("size-2.5 rounded-full border-[1.5px] oc-session-running", BORDER[tone], "border-r-transparent")
-      : cn(
-          "rounded-full",
-          size === "md" ? "size-[7px]" : "size-1.5",
-          BG[tone],
-          size === "md" && HALO[tone],
-          spec?.breathe && "oc-status-breathe",
-        );
+  const dot = buildDotClass(mark, size, dotTone, spec?.breathe);
+  const a11yProps = decorative
+    ? { "aria-hidden": true as const }
+    : { role: "img" as const, "aria-label": text, title: text };
 
   if (variant === "dot") {
     if (mark === "question") {
       return (
         <span
-          role={decorative ? undefined : "img"}
-          aria-hidden={decorative ? true : undefined}
-          aria-label={decorative ? undefined : text}
-          title={decorative ? undefined : text}
+          {...a11yProps}
           data-status={status}
-          data-tone={tone}
+          data-tone={dotTone}
           data-mark="question"
           className={cn(
             "inline-flex shrink-0 items-center justify-center rounded-full shadow-2xs oc-status-breathe",
             size === "md" ? "size-3.5" : "size-3",
-            BG[tone],
-            size === "md" && HALO[tone],
+            BG[dotTone],
+            size === "md" && HALO[dotTone],
             className,
           )}
           {...rest}
         >
-          <svg
-            viewBox="0 0 16 16"
-            aria-hidden="true"
-            className={cn("size-full shrink-0", ON_FILL[tone])}
-          >
+          <svg viewBox="0 0 16 16" aria-hidden="true" className={cn("size-full shrink-0", ON_FILL[dotTone])}>
             <path
               d="M6.15 5.65C6.35 4.45 7.25 3.75 8.35 3.75C9.55 3.75 10.35 4.5 10.35 5.55C10.35 6.45 9.85 6.95 9.05 7.42C8.35 7.83 8.05 8.22 8.05 9.05"
               fill="none"
@@ -138,12 +144,9 @@ export function StatusPill({
     }
     return (
       <span
-        role={decorative ? undefined : "img"}
-        aria-hidden={decorative ? true : undefined}
-        aria-label={decorative ? undefined : text}
-        title={decorative ? undefined : text}
+        {...a11yProps}
         data-status={status}
-        data-tone={tone}
+        data-tone={dotTone}
         className={cn("inline-block shrink-0", dot, className)}
         {...rest}
       />

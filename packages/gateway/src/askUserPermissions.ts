@@ -29,6 +29,8 @@ import {
   formatAskUserAnswerMessage,
   isDetachedAskUserPending,
   isDetachedAskUserRequestId,
+  isToolBrokerApprovalPending,
+  isToolBrokerApprovalRequestId,
   pendingFromDetachedAskUserMessage,
 } from './detachedAskUser.js'
 import {
@@ -87,6 +89,20 @@ export type HandlePermissionResponseFrame = {
      *  forwarded to CCB; untrusted client fields are dropped. */
     updatedInput?: Record<string, unknown>
   }
+
+function extractSettledAskUserAnswers(effectiveBehavior: 'allow' | 'deny', toolName: string, forwardedInput: Record<string, unknown>, pendingInput: Record<string, unknown>): Record<string, string> | undefined {
+  if (effectiveBehavior !== 'allow' || toolName !== 'AskUserQuestion' || forwardedInput === pendingInput) return undefined
+  const answers = (forwardedInput as { answers?: unknown }).answers
+  return answers && typeof answers === 'object' ? (answers as Record<string, string>) : undefined
+}
+function settleTerminalToolBrokerApproval(host: AskUserPermissionsHost, pending: NonNullable<ReturnType<AskUserPermissionsHost['_pendingPermissions']['get']>>, requestId: string): boolean {
+  if (!isToolBrokerApprovalRequestId(requestId) && !isToolBrokerApprovalPending(pending)) return false
+  host._recordSettlement(requestId, { behavior: 'deny', channel: pending.channel, peer: pending.peer, sessionKey: pending.sessionKey, userId: pending.userId })
+  host._broadcastPermissionSettled(pending.peerKey, { sessionKey: pending.sessionKey, channel: pending.channel, peer: pending.peer, requestId, behavior: 'deny', reason: 'timeout' })
+  void host._patchDetachedAskUserResolved(pending, requestId, { _resolved: true, _behavior: 'deny', _settledReason: 'timeout' })
+  host.log.info('tool-broker expired/post-restart approval card settled terminal', { requestId, startedTurn: false })
+  return true
+}
 
 /** Handle permission approval/denial from the web frontend */
 export async function handlePermissionResponse(
@@ -176,28 +192,10 @@ export async function handlePermissionResponse(
     })
     return
   }
-  // Build the updatedInput that will be passed to CCB.
-  // Default: preserve original input so CCB doesn't receive an empty object.
-  // Tool-specific exception: AskUserQuestion lets the client merge in
-  // `answers` / `annotations` — we validate & whitelist them first so a
-  // compromised client can't inject arbitrary keys into the tool payload.
-  //
-  // `effectiveBehavior` starts at frame.behavior but can be downgraded to
-  // 'deny' if the AskUserQuestion sanitizer finds nothing usable in the
-  // client-supplied updatedInput. Silently allowing an empty-answers
-  // AskUserQuestion turn would pass the tool call through with zero
-  // answers and leave the model wondering what the user said — far
-  // harder to diagnose than an explicit deny.
+  // Build updatedInput for CCB (whitelisting AskUserQuestion answers/annotations; empty/invalid allow downgrades to deny).
   let forwardedInput: Record<string, unknown> = pending.input
   let effectiveBehavior: 'allow' | 'deny' = frame.behavior
   let effectiveMessage = frame.message
-  // AskUserQuestion allow *requires* valid client-supplied answers. If the
-  // client forgot to send updatedInput (buggy tab), sent a non-object, or
-  // sent one whose fields all fail whitelist, we must downgrade to deny —
-  // otherwise CCB receives an empty-answers AskUserQuestion turn and the
-  // model has no idea why the user didn't answer. We run this branch
-  // *unconditionally* when the tool is AskUserQuestion + behavior=allow;
-  // the sanitizer itself handles every shape of bad input.
   if (frame.behavior === 'allow' && pending.toolName === 'AskUserQuestion') {
     const rawCandidate =
       frame.updatedInput &&
@@ -225,14 +223,13 @@ export async function handlePermissionResponse(
           message: effectiveMessage || 'User denied',
           toolUseID: pending.toolUseId,
         }
-  const settledAnswers =
-    effectiveBehavior === 'allow' &&
-    pending.toolName === 'AskUserQuestion' &&
-    forwardedInput !== pending.input &&
-    (forwardedInput as { answers?: unknown }).answers &&
-    typeof (forwardedInput as { answers?: unknown }).answers === 'object'
-      ? (forwardedInput as { answers: Record<string, string> }).answers
-      : undefined
+  const settledAnswers = extractSettledAskUserAnswers(
+    effectiveBehavior,
+    pending.toolName,
+    forwardedInput,
+    pending.input,
+  )
+  if (settleTerminalToolBrokerApproval(this, pending, frame.requestId)) return
   if (isDetachedAskUserPending(pending) || isDetachedAskUserRequestId(frame.requestId)) {
     this._recordSettlement(frame.requestId, {
       behavior: effectiveBehavior,

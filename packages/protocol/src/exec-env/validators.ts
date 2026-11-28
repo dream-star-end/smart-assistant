@@ -94,7 +94,28 @@ export const CANONICAL_READ_ONLY_TOOLS: ReadonlySet<string> = new Set<string>([
   'read_url_content',
   'list_resources',
   'read_resource',
+  'search_extra_tools',
+  'searchextratools',
+  'askuserquestion',
+  'ask_user_question',
+  'ask_question',
+  'exit_plan_mode',
+  'exitplanmode',
+  'oc_read',
+  'oc_find',
+  'oc_tree',
 ])
+
+const EXTRA_READ_ONLY_MEMORY_MCP_TOOLS: ReadonlySet<string> = new Set<string>([
+  'oc_read',
+  'oc_find',
+  'oc_tree',
+])
+
+const READ_ONLY_MEMORY_MCP_PREFIXES = [
+  'mcp_openclaude-memory_',
+  'mcp__openclaude-memory__',
+] as const
 
 const MUTATING_ARG_BOOLEAN_FLAGS = [
   'write',
@@ -413,6 +434,81 @@ export function validateToolCallEnvelope(
   })
 }
 
+function hasMutatingReadOnlyArgs(args: Readonly<Record<string, unknown>>): boolean {
+  if (!isPlainRecord(args)) return true
+  for (const flag of MUTATING_ARG_BOOLEAN_FLAGS) {
+    if (args[flag] === true) return true
+  }
+  if (typeof args.method === 'string') {
+    if (!SAFE_READ_ONLY_HTTP_METHODS.has(args.method.toUpperCase())) return true
+  }
+  return false
+}
+
+function isAllowedReadOnlyMemoryMcpTool(bareTool: string): boolean {
+  return isAdvisorReadOnlyMcpTool(bareTool) || EXTRA_READ_ONLY_MEMORY_MCP_TOOLS.has(bareTool)
+}
+
+function isNonEmptyUntrimmedFreeString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.trim() === value
+}
+
+function extractSingleKeyValue(
+  args: Readonly<Record<string, unknown>>,
+  keys: readonly string[],
+): { readonly ok: true; readonly value: unknown } | { readonly ok: false } {
+  const present = keys.filter((k) => k in args)
+  if (present.length !== 1) return { ok: false }
+  return { ok: true, value: args[present[0]!] }
+}
+
+function extractExclusiveRecordField(
+  args: Readonly<Record<string, unknown>>,
+  keyA: string,
+  keyB: string,
+): { readonly ok: true; readonly value: Readonly<Record<string, unknown>> | undefined } | { readonly ok: false } {
+  const valA = args[keyA]
+  const valB = args[keyB]
+  if (valA !== undefined && !isPlainRecord(valA)) return { ok: false }
+  if (valB !== undefined && !isPlainRecord(valB)) return { ok: false }
+  if (valA !== undefined && valB !== undefined) return { ok: false }
+  return { ok: true, value: (valA ?? valB) as Readonly<Record<string, unknown>> | undefined }
+}
+
+function isReadOnlyExecuteExtraTool(
+  args: Readonly<Record<string, unknown>> | undefined,
+  depth: number,
+): boolean {
+  if (!args || !isPlainRecord(args)) return false
+  const toolKey = extractSingleKeyValue(args, ['tool_name', 'toolName'])
+  if (!toolKey.ok || !isNonEmptyUntrimmedFreeString(toolKey.value)) return false
+  const inner = extractExclusiveRecordField(args, 'arguments', 'input')
+  if (!inner.ok) return false
+  return isReadOnlyAllowedCanonicalTool(toolKey.value, inner.value, depth + 1)
+}
+
+function isReadOnlyCallMcpTool(args: Readonly<Record<string, unknown>> | undefined): boolean {
+  if (!args || !isPlainRecord(args)) return false
+  const serverKey = extractSingleKeyValue(args, ['ServerName', 'server_name', 'serverName'])
+  const toolKey = extractSingleKeyValue(args, ['ToolName', 'tool_name', 'toolName'])
+  if (!serverKey.ok || !toolKey.ok || serverKey.value !== 'openclaude-memory') return false
+  if (!isNonEmptyUntrimmedFreeString(toolKey.value) || !isAllowedReadOnlyMemoryMcpTool(toolKey.value)) {
+    return false
+  }
+  const inner = extractExclusiveRecordField(args, 'Arguments', 'arguments')
+  if (!inner.ok) return false
+  return inner.value === undefined || !hasMutatingReadOnlyArgs(inner.value)
+}
+
+function isPrefixedReadOnlyMemoryTool(canonicalName: string): boolean {
+  for (const prefix of READ_ONLY_MEMORY_MCP_PREFIXES) {
+    if (canonicalName.startsWith(prefix)) {
+      if (isAllowedReadOnlyMemoryMcpTool(canonicalName.slice(prefix.length))) return true
+    }
+  }
+  return false
+}
+
 /**
  * Unified cross-pool read-only canonical tool predicate.
  * Fails closed for any unknown tool or mutating argument flag.
@@ -420,26 +516,25 @@ export function validateToolCallEnvelope(
 export function isReadOnlyAllowedCanonicalTool(
   canonicalName: string,
   args?: Readonly<Record<string, unknown>>,
+  depth = 0,
 ): boolean {
-  if (typeof canonicalName !== 'string' || canonicalName.trim() !== canonicalName) return false
-  if (canonicalName.length === 0 || canonicalName.length > 128) return false
+  if (depth > 2 || !isNonEmptyUntrimmedFreeString(canonicalName) || canonicalName.length > 128) {
+    return false
+  }
+  if (args !== undefined && hasMutatingReadOnlyArgs(args)) return false
 
   const normalized = canonicalName.toLowerCase()
-  const isKnownReadOnly =
-    CANONICAL_READ_ONLY_TOOLS.has(normalized) || isAdvisorReadOnlyMcpTool(canonicalName)
-  if (!isKnownReadOnly) return false
-
-  if (args !== undefined) {
-    if (!isPlainRecord(args)) return false
-    for (const flag of MUTATING_ARG_BOOLEAN_FLAGS) {
-      if (args[flag] === true) return false
-    }
-    if (typeof args.method === 'string') {
-      if (!SAFE_READ_ONLY_HTTP_METHODS.has(args.method.toUpperCase())) return false
-    }
+  if (normalized === 'executeextratool' || normalized === 'execute_extra_tool') {
+    return isReadOnlyExecuteExtraTool(args, depth)
   }
-
-  return true
+  if (normalized === 'call_mcp_tool') {
+    return isReadOnlyCallMcpTool(args)
+  }
+  return (
+    CANONICAL_READ_ONLY_TOOLS.has(normalized) ||
+    isAdvisorReadOnlyMcpTool(canonicalName) ||
+    isPrefixedReadOnlyMemoryTool(canonicalName)
+  )
 }
 
 export function validateExecutionPolicyEnvelope(raw: unknown): ExecutionPolicyEnvelope {

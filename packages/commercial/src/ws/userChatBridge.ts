@@ -513,25 +513,9 @@ export function parsePromptQueueDispatchActivated(value: unknown): PromptQueueDi
   return request === null ? null : value as unknown as PromptQueueDispatchActivated;
 }
 
-function samePromptQueueDispatch(
-  control: PromptQueueDispatchCancel | PromptQueueDispatchActivated,
-  request: PromptQueueDispatchRequest,
-): boolean {
-  return control.grantId === request.grantId &&
-    control.owner.sessionKey === request.owner.sessionKey &&
-    control.owner.clientSessionId === request.owner.clientSessionId &&
-    control.owner.agentId === request.owner.agentId &&
-    control.owner.peer.id === request.owner.peer.id &&
-    control.owner.peer.kind === request.owner.peer.kind &&
-    control.itemId === request.item.itemId &&
-    control.contentHash === request.item.contentHash &&
-    control.epoch === request.claim.epoch &&
-    control.claimToken === request.claim.claimToken;
-}
-
-
-
-/** 单方向 buffer 上限。超出 = 慢消费者 / 死循环 → close。 */
+function samePromptQueueDispatch(control: PromptQueueDispatchCancel | PromptQueueDispatchActivated, request: PromptQueueDispatchRequest): boolean {
+  return control.grantId === request.grantId && control.owner.sessionKey === request.owner.sessionKey && control.owner.clientSessionId === request.owner.clientSessionId && control.owner.agentId === request.owner.agentId && control.owner.peer.id === request.owner.peer.id && control.owner.peer.kind === request.owner.peer.kind && control.itemId === request.item.itemId && control.contentHash === request.item.contentHash && control.epoch === request.claim.epoch && control.claimToken === request.claim.claimToken;
+}/** 单方向 buffer 上限。超出 = 慢消费者 / 死循环 → close。 */
 const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 /** 连接到容器的超时 ms。容器 WS 同机回环,1s 都嫌长。 */
@@ -835,6 +819,7 @@ export interface UserChatBridgeDeps {
   resolveLogicalModelPoolTarget?: (args: { rawModelId: string; catalogSnapshot: Pick<ModelCatalogSnapshot, "resolve">; isModelAllowed?: (canonicalModel: string) => boolean; uid?: number; sessionKey?: string | null }) => Promise<{ ok: true; canonicalModelId: string } | { ok: false; code: string }>;
   /** Composition supplies the verified selfhost default; explicit env 0 rolls back. */
   containerLinkEnabled?: boolean;
+  containerLinkToolBrokerEnabled?: boolean;
   containerLinkHeartbeatMs?: number;
   resolveContainerLinkEndpoint?: (uid: bigint, containerId: number) => Promise<Awaited<ReturnType<ResolveContainerEndpoint>> | "pending" | null>;
   containerLinkRecovery?: { channel?: string; retryMs?: number; spacingMs?: number; maxAttempts?: number };
@@ -1492,6 +1477,7 @@ export interface UserChatBridgeHandler {
   readonly containerLinkEnabled?: boolean;
   containerLinkSnapshots?(): ContainerLinkSnapshot[];
   rebuildContainerLinks?(): Promise<void>;
+  createBrokerFrameLinkOpener?(): ReturnType<ContainerLinkRegistry["createBrokerFrameLinkOpener"]> | null;
   /** Dual-master lifecycle: activate/deactivate background ContainerLink recovery & durable control/recovery polling; resolves only after prior epoch drains. */
   setBackgroundRoleActive?(active: boolean): Promise<void>;
   /** Alias for setBackgroundRoleActive. */
@@ -1849,6 +1835,10 @@ export class _OutboundPersistQueueCoordinator {
   }
 }
 
+function resolveContainerLinkBrokerRuntimeChannel(deps: UserChatBridgeDeps): string | undefined {
+  return deps.containerLinkToolBrokerEnabled ? "v5" : deps.containerLinkRecovery?.channel;
+}
+
 // ---------- 主入口 ----------------------------------------------------------
 
 export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHandler {
@@ -2057,10 +2047,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const uidToContainerWs = new Map<string, Set<WebSocket>>();
   const links = deps.pgPool && (deps.containerLinkEnabled ?? containerLinkEnabled())
     ? new ContainerLinkRegistry(deps.pgPool, log, {
-        heartbeatMs: deps.containerLinkHeartbeatMs,
-        maxBufferedBytes,
-        dialTimeoutMs: connectTimeoutMs,
-        admittedRenewMaxAgeMs,
+        heartbeatMs: deps.containerLinkHeartbeatMs, maxBufferedBytes, dialTimeoutMs: connectTimeoutMs, admittedRenewMaxAgeMs,
+        toolBrokerEnabled: deps.containerLinkToolBrokerEnabled, runtimeChannel: resolveContainerLinkBrokerRuntimeChannel(deps),
       })
     : null;
   if (links) {
@@ -10647,6 +10635,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     containerLinkEnabled: links !== null,
     containerLinkSnapshots: () => links?.snapshots() ?? [],
     rebuildContainerLinks: async () => { await Promise.all([recovery?.start(), controls?.scan()]); },
+    createBrokerFrameLinkOpener: () => (links?.toolBrokerEnabled ? links.createBrokerFrameLinkOpener() : null),
     setBackgroundRoleActive,
     setActiveLeader: setBackgroundRoleActive,
     drainBrowserWebSockets: () => registry.closeAll("server_restart"),

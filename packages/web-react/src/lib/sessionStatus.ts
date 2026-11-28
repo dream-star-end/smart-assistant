@@ -201,11 +201,15 @@ export {
   syncTicketApprovalFromTicket,
 };
 
-const OPTIONS_FENCE_RE = /(?:^`{3,}|^~{3,}|\n\s*`{3,}|\n\s*~{3,})\s*options\b/i;
+import { hasUnansweredOptionsFence } from "./optionsBlock";
+export { hasUnansweredOptionsFence };
 
-export function hasUnansweredOptionsFence(text: string | undefined | null): boolean {
-  if (typeof text !== "string" || !text) return false;
-  return OPTIONS_FENCE_RE.test(text);
+export function deriveSessionNeedsYouFromPreview(
+  meta: { lastMessagePreview?: string | null; lastOutcome?: string | null; lastErrorCode?: string | null } | undefined,
+): SessionNeedsYouKind | null {
+  if (!meta?.lastMessagePreview || meta.lastErrorCode) return null;
+  if (meta.lastOutcome && meta.lastOutcome !== "completed") return null;
+  return hasUnansweredOptionsFence(meta.lastMessagePreview, { allowTruncated: true }) ? "answer" : null;
 }
 
 function asRecord(v: unknown): Record<string, unknown> | null {
@@ -223,6 +227,76 @@ function asRecord(v: unknown): Record<string, unknown> | null {
   return typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
 }
 
+function extractTextPartsRecord(parts: readonly unknown[], allowStringPart: boolean): Record<string, unknown> | null {
+  const texts: string[] = [];
+  for (const part of parts) {
+    if (allowStringPart && typeof part === "string" && part) {
+      texts.push(part);
+      continue;
+    }
+    const p = asRecord(part);
+    if (p && typeof p.text === "string" && p.text) texts.push(p.text);
+  }
+  return texts.length > 0 ? asRecord(texts.join("\n")) : null;
+}
+
+const FAILED_TOOL_STATUSES = new Set(["failed", "error", "cancelled", "canceled"]);
+
+function unwrapCodexToolCallOutput(outer: Record<string, unknown>): Record<string, unknown> | null {
+  const status = typeof outer.status === "string" ? outer.status.toLowerCase() : "";
+  if (FAILED_TOOL_STATUSES.has(status) || outer.error != null) {
+    return { ok: false, error: outer.error ?? status };
+  }
+  if (typeof outer.result === "string") return asRecord(outer.result);
+  const resultRec = asRecord(outer.result);
+  if (!resultRec) return null;
+  if (Array.isArray(resultRec.content)) {
+    const parsed = extractTextPartsRecord(resultRec.content, false);
+    if (parsed) return parsed;
+  }
+  return resultRec.structuredContent !== undefined ? asRecord(resultRec.structuredContent) : null;
+}
+
+function unwrapToolOutputRecord(rawOutput: unknown): Record<string, unknown> | null {
+  const outer = asRecord(rawOutput);
+  if (!outer) return null;
+  if (typeof outer.type === "string" && /ToolCall$/i.test(outer.type)) {
+    return unwrapCodexToolCallOutput(outer);
+  }
+  if ("result" in outer && (Array.isArray(outer.result) || typeof outer.tool_name === "string")) {
+    if (Array.isArray(outer.result)) return extractTextPartsRecord(outer.result, true);
+    if (typeof outer.result === "string") return asRecord(outer.result);
+  }
+  return outer;
+}
+
+function firstTrimmedString(rec: Record<string, unknown>, keys: readonly string[]): string {
+  for (const k of keys) {
+    const v = rec[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
+function firstDefinedValue(rec: Record<string, unknown>, keys: readonly string[]): unknown {
+  for (const k of keys) {
+    if (rec[k] !== undefined) return rec[k];
+  }
+  return undefined;
+}
+
+const WRAPPER_TOOL_RE =
+  /(?:^|__|:|-)(?:use_tool|call_mcp_tool|ExecuteExtraTool|mcpToolCall|mcp_tool_call|dynamicToolCall|dynamic_tool_call)$/i;
+const INNER_TOOL_NAME_KEYS = ["tool_name", "toolName", "ToolName", "name", "tool"] as const;
+const INNER_TOOL_ARG_KEYS = ["tool_input", "toolInput", "arguments", "Arguments", "args", "params", "input"] as const;
+const SERVER_NAME_KEYS = ["server", "server_name", "serverName", "serverIdentifier", "ServerName"] as const;
+
+function resolveWrappedArgs(outer: Record<string, unknown>, innerRaw: unknown): Record<string, unknown> | null {
+  if (innerRaw !== undefined) return asRecord(innerRaw);
+  if (typeof outer.type === "string" && /ToolCall$/i.test(outer.type)) return null;
+  return outer;
+}
+
 export function unwrapToolNameAndInput(m: {
   toolName?: string;
   inputJson?: unknown;
@@ -232,59 +306,36 @@ export function unwrapToolNameAndInput(m: {
   const rawName = typeof m.toolName === "string" ? m.toolName.trim() : "";
   const outer = asRecord(m.inputJson ?? m.toolInput ?? m.input);
   if (!outer) return { name: rawName, input: null };
-  const innerRaw =
-    outer.tool_input ??
-    outer.toolInput ??
-    outer.arguments ??
-    outer.Arguments ??
-    outer.params ??
-    outer.input;
-  const innerArgs = asRecord(innerRaw) ?? outer;
-  const innerTool =
-    (typeof outer.tool_name === "string" && outer.tool_name.trim()) ||
-    (typeof outer.toolName === "string" && outer.toolName.trim()) ||
-    (typeof outer.ToolName === "string" && outer.ToolName.trim()) ||
-    (typeof outer.name === "string" && outer.name.trim()) ||
-    (typeof outer.tool === "string" && outer.tool.trim()) ||
-    "";
-  const isWrapper =
-    !rawName ||
-    /(?:^|__|:|-)(?:use_tool|call_mcp_tool|ExecuteExtraTool|mcpToolCall|mcp_tool_call)$/i.test(
-      rawName,
-    );
+  const innerTool = firstTrimmedString(outer, INNER_TOOL_NAME_KEYS);
+  const isWrapper = !rawName || WRAPPER_TOOL_RE.test(rawName);
   if (innerTool && (isWrapper || innerTool.includes("__") || innerTool.startsWith("mcp__"))) {
-    const server =
-      (typeof outer.server === "string" && outer.server.trim()) ||
-      (typeof outer.server_name === "string" && outer.server_name.trim()) ||
-      (typeof outer.serverName === "string" && outer.serverName.trim()) ||
-      (typeof outer.serverIdentifier === "string" && outer.serverIdentifier.trim()) ||
-      (typeof outer.ServerName === "string" && outer.ServerName.trim()) ||
-      "";
+    const innerRaw = firstDefinedValue(outer, INNER_TOOL_ARG_KEYS);
+    const server = firstTrimmedString(outer, SERVER_NAME_KEYS);
     const resolvedName =
       server && !innerTool.includes("__") ? `mcp__${server}__${innerTool}` : innerTool;
-    return { name: resolvedName, input: innerArgs };
+    return { name: resolvedName, input: resolveWrappedArgs(outer, innerRaw) };
   }
   return { name: rawName, input: outer };
 }
 
 type NeedsYouCandidateMessage = TerminalCandidateMessage & {
-    toolName?: string;
-    inputJson?: unknown;
-    toolInput?: unknown;
-    input?: unknown;
-    output?: unknown;
-    error?: boolean;
-    cancelled?: boolean;
-    role?: string;
-    text?: string;
-    _resolved?: boolean;
-    _controlPending?: boolean;
-    _askUserExpiresAt?: number;
-    _hideUnpublishedFallback?: boolean;
-    _isAutoRetry?: boolean;
-    _automaticRecovery?: boolean;
-    _continuationOfClientMessageId?: string;
-  };
+  toolName?: string;
+  inputJson?: unknown;
+  toolInput?: unknown;
+  input?: unknown;
+  output?: unknown;
+  error?: boolean;
+  cancelled?: boolean;
+  role?: string;
+  text?: string;
+  _resolved?: boolean;
+  _controlPending?: boolean;
+  _askUserExpiresAt?: number;
+  _hideUnpublishedFallback?: boolean;
+  _isAutoRetry?: boolean;
+  _automaticRecovery?: boolean;
+  _continuationOfClientMessageId?: string;
+};
 
 function isUnresolvedPermissionRow(msg: NeedsYouCandidateMessage, now: number): boolean {
   if (msg.role !== "permission") return false;
@@ -297,6 +348,59 @@ function isUnresolvedPermissionRow(msg: NeedsYouCandidateMessage, now: number): 
     return false;
   }
   return true;
+}
+
+function classifyToolNeedsYou(
+  m: NeedsYouCandidateMessage,
+  sendingInFlight?: boolean,
+): SessionNeedsYouKind | "resolved" | null {
+  if (m.error || m.cancelled) return null;
+  if (typeof m.output === "string" && /^error:/i.test(m.output.trim())) return null;
+  const { name, input } = unwrapToolNameAndInput(m);
+  if (/(?:^|__|:)present_task_approval$/i.test(name)) {
+    const outputObj = unwrapToolOutputRecord(m.output);
+    if (outputObj?.ok === false || outputObj?.error) return null;
+    const candidates = [
+      input?.id,
+      input?.identifier,
+      input?.ticketId,
+      input?.ticket_id,
+      outputObj?.id,
+      outputObj?.identifier,
+      outputObj?.ticketId,
+    ]
+      .map((v) => (typeof v === "string" ? v.trim() : ""))
+      .filter((v) => v.length > 0);
+    if (candidates.length === 0 || candidates.some((c) => isTicketApprovalKnownResolved(c))) {
+      return "resolved";
+    }
+    return "approval";
+  }
+  if (
+    name !== "AskUserQuestion" &&
+    name !== "ExitPlanMode" &&
+    /present_options|ask_user|request_user_input/i.test(name) &&
+    !sendingInFlight
+  ) {
+    return "answer";
+  }
+  return null;
+}
+
+function findLastRealUserIndex(messages: ReadonlyArray<NeedsYouCandidateMessage>): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m._turnStatusRecord) continue;
+    if (
+      m.role === "user" &&
+      !m._isAutoRetry &&
+      !m._automaticRecovery &&
+      !m._continuationOfClientMessageId
+    ) {
+      return i;
+    }
+  }
+  return -1;
 }
 
 /**
@@ -319,44 +423,23 @@ export function deriveSessionNeedsYou(
 ): SessionNeedsYouKind | null {
   if (!session) return null;
   const messages = session.messages ?? [];
-  let lastUserIdx = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (!m || m._turnStatusRecord) continue;
-    if (
-      m.role === "user" &&
-      !m._isAutoRetry &&
-      !m._automaticRecovery &&
-      !m._continuationOfClientMessageId
-    ) {
-      lastUserIdx = i;
-      break;
-    }
-  }
+  const lastUserIdx = findLastRealUserIndex(messages);
   const turnMsgs = lastUserIdx >= 0 ? messages.slice(lastUserIdx + 1) : messages;
 
   for (let i = turnMsgs.length - 1; i >= 0; i--) {
     const m = turnMsgs[i];
     if (!m || !isUnresolvedPermissionRow(m, now)) continue;
     const tName = m.toolName ?? "";
-    if (tName === "AskUserQuestion" || /ask_user|request_user_input|present_options/i.test(tName)) {
-      return "answer";
-    }
-    return "approval";
+    return tName === "AskUserQuestion" || /ask_user|request_user_input|present_options/i.test(tName)
+      ? "answer"
+      : "approval";
   }
 
-  if (session._turnStatus === "waiting_for_user") {
-    return "answer";
-  }
-
+  if (session._turnStatus === "waiting_for_user") return "answer";
   if (turnMsgs.length === 0) return null;
 
   const terminal = deriveLiveTerminalFromMessages(turnMsgs);
-  if (
-    terminal &&
-    (terminal.lastErrorCode ||
-      (terminal.lastOutcome && terminal.lastOutcome !== "completed"))
-  ) {
+  if (terminal && (terminal.lastErrorCode || (terminal.lastOutcome && terminal.lastOutcome !== "completed"))) {
     return null;
   }
 
@@ -364,44 +447,11 @@ export function deriveSessionNeedsYou(
     const m = turnMsgs[i];
     if (!m || m._turnStatusRecord) continue;
     if (m.role === "tool") {
-      if (m.error || m.cancelled) continue;
-      if (typeof m.output === "string" && /^error:/i.test(m.output.trim())) continue;
-      const { name, input } = unwrapToolNameAndInput(m);
-      const outputObj = typeof m.output === "string" ? asRecord(m.output) : asRecord(m.output);
-      const isTaskApproval =
-        /present_task_approval/i.test(name) ||
-        outputObj?.kind === "task_approval" ||
-        (typeof m.output === "string" && m.output.includes('"kind":"task_approval"'));
-      if (isTaskApproval) {
-        const candidates = [
-          input?.id,
-          input?.identifier,
-          input?.ticketId,
-          input?.ticket_id,
-          outputObj?.id,
-          outputObj?.identifier,
-          outputObj?.ticketId,
-        ].filter((v): v is string => typeof v === "string" && v.trim().length > 0);
-        if (candidates.length > 0 && candidates.some((c) => isTicketApprovalKnownResolved(c))) {
-          continue;
-        }
-        return "approval";
-      }
-      if (
-        name !== "AskUserQuestion" &&
-        name !== "ExitPlanMode" &&
-        /present_options|ask_user|request_user_input/i.test(name) &&
-        !session._sendingInFlight
-      ) {
-        return "answer";
-      }
+      const hit = classifyToolNeedsYou(m, session._sendingInFlight);
+      if (hit === "approval" || hit === "answer") return hit;
+      continue;
     }
-    if (
-      m.role === "assistant" &&
-      !m._hideUnpublishedFallback &&
-      !m._errorCode &&
-      hasUnansweredOptionsFence(m.text)
-    ) {
+    if (m.role === "assistant" && !m._hideUnpublishedFallback && !m._errorCode && hasUnansweredOptionsFence(m.text)) {
       return "answer";
     }
   }

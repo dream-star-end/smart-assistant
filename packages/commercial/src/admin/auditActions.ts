@@ -167,6 +167,13 @@ export const ADMIN_AUDIT_ACTIONS = {
   "connector_platform_oauth.put": { kind: "write", mode: "tx" },
   "connector_platform_oauth.delete": { kind: "write", mode: "tx" },
 
+  // ── 个人版自托管视觉治理控制面(OCV5-914)───────────────────────────
+  "governance.mode": { kind: "write", mode: "best-effort" },
+  "governance.breaker.unlock": { kind: "write", mode: "best-effort" },
+  "governance.approval.approve": { kind: "write", mode: "best-effort" },
+  "governance.approval.reject": { kind: "write", mode: "best-effort" },
+  "governance.approval.resume": { kind: "write", mode: "best-effort" },
+
   // ── 敏感读取────────────────────────────────────────────────────────
   // sessions.read 有意 fail-closed(直接 await writeAdminAudit,失败 → 500):
   // 看用户会话内容是最重的隐私读取,留痕失败就不放行。

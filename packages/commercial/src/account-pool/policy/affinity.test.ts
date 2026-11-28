@@ -171,7 +171,7 @@ describe("per-member rate and in-flight caps", () => {
     acquireInflight("antigravity", "A", "x2", t0);
     for (let i = 0; i < 2; i++) noteAdmission("antigravity", "B", t0);
     // A is at inflight cap (2/2), B is at rate cap (2/min)
-    assert.equal(reserveInflight("antigravity", ["A", "B"], "strict-1", 2, t0 + 1, 2, true), null);
+    assert.equal(reserveInflight("antigravity", ["A", "B"], "strict-1", 2, t0 + 1, 2, "strict"), null);
     assert.equal(inflightCount("antigravity", "A", t0 + 1), 2, "must not oversubscribe A");
     assert.equal(inflightCount("antigravity", "B", t0 + 1), 0, "must not acquire rate-capped B");
     // Default (strictCapacity=false) retains soft spillover for foreground traffic
@@ -181,7 +181,7 @@ describe("per-member rate and in-flight caps", () => {
 
   it("OCV5-897 B3: renewInflight keeps active long-running delegates occupying slots past 15m TTL, while unrenewed lost slots reclaim automatically", () => {
     const t0 = NOW.getTime();
-    assert.equal(reserveInflight("antigravity", ["A"], "long-1", 1, t0, 10, true), "A");
+    assert.equal(reserveInflight("antigravity", ["A"], "long-1", 1, t0, 10, "strict"), "A");
     assert.equal(inflightCount("antigravity", "A", t0), 1);
     // Heartbeat at 10m slides expiry to t0 + 25m
     const t10m = t0 + 10 * 60_000;
@@ -189,12 +189,12 @@ describe("per-member rate and in-flight caps", () => {
     // At 16m (past original 15m INFLIGHT_TTL_MS), renewed delegate still occupies A -> strictCapacity refuses new delegate
     const t16m = t0 + INFLIGHT_TTL_MS + 60_000;
     assert.equal(inflightCount("antigravity", "A", t16m), 1);
-    assert.equal(reserveInflight("antigravity", ["A"], "new-2", 1, t16m, 10, true), null);
+    assert.equal(reserveInflight("antigravity", ["A"], "new-2", 1, t16m, 10, "strict"), null);
     // Stop renewing: after t10m + 15m + 1ms, slot auto-reclaims and renewInflight returns false
     const tExpired = t10m + INFLIGHT_TTL_MS + 1;
     assert.equal(renewInflight("long-1", tExpired), false);
     assert.equal(inflightCount("antigravity", "A", tExpired), 0);
-    assert.equal(reserveInflight("antigravity", ["A"], "new-3", 1, tExpired, 10, true), "A");
+    assert.equal(reserveInflight("antigravity", ["A"], "new-3", 1, tExpired, 10, "strict"), "A");
   });
 
   it("settings come from the admin loader, cached; a failed read keeps the last/default values", async () => {

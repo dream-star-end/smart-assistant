@@ -1,26 +1,40 @@
 {
   "schemaVersion": 1,
-  "note": "Authoritative A0 / A1 monotonic guardrail separation policy (OCV5-904). A0 paths/rules represent the true meta-layer requiring human CODEOWNERS review or a host root-signed A0 approval receipt. A1 surfaces are mechanically verified as monotonic tighten-only or validated declarative pins and auto-pass without human bottleneck.",
+  "note": "Authoritative A0 / A1 monotonic guardrail separation policy (OCV5-904 / OCV5-919). A0 paths/rules represent the true meta-layer requiring human CODEOWNERS review or a host root-signed A0 approval receipt; riskCategory separates plain-language approval card taxonomy (ux_degradation vs billing_change) from underlying A0 protection scope. A1 surfaces are mechanically verified as monotonic tighten-only, validated declarative pins, or strictly verified billing exemptions (pure tests, 4 read-only/post-settlement audit helpers in billingNonCoreAllowlist, or AST-proven zero-runtime-diff TS edits) and auto-pass without human bottleneck.",
   "approvalDefaults": {
     "hostApprovalDir": "/opt/openclaude/harness-gate/control/a0-approvals",
     "envApprovalDir": "OC_A0_APPROVAL_DIR",
     "receiptSchemaVersion": 1
   },
+  "billingNonCoreAllowlist": [
+    "packages/commercial/src/billing/apiKeyMessageAudit.ts",
+    "packages/commercial/src/billing/apiKeyUsageReport.ts",
+    "packages/commercial/src/billing/ledgerRowContext.ts",
+    "packages/commercial/src/billing/usageReport.ts"
+  ],
   "a0Categories": [
     {
       "id": "a0-meta-referee",
+      "riskCategory": "ux_degradation",
       "description": "A0/A1 referee itself, its semantic rule library, protected-path manifest, and CODEOWNERS",
       "paths": [
         "scripts/check-a0-monotonic.ts",
         "scripts/lib/a0MonotonicRules.ts",
         "scripts/lib/a0ApprovalReceipt.ts",
+        "scripts/lib/a0RangeCarryOver.ts",
+        "scripts/lib/gitRangeInspect.ts",
+        "scripts/lib/globMatch.ts",
+        "scripts/lib/githubApprovalParsers.ts",
         "scripts/lib/githubTrustedApproval.ts",
+        "scripts/lib/githubMergedPrEquivalence.ts",
+        "scripts/lib/commitRangeCarryOver.ts",
         "arch/a0-protected-paths.json",
         ".github/CODEOWNERS"
       ]
     },
     {
       "id": "monotonic-baseline-checkers",
+      "riskCategory": "ux_degradation",
       "description": "Core monotonic ratchet, architecture, parity, steward, and debt-TTL gate checkers and their helper libraries",
       "paths": [
         "scripts/check-monotonic-baselines.ts",
@@ -31,6 +45,7 @@
         "scripts/lib/archMapUpgrades.ts",
         "scripts/check-release-gate-parity.ts",
         "scripts/check-cross-family-audit.ts",
+        "scripts/arch-steward-review.sh",
         "scripts/lib/archStewardContract.ts",
         "scripts/lib/archStewardGitDiff.ts",
         "scripts/lib/archStewardReceipt.ts",
@@ -47,17 +62,25 @@
     },
     {
       "id": "incident-ledger-freeze-anchors",
-      "description": "Incident ledger append-only freeze anchors, tombstones, approvers, and superset gate",
+      "riskCategory": "ux_degradation",
+      "description": "Incident ledger append-only freeze anchors, tombstones, approvers, superset gate, and user-facing UX/budget/layout/context guard executors",
       "paths": [
         "e2e/session-display/incident-ledger-baseline.json",
         "e2e/session-display/incident-ledger-baseline.sha256",
         "e2e/session-display/incident-tombstones.json",
         "e2e/session-display/incident-tombstone-approvers.json",
-        "scripts/check-incident-ledger-superset.ts"
+        "scripts/check-incident-ledger-superset.ts",
+        "scripts/check-ui-hard-gates.ts",
+        "scripts/check-context-static.ts",
+        "packages/web-react/vite.config.ts",
+        "packages/web-react/src/test/designTokens.test.ts",
+        "packages/web-react/browser-tests/layout-invariants.mjs",
+        "packages/web-react/browser-tests/vlm-rubric/**"
       ]
     },
     {
       "id": "ci-workflows-and-gate-manifests",
+      "riskCategory": "ux_degradation",
       "description": "CI workflow definitions, gate runner scripts, release-gate parity manifest, and linter config",
       "paths": [
         ".github/workflows/**",
@@ -68,6 +91,7 @@
     },
     {
       "id": "host-control-plane-and-deploy",
+      "riskCategory": "ux_degradation",
       "description": "Host physical governor/referee scripts, selfhost deploy orchestrator, lease worker, debounce, release policy, and migration gates",
       "paths": [
         "scripts/harness-gate/**",
@@ -84,19 +108,17 @@
     },
     {
       "id": "billing-accounting-core",
-      "description": "Core credit ledger, pricing authority, spend/refund/preCheck billing invariants",
+      "riskCategory": "billing_change",
+      "description": "Default-protected billing, pricing, tier multiplier, model authorization, waiver, settlement, credit ledger, and payment modules (excluding strictly read-only/post-settlement audit helpers in billingNonCoreAllowlist, pure tests, and AST-proven zero-runtime-diff TS edits)",
       "paths": [
-        "packages/commercial/src/billing/ledger.ts",
-        "packages/commercial/src/billing/pricing.ts",
-        "packages/commercial/src/billing/persistedBillingPricing.ts",
-        "packages/commercial/src/billing/calculator.ts",
-        "packages/commercial/src/billing/spend.ts",
-        "packages/commercial/src/billing/refund.ts",
-        "packages/commercial/src/billing/preCheck.ts"
+        "packages/commercial/src/billing/**",
+        "packages/commercial/src/payment/**",
+        "packages/protocol/src/serviceTiers.ts"
       ]
     },
     {
       "id": "permission-and-contract-core",
+      "riskCategory": "ux_degradation",
       "description": "Runtime action permission policy, advisor read-only lock, REST contracts, and flavor rules",
       "paths": [
         "packages/gateway/src/actionPolicyEngine.ts",
@@ -108,6 +130,7 @@
     },
     {
       "id": "exemptions-and-known-failures",
+      "riskCategory": "ux_degradation",
       "description": "Known-failure allowlists, integration tier manifests, and exemption additions/renewals",
       "paths": [
         ".github/known-failures/**",
@@ -116,6 +139,7 @@
     },
     {
       "id": "release-announcements",
+      "riskCategory": "ux_degradation",
       "description": "Human-authored user-facing release announcements",
       "paths": [
         "changelog.json"
@@ -123,6 +147,7 @@
     },
     {
       "id": "existing-gate-deletion-or-modification",
+      "riskCategory": "ux_degradation",
       "description": "Deleting or modifying any pre-existing gate script (adding brand-new check-*.ts is A1)",
       "gateGlobs": [
         "scripts/check-*.ts",

@@ -1337,7 +1337,7 @@ export class RemotePoolRelay {
           'REMOTE_EFFORT_NOT_SUPPORTED',
         )
       }
-      let validatedServiceTier: 'standard' | 'fast' | 'ultrafast' | undefined
+      const tierPatch: { serviceTier?: 'standard' | 'fast' | 'ultrafast' } = {}
       if (cmd.serviceTier !== undefined) {
         remotePoolNeed(
           cmd.serviceTier === 'standard' ||
@@ -1345,7 +1345,7 @@ export class RemotePoolRelay {
             cmd.serviceTier === 'ultrafast',
           'REMOTE_SERVICE_TIER_INVALID',
         )
-        validatedServiceTier = cmd.serviceTier
+        tierPatch.serviceTier = cmd.serviceTier
       }
       const validatedContent =
         cmd.content !== undefined ? validateRemoteTurnContentBlocks(cmd.content) : undefined
@@ -1364,7 +1364,7 @@ export class RemotePoolRelay {
         prompt: cmd.prompt,
         nativeSessionId: this.nativeSessionId,
         ...(typeof cmd.effort === 'string' ? { effort: cmd.effort } : {}),
-        ...(validatedServiceTier !== undefined ? { serviceTier: validatedServiceTier } : {}),
+        ...tierPatch,
         ...(validatedContent !== undefined ? { content: validatedContent } : {}),
         ...(typeof cmd.instructions === 'string' ? { instructions: cmd.instructions } : {}),
       }
@@ -1372,10 +1372,7 @@ export class RemotePoolRelay {
       this.dispatching = true
       this.newTurnAcked = false
       this.activeNativeTurnId = undefined
-      await this.financeTurn!.beforeDispatch({
-        sequence: ++this.dispatchSeq,
-        inputSha256: remoteCanonicalSha256(typedCmd),
-      })
+      await this.financeTurn!.beforeDispatch({ sequence: ++this.dispatchSeq, inputSha256: remoteCanonicalSha256(typedCmd), ...tierPatch })
       await this.dispatchCommand(typedCmd, { publishReplies: true, waitReply: false })
       this.dispatchedTurnsCount += 1
       return { dispatched: true }

@@ -163,6 +163,8 @@ export const SKILL_LOCAL_RELAY_PREFIX = '/internal/v3/skill-local'
 export const PROJECT_SEARCH_LOCAL_PATH = '/internal/v3/project-search-local'
 /** Remote Antigravity Swarm MCP tools → this container's gateway (loopback + gateway token). */
 export const REMOTE_SWARM_LOCAL_PREFIX = '/internal/v3/remote-swarm'
+/** OCV5-915 P3-2: Loopback-only ToolBroker endpoints (invoke / hook-evaluate / mcp-execute / spill-read). */
+export const TOOL_BROKER_LOCAL_PREFIX = '/internal/v3/tool-broker'
 
 export type InternalRoutePlane = 'v3' | 'v5'
 export type InternalRouteMatch = 'exact' | 'prefix'
@@ -688,6 +690,16 @@ export const INTERNAL_ROUTES = [
     match: 'prefix',
     plane: 'v3',
     sources: ['gateway/src/remoteSwarmRuntime.ts', 'mcp-memory/src/remoteSwarmMcp.ts'],
+  },
+  {
+    path: TOOL_BROKER_LOCAL_PREFIX,
+    match: 'prefix',
+    plane: 'v3',
+    sources: [
+      'gateway/src/routes/toolBrokerLocalRoute.ts',
+      'gateway/src/engine/antigravityBrokerHook.ts',
+      'mcp-memory/src/toolBrokerClient.ts',
+    ],
   },
   {
     path: DELEGATE_REMOTE_LANE_ENSURE_PATH,

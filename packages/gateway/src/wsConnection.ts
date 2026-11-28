@@ -29,6 +29,7 @@ import {
   isClientMessageId,
   type PromptQueueMutationFrame,
 } from '@openclaude/protocol'
+import { isReservedToolBrokerFrame, isToolBrokerWireFrame } from '@openclaude/protocol/exec-env'
 import { checkLocalBridge } from './localBridgeAuth.js'
 import {
   PROMPT_QUEUE_DISPATCH_RESULT_TYPE,
@@ -72,12 +73,14 @@ import { readUploadUserFailureCode } from './uploadTotalRejection.js'
 import { _pendingPermissionCatchupFrames } from './pendingPermissionSnapshot.js'
 import { resolveLocalExecutionIfEnforced, localExecutionOverride, makePeerKey, _parseConnectionTraceIdFromUpgrade, _stripPrivateRoutingFields, _turnStatusWireFields, _helloTurnStatusResendPhase, preparedModelSwitchCatchupFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldPushTurnInterruptedFinal, _shouldInterruptUnknownInFlight } from './server.js'
 import type { Gateway } from './server.js'
+import { handlePreStartStop } from './wsStopHandlers.js'
 
 const MODEL_SWITCH_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,127}$/
 
 export interface WsConnectionHost {
   _activeTurnReplaysServed: Gateway['_activeTurnReplaysServed']
   _admittedClientTurns: Gateway['_admittedClientTurns']
+  _admittedClientTurnMeta?: Gateway['_admittedClientTurnMeta']
   _authorityConns: Gateway['_authorityConns']
   _bridgeConnections: Gateway['_bridgeConnections']
   _consumeDispatchAuthority: Gateway['_consumeDispatchAuthority']
@@ -91,6 +94,9 @@ export interface WsConnectionHost {
   _handleSessionRepoUnbind: Gateway['_handleSessionRepoUnbind']
   _interruptDelegationsForParent: Gateway['_interruptDelegationsForParent']
   _interruptRemoteSwarmForSession?: Gateway['_interruptRemoteSwarmForSession']
+  _handleToolBrokerBridgeFrame?: Gateway['_handleToolBrokerBridgeFrame']
+  _detachToolBrokerBridgeSocket?: Gateway['_detachToolBrokerBridgeSocket']
+  _cancelToolBrokerSession?: Gateway['_cancelToolBrokerSession']
   _modelAuthority: Gateway['_modelAuthority']
   _outboundRing: Gateway['_outboundRing']
   _pendingPermissions: Gateway['_pendingPermissions']
@@ -153,12 +159,7 @@ export function handleWsConnection(
     } catch {}
     return
   }
-  // v3 commercial 容器内信任 docker bridge gateway IP 直连。commercial 侧 userChatBridge
-  // 经 docker bridge 网络转发的 ws → /ws 不带 bearer(容器随机生成的 accessToken supervisor
-  // 没回传)。仅当 commercial supervisor 显式注入 OPENCLAUDE_TRUST_BRIDGE_IP=<本机 bridge
-  // 网关 .1>(self host=172.30.0.1,远端 host 由 v3supervisor.gatewayIpFromV3Cidr 按
-  // host.bridge_cidr 算)时生效;个人版 / 任何未配置该 env 的场景下
-  // process.env.OPENCLAUDE_TRUST_BRIDGE_IP 为空,旁路恒为 false,checkHttpAuth 行为完全不变。
+  // Commercial container trusts docker bridge IP only when OPENCLAUDE_TRUST_BRIDGE_IP is set.
   const remoteIp = req.socket.remoteAddress || ''
   const TRUST_BRIDGE_IP = process.env.OPENCLAUDE_TRUST_BRIDGE_IP || ''
   const isFromBridge =
@@ -169,16 +170,7 @@ export function handleWsConnection(
   }
   if (isFromBridge)
     this._bridgeConnections.add(ws)
-    // Stash authenticated userId on the WS so every subsequent broadcast lookup
-    // can scope peerKey by user, preventing cross-account delivery when two
-    // users happen to share the same client-generated peerId (see makePeerKey
-    // helper). Legacy-token auth returns 'default'.
   ;(ws as any)._userId = this.getUserId(req)
-  // V3 S12e CG6 — connection-level trace stash. Read X-Connection-Trace-Id
-  // upgrade header(由 master 在 mTLS WS dial 时写入,CG4),失败 fallback
-  // newTraceId() + warn(不含 raw value 防 log injection)。Stash 到 ws 上
-  // 供 CG7 后续 dispatchInbound stamp 4 类 outbound 使用,以及 ws.connect /
-  // disconnect log 关联。
   const connectionTraceId = _parseConnectionTraceIdFromUpgrade(req.headers, this.log)
   ;(ws as any)._connectionTraceId = connectionTraceId
   wsConnectionsTotal.inc()
@@ -192,20 +184,12 @@ export function handleWsConnection(
   })
 
   this.wsClients.add(ws)
-  ws.once('close', () => this.wsClients.delete(ws))
+  ws.once('close', () => {
+    this.wsClients.delete(ws)
+    this._detachToolBrokerBridgeSocket?.(ws)
+  })
 
-  // ── 模型执行权威 attestation(方案 §7 步 3/4)────────────────────────────
-  // **只对 bridge 连接发**:isFromBridge 是「对端是 master」的唯一权威判据(容器内
-  // 的本地/个人版 WS 客户端拿不到这条旁路)。个人版前端因此永远看不到这帧,零影响。
-  //
-  // 帧内容 = { capabilities, connectionChallenge }:
-  //   - capabilities 含 model_authority_v1 ⟺ 本容器**真的能验签**(有 keyring + 身份 env);
-  //     旧 env 的新镜像容器不会骗到 bridge(见 ModelAuthorityConsumer.enabled)。
-  //   - connectionChallenge 每连接现铸,bridge 必须把它签进 authority payload
-  //     (R4-m4)。连接关闭 / gateway 重启后 challenge 变更 → 旧 envelope 天然失效,
-  //     replay cache 不需要跨进程共享。
-  // 连接一建立就发(先于任何用户帧到达):bridge 侧的 attestation 门在收到本帧前会
-  // 缓冲用户帧,收到即放行 —— 早到帧竞态由缓冲覆盖,不靠时序运气。
+  // Model authority attestation (bridge connections only).
   if (isFromBridge) {
     const authorityConn = this._modelAuthority.newConnection()
     this._authorityConns.set(ws, authorityConn)
@@ -216,10 +200,6 @@ export function handleWsConnection(
         authorityConn,
         Number(process.env.OC_CONTAINER_ID) || null,
       )
-      // RFC-v5-durable-turn-dispatch §3/§B5 — durable-turn-dispatch-v1 runtime capability
-      // 并入 attest 广播(与 model_authority_v1 同一 capabilities 集合;bridge 的 admission
-      // 门据此分流:无此 capability → legacy 路径不建 dispatch 行)。**绑定完整 readiness**:
-      // 验签能力 ∧ sink 装配 ∧ boot recovery 首跑成功,任一不满足 → 不申报(fail-closed)。
       attestFrame.capabilities = [
         ...attestFrame.capabilities,
         CODEX_SPEED_TIERS_CAPABILITY,
@@ -237,7 +217,6 @@ export function handleWsConnection(
     }
   }
 
-  // Phase 4 — ws close 时清 pending bind 队列(WeakMap recentHelloPeers 自动 GC)
   ws.once('close', () => {
     for (const [key, entry] of this._pendingRepoBinds) {
       if (entry.ws === ws) {
@@ -248,13 +227,23 @@ export function handleWsConnection(
   })
   ws.on('message', async (raw) => {
     try {
-      let frame: InboundFrame
+      let parsed: unknown
       try {
-        frame = JSON.parse(raw.toString()) as InboundFrame
+        parsed = JSON.parse(raw.toString())
       } catch {
         ws.send(JSON.stringify(withUserError({ type: 'error', error: 'invalid json' })))
         return
       }
+      if (isReservedToolBrokerFrame(parsed)) {
+        if (!isFromBridge) {
+          const rec = parsed as Record<string, unknown>
+          ws.send(JSON.stringify({ type: 'broker.error', channelId: typeof rec.channelId === 'string' ? rec.channelId : '', requestId: typeof rec.requestId === 'string' ? rec.requestId : '', code: 'BROKER_WS_BRIDGE_ONLY', message: 'ToolBroker WS frames require a trusted bridge connection' }))
+          return
+        }
+        if (isToolBrokerWireFrame(parsed)) this._handleToolBrokerBridgeFrame?.(ws, parsed)
+        return
+      }
+      const frame = parsed as InboundFrame
       const systemHelpBootstrap = takeSystemHelpBootstrap(frame)
       // Client-side application-level ping. Echo a pong (preserving the
       // optional id) so the client's watchdog can distinguish a live socket
@@ -1323,6 +1312,57 @@ async function interruptRemoteSwarmForSession(
   }
 }
 
+function cancelBrokerIfInterrupted(host: WsConnectionHost, sessionKey: string, hit: boolean): void {
+  if (hit) host._cancelToolBrokerSession?.(sessionKey, 'user_stop')
+}
+
+function settlePermissionsIfInterrupted(host: WsConnectionHost, sessionKey: string, hit: boolean): void {
+  if (hit) host._settlePendingPermissionsForStop(sessionKey)
+}
+
+async function handleUnmatchedClientMessageIdStop(
+  host: WsConnectionHost,
+  frame: HandleStopFrame,
+  clientMessageId: string,
+  safePeerId: string,
+  suffix: string,
+): Promise<boolean> {
+  const admittedKey = preStartStopKey(frame.peer.id, clientMessageId)
+  if (host._admittedClientTurns?.has(admittedKey)) {
+    return handlePreStartStop(host, frame, clientMessageId, admittedKey, safePeerId, suffix, {
+      preStartStopKey,
+      isHiddenSystemAgentId,
+      interruptRemoteSwarm: interruptRemoteSwarmForSession,
+    })
+  }
+  host.sessions.fencePreStartStop(
+    frame.peer.id,
+    clientMessageId,
+    PRE_ADMISSION_STOP_TTL_MS,
+    stopControlSendAttempt((frame as { controlId?: unknown }).controlId, clientMessageId),
+  )
+  host.log.info('interrupt', {
+    sessionKey: `*${suffix}`,
+    clientMessageId,
+    ok: false,
+  })
+  return false
+}
+
+async function interruptFallbackPeerSessions(host: WsConnectionHost, suffix: string): Promise<boolean> {
+  let ok = false
+  for (const live of host.sessions.list()) {
+    if (!live.sessionKey.endsWith(suffix)) continue
+    const fallbackSelf = host.sessions.interrupt(live.sessionKey, 'user')
+    cancelBrokerIfInterrupted(host, live.sessionKey, fallbackSelf)
+    const fallbackDelegates = host._interruptDelegationsForParent(live.sessionKey)
+    const fallbackSwarm = await interruptRemoteSwarmForSession(host, live.sessionKey, 'user_stop')
+    settlePermissionsIfInterrupted(host, live.sessionKey, fallbackSelf)
+    ok = fallbackSelf || fallbackDelegates || fallbackSwarm || ok
+  }
+  return ok
+}
+
 export async function handleStop(
   this: WsConnectionHost,
   frame: HandleStopFrame,
@@ -1347,51 +1387,15 @@ export async function handleStop(
       if (!live.sessionKey.endsWith(suffix)) continue
       const selfInterrupted = this.sessions.interruptClientTurn(live.sessionKey, clientMessageId)
       if (!selfInterrupted) continue
+      cancelBrokerIfInterrupted(this, live.sessionKey, true)
       const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
       const swarmInterrupted = await interruptRemoteSwarmForSession(this, live.sessionKey, 'user_stop')
       const ok = selfInterrupted || delegateInterrupted || swarmInterrupted
-      // The turn is gone; any permission it was blocked on must not
-      // outlive it as a dead card (browser) / pending row (master).
       this._settlePendingPermissionsForStop(live.sessionKey, clientMessageId)
-      this.log.info('interrupt', {
-        sessionKey: live.sessionKey,
-        clientMessageId,
-        ok,
-      })
+      this.log.info('interrupt', { sessionKey: live.sessionKey, clientMessageId, ok })
       return ok
     }
-    // OCV5-435: accepted but its engine run does not exist yet (cold start,
-    // lock wait). Bind the Stop to that exact turn instead of answering
-    // TURN_NOT_ACTIVE and letting it run unseen.
-    // B5: Do NOT cascade-interrupt other live sessions sharing the peer suffix;
-    // pre-start turns have not spawned workers and have no ownership over other agents' swarms.
-    if (this._admittedClientTurns?.has(preStartStopKey(frame.peer.id, clientMessageId))) {
-      this.sessions.fencePreStartStop(frame.peer.id, clientMessageId)
-      this.log.info('interrupt', {
-        sessionKey: `*${suffix}`,
-        clientMessageId,
-        ok: true,
-        preStart: true,
-      })
-      return true
-    }
-    // Not admitted here yet: the Stop may have overtaken its own message
-    // (Master acks admission before forwarding it). Arm a short fence for
-    // that send attempt; admission of the same attempt extends it, another
-    // attempt drops it. Nothing is active now, so the receipt stays
-    // TURN_NOT_ACTIVE.
-    this.sessions.fencePreStartStop(
-      frame.peer.id,
-      clientMessageId,
-      PRE_ADMISSION_STOP_TTL_MS,
-      stopControlSendAttempt((frame as { controlId?: unknown }).controlId, clientMessageId),
-    )
-    this.log.info('interrupt', {
-      sessionKey: `*${suffix}`,
-      clientMessageId,
-      ok: false,
-    })
-    return false
+    return handleUnmatchedClientMessageIdStop(this, frame, clientMessageId, safePeerId, suffix)
   }
   if (!sessionKey) {
     if (frame.agentId) {
@@ -1401,9 +1405,10 @@ export async function handleStop(
       for (const live of this.sessions.list()) {
         if (!live.sessionKey.endsWith(suffix)) continue
         const selfInterrupted = this.sessions.interrupt(live.sessionKey, 'user')
+        cancelBrokerIfInterrupted(this, live.sessionKey, selfInterrupted)
         const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
         const swarmInterrupted = await interruptRemoteSwarmForSession(this, live.sessionKey, 'user_stop')
-        if (selfInterrupted) this._settlePendingPermissionsForStop(live.sessionKey)
+        settlePermissionsIfInterrupted(this, live.sessionKey, selfInterrupted)
         interrupted = selfInterrupted || delegateInterrupted || swarmInterrupted || interrupted
       }
       if (interrupted) {
@@ -1422,22 +1427,13 @@ export async function handleStop(
     }
   }
   const selfInterrupted = this.sessions.interrupt(sessionKey, 'user')
+  cancelBrokerIfInterrupted(this, sessionKey, selfInterrupted)
   const delegateInterrupted = this._interruptDelegationsForParent(sessionKey)
   const swarmInterrupted = await interruptRemoteSwarmForSession(this, sessionKey, 'user_stop')
-  if (selfInterrupted) this._settlePendingPermissionsForStop(sessionKey)
+  settlePermissionsIfInterrupted(this, sessionKey, selfInterrupted)
   let ok = selfInterrupted || delegateInterrupted || swarmInterrupted
-  // Compatibility containment for already-open clients: if their selector
-  // changed before Stop, the legacy frame names the new agent. Only on a
-  // direct miss do we fall back to the existing peer-wide stop behavior.
   if (!ok && frame.agentId) {
-    for (const live of this.sessions.list()) {
-      if (!live.sessionKey.endsWith(suffix)) continue
-      const fallbackSelf = this.sessions.interrupt(live.sessionKey, 'user')
-      const fallbackDelegates = this._interruptDelegationsForParent(live.sessionKey)
-      const fallbackSwarm = await interruptRemoteSwarmForSession(this, live.sessionKey, 'user_stop')
-      if (fallbackSelf) this._settlePendingPermissionsForStop(live.sessionKey)
-      ok = fallbackSelf || fallbackDelegates || fallbackSwarm || ok
-    }
+    ok = (await interruptFallbackPeerSessions(this, suffix)) || ok
   }
   this.log.info('interrupt', { sessionKey, ok })
   return ok

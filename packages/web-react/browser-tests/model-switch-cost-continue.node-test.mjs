@@ -72,6 +72,7 @@ test(
       loader: { '.css': 'empty' },
       alias: {
         'node:crypto': here('./stubs/node-crypto.js'),
+        '@openclaude/protocol/containerPreview': here('../../protocol/src/containerPreview.ts'),
         '@openclaude/protocol/browser': here('../../protocol/src/browser.ts'),
         '@openclaude/protocol/teamCards': here('../../protocol/src/teamCards.ts'),
         '@openclaude/protocol': here('../../protocol/src/index.ts'),

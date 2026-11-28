@@ -26,6 +26,7 @@ import { getClientSessionCollabParent } from '@openclaude/storage'
 import { SWARM_COMMAND_ROUTE_RE } from '@openclaude/gateway'
 import { incrGatewayRequest } from '../admin/metrics.js'
 import { handleCodexCommissioning } from './admin/codexCommissioning.js'
+import { handleAdminGovernance } from './admin/governance.js'
 import { handleAdminRemoteDriverV4 } from './admin/remoteDriverV4.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
 import { writeSecurityEvent } from '../admin/securityEvents.js'
@@ -1383,6 +1384,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', pathPrefix: '/api/admin/remote-pool/codex-commissioning', handler: handleCodexCommissioning },
     { method: 'GET', pathPrefix: '/api/admin/remote-pool/driver-v4', handler: handleAdminRemoteDriverV4 },
     { method: 'POST', pathPrefix: '/api/admin/remote-pool/driver-v4', handler: handleAdminRemoteDriverV4 },
+    { method: 'GET', pathPrefix: '/api/admin/governance', handler: handleAdminGovernance },
+    { method: 'POST', pathPrefix: '/api/admin/governance', handler: handleAdminGovernance },
     { method: 'GET', path: '/api/admin/remote-pool', handler: handleAdminRemotePoolGet },
     { method: 'POST', path: '/api/admin/remote-pool/nodes', handler: handleAdminRemotePoolNodeCreate },
     { method: 'POST', pathPrefix: '/api/admin/remote-pool/nodes/', handler: handleAdminRemotePoolNodeAction },
@@ -1391,14 +1394,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'PATCH', pathPrefix: '/api/admin/remote-pool/profiles/', handler: handleAdminRemotePoolProfilePatch },
     { method: 'POST', pathPrefix: '/api/admin/remote-pool/bindings/', handler: handleAdminRemotePoolBindingRevoke },
     { method: 'POST', path: '/api/sessions/preheat', handler: handleSessionPreheat },
-    // R3:reset-cooldown 子资源。pathPrefix 命中 /accounts/,handler 内部用 regex 抠
-    //  `/accounts/:id/reset-cooldown`;POST 会先匹配到这条(method 一致),
-    //  adjustCredits 走的是不同 prefix。
-    {
-      method: 'POST',
-      pathPrefix: '/api/admin/accounts/',
-      handler: handleAdminResetAccountCooldown,
-    },
+    // R3:reset-cooldown 子资源。pathPrefix 命中 /accounts/,handler 内部用 regex 抠 `/accounts/:id/reset-cooldown`。
+    { method: 'POST', pathPrefix: '/api/admin/accounts/', handler: handleAdminResetAccountCooldown },
     { method: 'GET', pathPrefix: '/api/admin/accounts/', handler: handleAdminGetAccount },
     { method: 'PATCH', pathPrefix: '/api/admin/accounts/', handler: handleAdminPatchAccount },
     { method: 'DELETE', pathPrefix: '/api/admin/accounts/', handler: handleAdminDeleteAccount },

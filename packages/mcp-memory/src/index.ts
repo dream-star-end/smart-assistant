@@ -100,6 +100,7 @@ import {
   isLocalCliToolName,
   shutdownLocalCliTools,
 } from './localCliTools.js'
+import { extractMcpToolCallIdentity } from './toolBrokerClient.js'
 import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPolicy.js'
 import { filterAdvisorReadOnlyMcpTools, isAdvisorReadOnlyMcpTool } from './advisorReadOnlyPolicy.js'
 // Tool 定义(TOOLS / SKILL_PROPOSE_TOOL)抽到 ./toolDefs.ts(纯数据模块,无副作用),
@@ -253,11 +254,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   }
 })
 
-// ─────────────────────────────────────────────────────────────
 // Tool handlers
-// ─────────────────────────────────────────────────────────────
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
+server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   const { name, arguments: args } = req.params
+  const toolCallIdentity = extractMcpToolCallIdentity(req.params, extra, MCP_ENV)
   const delegateDeadlineAtMs = Date.now() + resolveDelegateMcpBudgetMs()
   try {
     // Reject unknown names as well as known mutators before handler dispatch,
@@ -331,11 +331,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'project_search':
         return await handleProjectSearch(args as any)
       case 'oc_bash':
-        return await handleOcBash(args)
+        return await handleOcBash(args, toolCallIdentity)
       case 'oc_grep':
-        return await handleOcGrep(args)
+        return await handleOcGrep(args, toolCallIdentity)
       case 'oc_glob':
-        return await handleOcGlob(args)
+        return await handleOcGlob(args, toolCallIdentity)
       case 'swarm':
       case 'post_message':
       case 'read_board':

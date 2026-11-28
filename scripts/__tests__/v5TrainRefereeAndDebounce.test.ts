@@ -32,6 +32,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { signArchStewardReceipt } from '../lib/archStewardReceipt.js'
+import { ARCH_STEWARD_RECEIPT_SCHEMA_VERSION } from '../lib/archStewardTypes.js'
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const GOV_LIB = join(REPO_ROOT, 'scripts/lib/v5-selfhost-governance-gates.sh')
@@ -1898,6 +1900,279 @@ describe('B7. Shared forward cutover guard boundary, physical blast-radius & tru
     r = runGuards(ddlSha, 'CUTOVER_ROLLBACK=1')
     assert.equal(r.status, 0, r.stderr)
     assert.match(r.stdout, /应急回滚豁免/)
+  })
+
+  test('OCV5-914 train guards pass NUL diff + --sha/--base-ref, fail-closed on detached branch, honor NB4 on record failure, catch rename of core file, and allow AST pure-type non-core pass', (t) => {
+    const f = makeTempGitRepo(t)
+    const govRoot = join(f.dir, 'governor')
+    const ctrl = join(govRoot, 'control')
+    const stewardDir = join(govRoot, 'steward-receipts')
+    mkdirSync(ctrl, { recursive: true })
+    mkdirSync(stewardDir, { recursive: true })
+
+    const hmacSecret = 'train-guards-914-hmac-secret'
+    const hmacPath = join(ctrl, '.hmac-key')
+    writeFileSync(hmacPath, `${hmacSecret}\n`, { mode: 0o600 })
+    chmodSync(hmacPath, 0o600)
+
+    mkdirSync(join(f.repo, 'packages/commercial/src/billing'), { recursive: true })
+    writeFileSync(join(f.repo, 'packages/commercial/src/billing/proxyBilling.ts'), 'export function tag(x: number): string { return String(x) }\n')
+    writeFileSync(join(f.repo, 'packages/commercial/src/billing/ledger.ts'), 'export const L = 1\n')
+    f.git('add', '.')
+    f.git('commit', '-qm', 'chore(v5): base')
+    const baseSha = f.git('rev-parse', 'HEAD')
+
+    // 1. Core billing commit -> blocked AND auto-records pending approval gov-billing-<sha12> + prints /admin/#tab=governance
+    writeFileSync(join(f.repo, 'packages/commercial/src/billing/ledger.ts'), 'export const L = 2\n')
+    f.git('commit', '-qam', 'fix(v5): adjust ledger')
+    const coreSha = f.git('rev-parse', 'HEAD')
+
+    const runBlast = (sha: string, branch?: string, extraEnv = '') =>
+      runBash(
+        [
+          `source ${q(TRAIN_GUARDS_LIB)}`,
+          `REPO_ROOT=${q(f.repo)}`,
+          `OC_GOVERNOR_ROOT=${q(govRoot)}`,
+          `OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
+          `OC_V5_GOVERNOR_BIN=${q(OC_GOVERNOR)}`,
+          `OC_GOVERNOR_STEWARD_VERIFIER=${q(join(REPO_ROOT, 'scripts/lib/archStewardReceipt.ts'))}`,
+          extraEnv,
+          branch !== undefined
+            ? `v5_selfhost_check_blast_radius ${q(sha)} ${q(baseSha)} ${q(branch)}`
+            : `v5_selfhost_check_blast_radius ${q(sha)} ${q(baseSha)}`,
+        ].join('\n'),
+        f.env,
+      )
+
+    const coreRes = runBlast(coreSha, 'feat/v5-selfhost')
+    assert.notEqual(coreRes.status, 0)
+    assert.match(coreRes.stderr, /BILLING_CORE_LOCKED/)
+    assert.match(coreRes.stderr, /OC_V5_BLAST_VOUCHER/)
+    const expectedCoreId = `gov-billing-${coreSha.slice(0, 12)}`
+    assert.match(coreRes.stderr, new RegExp(`approvalId=${expectedCoreId}`))
+    assert.match(coreRes.stderr, /\/admin\/#tab=governance/)
+    const coreApprovalPath = join(ctrl, 'pending-approvals', `${expectedCoreId}.json`)
+    assert.equal(existsSync(coreApprovalPath), true, 'must auto-record pending approval for BILLING_CORE_LOCKED')
+    const coreApproval = JSON.parse(readFileSync(coreApprovalPath, 'utf8'))
+    assert.equal(coreApproval.status, 'pending')
+    assert.equal(coreApproval.version, 1)
+    assert.equal(coreApproval.classification, 'human_review_required')
+    assert.equal(coreApproval.code, 'BILLING_CORE_LOCKED')
+    assert.equal(coreApproval.riskCategory, 'billing_change')
+    assert.equal(typeof coreApproval.whatChanged, 'string')
+    assert.match(coreApproval.whyNeedYou, /计费方式/)
+    assert.ok(['approve', 'reject', 'caution'].includes(coreApproval.recommendation?.action))
+    assert.equal(coreApproval.sha, coreSha)
+
+    // 2. Commercial branch feat/v5-aurora-rewrite -> blocked AND NEVER creates any pending approval!
+    const auroraRes = runBlast(coreSha, 'feat/v5-aurora-rewrite')
+    assert.notEqual(auroraRes.status, 0)
+    assert.match(auroraRes.stderr, /COMMERCIAL_BRANCH_HARD_LOCK/)
+    assert.doesNotMatch(auroraRes.stderr, /approvalId=/)
+
+    // 3. B3: Unresolved branch on detached HEAD -> MUST fail-closed (never silently default to feat/v5-selfhost!)
+    f.git('checkout', '-q', '--detach', coreSha)
+    const detachedRes = runBlast(coreSha, undefined)
+    assert.notEqual(detachedRes.status, 0, 'detached HEAD without branch MUST fail closed')
+    assert.match(detachedRes.stderr, /无法解析目标分支.*fail-closed/)
+
+    // 4. B3: Pure comment/type edit on non-core billing with valid HMAC steward -> auto_pass!
+    f.git('checkout', '-q', baseSha)
+    writeFileSync(
+      join(f.repo, 'packages/commercial/src/billing/proxyBilling.ts'),
+      '// pure comment\nexport type ProxyHint = { id: string }\nexport function tag(x: number | bigint): string { return String(x) }\n',
+    )
+    f.git('commit', '-qam', 'refactor(v5): pure comment & type edit in proxyBilling')
+    const nonCoreTypeSha = f.git('rev-parse', 'HEAD')
+
+    const signed = signArchStewardReceipt(
+      {
+        schemaVersion: ARCH_STEWARD_RECEIPT_SCHEMA_VERSION,
+        headSha: nonCoreTypeSha,
+        baseSha,
+        authorModel: 'claude-opus-4-6',
+        authorFamily: 'anthropic-claude',
+        stewardModel: 'gpt-5.4',
+        stewardFamily: 'openai-gpt',
+        verdict: 'approve',
+        triggers: ['CLONE_OR_T2_CORE_PATH'],
+        dimensions: {
+          godClassAppend: { status: 'pass', notes: 'ok' },
+          wheelReinvention: { status: 'pass', notes: 'ok' },
+          boundaryIntegrity: { status: 'pass', notes: 'ok' },
+          complexityDrift: { status: 'pass', notes: 'ok' },
+        },
+        blockers: [],
+        usageEvidence: { jobId: 'job-914-train', timestamp: '2026-11-27T01:00:00Z' },
+      },
+      hmacSecret,
+    )
+    writeFileSync(join(stewardDir, `${nonCoreTypeSha}.json`), `${JSON.stringify(signed, null, 2)}\n`, { mode: 0o644 })
+
+    const nonCorePass = runBlast(nonCoreTypeSha, 'feat/v5-selfhost')
+    assert.equal(nonCorePass.status, 0, `pure type/comment non-core billing with HMAC steward should pass: ${nonCorePass.stderr}`)
+
+    // 5. B3: Rename of core billing file to outside directory -> old path caught via git diff -z --name-status!
+    f.git('checkout', '-q', baseSha)
+    f.git('mv', 'packages/commercial/src/billing/ledger.ts', 'packages/commercial/src/moved-ledger.ts')
+    f.git('commit', '-qm', 'refactor(v5): rename ledger outside billing')
+    const renameSha = f.git('rev-parse', 'HEAD')
+    const renameRes = runBlast(renameSha, 'feat/v5-selfhost')
+    assert.notEqual(renameRes.status, 0, 'rename moving core billing file MUST be caught via old path in NUL diff')
+    assert.match(renameRes.stderr, /BILLING_CORE_LOCKED/)
+
+    // 6. NB4: When pending-approvals dir is unwritable so record-pending-approval fails, do NOT print fake approvalId/link!
+    const lockedGovRoot = join(f.dir, 'ro-governor')
+    const lockedCtrl = join(lockedGovRoot, 'control')
+    const lockedPending = join(lockedCtrl, 'pending-approvals')
+    mkdirSync(lockedPending, { recursive: true })
+    // Place symlink as pending-approvals/.locks so _assert_safe_dir_chain rejects record-pending-approval
+    symlinkSync(join(f.dir, 'nonexistent-target'), join(lockedPending, '.locks'))
+    const nb4Res = runBash(
+      [
+        `source ${q(TRAIN_GUARDS_LIB)}`,
+        `REPO_ROOT=${q(f.repo)}`,
+        `OC_GOVERNOR_ROOT=${q(lockedGovRoot)}`,
+        `OC_V5_GOVERNOR_CONTROL_DIR=${q(lockedCtrl)}`,
+        `OC_V5_GOVERNOR_BIN=${q(OC_GOVERNOR)}`,
+        `v5_selfhost_check_blast_radius ${q(coreSha)} ${q(baseSha)} feat/v5-selfhost`,
+      ].join('\n'),
+      f.env,
+    )
+    assert.notEqual(nb4Res.status, 0)
+    assert.match(nb4Res.stderr, /BILLING_CORE_LOCKED/)
+    assert.doesNotMatch(nb4Res.stderr, /approvalId=/, 'NB4: must NOT print approvalId when record-pending-approval failed')
+    assert.doesNotMatch(nb4Res.stderr, /\/admin\/#tab=governance/, 'NB4: must NOT print console link when record-pending-approval failed')
+  })
+
+  test('OCV5-914 R2 train guards (B3/B6): enforces OC_V5_EXPECTED_HEAD, preserves space/comma file paths end-to-end through approval+voucher, and applies conservative SQL DDL whitelist', (t) => {
+    const f = makeTempGitRepo(t)
+    const govRoot = join(f.dir, 'governor')
+    const ctrl = join(govRoot, 'control')
+    const modeFile = join(ctrl, 'mode.json')
+    const ghStub = join(f.dir, 'gh')
+    const ghResp = join(f.dir, 'gh-runs.json')
+    const retentionStub = join(f.dir, 'run-retention.sh')
+    mkdirSync(ctrl, { recursive: true })
+    writeFileSync(modeFile, JSON.stringify({ mode: 'autonomous', reason: 'ok' }))
+    writeFileSync(ghStub, `#!/usr/bin/env bash\ncat ${q(ghResp)}\n`, { mode: 0o755 })
+    writeFileSync(retentionStub, '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 })
+
+    mkdirSync(join(f.repo, 'packages/commercial/src/billing'), { recursive: true })
+    mkdirSync(join(f.repo, 'packages/commercial/src/db/migrations'), { recursive: true })
+    writeFileSync(join(f.repo, 'README.md'), 'init\n')
+    f.git('add', '.')
+    f.git('commit', '-qm', 'chore(v5): base')
+    const baseSha = f.git('rev-parse', 'HEAD')
+
+    // 1. B6: OC_V5_EXPECTED_HEAD hard-binding in v5_selfhost_enforce_forward_cutover_guards
+    writeFileSync(join(f.repo, 'README.md'), 'clean change\n')
+    f.git('commit', '-qam', 'fix(v5): clean doc update')
+    const cleanSha = f.git('rev-parse', 'HEAD')
+    writeFileSync(
+      ghResp,
+      JSON.stringify({
+        workflow_runs: [
+          { id: 1, name: 'V5 selfhost gates', path: '.github/workflows/v5-selfhost-gates.yml', head_sha: cleanSha, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+          { id: 2, name: 'V5 selfhost release gates', path: '.github/workflows/v5-selfhost-release-gates.yml', head_sha: cleanSha, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+          { id: 3, name: 'V5 selfhost commercial', path: '.github/workflows/v5-selfhost-commercial.yml', head_sha: cleanSha, event: 'push', status: 'completed', conclusion: 'success', created_at: '2026-11-26T10:00:00Z' },
+        ],
+      }),
+    )
+    const runForwardGuards = (sha: string, extra = '') =>
+      runBash(
+        [
+          `source ${q(TRAIN_GUARDS_LIB)}`,
+          `REPO_ROOT=${q(f.repo)}`,
+          `OC_GOVERNOR_ROOT=${q(govRoot)}`,
+          `OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
+          `OC_V5_GOVERNOR_MODE_FILE=${q(modeFile)}`,
+          `OC_V5_GOVERNOR_BIN=${q(OC_GOVERNOR)}`,
+          `OC_V5_GH_BIN=${q(ghStub)}`,
+          'OC_V5_GH_REPO=dream-star-end/openclaude',
+          `OC_V5_RETENTION_RUNNER=${q(retentionStub)}`,
+          extra,
+          `v5_selfhost_enforce_forward_cutover_guards ${q(sha)} ${q(baseSha)} feat/v5-selfhost`,
+        ].join('\n'),
+        f.env,
+      )
+
+    const mismatchHead = runForwardGuards(cleanSha, `OC_V5_EXPECTED_HEAD=${q('1'.repeat(40))}`)
+    assert.notEqual(mismatchHead.status, 0, 'mismatched OC_V5_EXPECTED_HEAD MUST fail closed')
+    assert.match(mismatchHead.stderr, /\[expected-head\]/)
+
+    const matchHead = runForwardGuards(cleanSha, `OC_V5_EXPECTED_HEAD=${q(cleanSha)}`)
+    assert.equal(matchHead.status, 0, `matching OC_V5_EXPECTED_HEAD should pass: ${matchHead.stderr}`)
+
+    // 2. B3: Lossless path with space & comma flows 3-way identically: git diff -> pending approval -> blast voucher -> re-check passes!
+    f.git('checkout', '-q', baseSha)
+    const trickyRel = 'packages/commercial/src/billing/x,y costHelper.ts'
+    writeFileSync(join(f.repo, trickyRel), 'export const TRICKY = 1\n')
+    f.git('add', trickyRel)
+    f.git('commit', '-qm', 'fix(v5): add cost helper with comma and space')
+    const trickySha = f.git('rev-parse', 'HEAD')
+
+    const runBlastOnly = (sha: string, extra = '') =>
+      runBash(
+        [
+          `source ${q(TRAIN_GUARDS_LIB)}`,
+          `REPO_ROOT=${q(f.repo)}`,
+          `OC_GOVERNOR_ROOT=${q(govRoot)}`,
+          `OC_V5_GOVERNOR_CONTROL_DIR=${q(ctrl)}`,
+          `OC_V5_GOVERNOR_BIN=${q(OC_GOVERNOR)}`,
+          'OC_GOVERNOR_UNSAFE_TEST_SKIP_OWNER=1',
+          extra,
+          `v5_selfhost_check_blast_radius ${q(sha)} ${q(baseSha)} feat/v5-selfhost`,
+        ].join('\n'),
+        f.env,
+      )
+
+    const trickyBlocked = runBlastOnly(trickySha)
+    assert.notEqual(trickyBlocked.status, 0)
+    assert.match(trickyBlocked.stderr, /BILLING_CORE_LOCKED/)
+    const trickyApprovalId = `gov-billing-${trickySha.slice(0, 12)}`
+    const trickyApprovalDoc = JSON.parse(readFileSync(join(ctrl, 'pending-approvals', `${trickyApprovalId}.json`), 'utf8'))
+    assert.deepEqual(trickyApprovalDoc.files, [trickyRel], 'pending approval MUST preserve exact path with space & comma')
+    assert.equal(trickyApprovalDoc.riskCategory, 'billing_change')
+
+    const decTricky = spawnSync(
+      'bash',
+      [OC_GOVERNOR, 'decide-pending-approval', '--id', trickyApprovalId, '--decision', 'approve', '--actor', 'admin-r2', '--note', 'Approve tricky filename'],
+      { env: { ...f.env, OC_GOVERNOR_ROOT: govRoot, OC_GOVERNOR_UNSAFE_TEST_SKIP_OWNER: '1' }, encoding: 'utf8' },
+    )
+    assert.equal(decTricky.status, 0, decTricky.stderr)
+    const trickyVoucherId = JSON.parse(decTricky.stdout).decision.issuedArtifactId
+    const trickyPass = runBlastOnly(trickySha, `OC_V5_BLAST_VOUCHER=${q(trickyVoucherId)}`)
+    assert.equal(trickyPass.status, 0, `approved voucher for tricky space+comma path MUST pass check-blast-radius: ${trickyPass.stderr}`)
+
+    // 3. B3 SQL DDL whitelist via train guards: safe additive & safe idempotent DO $$ pass; unsafe DO $$ fails closed as DESTRUCTIVE_DDL_LOCKED with riskCategory=ux_degradation
+    f.git('checkout', '-q', baseSha)
+    writeFileSync(
+      join(f.repo, 'packages/commercial/src/db/migrations/100_safe_additive.sql'),
+      'CREATE TABLE IF NOT EXISTS r2_events (id bigserial PRIMARY KEY);\nDO $$\nBEGIN\n  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = \'idx_r2_events\') THEN\n    CREATE INDEX IF NOT EXISTS idx_r2_events ON r2_events (id);\n  END IF;\nEND $$;\n',
+    )
+    f.git('add', '.')
+    f.git('commit', '-qm', 'feat(v5): safe additive + idempotent DO migration')
+    const safeSqlSha = f.git('rev-parse', 'HEAD')
+    const safeSqlPass = runBlastOnly(safeSqlSha)
+    assert.equal(safeSqlPass.status, 0, `safe additive + idempotent DO SQL migration should pass: ${safeSqlPass.stderr}`)
+
+    f.git('checkout', '-q', baseSha)
+    mkdirSync(join(f.repo, 'packages/commercial/src/db/migrations'), { recursive: true })
+    writeFileSync(
+      join(f.repo, 'packages/commercial/src/db/migrations/101_unrecognized.sql'),
+      'DO $$ BEGIN PERFORM 1; END $$;\n',
+    )
+    f.git('add', '.')
+    f.git('commit', '-qm', 'feat(v5): DO block migration')
+    const doSqlSha = f.git('rev-parse', 'HEAD')
+    const doSqlBlocked = runBlastOnly(doSqlSha)
+    assert.notEqual(doSqlBlocked.status, 0, 'unrecognized DO $$ migration MUST be blocked as DESTRUCTIVE_DDL_LOCKED')
+    assert.match(doSqlBlocked.stderr, /DESTRUCTIVE_DDL_LOCKED/)
+    const ddlApprovalId = `gov-ddl-${doSqlSha.slice(0, 12)}`
+    const ddlApprovalDoc = JSON.parse(readFileSync(join(ctrl, 'pending-approvals', `${ddlApprovalId}.json`), 'utf8'))
+    assert.equal(ddlApprovalDoc.riskCategory, 'ux_degradation')
+    assert.match(ddlApprovalDoc.whyNeedYou, /用户体验/)
   })
 
   test('removes OC_V5_SKIP_TRAILER_GATE=1 env escape hatch while allowing exact-SHA host break-glass file', (t) => {

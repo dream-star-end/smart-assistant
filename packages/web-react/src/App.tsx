@@ -150,8 +150,8 @@ import {
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import {
   deriveSessionNeedsYou,
+  deriveSessionNeedsYouFromPreview,
   getTicketApprovalPendingVersion,
-  hasUnansweredOptionsFence,
   subscribeTicketApprovalPending,
 } from "./lib/sessionStatus";
 import { deriveConnBanner, isPlatedAssistantMessage, lastRealUserTurn } from "./lib/chat/pure";
@@ -1248,10 +1248,7 @@ export function App() {
       const fromLive = deriveSessionNeedsYou(liveSess);
       if (fromLive) return fromLive;
       if (!liveSess || liveSess.messages.length === 0) {
-        const meta = sessions.find((s) => s.id === id);
-        if (meta?.lastMessagePreview && hasUnansweredOptionsFence(meta.lastMessagePreview)) {
-          return "answer";
-        }
+        return deriveSessionNeedsYouFromPreview(sessions.find((s) => s.id === id));
       }
       return null;
     },

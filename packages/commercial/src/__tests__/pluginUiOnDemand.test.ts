@@ -91,7 +91,8 @@ describe("2. 前端类型的归属", () => {
   test("前端每个类型要么在通用协议里，要么恰好属于一个插件（sources 只做旧消息兼容）", () => {
     const all = frontendTypes();
     assert.ok(all.length >= 30, `parsed types: ${all.join(",")}`);
-    const frontendOnly = new Set(["sources"]);
+    // sources 只做旧消息兼容; governance_approval 仅个人版自托管控制面使用,不对商业版通用系统提示词宣传(OCV5-914)
+    const frontendOnly = new Set(["sources", "governance_approval"]);
     for (const t of all) {
       if (frontendOnly.has(t)) continue;
       const owners = PLUGIN_UI_COMPONENTS.filter((s) => s.types.includes(t)).length;

@@ -21,7 +21,7 @@ import { type OpenClaudeConfig } from '@openclaude/storage'
 import { createLogger } from './logger.js'
 import { boxCcBridgePath, stripBoxCcParentAuth } from './engine/cursorBoxCc.js'
 import { ccbStdinUserContent } from './ccbNativeCompaction.js'
-import { atomicWriteJsonFile, buildCcbEfficiencySettings } from './efficiencyHookConfig.js'
+import { atomicWriteJsonFile, buildCcbEfficiencySettings, isEfficiencyBrokerHookRequired, resolveActiveEfficiencyBrokerHook } from './efficiencyHookConfig.js'
 import { isV3ContainerRuntime } from './hostStaticProviders.js'
 import type { GoalStateSnapshot, ServiceTier } from '@openclaude/protocol'
 import { renderCcbGoalPrompt } from './goalPrompt.js'
@@ -313,6 +313,7 @@ export class SubprocessRunner extends EventEmitter {
   private overflowKilled = false
   private transcriptRestoreSocket: CcbTranscriptRestoreSocket | null = null
   private sessionDir: string | null = null
+  private revokeBrokerHook: (() => void) | null = null; private brokerHookSlotPath: string | null = null; private brokerHookTurnFresh = false; private lastWorkspaceCwd: string | null = null
   private advisorHomeDir: string | null = null
   private advisorConfigDir: string | null = null
   /** Stable path inherited by MCP + Bash; contents are re-minted every turn. */
@@ -871,14 +872,7 @@ export class SubprocessRunner extends EventEmitter {
           ..._buildCcbServiceTierEnv(this._serviceTier),
           ...(this.opts.hermeticNoTools || this.readOnlyTurn ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' } : {}),
           ...(this.readOnlyTurn ? { ENABLE_SEARCH_EXTRA_TOOLS: 'false' } : {}),
-          // Note: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS used to be set to '1'
-          // here to strip run_in_background from Bash/Agent/PowerShell tool
-          // schemas (visibility band-aid for Opus 4.7 over-using background
-          // mode). Removed once CCB started streaming bash_output_tail
-          // SDK events at 1 Hz — the underlying UX problem (background
-          // commands looking idle) is now solved end-to-end (CCB
-          // sdkEventQueue → gateway ccbMessageParser → web tool_output_tail
-          // block), so the model can pick run_in_background:true again.
+          // CCB streams bash_output_tail at 1 Hz so run_in_background remains enabled.
           IS_SANDBOX: '1',
           ...(harness === 'ccb' ? { FEATURE_VERIFICATION_AGENT: '1' } : {}),
           // 禁用 CCB 自带 Kairos cron 工具(CronList/CronCreate/CronDelete)。它们操作
@@ -1450,7 +1444,7 @@ export class SubprocessRunner extends EventEmitter {
     turnTiming.once('process_available')
     if (!this.proc) throw new Error('failed to start agent subprocess')
     this.delegateContextTraceId = turnTraceId
-    if (!this.opts.cc5BridgePort) this.refreshDelegateContext(turnTraceId)
+    if (!this.opts.cc5BridgePort) { this.refreshDelegateContext(turnTraceId); await this.refreshTurnBrokerHook() }
     const envUpdateLine = envUpdateVars
       ? _buildUpdateEnvStdinLine({
           ...envUpdateVars,
@@ -1672,7 +1666,7 @@ export class SubprocessRunner extends EventEmitter {
     // The container tool host runs tools with a local chat's environment, minus model credentials.
     const laneEnv: Record<string, string> = {}
     for (const [key, value] of Object.entries(process.env)) {
-      if (value !== undefined && !CC5_LANE_CREDENTIAL_ENV.test(key)) laneEnv[key] = value
+      if (value !== undefined && !CC5_LANE_CREDENTIAL_ENV.test(key) && !key.startsWith('OPENCLAUDE_TOOL_BROKER_') && !key.startsWith('OC_TOOL_BROKER_')) laneEnv[key] = value
     }
     Object.assign(laneEnv, {
       OC_SESSION_KEY: this.opts.sessionKey,
@@ -1856,6 +1850,7 @@ export class SubprocessRunner extends EventEmitter {
     const privacyEpoch = this._startEpoch
     this._promptIntelligentUi = undefined
     this._promptPolicyFingerprint = undefined
+    let resolvedWorkspaceCwd = this.opts.agentBaseDir
     try {
       const promptResult = await buildPromptContext({
         promptPolicy: this.promptPolicy,
@@ -1887,6 +1882,8 @@ export class SubprocessRunner extends EventEmitter {
         projectBound: Boolean(this.opts.projectId),
         desktopWorkspaceDir: resolveDesktopWorkspaceDir(),
       })
+      resolvedWorkspaceCwd = cwdDecision.cwd
+      this.lastWorkspaceCwd = cwdDecision.cwd
       const freshPrompt: FrozenPromptBuild = {
         content: promptResult.content,
         contentSha256: promptResult.contentSha256,
@@ -2097,45 +2094,50 @@ export class SubprocessRunner extends EventEmitter {
       }
     } catch (err) {
       if (this.readOnlyTurn) throw err
-      runnerLog.warn(
-        'failed to write mcp config',
-        { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
-        err,
-      )
+      runnerLog.warn('failed to write mcp config', { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId }, err)
     }
-
-    try {
-      const settingsPath = resolve(sessionDir, 'settings.json')
-      atomicWriteJsonFile(settingsPath, buildCcbSessionSettings(buildCcbEfficiencySettings()), 0o600)
-      out.settingsFile = settingsPath
-    } catch (err) {
-      runnerLog.warn(
-        'failed to write CCB session settings',
-        { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
-        err,
-      )
-    }
-
+    const settingsFile = await this.setupInitialBrokerHookAndSettings(sessionDir, resolvedWorkspaceCwd)
+    if (settingsFile) out.settingsFile = settingsFile
     return out
   }
+  private async setupInitialBrokerHookAndSettings(sessionDir: string, workspaceCwd: string): Promise<string | undefined> {
+    const brokerRequired = isEfficiencyBrokerHookRequired()
+    let brokerHook: Awaited<ReturnType<typeof resolveActiveEfficiencyBrokerHook>> = null
+    try {
+      brokerHook = await resolveActiveEfficiencyBrokerHook({ protocol: 'ccb', sessionKey: this.opts.sessionKey, gatewayPort: this.opts.config.gateway.port, readOnly: this.readOnlyTurn, hermeticNoTools: Boolean(this.opts.hermeticNoTools), workspaceCwd, ...(this.brokerHookSlotPath ? { tokenFilePath: this.brokerHookSlotPath } : {}) })
+      if (brokerRequired && !brokerHook) throw new Error('missing selfhost broker hook binding')
+      this.revokeTurnBrokerHook(); this.revokeBrokerHook = brokerHook?.revoke ?? null; this.brokerHookSlotPath = brokerHook?.hookTokenFile ?? null; this.brokerHookTurnFresh = Boolean(brokerHook)
+      const settingsPath = resolve(sessionDir, 'settings.json')
+      atomicWriteJsonFile(settingsPath, buildCcbSessionSettings(buildCcbEfficiencySettings(undefined, undefined, brokerHook ? { brokerApprovalActive: true, brokerHook } : undefined)), 0o600)
+      return settingsPath
+    } catch (err) {
+      brokerHook?.revoke(); this.revokeTurnBrokerHook()
+      if (brokerRequired) throw new Error(`TOOL_BROKER_HOOK_SETUP_FAILED: ${err instanceof Error ? err.message : String(err)}`)
+      runnerLog.warn('failed to write CCB session settings', { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId }, err)
+      return undefined
+    }
+  }
+  private async refreshTurnBrokerHook(): Promise<void> {
+    if (this.brokerHookTurnFresh) { this.brokerHookTurnFresh = false; return }
+    const brokerRequired = isEfficiencyBrokerHookRequired(); if (!brokerRequired && !this.brokerHookSlotPath) return
+    let next: Awaited<ReturnType<typeof resolveActiveEfficiencyBrokerHook>> = null
+    try {
+      this.revokeTurnBrokerHook()
+      next = await resolveActiveEfficiencyBrokerHook({ protocol: 'ccb', sessionKey: this.opts.sessionKey, gatewayPort: this.opts.config.gateway.port, readOnly: this.readOnlyTurn, hermeticNoTools: Boolean(this.opts.hermeticNoTools), workspaceCwd: this.lastWorkspaceCwd ?? this.opts.agentBaseDir, ...(this.brokerHookSlotPath ? { tokenFilePath: this.brokerHookSlotPath } : {}) })
+      if (brokerRequired && !next) throw new Error('missing selfhost broker hook binding')
+      this.revokeBrokerHook = next?.revoke ?? null
+      if (next && this.sessionDir && next.hookTokenFile !== this.brokerHookSlotPath) { this.brokerHookSlotPath = next.hookTokenFile; atomicWriteJsonFile(resolve(this.sessionDir, 'settings.json'), buildCcbSessionSettings(buildCcbEfficiencySettings(undefined, undefined, { brokerApprovalActive: true, brokerHook: next })), 0o600) }
+    } catch (err) { next?.revoke(); this.revokeTurnBrokerHook(); if (brokerRequired) throw new Error(`TOOL_BROKER_HOOK_SETUP_FAILED: ${err instanceof Error ? err.message : String(err)}`) }
+  }
+  revokeTurnBrokerHook(): void { this.revokeBrokerHook?.(); this.revokeBrokerHook = null; this.brokerHookTurnFresh = false }
 
   // 发送权限审批响应 — CCB 在 stdio 模式下等待 control_response
   sendPermissionResponse(requestId: string, response: PermissionResponse): boolean {
     if (!this.proc) return false
     try {
-      const msg = {
-        type: 'control_response',
-        response: {
-          request_id: requestId,
-          subtype: 'success',
-          response,
-        },
-      }
-      this.proc.stdin.write(`${JSON.stringify(msg)}\n`)
+      this.proc.stdin.write(`${JSON.stringify({ type: 'control_response', response: { request_id: requestId, subtype: 'success', response } })}\n`)
       return true
-    } catch {
-      return false
-    }
+    } catch { return false }
   }
 
   /** Read-only snapshot of telemetry drop diagnostics. */
@@ -2209,16 +2211,10 @@ export class SubprocessRunner extends EventEmitter {
     proc.once('exit', () => clearTimeout(reaper))
   }
 
-  /** Remove the session's temp directory (extra-prompt.md, mcp-config.json, …). */
   private cleanupSessionDir(): void {
-    if (this.sessionDir) {
-      try { rmSync(this.sessionDir, { recursive: true, force: true }) } catch {}
-      this.sessionDir = null
-      this.advisorHomeDir = null
-      this.advisorConfigDir = null
-    }
-    this.delegateContextFile = null
-    this.delegateContextTraceId = undefined
+    this.revokeTurnBrokerHook(); this.brokerHookSlotPath = null
+    if (this.sessionDir) { try { rmSync(this.sessionDir, { recursive: true, force: true }) } catch {}; this.sessionDir = null; this.advisorHomeDir = null; this.advisorConfigDir = null }
+    this.delegateContextFile = null; this.delegateContextTraceId = undefined
   }
 
   private consultTurnBinding:

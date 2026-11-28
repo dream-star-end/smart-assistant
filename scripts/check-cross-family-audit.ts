@@ -53,11 +53,11 @@ import {
   signArchStewardReceipt,
   verifyArchStewardReceipt,
 } from './lib/archStewardContract.js'
+import { resolveStewardGateOnlineAsync } from './lib/commitRangeCarryOver.js'
 import {
   type FetchLike,
   type GithubStewardStatusResult,
   resolveGithubToken,
-  verifyGithubStewardStatus,
 } from './lib/githubTrustedApproval.js'
 import {
   type CrossFamilyAuditResult,
@@ -125,6 +125,7 @@ export interface StewardGateRunOptions {
     token?: string
     trustedPublishers?: readonly string[]
     apiBaseUrl?: string
+    expectedBaseRef?: string
     fetchImpl?: FetchLike
   }
 }
@@ -161,7 +162,12 @@ function runLocalStewardCheck(opts: StewardGateRunOptions): {
     headRef: headSha,
     gitDir,
   })
-  const baseSha = diffSummary.baseSha ?? resolveGitSha(opts.root, baseRef, gitDir)
+  // F1: In enforce-commit mode, preserve the caller's requested baseSha for ancestry/range
+  // classification and receipt baseSha verification (never silently replace a diverged baseRef
+  // with its merge-base). Keep merge-base diff semantics for enforce-pr / check-only.
+  const requestedBaseSha = resolveGitSha(opts.root, baseRef, gitDir)
+  const baseSha =
+    opts.mode === 'enforce-commit' ? requestedBaseSha : (diffSummary.baseSha ?? requestedBaseSha)
   const risk = evaluateStructuralRisk(diffSummary, { root: opts.root })
 
   if (!risk.requiresSteward) {
@@ -227,115 +233,63 @@ export function runStewardGate(opts: StewardGateRunOptions): StewardGateRunResul
   }
 }
 
-function mergeGithubStewardOutcome(
-  opts: StewardGateRunOptions,
-  local: ReturnType<typeof runLocalStewardCheck>,
-  githubStatus: GithubStewardStatusResult,
-): StewardGateRunResult {
-  const searched = [...(local.receiptLookup?.searchedLocations ?? []), githubStatus.source]
-  const failExit: 0 | 1 = opts.mode === 'check-only' ? 0 : 1
-  const base = { mode: opts.mode, headSha: local.headSha, baseSha: local.baseSha, risk: local.risk }
-  // B3: Cross-channel VETO/failure precedence — even if local receipt passed, GitHub veto blocks!
-  if (githubStatus.verdict === 'veto') {
-    return {
-      ...base,
-      ok: false,
-      exitCode: failExit,
-      receiptLookup: {
-        found: true,
-        channel: 'github-status',
-        source: githubStatus.source,
-        error: githubStatus.reason,
-        searchedLocations: searched,
-      },
-      receiptVerification: local.receiptVerification,
-      githubStatus,
-    }
-  }
-  if (local.passed) {
-    return {
-      ...base,
-      ok: true,
-      exitCode: 0,
-      receiptLookup: local.receiptLookup,
-      receiptVerification: local.receiptVerification,
-      githubStatus,
-    }
-  }
-  if (githubStatus.valid) {
-    return {
-      ...base,
-      ok: true,
-      exitCode: 0,
-      receiptLookup: {
-        found: true,
-        channel: 'github-status',
-        source: githubStatus.source,
-        searchedLocations: searched,
-      },
-      githubStatus,
-    }
-  }
-  return {
-    ...base,
-    ok: false,
-    exitCode: failExit,
-    receiptLookup: {
-      found: local.receiptLookup?.found ?? false,
-      channel: local.receiptLookup?.channel,
-      source: local.receiptLookup?.source ?? githubStatus.source,
-      raw: local.receiptLookup?.raw,
-      error: local.receiptLookup?.error
-        ? `${local.receiptLookup.error}; github: ${githubStatus.reason}`
-        : githubStatus.reason,
-      searchedLocations: searched,
-    },
-    receiptVerification: local.receiptVerification,
-    githubStatus,
-  }
-}
-
 /**
- * Asynchronous Architecture Steward check supporting both host root-only receipts
- * and out-of-commit GitHub Commit Status `oc-v5/arch-steward`.
+ * Asynchronous Architecture Steward check (B2/B3/B4/B5):
+ *   - Distinguishes single-commit vs multi-commit ranges BEFORE any tip-only carry-over so a
+ *     later PR's approval can never skip an earlier unapproved or vetoed commit in a train.
+ *   - Enforces symmetric cross-channel VETO & incomplete-history precedence across S and H.
  */
 export async function runStewardGateAsync(
   opts: StewardGateRunOptions,
 ): Promise<StewardGateRunResult> {
   const local = runLocalStewardCheck(opts)
   const base = { mode: opts.mode, headSha: local.headSha, baseSha: local.baseSha, risk: local.risk }
-  if (!local.risk.requiresSteward) {
-    return { ...base, ok: true, exitCode: 0 }
-  }
+  const failExit: 0 | 1 = opts.mode === 'check-only' ? 0 : 1
+  if (!local.risk.requiresSteward) return { ...base, ok: true, exitCode: 0 }
   if (local.hasHardVeto) {
     return {
       ...base,
       ok: false,
-      exitCode: opts.mode === 'check-only' ? 0 : 1,
+      exitCode: failExit,
       receiptLookup: local.receiptLookup,
       receiptVerification: local.receiptVerification,
     }
   }
+
+  const env = opts.env ?? process.env
+  const gitDir = opts.gitDir ?? (env.GIT_DIR?.trim() || undefined)
+  const requireHmac = opts.requireHmac ?? env.OC_STEWARD_REQUIRE_HMAC === '1'
   const ghRepo = opts.github?.repo?.trim()
   const ghToken = opts.github?.token?.trim()
-  if (ghRepo && ghToken && !opts.explicitReceiptPath) {
-    const githubStatus = await verifyGithubStewardStatus({
-      repo: ghRepo,
-      token: ghToken,
-      headSha: local.headSha,
-      trustedPublishers: opts.github?.trustedPublishers,
-      apiBaseUrl: opts.github?.apiBaseUrl,
-      fetchImpl: opts.github?.fetchImpl,
-    })
-    return mergeGithubStewardOutcome(opts, local, githubStatus)
-  }
-  return {
-    ...base,
-    ok: local.passed,
-    exitCode: local.passed || opts.mode === 'check-only' ? 0 : 1,
+  return resolveStewardGateOnlineAsync({
+    root: opts.root,
+    mode: opts.mode,
+    gitDir,
+    explicitReceiptPath: opts.explicitReceiptPath,
+    receiptDirs: opts.receiptDirs,
+    requireRootOwner: opts.requireRootOwner ?? true,
+    hmacKey: opts.hmacKey,
+    requireHmac,
+    allowUntrustedRepoReceipt: opts.allowUntrustedRepoReceipt ?? false,
+    env,
+    headSha: local.headSha,
+    baseSha: local.baseSha,
+    risk: local.risk,
+    passed: local.passed,
     receiptLookup: local.receiptLookup,
     receiptVerification: local.receiptVerification,
-  }
+    github:
+      ghRepo && ghToken
+        ? {
+            repo: ghRepo,
+            token: ghToken,
+            trustedPublishers: opts.github?.trustedPublishers,
+            apiBaseUrl: opts.github?.apiBaseUrl,
+            expectedBaseRef: opts.github?.expectedBaseRef,
+            fetchImpl: opts.github?.fetchImpl,
+          }
+        : undefined,
+  })
 }
 
 function printUsage(): void {
@@ -377,6 +331,7 @@ async function main(argv: string[]): Promise<number> {
   let githubTokenEnv: string | undefined
   let trustedPublishersRaw = process.env.OC_TRUSTED_APPROVERS?.trim() || ''
   let githubApiUrl = process.env.GITHUB_API_URL?.trim() || undefined
+  let expectedBaseBranchArg: string | undefined
   let recommendAuthorSlug: string | undefined
   let signReceiptPath: string | undefined
   let outPath: string | undefined
@@ -481,6 +436,10 @@ async function main(argv: string[]): Promise<number> {
       const v = takeValue(arg, ++i)
       if (!v) return 2
       githubApiUrl = v
+    } else if (arg === '--expected-base-branch') {
+      const v = takeValue(arg, ++i)
+      if (!v) return 2
+      expectedBaseBranchArg = v
     } else if (arg === '--json') {
       jsonOut = true
     } else if (arg === '--recommend-model') {
@@ -542,6 +501,7 @@ async function main(argv: string[]): Promise<number> {
         headRef,
         requireRootOwner: false,
       })
+      const requestedBaseSha = baseRef ? resolveGitSha(root, baseRef) : gate.baseSha
       console.log(
         JSON.stringify({
           authorModel: cross.devModel,
@@ -549,7 +509,8 @@ async function main(argv: string[]): Promise<number> {
           stewardModel: cross.auditModel,
           stewardFamily: cross.auditFamily,
           headSha: gate.headSha,
-          baseSha: gate.baseSha,
+          baseSha: requestedBaseSha,
+          diffBaseSha: gate.baseSha,
           risk: gate.risk,
         }),
       )
@@ -637,6 +598,11 @@ async function main(argv: string[]): Promise<number> {
             .map((s) => s.trim())
             .filter(Boolean)
         : undefined
+      const expectedBaseRef =
+        expectedBaseBranchArg?.trim() ||
+        (process.env.GITHUB_REF_TYPE === 'branch' && process.env.GITHUB_REF_NAME?.trim()
+          ? process.env.GITHUB_REF_NAME.trim()
+          : process.env.OC_V5_EXPECTED_BASE_BRANCH?.trim() || undefined)
       const result = await runStewardGateAsync({
         root,
         mode: gateMode,
@@ -655,6 +621,7 @@ async function main(argv: string[]): Promise<number> {
                 token: githubToken,
                 trustedPublishers,
                 apiBaseUrl: githubApiUrl,
+                expectedBaseRef,
               }
             : undefined,
       })
@@ -680,6 +647,10 @@ async function main(argv: string[]): Promise<number> {
           const gh = result.githubStatus
           console.log(
             `[arch-steward] ok (${gateMode}): head=${result.headSha.slice(0, 12)} approved via GitHub status (${gh.authorFamily} -> ${gh.stewardFamily}, digest=${gh.receiptDigest}, publisher=@${gh.publishedBy}) [source=${gh.source}]`,
+          )
+        } else if (result.receiptLookup?.found) {
+          console.log(
+            `[arch-steward] ok (${gateMode}): head=${result.headSha.slice(0, 12)} approved via ${result.receiptLookup.source}`,
           )
         }
         return 0

@@ -16,6 +16,7 @@ import {
   useScrollToBottomVisibility,
 } from "./chat/ScrollToBottomButton";
 import { snapScrollToBottomOnce } from "./chat/stickToBottom";
+import { processSwarmSnapshot } from "../lib/chat/swarmBoardEvidence";
 import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isInteractiveToolMessage, isProcessMessage, keepDistinctActivity, processSections, promptShadowedToolIds, turnOutcome } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronUp, Info, X } from "lucide-react";
 import {
@@ -91,7 +92,7 @@ import {
 } from "./chat/permissionPromptState";
 import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
-import { currentTurnStartIndex, turnFinalAssistantFlags, turnLineageRoot, turnRatingFlags } from "./chat/turnSegment";
+import { currentTurnStartIndex, explicitRowTurnRoot, turnFinalAssistantFlags, turnLineageRoot, turnRatingFlags } from "./chat/turnSegment";
 import {
   captureVisibleVirtualRowAnchor,
   correctedScrollTop,
@@ -789,6 +790,7 @@ type RenderItem =
       members: ChatMessage[];
       items: LeafRenderItem[];
       active: boolean;
+      swarm?: ReturnType<typeof processSwarmSnapshot>;
     }
   | {
       kind: "approval-group";
@@ -797,6 +799,16 @@ type RenderItem =
       items: SingleRenderItem[];
       ticketIds: string[];
     };
+function withActiveSwarm(out: RenderItem[], messages: ChatMessage[], activeStart: number, sending: boolean): RenderItem[] {
+  if (!sending) return out;
+  for (let i = out.length - 1; i >= 0; i -= 1) {
+    const item = out[i];
+    if (item.kind !== "process" || !item.active) continue;
+    item.swarm = processSwarmSnapshot(messages, activeStart, item.members.at(-1));
+    break;
+  }
+  return out;
+}
 function itemMessages(item: LeafRenderItem): ChatMessage[] {
   return item.kind === "single" ? [item.m] : item.members;
 }
@@ -824,19 +836,6 @@ const ProcessGroupMemo = memo(
  * answer. A deferred empty locator for a finished turn stays outside too.
  * Deliverable rows are excluded separately by isProcessMessage.
  */
-function explicitRowTurnRoot(
-  message: ChatMessage | undefined,
-  rootOf: (id: string) => string,
-): string | undefined {
-  if (!message) return undefined;
-  const raw = message.role === "user"
-    ? message.id
-    : (typeof message._turnOwnerId === "string" && message._turnOwnerId) ||
-      (typeof message._clientMessageId === "string" && message._clientMessageId) ||
-      undefined;
-  return raw ? rootOf(raw) : undefined;
-}
-
 function disclosureAnswerIds(
   messages: ChatMessage[],
   finals: boolean[],
@@ -1128,7 +1127,7 @@ function discloseProcess(
   if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
   flushInteractive();
   flushTerminal();
-  return out;
+  return withActiveSwarm(out, messages, activeStart, sending);
 }
 
 /**
@@ -2718,8 +2717,7 @@ export function MessageList({
       const olderSteps = olderLiveStepsKey === it.key ? olderLiveStepsControl : null;
       const live = it.active || olderSteps !== null;
       return (
-        <ProcessGroupMemo
-          live={live}
+        <ProcessGroupMemo live={live}
           sig={live ? "" : [
             open ? 1 : 0,
             needle,
@@ -2749,6 +2747,7 @@ export function MessageList({
           olderSteps={olderSteps}
           activity={it.active ? turnActivity : null}
           bounds={bounds}
+          swarm={it.swarm}
           tokenUsageOf={(item) => ("tokenUsage" in item ? item.tokenUsage : undefined)}
         />
         </ProcessGroupMemo>

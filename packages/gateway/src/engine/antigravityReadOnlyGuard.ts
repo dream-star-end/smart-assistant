@@ -270,7 +270,7 @@ function sha256Hex(data: Buffer | string): string {
   return createHash('sha256').update(data).digest('hex')
 }
 
-function formatShellPath(value: string): string {
+export function formatShellPath(value: string): string {
   if (!isAbsolute(value) || /[\0\r\n]/.test(value)) {
     throw new Error(`${ANTIGRAVITY_READ_ONLY_GUARD_UNAVAILABLE}: unsafe path for hook command`)
   }
@@ -329,7 +329,7 @@ export function buildAntigravityReadOnlyHooksConfig(
   }
 }
 
-function atomicWriteVerifiedMode400(dstPath: string, content: string): string {
+export function atomicWriteVerifiedMode400(dstPath: string, content: string): string {
   const expectedBytes = Buffer.from(content, 'utf8')
   const expectedSha256 = sha256Hex(expectedBytes)
   const tmpPath = `${dstPath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
@@ -413,11 +413,8 @@ export function installAntigravityReadOnlyGuard(opts: {
   }
 }
 
-/**
- * Ensure a non-read-only launch config directory contains no stale local
- * read-only PreToolUse hook entry.
- */
-export function clearAntigravityReadOnlyHookIfPresent(configDir: string): void {
+/** Remove a named hook group from `hooks.json` if present, deleting empty files. */
+export function clearAntigravityHookGroupIfPresent(configDir: string, groupName: string): void {
   const hooksPath = join(configDir, 'hooks.json')
   let st: ReturnType<typeof lstatSync>
   try {
@@ -436,8 +433,8 @@ export function clearAntigravityReadOnlyHookIfPresent(configDir: string): void {
       return
     }
     const obj = parsed as Record<string, unknown>
-    if (!(ANTIGRAVITY_READ_ONLY_HOOK_GROUP in obj)) return
-    delete obj[ANTIGRAVITY_READ_ONLY_HOOK_GROUP]
+    if (!(groupName in obj)) return
+    delete obj[groupName]
     const remainingKeys = Object.keys(obj)
     if (remainingKeys.length === 0) {
       rmSync(hooksPath, { force: true })
@@ -469,6 +466,14 @@ export function clearAntigravityReadOnlyHookIfPresent(configDir: string): void {
   } catch {
     try { rmSync(hooksPath, { force: true }) } catch { /* ignore */ }
   }
+}
+
+/**
+ * Ensure a non-read-only launch config directory contains no stale local
+ * read-only PreToolUse hook entry.
+ */
+export function clearAntigravityReadOnlyHookIfPresent(configDir: string): void {
+  clearAntigravityHookGroupIfPresent(configDir, ANTIGRAVITY_READ_ONLY_HOOK_GROUP)
 }
 
 export const _readOnlyGuardInternals = {

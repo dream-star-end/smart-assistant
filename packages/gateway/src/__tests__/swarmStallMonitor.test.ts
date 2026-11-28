@@ -5,7 +5,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/swarmStallMonitor.test.ts
  */
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -24,6 +24,7 @@ import {
   isSwarmMonitorAgentName,
   type SwarmStallAlert,
   type SwarmStallDiagnosticEvent,
+  type SwarmStallExhaustion,
 } from '../engine/swarmStallMonitor.js'
 import { injectSwarmDirective } from '../swarmCommand.js'
 
@@ -303,10 +304,9 @@ test('OCV5-848: AntigravitySwarmWatcher triggers stall alert even when disk file
         tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }],
       })}\n`,
     )
-    writeFileSync(
-      join(workerLogs, 'transcript.jsonl'),
-      `${JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] })}\n`,
-    )
+    const workerTranscript = join(workerLogs, 'transcript.jsonl')
+    const parkedStep = { step_index: 100, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }
+    writeFileSync(workerTranscript, `${JSON.stringify({ ...parkedStep, created_at: new Date(970_000).toISOString() })}\n`)
     writeFileSync(
       join(swarmDir, 'board.jsonl'),
       [
@@ -317,6 +317,7 @@ test('OCV5-848: AntigravitySwarmWatcher triggers stall alert even when disk file
 
     let fakeNow = 1_000_000
     const alerts: SwarmStallAlert[] = []
+    const diagnostics: SwarmStallDiagnosticEvent[] = []
     const pendingWrites: Promise<unknown>[] = []
     const watcher = new AntigravitySwarmWatcher({
       brainDir,
@@ -324,7 +325,10 @@ test('OCV5-848: AntigravitySwarmWatcher triggers stall alert even when disk file
       pollMs: 20,
       activityThrottleMs: 0,
       now: () => fakeNow,
-      stallMonitor: { stallThresholdMs: 180_000, retryCooldownMs: 540_000, maxAlerts: 3 },
+      stallMonitor: {
+        stallThresholdMs: 180_000, retryCooldownMs: 540_000, maxAlerts: 3,
+        onDiagnostic: (event) => diagnostics.push(event),
+      },
       onSnapshot: () => {},
       onStallDetected: (alert) => {
         alerts.push(alert)
@@ -349,8 +353,18 @@ test('OCV5-848: AntigravitySwarmWatcher triggers stall alert even when disk file
     watcher.start()
     assert.equal(alerts.length, 0)
 
-    // 2. Advance virtual clock past 3 min while disk statSignature stays completely unchanged
-    fakeNow += 185_000
+    // 2. Timestamp-only progress is deduped on wire, but unchanged-disk polls
+    // must continue from that exact sample rather than replay the older activity.
+    fakeNow += 30_000
+    appendFileSync(workerTranscript, `${JSON.stringify({ ...parkedStep, created_at: new Date(fakeNow).toISOString() })}\n`)
+    watcher.kick()
+    assert.equal(diagnostics.at(-1)?.kind, 'activity_postponed')
+    fakeNow += 60_000
+    for (let i = 0; i < 12 && diagnostics.at(-1)?.kind !== 'quiet_waiting'; i += 1) {
+      await new Promise((r) => setTimeout(r, 25))
+    }
+    assert.equal(diagnostics.at(-1)?.idleMs, 60_000, 'quiet ticks must not roll telemetry backwards')
+    fakeNow += 125_000
     for (let i = 0; i < 12 && alerts.length === 0; i += 1) {
       await new Promise((r) => setTimeout(r, 25))
     }
@@ -926,4 +940,389 @@ test('OCV5-887 P2-09: rollbackAlert ignores stale callbacks from an earlier stag
   const stage2Retried = mon.evaluate(stage2, 315_000)
   assert.ok(stage2Retried)
   assert.equal(stage2Retried.attempt, 2)
+})
+
+const VERIFIER_CONV_ID = 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+const NATIVE_COORD_TASK = { seq: 19, agent: 'coordinator', channel: 'main', text: '@worker-a 实现后交给验证员' }
+const NATIVE_HANDOFF_PROGRESS = { seq: 20, agent: 'worker-a', channel: 'main', text: '正在整理变更，随后请 @verifier 验证' }
+const NATIVE_HANDOFF_READY = { seq: 25, agent: 'worker-a', channel: 'main', text: '@verifier ready' }
+const NATIVE_HANDOFF_ACK = { seq: 26, agent: 'verifier', channel: 'main', text: '@worker-a 已接手，正在验证' }
+const NATIVE_HANDOFF_DONE = { seq: 30, agent: 'worker-a', channel: 'main', text: '@coordinator done，验证通过' }
+
+function withNativeHandoff(run: (read: (
+  posts: ReadonlyArray<typeof NATIVE_HANDOFF_READY>, verifyPass?: number, failure?: boolean, coordinatorWoke?: boolean,
+) => SwarmSnapshot) => void): void {
+  const brainDir = mkdtempSync(join(tmpdir(), 'oc-stall-916-'))
+  const swarmDir = join(brainDir, CONV_ID, '.system_generated', 'swarm')
+  let revision = 0
+  function writeTranscript(id: string, steps: object[]) {
+    const dir = join(brainDir, id, '.system_generated', 'logs')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'transcript.jsonl'), `${steps.map((step, step_index) => JSON.stringify({ step_index, ...step })).join('\n')}\n`)
+  }
+  try {
+    mkdirSync(swarmDir, { recursive: true })
+    run((posts, verifyPass = 1, failure = false, coordinatorWoke = false) => {
+      const final = posts.includes(NATIVE_HANDOFF_DONE)
+      const member = (conversation_id: string, role: string, wake_mode: string, last_read_seq: number) => ({
+        conversation_id, role, wake_mode, last_read_seq, last_nudged_seq: last_read_seq,
+        desired_state: 'RUNNING', phase: 'RUNNING',
+      })
+      writeFileSync(join(swarmDir, 'members.json'), JSON.stringify({
+        members: {
+          coordinator: member(CONV_ID, 'coordinator', coordinatorWoke ? 'working' : 'mentions', final ? 30 : 19),
+          'worker-a': member(WORKER_CONV_ID, 'worker', 'working', 25),
+          verifier: member(VERIFIER_CONV_ID, 'verifier', 'working', 25),
+        },
+      }))
+      writeFileSync(join(swarmDir, 'board.jsonl'), `${posts.map((post) => JSON.stringify(post)).join('\n')}\n`)
+      const settledPlanner = { type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] }
+      writeTranscript(CONV_ID, [
+        { type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', args: { since: '19', mentions_only: true } }] },
+        { type: 'GENERIC', status: 'DONE', content: 'Waiting...' },
+        ...(final ? [{ type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[swarm] #30' }] : []),
+        ...(final && !coordinatorWoke ? [settledPlanner] : []),
+      ])
+      writeTranscript(WORKER_CONV_ID, [settledPlanner])
+      writeTranscript(VERIFIER_CONV_ID, [
+        { type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[swarm] #25' },
+        ...Array.from({ length: verifyPass }, () => [
+          { type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'run_command', args: {} }] },
+          { type: 'GENERIC', status: 'DONE', content: 'verification command completed' },
+        ]).flat(),
+        failure ? { type: 'ERROR_MESSAGE', status: 'ERROR', content: 'verification failed' } : settledPlanner,
+      ])
+      const snap = readAntigravitySwarmSnapshot({ brainDir, conversationId: CONV_ID, phase: 'running', revision: ++revision })
+      assert.ok(snap)
+      return snap
+    })
+  } finally {
+    rmSync(brainDir, { recursive: true, force: true })
+  }
+}
+
+test('OCV5-916: native peer handoff survives parked planner tails and monitor posts, until real coordinator mention', () => {
+  const mon = new SwarmStallMonitor({ stallThresholdMs: 180_000, workingStallThresholdMs: 2_400_000 })
+  withNativeHandoff((read) => {
+    const old = [NATIVE_COORD_TASK, NATIVE_HANDOFF_PROGRESS]
+    const ready = [...old, NATIVE_HANDOFF_READY]
+    const accepted = [...ready, NATIVE_HANDOFF_ACK]
+    assert.equal(mon.evaluate(read(old), 0), null)
+    assert.equal(mon.evaluate(read(ready), 20_000), null)
+    const snap = read(accepted)
+    const verifier = snap.members.find((m) => m.role === 'verifier')!
+    assert.equal(verifier.status, 'working')
+    assert.equal(verifier.waitingOnBoard, true, 'native DONE/no-tools planner looks parked')
+    assert.ok(verifier.toolCalls)
+    assert.equal(mon.evaluate(snap, 30_000), null)
+    assert.equal(mon.evaluate(snap, 210_000), null, 'an accepted P2P request is not an unclaimed result or idle fallback')
+
+    const afterMonitorPosts = [
+      ...accepted,
+      ...[27, 28, 29].map((seq) => ({ seq, agent: GATEWAY_STALL_MONITOR_AGENT, channel: 'main', text: '@coordinator [stall]' })),
+    ]
+    const progressed = read(afterMonitorPosts, 2)
+    assert.ok(progressed.members.find((m) => m.role === 'verifier')!.stepCount > verifier.stepCount)
+    assert.equal(mon.evaluate(progressed, 2_420_000), null, 'real transcript progress extends the observation window')
+    assert.equal(mon.evaluate(snap, 2_430_000), null, 'a superseded disk snapshot cannot revive an old candidate or reset quiet')
+    assert.equal(mon.evaluate(progressed, 2_600_000), null)
+
+    const reportPosts = [...afterMonitorPosts, NATIVE_HANDOFF_DONE]
+    const wake = read(reportPosts, 2, false, true)
+    const coordinator = wake.members.find((m) => m.role === 'coordinator')!
+    assert.equal(coordinator.status, 'working')
+    assert.equal(isMemberEffectivelyWaiting(coordinator), false)
+    assert.equal(mon.evaluate(wake, 2_610_000), null)
+    assert.equal(mon.evaluate(wake, 2_790_000), null, 'a genuinely woken coordinator gets time to respond')
+
+    const reported = read(reportPosts, 2)
+    assert.equal(mon.evaluate(reported, 2_800_000), null)
+    const alert = mon.evaluate(reported, 2_980_000)
+    assert.equal(alert?.reason, 'unclaimed_result', 'a real direct coordinator mention requires follow-through even after being read')
+    assert.deepEqual(alert?.citedSeqs, [30])
+    assert.match(alert!.message, /已点名协调者但尚无回复/)
+
+    const completed = read([...afterMonitorPosts, NATIVE_HANDOFF_DONE, {
+      seq: 31, agent: 'coordinator', channel: 'main', text: '[done] 已收口',
+    }])
+    assert.equal(mon.evaluate(completed, 2_990_000), null)
+    assert.equal(mon.evaluate(completed, 5_600_000), null)
+  })
+})
+
+test('OCV5-916: sorted handoff evidence expires and preserves cooldown, budget, and genuine failures', () => {
+  withNativeHandoff((read) => {
+    // An older post discovered after the receipt must not become the head or defeat handoff evidence.
+    const posts = [NATIVE_COORD_TASK, NATIVE_HANDOFF_READY, NATIVE_HANDOFF_ACK, NATIVE_HANDOFF_PROGRESS]
+    const old = read(posts)
+    const snap = read(posts, 2)
+    const mon = new SwarmStallMonitor({
+      stallThresholdMs: 10_000, workingStallThresholdMs: 40_000, retryCooldownMs: 20_000, maxAlerts: 2,
+    })
+    assert.equal(mon.evaluate(snap, 0), null)
+    assert.equal(mon.evaluate(snap, 10_000), null)
+    assert.equal(mon.evaluate(old, 39_999), null, 'replayed progress cannot restart the quiet clock')
+    const expired = mon.evaluate(snap, 40_000)
+    assert.equal(expired?.reason, 'idle_waiting')
+    assert.deepEqual(expired?.citedSeqs, [26])
+    assert.equal(mon.evaluate(snap, 59_999), null)
+    assert.equal(mon.evaluate(snap, 60_000)?.attempt, 2)
+    assert.equal(mon.evaluate(snap, 90_000), null)
+
+    const failed = read(posts, 1, true)
+    assert.equal(mon.evaluate(failed, 100_000), null)
+    assert.equal(mon.evaluate(failed, 110_000)?.reason, 'member_failed')
+  })
+})
+
+test('OCV5-916: no, older, and off-channel verifier replies are not receipt evidence', () => {
+  withNativeHandoff((read) => {
+    for (const reply of [
+      [],
+      [{ ...NATIVE_HANDOFF_ACK, seq: 24 }],
+      [{ ...NATIVE_HANDOFF_ACK, channel: 'other' }],
+    ]) {
+      const mon = new SwarmStallMonitor({ stallThresholdMs: 10_000, workingStallThresholdMs: 40_000 })
+      const snap = read([NATIVE_COORD_TASK, NATIVE_HANDOFF_READY, ...reply])
+      assert.equal(mon.evaluate(snap, 0), null)
+      const alert = mon.evaluate(snap, 10_000)
+      assert.ok(alert)
+      if (reply.length === 0 || reply[0]?.seq === 24) {
+        assert.equal(alert.reason, 'unanswered_mention')
+        assert.deepEqual(alert.citedSeqs, [25])
+      } else {
+        assert.equal(alert.reason, 'unanswered_mention')
+        assert.deepEqual(alert.citedSeqs, [26])
+      }
+    }
+    const mon = new SwarmStallMonitor({ stallThresholdMs: 10_000, workingStallThresholdMs: 40_000 })
+    const snap = read([NATIVE_COORD_TASK, NATIVE_HANDOFF_READY, NATIVE_HANDOFF_ACK, {
+      seq: 27, agent: 'worker-a', channel: 'main', text: '另一个任务已完成，产物在报告中。',
+    }])
+    assert.equal(mon.evaluate(snap, 0), null)
+    const alert = mon.evaluate(snap, 10_000)
+    assert.equal(alert?.reason, 'unclaimed_result')
+    assert.deepEqual(alert?.citedSeqs, [27], 'new unaddressed results must not inherit older handoff coverage')
+  })
+})
+
+test('OCV5-923: emits stall_exhausted once after exhaustedGraceMs when all parked, resets on real progress, and never fires when working or [done]', () => {
+  const diags: SwarmStallDiagnosticEvent[] = []
+  const exhausted: SwarmStallExhaustion[] = []
+  const mon = new SwarmStallMonitor({
+    stallThresholdMs: 60_000,
+    retryCooldownMs: 120_000,
+    exhaustedGraceMs: 120_000,
+    maxAlerts: 3,
+    diagnosticThrottleMs: 0,
+    onDiagnostic: (d) => diags.push(d),
+    onStallExhausted: (e) => exhausted.push(e),
+  })
+  const base = makeSnapshot()
+  assert.equal(mon.isStallSuppressedAllParked(), false)
+
+  // Seed & fire 3 stall alerts
+  assert.equal(mon.evaluate(base, 0), null)
+  const a1 = mon.evaluate(base, 60_000)
+  assert.ok(a1 && a1.attempt === 1)
+  assert.equal(mon.isStallSuppressedAllParked(), false)
+
+  const a2 = mon.evaluate(base, 180_000)
+  assert.ok(a2 && a2.attempt === 2)
+  assert.equal(mon.isStallSuppressedAllParked(), false)
+
+  const a3 = mon.evaluate(base, 300_000)
+  assert.ok(a3 && a3.attempt === 3)
+  assert.equal(mon.isStallSuppressedAllParked(), true, 'all parked after maxAlerts -> suppressed')
+
+  // Rollback below maxAlerts clears isStallSuppressedAllParked()
+  mon.rollbackAlert(a3)
+  assert.equal(mon.isStallSuppressedAllParked(), false)
+  const a3Retry = mon.evaluate(base, 305_000)
+  assert.ok(a3Retry && a3Retry.attempt === 3)
+  assert.equal(mon.isStallSuppressedAllParked(), true)
+
+  // Inside exhaustedGraceMs (305_000 + 60_000 < 305_000 + 120_000): emits suppressed_max_alerts, NOT stall_exhausted
+  assert.equal(mon.evaluate(base, 365_000), null)
+  assert.equal(exhausted.length, 0)
+  assert.ok(diags.some((d) => d.kind === 'suppressed_max_alerts'))
+
+  // Reaching exhaustedGraceMs with workingMembers=[] -> fires stall_exhausted ONCE
+  assert.equal(mon.evaluate(base, 425_000), null)
+  assert.equal(exhausted.length, 1)
+  assert.deepEqual(exhausted[0], {
+    swarmId: CONV_ID,
+    generation: a3Retry.generation,
+    idleMs: 425_000,
+    alertCount: 3,
+    headSeq: 1,
+    waitingMembers: ['coordinator', 'worker-a'],
+    reason: 'max_alerts_exhausted',
+  })
+  assert.ok(diags.some((d) => d.kind === 'stall_exhausted'))
+
+  // Repeated evaluations in same generation must NOT re-fire onStallExhausted
+  assert.equal(mon.evaluate(base, 500_000), null)
+  assert.equal(mon.evaluate(base, 900_000), null)
+  assert.equal(exhausted.length, 1)
+
+  // Genuine business progress resets budget & generation; a future deadlock in the new generation can fire again
+  const resumed: SwarmSnapshot = {
+    ...base,
+    posts: [...base.posts, { seq: 2, agent: 'worker-a', channel: 'main', text: '@coordinator 恢复进展', mentions: ['coordinator'] }],
+    members: [
+      makeMember({ name: 'coordinator', role: 'coordinator', status: 'waiting', lastPostSeq: 1, unreadCount: 1 }),
+      makeMember({ name: 'worker-a', role: 'worker', status: 'waiting', lastPostSeq: 2 }),
+    ],
+    totalPosts: 2,
+  }
+  assert.equal(mon.evaluate(resumed, 910_000), null)
+  assert.equal(mon.isStallSuppressedAllParked(), false)
+  assert.ok(mon.evaluate(resumed, 970_000))
+  assert.ok(mon.evaluate(resumed, 1_090_000))
+  assert.ok(mon.evaluate(resumed, 1_210_000))
+  assert.equal(mon.evaluate(resumed, 1_330_000), null)
+  assert.equal(exhausted.length, 2)
+  assert.ok(exhausted[1]!.generation > exhausted[0]!.generation)
+
+  // Zero false positives: real progress before grace expires cancels exhaustion
+  const cancelledExhausted: SwarmStallExhaustion[] = []
+  const monCancel = new SwarmStallMonitor({
+    stallThresholdMs: 10_000,
+    retryCooldownMs: 20_000,
+    exhaustedGraceMs: 20_000,
+    maxAlerts: 1,
+    onStallExhausted: (e) => cancelledExhausted.push(e),
+  })
+  assert.equal(monCancel.evaluate(base, 0), null)
+  assert.ok(monCancel.evaluate(base, 10_000))
+  assert.equal(monCancel.evaluate(resumed, 25_000), null)
+  assert.equal(monCancel.evaluate(resumed, 30_000), null)
+  assert.equal(cancelledExhausted.length, 0)
+
+  // Zero false positives: stuck working member at maxAlerts NEVER triggers stall_exhausted or isStallSuppressedAllParked
+  const workingExhausted: SwarmStallExhaustion[] = []
+  const monWorking = new SwarmStallMonitor({
+    stallThresholdMs: 10_000,
+    workingStallThresholdMs: 20_000,
+    retryCooldownMs: 20_000,
+    exhaustedGraceMs: 20_000,
+    maxAlerts: 1,
+    onStallExhausted: (e) => workingExhausted.push(e),
+  })
+  const workingSnap = makeSnapshot({
+    members: [
+      makeMember({ name: 'coordinator', role: 'coordinator', status: 'waiting', lastPostSeq: 1 }),
+      makeMember({ name: 'worker-a', role: 'worker', status: 'working', activity: '运行命令', stepCount: 2 }),
+    ],
+  })
+  assert.equal(monWorking.evaluate(workingSnap, 0), null)
+  assert.ok(monWorking.evaluate(workingSnap, 20_000))
+  assert.equal(monWorking.isStallSuppressedAllParked(), false)
+  assert.equal(monWorking.evaluate(workingSnap, 100_000), null)
+  assert.equal(workingExhausted.length, 0)
+
+  // Zero false positives: [done] stage never triggers stall_exhausted
+  const doneExhausted: SwarmStallExhaustion[] = []
+  const monDone = new SwarmStallMonitor({
+    stallThresholdMs: 10_000,
+    retryCooldownMs: 10_000,
+    exhaustedGraceMs: 10_000,
+    maxAlerts: 1,
+    onStallExhausted: (e) => doneExhausted.push(e),
+  })
+  const doneSnap = makeSnapshot({
+    posts: [
+      { seq: 1, agent: 'worker-a', channel: 'main', text: '@coordinator ok', mentions: ['coordinator'] },
+      { seq: 2, agent: 'coordinator', channel: 'main', text: '[done] 完成', mentions: [] },
+    ],
+    totalPosts: 2,
+  })
+  assert.equal(monDone.evaluate(doneSnap, 0), null)
+  assert.equal(monDone.evaluate(doneSnap, 600_000), null)
+  assert.equal(monDone.isStallSuppressedAllParked(), false)
+  assert.equal(doneExhausted.length, 0)
+})
+
+test('OCV5-923: AntigravitySwarmWatcher exposes isStallSuppressedAllParked() and fires onStallExhausted once', async () => {
+  const brainDir = mkdtempSync(join(tmpdir(), 'oc-swarm-exhaust-watcher-'))
+  try {
+    const swarmDir = join(brainDir, CONV_ID, '.system_generated', 'swarm')
+    const coordLogs = join(brainDir, CONV_ID, '.system_generated', 'logs')
+    const workerLogs = join(brainDir, WORKER_CONV_ID, '.system_generated', 'logs')
+    mkdirSync(swarmDir, { recursive: true })
+    mkdirSync(coordLogs, { recursive: true })
+    mkdirSync(workerLogs, { recursive: true })
+    writeFileSync(
+      join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: '耗尽回调测试',
+        members: {
+          coordinator: { conversation_id: CONV_ID, role: 'coordinator', wake_mode: 'mentions', last_read_seq: 1, killed: false },
+          'worker-a': { conversation_id: WORKER_CONV_ID, role: 'worker', wake_mode: 'mentions', last_read_seq: 1, killed: false },
+        },
+      }),
+    )
+    writeFileSync(
+      join(swarmDir, 'board.jsonl'),
+      `${JSON.stringify({ seq: 1, agent: 'coordinator', channel: 'main', text: '@worker-a run' })}\n`,
+    )
+    writeFileSync(
+      join(coordLogs, 'transcript.jsonl'),
+      `${JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', args: { since: 1 } }] })}\n`,
+    )
+    writeFileSync(
+      join(workerLogs, 'transcript.jsonl'),
+      `${JSON.stringify({ step_index: 0, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [] })}\n`,
+    )
+
+    let fakeNow = 500_000
+    const alerts: SwarmStallAlert[] = []
+    const exhausted: SwarmStallExhaustion[] = []
+    const watcher = new AntigravitySwarmWatcher({
+      brainDir,
+      conversationId: CONV_ID,
+      pollMs: 15,
+      now: () => fakeNow,
+      stallMonitor: {
+        stallThresholdMs: 10_000,
+        retryCooldownMs: 20_000,
+        exhaustedGraceMs: 20_000,
+        maxAlerts: 2,
+      },
+      onSnapshot: () => {},
+      onStallDetected: (a) => alerts.push(a),
+      onStallExhausted: (e) => {
+        exhausted.push(e)
+        throw new Error('observer boom must be isolated')
+      },
+    })
+    watcher.start()
+    assert.equal(watcher.isStallSuppressedAllParked(), false)
+
+    fakeNow += 12_000
+    for (let i = 0; i < 20 && alerts.length < 1; i += 1) await new Promise((r) => setTimeout(r, 15))
+    assert.equal(alerts.length, 1)
+    assert.equal(watcher.isStallSuppressedAllParked(), false)
+
+    fakeNow += 25_000
+    for (let i = 0; i < 20 && alerts.length < 2; i += 1) await new Promise((r) => setTimeout(r, 15))
+    assert.equal(alerts.length, 2)
+    assert.equal(watcher.isStallSuppressedAllParked(), true)
+    assert.equal(exhausted.length, 0)
+
+    fakeNow += 25_000
+    for (let i = 0; i < 20 && exhausted.length < 1; i += 1) await new Promise((r) => setTimeout(r, 15))
+    assert.equal(exhausted.length, 1)
+    assert.equal(exhausted[0]!.reason, 'max_alerts_exhausted')
+
+    // Extra ticks never re-emit
+    fakeNow += 60_000
+    await new Promise((r) => setTimeout(r, 50))
+    assert.equal(exhausted.length, 1)
+    watcher.stop()
+    assert.equal(watcher.isStallSuppressedAllParked(), false)
+  } finally {
+    rmSync(brainDir, { recursive: true, force: true })
+  }
 })

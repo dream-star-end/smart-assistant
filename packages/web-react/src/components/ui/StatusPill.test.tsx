@@ -21,11 +21,19 @@ describe("StatusPill 点形态", () => {
     expect(dot).toHaveClass("bg-status-running", "oc-status-breathe");
   });
 
-  it("未读和运行中同色调,但未读不呼吸", () => {
+  it("未读走 done 绿点语义色调且不呼吸", () => {
     render(<StatusPill status="unread" />);
     const dot = screen.getByRole("img", { name: "未读" });
-    expect(dot).toHaveClass("bg-status-running");
+    expect(dot).toHaveClass("bg-status-done");
+    expect(dot).toHaveAttribute("data-tone", "done");
     expect(dot).not.toHaveClass("oc-status-breathe");
+  });
+
+  it("status=done 点形态复用 iconTone 渲染为 bg-status-done 绿点", () => {
+    render(<StatusPill status="done" variant="dot" label="已完成" />);
+    const dot = screen.getByRole("img", { name: "已完成" });
+    expect(dot).toHaveClass("bg-status-done");
+    expect(dot).toHaveAttribute("data-tone", "done");
   });
 
   it("md:失败 / 需要处理带柔光晕,ring 形态是细线旋转环", () => {

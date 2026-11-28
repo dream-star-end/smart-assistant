@@ -26,13 +26,11 @@ import {
   type RemoteReleaseDrainCoordinator,
   getMasterRemoteReleaseDrainCoordinator,
   isReservedVerificationSessionKey,
-  legacyBindingEngineForAuthority,
-  legacyProfileEngineForAuthority,
-  loadRemoteDriverRegistry,
   placeRemoteDriverLane,
   recordRemoteDriverLaneState,
   recordRemoteDriverNativeSession,
   recordRemoteDriverStartAttempt,
+  selectSelfhostRemoteDriverViaUnifiedRouter,
   startRemoteReleaseDrainSocketServer,
 } from '../account-pool/remotePool/index.js'
 
@@ -62,70 +60,33 @@ const BASE_ROOT = '/run/oc-cc5-t1555u'
  */
 async function resolveDriverV4Selection(
   pool: ReturnType<typeof getPool>,
-  request: { uid: number; sessionKey: string; canonicalModel: string; engine?: 'ccb' | 'codex' | 'antigravity' },
+  request: {
+    uid: number
+    sessionKey: string
+    canonicalModel: string
+    engine?: 'ccb' | 'codex' | 'antigravity'
+    allowStickyFailover?: boolean
+  },
 ): Promise<string | null> {
-  const authEngine = request.engine ?? 'ccb'
-  const legacyBindEngine = legacyBindingEngineForAuthority(authEngine)
-  const legacyProfEngine = legacyProfileEngineForAuthority(authEngine)
-  const regMap = loadRemoteDriverRegistry()
-  const stickyRows = (
-    await pool.query<{ driver_id: string | null }>(
-      `SELECT driver_id
-         FROM remote_agent_bindings
-        WHERE uid = $1
-          AND session_key = $2
-          AND driver_id IS NOT NULL
-          AND engine = $3
-        ORDER BY updated_at DESC
-        LIMIT 8`,
-      [String(request.uid), request.sessionKey, legacyBindEngine],
-    )
-  ).rows
-  for (const sticky of stickyRows) {
-    const did = sticky?.driver_id ? String(sticky.driver_id) : ''
-    if (did && regMap.get(did)?.authorityEngine === authEngine) {
-      return did
-    }
+  const selected = await selectSelfhostRemoteDriverViaUnifiedRouter(pool, {
+    selfhost: true,
+    uid: request.uid,
+    sessionKey: request.sessionKey,
+    canonicalModel: request.canonicalModel,
+    engine: request.engine,
+    ...(request.allowStickyFailover === true ? { allowStickyFailover: true } : {}),
+  })
+  if (selected.bindingStatus === 'read_error') {
+    console.warn('[selfhost] logical model binding read error during unified router selection', {
+      canonicalModel: request.canonicalModel,
+      sessionKey: request.sessionKey,
+      error: selected.bindingReadError ?? 'unknown',
+      fallbackSource: selected.source,
+      selectedDriverId: selected.driverId,
+      selectedProfileId: selected.selectedProfileId ?? null,
+    })
   }
-
-  const offer = (
-    await pool.query<{ driver_id: string }>(
-      `SELECT p.driver_id
-         FROM remote_model_offers o
-         JOIN remote_agent_profiles p ON p.id = o.profile_id
-         JOIN remote_agent_nodes n ON n.id = p.node_id
-        WHERE o.canonical_model_id = $1
-          AND o.enabled = TRUE
-          AND p.driver_id IS NOT NULL
-          AND p.engine = $2
-          AND p.status IN ('active', 'degraded')
-          AND (p.disabled_by IS NULL OR p.disabled_by <> 'admin')
-          AND n.status IN ('active', 'degraded')
-          AND (n.disabled_by IS NULL OR n.disabled_by <> 'admin')
-          AND (
-            p.execution_ready = TRUE
-            OR p.verified_fingerprint IS NOT NULL
-            OR NOT EXISTS (
-              SELECT 1
-                FROM remote_model_offers o_leg
-                JOIN remote_agent_profiles p_leg ON p_leg.id = o_leg.profile_id
-                JOIN remote_agent_nodes n_leg ON n_leg.id = p_leg.node_id
-               WHERE o_leg.canonical_model_id = $1
-                 AND o_leg.enabled = TRUE
-                 AND p_leg.driver_id IS NULL
-                 AND p_leg.engine = $2
-                 AND p_leg.status IN ('active', 'degraded')
-                 AND (p_leg.disabled_by IS NULL OR p_leg.disabled_by <> 'admin')
-                 AND n_leg.status IN ('active', 'degraded')
-                 AND (n_leg.disabled_by IS NULL OR n_leg.disabled_by <> 'admin')
-            )
-          )
-        ORDER BY p.execution_ready DESC, p.weight DESC, p.id ASC
-        LIMIT 1`,
-      [request.canonicalModel, legacyProfEngine],
-    )
-  ).rows[0]
-  return offer?.driver_id ?? null
+  return selected.driverId
 }
 
 export const DEFAULT_REMOTE_RELAY_STATE_FILE =

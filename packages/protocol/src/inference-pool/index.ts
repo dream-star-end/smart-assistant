@@ -47,3 +47,21 @@ export {
   validateTurnReceiptV5,
   validateUnifiedTurnRequest,
 } from './validators.js'
+
+export {
+  AUTHORITY_ENGINE_TO_INFERENCE_FAMILY,
+  DEFAULT_RECEIPT_V5_DRIVER_VERSION,
+  DEFAULT_TURN_RECEIPT_V5_USAGE_SEMANTICS,
+  authorityEngineToInferenceFamily,
+  buildTurnReceiptV5FromLocalOutcome,
+  buildTurnReceiptV5FromRemoteV4,
+  inferEngineFamilyFromIdentifier,
+  verifyDualPoolReceiptParity,
+} from './receiptBridge.js'
+
+export type {
+  BuildTurnReceiptV5FromLocalOutcomeInput,
+  BuildTurnReceiptV5FromRemoteV4Input,
+  DualPoolReceiptParityOptions,
+  DualPoolReceiptParityResult,
+} from './receiptBridge.js'

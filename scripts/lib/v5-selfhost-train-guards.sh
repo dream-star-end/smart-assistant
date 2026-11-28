@@ -372,67 +372,192 @@ v5_selfhost_check_blast_radius() { # <target-sha> [base-ref] [target-branch]
   if [[ -z "$branch" ]]; then
     branch="$("${g[@]}" symbolic-ref -q --short HEAD 2>/dev/null || true)"
   fi
-  [[ -n "$branch" ]] || branch="feat/v5-selfhost"
+  # B3: Unresolved branch MUST fail-closed (never silently assume feat/v5-selfhost!)
+  [[ -n "$branch" ]] \
+    || _v5_tg_die "[blast-radius] 无法解析目标分支（HEAD 处于 detached 且未传入 branch / OC_V5_TARGET_BRANCH），按 fail-closed 拒绝正向切流"
 
   base_ref="$(_v5_selfhost_resolve_diff_base "$sha" "$base_ref")"
-  local -a changed_files=()
-  local diff_out="" f=""
+  # B3: Lossless NUL-delimited path extraction via git diff -z --name-status (including BOTH old+new paths for Rename/Copy!)
+  local tmp_nul_files="" file_count="0"
+  tmp_nul_files="$(mktemp "${TMPDIR:-/tmp}/oc-blast-nul.XXXXXX")"
+  local diff_err="" diff_rc=0
+  set +e
   if [[ -n "$base_ref" ]]; then
-    if ! diff_out="$("${g[@]}" diff --name-only "${base_ref}...${sha}" 2>&1)"; then
-      _v5_tg_die "[blast-radius] git diff ${base_ref}...${sha} 失败，拒绝以空清单跳过爆破半径校验 (fail-closed): ${diff_out:0:300}"
-    fi
+    diff_err="$("${g[@]}" diff -z --name-status "${base_ref}...${sha}" 2>&1 >"$tmp_nul_files.raw")"
+    diff_rc=$?
   else
-    if ! diff_out="$("${g[@]}" show --pretty="" --name-only "$sha" 2>&1)"; then
-      _v5_tg_die "[blast-radius] git show --name-only ${sha} 失败，拒绝以空清单跳过爆破半径校验 (fail-closed): ${diff_out:0:300}"
-    fi
+    diff_err="$("${g[@]}" diff-tree --no-commit-id --root -r -z --name-status "$sha" 2>&1 >"$tmp_nul_files.raw")"
+    diff_rc=$?
   fi
-  while IFS= read -r f; do
-    [[ -n "$f" ]] && changed_files+=("$f")
-  done <<<"$diff_out"
-
-  # 若存在 pinned candidate release 目录，用其作为 --repo-root 确保 SQL 扫描读的是精确候选提交内容而非脏工作树
-  local scan_root="${CUTOVER_REL:-}"
-  local tmp_sql_root=""
-  if [[ -z "$scan_root" || ! -d "$scan_root" ]]; then
-    # 从目标 commit 导出变更的 .sql 文件到临时目录，彻底防止脏工作树 SQL 掩盖目标提交里的破坏性 DDL
-    local has_sql=0
-    for f in "${changed_files[@]}"; do
-      if [[ "$f" == *.sql || "$f" == */migrations/* ]]; then has_sql=1; break; fi
-    done
-    if [[ "$has_sql" == 1 ]]; then
-      tmp_sql_root="$(mktemp -d "${TMPDIR:-/tmp}/oc-blast-sql.XXXXXX")"
-      for f in "${changed_files[@]}"; do
-        if [[ "$f" == *.sql || "$f" == */migrations/* ]] && "${g[@]}" cat-file -e "${sha}:${f}" 2>/dev/null; then
-          mkdir -p "$tmp_sql_root/$(dirname -- "$f")"
-          "${g[@]}" show "${sha}:${f}" >"$tmp_sql_root/$f"
-        fi
-      done
-      scan_root="$tmp_sql_root"
-    else
-      scan_root="$REPO_ROOT"
-    fi
+  set -e
+  if (( diff_rc != 0 )); then
+    rm -f -- "$tmp_nul_files" "$tmp_nul_files.raw" 2>/dev/null || true
+    _v5_tg_die "[blast-radius] git diff ${base_ref:+${base_ref}...}${sha} 失败，拒绝以空清单跳过爆破半径校验 (fail-closed): ${diff_err:0:300}"
   fi
+  file_count="$(python3 - "$tmp_nul_files.raw" "$tmp_nul_files" <<'PY'
+import pathlib, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+toks = raw.split(b"\x00")
+paths = []
+seen = set()
+i = 0
+while i < len(toks):
+    if not toks[i]:
+        i += 1
+        continue
+    status = toks[i].decode("utf-8", errors="replace")
+    i += 1
+    if status.startswith(("R", "C")):
+        if i + 1 < len(toks):
+            for p in (toks[i], toks[i + 1]):
+                if p and p not in seen:
+                    seen.add(p)
+                    paths.append(p)
+            i += 2
+    else:
+        if i < len(toks):
+            p = toks[i]
+            if p and p not in seen:
+                seen.add(p)
+                paths.append(p)
+            i += 1
+pathlib.Path(sys.argv[2]).write_bytes((b"\x00".join(paths) + b"\x00") if paths else b"")
+print(len(paths))
+PY
+)"
+  rm -f -- "$tmp_nul_files.raw" 2>/dev/null || true
 
-  local -a args=(check-blast-radius --branch "$branch" --repo-root "$scan_root")
+  # OCV5-914: 优先使用 REPO_ROOT + --sha（oc-governor 直接从 git commit 对象读 SQL 与精确 diff，免疫脏工作树且支持非核心计费语义降噪）
+  local scan_root="${REPO_ROOT:-.}"
+  local -a args=(check-blast-radius --branch "$branch" --repo-root "$scan_root" --files-nul)
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    args+=(--sha "$sha")
+  fi
+  if [[ -n "$base_ref" ]]; then
+    args+=(--base-ref "$base_ref")
+  fi
   if [[ -n "${OC_V5_BLAST_VOUCHER:-}" ]]; then
     args+=(--voucher "$OC_V5_BLAST_VOUCHER")
   fi
-  if (( ${#changed_files[@]} > 0 )); then
-    args+=(--files "${changed_files[@]}")
-  fi
 
-  local out="" rc=0
-  out="$(OC_GOVERNOR_ROOT="$(v5_selfhost_governor_root)" "$gov_bin" "${args[@]}" 2>&1)" || rc=$?
-  if [[ -n "$tmp_sql_root" && -d "$tmp_sql_root" ]]; then
-    rm -rf -- "$tmp_sql_root"
-  fi
+  local out="" rc=0 gov_root_eff=""
+  gov_root_eff="$(v5_selfhost_governor_root)"
+  out="$(OC_GOVERNOR_ROOT="$gov_root_eff" "$gov_bin" "${args[@]}" <"$tmp_nul_files" 2>&1)" || rc=$?
+  rm -f -- "$tmp_nul_files" 2>/dev/null || true
   if (( rc != 0 )); then
-    _v5_tg_die "[blast-radius] 宿主 oc-governor 拒绝正向切流 (branch=$branch, sha=${sha:0:12}, files=${#changed_files[@]}):
+    local block_meta="" block_code="" block_cls="" scope_tag="" scope_arg="" approval_id=""
+    local -a blocked_files=()
+    block_meta="$(python3 - "$out" <<'PY' 2>/dev/null || true
+import json, sys
+raw = sys.argv[1].strip()
+doc = None
+for line in reversed(raw.splitlines()):
+    line = line.strip()
+    if line.startswith("{") and line.endswith("}"):
+        try:
+            doc = json.loads(line)
+            break
+        except Exception:
+            pass
+if not isinstance(doc, dict):
+    sys.exit(0)
+code = str(doc.get("code") or "")
+cls = str(doc.get("classification") or "")
+ddl = [str(x) for x in (doc.get("ddlFiles") or []) if x and x != "<inline-sql>"]
+bill = [str(x) for x in (doc.get("billingFiles") or []) if x]
+files = sorted(set(ddl + bill))
+if ddl and bill:
+    stag, sarg = "ddl-billing", "ddl+billing"
+elif code == "DESTRUCTIVE_DDL_LOCKED" or ddl:
+    stag, sarg = "ddl", "ddl"
+else:
+    stag, sarg = "billing", "billing"
+print(f"{code}\t{cls}\t{stag}\t{sarg}")
+for f in files:
+    print(f)
+PY
+)"
+    if [[ -n "$block_meta" ]]; then
+      local first_line=1 line=""
+      while IFS= read -r line; do
+        if [[ "$first_line" == 1 ]]; then
+          IFS=$'\t' read -r block_code block_cls scope_tag scope_arg <<<"$line"
+          first_line=0
+        elif [[ -n "$line" ]]; then
+          blocked_files+=("$line")
+        fi
+      done <<<"$block_meta"
+    fi
+
+    # B1: 绝不为 absolute_reject / COMMERCIAL_BRANCH_HARD_LOCK 建审批单！
+    # NB4: 仅在 record-pending-approval 实际返回 exit 0 时才打印 approvalId 与 /admin/#tab=governance！
+    if [[ "$block_cls" == "human_review_required" ]] && [[ "$block_code" == "BILLING_CORE_LOCKED" || "$block_code" == "DESTRUCTIVE_DDL_LOCKED" ]]; then
+      local sha_short="${sha:0:12}"
+      [[ "$sha_short" =~ ^[0-9a-f]{4,12}$ ]] || sha_short="unknown"
+      approval_id="gov-${scope_tag:-blast}-${sha_short}"
+      local risk_category="ux_degradation"
+      if [[ "$block_code" == "BILLING_CORE_LOCKED" ]]; then
+        risk_category="billing_change"
+      fi
+      local -a rec_args=(
+        record-pending-approval
+        --id "$approval_id"
+        --kind blast_voucher
+        --code "$block_code"
+        --classification human_review_required
+        --risk-category "$risk_category"
+        --branch "$branch"
+        --scope "${scope_arg:-billing}"
+        --repo-root "$REPO_ROOT"
+        --total-files "$file_count"
+      )
+      if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+        rec_args+=(--sha "$sha")
+      fi
+      if [[ -n "$base_ref" ]]; then
+        rec_args+=(--base-ref "$base_ref")
+      fi
+      if [[ -n "${LEASE_TRAIN_ID:-}" ]]; then
+        rec_args+=(--train "$LEASE_TRAIN_ID")
+      fi
+      if [[ -n "${OC_V5_TICKET_ID:-}" ]]; then
+        rec_args+=(--ticket "$OC_V5_TICKET_ID")
+      fi
+      # B3: Lossless JSON array transport of blocked files (preserves spaces, commas, special chars; rejects control chars)
+      local blocked_json="[]"
+      blocked_json="$(python3 - "$out" <<'PY' 2>/dev/null || echo "[]"
+import json, sys
+raw = sys.argv[1].strip()
+doc = None
+for line in reversed(raw.splitlines()):
+    s = line.strip()
+    if s.startswith("{") and s.endswith("}"):
+        try: doc = json.loads(s); break
+        except Exception: pass
+if not isinstance(doc, dict):
+    print("[]"); sys.exit(0)
+ddl = [x for x in (doc.get("ddlFiles") or []) if isinstance(x, str) and x and x != "<inline-sql>"]
+bill = [x for x in (doc.get("billingFiles") or []) if isinstance(x, str) and x]
+print(json.dumps(sorted(set(ddl + bill)), ensure_ascii=False))
+PY
+)"
+      if [[ "$blocked_json" != "[]" ]]; then
+        rec_args+=(--files-json "$blocked_json")
+      fi
+      if OC_GOVERNOR_ROOT="$gov_root_eff" "$gov_bin" "${rec_args[@]}" >/dev/null 2>&1; then
+        _v5_tg_die "[blast-radius] 宿主 oc-governor 拒绝正向切流 (branch=$branch, sha=${sha:0:12}, files=${file_count}, approvalId=${approval_id}):
+$out
+待拍板审批单: approvalId=${approval_id} — 请前往管理后台 /admin/#tab=governance 一键拍板放行或驳回。
+补救: 禁止触碰商业分支 feat/v5-aurora-rewrite；若涉及破坏性 DDL 或计费核心变更，可在 /admin/#tab=governance 批准 ${approval_id}，或由宿主机 root 签发凭证 oc-governor issue-blast-voucher 并通过 OC_V5_BLAST_VOUCHER 传入。"
+      fi
+    fi
+
+    _v5_tg_die "[blast-radius] 宿主 oc-governor 拒绝正向切流 (branch=$branch, sha=${sha:0:12}, files=${file_count}):
 $out
 补救: 禁止触碰商业分支 feat/v5-aurora-rewrite；若涉及破坏性 DDL 或计费核心变更，须由宿主机 root 签发凭证 oc-governor issue-blast-voucher 并通过 OC_V5_BLAST_VOUCHER 传入。"
   fi
-  tsum_note blastRadius "passed:${branch}:${#changed_files[@]}" 2>/dev/null || :
-  _v5_tg_log "  ✓ [blast-radius] oc-governor 校验通过 (branch=$branch, files=${#changed_files[@]})"
+  tsum_note blastRadius "passed:${branch}:${file_count}" 2>/dev/null || :
+  _v5_tg_log "  ✓ [blast-radius] oc-governor 校验通过 (branch=$branch, files=${file_count})"
 }
 
 # ── 5. 发车/切流前置可信 CI 事件绿灯硬门 (B5 / B7 / Non-blocker 2) ───────────
@@ -613,6 +738,12 @@ v5_selfhost_enforce_forward_cutover_guards() { # <target-sha> [base-ref] [target
   if [[ "${CUTOVER_ROLLBACK:-0}" == 1 ]]; then
     _v5_tg_log "  ⚠ [forward-guards] --rollback 已验证回滚血缘，放行应急回滚豁免 (${sha:0:12})"
     return 0
+  fi
+  # B6: Hard-bind execution to OC_V5_EXPECTED_HEAD when set by governance resume!
+  if [[ -n "${OC_V5_EXPECTED_HEAD:-}" ]]; then
+    if [[ ! "$OC_V5_EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ || "$sha" != "$OC_V5_EXPECTED_HEAD" ]]; then
+      _v5_tg_die "[expected-head] 目标提交已漂移 (target=${sha:0:12}, expected=${OC_V5_EXPECTED_HEAD:0:12})，拒绝执行正向切流！"
+    fi
   fi
   v5_selfhost_check_governor_mode "$sha" "$base_ref"
   v5_selfhost_check_blast_radius "$sha" "$base_ref" "$branch"
@@ -925,4 +1056,115 @@ v5_selfhost_post_cutover_retention_gate() { # <release-path> <40-hex-sha>
   fi
   _v5_tg_log "✗ 切流后置行为保留集 FAIL 且回滚失败/旧 live 不健康 (ret_rc=$rc rb_rc=$rb_rc verify_rc=$verify_rc): 已转入 recovery_required"
   return 79
+}
+
+# ── 10. OCV5-918 正向切流 committed 后自动刷新外置裁判（清掉已消费 transition-audited 切回 live-sync）──
+# Fail-safe：绝不触发已 committed 发布回滚，失败/缺失/不可信仅告警并返回非 0，由调用方 || cutover_clog 吸收。
+v5_selfhost_post_committed_sync_referee() { # <committed-rel> [head-sha]
+  local rel="${1:-}" sha="${2:-}"
+  if [[ "${CUTOVER_ROLLBACK:-0}" == 1 || "${DRY:-0}" == 1 ]]; then
+    return 0
+  fi
+  if [[ "${OC_V5_POST_COMMITTED_SYNC_REFEREE_ENABLED:-1}" == 0 ]]; then
+    _v5_tg_log "  · [post-committed-referee] OC_V5_POST_COMMITTED_SYNC_REFEREE_ENABLED=0，跳过切流后外置裁判刷新"
+    return 0
+  fi
+  local gov_root="" sync_bin="" live_link="${MASTER_LIVE_LINK:-/opt/openclaude/openclaude-v5-selfhost-live}"
+  local ref_root="" committed_sha="" live_canon="" rel_canon="" trans_file="" trans_sha=""
+  gov_root="$(v5_selfhost_governor_root)"
+  sync_bin="${OC_V5_SYNC_REFEREE_BIN:-${gov_root}/bin/sync-referee}"
+  ref_root="${OC_V5_REFEREE_ROOT:-${gov_root}/referee}"
+
+  live_canon="$(readlink -f -- "$live_link" 2>/dev/null || true)"
+  if [[ -n "$rel" ]]; then
+    rel_canon="$(readlink -f -- "$rel" 2>/dev/null || true)"
+    if [[ "$live_canon" != "$rel_canon" ]]; then
+      _v5_tg_log "  ⚠ [post-committed-referee] live 已指向其他版本 (live=${live_canon:-<empty>} ≠ rel=${rel_canon:-$rel})，跳过延迟的外置裁判刷新"
+      tsum_note postCommittedSyncReferee "skipped:live-moved" 2>/dev/null || :
+      return 0
+    fi
+  fi
+
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    committed_sha="$sha"
+  else
+    local complete_src=""
+    if [[ -n "$rel" && -f "$rel/.complete" && ! -L "$rel/.complete" ]]; then
+      complete_src="$rel/.complete"
+    elif [[ -n "$live_canon" && -f "$live_canon/.complete" && ! -L "$live_canon/.complete" ]]; then
+      complete_src="$live_canon/.complete"
+    fi
+    if [[ -n "$complete_src" ]]; then
+      committed_sha="$(python3 - "$complete_src" <<'PY' 2>/dev/null || true
+import json, re, sys
+try:
+    doc = json.load(open(sys.argv[1], encoding="utf-8"))
+    s = str(doc.get("sourceCommit") or "").strip() if isinstance(doc, dict) else ""
+    if re.fullmatch(r"[0-9a-f]{40}", s):
+        print(s)
+except Exception:
+    pass
+PY
+)"
+    fi
+  fi
+
+  trans_file="${ref_root%/}/TRANSITION_APPROVAL.json"
+  if [[ -e "$trans_file" || -L "$trans_file" ]]; then
+    trans_sha="$(python3 - "$trans_file" <<'PY' 2>/dev/null || true
+import json, re, sys
+try:
+    doc = json.load(open(sys.argv[1], encoding="utf-8"))
+    s = doc.get("targetSha") if isinstance(doc, dict) else ""
+    if isinstance(s, str) and re.fullmatch(r"[0-9a-f]{40}", s):
+        print(s)
+except Exception:
+    pass
+PY
+)"
+    if [[ -z "$committed_sha" || -z "$trans_sha" || "$trans_sha" != "$committed_sha" ]]; then
+      _v5_tg_log "  ⚠ [post-committed-referee] 外置裁判当前持有其他提交的过渡审批 (transition=${trans_sha:-<invalid>}, committed=${committed_sha:-<empty>})，保留不覆盖"
+      tsum_note postCommittedSyncReferee "skipped:other-transition" 2>/dev/null || :
+      return 0
+    fi
+  fi
+
+  if [[ -L "$sync_bin" || ! -f "$sync_bin" || ! -x "$sync_bin" ]]; then
+    _v5_tg_log "  ⚠ [post-committed-referee] 跳过外置裁判刷新: 缺少可执行普通文件 $sync_bin（已 committed 发布不受影响）"
+    tsum_note postCommittedSyncReferee "warn:missing-bin" 2>/dev/null || :
+    return 1
+  fi
+  if [[ "$(id -u)" == 0 && "$sync_bin" == /opt/openclaude/* ]] || [[ "${OC_V5_SYNC_REFEREE_REQUIRE_ROOT:-0}" == 1 ]]; then
+    local uid="" mode=""
+    read -r uid mode < <(stat -Lc '%u %a' -- "$sync_bin" 2>/dev/null || echo '999999 777')
+    if [[ "$uid" != 0 ]] || [[ ! "$mode" =~ ^[0-7]+$ ]] || (( (8#$mode & 8#022) != 0 )); then
+      _v5_tg_log "  ⚠ [post-committed-referee] 跳过外置裁判刷新: 属主/权限不可信(uid=$uid mode=$mode): $sync_bin（已 committed 发布不受影响）"
+      tsum_note postCommittedSyncReferee "warn:untrusted-bin" 2>/dev/null || :
+      return 1
+    fi
+  fi
+
+  local -a sync_args=(--live-link "$live_link")
+  if [[ "$committed_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    sync_args+=(--preserve-other-transition "$committed_sha" --expected-live-sha "$committed_sha")
+  fi
+  local out="" rc=0
+  out="$(
+    OC_GOVERNOR_ROOT="$gov_root" \
+    MASTER_LIVE_LINK="$live_link" \
+    "$sync_bin" "${sync_args[@]}" 2>&1
+  )" || rc=$?
+  if (( rc == 0 )); then
+    if grep -qE '"skipped"[[:space:]]*:[[:space:]]*true' <<<"$out"; then
+      tsum_note postCommittedSyncReferee "skipped" 2>/dev/null || :
+      _v5_tg_log "  ⚠ [post-committed-referee] 外置裁判同步已按原子锁复核跳过 (live=$live_link${rel:+, rel=$rel}${committed_sha:+, sha=${committed_sha:0:12}}, detail=$out)"
+      return 0
+    fi
+    tsum_note postCommittedSyncReferee "ok" 2>/dev/null || :
+    _v5_tg_log "  ✓ [post-committed-referee] 外置裁判已自动同步为 live-sync (live=$live_link${rel:+, rel=$rel}${committed_sha:+, sha=${committed_sha:0:12}}${out:+, summary=$out})"
+    return 0
+  fi
+  tsum_note postCommittedSyncReferee "warn:rc=$rc" 2>/dev/null || :
+  _v5_tg_log "  ⚠ [post-committed-referee] 外置裁判刷新失败 (rc=$rc, bin=$sync_bin, live=$live_link${rel:+, rel=$rel}${committed_sha:+, sha=${committed_sha:0:12}}；已 committed 发布不回滚): ${out:-<no output>}"
+  return "$rc"
 }

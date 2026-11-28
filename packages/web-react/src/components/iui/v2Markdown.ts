@@ -76,5 +76,12 @@ export function v2ToMarkdown(spec: V2Spec, values?: Record<string, string>): str
         ...(spec.url ? [`页面：${spec.url}`] : []),
         ...(spec.reason ? [spec.reason] : []),
       ].join("\n");
+    case "governance_approval":
+      return [
+        "**审批单操作卡片**",
+        "",
+        `审批单号：\`${spec.approvalId}\``,
+        "当前视图不支持交互操作，请在应用内查看并核验最新状态。",
+      ].join("\n");
   }
 }

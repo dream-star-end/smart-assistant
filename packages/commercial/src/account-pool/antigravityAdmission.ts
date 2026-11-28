@@ -60,7 +60,7 @@ export async function admitAntigravityTurn(
     allowedModelIds?: readonly string[]
     /** Optional admission-frozen pricing override for delegate relay budget checks (OCV5-897 B2). */
     pricingOverride?: AntigravityRelayPricingOverride
-    /** When true (delegation, OCV5-897 B3), fail closed with ANTIGRAVITY_NO_ACCOUNT when pool is full. */
+    /** Delegate admission: hard per-minute limit; only commercial also hard-limits concurrent turns. */
     strictCapacity?: boolean
   },
   deps: {

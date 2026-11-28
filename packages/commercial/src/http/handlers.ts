@@ -142,7 +142,7 @@ import { communityBlogEnabled } from "../tutorials/tutorialImages.js";
 import { tutorialModerationMode } from "../tutorials/tutorialModerationQueue.js";
 
 export interface CommercialHttpDeps {
-  codexCommissioning?: import('../account-pool/codexCommissioning.js').CodexCommissioning
+  codexCommissioning?: import('../account-pool/codexCommissioning.js').CodexCommissioning; selfhostGovernance?: import('../admin/selfhostGovernanceService.js').SelfhostGovernanceService
   remoteDriverV4?: import('../account-pool/remotePool/commissioningService.js').RemoteDriverV4CommissioningService
   sessionMetadataRead?: typeof readSessionMetadata
   modelSwitchCost?: import('../billing/modelSwitchCost.js').ModelSwitchCostService;

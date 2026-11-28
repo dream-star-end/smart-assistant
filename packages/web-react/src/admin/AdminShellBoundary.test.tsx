@@ -7,12 +7,16 @@ let currentTab = 'broken'
 function Broken(): never {
   throw new Error('page render failed')
 }
+const mockGetPage = (tab: string) =>
+  tab === 'broken'
+    ? { title: '坏页', Component: Broken }
+    : { title: '总览', Component: () => <div>总览内容</div> }
+
 vi.mock('./registry', () => ({
   adminGroups: [],
-  getAdminPage: (tab: string) =>
-    tab === 'broken'
-      ? { title: '坏页', Component: Broken }
-      : { title: '总览', Component: () => <div>总览内容</div> },
+  getAdminPage: (tab: string) => mockGetPage(tab),
+  getVisibleAdminGroups: () => [],
+  getVisibleAdminPage: (tab: string) => mockGetPage(tab),
 }))
 vi.mock('./router', () => ({
   useAdminRoute: () => ({ tab: currentTab, navigate: vi.fn() }),

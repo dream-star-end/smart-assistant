@@ -16,6 +16,7 @@ import {
   ScrollText,
   Server,
   Settings,
+  ShieldAlert,
   ShieldCheck,
   ShoppingCart,
   Store,
@@ -73,6 +74,8 @@ export type AdminPage = {
   /** 一句话描述（侧栏 tooltip + 页头副标题）。 */
   desc: string;
   icon: LucideIcon;
+  /** 仅在个人版自托管控制面启用时展示于侧栏（商业版自动隐藏防泄漏）。 */
+  selfhostOnly?: boolean;
   Component: LazyExoticComponent<ComponentType>;
 };
 
@@ -121,7 +124,22 @@ export const adminPages: AdminPage[] = [
   { key: "audit", title: "审计与安全", group: "审计与安全", desc: "管理操作、安全事件与主机审计", icon: History, Component: lz(() => import("./pages/audit")) },
 ];
 
-/** tab key 白名单（路由回落判定）。 */
+/** 个人版自托管专属页：不进默认 28 商业通用页列表，仅在服务端探测确认启用后按需注入。 */
+export const SELFHOST_GOVERNANCE_PAGE: AdminPage = {
+  key: "governance",
+  title: "自治治理",
+  group: "审计与安全",
+  desc: "零看码审批台、物理总闸开关、熔断解锁与健康驾驶舱",
+  icon: ShieldAlert,
+  selfhostOnly: true,
+  Component: lz(() => import("./pages/governance")),
+};
+
+export type AdminVisibilityOptions = {
+  selfhostGovernance?: boolean;
+};
+
+/** tab key 白名单（路由回落判定；默认仅含 28 个商业通用页）。 */
 export const adminTabKeys = new Set(adminPages.map((p) => p.key));
 
 /** Retired tab keys still reached by old links / bookmarks → their current tab. */
@@ -133,7 +151,26 @@ export function getAdminPage(tab: string): AdminPage {
   return adminPages.find((p) => p.key === key) ?? adminPages[0];
 }
 
-/** 按 ADMIN_GROUP_ORDER 分组后的页面（侧栏渲染用）。 */
+/** 按可见性解析当前页；未确认个人版治理启用时，深链 `#tab=governance` 强制回落 dashboard。 */
+export function getVisibleAdminPage(tab: string, opts?: AdminVisibilityOptions): AdminPage {
+  const key = ADMIN_TAB_ALIASES[tab] ?? tab;
+  if (opts?.selfhostGovernance && key === SELFHOST_GOVERNANCE_PAGE.key) {
+    return SELFHOST_GOVERNANCE_PAGE;
+  }
+  return getAdminPage(key);
+}
+
+/** 按 ADMIN_GROUP_ORDER 分组后的页面（默认 28 商业通用页）。 */
 export const adminGroups: { group: AdminGroup; pages: AdminPage[] }[] = ADMIN_GROUP_ORDER.map(
   (group) => ({ group, pages: adminPages.filter((p) => p.group === group) }),
 );
+
+/** 按可见性生成侧栏分组（商业版恒为 28 通用页，零功能存在性泄漏）。 */
+export function getVisibleAdminGroups(opts?: AdminVisibilityOptions): { group: AdminGroup; pages: AdminPage[] }[] {
+  if (!opts?.selfhostGovernance) return adminGroups;
+  return adminGroups.map((entry) =>
+    entry.group === SELFHOST_GOVERNANCE_PAGE.group
+      ? { ...entry, pages: [...entry.pages, SELFHOST_GOVERNANCE_PAGE] }
+      : entry,
+  );
+}

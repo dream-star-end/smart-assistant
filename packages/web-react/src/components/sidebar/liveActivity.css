@@ -80,13 +80,13 @@
 }
 
 .oc-live-strip-pill[data-bucket="unread_done"] {
-  color: var(--muted);
+  color: var(--success);
 }
 
 .oc-live-strip-pill[data-bucket="unread_done"][aria-pressed="true"] {
-  background: var(--hover);
-  border-color: var(--border);
-  color: var(--fg);
+  background: var(--success-soft);
+  border-color: color-mix(in srgb, var(--success) 24%, transparent);
+  color: var(--success);
 }
 
 .oc-live-strip-pill-count {

@@ -33,7 +33,7 @@ import {
 import { createLogger } from '../logger.js'
 import { type McpMemoryLaunch, resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
 import { getPlatformPrompt } from '../platformPrompts.js'
-import { atomicWriteJsonFile, buildCursorEfficiencyHooks } from '../efficiencyHookConfig.js'
+import { atomicWriteJsonFile, buildCursorEfficiencyHooks, isEfficiencyBrokerHookRequired, resolveActiveEfficiencyBrokerHook } from '../efficiencyHookConfig.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
@@ -720,7 +720,7 @@ interface TurnCtx {
   assistantPartialText: string; pendingAssistantText: string | null
   assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
   lastContentKind: 'text' | 'thinking' | null
-  contextDir: string | null
+  contextDir: string | null; revokeBrokerHook: (() => void) | null
   rawToSafeToolId: Map<string, string>; safeToRawToolId: Map<string, string>; fallbackToolSequence: number
   sessionIdEmitted: boolean
   promptInputsKey: string | null
@@ -1876,12 +1876,9 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.stopPendingKeepalive()
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), silentToolIds: new Set(), presentOptionsCount: 0, stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, creditExhausted: false, error: null, resultSeen: false, resultDetail: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, promptInputsKey: null, elidedPlatformContext: false, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), silentToolIds: new Set(), presentOptionsCount: 0, stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, creditExhausted: false, error: null, resultSeen: false, resultDetail: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, lastContentKind: null, contextDir: null, revokeBrokerHook: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, promptInputsKey: null, elidedPlatformContext: false, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { ctx.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => {
-      // Only ever settle this turn's own barrier: shutdown() may have already
-      // abandoned it, in which case `active` and `drain` belong to a later turn
-      // that this failure says nothing about.
       if (!ctx.abandoned) {
         this.stopPendingKeepalive()
         this.cleanupContextDir(ctx)
@@ -1908,6 +1905,8 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     }
   }
   private cleanupContextDir(ctx: TurnCtx): void {
+    ctx.revokeBrokerHook?.()
+    ctx.revokeBrokerHook = null
     const contextDir = ctx.contextDir
     ctx.contextDir = null
     if (!contextDir || !this.ownedContextDirs.has(contextDir)) return
@@ -1920,10 +1919,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       const info = lstatSync(contextDir)
       if (info.isSymbolicLink() || !info.isDirectory()) return
       rmSync(contextDir, { recursive: true, force: true })
-    } catch {
-      // Cleanup is intentionally best-effort and fenced. Never broaden the
-      // deletion target after a validation/stat failure.
-    }
+    } catch { /* best-effort fenced cleanup */ }
   }
   private prepareCursorChatsDir(): string {
     const dir = cursorChatsRoot()
@@ -2182,17 +2178,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       }
 
       if (resumeId !== null) env.OPENCLAUDE_CURSOR_RESUME_ID = resumeId
-      try {
-        const hooks = buildCursorEfficiencyHooks()
-        if (hooks) {
-          const hooksFile = resolve(contextDir, 'hooks.json')
-          atomicWriteJsonFile(hooksFile, hooks, 0o600)
-          chmodSync(hooksFile, 0o600)
-          env.OPENCLAUDE_CURSOR_HOOKS_JSON = hooksFile
-        }
-      } catch (err) {
-        log.warn('failed to write cursor efficiency hooks', { sessionKey: this.opts.sessionKey }, err)
-      }
+      await this.setupTurnEfficiencyHooks(ctx, contextDir, env, discoveryCwd)
 
       const args = [
         ...(selected.upstreamModel === null ? [] : ['--model', selected.upstreamModel]),
@@ -2273,6 +2259,20 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     } catch (err) {
       this.cleanupContextDir(ctx)
       throw err
+    }
+  }
+  private async setupTurnEfficiencyHooks(ctx: TurnCtx, contextDir: string, env: NodeJS.ProcessEnv, workspaceCwd: string): Promise<void> {
+    const brokerRequired = isEfficiencyBrokerHookRequired()
+    let brokerHook: Awaited<ReturnType<typeof resolveActiveEfficiencyBrokerHook>> = null
+    try {
+      brokerHook = await resolveActiveEfficiencyBrokerHook({ protocol: 'cursor', sessionKey: this.opts.sessionKey, gatewayPort: this.opts.config.gateway.port, readOnly: Boolean(ctx.params.readOnly), hermeticNoTools: Boolean(this.opts.hermeticNoTools), workspaceCwd })
+      if (brokerRequired && !brokerHook) throw new Error('missing selfhost broker hook binding')
+      ctx.revokeBrokerHook = brokerHook?.revoke ?? null
+      const hooks = buildCursorEfficiencyHooks(undefined, undefined, brokerHook ? { brokerApprovalActive: true, brokerHook } : undefined)
+      if (brokerRequired && !hooks) throw new Error('missing cursor efficiency hooks config')
+      if (hooks) { const hooksFile = resolve(contextDir, 'hooks.json'); atomicWriteJsonFile(hooksFile, hooks, 0o600); chmodSync(hooksFile, 0o600); env.OPENCLAUDE_CURSOR_HOOKS_JSON = hooksFile }
+    } catch (err) {
+      brokerHook?.revoke(); ctx.revokeBrokerHook = null; if (brokerRequired) throw new Error(`TOOL_BROKER_HOOK_SETUP_FAILED: ${err instanceof Error ? err.message : String(err)}`); log.warn('failed to write cursor efficiency hooks', { sessionKey: this.opts.sessionKey }, err)
     }
   }
   private emitText(ctx: TurnCtx, kind: 'text' | 'thinking', value: unknown, separate = false): void {
