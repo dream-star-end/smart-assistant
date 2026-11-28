@@ -35,6 +35,22 @@ import type { ImageAnnotationSource } from "../components/ImageAnnotationEditor"
 import type { UseChatSocket } from "./useChatSocket";
 import type { ToastFn } from "../components/ui/Toast";
 
+function persistFirstTurnSwarmMode(opts: {
+  sessionId: string;
+  effectiveSwarmMode: boolean;
+  originalSessionId: string | undefined;
+  materializedDraft: boolean;
+  slashSwarmMatched: boolean;
+  modelIsAntigravity: boolean;
+}): void {
+  const isFirstTurnForSession = !opts.originalSessionId || opts.materializedDraft;
+  if (opts.effectiveSwarmMode && (isFirstTurnForSession || opts.slashSwarmMatched)) {
+    writeSessionSwarmMode(opts.sessionId, true);
+  } else if (isFirstTurnForSession && opts.modelIsAntigravity && !opts.effectiveSwarmMode) {
+    writeSessionSwarmMode(opts.sessionId, false);
+  }
+}
+
 export type ComposerSendInput = {
   activeId: string | undefined;
   authorizeSwitch?: AuthorizeSwitch;
@@ -409,9 +425,7 @@ export function useComposerSend({
         ...(effectiveTurnTier ? { serviceTier: effectiveTurnTier } : {}),
       });
       if(sent===false || !recoveryIdentityIsCurrent())return false;
-      if (effectiveSwarmMode && (!originalSessionId || Boolean(slashSwarm?.matched))) {
-        writeSessionSwarmMode(sessionId, true);
-      }
+      persistFirstTurnSwarmMode({ sessionId, effectiveSwarmMode, originalSessionId, materializedDraft, slashSwarmMatched: Boolean(slashSwarm?.matched), modelIsAntigravity });
       // Fee confirmation keeps ownership of the draft until the send is accepted.
       if (createdSession && recoveryIsCurrent()) {
         promoteDraftCollab(sessionId, latestCollab, false);
