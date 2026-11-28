@@ -538,31 +538,38 @@ _skip_command_wrappers() {
 }
 
 # Shared option/subcommand scanner for package runners (npm / bun / pnpm / yarn).
+# Respects `--` as end-of-options (positional arguments after `--` are STILL captured!).
 # Args: <two_arg_opts_csv_with_colons> <args...>
 _scan_pkg_subcommands() {
   local two_arg_opts="$1"
   shift
   _PKG_SUB=""
   _PKG_SUB2=""
-  local words=("$@") len=${#words[@]} j=0 tok
+  local words=("$@") len=${#words[@]} j=0 end_opts=0 tok
   while (( j < len )); do
     tok="${words[j]}"
-    if [[ "$two_arg_opts" == *":${tok}:"* ]]; then
-      (( j += 2 )); continue
-    fi
-    case "$tok" in
-      --) break ;;
-      -*) (( j += 1 )); continue ;;
-      *)
-        if [[ -z "$_PKG_SUB" ]]; then
-          _PKG_SUB="$tok"
-        elif [[ -z "$_PKG_SUB2" ]]; then
-          _PKG_SUB2="$tok"
-          break
-        fi
+    if (( !end_opts )); then
+      if [[ "$tok" == "--" ]]; then
+        end_opts=1
         (( j += 1 ))
-        ;;
-    esac
+        continue
+      fi
+      if [[ "$two_arg_opts" == *":${tok}:"* ]]; then
+        (( j += 2 ))
+        continue
+      fi
+      if [[ "$tok" == -* ]]; then
+        (( j += 1 ))
+        continue
+      fi
+    fi
+    if [[ -z "$_PKG_SUB" ]]; then
+      _PKG_SUB="$tok"
+    elif [[ -z "$_PKG_SUB2" ]]; then
+      _PKG_SUB2="$tok"
+      break
+    fi
+    (( j += 1 ))
   done
 }
 

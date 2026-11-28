@@ -116,29 +116,52 @@ EOF
   printf '[Unit]\nDescription=newer egress\n[Service]\nExecStart=/opt/openclaude/rel-newer/egress\n' \
     >"${box}/systemd/openclaude-v5-selfhost-egress@.service"
 
-  # Managed runtime drop-in directories (all 11) + 1 UNMANAGED runtime dir
-  local d
-  for d in \
-    cloudflared-oc.service.d \
-    cloudflared-v5-selfhost.service.d \
-    openclaude-v5-selfhost-egress@A.service.d \
-    openclaude-v5-selfhost-egress@B.service.d \
-    openclaude-v5-selfhost-frontdoor.service.d \
-    openclaude-v5-selfhost@A.service.d \
-    openclaude-v5-selfhost@B.service.d \
-    openclaude.service.d \
-    postgresql@16-main.service.d \
-    redis-server.service.d \
-    user-0.slice.d \
-    unrelated-custom.service.d; do
-    mkdir -p "${box}/runtime/${d}"
-    printf '[Service]\nCPUWeight=100\n' >"${box}/runtime/${d}/50-CPUWeight.conf"
-    printf '[Service]\nMemoryLow=64M\n' >"${box}/runtime/${d}/50-MemoryLow.conf"
-  done
+  # Seed exact registered 2026-11-28 temporary --runtime drop-ins (matching RUNTIME_MIGRATION_LEDGER)
+  mkdir -p \
+    "${box}/runtime/cloudflared-oc.service.d" \
+    "${box}/runtime/cloudflared-v5-selfhost.service.d" \
+    "${box}/runtime/openclaude-v5-selfhost-egress@B.service.d" \
+    "${box}/runtime/openclaude-v5-selfhost-frontdoor.service.d" \
+    "${box}/runtime/openclaude-v5-selfhost@A.service.d" \
+    "${box}/runtime/openclaude.service.d" \
+    "${box}/runtime/postgresql@16-main.service.d" \
+    "${box}/runtime/redis-server.service.d" \
+    "${box}/runtime/user-0.slice.d" \
+    "${box}/runtime/unrelated-custom.service.d"
 
-  # Unreplaced QoS runtime cap on postgresql@16-main (postgresql@16-main.service.conf has NO MemoryMax= -> MUST be preserved!)
+  printf '[Service]\nCPUWeight=500\n' >"${box}/runtime/cloudflared-oc.service.d/50-CPUWeight.conf"
+  printf '[Service]\nIOWeight=500\n'  >"${box}/runtime/cloudflared-oc.service.d/50-IOWeight.conf"
+  printf '[Service]\nCPUWeight=1000\n' >"${box}/runtime/cloudflared-v5-selfhost.service.d/50-CPUWeight.conf"
+  printf '[Service]\nIOWeight=1000\n'  >"${box}/runtime/cloudflared-v5-selfhost.service.d/50-IOWeight.conf"
+  printf '[Service]\nMemoryLow=134217728\n' >"${box}/runtime/cloudflared-v5-selfhost.service.d/50-MemoryLow.conf"
+  printf '[Service]\nCPUWeight=500\n' >"${box}/runtime/openclaude-v5-selfhost-egress@B.service.d/50-CPUWeight.conf"
+  printf '[Service]\nIOWeight=500\n'  >"${box}/runtime/openclaude-v5-selfhost-egress@B.service.d/50-IOWeight.conf"
+  printf '[Service]\nCPUWeight=1000\n' >"${box}/runtime/openclaude-v5-selfhost-frontdoor.service.d/50-CPUWeight.conf"
+  printf '[Service]\nIOWeight=1000\n'  >"${box}/runtime/openclaude-v5-selfhost-frontdoor.service.d/50-IOWeight.conf"
+  printf '[Service]\nMemoryLow=134217728\n' >"${box}/runtime/openclaude-v5-selfhost-frontdoor.service.d/50-MemoryLow.conf"
+  printf '[Service]\nCPUWeight=1000\n' >"${box}/runtime/openclaude-v5-selfhost@A.service.d/50-CPUWeight.conf"
+  printf '[Service]\nIOWeight=1000\n'  >"${box}/runtime/openclaude-v5-selfhost@A.service.d/50-IOWeight.conf"
+  printf '[Service]\nMemoryLow=805306368\n' >"${box}/runtime/openclaude-v5-selfhost@A.service.d/50-MemoryLow.conf"
+  printf '[Service]\nIOWeight=500\n'  >"${box}/runtime/openclaude.service.d/50-IOWeight.conf"
+  printf '[Service]\nMemoryLow=268435456\n' >"${box}/runtime/openclaude.service.d/50-MemoryLow.conf"
+  printf '[Service]\nCPUWeight=800\n' >"${box}/runtime/postgresql@16-main.service.d/50-CPUWeight.conf"
+  printf '[Service]\nIOWeight=800\n'  >"${box}/runtime/postgresql@16-main.service.d/50-IOWeight.conf"
+  printf '[Service]\nMemoryLow=1073741824\n' >"${box}/runtime/postgresql@16-main.service.d/50-MemoryLow.conf"
+  printf '[Service]\nCPUWeight=500\n' >"${box}/runtime/redis-server.service.d/50-CPUWeight.conf"
+  printf '[Service]\nIOWeight=500\n'  >"${box}/runtime/redis-server.service.d/50-IOWeight.conf"
+  printf '[Service]\nMemoryLow=134217728\n' >"${box}/runtime/redis-server.service.d/50-MemoryLow.conf"
+  printf '[Slice]\nCPUWeight=10\n' >"${box}/runtime/user-0.slice.d/50-CPUWeight.conf"
+  printf '[Slice]\nIOWeight=10\n'  >"${box}/runtime/user-0.slice.d/50-IOWeight.conf"
+  printf '[Service]\nCPUWeight=100\n' >"${box}/runtime/unrelated-custom.service.d/50-CPUWeight.conf"
+
+  # Custom/stricter runtime overrides that MUST NEVER be relaxed or deleted:
+  # 1) user-0.slice MemoryMax=4G (stricter than persistent MemoryMax=9G -> MUST be preserved!)
+  printf '[Slice]\nMemoryMax=4G\n' >"${box}/runtime/user-0.slice.d/50-MemoryMax.conf"
+  # 2) openclaude.service custom CPUWeight=200 (value != registered 500 -> MUST be preserved!)
+  printf '[Service]\nCPUWeight=200\n' >"${box}/runtime/openclaude.service.d/50-CPUWeight.conf"
+  # 3) postgresql@16-main MemoryMax=4G (not in persistent conf -> MUST be preserved!)
   printf '[Service]\nMemoryMax=4G\n' >"${box}/runtime/postgresql@16-main.service.d/50-MemoryMax.conf"
-  # Non-QoS runtime property file inside a MANAGED runtime directory (MUST be preserved!)
+  # 4) openclaude.service non-QoS TasksMax=4096 (MUST be preserved!)
   printf '[Service]\nTasksMax=4096\n' >"${box}/runtime/openclaude.service.d/50-TasksMax.conf"
 
   # Legacy tsc queue script
@@ -277,36 +300,39 @@ grep -Fxq 'MemoryMin=64M' "${BOX1}/systemd/openclaude-v5-selfhost-frontdoor.serv
   && pass "service drop-ins carry aligned dual-slot-safe QoS directives" \
   || fail "service drop-ins missing expected QoS directives"
 
-# Verified-replacement runtime cleanup:
-# - Replaced props removed and empty dirs rmdir'd
-# - user-0.slice.d/50-MemoryLow.conf NOT in user-0.slice.conf -> preserved! (only CPUWeight replaced)
-# - postgresql@16-main.service.d/50-MemoryMax.conf NOT in postgresql@16-main.service.conf -> preserved!
-# - openclaude.service.d/50-TasksMax.conf (non-QoS) -> preserved!
-# - unrelated-custom.service.d -> preserved!
+# Ledger-verified runtime cleanup:
+# - Exact registered legacy runtime files removed and empty dirs rmdir'd
+# - Stricter user-0.slice MemoryMax=4G (vs persistent 9G) MUST be preserved (never relaxed!)
+# - Custom unmatched openclaude.service CPUWeight=200 (vs ledger 500) MUST be preserved!
+# - Unreplaced postgresql@16-main MemoryMax=4G MUST be preserved!
+# - Non-QoS openclaude.service TasksMax=4096 & unrelated-custom.service.d MUST be preserved!
 rt_ok=1
 for d in \
   cloudflared-oc.service.d \
   cloudflared-v5-selfhost.service.d \
-  openclaude-v5-selfhost-egress@A.service.d \
   openclaude-v5-selfhost-egress@B.service.d \
   openclaude-v5-selfhost-frontdoor.service.d \
   openclaude-v5-selfhost@A.service.d \
-  openclaude-v5-selfhost@B.service.d \
   redis-server.service.d; do
   [[ ! -e "${BOX1}/runtime/${d}" ]] || rt_ok=0
 done
 [[ ! -e "${BOX1}/runtime/postgresql@16-main.service.d/50-CPUWeight.conf" ]] || rt_ok=0
+[[ ! -e "${BOX1}/runtime/postgresql@16-main.service.d/50-IOWeight.conf" ]] || rt_ok=0
 [[ ! -e "${BOX1}/runtime/postgresql@16-main.service.d/50-MemoryLow.conf" ]] || rt_ok=0
 [[ -f "${BOX1}/runtime/postgresql@16-main.service.d/50-MemoryMax.conf" ]] || rt_ok=0
 grep -Fxq 'MemoryMax=4G' "${BOX1}/runtime/postgresql@16-main.service.d/50-MemoryMax.conf" || rt_ok=0
 [[ ! -e "${BOX1}/runtime/user-0.slice.d/50-CPUWeight.conf" ]] || rt_ok=0
-[[ -f "${BOX1}/runtime/user-0.slice.d/50-MemoryLow.conf" ]] || rt_ok=0
-[[ ! -e "${BOX1}/runtime/openclaude.service.d/50-CPUWeight.conf" ]] || rt_ok=0
+[[ ! -e "${BOX1}/runtime/user-0.slice.d/50-IOWeight.conf" ]] || rt_ok=0
+[[ -f "${BOX1}/runtime/user-0.slice.d/50-MemoryMax.conf" ]] || rt_ok=0
+grep -Fxq 'MemoryMax=4G' "${BOX1}/runtime/user-0.slice.d/50-MemoryMax.conf" || rt_ok=0
+[[ ! -e "${BOX1}/runtime/openclaude.service.d/50-IOWeight.conf" ]] || rt_ok=0
 [[ ! -e "${BOX1}/runtime/openclaude.service.d/50-MemoryLow.conf" ]] || rt_ok=0
+[[ -f "${BOX1}/runtime/openclaude.service.d/50-CPUWeight.conf" ]] || rt_ok=0
+grep -Fxq 'CPUWeight=200' "${BOX1}/runtime/openclaude.service.d/50-CPUWeight.conf" || rt_ok=0
 [[ -f "${BOX1}/runtime/openclaude.service.d/50-TasksMax.conf" ]] || rt_ok=0
 grep -Fxq 'TasksMax=4096' "${BOX1}/runtime/openclaude.service.d/50-TasksMax.conf" || rt_ok=0
 [[ -f "${BOX1}/runtime/unrelated-custom.service.d/50-CPUWeight.conf" ]] || rt_ok=0
-assert_eq "verified-replacement cleanup preserves unreplaced postgresql MemoryMax, user-0 MemoryLow, TasksMax & unrelated dirs" "1" "$rt_ok"
+assert_eq "ledger cleanup removes exact legacy files and preserves stricter user-0 MemoryMax=4G, custom CPUWeight=200, pg MemoryMax=4G & TasksMax" "1" "$rt_ok"
 
 # Verify legacy /run/v5-tsc-queue.py removed when service confirmed inactive
 [[ ! -e "${BOX1}/run/v5-tsc-queue.py" ]] \
@@ -473,16 +499,16 @@ PATH="${TMP}/fakebin:${PATH}" bash "$INSTALLER" --verify \
 assert_eq "verify (red): user-0.slice memory.max=max fails" "1" "$rc"
 seed_cgroup_valid "${BOX1}/cgroup"
 
-# Counterexample H: leftover managed runtime QoS drop-in file -> MUST FAIL
+# Counterexample H: leftover registered legacy runtime QoS drop-in file -> MUST FAIL
 mkdir -p "${BOX1}/runtime/openclaude-v5-selfhost@A.service.d"
-printf '[Service]\nMemoryLow=128M\n' >"${BOX1}/runtime/openclaude-v5-selfhost@A.service.d/50-MemoryLow.conf"
+printf '[Service]\nMemoryLow=805306368\n' >"${BOX1}/runtime/openclaude-v5-selfhost@A.service.d/50-MemoryLow.conf"
 rc=0
 PATH="${TMP}/fakebin:${PATH}" bash "$INSTALLER" --verify \
   --systemd-dir "${BOX1}/systemd" \
   --runtime-control-dir "${BOX1}/runtime" \
   --cgroup-root "${BOX1}/cgroup" \
   --tsc-queue-script "${BOX1}/run/v5-tsc-queue.py" >/dev/null 2>&1 || rc=$?
-assert_eq "verify (red): leftover managed runtime QoS file fails" "1" "$rc"
+assert_eq "verify (red): leftover registered legacy runtime QoS file fails" "1" "$rc"
 rm -rf -- "${BOX1}/runtime/openclaude-v5-selfhost@A.service.d"
 
 # Counterexample I: legacy single-slot openclaude-v5-selfhost.service coexisting with dual-slot slices

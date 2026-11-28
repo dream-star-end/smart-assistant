@@ -69,30 +69,56 @@ DROPIN_MAPPINGS=(
   'openclaude-v5-selfhost-remote-relay@.service.conf|openclaude-v5-selfhost-remote-relay@.service'
 )
 
-# Runtime drop-in dir -> authoritative persistent replacement unit name & repo source file.
-# Only properties actually declared by that unit's persistent drop-in may be cleaned.
-RUNTIME_MIGRATION_MAP=(
-  'cloudflared-oc.service.d|cloudflared-oc.service|cloudflared-oc.service.conf'
-  'cloudflared-v5-selfhost.service.d|cloudflared-v5-selfhost.service|cloudflared-v5-selfhost.service.conf'
-  'openclaude-v5-selfhost-egress@A.service.d|openclaude-v5-selfhost-egress@.service|openclaude-v5-selfhost-egress@.service.conf'
-  'openclaude-v5-selfhost-egress@B.service.d|openclaude-v5-selfhost-egress@.service|openclaude-v5-selfhost-egress@.service.conf'
-  'openclaude-v5-selfhost-frontdoor.service.d|openclaude-v5-selfhost-frontdoor.service|openclaude-v5-selfhost-frontdoor.service.conf'
-  'openclaude-v5-selfhost@A.service.d|openclaude-v5-selfhost@.service|openclaude-v5-selfhost@.service.conf'
-  'openclaude-v5-selfhost@B.service.d|openclaude-v5-selfhost@.service|openclaude-v5-selfhost@.service.conf'
-  'openclaude.service.d|openclaude.service|openclaude.service.conf'
-  'postgresql@16-main.service.d|postgresql@16-main.service|postgresql@16-main.service.conf'
-  'redis-server.service.d|redis-server.service|redis-server.service.conf'
-  'user-0.slice.d|user-0.slice|user-0.slice.conf'
+# Registered 2026-11-28 temporary --runtime migration ledger:
+#   runtime_dir | persistent_unit | repo_dropin_file | prop_name | expected_legacy_value
+# ONLY runtime drop-in files whose (dir, prop, value) EXACTLY match this ledger AND
+# whose persistent 10-v5-selfhost-qos.conf declares `<prop>=` may be auto-removed.
+# Any custom or stricter runtime cap (e.g. user-0.slice MemoryMax=4G or postgresql MemoryMax=4G)
+# is preserved untouched with a warning so --apply can NEVER relax an existing tighter limit.
+RUNTIME_MIGRATION_LEDGER=(
+  'cloudflared-oc.service.d|cloudflared-oc.service|cloudflared-oc.service.conf|CPUWeight|500'
+  'cloudflared-oc.service.d|cloudflared-oc.service|cloudflared-oc.service.conf|IOWeight|500'
+  'cloudflared-v5-selfhost.service.d|cloudflared-v5-selfhost.service|cloudflared-v5-selfhost.service.conf|CPUWeight|1000'
+  'cloudflared-v5-selfhost.service.d|cloudflared-v5-selfhost.service|cloudflared-v5-selfhost.service.conf|IOWeight|1000'
+  'cloudflared-v5-selfhost.service.d|cloudflared-v5-selfhost.service|cloudflared-v5-selfhost.service.conf|MemoryLow|134217728'
+  'openclaude-v5-selfhost-egress@A.service.d|openclaude-v5-selfhost-egress@.service|openclaude-v5-selfhost-egress@.service.conf|CPUWeight|500'
+  'openclaude-v5-selfhost-egress@A.service.d|openclaude-v5-selfhost-egress@.service|openclaude-v5-selfhost-egress@.service.conf|IOWeight|500'
+  'openclaude-v5-selfhost-egress@B.service.d|openclaude-v5-selfhost-egress@.service|openclaude-v5-selfhost-egress@.service.conf|CPUWeight|500'
+  'openclaude-v5-selfhost-egress@B.service.d|openclaude-v5-selfhost-egress@.service|openclaude-v5-selfhost-egress@.service.conf|IOWeight|500'
+  'openclaude-v5-selfhost-frontdoor.service.d|openclaude-v5-selfhost-frontdoor.service|openclaude-v5-selfhost-frontdoor.service.conf|CPUWeight|1000'
+  'openclaude-v5-selfhost-frontdoor.service.d|openclaude-v5-selfhost-frontdoor.service|openclaude-v5-selfhost-frontdoor.service.conf|IOWeight|1000'
+  'openclaude-v5-selfhost-frontdoor.service.d|openclaude-v5-selfhost-frontdoor.service|openclaude-v5-selfhost-frontdoor.service.conf|MemoryLow|134217728'
+  'openclaude-v5-selfhost@A.service.d|openclaude-v5-selfhost@.service|openclaude-v5-selfhost@.service.conf|CPUWeight|1000'
+  'openclaude-v5-selfhost@A.service.d|openclaude-v5-selfhost@.service|openclaude-v5-selfhost@.service.conf|IOWeight|1000'
+  'openclaude-v5-selfhost@A.service.d|openclaude-v5-selfhost@.service|openclaude-v5-selfhost@.service.conf|MemoryLow|805306368'
+  'openclaude-v5-selfhost@B.service.d|openclaude-v5-selfhost@.service|openclaude-v5-selfhost@.service.conf|CPUWeight|1000'
+  'openclaude-v5-selfhost@B.service.d|openclaude-v5-selfhost@.service|openclaude-v5-selfhost@.service.conf|IOWeight|1000'
+  'openclaude-v5-selfhost@B.service.d|openclaude-v5-selfhost@.service|openclaude-v5-selfhost@.service.conf|MemoryLow|805306368'
+  'openclaude.service.d|openclaude.service|openclaude.service.conf|CPUWeight|500'
+  'openclaude.service.d|openclaude.service|openclaude.service.conf|IOWeight|500'
+  'openclaude.service.d|openclaude.service|openclaude.service.conf|MemoryLow|268435456'
+  'postgresql@16-main.service.d|postgresql@16-main.service|postgresql@16-main.service.conf|CPUWeight|800'
+  'postgresql@16-main.service.d|postgresql@16-main.service|postgresql@16-main.service.conf|IOWeight|800'
+  'postgresql@16-main.service.d|postgresql@16-main.service|postgresql@16-main.service.conf|MemoryLow|1073741824'
+  'redis-server.service.d|redis-server.service|redis-server.service.conf|CPUWeight|500'
+  'redis-server.service.d|redis-server.service|redis-server.service.conf|IOWeight|500'
+  'redis-server.service.d|redis-server.service|redis-server.service.conf|MemoryLow|134217728'
+  'user-0.slice.d|user-0.slice|user-0.slice.conf|CPUWeight|10'
+  'user-0.slice.d|user-0.slice|user-0.slice.conf|IOWeight|10'
 )
 
-MANAGED_RUNTIME_QOS_PROPS=(
-  'CPUWeight'
-  'IOWeight'
-  'MemoryLow'
-  'MemoryMin'
-  'MemoryHigh'
-  'MemoryMax'
-  'MemorySwapMax'
+MANAGED_RUNTIME_DIRS=(
+  'cloudflared-oc.service.d'
+  'cloudflared-v5-selfhost.service.d'
+  'openclaude-v5-selfhost-egress@A.service.d'
+  'openclaude-v5-selfhost-egress@B.service.d'
+  'openclaude-v5-selfhost-frontdoor.service.d'
+  'openclaude-v5-selfhost@A.service.d'
+  'openclaude-v5-selfhost@B.service.d'
+  'openclaude.service.d'
+  'postgresql@16-main.service.d'
+  'redis-server.service.d'
+  'user-0.slice.d'
 )
 
 usage() {
@@ -210,13 +236,44 @@ prop_has_verified_replacement() { # <unit_name> <src_name> <prop> <allow_planned
   grep -Eq "^[[:space:]]*${prop}=" "$check_file"
 }
 
-runtime_file_will_be_removed() { # <unit_name> <src_name> <filename> <allow_planned:0|1>
-  local unit_name="$1" src_name="$2" fname="$3" allow_planned="$4" prop
-  for prop in "${MANAGED_RUNTIME_QOS_PROPS[@]}"; do
-    if [[ "$fname" == "50-${prop}.conf" ]]; then
-      prop_has_verified_replacement "$unit_name" "$src_name" "$prop" "$allow_planned"
-      return $?
+# Extract single `<prop>=<val>` assignment from a runtime drop-in file.
+# Returns 0 and prints value only when the file contains exactly ONE non-comment
+# key=value assignment and its key equals `<prop>`.
+read_single_runtime_prop_value() { # <file> <prop>
+  local file="$1" prop="$2" line key val found=0
+  [[ -r "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line//$'\r'/}"
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# || "$line" =~ ^[[:space:]]*\[.*\][[:space:]]*$ ]] && continue
+    if [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_]+)=(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      val="${BASH_REMATCH[2]}"
+      val="${val#"${val%%[![:space:]]*}"}"
+      val="${val%"${val##*[![:space:]]}"}"
+      if [[ "$key" != "$prop" ]] || (( found == 1 )); then
+        return 1
+      fi
+      found=1
+    else
+      return 1
     fi
+  done <"$file"
+  (( found == 1 )) || return 1
+  printf '%s' "$val"
+}
+
+runtime_file_matches_ledger() { # <rt_dir> <fname> <allow_planned:0|1>
+  local want_dir="$1" fname="$2" allow_planned="$3"
+  local entry rt_dir unit_name src_name prop expected_val target got_val
+  for entry in "${RUNTIME_MIGRATION_LEDGER[@]}"; do
+    IFS='|' read -r rt_dir unit_name src_name prop expected_val <<<"$entry"
+    [[ "$rt_dir" == "$want_dir" && "$fname" == "50-${prop}.conf" ]] || continue
+    target="${RUNTIME_CONTROL_DIR}/${rt_dir}/${fname}"
+    [[ -f "$target" ]] || return 1
+    got_val="$(read_single_runtime_prop_value "$target" "$prop" || true)"
+    [[ "$got_val" == "$expected_val" ]] || return 1
+    prop_has_verified_replacement "$unit_name" "$src_name" "$prop" "$allow_planned"
+    return $?
   done
   return 1
 }
@@ -228,54 +285,63 @@ cleanup_runtime_dropins() {
   local allow_planned=0
   (( MODE_APPLY == 0 )) && allow_planned=1
 
-  local entry rt_dir unit_name src_name dir prop target removed_any
-  for entry in "${RUNTIME_MIGRATION_MAP[@]}"; do
-    IFS='|' read -r rt_dir unit_name src_name <<<"$entry"
+  local rt_dir dir f_entry base removed_any
+  for rt_dir in "${MANAGED_RUNTIME_DIRS[@]}"; do
     dir="${RUNTIME_CONTROL_DIR}/${rt_dir}"
     [[ -d "$dir" ]] || continue
 
     removed_any=0
-    for prop in "${MANAGED_RUNTIME_QOS_PROPS[@]}"; do
+    local entry l_dir unit_name src_name prop expected_val target got_val
+    for entry in "${RUNTIME_MIGRATION_LEDGER[@]}"; do
+      IFS='|' read -r l_dir unit_name src_name prop expected_val <<<"$entry"
+      [[ "$l_dir" == "$rt_dir" ]] || continue
       target="${dir}/50-${prop}.conf"
       [[ -e "$target" || -L "$target" ]] || continue
 
+      got_val="$(read_single_runtime_prop_value "$target" "$prop" || true)"
+      if [[ "$got_val" != "$expected_val" ]]; then
+        warn "preserving custom/unmatched runtime override ${target} (got '${got_val:-<complex>}', ledger expects '${expected_val}')"
+        continue
+      fi
+
       if ! prop_has_verified_replacement "$unit_name" "$src_name" "$prop" "$allow_planned"; then
-        log "preserving runtime drop-in without persistent ${prop}= replacement: ${target}"
+        warn "preserving runtime drop-in without verified persistent ${prop}= replacement: ${target}"
         continue
       fi
 
       removed_any=1
       if (( MODE_APPLY == 0 )); then
-        log "[dry-run] would remove runtime QoS drop-in (replaced by ${unit_name}.d/${DROPIN_NAME}): ${target}"
+        log "[dry-run] would remove registered legacy runtime drop-in (${prop}=${expected_val} -> ${unit_name}.d/${DROPIN_NAME}): ${target}"
       else
         rm -f -- "$target" || die "failed to remove runtime QoS drop-in: ${target}"
-        log "removed runtime QoS drop-in (replaced by ${unit_name}.d/${DROPIN_NAME}): ${target}"
+        log "removed registered legacy runtime drop-in (${prop}=${expected_val} -> ${unit_name}.d/${DROPIN_NAME}): ${target}"
       fi
     done
 
-    if (( MODE_APPLY == 0 )); then
-      if (( removed_any == 1 )); then
-        local has_other=0 f_entry base
-        shopt -s nullglob dotglob
-        for f_entry in "${dir}"/*; do
-          base="$(basename -- "$f_entry")"
-          if ! runtime_file_will_be_removed "$unit_name" "$src_name" "$base" 1; then
-            has_other=1
-            break
-          fi
-        done
-        shopt -u nullglob dotglob
-        if (( has_other == 0 )); then
-          log "[dry-run] would rmdir empty runtime drop-in dir: ${dir}"
-        else
-          log "[dry-run] would preserve runtime drop-in dir with unreplaced/non-QoS files: ${dir}"
+    # Report any remaining custom/non-ledger runtime drop-ins in this managed directory
+    shopt -s nullglob dotglob
+    local has_remaining=0
+    for f_entry in "${dir}"/*; do
+      base="$(basename -- "$f_entry")"
+      if (( MODE_APPLY == 0 )); then
+        if ! runtime_file_matches_ledger "$rt_dir" "$base" 1; then
+          has_remaining=1
+          log "[dry-run] preserving non-ledger/custom runtime file: ${f_entry}"
         fi
+      else
+        has_remaining=1
+        log "preserved non-ledger/custom runtime file: ${f_entry}"
+      fi
+    done
+    shopt -u nullglob dotglob
+
+    if (( MODE_APPLY == 0 )); then
+      if (( removed_any == 1 && has_remaining == 0 )); then
+        log "[dry-run] would rmdir empty runtime drop-in dir: ${dir}"
       fi
     else
       if rmdir -- "$dir" 2>/dev/null; then
         log "removed empty runtime drop-in dir: ${dir}"
-      elif (( removed_any == 1 )); then
-        log "preserved non-empty runtime drop-in dir (contains unreplaced/non-QoS files): ${dir}"
       fi
     fi
   done
@@ -399,20 +465,19 @@ verify_persistent_files() {
 }
 
 verify_runtime_clean() {
-  local entry rt_dir unit_name src_name prop rt_target leftover=0
-  for entry in "${RUNTIME_MIGRATION_MAP[@]}"; do
-    IFS='|' read -r rt_dir unit_name src_name <<<"$entry"
-    for prop in "${MANAGED_RUNTIME_QOS_PROPS[@]}"; do
-      rt_target="${RUNTIME_CONTROL_DIR}/${rt_dir}/50-${prop}.conf"
-      [[ -e "$rt_target" || -L "$rt_target" ]] || continue
-      if prop_has_verified_replacement "$unit_name" "$src_name" "$prop" 0; then
-        v_fail "leftover replaced runtime QoS drop-in: ${rt_target}"
-        leftover=1
-      fi
-    done
+  local entry rt_dir unit_name src_name prop expected_val rt_target got_val leftover=0
+  for entry in "${RUNTIME_MIGRATION_LEDGER[@]}"; do
+    IFS='|' read -r rt_dir unit_name src_name prop expected_val <<<"$entry"
+    rt_target="${RUNTIME_CONTROL_DIR}/${rt_dir}/50-${prop}.conf"
+    [[ -e "$rt_target" || -L "$rt_target" ]] || continue
+    got_val="$(read_single_runtime_prop_value "$rt_target" "$prop" || true)"
+    if [[ "$got_val" == "$expected_val" ]] && prop_has_verified_replacement "$unit_name" "$src_name" "$prop" 0; then
+      v_fail "leftover registered legacy runtime QoS drop-in: ${rt_target} (${prop}=${expected_val})"
+      leftover=1
+    fi
   done
   if (( leftover == 0 )); then
-    v_ok "no replaced runtime QoS drop-in files remaining under ${RUNTIME_CONTROL_DIR}"
+    v_ok "no registered legacy runtime QoS drop-in files remaining under ${RUNTIME_CONTROL_DIR}"
   fi
 }
 
