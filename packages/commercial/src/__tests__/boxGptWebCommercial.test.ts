@@ -7,6 +7,7 @@ import { readFile } from "node:fs/promises";
 import { describe, test } from "node:test";
 
 import { boxGptWebContainerEnv, isBoxGptWebAllowedUser } from "../cursor/access.js";
+import { readUserChatBridgeSource } from "./helpers/userChatBridgeSource.js";
 
 const COMMERCIAL = { OC_BOX_GPT_WEB_ALLOWED_UIDS: "1,4" };
 
@@ -36,7 +37,9 @@ describe("OCV5-575 box-gpt-6-astra-pro allowlist", () => {
   test("master gates (catalog, pricing, authz, grants, chat bridge) use the allowlist, not uid 3", async () => {
     for (const file of ["../billing/modelCatalog.ts", "../billing/pricing.ts", "../billing/authzModels.ts",
       "../admin/modelGrants.ts", "../ws/userChatBridge.ts"]) {
-      const source = await readFile(new URL(file, import.meta.url), "utf8");
+      const source = file === "../ws/userChatBridge.ts"
+        ? readUserChatBridgeSource()
+        : await readFile(new URL(file, import.meta.url), "utf8");
       assert.match(source, /isBoxGptWebAllowedUser\(/, file);
       assert.doesNotMatch(source, /isBoxGptWebOwnerUid/, file);
     }
@@ -45,7 +48,7 @@ describe("OCV5-575 box-gpt-6-astra-pro allowlist", () => {
 
 describe("OCV5-575 box-gpt-6-astra-pro is never billed", () => {
   test("no Cursor audit row, no balance requirement, no credit budget", async () => {
-    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const source = readUserChatBridgeSource();
     assert.match(source, /const cursorBilled = !isBoxGptWebModel\(activeCursorModel\);/);
     assert.match(source, /if \(cursorBilled\) cursorSpendable = await readTotalSpendableBalance\(uid\);/);
     assert.match(source, /if \(cursorSpendable !== null && cursorSpendable <= 0n\) \{/);

@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 import {
+  ANTIGRAVITY_ENGINE_MODELS,
+  ANTIGRAVITY_ENGINE_MODEL_IDS,
+  CODEX_ENGINE_MODELS,
   CODEX_ENGINE_MODEL_IDS,
   COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL,
   CONTEXT_TIER_FAMILIES,
@@ -45,9 +48,11 @@ import {
   codexTransportModelId,
   zcodeTransportModelId,
   GROK_ENGINE_MODELS,
+  GROK_ENGINE_MODEL_IDS,
+  ZCODE_ENGINE_MODELS,
   ZCODE_ENGINE_MODEL_IDS,
   ZCODE_HOSTED_PERMISSION_MODE,
-  ANTIGRAVITY_ENGINE_MODEL_IDS,
+  ZCODE_TRANSPORT_CANONICAL_IDS,
   antigravityAllowedUpstreamModels,
   antigravityCanonicalModelForUpstream,
   antigravityCliModelId,
@@ -209,8 +214,8 @@ describe('Grok Build engine model authority', () => {
 
 describe('Cursor engine model authority', () => {
   test('pins CLI families with effort/fast metadata and excludes GPT/Codex entries', () => {
-    // 72 + 8 grok-4.7 (2026-09-22) + 3 box Claude (2026-09-23) + box Claude Haiku 5.5 (2026-10-08) + box GPT-6 Astra Pro (2026-10-21)
-    assert.equal(CURSOR_ENGINE_MODELS.length, 85) // cc5 is a backend of existing Sonnet, not a model row
+    // 62 + 8 grok-4.7 (2026-09-22) + 3 box Claude (2026-09-23) + box Claude Haiku 5.5 (2026-10-08) + box GPT-6 Astra Pro (2026-10-21)
+    assert.equal(CURSOR_ENGINE_MODELS.length, 75) // cc5 is a backend of existing Sonnet, not a model row; 10 duplicate cursor-opus-4.8-* rows removed
     assert.equal(CURSOR_ENGINE_MODELS[0].id, 'cursor-auto')
     assert.deepEqual(
       CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),
@@ -827,5 +832,58 @@ describe('OCV5-879: Antigravity swarm upstream reverse-mapping and allowlist uni
     assert.ok(orchUnion.includes('gemini-flash-worker-agy'))
     assert.ok(orchUnion.includes('gemini-4-neon-xhigh'))
     assert.equal(orchUnion.includes('gemini-pro-orchestrator-neon'), false)
+  })
+})
+
+function findDuplicateIds(ids: readonly string[]): string[] {
+  const seen = new Set<string>()
+  const duplicates: string[] = []
+  for (const id of ids) {
+    if (seen.has(id)) duplicates.push(id)
+    else seen.add(id)
+  }
+  return duplicates
+}
+
+describe('OCV5-928: global model ID uniqueness across all exported engine model lists', () => {
+  test('every exported model list and ID array has zero duplicate IDs, and engine canonical IDs are globally disjoint', () => {
+    const namedLists: Array<[string, readonly string[]]> = [
+      ['CURSOR_ENGINE_MODEL_IDS', CURSOR_ENGINE_MODEL_IDS],
+      ['CURSOR_ENGINE_MODELS', CURSOR_ENGINE_MODELS.map((m) => m.id)],
+      ['CODEX_ENGINE_MODEL_IDS', CODEX_ENGINE_MODEL_IDS],
+      ['CODEX_ENGINE_MODELS', CODEX_ENGINE_MODELS.map((m) => m.id)],
+      ['GROK_ENGINE_MODEL_IDS', GROK_ENGINE_MODEL_IDS],
+      ['GROK_ENGINE_MODELS', GROK_ENGINE_MODELS.map((m) => m.id)],
+      ['ZCODE_ENGINE_MODEL_IDS', ZCODE_ENGINE_MODEL_IDS],
+      ['ZCODE_ENGINE_MODELS', ZCODE_ENGINE_MODELS.map((m) => m.id)],
+      ['ZCODE_TRANSPORT_CANONICAL_IDS', ZCODE_TRANSPORT_CANONICAL_IDS],
+      ['ANTIGRAVITY_ENGINE_MODEL_IDS', ANTIGRAVITY_ENGINE_MODEL_IDS],
+      ['ANTIGRAVITY_ENGINE_MODELS', ANTIGRAVITY_ENGINE_MODELS.map((m) => m.id)],
+      ['CONTEXT_TIER_FAMILIES.family', CONTEXT_TIER_FAMILIES.map((f) => f.family)],
+      ['CONTEXT_TIER_FAMILIES.standardId', CONTEXT_TIER_FAMILIES.map((f) => f.standardId)],
+      ['CONTEXT_TIER_FAMILIES.longId', CONTEXT_TIER_FAMILIES.map((f) => f.longId)],
+    ]
+    for (const [label, ids] of namedLists) {
+      assert.deepEqual(findDuplicateIds(ids), [], `${label} must not contain duplicate IDs`)
+    }
+
+    assert.equal(
+      CURSOR_ENGINE_MODELS.filter((m) => m.family === 'opus-4.8').length,
+      10,
+      'cursor-opus-4.8-* must declare exactly 10 effort/fast variants without duplicates',
+    )
+
+    const allEngineIds = [
+      ...CODEX_ENGINE_MODEL_IDS,
+      ...GROK_ENGINE_MODEL_IDS,
+      ...ZCODE_ENGINE_MODEL_IDS,
+      ...ANTIGRAVITY_ENGINE_MODEL_IDS,
+      ...CURSOR_ENGINE_MODEL_IDS,
+    ]
+    assert.deepEqual(
+      findDuplicateIds(allEngineIds),
+      [],
+      'canonical model IDs must be globally unique across all engines',
+    )
   })
 })

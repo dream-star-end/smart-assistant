@@ -16,8 +16,8 @@ import { SYSTEM_HELP_CAPABILITY, SYSTEM_HELP_BOOTSTRAP_FIELD } from '@openclaude
 import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as http from "node:http";
-import { readFile } from "node:fs/promises";
 import { WebSocket, WebSocketServer } from "ws";
+import { readUserChatBridgeSource } from "./helpers/userChatBridgeSource.js";
 
 import {
   DURABLE_TURN_DISPATCH_CAPABILITY,
@@ -850,10 +850,13 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     // resolveAuthorityExecOrReject 必须在 role 投影之后再套 projectContextWindowForCursorTier,
     // 且 cursor 分支把 frame.contextTier 传进去;(b) ensureHistory 的历史窗口用同一投影,
     // 否则历史预算与执行窗口不一致。删掉任一处 = 1M/300k 档位静默失效。
-    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
-    const resolveStart = source.indexOf("const resolveAuthorityExecOrReject = async (");
-    assert.ok(resolveStart > 0, "resolveAuthorityExecOrReject must exist");
-    const resolveBody = source.slice(resolveStart, source.indexOf("\n      return exec;\n    };", resolveStart));
+    const source = readUserChatBridgeSource();
+    const resolveMatch = /(?:const\s+resolveAuthorityExecOrReject\s*=\s*async\s*\(|(?:export\s+)?async\s+function\s+resolveAuthorityExecOrReject\s*\()/.exec(source);
+    assert.ok(resolveMatch, "resolveAuthorityExecOrReject must exist");
+    const resolveStart = resolveMatch.index;
+    const returnMatch = /\n\s*return exec;/.exec(source.slice(resolveStart));
+    assert.ok(returnMatch, "resolveAuthorityExecOrReject return exec must exist");
+    const resolveBody = source.slice(resolveStart, resolveStart + returnMatch.index + returnMatch[0].length);
     assert.match(resolveBody, /contextTier\?: CursorContextTier \| null/);
     assert.match(resolveBody, /const roleProjectedWindow = projectContextWindowForRole\(/);
     assert.match(
@@ -907,7 +910,7 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
       engines.filter((e) => engineUsesAnthropicAuxModels(e)),
       ["ccb", "cursor"],
     );
-    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const source = readUserChatBridgeSource();
     const fn = source.slice(source.indexOf("async function resolveTurnExecution("));
     const body = fn.slice(0, fn.indexOf("\n}\n"));
     assert.match(body, /auxModels: engineUsesAnthropicAuxModels\(descriptor\.engine\) \? platformAuxModels\(snapshot\) : \[\]/);

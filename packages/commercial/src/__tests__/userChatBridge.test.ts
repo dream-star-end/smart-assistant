@@ -50,6 +50,7 @@ import {
 } from "../ws/paperIntentHint.js";
 import { GoalStateError } from "../goal/goalStateService.js";
 import { DEFAULT_CODEX_ENGINE_MODEL, formatMessageReplyPrompt } from "@openclaude/protocol";
+import { readUserChatBridgeSource } from "./helpers/userChatBridgeSource.js";
 
 // ------- 测试夹具:bridge gateway + mock 容器 ws server ------------------
 
@@ -3628,14 +3629,7 @@ describe("userChatBridge — earlyClose during CONNECTING containerWs (regressio
 // 未来把 bug 改回去。配套 docs/v3/code-review-checklist.md §1。
 describe("tryAutoRebindFlush regression tripwire", () => {
   test("source contains progressMade gate in finally block", async () => {
-    const fs = await import("node:fs");
-    const path = await import("node:path");
-    const url = await import("node:url");
-    const here = path.dirname(url.fileURLToPath(import.meta.url));
-    const raw = fs.readFileSync(
-      path.resolve(here, "..", "ws", "userChatBridge.ts"),
-      "utf8",
-    );
+    const raw = readUserChatBridgeSource();
     // 剥块注释 + 行注释,防 comment-only false positive
     // (注释里带 "progressMade" 文案不能蒙混过关)
     const src = raw
@@ -3672,12 +3666,41 @@ describe("tryAutoRebindFlush regression tripwire", () => {
   });
 });
 
+function extractInboundEngineBranch(source: string, anchorNeedle: string, endNeedle: string, label: string): string {
+  const anchor = source.indexOf(anchorNeedle);
+  assert.notEqual(anchor, -1, `missing ${label} anchor: ${anchorNeedle}`);
+  const head = source.slice(0, anchor);
+  const startCandidates = [
+    head.lastIndexOf("if (isCursorInboundFrame"),
+    head.lastIndexOf("if (isAntigravityInboundFrame"),
+    head.lastIndexOf("if (isZcodeInboundFrame"),
+    head.lastIndexOf("export async function "),
+    head.lastIndexOf("async function "),
+  ].filter((idx) => idx >= 0);
+  const start = startCandidates.length > 0 ? Math.max(...startCandidates) : Math.max(0, anchor - 500);
+  const endMatch = source.indexOf(endNeedle, anchor);
+  assert.notEqual(endMatch, -1, `missing ${label} end marker: ${endNeedle}`);
+  return source.slice(start, endMatch + endNeedle.length + 260);
+}
+
+function extractAntigravitySettleBlock(source: string): string {
+  const startMatch = /(?:external\.engine\s*===\s*['"]antigravity['"]|case\s+['"]antigravity['"]\s*:)/.exec(source);
+  assert.ok(startMatch, "missing Antigravity settle branch");
+  const start = startMatch.index;
+  const tail = source.slice(start + startMatch[0].length);
+  const endMatch = /(?:external\.engine\s*===\s*['"]cursor['"]|case\s+['"]cursor['"]\s*:|Antigravity settle failed)/.exec(tail);
+  assert.ok(endMatch, "missing Antigravity settle end marker");
+  return source.slice(start, start + startMatch[0].length + endMatch.index);
+}
+
 describe("Cursor external authority regression tripwire", () => {
   test("Cursor uses the existing non-CCB authority classification and credential/audit gates", async () => {
-    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
-    const cursorBranch = source.slice(
-      source.indexOf("if (isCursorInboundFrame && containerId !== undefined)"),
-      source.indexOf("if (\n        isCodexInboundFrame &&", source.indexOf("if (isCursorInboundFrame && containerId !== undefined)")),
+    const source = readUserChatBridgeSource();
+    const cursorBranch = extractInboundEngineBranch(
+      source,
+      "isCursorEngineModel(modelCapture)",
+      "Cursor external admission failed",
+      "cursor",
     );
     assert.match(cursorBranch, /classifiedCodex: true/);
     assert.match(cursorBranch, /isCursorCredentialMember\(uid\)/);
@@ -3700,7 +3723,7 @@ describe("Cursor external authority regression tripwire", () => {
     );
     // The live bridge uses the same settle-before-close path as durable replay.
     // Follow that production import instead of requiring the leaf settler inline.
-    assert.match(source, /import \{ settleDurableCursorBilling \} from [\"']\.\.\/billing\/durableCursorBilling\.js[\"']/);
+    assert.match(source, /import\s*\{[^}]*\bsettleDurableCursorBilling\b[^}]*\}\s*from\s*["'](?:\.\.\/)+billing\/durableCursorBilling\.js["']/);
     assert.match(source, /await settleDurableCursorBilling\(/);
     const durableCursorSource = await readFile(new URL("../billing/durableCursorBilling.ts", import.meta.url), "utf8");
     assert.match(durableCursorSource, /settleCursorExternalUsage/);
@@ -3713,13 +3736,18 @@ describe("Cursor external authority regression tripwire", () => {
   });
 
   test("ZCode uses an independent admission/audit branch and does not reuse Cursor gates", async () => {
-    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
-    const start = source.indexOf("if (isZcodeInboundFrame && containerId !== undefined)");
-    const end = source.indexOf("if (\n        isCodexInboundFrame &&", start);
-    assert.notEqual(start, -1);
-    const zcodeBranch = source.slice(start, end);
+    const source = readUserChatBridgeSource();
+    const zcodeBranch = extractInboundEngineBranch(
+      source,
+      "abortInsertedZcodeAudit(",
+      "ZCode external admission failed",
+      "zcode",
+    );
     assert.match(zcodeBranch, /insertPendingZcodeAudit/);
-    assert.match(zcodeBranch, /authorityExec\.engine !== 'zcode'/);
+    assert.match(
+      zcodeBranch,
+      /(?:authorityExec\.engine\s*!==\s*['"]zcode['"]|switch\s*\(\s*authorityExec\.engine\s*\)[\s\S]{0,200}case\s+['"]zcode['"]|['"]zcode['"][^;\n]{0,40}authorityExec\.engine|authorityExec\.engine[^;\n]{0,40}['"]zcode['"]|\b[a-zA-Z0-9_]*Engine[a-zA-Z0-9_]*\(\s*authorityExec(?:\.engine)?\s*,\s*['"]zcode['"])/,
+    );
     assert.match(zcodeBranch, /isZcodeEngineModel\(modelCapture\)/);
     assert.doesNotMatch(zcodeBranch, /isCursorCredentialMember/);
     assert.doesNotMatch(zcodeBranch, /isCursorContainerOnSelfHost/);
@@ -3731,13 +3759,17 @@ describe("Cursor external authority regression tripwire", () => {
   });
 
   test("OCV5-415: Antigravity admission gates on authority and balance before minting; settle reads relay rows", async () => {
-    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
-    const start = source.indexOf("if (isAntigravityInboundFrame && !isRemoteNativeInboundFrame && containerId !== undefined)");
-    const end = source.indexOf("if (isZcodeInboundFrame && containerId !== undefined)", start);
-    assert.notEqual(start, -1);
-    assert.ok(end > start);
-    const branch = source.slice(start, end);
-    assert.match(branch, /authorityExec\.engine !== 'antigravity'/);
+    const source = readUserChatBridgeSource();
+    const branch = extractInboundEngineBranch(
+      source,
+      "isAntigravityEngineModel(modelCapture)",
+      "Antigravity admission threw",
+      "antigravity",
+    );
+    assert.match(
+      branch,
+      /(?:authorityExec\.engine\s*!==\s*['"]antigravity['"]|switch\s*\(\s*authorityExec\.engine\s*\)[\s\S]{0,200}case\s+['"]antigravity['"]|['"]antigravity['"][^;\n]{0,40}authorityExec\.engine|authorityExec\.engine[^;\n]{0,40}['"]antigravity['"]|\b[a-zA-Z0-9_]*Engine[a-zA-Z0-9_]*\(\s*authorityExec(?:\.engine)?\s*,\s*['"]antigravity['"])/,
+    );
     assert.match(branch, /isAntigravityEngineModel\(modelCapture\)/);
     assert.match(branch, /if \(spendable <= 0n\)/);
     assert.ok(
@@ -3759,9 +3791,7 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(branch, /reconcileStaleAntigravityTurns\(/);
     // Settlement claims the durable row (works on a reconnected bridge) and
     // uses the relay's metered rows, never the container-reported usage.
-    const settleStart = source.indexOf("external.engine === 'antigravity'");
-    assert.notEqual(settleStart, -1);
-    const settle = source.slice(settleStart, source.indexOf("external.engine === 'cursor'", settleStart));
+    const settle = extractAntigravitySettleBlock(source);
     assert.match(settle, /settleAntigravityTurnRecord\(/);
     assert.doesNotMatch(settle, /usage,/);
     assert.match(settle, /if \(!pricing\) return;/);
@@ -3769,24 +3799,26 @@ describe("Cursor external authority regression tripwire", () => {
   });
 
   test("OCV5-415: a closing bridge keeps Antigravity routes alive; the terminal frame expires them by requestId", async () => {
-    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const source = readUserChatBridgeSource();
     // Live 2026-10-15: expiring routes on browser reconnect made the running CLI 404 ROUTE_EXPIRED.
     const close = source.slice(source.indexOf("inflightCodexTurns.clear();"), source.indexOf("admittedDispatches.clear();"));
     assert.match(close, /pendingAntigravityRelays\.clear\(\);/);
     assert.doesNotMatch(close, /expireAntigravityRoute/);
-    const settleStart = source.indexOf("external.engine === 'antigravity'");
-    const settle = source.slice(settleStart, source.indexOf("settleAntigravityTurnRecord(", settleStart));
-    assert.match(settle, /deps\.expireAntigravityRouteForRequest\?\.\(requestId,\s*uid\)/);
+    const settleFull = extractAntigravitySettleBlock(source);
+    const settleHead = settleFull.slice(0, settleFull.indexOf("settleAntigravityTurnRecord("));
+    assert.match(settleHead, /deps\.expireAntigravityRouteForRequest\?\.\(requestId,\s*uid\)/);
   });
 
   test("OCV5-92: every base engine inbound carries a master-owned _creditBudget and ZCode gates on balance", async () => {
-    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const source = readUserChatBridgeSource();
 
     // ZCode: same 0-balance hard reject as Cursor, budget written after the spread.
-    const zcodeStart = source.indexOf("if (isZcodeInboundFrame && containerId !== undefined)");
-    const zcodeEnd = source.indexOf("if (\n        isCodexInboundFrame &&", zcodeStart);
-    assert.notEqual(zcodeStart, -1);
-    const zcodeBranch = source.slice(zcodeStart, zcodeEnd);
+    const zcodeBranch = extractInboundEngineBranch(
+      source,
+      "abortInsertedZcodeAudit(",
+      "ZCode external admission failed",
+      "zcode",
+    );
     assert.match(zcodeBranch, /zcodeSpendable = await readTotalSpendableBalance\(uid\)/);
     assert.match(zcodeBranch, /if \(zcodeSpendable <= 0n\)/);
     assert.match(zcodeBranch, /rejectPromptQueueDispatch\('ERR_INSUFFICIENT_CREDITS'\)/);
@@ -4266,7 +4298,7 @@ describe("userChatBridge — session-scoped live frame fan-out", () => {
 
 describe("userChatBridge — hello live-frame catch-up", () => {
   test("catch-up send path reuses bufferedAmount backpressure and does not cleanup the bridge", async () => {
-    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const source = readUserChatBridgeSource();
     const start = source.indexOf("if (liveCatchupSessions.length > 0 && deps.pgPool)");
     const end = source.indexOf("Fall through to forwardInboundFrame below", start);
     assert.notEqual(start, -1);
@@ -4387,7 +4419,7 @@ describe("userChatBridge — hello live-frame catch-up", () => {
 
 describe("inbound turn identity is frozen onto every parsed-turn error exit", () => {
   test("authority helpers and remaining parsed-turn errors carry frozen peer identity", async () => {
-    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const source = readUserChatBridgeSource();
     assert.match(source, /inboundTurnIdentityForFrame = inboundTurnIdentityFromParsed\(parsed\)/);
     assert.match(source, /sendErrorFrame\(userWs, code, message, args\.turn\)/);
     assert.equal(
