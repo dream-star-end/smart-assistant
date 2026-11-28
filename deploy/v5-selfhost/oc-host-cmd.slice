@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenClaude v5 Selfhost Container Host Command Slice (OCV5-931)
+Before=slices.target
+
+[Slice]
+CPUAccounting=yes
+IOAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes
+CPUWeight=20
+IOWeight=20
+CPUQuota=1200%
+MemoryHigh=6G
+MemoryMax=8G
+MemorySwapMax=1G
+TasksMax=2048
+# Note: OOMPolicy=kill is valid only on [Service]/[Scope] (systemd-analyze verify rejects it in [Slice]);
+# Layer 2 injects --property=OOMPolicy=kill on each transient systemd-run --scope inside this slice.

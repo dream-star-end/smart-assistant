@@ -29,6 +29,11 @@ TimeoutStopSec=1860
 SendSIGKILL=yes
 StandardOutput=append:/var/log/openclaude-v5-selfhost-egress.log
 StandardError=append:/var/log/openclaude-v5-selfhost-egress.log
+# OCV5-931: Control-plane QoS (cgroup v2 + OOM protection; dual-slot overlap safe: 2x256M <= 512M)
+CPUWeight=600
+IOWeight=600
+MemoryLow=256M
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target

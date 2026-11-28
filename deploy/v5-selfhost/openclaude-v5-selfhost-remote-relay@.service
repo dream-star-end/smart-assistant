@@ -34,6 +34,11 @@ StateDirectory=openclaude-v5-selfhost
 StateDirectoryMode=0700
 StandardOutput=append:/var/log/openclaude-v5-selfhost-remote-relay.log
 StandardError=append:/var/log/openclaude-v5-selfhost-remote-relay.log
+# OCV5-931: Control-plane QoS (cgroup v2 + OOM protection; dual-slot overlap safe: 2x64M <= 128M)
+CPUWeight=500
+IOWeight=500
+MemoryLow=64M
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target

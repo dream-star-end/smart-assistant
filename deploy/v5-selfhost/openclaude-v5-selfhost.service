@@ -26,6 +26,12 @@ StandardError=append:/var/log/openclaude-v5-selfhost.log
 LimitNOFILE=65536
 StateDirectory=openclaude-v5-selfhost
 StateDirectoryMode=0700
+# OCV5-931: Control-plane QoS (cgroup v2 + OOM protection)
+CPUWeight=1000
+IOWeight=1000
+MemoryMin=512M
+MemoryLow=768M
+OOMScoreAdjust=-800
 
 [Install]
 WantedBy=multi-user.target

@@ -11,6 +11,12 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=append:/var/log/cloudflared-v5-selfhost.log
 StandardError=append:/var/log/cloudflared-v5-selfhost.log
+# OCV5-931: Control-plane QoS (cgroup v2 + OOM protection)
+CPUWeight=1000
+IOWeight=1000
+MemoryMin=64M
+MemoryLow=128M
+OOMScoreAdjust=-800
 
 [Install]
 WantedBy=multi-user.target

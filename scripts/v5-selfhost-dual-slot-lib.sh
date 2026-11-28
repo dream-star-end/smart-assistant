@@ -360,6 +360,12 @@ StateDirectoryMode=0700
 StandardOutput=append:/var/log/openclaude-v5-selfhost-frontdoor.log
 StandardError=append:/var/log/openclaude-v5-selfhost-frontdoor.log
 LimitNOFILE=65536
+# OCV5-931: Control-plane QoS (cgroup v2 + OOM protection)
+CPUWeight=1000
+IOWeight=1000
+MemoryMin=64M
+MemoryLow=128M
+OOMScoreAdjust=-800
 
 [Install]
 WantedBy=multi-user.target
@@ -407,6 +413,12 @@ StandardError=append:/var/log/openclaude-v5-selfhost-%i.log
 LimitNOFILE=65536
 StateDirectory=openclaude-v5-selfhost
 StateDirectoryMode=0700
+# OCV5-931: Control-plane QoS (cgroup v2 + OOM protection; dual-slot overlap safe: 2x512M <= 1024M, 2x768M <= 1536M)
+CPUWeight=1000
+IOWeight=1000
+MemoryMin=512M
+MemoryLow=768M
+OOMScoreAdjust=-800
 
 [Install]
 WantedBy=multi-user.target
