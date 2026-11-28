@@ -2,15 +2,15 @@
   "schemaVersion": 1,
   "windowLines": 12,
   "summary": {
-    "scannedFiles": 2835,
+    "scannedFiles": 2634,
     "totalClusters": 1448,
     "totalInstances": 5128
   },
   "topHotspots": [
     {
       "hash": "3e9d2a180daa28d27605702e9c75a51fcd714560a4a64b1a942471d86f9b64ba",
-      "files": 75,
-      "instances": 1125,
+      "files": 76,
+      "instances": 1142,
       "locations": [
         "packages/commercial/src/account-pool/remotePool/driftCoordinator.ts:41-52",
         "packages/commercial/src/account-pool/remotePool/driftCoordinator.ts:42-53",
@@ -22,8 +22,8 @@
     },
     {
       "hash": "422a692e40663344621e4cf0d2f60378466931a616afef3fc7fd834707e15193",
-      "files": 27,
-      "instances": 31,
+      "files": 28,
+      "instances": 34,
       "locations": [
         "packages/commercial/src/connectors/providers/shared.ts:35-47",
         "packages/commercial/src/connectors/spec/compiler.ts:119-130",
@@ -66,7 +66,7 @@
       "locations": [
         "packages/commercial/src/logging/logger.ts:56-68",
         "packages/gateway/src/engine/cursorSandRelay.ts:1342-1353",
-        "packages/web-react/src/components/chat/ProcessDisclosure.tsx:906-917",
+        "packages/web-react/src/components/chat/ProcessDisclosure.tsx:904-915",
         "packages/web-react/src/components/chat/phaseTimeline.ts:101-112",
         "packages/web-react/src/components/chat/phaseTimeline.ts:135-146",
         "packages/web-react/src/components/chat/phaseTimeline.ts:182-193"
@@ -112,6 +112,19 @@
       ]
     },
     {
+      "hash": "101cd18b8360ea6efa434450fa09a8f1fc46f850cc49dbecd70062ca3b770767",
+      "files": 6,
+      "instances": 132,
+      "locations": [
+        "packages/commercial/src/account-pool/remotePool/index.ts:1-12",
+        "packages/commercial/src/account-pool/remotePool/index.ts:2-13",
+        "packages/commercial/src/account-pool/remotePool/index.ts:3-14",
+        "packages/commercial/src/account-pool/remotePool/index.ts:4-15",
+        "packages/gateway/src/index.ts:1-13",
+        "packages/gateway/src/index.ts:2-14"
+      ]
+    },
+    {
       "hash": "34b9603065f8eadf0b49504b0f2bd3699a8d208ba63b3666c8c566efc9a5896d",
       "files": 6,
       "instances": 7,
@@ -122,19 +135,6 @@
         "packages/gateway/src/gatewayFilePolicy.ts:270-281",
         "packages/gateway/src/gatewayFilePolicy.ts:328-339",
         "packages/gateway/src/webContextSafety.ts:90-101"
-      ]
-    },
-    {
-      "hash": "101cd18b8360ea6efa434450fa09a8f1fc46f850cc49dbecd70062ca3b770767",
-      "files": 5,
-      "instances": 92,
-      "locations": [
-        "packages/commercial/src/account-pool/remotePool/index.ts:1-12",
-        "packages/commercial/src/account-pool/remotePool/index.ts:2-13",
-        "packages/commercial/src/account-pool/remotePool/index.ts:3-14",
-        "packages/commercial/src/account-pool/remotePool/index.ts:4-15",
-        "packages/gateway/src/index.ts:1-13",
-        "packages/gateway/src/index.ts:2-14"
       ]
     },
     {
@@ -195,7 +195,19 @@
         "packages/gateway/src/containerPreview.ts:162-173",
         "packages/web-react/src/lib/api/integrationsApi.ts:87-98",
         "packages/web-react/src/lib/api/memorySkillsApi.ts:47-58",
-        "packages/web-react/src/lib/api/projectsApi.ts:36-47"
+        "packages/web-react/src/lib/api/projectsApi.ts:32-43"
+      ]
+    },
+    {
+      "hash": "8f494f5ae783316b7b5fd8693c8f8f8831ccbf408d480808d860f2746d23db30",
+      "files": 5,
+      "instances": 5,
+      "locations": [
+        "packages/commercial/src/admin/auditRetention.ts:190-209",
+        "packages/commercial/src/admin/retentionRegistry.ts:306-320",
+        "packages/commercial/src/billing/ledger.ts:39-52",
+        "packages/commercial/src/http/util.ts:92-103",
+        "packages/commercial/src/openai/omniModeration.ts:15-26"
       ]
     },
     {
@@ -241,17 +253,6 @@
         "packages/commercial/src/grok/webSearchProxy.ts:87-98",
         "packages/commercial/src/minimax/webSearchProxy.ts:57-68",
         "packages/commercial/src/tavily/webSearchProxy.ts:41-52"
-      ]
-    },
-    {
-      "hash": "8f494f5ae783316b7b5fd8693c8f8f8831ccbf408d480808d860f2746d23db30",
-      "files": 4,
-      "instances": 4,
-      "locations": [
-        "packages/commercial/src/admin/auditRetention.ts:200-219",
-        "packages/commercial/src/billing/ledger.ts:39-52",
-        "packages/commercial/src/http/util.ts:92-103",
-        "packages/commercial/src/openai/omniModeration.ts:15-26"
       ]
     },
     {
@@ -357,7 +358,7 @@
       "locations": [
         "packages/web-react/src/admin/pages/pools/types.ts:127-138",
         "packages/web-react/src/components/chat/DeliverableRichPreview.tsx:124-135",
-        "packages/web-react/src/components/chat/swarmUtils.ts:38-49"
+        "packages/web-react/src/components/chat/swarmUtils.ts:40-51"
       ]
     },
     {
@@ -365,8 +366,8 @@
       "files": 3,
       "instances": 3,
       "locations": [
-        "packages/protocol/src/exec-env/validators.ts:152-165",
-        "packages/protocol/src/inference-pool/validators.ts:139-152",
+        "packages/protocol/src/exec-env/validators.ts:131-144",
+        "packages/protocol/src/inference-pool/validators.ts:191-204",
         "packages/protocol/src/storage-seam/validators.ts:168-181"
       ]
     },
@@ -387,7 +388,7 @@
       "locations": [
         "packages/web-react/src/lib/api/integrationsApi.ts:88-99",
         "packages/web-react/src/lib/api/memorySkillsApi.ts:48-59",
-        "packages/web-react/src/lib/api/projectsApi.ts:37-48"
+        "packages/web-react/src/lib/api/projectsApi.ts:33-44"
       ]
     },
     {
@@ -441,6 +442,16 @@
       ]
     },
     {
+      "hash": "ab70faf483a2b4bc5f983047864af04f9388a9e923fcb6df198e2c91f3df571b",
+      "files": 3,
+      "instances": 3,
+      "locations": [
+        "packages/commercial/src/account-pool/remotePool/index.ts:5-16",
+        "packages/gateway/src/index.ts:15-28",
+        "packages/storage/src/index.ts:43-63"
+      ]
+    },
+    {
       "hash": "e51ce72ae0771037a2d0f5506f03aa7b26766ee0de4bee4a2ef86037e9de3d1a",
       "files": 3,
       "instances": 3,
@@ -448,16 +459,6 @@
         "packages/web-react/src/admin/pages/accountGroups/form.tsx:2-15",
         "packages/web-react/src/admin/pages/alerts/formBits.tsx:1-14",
         "packages/web-react/src/admin/pages/egressProxies/form.tsx:2-15"
-      ]
-    },
-    {
-      "hash": "e5e735ec8325ac021f9ef76fee834387f715f3aac1685ab9e09a861eeb4dfb1a",
-      "files": 3,
-      "instances": 3,
-      "locations": [
-        "packages/commercial/src/account-pool/remotePool/verificationRuntimeProof.ts:211-222",
-        "packages/commercial/src/literatureSkill.ts:66-77",
-        "packages/web-react/src/components/settings/ApiKeysSection.tsx:117-128"
       ]
     }
   ],
