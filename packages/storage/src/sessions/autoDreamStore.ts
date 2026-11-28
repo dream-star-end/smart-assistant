@@ -150,7 +150,7 @@ export async function pruneAutoDreamSuccessEvents(
   throughSeq: number,
 ): Promise<void> {
   const db = await getSessionsDb()
-  db.prepare(`DELETE FROM auto_dream_success_events WHERE agent_id = ? AND seq <= ?`).run(
+  db.prepare('DELETE FROM auto_dream_success_events WHERE agent_id = ? AND seq <= ?').run(
     agentId,
     Math.max(0, Math.floor(throughSeq)),
   )

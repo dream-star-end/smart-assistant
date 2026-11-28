@@ -367,7 +367,7 @@ function settleDeferredEmptyTurnNotice(
     return;
   }
   const lastMsg = sess.messages[sess.messages.length - 1];
-  const dup = lastMsg && lastMsg._emptyTurn && lastMsg._emptyTurnTargetMsgId === autoTid;
+  const dup = lastMsg?._emptyTurn && lastMsg._emptyTurnTargetMsgId === autoTid;
   if (!dup) {
     addMessage(sess, "assistant", cls.text, {
       _emptyTurn: true,

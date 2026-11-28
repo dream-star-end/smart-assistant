@@ -322,14 +322,26 @@ export function escapeLikePattern(q: string): string {
   return q.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
 }
 
+function stripControlChars(input: string): string {
+  let out = ''
+  for (let i = 0; i < input.length; i++) {
+    const code = input.charCodeAt(i)
+    const isCtl =
+      code <= 0x08 || code === 0x0b || code === 0x0c || (code >= 0x0e && code <= 0x1f) || code === 0x7f
+    if (!isCtl) out += input[i]
+  }
+  return out
+}
+
 /** Strip code fences, markdown images, HTML tags, line breaks and control chars. */
 export function toPlainSessionText(raw: string): string {
-  return raw
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/[\r\n]+/g, ' ')
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+  return stripControlChars(
+    raw
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/[\r\n]+/g, ' '),
+  )
     .replace(/\s+/g, ' ')
     .trim()
 }

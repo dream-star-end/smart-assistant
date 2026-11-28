@@ -23,7 +23,6 @@ import { TimelineEagerMediaContext } from "../timelineEager";
 import { delegateTokenUsage, tokenUsageSignature } from "../tokenUsage";
 import { TurnActivity, type TurnActivityInfo } from "../TurnActivity";
 import { processTimeBounds, turnHasVisibleWork } from "./processCoalesce";
-import { TapeBackedCard } from "./TapeRecordCards";
 import {
   itemMessages,
   type LeafRenderItem,
@@ -34,6 +33,10 @@ import {
   renderItemKey,
   type SingleRenderItem,
 } from "./types";
+
+export function TapeBackedCard({ children }: { children: ReactNode }) {
+  return <div className="space-y-1">{children}</div>;
+}
 
 /**
  * 「工作过程」组的 memo 边界(#1240)。已结束的组以 sig 比较，进行中的组(live)照常每帧渲染。

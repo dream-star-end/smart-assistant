@@ -191,9 +191,7 @@ function collectThinkingGroup(
       members.push(candidate);
       consumedThinking.add(start + j);
       lastAbs = start + j;
-    } else if (kj === "unknown") {
-      continue;
-    } else {
+    } else if (kj !== "unknown") {
       break;
     }
   }

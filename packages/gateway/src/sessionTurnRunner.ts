@@ -522,8 +522,17 @@ function wireAndRunAttempt(
     runner.off('model_progress', events.handleModelProgress)
     events.stopThinkingStatus(false)
   }
-  state.persistTerminalSnapshot = (status, reason, errorCode, settleAfter = true, waiveReason) =>
-    persistTerminalSnapshotFlow({ state, params, deps, status, reason, errorCode, settleAfter, waiveReason })
+  state.persistTerminalSnapshot = (status, reason, errorCode, settleAfter, waiveReason) =>
+    persistTerminalSnapshotFlow({
+      state,
+      params,
+      deps,
+      status,
+      reason,
+      errorCode,
+      settleAfter: settleAfter ?? true,
+      waiveReason,
+    })
   state.requestTerminalPersistence = (status, reason, errorCode, waiveReason) =>
     requestTerminalPersistenceFlow({ state, params, deps, status, reason, errorCode, waiveReason })
   session._persistActiveTurn = state.requestTerminalPersistence

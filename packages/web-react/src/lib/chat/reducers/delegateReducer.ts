@@ -44,13 +44,13 @@ function updateExistingSubagentToolUse(
   existing.inputPreview = block.inputPreview || existing.inputPreview;
   const dr = applyPartialJsonDelta(existing.partialJson, block);
   if (dr.action === "set") existing.partialJson = dr.value;
-  else if (dr.action === "drop") delete existing.partialJson;
+  else if (dr.action === "drop") Reflect.deleteProperty(existing, "partialJson");
   if (block.inputJson !== undefined && block.inputJson !== null) {
     existing.inputJson = block.inputJson;
     existing._inputRevision = (existing._inputRevision ?? 0) + 1;
   }
   existing._partial = !!block.partial;
-  if (!block.partial) delete existing.partialJson;
+  if (!block.partial) Reflect.deleteProperty(existing, "partialJson");
   if (block.toolName) existing.toolName = block.toolName;
 }
 

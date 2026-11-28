@@ -278,7 +278,7 @@ export async function handleCheckVerification(
     return;
   }
   const result = await query<{ email_verified: boolean }>(
-    `SELECT email_verified FROM users WHERE email = $1`,
+    "SELECT email_verified FROM users WHERE email = $1",
     [email],
   );
   const verified = result.rows.length > 0 && result.rows[0].email_verified === true;

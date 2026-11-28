@@ -396,10 +396,7 @@ export async function registerCommercial(
       }
     } else if (actualBind !== expectBind || actualPort !== expectPort) {
       throw new Error(
-        `[commercial] v5 内部代理 env 与 channel 期望不符:` +
-          `INTERNAL_PROXY_BIND=${actualBind ?? "(unset)"} (期望 ${expectBind}),` +
-          `INTERNAL_PROXY_PORT=${process.env.INTERNAL_PROXY_PORT ?? "(unset)"} (期望 ${expectPort})。` +
-          `容器 egress 与 listener bind 须一致,拒启。`,
+        `[commercial] v5 内部代理 env 与 channel 期望不符:INTERNAL_PROXY_BIND=${actualBind ?? "(unset)"} (期望 ${expectBind}),INTERNAL_PROXY_PORT=${process.env.INTERNAL_PROXY_PORT ?? "(unset)"} (期望 ${expectPort})。容器 egress 与 listener bind 须一致,拒启。`,
       );
     }
   }

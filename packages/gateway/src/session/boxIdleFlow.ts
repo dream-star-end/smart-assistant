@@ -690,7 +690,7 @@ export async function finishIdleUnderLockFlow(
   source: { sessionId: string; turnKey: string },
   recoveryDir: string,
   mode: 'after_turn' | 'pre_expiry',
-): Promise<'deferred' | void> {
+): Promise<'deferred' | undefined> {
   if (session._idleRunning) return
   const pending = deps.readPendingIdle(recoveryDir, session.sessionKey)
   if (!pending && !deps.readIdleCandidate(recoveryDir, session.sessionKey)) return

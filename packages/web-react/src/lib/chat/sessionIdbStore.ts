@@ -178,8 +178,7 @@ class IdbKV {
     const f = this.factory;
     if (!f) return Promise.resolve(null);
 
-    let opening!: Promise<IDBDatabase | null>;
-    opening = new Promise<IDBDatabase | null>((resolve) => {
+    const opening: Promise<IDBDatabase | null> = new Promise<IDBDatabase | null>((resolve) => {
       let settled = false;
       let blockedTimer: ReturnType<typeof setTimeout> | null = null;
       const finish = (db: IDBDatabase | null) => {
@@ -255,7 +254,7 @@ class IdbKV {
 
   private executeDurableTransaction<T = void>(
     storeNames: string | readonly string[],
-    work: (tx: IDBTransaction) => IDBRequest<T> | void,
+    work: (tx: IDBTransaction) => IDBRequest<T> | undefined,
   ): Promise<void> {
     return this.openDb().then((db) => {
       if (!db) throw new Error("indexeddb unavailable");
@@ -308,6 +307,7 @@ class IdbKV {
       (tx) => {
         tx.objectStore(SETTLED_DISPATCH_STORE).put({ key, settledAt }, key);
         tx.objectStore(PENDING_DISPATCH_STORE).delete(key);
+        return undefined;
       },
     );
   }

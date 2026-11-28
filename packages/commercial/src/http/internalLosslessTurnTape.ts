@@ -197,10 +197,7 @@ function emitLateTapeAlert(sessionId: string, tapeId: string): void {
     event_type: EVENTS.OPS_INCIDENT_OPENED,
     severity: "critical",
     title: "late turn tape 迟到(已告知失败却又产出计费内容)",
-    body:
-      `session \`${sessionId}\` tape \`${tapeId}\`:reconciler 已宣告该 turn ` +
-      `not_accepted 并向用户展示终态 error 卡,tape 随后到达。内容已完整 materialize(钱安全 I5),` +
-      `dispatch 已转 manual_reconcile、error 卡已撤销。请人工核对计费与用户告知一致性。`,
+    body: `session \`${sessionId}\` tape \`${tapeId}\`:reconciler 已宣告该 turn not_accepted 并向用户展示终态 error 卡,tape 随后到达。内容已完整 materialize(钱安全 I5),dispatch 已转 manual_reconcile、error 卡已撤销。请人工核对计费与用户告知一致性。`,
     payload: { source: "losslessTurnTapeFinalize", kind: "late_tape", session_id: sessionId, tape_id: tapeId },
     dedupe_key: `${EVENTS.OPS_INCIDENT_OPENED}:late_tape:${tapeId}`,
   }).catch(() => {});

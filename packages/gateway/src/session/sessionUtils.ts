@@ -39,8 +39,7 @@ export function assertPromptQueueExecutionAdmission(
 ): void {
   if (queueTurn && (activeSubmits !== 0 || activeClientTurns !== 1)) {
     throw new Error(
-      `PROMPT_QUEUE_EXECUTION_INVARIANT: expected one client turn and no queued submit ` +
-        `(client=${activeClientTurns}, submit=${activeSubmits})`,
+      `PROMPT_QUEUE_EXECUTION_INVARIANT: expected one client turn and no queued submit (client=${activeClientTurns}, submit=${activeSubmits})`,
     )
   }
   if (queueExecutionActive) {

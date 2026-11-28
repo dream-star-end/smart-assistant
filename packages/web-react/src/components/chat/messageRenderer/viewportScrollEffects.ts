@@ -372,7 +372,7 @@ export function useTimelineBlankProbeEffect(params: TimelineBlankProbeParams): v
       if (!force && now - lastSampleAt < BLANK_SAMPLE_INTERVAL_MS) return;
       lastSampleAt = now;
       if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-      let report;
+      let report: ReturnType<typeof blankDetectorRef.current.sample>;
       try {
         report = blankDetectorRef.current.sample(collect(), now);
       } catch {
@@ -403,8 +403,8 @@ export function useTimelineBlankProbeEffect(params: TimelineBlankProbeParams): v
       disposed = true;
       window.clearInterval(timer);
       scroller.removeEventListener("scroll", onScroll);
-      if (w.__ocTimelineDump) delete w.__ocTimelineDump;
-      if (w.__ocTimelineBlankLast) delete w.__ocTimelineBlankLast;
+      if (w.__ocTimelineDump) Reflect.deleteProperty(w, "__ocTimelineDump");
+      if (w.__ocTimelineBlankLast) Reflect.deleteProperty(w, "__ocTimelineBlankLast");
     };
   }, [scrollParent, sessionId, cb, listRootRef, blankDetectorRef, blankProbeStateRef, followBottomRefBox]);
 }

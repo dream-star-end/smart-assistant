@@ -38,6 +38,12 @@ type PinnedGoalModule = typeof import('./PinnedGoalBar')
 type PinnedGoalProps = ComponentProps<PinnedGoalModule['PinnedGoalBar']>
 type QueuedSendModule = typeof import('./QueuedSendList')
 type QueuedSendProps = ComponentProps<QueuedSendModule['QueuedSendList']>
+type TapeRecordCardsModule = typeof import('./messageRenderer/TapeRecordCards')
+type DeferredTapeRecordCardProps = ComponentProps<TapeRecordCardsModule['DeferredTapeRecordCard']>
+type ExactTapeRecordDisclosureProps = ComponentProps<
+  TapeRecordCardsModule['ExactTapeRecordDisclosure']
+>
+type RuntimeEventCardProps = ComponentProps<TapeRecordCardsModule['RuntimeEventCard']>
 export type PermissionCardLoader = () => Promise<PermissionCardModule>
 
 const defaultPermissionCardLoader: PermissionCardLoader = () => import('./PermissionCard')
@@ -197,6 +203,7 @@ export function preloadTimelineCards(): Promise<unknown> {
     preloadTeamPanel(),
     preloadGeneratingPlaceholderCard(),
     preloadPermissionCard(),
+    preloadTapeRecordCards(),
   ])
 }
 
@@ -504,6 +511,25 @@ const LazyPinnedGoalBar = createRetryableLazy(() =>
 const LazyQueuedSendList = createRetryableLazy(() =>
   import('./QueuedSendList').then((m) => ({ default: m.QueuedSendList })),
 )
+const LazyDeferredTapeRecordCard = createRetryableLazy(() =>
+  import('./messageRenderer/TapeRecordCards').then((m) => ({ default: m.DeferredTapeRecordCard })),
+)
+const LazyExactTapeRecordDisclosure = createRetryableLazy(() =>
+  import('./messageRenderer/TapeRecordCards').then((m) => ({
+    default: m.ExactTapeRecordDisclosure,
+  })),
+)
+const LazyRuntimeEventCard = createRetryableLazy(() =>
+  import('./messageRenderer/TapeRecordCards').then((m) => ({ default: m.RuntimeEventCard })),
+)
+
+export function preloadTapeRecordCards(): Promise<unknown> {
+  return Promise.all([
+    LazyDeferredTapeRecordCard.preload(),
+    LazyExactTapeRecordDisclosure.preload(),
+    LazyRuntimeEventCard.preload(),
+  ])
+}
 
 class SwarmLazyErrorBoundary extends Component<
   { onRebuild: () => void; renderChildren: () => ReactNode },
@@ -650,6 +676,55 @@ export function QueuedSendListLazy(props: QueuedSendProps) {
       renderChildren={() => (
         <Suspense fallback={null}>
           <LazyQueuedSendList {...props} />
+        </Suspense>
+      )}
+    />
+  )
+}
+
+export function DeferredTapeRecordCard(props: DeferredTapeRecordCardProps) {
+  return (
+    <InlineTimelineErrorBoundary
+      compact
+      label="完整记录加载失败"
+      renderChildren={() => (
+        <Suspense
+          fallback={
+            <div className="rounded-lg border border-dashed border-border bg-surface px-3.5 py-3 text-caption text-muted">
+              <span>{props.message._userPayloadDeferred ? '正在加载完整消息…' : '正在加载内容…'}</span>
+            </div>
+          }
+        >
+          <LazyDeferredTapeRecordCard {...props} />
+        </Suspense>
+      )}
+    />
+  )
+}
+
+export function ExactTapeRecordDisclosure(props: ExactTapeRecordDisclosureProps) {
+  if (!props.messages.some((message) => !!message._turnTapeId)) return null
+  return (
+    <InlineTimelineErrorBoundary
+      compact
+      label="原始记录视图加载失败"
+      renderChildren={() => (
+        <Suspense fallback={null}>
+          <LazyExactTapeRecordDisclosure {...props} />
+        </Suspense>
+      )}
+    />
+  )
+}
+
+export function RuntimeEventCard(props: RuntimeEventCardProps) {
+  return (
+    <InlineTimelineErrorBoundary
+      compact
+      label="运行事件卡片加载失败"
+      renderChildren={() => (
+        <Suspense fallback={null}>
+          <LazyRuntimeEventCard {...props} />
         </Suspense>
       )}
     />

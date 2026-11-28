@@ -184,7 +184,7 @@ function resolveAgentOrDelegateCardSpec(
   const input = parseToolInputObject(tb.inputJson, tb.inputPreview);
   const preview = (tb.inputPreview || "").replace(/[{}"]/g, "").slice(0, 80);
   if (delegateInfo) {
-    const desc = (delegateInfo.goalRaw && delegateInfo.goalRaw.trim()) || preview || "委托子任务";
+    const desc = delegateInfo.goalRaw?.trim() || preview || "委托子任务";
     const isBg = Boolean(delegateInfo.background || isSendToAgentToolName(tb.toolName));
     return {
       desc,
@@ -233,7 +233,7 @@ function promoteExistingToolToDelegateGroup(
   existingTool.toolName = tb.toolName || "delegate_task";
   existingTool.inputPreview = tb.inputPreview || existingTool.inputPreview;
   existingTool.inputJson = tb.inputJson ?? existingTool.inputJson ?? null;
-  delete existingTool.partialJson;
+  Reflect.deleteProperty(existingTool, "partialJson");
   existingTool._partial = false;
   existingTool._completed = false;
   existingTool.output = null;
@@ -337,14 +337,14 @@ function updateExistingTopLevelToolCard(
   existing.inputPreview = tb.inputPreview || existing.inputPreview;
   const deltaResult = applyPartialJsonDelta(existing.partialJson, tb);
   if (deltaResult.action === "set") existing.partialJson = deltaResult.value;
-  else if (deltaResult.action === "drop") delete existing.partialJson;
+  else if (deltaResult.action === "drop") Reflect.deleteProperty(existing, "partialJson");
   if (tb.inputJson !== undefined && tb.inputJson !== null) {
     existing.inputJson = tb.inputJson;
     existing._inputRevision = (existing._inputRevision ?? 0) + 1;
   }
   existing._partial = !!tb.partial;
   if (!tb.partial) {
-    delete existing.partialJson;
+    Reflect.deleteProperty(existing, "partialJson");
     existing._partialRafPending = false;
   }
   bindDelegateWaitToolRow(sess, existing);

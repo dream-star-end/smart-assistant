@@ -1,5 +1,4 @@
 import {
-  type ReactNode,
   type RefObject,
   useCallback,
   useEffect,
@@ -16,10 +15,6 @@ import {
   RUNTIME_TEXT_STEP,
   type RendererProps,
 } from "./types";
-
-export function TapeBackedCard({ children }: { children: ReactNode }) {
-  return <div className="space-y-1">{children}</div>;
-}
 
 /** Readable cards retain their pre-direct-timeline UX, while the immutable
  * source remains reachable byte-for-byte instead of being replaced by the

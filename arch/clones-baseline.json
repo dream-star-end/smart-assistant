@@ -2,15 +2,15 @@
   "schemaVersion": 1,
   "windowLines": 12,
   "summary": {
-    "scannedFiles": 2634,
-    "totalClusters": 1455,
-    "totalInstances": 5204
+    "scannedFiles": 2835,
+    "totalClusters": 1448,
+    "totalInstances": 5128
   },
   "topHotspots": [
     {
       "hash": "3e9d2a180daa28d27605702e9c75a51fcd714560a4a64b1a942471d86f9b64ba",
-      "files": 76,
-      "instances": 1142,
+      "files": 75,
+      "instances": 1125,
       "locations": [
         "packages/commercial/src/account-pool/remotePool/driftCoordinator.ts:41-52",
         "packages/commercial/src/account-pool/remotePool/driftCoordinator.ts:42-53",
@@ -22,8 +22,8 @@
     },
     {
       "hash": "422a692e40663344621e4cf0d2f60378466931a616afef3fc7fd834707e15193",
-      "files": 28,
-      "instances": 34,
+      "files": 27,
+      "instances": 31,
       "locations": [
         "packages/commercial/src/connectors/providers/shared.ts:35-47",
         "packages/commercial/src/connectors/spec/compiler.ts:119-130",
@@ -66,7 +66,7 @@
       "locations": [
         "packages/commercial/src/logging/logger.ts:56-68",
         "packages/gateway/src/engine/cursorSandRelay.ts:1342-1353",
-        "packages/web-react/src/components/chat/ProcessDisclosure.tsx:904-915",
+        "packages/web-react/src/components/chat/ProcessDisclosure.tsx:906-917",
         "packages/web-react/src/components/chat/phaseTimeline.ts:101-112",
         "packages/web-react/src/components/chat/phaseTimeline.ts:135-146",
         "packages/web-react/src/components/chat/phaseTimeline.ts:182-193"
@@ -112,19 +112,6 @@
       ]
     },
     {
-      "hash": "101cd18b8360ea6efa434450fa09a8f1fc46f850cc49dbecd70062ca3b770767",
-      "files": 6,
-      "instances": 132,
-      "locations": [
-        "packages/commercial/src/account-pool/remotePool/index.ts:1-12",
-        "packages/commercial/src/account-pool/remotePool/index.ts:2-13",
-        "packages/commercial/src/account-pool/remotePool/index.ts:3-14",
-        "packages/commercial/src/account-pool/remotePool/index.ts:4-15",
-        "packages/gateway/src/index.ts:1-13",
-        "packages/gateway/src/index.ts:2-14"
-      ]
-    },
-    {
       "hash": "34b9603065f8eadf0b49504b0f2bd3699a8d208ba63b3666c8c566efc9a5896d",
       "files": 6,
       "instances": 7,
@@ -135,6 +122,19 @@
         "packages/gateway/src/gatewayFilePolicy.ts:270-281",
         "packages/gateway/src/gatewayFilePolicy.ts:328-339",
         "packages/gateway/src/webContextSafety.ts:90-101"
+      ]
+    },
+    {
+      "hash": "101cd18b8360ea6efa434450fa09a8f1fc46f850cc49dbecd70062ca3b770767",
+      "files": 5,
+      "instances": 92,
+      "locations": [
+        "packages/commercial/src/account-pool/remotePool/index.ts:1-12",
+        "packages/commercial/src/account-pool/remotePool/index.ts:2-13",
+        "packages/commercial/src/account-pool/remotePool/index.ts:3-14",
+        "packages/commercial/src/account-pool/remotePool/index.ts:4-15",
+        "packages/gateway/src/index.ts:1-13",
+        "packages/gateway/src/index.ts:2-14"
       ]
     },
     {
@@ -195,19 +195,7 @@
         "packages/gateway/src/containerPreview.ts:162-173",
         "packages/web-react/src/lib/api/integrationsApi.ts:87-98",
         "packages/web-react/src/lib/api/memorySkillsApi.ts:47-58",
-        "packages/web-react/src/lib/api/projectsApi.ts:32-43"
-      ]
-    },
-    {
-      "hash": "8f494f5ae783316b7b5fd8693c8f8f8831ccbf408d480808d860f2746d23db30",
-      "files": 5,
-      "instances": 5,
-      "locations": [
-        "packages/commercial/src/admin/auditRetention.ts:190-209",
-        "packages/commercial/src/admin/retentionRegistry.ts:306-320",
-        "packages/commercial/src/billing/ledger.ts:39-52",
-        "packages/commercial/src/http/util.ts:92-103",
-        "packages/commercial/src/openai/omniModeration.ts:15-26"
+        "packages/web-react/src/lib/api/projectsApi.ts:36-47"
       ]
     },
     {
@@ -253,6 +241,17 @@
         "packages/commercial/src/grok/webSearchProxy.ts:87-98",
         "packages/commercial/src/minimax/webSearchProxy.ts:57-68",
         "packages/commercial/src/tavily/webSearchProxy.ts:41-52"
+      ]
+    },
+    {
+      "hash": "8f494f5ae783316b7b5fd8693c8f8f8831ccbf408d480808d860f2746d23db30",
+      "files": 4,
+      "instances": 4,
+      "locations": [
+        "packages/commercial/src/admin/auditRetention.ts:200-219",
+        "packages/commercial/src/billing/ledger.ts:39-52",
+        "packages/commercial/src/http/util.ts:92-103",
+        "packages/commercial/src/openai/omniModeration.ts:15-26"
       ]
     },
     {
@@ -358,7 +357,7 @@
       "locations": [
         "packages/web-react/src/admin/pages/pools/types.ts:127-138",
         "packages/web-react/src/components/chat/DeliverableRichPreview.tsx:124-135",
-        "packages/web-react/src/components/chat/swarmUtils.ts:40-51"
+        "packages/web-react/src/components/chat/swarmUtils.ts:38-49"
       ]
     },
     {
@@ -366,8 +365,8 @@
       "files": 3,
       "instances": 3,
       "locations": [
-        "packages/protocol/src/exec-env/validators.ts:131-144",
-        "packages/protocol/src/inference-pool/validators.ts:191-204",
+        "packages/protocol/src/exec-env/validators.ts:152-165",
+        "packages/protocol/src/inference-pool/validators.ts:139-152",
         "packages/protocol/src/storage-seam/validators.ts:168-181"
       ]
     },
@@ -388,7 +387,7 @@
       "locations": [
         "packages/web-react/src/lib/api/integrationsApi.ts:88-99",
         "packages/web-react/src/lib/api/memorySkillsApi.ts:48-59",
-        "packages/web-react/src/lib/api/projectsApi.ts:33-44"
+        "packages/web-react/src/lib/api/projectsApi.ts:37-48"
       ]
     },
     {
@@ -442,16 +441,6 @@
       ]
     },
     {
-      "hash": "ab70faf483a2b4bc5f983047864af04f9388a9e923fcb6df198e2c91f3df571b",
-      "files": 3,
-      "instances": 3,
-      "locations": [
-        "packages/commercial/src/account-pool/remotePool/index.ts:5-16",
-        "packages/gateway/src/index.ts:15-28",
-        "packages/storage/src/index.ts:43-63"
-      ]
-    },
-    {
       "hash": "e51ce72ae0771037a2d0f5506f03aa7b26766ee0de4bee4a2ef86037e9de3d1a",
       "files": 3,
       "instances": 3,
@@ -459,6 +448,16 @@
         "packages/web-react/src/admin/pages/accountGroups/form.tsx:2-15",
         "packages/web-react/src/admin/pages/alerts/formBits.tsx:1-14",
         "packages/web-react/src/admin/pages/egressProxies/form.tsx:2-15"
+      ]
+    },
+    {
+      "hash": "e5e735ec8325ac021f9ef76fee834387f715f3aac1685ab9e09a861eeb4dfb1a",
+      "files": 3,
+      "instances": 3,
+      "locations": [
+        "packages/commercial/src/account-pool/remotePool/verificationRuntimeProof.ts:211-222",
+        "packages/commercial/src/literatureSkill.ts:66-77",
+        "packages/web-react/src/components/settings/ApiKeysSection.tsx:117-128"
       ]
     }
   ],
@@ -827,10 +826,6 @@
       "files": 2,
       "instances": 2
     },
-    "0da4f2c899d8757071396319e7af65705d651b73abbecc72309a38f64075e3d1": {
-      "files": 2,
-      "instances": 2
-    },
     "0dd1d790c8d237e0a440d597d3eea13288bfe7dbef58f76eb3316641427bf5ae": {
       "files": 2,
       "instances": 2
@@ -880,8 +875,8 @@
       "instances": 5
     },
     "101cd18b8360ea6efa434450fa09a8f1fc46f850cc49dbecd70062ca3b770767": {
-      "files": 6,
-      "instances": 132
+      "files": 5,
+      "instances": 92
     },
     "103c1dbea1b4b1dde117ae1b4b1286a02dfc33b604c5414e7742e016431ebff1": {
       "files": 2,
@@ -1940,8 +1935,8 @@
       "instances": 2
     },
     "3e9d2a180daa28d27605702e9c75a51fcd714560a4a64b1a942471d86f9b64ba": {
-      "files": 76,
-      "instances": 1142
+      "files": 75,
+      "instances": 1125
     },
     "3ed347404d9c5bc4e900927f626c5cd526769821d6a4752bbce42e791f0a04e5": {
       "files": 2,
@@ -2024,8 +2019,8 @@
       "instances": 2
     },
     "422a692e40663344621e4cf0d2f60378466931a616afef3fc7fd834707e15193": {
-      "files": 28,
-      "instances": 34
+      "files": 27,
+      "instances": 31
     },
     "424fa603e8bcce958c3cefebe3d890b813e87c988600b61575095f2a42a0ecb1": {
       "files": 2,
@@ -2154,10 +2149,6 @@
     "47526fb1bdf586372b4ce9f9c0397ae0761303c63b83ef7e9d81620401165652": {
       "files": 3,
       "instances": 3
-    },
-    "47753745bf0d082fe15dedfcc4154b8e275811889217a009e8ad271994c1f08a": {
-      "files": 2,
-      "instances": 2
     },
     "477b66dfed8541d3316e7c6519ab33d5219a494fb06d23efabab4a8aab94f4c0": {
       "files": 2,
@@ -3135,10 +3126,6 @@
       "files": 2,
       "instances": 2
     },
-    "70d3fe90da2d5f12c63256a25d2e9e2bf9768336a671e9dcacbccb33a63d7801": {
-      "files": 2,
-      "instances": 2
-    },
     "70ddd8f4d45613b014270a7aa3812893ad2ff099d9e642c3628bb00ecad5cb67": {
       "files": 2,
       "instances": 2
@@ -3880,8 +3867,8 @@
       "instances": 4
     },
     "8f494f5ae783316b7b5fd8693c8f8f8831ccbf408d480808d860f2746d23db30": {
-      "files": 5,
-      "instances": 5
+      "files": 4,
+      "instances": 4
     },
     "8fac6941733119c2b1f71426e551f11c20f14c266fab1eabd1c833a2ac4bbfd7": {
       "files": 2,
@@ -4072,10 +4059,6 @@
       "instances": 2
     },
     "9804c361d2c6b0b7f7463ec93ba07268af2f70f420ec297d682572001b9a5069": {
-      "files": 2,
-      "instances": 2
-    },
-    "9805edcf1cb67bd37898f24b414862339553d4d2b9eeb7178a16469f3ac399a1": {
       "files": 2,
       "instances": 2
     },
@@ -4440,8 +4423,8 @@
       "instances": 2
     },
     "ab70faf483a2b4bc5f983047864af04f9388a9e923fcb6df198e2c91f3df571b": {
-      "files": 3,
-      "instances": 3
+      "files": 2,
+      "instances": 2
     },
     "ab753d42c7f0991123479477674a06150e9441628a976cc89b2b4eb55a4f5346": {
       "files": 2,
@@ -4596,10 +4579,6 @@
       "instances": 2
     },
     "b2ac085e483f5a865e874302359af5e92ae8299b0eae694da33d6328cc057af1": {
-      "files": 2,
-      "instances": 2
-    },
-    "b31ac99b4cd2ff3021906ae8520a9e09604922cca6694857e53935ca2d652736": {
       "files": 2,
       "instances": 2
     },
@@ -5270,10 +5249,6 @@
     "d08a69efdac43bfab7431f38f00a816fed5a14786adf8c58550767ae3c4e074b": {
       "files": 4,
       "instances": 4
-    },
-    "d09466449fe95ef3ad5fc4d85030f98b324cddb46db59253aba114c96e463345": {
-      "files": 2,
-      "instances": 2
     },
     "d0b36f8c230bed3d9c661de420218e4c183951cae7369813eb3109856877c37e": {
       "files": 3,
@@ -6020,10 +5995,6 @@
       "instances": 2
     },
     "f257a85a29ea6e52627e61421615cb85fb4b2297f9cbb5072b1c3ee941125f78": {
-      "files": 2,
-      "instances": 2
-    },
-    "f25fac58b2535ee57be6a8e7ce187adde628f2e69c9ccaa148666502b568b429": {
       "files": 2,
       "instances": 2
     },

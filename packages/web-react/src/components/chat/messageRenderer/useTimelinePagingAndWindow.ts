@@ -42,12 +42,17 @@ type LiveUnitsAutoFillParams = {
   sessionId: string | undefined;
   requestedLiveCursorRef: MutableRefObject<string | null>;
   liveAutoPagesRef: MutableRefObject<{ session?: string; count: number }>;
-  requestOlderLiveUnits: () => false | Promise<void | {
-    ok?: boolean;
-    hasMore?: boolean;
-    error?: boolean;
-    inflight?: boolean;
-  }>;
+  requestOlderLiveUnits: () =>
+    | false
+    | Promise<
+        | undefined
+        | {
+            ok?: boolean;
+            hasMore?: boolean;
+            error?: boolean;
+            inflight?: boolean;
+          }
+      >;
 };
 
 function useLiveUnitsAutoFillEffect(params: LiveUnitsAutoFillParams): void {
@@ -209,7 +214,9 @@ function useLiveUnitsAutoPaging(
       epoch: processPaging.interactionVersion(),
       anchor: !following && scrollParent ? captureLiveUnitsAnchor(scrollParent) : null,
     };
-    return Promise.resolve(archive.onLoadOlderLiveUnits()).finally(() => {
+    return Promise.resolve(archive.onLoadOlderLiveUnits())
+      .then((result) => result ?? undefined)
+      .finally(() => {
       if (archiveQueueTokenRef.current !== token) return;
       const hold = liveUnitsHoldRef.current;
       liveUnitsHoldRef.current = null;

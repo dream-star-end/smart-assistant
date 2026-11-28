@@ -22,16 +22,14 @@ import {
 import { FirstTextPaintCommitProbe } from "./chat/FirstTextPaintCommitProbe";
 import {
   AgentGroupCard,
-  GeneratingPlaceholderCard,
-  PermissionCard,
-} from "./chat/lazyTimelineCards";
-import { MessageListView } from "./chat/messageRenderer/MessageListView";
-import {
   DeferredTapeRecordCard,
   ExactTapeRecordDisclosure,
+  GeneratingPlaceholderCard,
+  PermissionCard,
   RuntimeEventCard,
-  TapeBackedCard,
-} from "./chat/messageRenderer/TapeRecordCards";
+} from "./chat/lazyTimelineCards";
+import { TapeBackedCard } from "./chat/messageRenderer/MessageListParts";
+import { MessageListView } from "./chat/messageRenderer/MessageListView";
 import {
   type MessageListArchive,
   type MessageListProps,

@@ -161,12 +161,18 @@ export type MessageListArchive = {
   liveHasMoreBefore?: boolean;
   /** Server cursor for the next older live-unit page. Auto-load keys on this. */
   liveUnitsCursor?: string | null;
-  onLoadOlderLiveUnits?: () => void | Promise<void | {
-    ok?: boolean;
-    hasMore?: boolean;
-    error?: boolean;
-    inflight?: boolean;
-  }>;
+  onLoadOlderLiveUnits?: () =>
+    | void
+    | Promise<void>
+    | Promise<
+        | undefined
+        | {
+            ok?: boolean;
+            hasMore?: boolean;
+            error?: boolean;
+            inflight?: boolean;
+          }
+      >;
 };
 
 export type MessageListProps = {

@@ -6,10 +6,10 @@
     "maxNesting": 5
   },
   "summary": {
-    "exceedingFunctions": 2058,
-    "overLines": 1333,
-    "overCcDirect": 1391,
-    "overMaxNesting": 67
+    "exceedingFunctions": 1916,
+    "overLines": 1225,
+    "overCcDirect": 1295,
+    "overMaxNesting": 55
   },
   "functions": {
     "packages/channels/feishu/src/cards.ts::parseFeishuApprovalCardCallback": {
@@ -78,8 +78,8 @@
       "maxNesting": 3
     },
     "packages/commercial/src/account-pool/antigravityPool.ts::pickAntigravityAccount": {
-      "lines": 136,
-      "ccDirect": 24,
+      "lines": 130,
+      "ccDirect": 22,
       "maxNesting": 2
     },
     "packages/commercial/src/account-pool/antigravityQuota.ts::fetchQuota": {
@@ -153,7 +153,7 @@
       "maxNesting": 0
     },
     "packages/commercial/src/account-pool/remoteBrainPool.ts::placeRemoteLane": {
-      "lines": 109,
+      "lines": 108,
       "ccDirect": 32,
       "maxNesting": 3
     },
@@ -178,9 +178,9 @@
       "maxNesting": 1
     },
     "packages/commercial/src/account-pool/remotePool/commissioningService.ts::RemoteDriverV4CommissioningService.runJobInternal": {
-      "lines": 189,
-      "ccDirect": 23,
-      "maxNesting": 4
+      "lines": 144,
+      "ccDirect": 17,
+      "maxNesting": 2
     },
     "packages/commercial/src/account-pool/remotePool/crossPoolContinuity.ts::buildAnchorsSection": {
       "lines": 127,
@@ -553,7 +553,7 @@
       "maxNesting": 1
     },
     "packages/commercial/src/agent-sandbox/cc5Runtime.ts::createMasterCc5Runtime": {
-      "lines": 212,
+      "lines": 150,
       "ccDirect": 36,
       "maxNesting": 3
     },
@@ -652,35 +652,10 @@
       "ccDirect": 23,
       "maxNesting": 4
     },
-    "packages/commercial/src/agent-sandbox/v3supervisor.ts::cleanupV3DockerEffects": {
-      "lines": 119,
-      "ccDirect": 28,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/agent-sandbox/v3supervisor.ts::createV3ContainerLocalWithSelfHeal": {
-      "lines": 90,
-      "ccDirect": 22,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/agent-sandbox/v3supervisor.ts::getV3ContainerStatus": {
-      "lines": 131,
-      "ccDirect": 28,
-      "maxNesting": 2
-    },
     "packages/commercial/src/agent-sandbox/v3supervisor.ts::provisionV3Container": {
-      "lines": 1277,
-      "ccDirect": 155,
-      "maxNesting": 7
-    },
-    "packages/commercial/src/agent-sandbox/v3supervisor.ts::resolveCcbBaselineMounts": {
-      "lines": 117,
-      "ccDirect": 24,
-      "maxNesting": 4
-    },
-    "packages/commercial/src/agent-sandbox/v3supervisor.ts::resolveV5CursorAuthMount": {
-      "lines": 62,
-      "ccDirect": 30,
-      "maxNesting": 3
+      "lines": 167,
+      "ccDirect": 13,
+      "maxNesting": 1
     },
     "packages/commercial/src/agent/subscriptions.ts::openAgentSubscription": {
       "lines": 161,
@@ -958,22 +933,22 @@
       "maxNesting": 2
     },
     "packages/commercial/src/billing/remoteDriverTurnBilling.ts::createRemoteDriverTurnFinance": {
-      "lines": 527,
+      "lines": 518,
       "ccDirect": 5,
       "maxNesting": 0
     },
     "packages/commercial/src/billing/remoteDriverTurnBilling.ts::createRemoteDriverTurnFinance.admit": {
-      "lines": 511,
+      "lines": 502,
       "ccDirect": 30,
       "maxNesting": 2
     },
     "packages/commercial/src/billing/remoteDriverTurnBilling.ts::parseContextV4": {
-      "lines": 93,
-      "ccDirect": 58,
+      "lines": 85,
+      "ccDirect": 55,
       "maxNesting": 2
     },
     "packages/commercial/src/billing/remoteDriverTurnBilling.ts::persistDriverReceiptV4": {
-      "lines": 120,
+      "lines": 116,
       "ccDirect": 15,
       "maxNesting": 3
     },
@@ -983,17 +958,17 @@
       "maxNesting": 1
     },
     "packages/commercial/src/billing/remoteDriverTurnBilling.ts::recoverRemoteDriverTurnBilling": {
-      "lines": 118,
+      "lines": 112,
       "ccDirect": 16,
       "maxNesting": 4
     },
     "packages/commercial/src/billing/remoteNativeTurnBilling.ts::createRemoteNativeTurnFinance": {
-      "lines": 285,
+      "lines": 280,
       "ccDirect": 5,
       "maxNesting": 0
     },
     "packages/commercial/src/billing/remoteNativeTurnBilling.ts::createRemoteNativeTurnFinance.admit": {
-      "lines": 267,
+      "lines": 262,
       "ccDirect": 38,
       "maxNesting": 2
     },
@@ -1094,7 +1069,7 @@
     },
     "packages/commercial/src/bootstrap/chatBridgeBootstrap.ts::createCommercialUserChatBridge": {
       "lines": 228,
-      "ccDirect": 14,
+      "ccDirect": 12,
       "maxNesting": 0
     },
     "packages/commercial/src/bootstrap/internalProxyBootstrap.ts::bootstrapExternalApiKeyProxy": {
@@ -1138,24 +1113,19 @@
       "maxNesting": 1
     },
     "packages/commercial/src/bootstrap/runtimeSupervisorBootstrap.ts::assembleV3SupervisorCore": {
-      "lines": 228,
-      "ccDirect": 32,
+      "lines": 215,
+      "ccDirect": 31,
       "maxNesting": 3
     },
-    "packages/commercial/src/bootstrap/runtimeSupervisorBootstrap.ts::bootstrapMailerBridgeAndAuthority": {
-      "lines": 124,
-      "ccDirect": 20,
-      "maxNesting": 2
-    },
     "packages/commercial/src/bootstrap/runtimeSupervisorBootstrap.ts::bootstrapPluginsRuntime": {
-      "lines": 168,
+      "lines": 164,
       "ccDirect": 4,
       "maxNesting": 1
     },
     "packages/commercial/src/bootstrap/runtimeSupervisorBootstrap.ts::buildContainerHelpersAndPreview": {
-      "lines": 272,
-      "ccDirect": 21,
-      "maxNesting": 3
+      "lines": 206,
+      "ccDirect": 13,
+      "maxNesting": 0
     },
     "packages/commercial/src/bootstrap/shutdownBootstrap.ts::createCommercialShutdown": {
       "lines": 107,
@@ -1417,216 +1387,6 @@
       "ccDirect": 81,
       "maxNesting": 3
     },
-    "packages/commercial/src/db/pgSessionsBackend.ts::_prepareLosslessTurnTapeOutsideLocks": {
-      "lines": 128,
-      "ccDirect": 19,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::_stagePreparedLosslessTurnRecords": {
-      "lines": 371,
-      "ccDirect": 4,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::commitVisibleLosslessTurnPhaseA": {
-      "lines": 368,
-      "ccDirect": 2,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::computeEngineContextMessages": {
-      "lines": 120,
-      "ccDirect": 13,
-      "maxNesting": 4
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::computeFiniteEngineContextMessages": {
-      "lines": 421,
-      "ccDirect": 12,
-      "maxNesting": 4
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::computeFiniteEngineContextMessages.processCompleteTape": {
-      "lines": 245,
-      "ccDirect": 40,
-      "maxNesting": 6
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::computeFiniteEngineContextMessages.processMessages": {
-      "lines": 52,
-      "ccDirect": 23,
-      "maxNesting": 3
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend": {
-      "lines": 4777,
-      "ccDirect": 2,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.admitUserTurn": {
-      "lines": 432,
-      "ccDirect": 3,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.appendCostCredits": {
-      "lines": 449,
-      "ccDirect": 8,
-      "maxNesting": 1
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.batchClientSessions": {
-      "lines": 165,
-      "ccDirect": 5,
-      "maxNesting": 1
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.drainDelegateCostForClientSession": {
-      "lines": 102,
-      "ccDirect": 1,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.finalizeLosslessTurnTape": {
-      "lines": 965,
-      "ccDirect": 3,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.getClientSessionPartial": {
-      "lines": 148,
-      "ccDirect": 2,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.getClientSessionPartial.read": {
-      "lines": 138,
-      "ccDirect": 17,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.listClientSessions": {
-      "lines": 122,
-      "ccDirect": 14,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.readArchivedMessages": {
-      "lines": 69,
-      "ccDirect": 23,
-      "maxNesting": 4
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.reconcileAutomaticRecoveryJobs": {
-      "lines": 140,
-      "ccDirect": 8,
-      "maxNesting": 3
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.searchClientSessions": {
-      "lines": 165,
-      "ccDirect": 12,
-      "maxNesting": 1
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.stageLosslessTurnTapePart": {
-      "lines": 116,
-      "ccDirect": 1,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.updateChatProject": {
-      "lines": 112,
-      "ccDirect": 29,
-      "maxNesting": 3
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::createPgSessionsBackend.upsertClientSession": {
-      "lines": 107,
-      "ccDirect": 3,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::deferredUserReplayMetadata": {
-      "lines": 45,
-      "ccDirect": 27,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::hydrateTurnTapeMessages": {
-      "lines": 289,
-      "ccDirect": 36,
-      "maxNesting": 3
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::hydrateTurnTapeMessages.hydrated": {
-      "lines": 150,
-      "ccDirect": 49,
-      "maxNesting": 4
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::hydrateUnifiedTimelineTapeUnits": {
-      "lines": 206,
-      "ccDirect": 20,
-      "maxNesting": 5
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::inspectLateDelegateContinuationAgainstRoot": {
-      "lines": 198,
-      "ccDirect": 47,
-      "maxNesting": 4
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::isLosslessTurnTapeReadyForPreparation": {
-      "lines": 75,
-      "ccDirect": 21,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::listTurnTapeRecordsImpl": {
-      "lines": 169,
-      "ccDirect": 28,
-      "maxNesting": 3
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::readClientTimelinePageImpl": {
-      "lines": 430,
-      "ccDirect": 3,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::readClientTimelinePageImpl.readSnapshot": {
-      "lines": 413,
-      "ccDirect": 79,
-      "maxNesting": 6
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::readDirectTapeHeaders": {
-      "lines": 120,
-      "ccDirect": 5,
-      "maxNesting": 3
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::readExactPreparedLosslessTurnOrdinals": {
-      "lines": 107,
-      "ccDirect": 16,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::readHydratedTapeRows": {
-      "lines": 108,
-      "ccDirect": 10,
-      "maxNesting": 1
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::readOrBackfillPhysicalModelPage": {
-      "lines": 169,
-      "ccDirect": 20,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::readTapeRecordPayloadImpl": {
-      "lines": 122,
-      "ccDirect": 19,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::readUnifiedTimelineBashTailAuxiliaries": {
-      "lines": 289,
-      "ccDirect": 22,
-      "maxNesting": 4
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::readUnifiedTimelineBashTailAuxiliaries.flush": {
-      "lines": 59,
-      "ccDirect": 21,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::scheduleAutomaticRecoveryForFinalizedTurn": {
-      "lines": 330,
-      "ccDirect": 81,
-      "maxNesting": 1
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::startSessionsGcSweeper": {
-      "lines": 127,
-      "ccDirect": 4,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::sweepOnce": {
-      "lines": 152,
-      "ccDirect": 8,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/db/pgSessionsBackend.ts::unifiedTimelineTapeFallbackMessages": {
-      "lines": 75,
-      "ccDirect": 27,
-      "maxNesting": 0
-    },
     "packages/commercial/src/db/runtimeBatch.ts::expandHydratedRuntimeBatch": {
       "lines": 127,
       "ccDirect": 74,
@@ -1675,21 +1435,6 @@
     "packages/commercial/src/db/threeLayerPendingInstall.ts::extractPendingInstallMigration": {
       "lines": 39,
       "ccDirect": 21,
-      "maxNesting": 1
-    },
-    "packages/commercial/src/db/threeLayerStateStore.ts::PgSessionAuthorityStateStore.beginPlacementMigration": {
-      "lines": 121,
-      "ccDirect": 2,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/db/threeLayerStateStore.ts::PgSessionAuthorityStateStore.commitPlacementMigration": {
-      "lines": 137,
-      "ccDirect": 2,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/db/threeLayerStateStore.ts::PgSessionAuthorityStateStore.upsertEnginePointer": {
-      "lines": 143,
-      "ccDirect": 3,
       "maxNesting": 1
     },
     "packages/commercial/src/deploy/controlListener.ts::createControlListener": {
@@ -1898,8 +1643,8 @@
       "maxNesting": 3
     },
     "packages/commercial/src/http/admin/remoteDriverV4.ts::handleAdminRemoteDriverV4": {
-      "lines": 131,
-      "ccDirect": 43,
+      "lines": 129,
+      "ccDirect": 42,
       "maxNesting": 3
     },
     "packages/commercial/src/http/admin/sessions.ts::handleAdminGetSession": {
@@ -1996,26 +1741,6 @@
       "lines": 101,
       "ccDirect": 29,
       "maxNesting": 4
-    },
-    "packages/commercial/src/http/handlers.ts::handleGetMyUsage": {
-      "lines": 345,
-      "ccDirect": 33,
-      "maxNesting": 4
-    },
-    "packages/commercial/src/http/handlers.ts::handleMediaSign": {
-      "lines": 143,
-      "ccDirect": 28,
-      "maxNesting": 3
-    },
-    "packages/commercial/src/http/handlers.ts::handleMediaSigned": {
-      "lines": 276,
-      "ccDirect": 41,
-      "maxNesting": 3
-    },
-    "packages/commercial/src/http/handlers.ts::handleSubmitFeedback": {
-      "lines": 102,
-      "ccDirect": 20,
-      "maxNesting": 2
     },
     "packages/commercial/src/http/internal/selfhealRepairs.ts::dispatchSelfhealRepairsRoute": {
       "lines": 182,
@@ -2151,16 +1876,6 @@
       "lines": 69,
       "ccDirect": 27,
       "maxNesting": 2
-    },
-    "packages/commercial/src/http/internalServerAuthored.ts::BodySchema": {
-      "lines": 179,
-      "ccDirect": 16,
-      "maxNesting": 0
-    },
-    "packages/commercial/src/http/internalServerAuthored.ts::handleLosslessTurnTapeRequest": {
-      "lines": 409,
-      "ccDirect": 82,
-      "maxNesting": 6
     },
     "packages/commercial/src/http/internalServerAuthored.ts::makeServerAuthoredHandler": {
       "lines": 1517,
@@ -2793,7 +2508,7 @@
       "maxNesting": 3
     },
     "packages/commercial/src/http/router.ts::buildCommercialRoutes": {
-      "lines": 998,
+      "lines": 994,
       "ccDirect": 1,
       "maxNesting": 0
     },
@@ -2848,8 +2563,8 @@
       "maxNesting": 0
     },
     "packages/commercial/src/index.ts::registerCommercial": {
-      "lines": 2495,
-      "ccDirect": 196,
+      "lines": 1574,
+      "ccDirect": 93,
       "maxNesting": 4
     },
     "packages/commercial/src/literatureProxy.ts::makeLiteratureProxyHandler": {
@@ -3728,7 +3443,7 @@
       "maxNesting": 2
     },
     "packages/commercial/src/remoteRelay/main.ts::startRemoteRelayDaemon": {
-      "lines": 378,
+      "lines": 311,
       "ccDirect": 22,
       "maxNesting": 3
     },
@@ -4122,18 +3837,13 @@
       "ccDirect": 21,
       "maxNesting": 2
     },
-    "packages/commercial/src/ws/containerLink.ts::ContainerLink.deliver": {
-      "lines": 42,
-      "ccDirect": 30,
-      "maxNesting": 3
-    },
     "packages/commercial/src/ws/containerLink.ts::ContainerLink.renew": {
       "lines": 55,
       "ccDirect": 23,
       "maxNesting": 5
     },
     "packages/commercial/src/ws/containerLink.ts::ContainerLink.send": {
-      "lines": 245,
+      "lines": 223,
       "ccDirect": 36,
       "maxNesting": 3
     },
@@ -4222,91 +3932,6 @@
       "ccDirect": 21,
       "maxNesting": 3
     },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge": {
-      "lines": 8811,
-      "ccDirect": 37,
-      "maxNesting": 1
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.handleUpgrade": {
-      "lines": 298,
-      "ccDirect": 3,
-      "maxNesting": 1
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.runSingleRecoveryDrainPass": {
-      "lines": 74,
-      "ccDirect": 26,
-      "maxNesting": 5
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge": {
-      "lines": 7754,
-      "ccDirect": 18,
-      "maxNesting": 1
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.attachMasterTurnState": {
-      "lines": 851,
-      "ccDirect": 205,
-      "maxNesting": 5
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.cleanup": {
-      "lines": 87,
-      "ccDirect": 30,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.executeAdmittedTurn": {
-      "lines": 3009,
-      "ccDirect": 31,
-      "maxNesting": 3
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.executeAdmittedTurn.continuePreparation": {
-      "lines": 2767,
-      "ccDirect": 268,
-      "maxNesting": 7
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.finalCleanup": {
-      "lines": 159,
-      "ccDirect": 23,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.handleCrossBridgeCodexBilling": {
-      "lines": 433,
-      "ccDirect": 4,
-      "maxNesting": 1
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.onContainerAttest": {
-      "lines": 139,
-      "ccDirect": 26,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.onContainerMessage": {
-      "lines": 1272,
-      "ccDirect": 263,
-      "maxNesting": 6
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.onContainerMessage.forwardCommittedFrame": {
-      "lines": 67,
-      "ccDirect": 22,
-      "maxNesting": 3
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.releaseCodexTurnState": {
-      "lines": 61,
-      "ccDirect": 24,
-      "maxNesting": 2
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::createUserChatBridge.startBridge.resolveAuthorityExecOrReject": {
-      "lines": 143,
-      "ccDirect": 28,
-      "maxNesting": 3
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::isValidatedAnnotatedImageInbound": {
-      "lines": 30,
-      "ccDirect": 24,
-      "maxNesting": 1
-    },
-    "packages/commercial/src/ws/userChatBridge.ts::parsePromptQueueDispatchRequest": {
-      "lines": 50,
-      "ccDirect": 66,
-      "maxNesting": 1
-    },
     "packages/commercial/src/ws/userChatBridgeLocalFallbackTransport.ts::prepareAntigravityLocalFallbackTransport": {
       "lines": 232,
       "ccDirect": 36,
@@ -4323,9 +3948,9 @@
       "maxNesting": 1
     },
     "packages/commercial/src/ws/userChatBridgeRemotePoolSeal.ts::parseAndHandleMigrationInstallReceipt": {
-      "lines": 135,
-      "ccDirect": 48,
-      "maxNesting": 2
+      "lines": 56,
+      "ccDirect": 41,
+      "maxNesting": 1
     },
     "packages/commercial/src/ws/userChatBridgeRemotePoolSeal.ts::resolveRemotePoolBackendAndSeal": {
       "lines": 583,
@@ -4433,8 +4058,8 @@
       "maxNesting": 2
     },
     "packages/gateway/src/askUserPermissions.ts::handlePermissionResponse": {
-      "lines": 276,
-      "ccDirect": 44,
+      "lines": 257,
+      "ccDirect": 40,
       "maxNesting": 2
     },
     "packages/gateway/src/askUserSanitize.ts::sanitizeAskUserQuestionUpdatedInput": {
@@ -4968,13 +4593,13 @@
       "maxNesting": 3
     },
     "packages/gateway/src/detachedAskUser.ts::pendingFromDetachedAskUserMessage": {
-      "lines": 47,
-      "ccDirect": 26,
+      "lines": 41,
+      "ccDirect": 23,
       "maxNesting": 1
     },
     "packages/gateway/src/efficiencyPreToolHook.ts::handlePreToolHookInput": {
-      "lines": 130,
-      "ccDirect": 45,
+      "lines": 75,
+      "ccDirect": 21,
       "maxNesting": 3
     },
     "packages/gateway/src/engine/antigravityAdapter.ts::AntigravityAdapter.closeTurn": {
@@ -4998,9 +4623,9 @@
       "maxNesting": 4
     },
     "packages/gateway/src/engine/antigravityAdapter.ts::AntigravityAdapter.spawnTurn": {
-      "lines": 257,
-      "ccDirect": 49,
-      "maxNesting": 2
+      "lines": 226,
+      "ccDirect": 37,
+      "maxNesting": 1
     },
     "packages/gateway/src/engine/antigravityNativeTrajectory.ts::prepareAntigravityNativeTrajectory": {
       "lines": 78,
@@ -5008,9 +4633,9 @@
       "maxNesting": 5
     },
     "packages/gateway/src/engine/antigravityPlatform.ts::projectAntigravityPlatform": {
-      "lines": 154,
-      "ccDirect": 24,
-      "maxNesting": 3
+      "lines": 125,
+      "ccDirect": 20,
+      "maxNesting": 2
     },
     "packages/gateway/src/engine/antigravityPromptState.ts::buildAntigravitySlotHashes": {
       "lines": 44,
@@ -5123,7 +4748,7 @@
       "maxNesting": 2
     },
     "packages/gateway/src/engine/ccbAdapter.ts::CcbAdapter.submitTurn": {
-      "lines": 177,
+      "lines": 175,
       "ccDirect": 8,
       "maxNesting": 2
     },
@@ -5218,8 +4843,8 @@
       "maxNesting": 4
     },
     "packages/gateway/src/engine/cursorAdapter.ts::CursorAdapter.spawnTurn": {
-      "lines": 332,
-      "ccDirect": 45,
+      "lines": 322,
+      "ccDirect": 43,
       "maxNesting": 3
     },
     "packages/gateway/src/engine/cursorAdapter.ts::CursorAdapter.tickPendingKeepalive": {
@@ -5398,13 +5023,13 @@
       "maxNesting": 3
     },
     "packages/gateway/src/engine/swarmStallMonitor.ts::SwarmStallMonitor.diagnoseStall": {
-      "lines": 164,
-      "ccDirect": 30,
-      "maxNesting": 3
+      "lines": 144,
+      "ccDirect": 27,
+      "maxNesting": 2
     },
     "packages/gateway/src/engine/swarmStallMonitor.ts::SwarmStallMonitor.evaluate": {
-      "lines": 308,
-      "ccDirect": 28,
+      "lines": 268,
+      "ccDirect": 27,
       "maxNesting": 2
     },
     "packages/gateway/src/engine/zcodeAdapter.ts::ZcodeAdapter.finalize": {
@@ -5448,19 +5073,9 @@
       "maxNesting": 2
     },
     "packages/gateway/src/execEnv/containerLinkBrokerTransport.ts::ContainerLinkToolBrokerHost.handleFrame": {
-      "lines": 221,
-      "ccDirect": 40,
+      "lines": 114,
+      "ccDirect": 21,
       "maxNesting": 5
-    },
-    "packages/gateway/src/execEnv/jobRegistry.ts::ExecEnvJobRegistry.startJob": {
-      "lines": 132,
-      "ccDirect": 23,
-      "maxNesting": 2
-    },
-    "packages/gateway/src/execEnv/jobRegistry.ts::ExecEnvJobRegistry.waitJob": {
-      "lines": 127,
-      "ccDirect": 34,
-      "maxNesting": 2
     },
     "packages/gateway/src/execEnv/scopedCapabilityToken.ts::ScopedCapabilityTokenAuthority.verifyAndConsumeToken": {
       "lines": 108,
@@ -5473,8 +5088,8 @@
       "maxNesting": 3
     },
     "packages/gateway/src/execEnv/toolBroker.ts::ToolBrokerServer.executeInternal": {
-      "lines": 611,
-      "ccDirect": 95,
+      "lines": 443,
+      "ccDirect": 82,
       "maxNesting": 4
     },
     "packages/gateway/src/execEnv/toolBroker.ts::ToolBrokerServer.verifyReplayedSpilledReceipt": {
@@ -5963,8 +5578,8 @@
       "maxNesting": 2
     },
     "packages/gateway/src/remotePool/containerLane.ts::RemoteContainerLane.serveToolDelivery": {
-      "lines": 148,
-      "ccDirect": 30,
+      "lines": 144,
+      "ccDirect": 27,
       "maxNesting": 3
     },
     "packages/gateway/src/remotePool/containerLane.ts::extractRemoteTurnContent": {
@@ -5983,8 +5598,8 @@
       "maxNesting": 4
     },
     "packages/gateway/src/remotePool/relay.ts::RemotePoolRelay.handleClientCommand": {
-      "lines": 117,
-      "ccDirect": 40,
+      "lines": 114,
+      "ccDirect": 39,
       "maxNesting": 2
     },
     "packages/gateway/src/remotePool/relay.ts::RemotePoolRelay.handleControl": {
@@ -6008,7 +5623,7 @@
       "maxNesting": 3
     },
     "packages/gateway/src/remotePool/remoteEngineAdapter.ts::RemoteEngineAdapter.submitTurn": {
-      "lines": 878,
+      "lines": 876,
       "ccDirect": 7,
       "maxNesting": 1
     },
@@ -6018,7 +5633,7 @@
       "maxNesting": 3
     },
     "packages/gateway/src/remotePool/remoteEngineAdapter.ts::RemoteEngineAdapter.submitTurn.settleWithReceipt": {
-      "lines": 161,
+      "lines": 159,
       "ccDirect": 37,
       "maxNesting": 1
     },
@@ -6208,7 +5823,7 @@
       "maxNesting": 2
     },
     "packages/gateway/src/server.ts::Gateway.constructor": {
-      "lines": 109,
+      "lines": 107,
       "ccDirect": 6,
       "maxNesting": 1
     },
@@ -6232,14 +5847,9 @@
       "ccDirect": 28,
       "maxNesting": 2
     },
-    "packages/gateway/src/sessionBgCommands.ts::cancelSessionBgCommand": {
-      "lines": 122,
-      "ccDirect": 33,
-      "maxNesting": 4
-    },
     "packages/gateway/src/sessionBgCommands.ts::parseSnapshotFile": {
-      "lines": 53,
-      "ccDirect": 32,
+      "lines": 43,
+      "ccDirect": 28,
       "maxNesting": 2
     },
     "packages/gateway/src/sessionBgCommands.ts::scanVerifiedGroupMembers": {
@@ -6292,21 +5902,6 @@
       "ccDirect": 42,
       "maxNesting": 3
     },
-    "packages/gateway/src/sessionManager.ts::SessionManager.getOrCreate": {
-      "lines": 120,
-      "ccDirect": 1,
-      "maxNesting": 0
-    },
-    "packages/gateway/src/sessionManager.ts::buildHistoricalContextPrompt": {
-      "lines": 103,
-      "ccDirect": 28,
-      "maxNesting": 3
-    },
-    "packages/gateway/src/sessionManager.ts::nextUserGoal": {
-      "lines": 33,
-      "ccDirect": 31,
-      "maxNesting": 1
-    },
     "packages/gateway/src/sessionPreheat.ts::runSessionPreheat": {
       "lines": 53,
       "ccDirect": 22,
@@ -6333,29 +5928,14 @@
       "maxNesting": 2
     },
     "packages/gateway/src/sessionSubmit.ts::_getOrCreateExclusive": {
-      "lines": 673,
-      "ccDirect": 190,
-      "maxNesting": 7
-    },
-    "packages/gateway/src/sessionSubmit.ts::finishIdleUnderLock": {
-      "lines": 381,
-      "ccDirect": 109,
-      "maxNesting": 7
-    },
-    "packages/gateway/src/sessionSubmit.ts::getOrCreate": {
-      "lines": 122,
-      "ccDirect": 1,
-      "maxNesting": 0
-    },
-    "packages/gateway/src/sessionSubmit.ts::recordExternalTurn": {
-      "lines": 122,
-      "ccDirect": 11,
-      "maxNesting": 2
+      "lines": 93,
+      "ccDirect": 37,
+      "maxNesting": 3
     },
     "packages/gateway/src/sessionSubmit.ts::submit": {
-      "lines": 1175,
-      "ccDirect": 280,
-      "maxNesting": 7
+      "lines": 131,
+      "ccDirect": 26,
+      "maxNesting": 2
     },
     "packages/gateway/src/sessionTail.ts::_persistTailBatch": {
       "lines": 96,
@@ -6366,26 +5946,6 @@
       "lines": 313,
       "ccDirect": 34,
       "maxNesting": 1
-    },
-    "packages/gateway/src/sessionTurnRunner.ts::_runOneTurn": {
-      "lines": 2158,
-      "ccDirect": 1,
-      "maxNesting": 1
-    },
-    "packages/gateway/src/sessionTurnRunner.ts::_runOneTurn.finalizeTurn": {
-      "lines": 1003,
-      "ccDirect": 259,
-      "maxNesting": 4
-    },
-    "packages/gateway/src/sessionTurnRunner.ts::_runOneTurn.handleEngineEvent": {
-      "lines": 254,
-      "ccDirect": 71,
-      "maxNesting": 4
-    },
-    "packages/gateway/src/sessionTurnRunner.ts::runOneTurnWithRetry": {
-      "lines": 395,
-      "ccDirect": 62,
-      "maxNesting": 5
     },
     "packages/gateway/src/skillEval.ts::computeBenchmark": {
       "lines": 60,
@@ -6443,13 +6003,13 @@
       "maxNesting": 3
     },
     "packages/gateway/src/storageSeam/engineStateCapsuleStore.ts::UniversalEngineStateCapsuleStore.exportCapsule": {
-      "lines": 236,
+      "lines": 230,
       "ccDirect": 41,
       "maxNesting": 5
     },
     "packages/gateway/src/storageSeam/engineStateCapsuleStore.ts::UniversalEngineStateCapsuleStore.importCapsule": {
-      "lines": 206,
-      "ccDirect": 61,
+      "lines": 203,
+      "ccDirect": 59,
       "maxNesting": 4
     },
     "packages/gateway/src/storageSeam/engineStateCapsuleStore.ts::UniversalEngineStateCapsuleStore.resolveResumeLadder": {
@@ -6473,12 +6033,12 @@
       "maxNesting": 2
     },
     "packages/gateway/src/subprocessRunner.ts::SubprocessRunner._startInternal": {
-      "lines": 627,
+      "lines": 620,
       "ccDirect": 106,
       "maxNesting": 6
     },
     "packages/gateway/src/subprocessRunner.ts::SubprocessRunner.buildLearningContext": {
-      "lines": 384,
+      "lines": 372,
       "ccDirect": 78,
       "maxNesting": 4
     },
@@ -6743,12 +6303,12 @@
       "maxNesting": 3
     },
     "packages/gateway/src/wsConnection.ts::handleStop": {
-      "lines": 119,
+      "lines": 117,
       "ccDirect": 32,
       "maxNesting": 4
     },
     "packages/gateway/src/wsConnection.ts::handleWsConnection": {
-      "lines": 674,
+      "lines": 657,
       "ccDirect": 18,
       "maxNesting": 3
     },
@@ -6783,8 +6343,8 @@
       "maxNesting": 3
     },
     "packages/mcp-memory/src/localCliTools.ts::formatOcBashOutcome": {
-      "lines": 95,
-      "ccDirect": 31,
+      "lines": 79,
+      "ccDirect": 28,
       "maxNesting": 2
     },
     "packages/mcp-memory/src/memoryTools.ts::handleCoreSearch": {
@@ -6796,16 +6356,6 @@
       "lines": 129,
       "ccDirect": 31,
       "maxNesting": 3
-    },
-    "packages/mcp-memory/src/ocBashJobManager.ts::OcBashJobManager.continueJob": {
-      "lines": 134,
-      "ccDirect": 20,
-      "maxNesting": 2
-    },
-    "packages/mcp-memory/src/ocBashJobManager.ts::OcBashJobManager.startAndWait": {
-      "lines": 172,
-      "ccDirect": 16,
-      "maxNesting": 2
     },
     "packages/mcp-memory/src/ocMemoryCli.ts::main": {
       "lines": 296,
@@ -7237,51 +6787,6 @@
       "ccDirect": 24,
       "maxNesting": 2
     },
-    "packages/storage/src/sessionsDb.ts::_openSessionsDb": {
-      "lines": 682,
-      "ccDirect": 57,
-      "maxNesting": 3
-    },
-    "packages/storage/src/sessionsDb.ts::_sqliteAppendCostCredits": {
-      "lines": 112,
-      "ccDirect": 1,
-      "maxNesting": 0
-    },
-    "packages/storage/src/sessionsDb.ts::_sqliteGetClientSessionPartial": {
-      "lines": 101,
-      "ccDirect": 18,
-      "maxNesting": 2
-    },
-    "packages/storage/src/sessionsDb.ts::_sqliteReadClientTimelinePage": {
-      "lines": 84,
-      "ccDirect": 28,
-      "maxNesting": 6
-    },
-    "packages/storage/src/sessionsDb.ts::_sqliteUpsertClientSession": {
-      "lines": 125,
-      "ccDirect": 3,
-      "maxNesting": 2
-    },
-    "packages/storage/src/sessionsDb.ts::_sqliteUpsertClientSession.txn": {
-      "lines": 116,
-      "ccDirect": 21,
-      "maxNesting": 3
-    },
-    "packages/storage/src/sessionsDb.ts::decodeClientTimelineCursor": {
-      "lines": 20,
-      "ccDirect": 21,
-      "maxNesting": 2
-    },
-    "packages/storage/src/sessionsDb.ts::mergePreservingServerAuthored": {
-      "lines": 252,
-      "ccDirect": 70,
-      "maxNesting": 6
-    },
-    "packages/storage/src/sessionsDb.ts::normalizeAndAssignSeqs": {
-      "lines": 126,
-      "ccDirect": 21,
-      "maxNesting": 3
-    },
     "packages/storage/src/sessionsDbProjects.ts::_sqliteUpdateChatProject": {
       "lines": 117,
       "ccDirect": 31,
@@ -7367,18 +6872,13 @@
       "ccDirect": 28,
       "maxNesting": 4
     },
-    "packages/storage/src/wechatBindings.ts::_sqliteUpsertWechatBinding": {
-      "lines": 67,
-      "ccDirect": 22,
-      "maxNesting": 2
-    },
     "packages/web-react/src/App.tsx::App": {
-      "lines": 2737,
+      "lines": 2734,
       "ccDirect": 355,
       "maxNesting": 1
     },
     "packages/web-react/src/admin/AdminShell.tsx::AdminShell": {
-      "lines": 152,
+      "lines": 150,
       "ccDirect": 7,
       "maxNesting": 0
     },
@@ -7957,36 +7457,6 @@
       "ccDirect": 25,
       "maxNesting": 0
     },
-    "packages/web-react/src/components/MessageRenderer.tsx::DeferredTapeRecordCard": {
-      "lines": 251,
-      "ccDirect": 8,
-      "maxNesting": 1
-    },
-    "packages/web-react/src/components/MessageRenderer.tsx::MessageList": {
-      "lines": 1532,
-      "ccDirect": 105,
-      "maxNesting": 4
-    },
-    "packages/web-react/src/components/MessageRenderer.tsx::MessageList.renderItem": {
-      "lines": 141,
-      "ccDirect": 19,
-      "maxNesting": 1
-    },
-    "packages/web-react/src/components/MessageRenderer.tsx::MessageRendererInner": {
-      "lines": 199,
-      "ccDirect": 42,
-      "maxNesting": 3
-    },
-    "packages/web-react/src/components/MessageRenderer.tsx::coalesceTeam": {
-      "lines": 211,
-      "ccDirect": 40,
-      "maxNesting": 5
-    },
-    "packages/web-react/src/components/MessageRenderer.tsx::discloseProcess": {
-      "lines": 185,
-      "ccDirect": 56,
-      "maxNesting": 3
-    },
     "packages/web-react/src/components/ModelSelector.tsx::ModelSelector": {
       "lines": 337,
       "ccDirect": 64,
@@ -8238,7 +7708,7 @@
       "maxNesting": 1
     },
     "packages/web-react/src/components/chat/ProcessDisclosure.tsx::ProcessDisclosure": {
-      "lines": 242,
+      "lines": 216,
       "ccDirect": 85,
       "maxNesting": 2
     },
@@ -8263,7 +7733,7 @@
       "maxNesting": 2
     },
     "packages/web-react/src/components/chat/QuickAskWindow.tsx::QuickAskWindow": {
-      "lines": 1004,
+      "lines": 1002,
       "ccDirect": 58,
       "maxNesting": 0
     },
@@ -8438,7 +7908,7 @@
       "maxNesting": 2
     },
     "packages/web-react/src/components/chat/processStageList.tsx::ProcessStageList": {
-      "lines": 347,
+      "lines": 341,
       "ccDirect": 12,
       "maxNesting": 0
     },
@@ -8533,13 +8003,13 @@
       "maxNesting": 0
     },
     "packages/web-react/src/components/iui/IuiBlock.tsx::hasContent": {
-      "lines": 90,
-      "ccDirect": 56,
+      "lines": 79,
+      "ccDirect": 49,
       "maxNesting": 1
     },
     "packages/web-react/src/components/iui/IuiBlock.tsx::renderSpec": {
-      "lines": 105,
-      "ccDirect": 51,
+      "lines": 93,
+      "ccDirect": 44,
       "maxNesting": 1
     },
     "packages/web-react/src/components/iui/StudioBlocks.tsx::FlashcardsBlock": {
@@ -8663,8 +8133,8 @@
       "maxNesting": 0
     },
     "packages/web-react/src/components/iui/toMarkdown.ts::specToMarkdown": {
-      "lines": 243,
-      "ccDirect": 68,
+      "lines": 237,
+      "ccDirect": 61,
       "maxNesting": 1
     },
     "packages/web-react/src/components/iui/v2Schema.ts::citations": {
@@ -9543,18 +9013,13 @@
       "maxNesting": 4
     },
     "packages/web-react/src/components/tool/status.ts::resolveToolStatus": {
-      "lines": 48,
-      "ccDirect": 23,
+      "lines": 47,
+      "ccDirect": 22,
       "maxNesting": 0
     },
     "packages/web-react/src/components/tool/taskApprovalCard.tsx::TaskApprovalCard": {
       "lines": 393,
       "ccDirect": 57,
-      "maxNesting": 1
-    },
-    "packages/web-react/src/components/tool/taskApprovalGroup.tsx::TaskApprovalGroupFooter": {
-      "lines": 190,
-      "ccDirect": 35,
       "maxNesting": 1
     },
     "packages/web-react/src/components/tool/taskApprovalGroup.tsx::createTaskApprovalGroupStore": {
@@ -9651,11 +9116,6 @@
       "lines": 143,
       "ccDirect": 16,
       "maxNesting": 1
-    },
-    "packages/web-react/src/components/ui/StatusPill.tsx::StatusPill": {
-      "lines": 106,
-      "ccDirect": 26,
-      "maxNesting": 2
     },
     "packages/web-react/src/components/ui/Tabs.tsx::Tabs": {
       "lines": 218,
@@ -9947,61 +9407,6 @@
       "ccDirect": 24,
       "maxNesting": 1
     },
-    "packages/web-react/src/lib/chat/reducer.ts::appendSubagentBlock": {
-      "lines": 102,
-      "ccDirect": 53,
-      "maxNesting": 4
-    },
-    "packages/web-react/src/lib/chat/reducer.ts::applyCostCharged": {
-      "lines": 95,
-      "ccDirect": 36,
-      "maxNesting": 3
-    },
-    "packages/web-react/src/lib/chat/reducer.ts::applyOutboundMessage": {
-      "lines": 935,
-      "ccDirect": 381,
-      "maxNesting": 8
-    },
-    "packages/web-react/src/lib/chat/reducer.ts::applyPermissionRequest": {
-      "lines": 65,
-      "ccDirect": 24,
-      "maxNesting": 3
-    },
-    "packages/web-react/src/lib/chat/reducer.ts::applyTurnStatus": {
-      "lines": 63,
-      "ccDirect": 24,
-      "maxNesting": 2
-    },
-    "packages/web-react/src/lib/chat/reducer.ts::estimatedBlockBytes": {
-      "lines": 78,
-      "ccDirect": 33,
-      "maxNesting": 4
-    },
-    "packages/web-react/src/lib/chat/reducer.ts::handleDelegateProgressBlock": {
-      "lines": 114,
-      "ccDirect": 55,
-      "maxNesting": 3
-    },
-    "packages/web-react/src/lib/chat/reducer.ts::matchesDelegateProgress": {
-      "lines": 14,
-      "ccDirect": 22,
-      "maxNesting": 1
-    },
-    "packages/web-react/src/lib/chat/reducer.ts::mergeDelegateProgressIntoGroup": {
-      "lines": 39,
-      "ccDirect": 37,
-      "maxNesting": 3
-    },
-    "packages/web-react/src/lib/chat/reducer.ts::normalizeDelegateToolRow": {
-      "lines": 53,
-      "ccDirect": 34,
-      "maxNesting": 2
-    },
-    "packages/web-react/src/lib/chat/reducer.ts::paintTerminalError": {
-      "lines": 59,
-      "ccDirect": 28,
-      "maxNesting": 4
-    },
     "packages/web-react/src/lib/chat/render.ts::commitErrorCardSnapshot": {
       "lines": 51,
       "ccDirect": 21,
@@ -10041,111 +9446,6 @@
       "lines": 105,
       "ccDirect": 46,
       "maxNesting": 3
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.adoptMasterAutomaticRecovery": {
-      "lines": 82,
-      "ccDirect": 21,
-      "maxNesting": 2
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.adoptPendingAutomaticRecoveryFromHistory": {
-      "lines": 43,
-      "ccDirect": 23,
-      "maxNesting": 2
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.applyDurableLiveFrames": {
-      "lines": 95,
-      "ccDirect": 29,
-      "maxNesting": 4
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.applyServerMessages": {
-      "lines": 253,
-      "ccDirect": 77,
-      "maxNesting": 3
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.applySnapshotHead": {
-      "lines": 55,
-      "ccDirect": 27,
-      "maxNesting": 2
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.autoContinueEmptyTurn": {
-      "lines": 70,
-      "ccDirect": 25,
-      "maxNesting": 1
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.autoRecoverTerminalTurn": {
-      "lines": 85,
-      "ccDirect": 35,
-      "maxNesting": 3
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.composeHelloFrame": {
-      "lines": 49,
-      "ccDirect": 22,
-      "maxNesting": 3
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.connect": {
-      "lines": 268,
-      "ccDirect": 12,
-      "maxNesting": 1
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.dispatch": {
-      "lines": 303,
-      "ccDirect": 96,
-      "maxNesting": 4
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.dispatchTurnRecovery": {
-      "lines": 132,
-      "ccDirect": 43,
-      "maxNesting": 1
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.hydrateDurableLiveFrameJournal": {
-      "lines": 254,
-      "ccDirect": 1,
-      "maxNesting": 0
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.hydrateDurableLiveFrameJournal.readPages": {
-      "lines": 54,
-      "ccDirect": 22,
-      "maxNesting": 4
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.loadStored": {
-      "lines": 160,
-      "ccDirect": 62,
-      "maxNesting": 3
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.reconcileSkippedRecovery": {
-      "lines": 84,
-      "ccDirect": 29,
-      "maxNesting": 4
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.restoreDeferredTerminalError": {
-      "lines": 43,
-      "ccDirect": 22,
-      "maxNesting": 1
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.retryMessage": {
-      "lines": 112,
-      "ccDirect": 45,
-      "maxNesting": 2
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.sendMessage": {
-      "lines": 129,
-      "ccDirect": 51,
-      "maxNesting": 2
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.stopTurn": {
-      "lines": 209,
-      "ccDirect": 55,
-      "maxNesting": 3
-    },
-    "packages/web-react/src/lib/chat/socket.ts::ChatSocket.toStored": {
-      "lines": 112,
-      "ccDirect": 39,
-      "maxNesting": 1
-    },
-    "packages/web-react/src/lib/chat/socket.ts::automaticTurnRecoveryTarget": {
-      "lines": 78,
-      "ccDirect": 26,
-      "maxNesting": 1
     },
     "packages/web-react/src/lib/chat/socketMeta.ts::quickSessionPersistFingerprint": {
       "lines": 14,
@@ -10207,11 +9507,6 @@
       "ccDirect": 1,
       "maxNesting": 0
     },
-    "packages/web-react/src/lib/persist.ts::SessionStore.getAllForHydration": {
-      "lines": 128,
-      "ccDirect": 17,
-      "maxNesting": 2
-    },
     "packages/web-react/src/lib/persist.ts::detectServerTerminalTurns": {
       "lines": 46,
       "ccDirect": 22,
@@ -10268,14 +9563,9 @@
       "maxNesting": 2
     },
     "packages/web-react/src/lib/sessionStatus.ts::deriveSessionNeedsYou": {
-      "lines": 101,
-      "ccDirect": 46,
-      "maxNesting": 4
-    },
-    "packages/web-react/src/lib/sessionStatus.ts::unwrapToolNameAndInput": {
-      "lines": 43,
-      "ccDirect": 38,
-      "maxNesting": 1
+      "lines": 47,
+      "ccDirect": 26,
+      "maxNesting": 3
     },
     "packages/web-react/src/lib/studio/api.ts::studioErrorText": {
       "lines": 65,
