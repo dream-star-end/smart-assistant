@@ -2792,6 +2792,72 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
     r5DoneMon.evaluate({ ...r5DoneSnap, revision: 84 }, 3_000)
     r5DoneMon.evaluate({ ...r5DoneSnap, revision: 85 }, 5_000)
     assert.equal(r5DoneReclaimed, 1, 'R5 positive control: genuine deadlock reclaims once both calls settle')
+
+    // Steward R6 Blocker (1) boundaryIntegrity: order-independent credential ownership when BOTH call A and call B
+    // have independent DONEs in epoch 1 (both B->A and A->B permutations for unidentified AND identified A DONEs)
+    const runOrderPermutation = async (
+      firstDone: Record<string, unknown>, secondDone: Record<string, unknown>, revBase: number, label: string,
+    ): Promise<void> => {
+      const seq: Record<string, unknown>[] = [
+        { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', arguments: { Path: '/repo/a.ts' } }] },
+        { ...firstDone, step_index: 2 },
+        { ...secondDone, step_index: 3 },
+        { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', arguments: { Path: '/repo/b.ts' } }] },
+        { step_index: 5, type: 'TOOL_CALL', tool_call_id: 'cid-B', tool_name: 'read_file', status: 'ACTIVE', arguments: { Path: '/repo/b.ts' } },
+        { step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+      ]
+      assert.equal(findActiveNonBoardToolInTurn(seq, 5, [{ name: 'swarm_wait', arguments: { since: 1 } }]), null, `${label}: both calls must settle`)
+      await writeFile(workerTranscript, `${seq.map((s) => JSON.stringify(s)).join('\n')}\n`)
+      const snap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: revBase })!
+      assert.equal(snap.members.find((m) => m.name === 'parser')!.status, 'waiting', `${label}: status must be waiting`)
+      let reclaims = 0
+      const mon = new SwarmStallMonitor({
+        stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+        onStallExhausted: () => { reclaims += 1 },
+      })
+      mon.evaluate(snap, 1_000)
+      mon.evaluate({ ...snap, revision: revBase + 1 }, 3_000)
+      mon.evaluate({ ...snap, revision: revBase + 2 }, 5_000)
+      assert.equal(reclaims, 1, `${label}: genuine deadlock must reclaim (1) regardless of DONE order`)
+    }
+    const doneB = { type: 'TOOL_RESULT', tool_call_id: 'cid-B', tool_name: 'read_file', status: 'DONE', content: 'b done' }
+    const doneAUnid = { type: 'TOOL_RESULT', tool_name: 'read_file', status: 'DONE', content: 'a done' }
+    const doneAId = { type: 'TOOL_RESULT', tool_call_id: 'cid-A', tool_name: 'read_file', status: 'DONE', content: 'a done' }
+    await runOrderPermutation(doneB, doneAUnid, 90, 'R6 B->A(unid)')
+    await runOrderPermutation(doneAUnid, doneB, 93, 'R6 A(unid)->B')
+    await runOrderPermutation(doneB, doneAId, 96, 'R6 B->A(id)')
+    await runOrderPermutation(doneAId, doneB, 99, 'R6 A(id)->B')
+
+    // Steward R6 Blocker (2) complexityDrift: ID-only DONEs (no tool_name) across 32/64/128 swarm_wait + SYSTEM_MESSAGE epochs
+    // must keep parallel tool active, STILL allow late exact-ID claim, and scale ID lookups strictly linearly O(N)
+    const measureIdOnlyPendingLookups = (nEpochs: number) => {
+      const seq: Record<string, unknown>[] = [
+        { step_index: 0, type: 'USER_INPUT', status: 'DONE' },
+        { step_index: 1, type: 'TOOL_CALL', tool_call_id: 'long-sibling', tool_name: 'run_command', status: 'ACTIVE', arguments: { CommandLine: 'sleep 999' } },
+      ]
+      let si = 2
+      for (let e = 0; e < nEpochs; e += 1) {
+        seq.push({ step_index: si++, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: e + 1 } }] })
+        seq.push({ step_index: si++, type: 'TOOL_RESULT', tool_call_id: `id-only-${e}`, status: 'DONE', content: 'done' })
+        seq.push({ step_index: si++, type: 'SYSTEM_MESSAGE', status: 'DONE', content: `tick ${e}` })
+      }
+      // Late exact-ID claim for id-only-0 must still succeed and leave only long-sibling active
+      seq.push({ step_index: si++, type: 'TOOL_CALL', tool_call_id: 'id-only-0', tool_name: 'read_file', status: 'ACTIVE', arguments: { Path: '/repo/late.ts' } })
+      resetTurnReductionCandidateVisitsForTests()
+      assert.equal(findTurnStartIndex(seq), 0, `R6 id-only pending: parallel tool must remain active (N=${nEpochs})`)
+      const active = findActiveNonBoardToolInTurn(seq, -1, [])
+      assert.deepEqual(active, { name: 'run_command', args: { CommandLine: 'sleep 999' } }, `R6 id-only pending: late id-only-0 must claim and leave only long-sibling active (N=${nEpochs})`)
+      return getTurnReductionMetricsForTests()
+    }
+    const idm32 = measureIdOnlyPendingLookups(32)
+    const idm64 = measureIdOnlyPendingLookups(64)
+    const idm128 = measureIdOnlyPendingLookups(128)
+    assert.ok(idm128.idLookups <= 300, `R6 idLookups across findTurnStartIndex+findActive must be O(N), got ${idm128.idLookups}`)
+    assert.ok(
+      idm128.idLookups - idm64.idLookups <= (idm64.idLookups - idm32.idLookups) * 2.2 + 8,
+      `R6 idLookups must scale linearly (32=${idm32.idLookups}, 64=${idm64.idLookups}, 128=${idm128.idLookups})`,
+    )
+    assert.equal(idm128.setCopies, 0)
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }
