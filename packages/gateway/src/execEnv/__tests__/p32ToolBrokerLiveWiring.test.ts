@@ -3321,7 +3321,7 @@ test('Steward S9: Rejected policy relaxation never mutates session baseline, blo
 test('OCV5-930: Antigravity broker PreToolUse honors default warn mode and never blocks native swarm rg/grep or pipe filters even in deny mode', async () => {
   const workDir = await mkdtemp(join(tmpdir(), 'oc-p32-930-'))
   const origGuard = process.env.OPENCLAUDE_EFFICIENCY_GUARD
-  delete process.env.OPENCLAUDE_EFFICIENCY_GUARD
+  Reflect.deleteProperty(process.env, 'OPENCLAUDE_EFFICIENCY_GUARD')
   const warnRuntime = createGatewayToolBrokerRuntime({ homeDir: workDir })
   const denyRuntime = createGatewayToolBrokerRuntime({
     homeDir: join(workDir, 'deny'),
@@ -3412,7 +3412,7 @@ test('OCV5-930: Antigravity broker PreToolUse honors default warn mode and never
     })
     assert.equal(denySleep.decision, 'deny')
   } finally {
-    if (origGuard === undefined) delete process.env.OPENCLAUDE_EFFICIENCY_GUARD
+    if (origGuard === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_EFFICIENCY_GUARD')
     else process.env.OPENCLAUDE_EFFICIENCY_GUARD = origGuard
     warnRuntime.dispose()
     denyRuntime.dispose()
