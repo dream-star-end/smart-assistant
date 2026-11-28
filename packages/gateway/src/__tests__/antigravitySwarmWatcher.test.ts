@@ -3207,6 +3207,88 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
     r10RepMon.evaluate({ ...r10RepSnap, revision: 157 }, 3_000)
     r10RepMon.evaluate({ ...r10RepSnap, revision: 158 }, 5_000)
     assert.equal(r10RepReclaims, 1, 'R10 #2: replayed pre-cut PLANNER declaration must NOT block stall reclaim')
+
+    // Steward R11 Blocker (1): exact pre-cut PLANNER_RESPONSE replay placed (a) mid-batch between C and DONE(C)
+    // and (b) at EOF after swarm_wait must BOTH be 100% idempotent (waiting, reclaim=1)
+    const oldPlannerDecl = { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ id: 'cid-r11-a', name: 'read_file', arguments: { Path: '/repo/a.ts' } }] }
+    const r11MidBatchReplay: Record<string, unknown>[] = [
+      oldPlannerDecl,
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [], content: 'handoff' },
+      { step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] wake' },
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', arguments: { Path: '/repo/c.ts' } }] },
+      oldPlannerDecl,
+      { step_index: 5, type: 'TOOL_RESULT', tool_name: 'read_file', status: 'DONE', content: 'c done' },
+      { step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    const r11EofReplay: Record<string, unknown>[] = [
+      oldPlannerDecl,
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [], content: 'handoff' },
+      { step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] wake' },
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+      oldPlannerDecl,
+    ]
+    for (const [label, seq, revBase] of [
+      ['R11 mid-batch replay', r11MidBatchReplay, 160],
+      ['R11 EOF replay', r11EofReplay, 164],
+    ] as const) {
+      await writeFile(workerTranscript, `${seq.map((s) => JSON.stringify(s)).join('\n')}\n`)
+      const snap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: revBase })!
+      assert.equal(snap.members.find((m) => m.name === 'parser')!.status, 'waiting', `${label}: must match no-replay waiting`)
+      let reclaims = 0
+      const mon = new SwarmStallMonitor({
+        stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+        onStallExhausted: () => { reclaims += 1 },
+      })
+      mon.evaluate(snap, 1_000)
+      mon.evaluate({ ...snap, revision: revBase + 1 }, 3_000)
+      mon.evaluate({ ...snap, revision: revBase + 2 }, 5_000)
+      assert.equal(reclaims, 1, `${label}: must preserve deadlock reclaim (1)`)
+    }
+
+    // Steward R11 Blocker (2): restored pre-cut call A in current epoch is eligible for unambiguous unnamed DONE -> waiting/reclaim=1,
+    // while ambiguous same-epoch A + unnamed C refuses to guess on unnamed DONE -> working/reclaim=0
+    const r11SoleRestoredUnnamedDone: Record<string, unknown>[] = [
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ id: 'cid-r11-sole', name: 'read_file', arguments: { Path: '/repo/sole.ts' } }] },
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [], content: 'handoff' },
+      { step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] wake' },
+      { step_index: 4, type: 'TOOL_CALL', tool_call_id: 'cid-r11-sole', tool_name: 'read_file', status: 'ACTIVE' },
+      { step_index: 5, type: 'TOOL_RESULT', tool_name: 'read_file', status: 'DONE', content: 'sole done' },
+      { step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    await writeFile(workerTranscript, `${r11SoleRestoredUnnamedDone.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r11SoleSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 168 })!
+    assert.equal(r11SoleSnap.members.find((m) => m.name === 'parser')!.status, 'waiting', 'R11 #2 sole restored candidate must settle on unnamed DONE')
+    let r11SoleReclaims = 0
+    const r11SoleMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { r11SoleReclaims += 1 },
+    })
+    r11SoleMon.evaluate(r11SoleSnap, 1_000)
+    r11SoleMon.evaluate({ ...r11SoleSnap, revision: 169 }, 3_000)
+    r11SoleMon.evaluate({ ...r11SoleSnap, revision: 170 }, 5_000)
+    assert.equal(r11SoleReclaims, 1, 'R11 #2 sole restored candidate must restore reclaim (1)')
+
+    const r11AmbiguousRestoredUnnamedDone: Record<string, unknown>[] = [
+      { step_index: 1, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ id: 'cid-r11-amb', name: 'read_file', arguments: { Path: '/repo/a.ts' } }] },
+      { step_index: 2, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [], content: 'handoff' },
+      { step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: '[Message] sender=system content=[swarm] wake' },
+      { step_index: 4, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'read_file', arguments: { Path: '/repo/c.ts' } }] },
+      { step_index: 5, type: 'TOOL_CALL', tool_call_id: 'cid-r11-amb', tool_name: 'read_file', status: 'ACTIVE' },
+      { step_index: 6, type: 'TOOL_RESULT', tool_name: 'read_file', status: 'DONE', content: 'ambiguous done' },
+      { step_index: 7, type: 'PLANNER_RESPONSE', status: 'DONE', tool_calls: [{ name: 'swarm_wait', arguments: { since: 1 } }] },
+    ]
+    await writeFile(workerTranscript, `${r11AmbiguousRestoredUnnamedDone.map((s) => JSON.stringify(s)).join('\n')}\n`)
+    const r11AmbSnap = readAntigravitySwarmSnapshot({ brainDir, conversationId: COORD_CONV, phase: 'running', revision: 171 })!
+    assert.equal(r11AmbSnap.members.find((m) => m.name === 'parser')!.status, 'working', 'R11 #2 ambiguous restored A + unnamed C must NOT guess on unnamed DONE')
+    let r11AmbReclaims = 0
+    const r11AmbMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { r11AmbReclaims += 1 },
+    })
+    r11AmbMon.evaluate(r11AmbSnap, 1_000)
+    r11AmbMon.evaluate({ ...r11AmbSnap, revision: 172 }, 3_000)
+    r11AmbMon.evaluate({ ...r11AmbSnap, revision: 173 }, 5_000)
+    assert.equal(r11AmbReclaims, 0, 'R11 #2 ambiguous restored A + unnamed C must trigger 0 reclaims')
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }

@@ -246,9 +246,8 @@ export function parseMemberTranscriptTail(
     toolCalls,
     ...(mergedBg.incompleteEvidence ? { incompleteBgEvidence: true } : {}),
   }
-  const { turnStart, activeNonBoardTool } = analyzeTurnWindow(steps, bgTasks)
-  const turnSteps = steps.slice(turnStart)
-  const last = turnSteps[turnSteps.length - 1]!
+  const { turnStart, turnSteps, activeNonBoardTool } = analyzeTurnWindow(steps, bgTasks)
+  const last = turnSteps[turnSteps.length - 1] ?? steps[steps.length - 1]!
   const lastType = asStr(last.type).toUpperCase()
   const lastStatus = asStr(last.status).toUpperCase()
 
