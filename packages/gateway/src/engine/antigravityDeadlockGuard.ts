@@ -32,6 +32,7 @@ import {
   formatSwarmWorkingDetail,
 } from './antigravitySwarmFormat.js'
 import type { AntigravitySwarmWatcher } from './antigravitySwarmWatcher.js'
+import type { SwarmWakeDeliveryStatus, SwarmWakeTargetHandler } from './nativeSwarmWake.js'
 import { GATEWAY_STALL_MONITOR_AGENT, type SwarmStallAlert } from './swarmStallTypes.js'
 
 export const ANTIGRAVITY_SWARM_DEADLOCKED_DETAIL =
@@ -261,6 +262,34 @@ export interface SwarmDirectiveInjectResult {
   readonly seq?: number
   readonly code?: string
   readonly error?: string
+  readonly wakeDelivery?: SwarmWakeDeliveryStatus
+  readonly wakeDetail?: string
+}
+
+interface SwarmStallAlertLog {
+  info: (msg: string, fields?: Record<string, unknown>) => void
+  warn: (msg: string, fields?: Record<string, unknown>) => void
+}
+
+function logSwarmStallAlertSuccess(
+  args: { sessionKey: string; conversationId: string; alert: SwarmStallAlert; log: SwarmStallAlertLog },
+  res: SwarmDirectiveInjectResult,
+): void {
+  const fields: Record<string, unknown> = {
+    sessionKey: args.sessionKey,
+    conversationId: args.conversationId,
+    target: args.alert.target,
+    reason: args.alert.reason,
+    attempt: args.alert.attempt,
+    idleMs: args.alert.idleMs,
+    seq: res.seq,
+    ...(res.wakeDelivery ? { wakeDelivery: res.wakeDelivery } : {}),
+    ...(res.wakeDetail ? { wakeDetail: res.wakeDetail } : {}),
+  }
+  args.log.info('antigravity_swarm_stall_alert', fields)
+  if (res.wakeDelivery === 'board_only_unwoken') {
+    args.log.warn('antigravity_swarm_stall_unwoken', fields)
+  }
 }
 
 export function dispatchAntigravitySwarmStallAlert(args: {
@@ -270,6 +299,7 @@ export function dispatchAntigravitySwarmStallAlert(args: {
   alert: SwarmStallAlert
   isAborted: () => boolean
   getWatcher: () => AntigravitySwarmWatcher | null
+  wakeTarget?: SwarmWakeTargetHandler
   injectDirective: (input: {
     brainDir: string
     conversationId: string
@@ -279,13 +309,17 @@ export function dispatchAntigravitySwarmStallAlert(args: {
     sender: string
     controlKind: 'stall'
     shouldAbort: () => boolean
+    wakeTarget?: SwarmWakeTargetHandler
   }) => Promise<SwarmDirectiveInjectResult>
-  log: {
-    info: (msg: string, fields?: Record<string, unknown>) => void
-    warn: (msg: string, fields?: Record<string, unknown>) => void
-  }
+  log: SwarmStallAlertLog
 }): void {
   if (args.isAborted()) return
+  const guardedWakeTarget: SwarmWakeTargetHandler | undefined = args.wakeTarget
+    ? (wakeCtx) =>
+        args.isAborted()
+          ? { status: 'board_only_unwoken', detail: 'stall_alert_aborted' }
+          : args.wakeTarget!(wakeCtx)
+    : undefined
   void args
     .injectDirective({
       brainDir: args.brainDir,
@@ -296,19 +330,12 @@ export function dispatchAntigravitySwarmStallAlert(args: {
       sender: GATEWAY_STALL_MONITOR_AGENT,
       controlKind: 'stall',
       shouldAbort: args.isAborted,
+      ...(guardedWakeTarget ? { wakeTarget: guardedWakeTarget } : {}),
     })
     .then((res) => {
       if (args.isAborted()) return
       if (res.ok) {
-        args.log.info('antigravity_swarm_stall_alert', {
-          sessionKey: args.sessionKey,
-          conversationId: args.conversationId,
-          target: args.alert.target,
-          reason: args.alert.reason,
-          attempt: args.alert.attempt,
-          idleMs: args.alert.idleMs,
-          seq: res.seq,
-        })
+        logSwarmStallAlertSuccess(args, res)
         args.getWatcher()?.kick()
       } else if (res.code !== 'ABORTED') {
         args.getWatcher()?.rollbackStallAlert(args.alert)

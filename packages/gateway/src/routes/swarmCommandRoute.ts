@@ -26,6 +26,7 @@ import {
   resolveDefaultRemoteSwarmRuntime,
 } from '../remoteSwarmRuntime.js'
 import {
+  createNativeSwarmWakeTarget,
   handleSwarmCommandRoute,
   parseSwarmControlCommand,
   type ResolvedSessionSwarmTarget,
@@ -216,7 +217,7 @@ export function resolveAuthoritativeSessionSwarm(
 
 function extractSessionId(url: URL): string | null {
   const match = INTERNAL_SWARM_COMMAND_PATH_RE.exec(url.pathname)
-  if (match && match[1]) {
+  if (match?.[1]) {
     try {
       const decoded = decodeURIComponent(match[1]).trim()
       return decoded || null
@@ -249,6 +250,38 @@ async function readRawBodyBounded(req: IncomingMessage, maxBytes: number): Promi
     chunks.push(buf)
   }
   return Buffer.concat(chunks, total)
+}
+
+function attachBindingWakeTarget(
+  binding: AuthoritativeSwarmBinding | null,
+  remoteRuntime: RemoteSwarmRuntime | undefined,
+  remoteSessionKey: string | undefined,
+): ResolvedSessionSwarmTarget | null {
+  if (!binding) return null
+  if (binding.kind === 'remote') {
+    if (remoteRuntime && remoteSessionKey) {
+      return {
+        ...binding.target,
+        wakeTarget: (ctx) => {
+          const outcome = remoteRuntime.onExternalBoardWrite(remoteSessionKey, {
+            seq: ctx.seq,
+            target: ctx.target,
+          })
+          return outcome?.woke
+            ? { status: 'woken', detail: 'remote_swarm_runtime' }
+            : { status: 'board_only_unwoken', detail: 'remote_swarm_no_active_receiver' }
+        },
+      }
+    }
+    return {
+      ...binding.target,
+      wakeTarget: () => ({ status: 'board_only_unwoken', detail: 'no_active_remote_swarm_runtime' }),
+    }
+  }
+  return {
+    ...binding.target,
+    wakeTarget: createNativeSwarmWakeTarget(binding.target.brainDir, binding.target.conversationId),
+  }
 }
 
 export async function handleInternalSwarmCommand(
@@ -392,15 +425,15 @@ export async function handleInternalSwarmCommand(
   replayReq.headers = req.headers
   ;(replayReq as unknown as { socket?: unknown }).socket = req.socket
 
+  const resolvedTarget = deps.resolveSessionSwarm
+    ? (customResolvedTarget ?? null)
+    : attachBindingWakeTarget(resolvedBinding, remoteRuntime, remoteSessionKey)
+
   await handleSwarmCommandRoute(replayReq, res, {
     authenticate: async () => ({ id: userId }),
-    resolveSessionSwarm: async () =>
-      deps.resolveSessionSwarm ? (customResolvedTarget ?? null) : (resolvedBinding?.target ?? null),
+    resolveSessionSwarm: async () => resolvedTarget,
     now: deps.now,
   })
-  if (remoteRuntime && remoteSessionKey) {
-    remoteRuntime.onExternalBoardWrite(remoteSessionKey)
-  }
 }
 
 export const SWARM_COMMAND_INTERNAL_ROUTES: readonly HttpRoute<PlatformRoutesIo>[] = [

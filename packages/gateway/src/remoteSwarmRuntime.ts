@@ -221,6 +221,7 @@ interface SwarmSessionState {
   allowedToolsets?: readonly string[]
   readonly workers: Map<string, WorkerRuntimeState>
   readonly waiters: Set<WaiterEntry>
+  readonly recentWakeReceipts: Map<number, readonly string[]>
   shuttingDown: boolean
   interruptGeneration: number
   boardSeqKnown: number
@@ -416,7 +417,7 @@ export class RemoteSwarmRuntime {
         parentAgentId,
         allowedToolsets: input.allowedToolsets ? [...input.allowedToolsets] : undefined,
         workers: new Map(),
-        waiters: new Set(),
+        waiters: new Set(), recentWakeReceipts: new Map(),
         shuttingDown: false,
         interruptGeneration: 0,
         boardSeqKnown: 0,
@@ -497,7 +498,7 @@ export class RemoteSwarmRuntime {
       workspaceCwd: resolvedCwd,
       parentAgentId,
       workers: new Map(),
-      waiters: new Set(),
+      waiters: new Set(), recentWakeReceipts: new Map(),
       shuttingDown: false,
       interruptGeneration: 0,
       boardSeqKnown: headSeq,
@@ -657,8 +658,7 @@ export class RemoteSwarmRuntime {
       },
     )
     if (!writeRes) return null
-    state.boardSeqKnown = Math.max(state.boardSeqKnown, writeRes.post.seq)
-    this.notifyAfterBoardPost(state, writeRes.post, writeRes.allPosts, expectedGen)
+    this.notifyUnseenPosts(state, writeRes.allPosts, expectedGen)
     return writeRes.post
   }
 
@@ -885,21 +885,39 @@ export class RemoteSwarmRuntime {
         return { post: next, allPosts: [...existing, next] }
       },
     )
-    state.boardSeqKnown = Math.max(state.boardSeqKnown, post.seq)
-    this.notifyAfterBoardPost(state, post, allPosts)
+    this.notifyUnseenPosts(state, allPosts)
     return post
   }
 
-  /** Called when a trusted external API (e.g. `swarmCommand.ts`) appended to `board.jsonl`. */
-  onExternalBoardWrite(sessionKey: string): void {
-    const state = this.sessions.get(sessionKey.trim())
-    if (!state || state.shuttingDown) return
-    const posts = readBoardPostsFromDisk(state.location.swarmDir)
-    const fresh = posts.filter((p) => p.seq > state.boardSeqKnown)
-    for (const post of fresh) {
-      state.boardSeqKnown = Math.max(state.boardSeqKnown, post.seq)
-      this.notifyAfterBoardPost(state, post, posts)
+  private recordWakeReceipt(state: SwarmSessionState, seq: number, woken: readonly string[]): void {
+    state.recentWakeReceipts.set(seq, woken)
+    if (state.recentWakeReceipts.size > 64) {
+      const oldest = state.recentWakeReceipts.keys().next().value
+      if (oldest !== undefined) state.recentWakeReceipts.delete(oldest)
     }
+  }
+
+  private notifyUnseenPosts(state: SwarmSessionState, allPosts: BoardPostRecord[], expectedGeneration?: number): string[] {
+    const allWoken: string[] = []
+    for (const post of allPosts) {
+      if (post.seq <= state.boardSeqKnown) continue
+      state.boardSeqKnown = Math.max(state.boardSeqKnown, post.seq)
+      allWoken.push(...this.notifyAfterBoardPost(state, post, allPosts, expectedGeneration))
+    }
+    return allWoken
+  }
+
+  /** Called when a trusted external API (e.g. `swarmCommand.ts`) appended to `board.jsonl`. */
+  onExternalBoardWrite(sessionKey: string, opts?: { seq?: number; target?: string }): { woke: boolean; wokenMembers: string[] } {
+    const state = this.sessions.get(sessionKey.trim())
+    if (!state || state.shuttingDown) return { woke: false, wokenMembers: [] }
+    const freshWoken = this.notifyUnseenPosts(state, readBoardPostsFromDisk(state.location.swarmDir))
+    const wokenMembers = opts?.seq !== undefined ? [...(state.recentWakeReceipts.get(opts.seq) ?? [])] : freshWoken
+    const targetLower = opts?.target?.trim().toLowerCase()
+    const woke = !targetLower || targetLower === 'all'
+      ? wokenMembers.length > 0
+      : wokenMembers.some((m) => { const ml = m.toLowerCase(); return ml === targetLower || (ml.startsWith(`${targetLower}-`) && /^\d+$/.test(ml.slice(targetLower.length + 1))) })
+    return { woke, wokenMembers }
   }
 
   private notifyAfterBoardPost(
@@ -907,10 +925,7 @@ export class RemoteSwarmRuntime {
     post: BoardPostRecord,
     preloadedPosts?: BoardPostRecord[],
     expectedGeneration?: number,
-  ): void {
-    // Ordinary board messages NEVER parse or execute kill directives (BLOCKER 4).
-    // Destructive kills go exclusively through `swarm{action:"kill"}` (ownership-checked)
-    // or trusted `executeOperatorKill(...)`.
+  ): string[] {
     let roster: RosterFile | null = null
     try {
       roster = readRosterStrict(state.location, {
@@ -919,9 +934,10 @@ export class RemoteSwarmRuntime {
         workspaceCwd: state.workspaceCwd,
       })
     } catch {
-      return
+      return []
     }
-    if (!roster) return
+    if (!roster) return []
+    const wokenMembers: string[] = []
 
     const trustedStallTarget = trustedStallAlertTarget(post)
     const mentions = trustedStallTarget ? [trustedStallTarget] : extractSwarmMentions(post.text)
@@ -972,12 +988,8 @@ export class RemoteSwarmRuntime {
           delta = cachedAllPosts.filter((p) => p.seq > waiter.since)
           headSeq = cachedHeadSeq
         }
-        waiter.resolve({
-          woke: true,
-          posts: delta,
-          headSeq,
-          reason: 'new_post',
-        })
+        waiter.resolve({ woke: true, posts: delta, headSeq, reason: 'new_post' })
+        wokenMembers.push(waiter.memberName)
       }
     }
 
@@ -986,27 +998,30 @@ export class RemoteSwarmRuntime {
       expectedGeneration !== undefined &&
       (state.shuttingDown || state.interruptGeneration !== expectedGeneration)
     ) {
-      return
+      this.recordWakeReceipt(state, post.seq, wokenMembers)
+      return wokenMembers
     }
     for (const [name, member] of Object.entries(roster.members)) {
       if (name === 'coordinator' || member.killed) continue
       if (name.toLowerCase() === post.agent.toLowerCase()) continue
-      if (trustedStallTarget) {
-        if (name.toLowerCase() === trustedStallTarget) {
-          this.scheduleWorkerRun(state, name, expectedGeneration)
-        }
-        continue
-      }
-      const mentioned = mentions.some((m) =>
-        memberMatchesMention(name, m, member.channels ?? ['main'], post.channel),
-      )
-      const channelMatch =
-        member.wake_mode === 'all' &&
-        (post.channel === 'main' || (member.channels ?? ['main']).includes(post.channel))
-      if (mentioned || channelMatch) {
-        this.scheduleWorkerRun(state, name, expectedGeneration)
-      }
+      const shouldWake = trustedStallTarget
+        ? name.toLowerCase() === trustedStallTarget
+        : mentions.some((m) => memberMatchesMention(name, m, member.channels ?? ['main'], post.channel)) ||
+          (member.wake_mode === 'all' &&
+            (post.channel === 'main' || (member.channels ?? ['main']).includes(post.channel)))
+      if (shouldWake) this.tryScheduleWorker(state, name, wokenMembers, expectedGeneration)
     }
+    this.recordWakeReceipt(state, post.seq, wokenMembers)
+    return wokenMembers
+  }
+
+  private tryScheduleWorker(
+    state: SwarmSessionState,
+    name: string,
+    wokenMembers: string[],
+    expectedGeneration?: number,
+  ): void {
+    if (this.scheduleWorkerRun(state, name, expectedGeneration)) wokenMembers.push(name)
   }
 
   /** Runtime-wide concurrency semaphore shared across ALL coordinator sessions (IMPORTANT 5). */
@@ -1079,52 +1094,36 @@ export class RemoteSwarmRuntime {
     state: SwarmSessionState,
     workerName: string,
     expectedGeneration?: number,
-  ): void {
-    if (state.shuttingDown || !this.executor) return
-    if (expectedGeneration !== undefined && state.interruptGeneration !== expectedGeneration) return
+  ): boolean {
+    if (state.shuttingDown || !this.executor) return false
+    if (expectedGeneration !== undefined && state.interruptGeneration !== expectedGeneration) return false
     let rt = state.workers.get(workerName)
     if (!rt) {
       const cleanName = workerName.replace(/[^a-zA-Z0-9_-]/g, '_')
-      const suffix = createHash('sha256')
-        .update(`${state.sessionKey}:${workerName}`, 'utf8')
-        .digest('hex')
-        .slice(0, 12)
+      const suffix = createHash('sha256').update(`${state.sessionKey}:${workerName}`, 'utf8').digest('hex').slice(0, 12)
       const sessionSlug = `${suffix}_${cleanName}`
       rt = {
-        name: workerName,
-        sessionSlug,
-        workerSessionKey: `agent:${state.parentAgentId}:swarm:dm:${sessionSlug}_r0`,
-        turnSeq: 0,
-        running: false,
-        pendingWake: false,
-        runGeneration: state.interruptGeneration,
-        abortController: null,
-        runPromise: null,
-        stepCounter: 0,
+        name: workerName, sessionSlug, workerSessionKey: `agent:${state.parentAgentId}:swarm:dm:${sessionSlug}_r0`,
+        turnSeq: 0, running: false, pendingWake: false, runGeneration: state.interruptGeneration,
+        abortController: null, runPromise: null, stepCounter: 0,
       }
       state.workers.set(workerName, rt)
     }
     if (rt.running) {
       rt.pendingWake = true
-      return
+      return true
     }
-    // B4: Bind cancelable generation & AbortController synchronously BEFORE any await.
     const myGeneration = state.interruptGeneration
     const runAc = new AbortController()
     rt.running = true
     rt.pendingWake = false
     rt.runGeneration = myGeneration
     rt.abortController = runAc
-    // B8: Catch all background rejections at the scheduling boundary so a roster/IO fault
-    // NEVER escapes as an unhandledRejection and crashes the Gateway process.
     const run = this.runWorkerLoop(state, rt, myGeneration, runAc)
-      .catch((err) => {
-        this.handleBackgroundWorkerFatal(state, rt, err)
-      })
-      .finally(() => {
-        if (rt && rt.runPromise === run) rt.runPromise = null
-      })
+      .catch((err) => { this.handleBackgroundWorkerFatal(state, rt, err) })
+      .finally(() => { if (rt && rt.runPromise === run) rt.runPromise = null })
     rt.runPromise = run
+    return true
   }
 
   private async runWorkerLoop(

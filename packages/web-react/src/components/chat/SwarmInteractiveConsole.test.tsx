@@ -169,6 +169,93 @@ describe("SwarmBoardDrawer · 遥测展示与交互式指挥操控台", () => {
     await waitFor(() => expect(screen.getByText("已停止 @worker-ui")).toBeInTheDocument());
     expect(screen.queryByTestId("swarm-command-feedback")).toBeNull();
   });
+
+  it("OCV5-932 Defect #2: 诚实区分 wakeDelivery='woken' 与 'board_only_unwoken'（steer 与 terminate）", async () => {
+    const auth = createMemoryAuthSession(() => {}, "jwt-swarm-wake");
+    let steerWakeDelivery: "woken" | "board_only_unwoken" = "woken";
+    let terminateWakeDelivery: "woken" | "board_only_unwoken" = "board_only_unwoken";
+    let seqCounter = 10;
+
+    globalThis.fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      seqCounter += 1;
+      if (body.action === "steer") {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            seq: seqCounter,
+            target: body.target,
+            channel: body.channel ?? "main",
+            agent: "user:42",
+            text: `@${body.target} ${body.message}`,
+            mentions: [body.target],
+            time: "2026-11-28T08:30:00Z",
+            wakeDelivery: steerWakeDelivery,
+            wakeDetail: steerWakeDelivery === "woken" ? "remote_swarm_runtime" : "no_active_native_swarm_process",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (body.action === "terminate") {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            status: "requested",
+            memberName: body.memberName,
+            alreadyKilled: false,
+            noticeSeq: seqCounter,
+            time: "2026-11-28T08:31:00Z",
+            wakeDelivery: terminateWakeDelivery,
+            wakeDetail:
+              terminateWakeDelivery === "woken" ? "remote_swarm_runtime" : "native_cli_stdin_queued_until_result",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("bad request", { status: 400 });
+    }) as typeof fetch;
+
+    render(
+      <ToastProvider>
+        <SwarmBoardDrawer
+          open
+          onOpenChange={() => {}}
+          snapshot={makeTelemetrySnapshot()}
+          sessionId="sess-swarm-wake"
+          auth={auth}
+        />
+      </ToastProvider>,
+    );
+
+    // 1. steer + wakeDelivery === "woken" -> 成功唤醒文案
+    fireEvent.change(screen.getByTestId("swarm-command-input"), { target: { value: "继续推进" } });
+    fireEvent.click(screen.getByTestId("swarm-command-send"));
+    expect(await screen.findByText("已向 @coordinator 发送指令（#11）")).toBeInTheDocument();
+
+    // 2. steer + wakeDelivery === "board_only_unwoken" -> 诚实告知仅落盘且未即时唤醒
+    steerWakeDelivery = "board_only_unwoken";
+    fireEvent.change(screen.getByTestId("swarm-command-input"), { target: { value: "补充约束" } });
+    fireEvent.click(screen.getByTestId("swarm-command-send"));
+    expect(
+      await screen.findByText("已写入讨论板（#12），未即时唤醒目标成员（将在其下次读板时可见）"),
+    ).toBeInTheDocument();
+
+    // 3. terminate(requested) + wakeDelivery === "board_only_unwoken" -> 诚实告知协调者未即时唤醒
+    const targetTrigger = screen.getByTestId("swarm-command-target");
+    fireEvent.pointerDown(targetTrigger, { button: 0, ctrlKey: false, pointerType: "mouse" });
+    fireEvent.click(await screen.findByTestId("swarm-command-target-option-worker-ui"));
+    fireEvent.click(screen.getByTestId("swarm-terminate-trigger"));
+    fireEvent.click(screen.getByTestId("swarm-terminate-confirm-btn"));
+    expect(
+      await screen.findByText("已写入停止 @worker-ui 请求（#13），未即时唤醒协调者（将在其下次读板时可见）"),
+    ).toBeInTheDocument();
+
+    // 4. terminate(requested) + wakeDelivery === "woken" -> 保持清爽请求文案
+    terminateWakeDelivery = "woken";
+    fireEvent.click(screen.getByTestId("swarm-terminate-trigger"));
+    fireEvent.click(screen.getByTestId("swarm-terminate-confirm-btn"));
+    expect(await screen.findByText("已请求停止 @worker-ui")).toBeInTheDocument();
+  });
 });
 
 describe("Composer · 蜂群剧本模板快选弹层", () => {

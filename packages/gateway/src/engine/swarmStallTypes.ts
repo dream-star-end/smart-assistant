@@ -95,6 +95,8 @@ export interface SwarmStallMonitorOptions {
 
 const MONITOR_NAME_RE = /^monitor(?:-\d+)?$/i
 const DONE_PREFIX_RE = /^\s*(?:@all\s+)?(?:\*{1,2}|_{1,2})?\[done\](?::|：)?(?:\*{1,2}|_{1,2})?(?:\s|$|:|：|-|—)/i
+const PROGRESS_PREFIX_RE =
+  /^\s*(?:\*{1,2}|_{1,2})?\[progress\](?::|：)?(?:\*{1,2}|_{1,2})?(?:\s|$|:|：|-|—)/i
 const PARKED_WAIT_ACTIVITIES = new Set(['等待讨论板消息', '已完成本轮思考'])
 
 export function isSwarmMonitorAgentName(name: string): boolean {
@@ -127,6 +129,10 @@ export function isMonitorPost(post: SwarmBoardPost): boolean {
 
 export function isCoordinatorDonePost(post: SwarmBoardPost): boolean {
   return post.agent.trim().toLowerCase() === 'coordinator' && DONE_PREFIX_RE.test(post.text)
+}
+
+export function isProgressUpdatePost(post: SwarmBoardPost): boolean {
+  return PROGRESS_PREFIX_RE.test(post.text)
 }
 
 export function mentionMatchesWorker(mention: string, workerName: string): boolean {

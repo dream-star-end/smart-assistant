@@ -94,6 +94,11 @@ import {
   seedSpawnedTurnProcessIdentity,
 } from './antigravityDeadlockGuard.js'
 import {
+  createNativeAntigravityWakeHandler,
+  registerActiveNativeSwarmWakeHandler,
+  type NativeSwarmWakeHandler,
+} from './nativeSwarmWake.js'
+import {
   prepareAntigravityNativeTrajectory,
   recoverAntigravityNativeTrajectory,
   type AntigravityNativeBinding,
@@ -148,6 +153,7 @@ type AntigravityTimingTestHooks = {
   resultSettleMs?: number; staleErrorExitWaitMs?: number
   deadlockTermGraceMs?: number; deadlockKillGraceMs?: number
   swarmWatcher?: { pollMs?: number; now?: () => number; stallMonitor?: SwarmStallMonitorOptions }
+  nativeSwarmWake?: NativeSwarmWakeHandler
 }
 let timingTestHooks: AntigravityTimingTestHooks | null = null
 const STDERR_MAX_CHARS = 64 * 1024
@@ -285,6 +291,7 @@ interface TurnContext {
   awaitingExitSince: number | null
   /** Live watcher for Antigravity native swarm dir (`<brain>/<conv>/.system_generated/swarm`). */
   swarmWatcher: AntigravitySwarmWatcher | null
+  unregisterSwarmWake: (() => void) | null
   swarmBlockId: string | null
   swarmEventOrdinal: number | undefined
   swarmCommitted: boolean
@@ -462,7 +469,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       firstOwnStepIndex: null, usageSteps: new Set(), inputBytes: 0, stdoutEvents: 0, stepEvents: 0, resultResponseBytes: 0,
       preludeErrorDetail: null, trailingErrorStep: false, trailingErrorDetail: null, ownErrorStep: false,
       resumedLaunch: false, elidedPlatformContext: false, promptInputsKey: null, promptSlotHashes: null,
-      exitCode: null, awaitingExitSince: null, swarmWatcher: null, swarmBlockId: null, swarmEventOrdinal: undefined,
+      exitCode: null, awaitingExitSince: null, swarmWatcher: null, unregisterSwarmWake: null, swarmBlockId: null, swarmEventOrdinal: undefined,
       swarmCommitted: false, lastEmittedSwarmSnapshot: null,
       workerUsageDelta: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, thinkingTokens: 0 },
       releaseSwarmSlot: null, workspaceCwd: null, toolBackfiller: null, resolveSummary, resolveDrain: null,
@@ -760,11 +767,22 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     }
   }
 
+  private clearSwarmWake(ctx: TurnContext): void {
+    ctx.unregisterSwarmWake?.()
+    ctx.unregisterSwarmWake = null
+  }
+
   private ensureSwarmWatcher(ctx: TurnContext, conversationId: string): void {
     if (ctx.params.readOnly === true || ctx.swarmWatcher || ctx.terminal || ctx.abandoned || !ctx.projection) return
     if (!CONVERSATION_ID_RE.test(conversationId)) return
     const brainDir = ctx.projection.sessionBrainDir
     const watcherHooks = timingTestHooks?.swarmWatcher
+    const wakeHandler = createNativeAntigravityWakeHandler({
+      isInactive: () => ctx.terminal || ctx.abandoned || ctx.interrupted || ctx.sawResult || ctx.procClosed || !ctx.proc,
+      overrideWake: timingTestHooks?.nativeSwarmWake,
+    })
+    this.clearSwarmWake(ctx)
+    ctx.unregisterSwarmWake = registerActiveNativeSwarmWakeHandler(brainDir, conversationId, wakeHandler)
     const watcher = new AntigravitySwarmWatcher({
       brainDir,
       conversationId,
@@ -799,8 +817,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       onStallDetected: (alert) => {
         dispatchAntigravitySwarmStallAlert({
           brainDir, conversationId, sessionKey: this.opts.sessionKey, alert,
-          isAborted: () => ctx.terminal || ctx.abandoned || ctx.interrupted,
+          isAborted: () => ctx.terminal || ctx.abandoned || ctx.interrupted || ctx.procClosed,
           getWatcher: () => ctx.swarmWatcher,
+          wakeTarget: wakeHandler,
           injectDirective: injectSwarmDirective,
           log,
         })
@@ -811,6 +830,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private stopSwarmWatcher(ctx: TurnContext): void {
+    this.clearSwarmWake(ctx)
     if (!ctx.swarmWatcher) return
     ctx.swarmWatcher.stop()
     ctx.swarmWatcher = null
@@ -869,6 +889,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       this.stopSwarmWatcher(ctx)
       return
     }
+    this.clearSwarmWake(ctx)
     const watcher = ctx.swarmWatcher
     ctx.swarmWatcher = null
     let finalSwarm: SwarmSnapshot | null = null
@@ -1810,6 +1831,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     ctx.interruptReason ??= reason
     ctx.interrupted = true
     ctx.interruptSignaled = true
+    this.clearSwarmWake(ctx)
     if (!ctx.procClosed) {
       const proc = ctx.proc
       ctx.interruptSnapDone = captureProcessTreeSnapshotAsync(proc, ctx.processTreeSnapshot, ctx.turnReapTag)

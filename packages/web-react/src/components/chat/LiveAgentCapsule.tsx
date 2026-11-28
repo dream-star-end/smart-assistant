@@ -36,7 +36,7 @@ import {
 } from "./PinnedBackgroundTasksPanel";
 import { SwarmElapsedTicker } from "./SwarmElapsedTicker";
 import type { SwarmOpenRequest } from "./swarmDetect";
-import { detectSwarmAlerts, isSwarmActive, summarizeSwarmCounts, swarmPhaseMeta } from "./swarmUtils";
+import { detectSwarmAlerts, formatSwarmCapsuleDetail, isSwarmActive } from "./swarmUtils";
 import type { TodoItem } from "./todoExtract";
 import "./liveActivity.css";
 
@@ -329,16 +329,9 @@ export default function LiveAgentCapsule({
   const swarmAlerts = primaryKind === "swarm" && latestSwarm ? detectSwarmAlerts(latestSwarm) : null;
 
   if (primaryKind === "swarm" && latestSwarm) {
-    const counts = summarizeSwarmCounts(latestSwarm.members);
-    const phase = swarmPhaseMeta(latestSwarm.phase);
-    const latestPost = latestSwarm.posts[latestSwarm.posts.length - 1] ?? null;
     isRunning = swarmActive;
     label = latestSwarm.title || "蜂群协作";
-    detail = swarmActive
-      ? counts.working > 0
-        ? `${counts.working} 运行中${latestPost ? ` · ${latestPost.agent}` : ""}`
-        : `${counts.live} 成员`
-      : phase.label;
+    detail = formatSwarmCapsuleDetail(latestSwarm);
     timer = "";
   } else if (primaryKind === "delegate" && primaryDelegate) {
     const liveCount = liveDelegates.length;

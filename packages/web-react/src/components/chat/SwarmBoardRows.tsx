@@ -29,6 +29,7 @@ import { Badge, useToast } from "../ui";
 import { ModelFamilyIcon } from "../ui/ModelFamilyIcons";
 import {
   classifySwarmPost,
+  collectSwarmCodeRanges,
   formatPostClock,
   formatTelemetryDuration,
   formatTelemetryTokens,
@@ -43,19 +44,14 @@ import {
 } from "./swarmUtils";
 
 export function hasRichMarkdown(text: string): boolean {
-  return /(?:^|\n)(?:#{1,4}\s|```|[-*]\s|\d+\.\s|>\s|\|.*\|)|`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\)/.test(
+  return /(?:^|\n)(?:#{1,4}\s|```|~~~|[-*]\s|\d+\.\s|>\s|\|.*\|)|`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\)/.test(
     text,
   );
 }
 
-/**
- * 将富文本 Markdown 中非代码/非链接区域的 @member、@#channel、#seq 转为页内锚点链接，
- * 以便 Markdown 完整渲染的同时，仍然保持点击聚焦成员 / 切换频道 / 跳转序号的交互能力。
- * `@all` 使用独立 `#swarm-mention-all` 锚点并禁用误点，与纯文本模式视觉完全一致。
- */
-export function linkifySwarmMarkdownTokens(text: string): string {
-  const PROTECTED_RE = /(```[\s\S]*?```|`[^`\n]+`|\[[^\]]*\]\([^)]+\))/g;
-  const parts = text.split(PROTECTED_RE);
+function linkifySwarmPlainSegment(segment: string): string {
+  const LINK_RE = /(\[[^\]]*\]\([^)]+\))/g;
+  const parts = segment.split(LINK_RE);
   return parts
     .map((part, idx) => {
       if (idx % 2 === 1) return part;
@@ -76,6 +72,26 @@ export function linkifySwarmMarkdownTokens(text: string): string {
         .join("");
     })
     .join("");
+}
+
+/**
+ * 将富文本 Markdown 中非代码/非链接区域的 @member、@#channel、#seq 转为页内锚点链接，
+ * 以便 Markdown 完整渲染的同时，仍然保持点击聚焦成员 / 切换频道 / 跳转序号的交互能力。
+ * 先基于整文识别围栏代码块（``` 与 ~~~）及行内代码区间，再仅对非代码段做链接化。
+ * `@all` 使用独立 `#swarm-mention-all` 锚点并禁用误点，与纯文本模式视觉完全一致。
+ */
+export function linkifySwarmMarkdownTokens(text: string): string {
+  const codeRanges = collectSwarmCodeRanges(text);
+  if (codeRanges.length === 0) return linkifySwarmPlainSegment(text);
+  let out = "";
+  let pos = 0;
+  for (const [start, end] of codeRanges) {
+    if (start > pos) out += linkifySwarmPlainSegment(text.slice(pos, start));
+    out += text.slice(start, end);
+    pos = end;
+  }
+  if (pos < text.length) out += linkifySwarmPlainSegment(text.slice(pos));
+  return out;
 }
 
 export const InteractivePostBody = memo(function InteractivePostBody({

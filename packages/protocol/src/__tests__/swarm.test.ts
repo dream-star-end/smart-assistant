@@ -6,11 +6,13 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  type SwarmSnapshot,
   compactSwarmSnapshotToByteBudget,
+  extractSwarmMentions,
   isSwarmSnapshot,
   mergeSwarmSnapshotsStrict,
   parseSwarmSlashCommand,
-  type SwarmSnapshot,
+  scanSwarmMentionSpans,
 } from '../swarm.js'
 
 describe('parseSwarmSlashCommand', () => {
@@ -102,5 +104,74 @@ describe('SwarmMemberSnapshot backwards-compatible optional telemetry & workspac
     assert.equal(compacted.members[0]?.thinkingTokens, 1_950)
     assert.equal(compacted.members[0]?.workspaceBranch, 'oc-swarm/worker-a')
     assert.equal(compacted.members[0]?.workspacePath, '.oc-swarm-worktrees/11111111/worker-a')
+  })
+})
+
+describe('extractSwarmMentions (OCV5-932 Defect #3A)', () => {
+  it('extracts @b1-integrator from real #48 handoff text while ignoring `@openclaude/protocol` and scoped paths', () => {
+    const post48 = [
+      '@b1-integrator [done] 前端切片已完成，契约对齐 `` `@openclaude/protocol` `` 与 `@openclaude/protocol` 导出。',
+      '同时检查了 @openclaude/protocol/browser、@sinclair/typebox 与 @types/node 类型引用，请 @b1-integrator 处理合入。',
+    ].join('\n')
+    assert.deepEqual(extractSwarmMentions(post48), ['b1-integrator'])
+  })
+
+  it('strips triple-backtick and tilde fenced code blocks and inline code spans before matching mentions', () => {
+    const fenced = [
+      '请 @verifier 复核以下示例（不要唤醒代码里的成员）：',
+      '```ts',
+      '// @all @coordinator @worker-1',
+      'const pkg = "@openclaude/protocol"',
+      '```',
+      '~~~bash',
+      'echo "@all @slice-gw-wake"',
+      '~~~',
+      '> ```json',
+      '> { "mention": "@coordinator" }',
+      '> ```',
+      '行内代码 `@worker`、`foo @all bar` 以及 ```@worker-2``` 同样不应触发提及。',
+    ].join('\n')
+    assert.deepEqual(extractSwarmMentions(fenced), ['verifier'])
+  })
+
+  it('rejects plain npm scoped packages and emails while preserving valid mentions & Chinese punctuation', () => {
+    assert.deepEqual(
+      extractSwarmMentions('依赖 @openclaude/protocol, @sinclair/typebox, @types/node, @scope/pkg-a/sub'),
+      [],
+    )
+    assert.deepEqual(
+      extractSwarmMentions('联系 a.b@example.com 或 dev+ops@company.org 或 foo_bar@test.io'),
+      [],
+    )
+    assert.deepEqual(
+      extractSwarmMentions(
+        '请 @b1-integrator 处理；抄送（@worker、@worker-1）与请@coordinator确认 @all 广播到 @#channel-1.',
+      ),
+      ['b1-integrator', 'worker', 'worker-1', 'coordinator', 'all', '#channel-1'],
+    )
+  })
+
+  it('processes adversarial unmatched backticks in linear time without catastrophic backtracking', () => {
+    const pathological = `${Array.from({ length: 1500 }, (_, i) => '`'.repeat((i % 4) + 1)).join('x')} @b1-integrator`
+    const t0 = Date.now()
+    const mentions = extractSwarmMentions(pathological)
+    const elapsed = Date.now() - t0
+    assert.equal(mentions.includes('b1-integrator'), true)
+    assert.equal(elapsed < 200, true)
+  })
+
+  it('computes exact mention spans for @@reviewer and trailing-hyphen member names (@all-, @worker-)', () => {
+    const text = '复核 @@reviewer 以及 @all- 与 @worker- 和 @#chan-1.'
+    const spans = scanSwarmMentionSpans(text)
+    assert.deepEqual(
+      spans.map((s) => ({ raw: s.raw, kind: s.kind, target: s.target, sliced: text.slice(s.start, s.end) })),
+      [
+        { raw: '@reviewer', kind: 'mention', target: 'reviewer', sliced: '@reviewer' },
+        { raw: '@all-', kind: 'mention', target: 'all-', sliced: '@all-' },
+        { raw: '@worker-', kind: 'mention', target: 'worker-', sliced: '@worker-' },
+        { raw: '@#chan-1', kind: 'channel_mention', target: 'chan-1', sliced: '@#chan-1' },
+      ],
+    )
+    assert.deepEqual(extractSwarmMentions(text), ['reviewer', 'all-', 'worker-', '#chan-1'])
   })
 })

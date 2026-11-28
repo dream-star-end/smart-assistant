@@ -44,6 +44,8 @@ export interface SwarmMemberSnapshot {
   toolCalls?: number
   /** True when telemetry scanning still has unread backlog or hit its per-file budget/line cap. */
   telemetryPartial?: boolean
+  /** True when current-epoch liveness/background-task transcript evidence is incomplete (blocks stall-exhausted auto-kill). */
+  livenessEvidencePartial?: boolean
 }
 
 export interface SwarmChannelSnapshot {
@@ -85,19 +87,164 @@ export interface SwarmSnapshot {
 }
 
 /** Extract `@name`, `@all`, and `@#channel` mentions matching Antigravity board rules. */
-const MENTION_RE = /(?:^|[^A-Za-z0-9_#-])@(#?[A-Za-z0-9][A-Za-z0-9._-]{0,63})(?![A-Za-z0-9._-])/g
+const MENTION_RE = /(?:^|[^A-Za-z0-9_.+#-])@(#?[A-Za-z0-9][A-Za-z0-9._-]{0,63})(?![A-Za-z0-9._/-])/g
+
+function matchSwarmFenceOpen(line: string): { ch: string; len: number } | null {
+  let i = 0
+  while (i < line.length && (line[i] === ' ' || line[i] === '\t' || line[i] === '>')) i += 1
+  const ch = line[i]
+  if (ch !== '`' && ch !== '~') return null
+  let len = 0
+  while (i + len < line.length && line[i + len] === ch) len += 1
+  if (len < 3) return null
+  if (ch === '`' && line.indexOf('`', i + len) !== -1) return null
+  return { ch, len }
+}
+
+function isSwarmFenceClose(line: string, ch: string, minLen: number): boolean {
+  let i = 0
+  while (i < line.length && (line[i] === ' ' || line[i] === '\t' || line[i] === '>')) i += 1
+  let len = 0
+  while (i + len < line.length && line[i + len] === ch) len += 1
+  if (len < minLen) return false
+  for (let j = i + len; j < line.length; j += 1) {
+    if (line[j] !== ' ' && line[j] !== '\t' && line[j] !== '\r') return false
+  }
+  return true
+}
+
+function collectInlineCodeRangesInSlice(
+  text: string,
+  sliceStart: number,
+  sliceEnd: number,
+  out: Array<readonly [number, number]>,
+): void {
+  const runs: Array<{ start: number; len: number }> = []
+  const byLen = new Map<number, number[]>()
+  for (let i = sliceStart; i < sliceEnd; ) {
+    if (text[i] !== '`') {
+      i += 1
+      continue
+    }
+    let len = 1
+    while (i + len < sliceEnd && text[i + len] === '`') len += 1
+    const idx = runs.length
+    runs.push({ start: i, len })
+    const bucket = byLen.get(len)
+    if (bucket) bucket.push(idx)
+    else byLen.set(len, [idx])
+    i += len
+  }
+  const ptrByLen = new Map<number, number>()
+  for (let r = 0; r < runs.length; ) {
+    const open = runs[r]!
+    const bucket = byLen.get(open.len)!
+    let ptr = ptrByLen.get(open.len) ?? 0
+    while (ptr < bucket.length && bucket[ptr]! <= r) ptr += 1
+    ptrByLen.set(open.len, ptr)
+    if (ptr < bucket.length) {
+      const close = runs[bucket[ptr]!]!
+      out.push([open.start, close.start + close.len])
+      ptrByLen.set(open.len, ptr + 1)
+      r = bucket[ptr]! + 1
+    } else {
+      r += 1
+    }
+  }
+}
+
+/**
+ * Single source of truth for Markdown code spans (fenced ``` / ~~~ blocks and
+ * paragraph-scoped inline backticks) shared by protocol mention routing and Web UI rendering.
+ */
+export function collectSwarmCodeRanges(text: string): Array<readonly [number, number]> {
+  if (text.indexOf('`') === -1 && text.indexOf('~') === -1) return []
+  const ranges: Array<readonly [number, number]> = []
+  let fence: { ch: string; len: number; start: number } | null = null
+  let paraStart = 0
+  let lineStart = 0
+  while (lineStart <= text.length) {
+    const nl = text.indexOf('\n', lineStart)
+    const lineEnd = nl >= 0 ? nl : text.length
+    const nextStart = nl >= 0 ? nl + 1 : text.length + 1
+    const line = text.slice(lineStart, lineEnd)
+    if (fence) {
+      if (isSwarmFenceClose(line, fence.ch, fence.len)) {
+        ranges.push([fence.start, Math.min(text.length, nextStart)])
+        fence = null
+        paraStart = Math.min(text.length, nextStart)
+      }
+    } else {
+      const opened = matchSwarmFenceOpen(line)
+      if (opened) {
+        if (lineStart > paraStart) collectInlineCodeRangesInSlice(text, paraStart, lineStart, ranges)
+        fence = { ch: opened.ch, len: opened.len, start: lineStart }
+      } else if (line.trim().length === 0) {
+        if (lineStart > paraStart) collectInlineCodeRangesInSlice(text, paraStart, lineStart, ranges)
+        paraStart = Math.min(text.length, nextStart)
+      }
+    }
+    if (nl < 0) break
+    lineStart = nextStart
+  }
+  if (fence) {
+    ranges.push([fence.start, text.length])
+  } else if (paraStart < text.length) {
+    collectInlineCodeRangesInSlice(text, paraStart, text.length, ranges)
+  }
+  return ranges
+}
+
+export interface SwarmMentionSpan {
+  readonly start: number
+  readonly end: number
+  readonly raw: string
+  readonly kind: 'mention' | 'channel_mention'
+  readonly target: string
+}
+
+/**
+ * Single source of truth for `@member`, `@all`, and `@#channel` mention spans,
+ * skipping fenced (` ``` ` / ` ~~~ `) and paragraph-scoped inline code ranges.
+ * Consumed by both protocol/gateway routing (`extractSwarmMentions`) and Web UI tokenizers.
+ */
+export function scanSwarmMentionSpans(text: string): SwarmMentionSpan[] {
+  if (!text) return []
+  const codeRanges = collectSwarmCodeRanges(text)
+  let rangeIdx = 0
+  const spans: SwarmMentionSpan[] = []
+  MENTION_RE.lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = MENTION_RE.exec(text)) !== null) {
+    const rawBody = match[1]
+    if (!rawBody) continue
+    const atOffset = match[0].length - rawBody.length - 1
+    if (atOffset < 0 || match[0][atOffset] !== '@') continue
+    const start = match.index + atOffset
+    while (rangeIdx < codeRanges.length && codeRanges[rangeIdx]![1] <= start) rangeIdx += 1
+    if (rangeIdx < codeRanges.length && start >= codeRanges[rangeIdx]![0]) continue
+    const trimmed = rawBody.replace(/\.+$/, '')
+    if (!trimmed || trimmed === '#') continue
+    const end = start + 1 + trimmed.length
+    const raw = text.slice(start, end)
+    if (trimmed.startsWith('#')) {
+      spans.push({ start, end, raw, kind: 'channel_mention', target: trimmed.slice(1).toLowerCase() })
+    } else {
+      spans.push({ start, end, raw, kind: 'mention', target: trimmed.toLowerCase() })
+    }
+  }
+  return spans
+}
 
 export function extractSwarmMentions(text: string): string[] {
   if (!text) return []
   const seen = new Set<string>()
   const out: string[] = []
-  MENTION_RE.lastIndex = 0
-  let match: RegExpExecArray | null
-  while ((match = MENTION_RE.exec(text)) !== null) {
-    const raw = match[1]?.toLowerCase()
-    if (!raw || seen.has(raw)) continue
-    seen.add(raw)
-    out.push(raw)
+  for (const span of scanSwarmMentionSpans(text)) {
+    const key = span.kind === 'channel_mention' ? `#${span.target}` : span.target
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(key)
   }
   return out
 }

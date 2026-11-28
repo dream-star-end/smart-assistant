@@ -8,10 +8,16 @@ import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, re
 import { lstat as lstatAsync, open as openAsync, realpath as realpathAsync } from 'node:fs/promises'
 import { join, sep } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
+import {
+  applyTranscriptStepToBgTasks,
+  createBackgroundTaskState,
+  reconcileOverflowBgTasksFromJsonlBuffer,
+  summarizeBackgroundTaskState,
+  type BackgroundTaskTelemetrySummary,
+  type MutableBackgroundTaskState,
+} from './antigravitySwarmBgTasks.js'
 
-/** Max bytes parsed per member per tick by the incremental telemetry scanner so large bursts never block the event loop. */
 export const MAX_TELEMETRY_DELTA_BYTES = 128 * 1024
-/** Max total bytes drained per member during terminal `stopAndReadFinal` before marking `telemetryPartial: true`. */
 export const MAX_TELEMETRY_DRAIN_BYTES = 16 * 1024 * 1024
 const MAX_TELEMETRY_REMAINDER_BYTES = 2 * 1024 * 1024
 export const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -24,14 +30,14 @@ export interface MemberTelemetrySnapshot {
   cacheReadTokens: number
   thinkingTokens: number
   toolCalls: number
-  /** Tokens observed on steps within the active turn window (`ts >= turnWindowStartMs`). */
   windowInputTokens?: number
   windowOutputTokens?: number
   windowCacheReadTokens?: number
   windowThinkingTokens?: number
-  /** True when unread bytes remain (`byteOffset < fileSize`) or an oversized line/budget cap prevented complete counting. */
   partial?: boolean
   hasBacklog?: boolean
+  /** Incremental byte-0..offset background-task lifecycle state (internal; never sent over wire). */
+  bgTasks?: BackgroundTaskTelemetrySummary
 }
 
 interface TelemetryCursor extends MemberTelemetrySnapshot {
@@ -44,6 +50,10 @@ interface TelemetryCursor extends MemberTelemetrySnapshot {
   decoder: StringDecoder
   droppedOversizedLine: boolean
   hadMalformedLine: boolean
+  bgEpochIncomplete: boolean
+  bgResetByteOffset: number
+  bgReverifiedAtOffset: number
+  bgTaskState: MutableBackgroundTaskState
 }
 
 function asStr(v: unknown): string {
@@ -194,10 +204,10 @@ export async function statSignatureWithinRootAsync(
 }
 
 export interface BoundedTailReadOptions {
-  /** If a tail slice starts mid-file and contains no `\n` (single line > `maxBytes`),
-   *  widen once up to this byte ceiling, then fall back to scanning backward for the
-   *  previous complete line so oversized steps never zero out `stepCount` or mask `ERROR`. */
+  /** Widen once up to this byte ceiling if a single tail line exceeds `maxBytes`. */
   maxAdaptiveBytes?: number
+  /** Invoked when the read started mid-file (`st.size > readWindow`), indicating omitted prefix bytes. */
+  onTruncated?: () => void
 }
 
 function readSyncSliceWithBoundary(
@@ -264,31 +274,26 @@ export function readBoundedFileWithinRoot(
       (typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0)
     fd = openSync(resolved.fullPath, flags)
     const st = fstatSync(fd)
-    if (!st.isFile() || st.dev !== resolved.stat.dev || st.ino !== resolved.stat.ino || st.size <= 0) {
-      return null
-    }
+    if (!st.isFile() || st.dev !== resolved.stat.dev || st.ino !== resolved.stat.ino || st.size <= 0) return null
     // Defense-in-depth containment verification against cached realpath of trusted rootDir.
     const realRoot = resolveCachedRealRootSync(rootDir, resolved.rootStat)
     const realFile = realpathSync(resolved.fullPath)
-    if (!realFile.startsWith(realRoot.endsWith(sep) ? realRoot : `${realRoot}${sep}`)) {
-      return null
-    }
+    if (!realFile.startsWith(realRoot.endsWith(sep) ? realRoot : `${realRoot}${sep}`)) return null
     const size = Math.min(st.size, maxBytes)
     const startOffset = st.size > maxBytes ? st.size - maxBytes : 0
     const slice = readSyncSliceWithBoundary(fd, startOffset, size)
     if (startOffset > 0) {
       const complete = trimTailToCompleteLines(slice)
-      if (complete !== null) return complete
+      if (complete !== null) { opts?.onTruncated?.(); return complete }
       const adaptiveCap = opts?.maxAdaptiveBytes ? Math.max(maxBytes, opts.maxAdaptiveBytes) : maxBytes
       if (adaptiveCap > maxBytes) {
         const widerSize = Math.min(st.size, adaptiveCap)
         const widerStart = st.size > adaptiveCap ? st.size - adaptiveCap : 0
         const wider = readSyncSliceWithBoundary(fd, widerStart, widerSize)
         if (widerStart === 0) return wider.text
+        opts?.onTruncated?.()
         const widerComplete = trimTailToCompleteLines(wider)
         if (widerComplete !== null) return widerComplete
-        // Final line alone exceeds `adaptiveCap`: scan up to 256 KB immediately before `widerStart`
-        // to recover the preceding complete JSONL lines rather than returning empty string (N1).
         if (widerStart > 0) {
           const lookbackSize = Math.min(widerStart, 256 * 1024)
           const lookbackStart = widerStart - lookbackSize
@@ -302,15 +307,14 @@ export function readBoundedFileWithinRoot(
           }
         }
       }
+      opts?.onTruncated?.()
       return ''
     }
     return slice.text
   } catch {
     return null
   } finally {
-    if (fd !== null) {
-      try { closeSync(fd) } catch { /* ignore */ }
-    }
+    if (fd !== null) { try { closeSync(fd) } catch { /* ignore */ } }
   }
 }
 
@@ -330,28 +334,25 @@ export async function readBoundedFileWithinRootAsync(
       (typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0)
     fh = await openAsync(resolved.fullPath, flags)
     const st = await fh.stat()
-    if (!st.isFile() || st.dev !== resolved.stat.dev || st.ino !== resolved.stat.ino || st.size <= 0) {
-      return null
-    }
+    if (!st.isFile() || st.dev !== resolved.stat.dev || st.ino !== resolved.stat.ino || st.size <= 0) return null
     const [realRoot, realFile] = await Promise.all([
       resolveCachedRealRootAsync(rootDir, resolved.rootStat),
       realpathAsync(resolved.fullPath),
     ])
-    if (!realFile.startsWith(realRoot.endsWith(sep) ? realRoot : `${realRoot}${sep}`)) {
-      return null
-    }
+    if (!realFile.startsWith(realRoot.endsWith(sep) ? realRoot : `${realRoot}${sep}`)) return null
     const size = Math.min(st.size, maxBytes)
     const startOffset = st.size > maxBytes ? st.size - maxBytes : 0
     const slice = await readAsyncSliceWithBoundary(fh, startOffset, size)
     if (startOffset > 0) {
       const complete = trimTailToCompleteLines(slice)
-      if (complete !== null) return complete
+      if (complete !== null) { opts?.onTruncated?.(); return complete }
       const adaptiveCap = opts?.maxAdaptiveBytes ? Math.max(maxBytes, opts.maxAdaptiveBytes) : maxBytes
       if (adaptiveCap > maxBytes) {
         const widerSize = Math.min(st.size, adaptiveCap)
         const widerStart = st.size > adaptiveCap ? st.size - adaptiveCap : 0
         const wider = await readAsyncSliceWithBoundary(fh, widerStart, widerSize)
         if (widerStart === 0) return wider.text
+        opts?.onTruncated?.()
         const widerComplete = trimTailToCompleteLines(wider)
         if (widerComplete !== null) return widerComplete
         if (widerStart > 0) {
@@ -367,15 +368,14 @@ export async function readBoundedFileWithinRootAsync(
           }
         }
       }
+      opts?.onTruncated?.()
       return ''
     }
     return slice.text
   } catch {
     return null
   } finally {
-    if (fh !== null) {
-      try { await fh.close() } catch { /* ignore */ }
-    }
+    if (fh !== null) { try { await fh.close() } catch { /* ignore */ } }
   }
 }
 
@@ -456,64 +456,45 @@ export function extractStepTelemetry(step: Record<string, unknown>): {
 }
 
 function applyTelemetryLine(
-  cursor: MemberTelemetrySnapshot,
+  cursor: TelemetryCursor,
   line: string,
   turnWindowStartMs?: number,
-): boolean {
+): 'ok' | 'restart' | 'malformed' {
   const trimmed = line.trim()
-  if (!trimmed) return true
+  if (!trimmed) return 'ok'
   try {
     const obj = recordOf(JSON.parse(trimmed))
-    if (!obj) return false
+    if (!obj) return 'malformed'
+    const sawRestart = applyTranscriptStepToBgTasks(cursor.bgTaskState, obj)
     const delta = extractStepTelemetry(obj)
     if (delta.ts !== undefined) {
-      if (cursor.firstStepAt === undefined || delta.ts < cursor.firstStepAt) {
-        cursor.firstStepAt = delta.ts
-      }
-      if (cursor.lastActiveAt === undefined || delta.ts > cursor.lastActiveAt) {
-        cursor.lastActiveAt = delta.ts
-      }
+      if (cursor.firstStepAt === undefined || delta.ts < cursor.firstStepAt) cursor.firstStepAt = delta.ts
+      if (cursor.lastActiveAt === undefined || delta.ts > cursor.lastActiveAt) cursor.lastActiveAt = delta.ts
     }
     cursor.inputTokens += delta.inputTokens
     cursor.outputTokens += delta.outputTokens
     cursor.cacheReadTokens += delta.cacheReadTokens
     cursor.thinkingTokens += delta.thinkingTokens
     cursor.toolCalls += delta.toolCalls
-    if (
-      turnWindowStartMs === undefined ||
-      (delta.ts !== undefined && delta.ts >= turnWindowStartMs)
-    ) {
+    if (turnWindowStartMs === undefined || (delta.ts !== undefined && delta.ts >= turnWindowStartMs)) {
       cursor.windowInputTokens = (cursor.windowInputTokens ?? 0) + delta.inputTokens
       cursor.windowOutputTokens = (cursor.windowOutputTokens ?? 0) + delta.outputTokens
       cursor.windowCacheReadTokens = (cursor.windowCacheReadTokens ?? 0) + delta.cacheReadTokens
       cursor.windowThinkingTokens = (cursor.windowThinkingTokens ?? 0) + delta.thinkingTokens
     }
-    return true
+    return sawRestart ? 'restart' : 'ok'
   } catch {
-    return false
+    return 'malformed'
   }
 }
 
-/**
- * Incremental byte-offset telemetry scanner for member `transcript.jsonl` files (B7).
- *
- * - Uses per-member `StringDecoder('utf8')` so multi-byte UTF-8 characters split across
- *   chunk boundaries never corrupt into U+FFFD replacement characters.
- * - Tracks `hasBacklog` (`byteOffset < fileSize`) and `partial` (unread backlog or oversized
- *   line drop), so callers continue draining quiet large logs across ticks and NEVER emit a
- *   partial count disguised as an exact terminal total.
- */
 export class IncrementalTranscriptTelemetryCache {
   private readonly cursors = new Map<string, TelemetryCursor>()
   private readonly maxChunkBytes: number
   private readonly maxDrainBytes: number
   private readonly turnWindowStartMs?: number
 
-  constructor(
-    maxChunkBytes = MAX_TELEMETRY_DELTA_BYTES,
-    maxDrainBytes = MAX_TELEMETRY_DRAIN_BYTES,
-    turnWindowStartMs?: number,
-  ) {
+  constructor(maxChunkBytes = MAX_TELEMETRY_DELTA_BYTES, maxDrainBytes = MAX_TELEMETRY_DRAIN_BYTES, turnWindowStartMs?: number) {
     this.maxChunkBytes = Math.max(4096, maxChunkBytes)
     this.maxDrainBytes = Math.max(this.maxChunkBytes, maxDrainBytes)
     this.turnWindowStartMs = turnWindowStartMs
@@ -528,86 +509,82 @@ export class IncrementalTranscriptTelemetryCache {
 
   private createCursor(st: Stats): TelemetryCursor {
     return {
-      dev: st.dev,
-      ino: st.ino,
-      byteOffset: 0,
-      lastSeenSize: st.size,
-      mutationEpoch: 0,
-      remainder: '',
-      decoder: new StringDecoder('utf8'),
-      droppedOversizedLine: false,
-      hadMalformedLine: false,
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      thinkingTokens: 0,
-      toolCalls: 0,
-      windowInputTokens: 0,
-      windowOutputTokens: 0,
-      windowCacheReadTokens: 0,
-      windowThinkingTokens: 0,
-      hasBacklog: st.size > 0,
-      partial: st.size > 0,
+      dev: st.dev, ino: st.ino, byteOffset: 0, lastSeenSize: st.size, mutationEpoch: 0,
+      remainder: '', decoder: new StringDecoder('utf8'), droppedOversizedLine: false, hadMalformedLine: false,
+      bgEpochIncomplete: false, bgResetByteOffset: 0, bgReverifiedAtOffset: -1, bgTaskState: createBackgroundTaskState(),
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, thinkingTokens: 0, toolCalls: 0,
+      windowInputTokens: 0, windowOutputTokens: 0, windowCacheReadTokens: 0, windowThinkingTokens: 0,
+      hasBacklog: st.size > 0, partial: st.size > 0,
     }
   }
 
   private snapshotOf(c: TelemetryCursor): MemberTelemetrySnapshot {
+    const bgIncomplete = Boolean(c.hasBacklog || c.remainder.trim().length > 0 || c.bgEpochIncomplete || c.bgTaskState.overflowed)
     return {
-      firstStepAt: c.firstStepAt,
-      lastActiveAt: c.lastActiveAt,
-      inputTokens: c.inputTokens,
-      outputTokens: c.outputTokens,
-      cacheReadTokens: c.cacheReadTokens,
-      thinkingTokens: c.thinkingTokens,
-      toolCalls: c.toolCalls,
-      windowInputTokens: c.windowInputTokens ?? 0,
-      windowOutputTokens: c.windowOutputTokens ?? 0,
-      windowCacheReadTokens: c.windowCacheReadTokens ?? 0,
-      windowThinkingTokens: c.windowThinkingTokens ?? 0,
-      hasBacklog: c.hasBacklog,
-      partial: c.partial,
+      firstStepAt: c.firstStepAt, lastActiveAt: c.lastActiveAt,
+      inputTokens: c.inputTokens, outputTokens: c.outputTokens,
+      cacheReadTokens: c.cacheReadTokens, thinkingTokens: c.thinkingTokens, toolCalls: c.toolCalls,
+      windowInputTokens: c.windowInputTokens ?? 0, windowOutputTokens: c.windowOutputTokens ?? 0,
+      windowCacheReadTokens: c.windowCacheReadTokens ?? 0, windowThinkingTokens: c.windowThinkingTokens ?? 0,
+      hasBacklog: c.hasBacklog, partial: c.partial, bgTasks: summarizeBackgroundTaskState(c.bgTaskState, bgIncomplete),
     }
   }
 
   private computePartial(c: TelemetryCursor): boolean {
-    // B7: 区分“读到物理 EOF”与“最后一条记录完整”——只要仍有未闭合/不可解析尾行或损坏行，
-    // 必须诚实标记 partial=true，绝不将已解析小计伪装为完整总计。
-    return Boolean(
-      c.hasBacklog ||
-        c.droppedOversizedLine ||
-        c.hadMalformedLine ||
-        c.remainder.trim().length > 0,
-    )
+    return Boolean(c.hasBacklog || c.droppedOversizedLine || c.hadMalformedLine || c.remainder.trim().length > 0)
   }
 
-  private consumeTextChunk(cursor: TelemetryCursor, decoded: string, atEof: boolean): void {
+  private applyLineWithEpoch(cursor: TelemetryCursor, line: string, lineOriginOffset: number): boolean {
+    const outcome = applyTelemetryLine(cursor, line, this.turnWindowStartMs)
+    if (outcome === 'malformed') { cursor.hadMalformedLine = true; cursor.bgEpochIncomplete = true; return false }
+    if (outcome === 'restart') { cursor.bgEpochIncomplete = false; cursor.bgResetByteOffset = lineOriginOffset; cursor.bgReverifiedAtOffset = -1 }
+    return true
+  }
+
+  private needsOverflowReverify(c: TelemetryCursor): boolean {
+    return !c.hasBacklog && c.bgTaskState.overflowed && c.bgTaskState.active.size === 0 && !c.bgEpochIncomplete && c.remainder.trim().length === 0 && c.bgReverifiedAtOffset !== c.byteOffset
+  }
+
+  private reverifyOverflowSync(fd: number, c: TelemetryCursor): void {
+    if (!this.needsOverflowReverify(c)) return
+    c.bgReverifiedAtOffset = c.byteOffset
+    const span = c.byteOffset - c.bgResetByteOffset
+    if (span <= 0 || span > this.maxDrainBytes) return
+    const slice = readSyncSliceWithBoundary(fd, c.bgResetByteOffset, span)
+    reconcileOverflowBgTasksFromJsonlBuffer(c.bgTaskState, slice.text, { truncatedStart: c.bgResetByteOffset > 0 })
+  }
+
+  private async reverifyOverflowAsync(fh: Awaited<ReturnType<typeof openAsync>>, c: TelemetryCursor, isStale: () => boolean): Promise<void> {
+    if (!this.needsOverflowReverify(c)) return
+    const targetOffset = c.byteOffset
+    const resetOffset = c.bgResetByteOffset
+    const span = targetOffset - resetOffset
+    if (span <= 0 || span > this.maxDrainBytes) { c.bgReverifiedAtOffset = targetOffset; return }
+    const slice = await readAsyncSliceWithBoundary(fh, resetOffset, span)
+    if (isStale()) return
+    c.bgReverifiedAtOffset = targetOffset
+    reconcileOverflowBgTasksFromJsonlBuffer(c.bgTaskState, slice.text, { truncatedStart: resetOffset > 0 })
+  }
+
+  private consumeTextChunk(cursor: TelemetryCursor, decoded: string, atEof: boolean, chunkStartOffset: number): void {
+    const lineOrigin = Math.max(0, chunkStartOffset - Buffer.byteLength(cursor.remainder, 'utf8'))
     const combined = cursor.remainder + decoded
     const lastNewline = combined.lastIndexOf('\n')
     if (lastNewline >= 0) {
       const completePart = combined.slice(0, lastNewline)
       const trailing = combined.slice(lastNewline + 1)
-      for (const line of completePart.split('\n')) {
-        if (!applyTelemetryLine(cursor, line, this.turnWindowStartMs)) {
-          cursor.hadMalformedLine = true
-        }
-      }
-      if (trailing.length > MAX_TELEMETRY_REMAINDER_BYTES) {
-        cursor.remainder = ''
-        cursor.droppedOversizedLine = true
-      } else {
-        cursor.remainder = trailing
-      }
+      for (const line of completePart.split('\n')) this.applyLineWithEpoch(cursor, line, lineOrigin)
+      if (trailing.length > MAX_TELEMETRY_REMAINDER_BYTES) { cursor.remainder = ''; cursor.droppedOversizedLine = true; cursor.bgEpochIncomplete = true }
+      else cursor.remainder = trailing
     } else if (combined.length > MAX_TELEMETRY_REMAINDER_BYTES) {
-      cursor.remainder = ''
-      cursor.droppedOversizedLine = true
+      cursor.remainder = ''; cursor.droppedOversizedLine = true; cursor.bgEpochIncomplete = true
     } else {
       cursor.remainder = combined
     }
-
-    // Only attempt to parse a trailing line without newline when we have reached EOF
-    // and the trailing text is a complete JSON object (avoiding premature truncation mid-chunk).
     if (atEof && cursor.remainder.trim().endsWith('}')) {
-      if (applyTelemetryLine(cursor, cursor.remainder, this.turnWindowStartMs)) {
+      const outcome = applyTelemetryLine(cursor, cursor.remainder, this.turnWindowStartMs)
+      if (outcome !== 'malformed') {
+        if (outcome === 'restart') { cursor.bgEpochIncomplete = false; cursor.bgResetByteOffset = lineOrigin; cursor.bgReverifiedAtOffset = -1 }
         cursor.remainder = ''
       }
     }
@@ -632,12 +609,7 @@ export class IncrementalTranscriptTelemetryCache {
 
     const st = resolved.stat
     let cursor = this.cursors.get(memberConvId)
-    const rotated =
-      !cursor ||
-      cursor.dev !== st.dev ||
-      cursor.ino !== st.ino ||
-      st.size < cursor.byteOffset
-    if (rotated) {
+    if (!cursor || cursor.dev !== st.dev || cursor.ino !== st.ino || st.size < cursor.byteOffset) {
       cursor = this.createCursor(st)
       this.cursors.set(memberConvId, cursor)
     }
@@ -684,25 +656,27 @@ export class IncrementalTranscriptTelemetryCache {
           readTotal += n
         }
         if (readTotal <= 0) break
+        const chunkStartOffset = c.byteOffset
         c.byteOffset += readTotal
         c.mutationEpoch += 1
         bytesBudgetLeft -= readTotal
         const atEof = c.byteOffset >= fst.size
         const decoded = c.decoder.write(buf.subarray(0, readTotal))
-        this.consumeTextChunk(c, decoded, atEof)
+        this.consumeTextChunk(c, decoded, atEof, chunkStartOffset)
       }
 
       if (opts?.drainAll && c.byteOffset >= fst.size) {
         const flushed = c.decoder.end()
         if (flushed) {
           c.mutationEpoch += 1
-          this.consumeTextChunk(c, flushed, true)
+          this.consumeTextChunk(c, flushed, true, c.byteOffset)
         }
         // Re-initialize fresh decoder in case more bytes are appended later.
         c.decoder = new StringDecoder('utf8')
       }
 
       c.hasBacklog = c.byteOffset < fst.size
+      this.reverifyOverflowSync(fd, c)
       c.partial = this.computePartial(c)
     } catch {
       return null
@@ -752,12 +726,7 @@ export class IncrementalTranscriptTelemetryCache {
 
     const st = resolved.stat
     let cursor = postLstatCursor
-    const rotated =
-      !cursor ||
-      cursor.dev !== st.dev ||
-      cursor.ino !== st.ino ||
-      st.size < cursor.byteOffset
-    if (rotated) {
+    if (!cursor || cursor.dev !== st.dev || cursor.ino !== st.ino || st.size < cursor.byteOffset) {
       cursor = this.createCursor(st)
       this.cursors.set(memberConvId, cursor)
     }
@@ -827,19 +796,20 @@ export class IncrementalTranscriptTelemetryCache {
         bytesBudgetLeft -= readTotal
         const atEof = c.byteOffset >= fst.size
         const decoded = c.decoder.write(buf.subarray(0, readTotal))
-        this.consumeTextChunk(c, decoded, atEof)
+        this.consumeTextChunk(c, decoded, atEof, chunkStartOffset)
       }
 
       if (opts?.drainAll && c.byteOffset >= fst.size) {
         const flushed = c.decoder.end()
         if (flushed) {
           c.mutationEpoch += 1
-          this.consumeTextChunk(c, flushed, true)
+          this.consumeTextChunk(c, flushed, true, c.byteOffset)
         }
         c.decoder = new StringDecoder('utf8')
       }
 
       c.hasBacklog = c.byteOffset < fst.size
+      await this.reverifyOverflowAsync(fh, c, isStale)
       c.partial = this.computePartial(c)
     } catch {
       return null

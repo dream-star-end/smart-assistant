@@ -22,7 +22,16 @@ import {
   type ProcessTreeOpts,
 } from '../processGroupShutdown.js'
 import { reapLingeringCliProcessGroup } from '../engine/antigravitySwarmConcurrency.js'
-import { advanceAntigravityRouteHeartbeatCounters } from '../engine/antigravityDeadlockGuard.js'
+import {
+  advanceAntigravityRouteHeartbeatCounters,
+  dispatchAntigravitySwarmStallAlert,
+} from '../engine/antigravityDeadlockGuard.js'
+import {
+  activeNativeSwarmWakeHandlerCountForTests,
+  clearActiveNativeSwarmWakeHandlersForTests,
+  lookupActiveNativeSwarmWakeHandler,
+  registerActiveNativeSwarmWakeHandler,
+} from '../engine/nativeSwarmWake.js'
 import { parseMemberTranscriptTail, readAntigravitySwarmSnapshot } from '../engine/antigravitySwarmWatcher.js'
 import { SwarmStallMonitor, type SwarmStallExhaustion } from '../engine/swarmStallMonitor.js'
 import { AntigravityAdapter, _internals } from '../engine/antigravityAdapter.js'
@@ -2030,6 +2039,261 @@ process.stdin.on('end', () => {
       assert.equal(parsedActiveSwarmWaitAfterCmdDone.waitingOnBoard, true)
     } finally {
       await rm(brainDir, { recursive: true, force: true })
+    }
+  })
+
+  test('OCV5-932: dispatchAntigravitySwarmStallAlert logs wakeDelivery + antigravity_swarm_stall_unwoken and aborts wake on turn cancel', async () => {
+    const infoLogs: Array<{ msg: string; fields?: Record<string, unknown> }> = []
+    const warnLogs: Array<{ msg: string; fields?: Record<string, unknown> }> = []
+    const logSpy = {
+      info: (msg: string, fields?: Record<string, unknown>) => infoLogs.push({ msg, fields }),
+      warn: (msg: string, fields?: Record<string, unknown>) => warnLogs.push({ msg, fields }),
+    }
+    const baseAlert = {
+      target: 'coordinator',
+      channel: 'main',
+      reason: 'idle_waiting' as const,
+      message: '@coordinator [stall] please check',
+      attempt: 1,
+      generation: 1,
+      idleMs: 180_000,
+      headSeq: 1,
+      citedSeqs: [1],
+    }
+
+    // 1) board_only_unwoken emits BOTH antigravity_swarm_stall_alert and antigravity_swarm_stall_unwoken
+    let kickCount = 0
+    dispatchAntigravitySwarmStallAlert({
+      brainDir: '/tmp/b',
+      conversationId: '11111111-2222-4333-8444-555555555555',
+      sessionKey: 'sess-1',
+      alert: baseAlert,
+      isAborted: () => false,
+      getWatcher: () => ({ kick: () => { kickCount += 1 }, rollbackStallAlert: () => {} }) as never,
+      wakeTarget: () => ({ status: 'board_only_unwoken', detail: 'native_cli_stdin_queued_until_result' }),
+      injectDirective: async (input) => {
+        const outcome = await input.wakeTarget?.({
+          target: input.target,
+          seq: 2,
+          channel: input.channel,
+          text: input.message,
+          controlKind: input.controlKind,
+        })
+        return { ok: true, seq: 2, wakeDelivery: outcome?.status, wakeDetail: outcome?.detail }
+      },
+      log: logSpy,
+    })
+    await waitUntil(() => kickCount === 1, 500)
+    assert.equal(infoLogs.length, 1)
+    assert.equal(infoLogs[0]?.msg, 'antigravity_swarm_stall_alert')
+    assert.equal(infoLogs[0]?.fields?.wakeDelivery, 'board_only_unwoken')
+    assert.equal(infoLogs[0]?.fields?.wakeDetail, 'native_cli_stdin_queued_until_result')
+    assert.equal(warnLogs.length, 1)
+    assert.equal(warnLogs[0]?.msg, 'antigravity_swarm_stall_unwoken')
+    assert.equal(warnLogs[0]?.fields?.wakeDetail, 'native_cli_stdin_queued_until_result')
+
+    // 2) woken emits ONLY antigravity_swarm_stall_alert (no unwoken warning)
+    infoLogs.length = 0
+    warnLogs.length = 0
+    dispatchAntigravitySwarmStallAlert({
+      brainDir: '/tmp/b',
+      conversationId: '11111111-2222-4333-8444-555555555555',
+      sessionKey: 'sess-1',
+      alert: baseAlert,
+      isAborted: () => false,
+      getWatcher: () => ({ kick: () => { kickCount += 1 }, rollbackStallAlert: () => {} }) as never,
+      wakeTarget: () => ({ status: 'woken', detail: 'live_transport' }),
+      injectDirective: async (input) => {
+        const outcome = await input.wakeTarget?.({
+          target: input.target,
+          seq: 3,
+          channel: input.channel,
+          text: input.message,
+          controlKind: input.controlKind,
+        })
+        return { ok: true, seq: 3, wakeDelivery: outcome?.status, wakeDetail: outcome?.detail }
+      },
+      log: logSpy,
+    })
+    await waitUntil(() => kickCount === 2, 500)
+    assert.equal(infoLogs[0]?.fields?.wakeDelivery, 'woken')
+    assert.equal(warnLogs.length, 0)
+
+    // 3) Abort flipping true mid-flight suppresses underlying wakeTarget call
+    let aborted = false
+    let underlyingWakeCalled = false
+    let wakeOutcomeStatus: string | undefined
+    dispatchAntigravitySwarmStallAlert({
+      brainDir: '/tmp/b',
+      conversationId: '11111111-2222-4333-8444-555555555555',
+      sessionKey: 'sess-1',
+      alert: baseAlert,
+      isAborted: () => aborted,
+      getWatcher: () => null,
+      wakeTarget: () => {
+        underlyingWakeCalled = true
+        return { status: 'woken', detail: 'should_not_fire' }
+      },
+      injectDirective: async (input) => {
+        aborted = true
+        const outcome = await input.wakeTarget?.({
+          target: input.target,
+          seq: 4,
+          channel: input.channel,
+          text: input.message,
+          controlKind: input.controlKind,
+        })
+        wakeOutcomeStatus = outcome?.detail
+        return { ok: true, seq: 4, wakeDelivery: outcome?.status, wakeDetail: outcome?.detail }
+      },
+      log: logSpy,
+    })
+    await waitUntil(() => wakeOutcomeStatus !== undefined, 500)
+    assert.equal(underlyingWakeCalled, false, 'aborted turn must suppress underlying wakeTarget')
+    assert.equal(wakeOutcomeStatus, 'stall_alert_aborted')
+  })
+
+  test('OCV5-932: AntigravityAdapter registers live honest wake handler, aborts after interrupt/close, and leaves zero registry leaks', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-agy-wake-lifecycle-'))
+    const readyFile = path.join(dir, 'ready')
+    const saved = {
+      OC_ANTIGRAVITY_CLI_BIN: process.env.OC_ANTIGRAVITY_CLI_BIN,
+      OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME,
+    }
+    clearActiveNativeSwarmWakeHandlersForTests()
+    try {
+      const convId = '77777777-8888-4999-8aaa-bbbbbbbbbbbb'
+      const fakeCli = path.join(dir, 'fake-wake-lifecycle.cjs')
+      await writeFile(
+        fakeCli,
+        `#!${process.execPath}
+const fs = require('node:fs')
+const path = require('node:path')
+process.on('SIGINT', () => process.exit(0))
+process.stdin.setEncoding('utf8')
+let buf = ''
+let started = false
+process.stdin.on('data', (c) => {
+  buf += c
+  if (started || !buf.includes('\\n')) return
+  started = true
+  const brain = path.join(process.env.HOME, '.gemini', 'antigravity-cli', 'brain')
+  const swarmDir = path.join(brain, '${convId}', '.system_generated', 'swarm')
+  fs.mkdirSync(swarmDir, { recursive: true })
+  fs.writeFileSync(path.join(swarmDir, 'members.json'), JSON.stringify({
+    title: 'Wake Lifecycle Swarm',
+    members: {
+      coordinator: { conversation_id: '${convId}', role: 'coordinator', killed: false },
+      'worker-a': { conversation_id: 'eeeeeeee-ffff-4000-8111-222222222222', role: 'worker', killed: false },
+    },
+  }))
+  fs.writeFileSync(path.join(swarmDir, 'board.jsonl'), '')
+  process.stdout.write(JSON.stringify({ event: 'init', conversation_id: '${convId}' }) + '\\n')
+  fs.writeFileSync(${JSON.stringify(readyFile)}, '1')
+  setInterval(() => {}, 1000)
+})
+`,
+      )
+      await chmod(fakeCli, 0o755)
+      process.env.OC_ANTIGRAVITY_CLI_BIN = fakeCli
+      process.env.OPENCLAUDE_HOME = path.join(dir, 'oc-home')
+
+      const adapter = new AntigravityAdapter({
+        sessionKey: 'agent:main:webchat:dm:agy-wake-lifecycle',
+        agentId: 'main',
+        agentBaseDir: dir,
+        config: makeConfig(),
+        model: 'antigravity-gemini-3.8-flash',
+        effortLevel: 'high',
+      } as EngineCreateOpts)
+      adapter.on('error', () => {})
+      adapter.setAntigravityRoute(ROUTE)
+
+      const run = adapter.submitTurn({
+        input: 'run wake lifecycle test',
+        requestId: '9'.repeat(32),
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      assert.equal(await waitUntil(() => existsSync(readyFile), 3_000), true)
+
+      const target = adapter.getActiveSwarmTarget()
+      assert.ok(target)
+      assert.equal(
+        await waitUntil(() => lookupActiveNativeSwarmWakeHandler(target.brainDir, target.conversationId) !== null, 2_000),
+        true,
+        'active turn must register live native wake handler on watcher start',
+      )
+      assert.equal(activeNativeSwarmWakeHandlerCountForTests(), 1)
+
+      const liveHandler = lookupActiveNativeSwarmWakeHandler(target.brainDir, target.conversationId)!
+      const coordOutcome = await liveHandler({
+        target: 'coordinator',
+        seq: 1,
+        channel: 'main',
+        text: '@coordinator check',
+        controlKind: 'steer',
+        targetConversationId: convId,
+      })
+      assert.deepEqual(coordOutcome, {
+        status: 'board_only_unwoken',
+        detail: 'native_cli_stdin_queued_until_result',
+      })
+
+      const workerOutcome = await liveHandler({
+        target: 'worker-a',
+        seq: 2,
+        channel: 'main',
+        text: '@worker-a check',
+        controlKind: 'steer',
+        targetConversationId: 'eeeeeeee-ffff-4000-8111-222222222222',
+      })
+      assert.deepEqual(workerOutcome, {
+        status: 'board_only_unwoken',
+        detail: 'native_worker_no_external_wake_channel',
+      })
+
+      // Interrupt immediately unregisters AND flips captured liveHandler to inactive no-op!
+      assert.equal(adapter.interrupt('user'), true)
+      assert.equal(activeNativeSwarmWakeHandlerCountForTests(), 0, 'interrupt must immediately unregister wake handler')
+      const postInterruptOutcome = await liveHandler({
+        target: 'coordinator',
+        seq: 3,
+        channel: 'main',
+        text: '@coordinator late',
+        controlKind: 'steer',
+      })
+      assert.deepEqual(postInterruptOutcome, {
+        status: 'board_only_unwoken',
+        detail: 'native_swarm_turn_inactive',
+      })
+
+      await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(activeNativeSwarmWakeHandlerCountForTests(), 0, 'zero registry leaks after drain')
+
+      // Token isolation check: newer turn registration survives older unregister closure
+      const u1 = registerActiveNativeSwarmWakeHandler(target.brainDir, convId, () => ({ status: 'board_only_unwoken', detail: 'old' }))
+      const u2 = registerActiveNativeSwarmWakeHandler(target.brainDir, convId, () => ({ status: 'woken', detail: 'new' }))
+      u1()
+      const current = lookupActiveNativeSwarmWakeHandler(target.brainDir, convId)
+      assert.ok(current)
+      assert.deepEqual(await current({ target: 'coordinator', seq: 1, channel: 'main', text: 'hi', controlKind: 'steer' }), {
+        status: 'woken',
+        detail: 'new',
+      })
+      u2()
+      assert.equal(activeNativeSwarmWakeHandlerCountForTests(), 0)
+    } finally {
+      _internals.setTimingTestHooks(null)
+      clearActiveNativeSwarmWakeHandlersForTests()
+      if (saved.OC_ANTIGRAVITY_CLI_BIN === undefined) Reflect.deleteProperty(process.env, 'OC_ANTIGRAVITY_CLI_BIN')
+      else process.env.OC_ANTIGRAVITY_CLI_BIN = saved.OC_ANTIGRAVITY_CLI_BIN
+      if (saved.OPENCLAUDE_HOME === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_HOME')
+      else process.env.OPENCLAUDE_HOME = saved.OPENCLAUDE_HOME
+      await rm(dir, { recursive: true, force: true })
     }
   })
 })

@@ -483,6 +483,8 @@ export async function resolvePendingDecision(
 
 // ── 4. Swarm 交互式操控指令与剧本模板 ───────────────────────────────────────
 
+export type SwarmWakeDelivery = "woken" | "board_only_unwoken" | "not_applicable";
+
 export interface SwarmSteerSuccess {
   ok: true;
   seq: number;
@@ -492,6 +494,8 @@ export interface SwarmSteerSuccess {
   text: string;
   mentions: string[];
   time: string;
+  wakeDelivery?: SwarmWakeDelivery;
+  wakeDetail?: string;
 }
 
 export type SwarmTerminateStatus = "requested" | "confirmed" | "already_killed";
@@ -503,6 +507,8 @@ export interface SwarmTerminateSuccess {
   alreadyKilled: boolean;
   noticeSeq?: number;
   time: string;
+  wakeDelivery?: SwarmWakeDelivery;
+  wakeDetail?: string;
 }
 
 export async function sendSwarmSteer(
