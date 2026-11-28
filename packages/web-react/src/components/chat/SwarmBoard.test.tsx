@@ -952,5 +952,19 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     expect(protoMentions).toEqual(["reviewer"]);
     expect(uiMentions).toEqual(protoMentions);
     expect(linkifySwarmMarkdownTokens(crossParagraph)).toContain("[@reviewer](#swarm-mention:reviewer)");
+
+    // Steward R2 Blocker #3: trailing-hyphen member names (@all-, @worker-) match protocol & Web UI identically
+    const hyphenText = "通知 @all- 与 @worker- 复核 #48";
+    expect(extractSwarmMentions(hyphenText)).toEqual(["all-", "worker-"]);
+    const hyphenTokens = tokenizeSwarmInlineText(hyphenText);
+    expect(hyphenTokens.filter((t) => t.kind === "mention")).toEqual([
+      { kind: "mention", value: "@all-", target: "all-" },
+      { kind: "mention", value: "@worker-", target: "worker-" },
+    ]);
+    expect(hyphenTokens.filter((t) => t.kind === "seq")).toEqual([{ kind: "seq", value: "#48", seq: 48 }]);
+    const hyphenLinked = linkifySwarmMarkdownTokens(hyphenText);
+    expect(hyphenLinked).toContain("[@all-](#swarm-mention:all-)");
+    expect(hyphenLinked).not.toContain("#swarm-mention-all");
+    expect(hyphenLinked).toContain("[@worker-](#swarm-mention:worker-)");
   });
 });

@@ -195,32 +195,56 @@ export function collectSwarmCodeRanges(text: string): Array<readonly [number, nu
   return ranges
 }
 
-function stripSwarmMarkdownCode(text: string): string {
-  const ranges = collectSwarmCodeRanges(text)
-  if (ranges.length === 0) return text
-  let out = ''
-  let pos = 0
-  for (const [start, end] of ranges) {
-    if (start > pos) out += text.slice(pos, start)
-    out += ' '
-    pos = end
+export interface SwarmMentionSpan {
+  readonly start: number
+  readonly end: number
+  readonly raw: string
+  readonly kind: 'mention' | 'channel_mention'
+  readonly target: string
+}
+
+/**
+ * Single source of truth for `@member`, `@all`, and `@#channel` mention spans,
+ * skipping fenced (` ``` ` / ` ~~~ `) and paragraph-scoped inline code ranges.
+ * Consumed by both protocol/gateway routing (`extractSwarmMentions`) and Web UI tokenizers.
+ */
+export function scanSwarmMentionSpans(text: string): SwarmMentionSpan[] {
+  if (!text) return []
+  const codeRanges = collectSwarmCodeRanges(text)
+  let rangeIdx = 0
+  const spans: SwarmMentionSpan[] = []
+  MENTION_RE.lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = MENTION_RE.exec(text)) !== null) {
+    const rawBody = match[1]
+    if (!rawBody) continue
+    const atOffset = match[0].indexOf('@')
+    if (atOffset < 0) continue
+    const start = match.index + atOffset
+    while (rangeIdx < codeRanges.length && codeRanges[rangeIdx]![1] <= start) rangeIdx += 1
+    if (rangeIdx < codeRanges.length && start >= codeRanges[rangeIdx]![0]) continue
+    const trimmed = rawBody.replace(/\.+$/, '')
+    if (!trimmed || trimmed === '#') continue
+    const end = start + 1 + trimmed.length
+    const raw = text.slice(start, end)
+    if (trimmed.startsWith('#')) {
+      spans.push({ start, end, raw, kind: 'channel_mention', target: trimmed.slice(1).toLowerCase() })
+    } else {
+      spans.push({ start, end, raw, kind: 'mention', target: trimmed.toLowerCase() })
+    }
   }
-  if (pos < text.length) out += text.slice(pos)
-  return out
+  return spans
 }
 
 export function extractSwarmMentions(text: string): string[] {
   if (!text) return []
-  const cleaned = stripSwarmMarkdownCode(text)
   const seen = new Set<string>()
   const out: string[] = []
-  MENTION_RE.lastIndex = 0
-  let match: RegExpExecArray | null
-  while ((match = MENTION_RE.exec(cleaned)) !== null) {
-    const raw = match[1]?.replace(/\.+$/, '').toLowerCase()
-    if (!raw || raw === '#' || seen.has(raw)) continue
-    seen.add(raw)
-    out.push(raw)
+  for (const span of scanSwarmMentionSpans(text)) {
+    const key = span.kind === 'channel_mention' ? `#${span.target}` : span.target
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(key)
   }
   return out
 }

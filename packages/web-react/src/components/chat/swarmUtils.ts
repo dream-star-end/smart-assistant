@@ -1,5 +1,6 @@
 import {
   collectSwarmCodeRanges,
+  scanSwarmMentionSpans,
   type SwarmBoardPost,
   type SwarmMemberRole,
   type SwarmMemberSnapshot,
@@ -505,45 +506,53 @@ export type SwarmTextToken =
   | { kind: "channel_mention"; value: string; channel: string }
   | { kind: "seq"; value: string; seq: number };
 
-const TOKEN_RE = /(@#[A-Za-z0-9][A-Za-z0-9._-]{0,63}|@[A-Za-z0-9][A-Za-z0-9._-]{0,63}|#\d{1,5})\b/g;
+const SEQ_RE = /#\d{1,5}\b/g;
+
+function pushSeqTokensInPlainSlice(
+  text: string,
+  sliceStart: number,
+  sliceEnd: number,
+  codeRanges: readonly (readonly [number, number])[],
+  out: SwarmTextToken[],
+): void {
+  if (sliceEnd <= sliceStart) return;
+  let rangeIdx = 0;
+  while (rangeIdx < codeRanges.length && codeRanges[rangeIdx]![1] <= sliceStart) rangeIdx += 1;
+  const slice = text.slice(sliceStart, sliceEnd);
+  let lastLocal = 0;
+  SEQ_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = SEQ_RE.exec(slice)) !== null) {
+    const absStart = sliceStart + match.index;
+    const raw = match[0];
+    while (rangeIdx < codeRanges.length && codeRanges[rangeIdx]![1] <= absStart) rangeIdx += 1;
+    if (rangeIdx < codeRanges.length && absStart >= codeRanges[rangeIdx]![0]) continue;
+    const prevChar = absStart > 0 ? text[absStart - 1]! : "";
+    if (prevChar && /[A-Za-z0-9_.+-]/.test(prevChar)) continue;
+    const seq = Number.parseInt(raw.slice(1), 10);
+    if (!Number.isFinite(seq) || seq <= 0) continue;
+    if (match.index > lastLocal) out.push({ kind: "text", value: slice.slice(lastLocal, match.index) });
+    out.push({ kind: "seq", value: raw, seq });
+    lastLocal = match.index + raw.length;
+  }
+  if (lastLocal < slice.length) out.push({ kind: "text", value: slice.slice(lastLocal) });
+}
 
 export function tokenizeSwarmInlineText(text: string): SwarmTextToken[] {
   if (!text) return [];
   const codeRanges = collectSwarmCodeRanges(text);
-  let rangeIdx = 0;
+  const mentions = scanSwarmMentionSpans(text);
   const out: SwarmTextToken[] = [];
-  let lastIndex = 0;
-  TOKEN_RE.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = TOKEN_RE.exec(text)) !== null) {
-    const start = match.index;
-    const raw = match[1]!;
-    while (rangeIdx < codeRanges.length && codeRanges[rangeIdx]![1] <= start) rangeIdx += 1;
-    if (rangeIdx < codeRanges.length && start >= codeRanges[rangeIdx]![0]) continue;
-    // Only treat as token at start of line or after non-word char (avoid emails & scoped paths).
-    const prevChar = start > 0 ? text[start - 1]! : "";
-    if (prevChar && /[A-Za-z0-9_.+-]/.test(prevChar)) continue;
-    const nextChar = text[start + raw.length] ?? "";
-    if (raw.startsWith("@") && nextChar === "/") continue;
-    if (start > lastIndex) {
-      out.push({ kind: "text", value: text.slice(lastIndex, start) });
+  let cursor = 0;
+  for (const m of mentions) {
+    if (m.start > cursor) pushSeqTokensInPlainSlice(text, cursor, m.start, codeRanges, out);
+    if (m.kind === "channel_mention") {
+      out.push({ kind: "channel_mention", value: m.raw, channel: m.target });
+    } else {
+      out.push({ kind: "mention", value: m.raw, target: m.target });
     }
-    if (raw.startsWith("@#")) {
-      out.push({ kind: "channel_mention", value: raw, channel: raw.slice(2).toLowerCase() });
-    } else if (raw.startsWith("@")) {
-      out.push({ kind: "mention", value: raw, target: raw.slice(1).toLowerCase() });
-    } else if (raw.startsWith("#")) {
-      const seq = Number.parseInt(raw.slice(1), 10);
-      if (Number.isFinite(seq) && seq > 0) {
-        out.push({ kind: "seq", value: raw, seq });
-      } else {
-        out.push({ kind: "text", value: raw });
-      }
-    }
-    lastIndex = start + raw.length;
+    cursor = m.end;
   }
-  if (lastIndex < text.length) {
-    out.push({ kind: "text", value: text.slice(lastIndex) });
-  }
+  if (cursor < text.length) pushSeqTokensInPlainSlice(text, cursor, text.length, codeRanges, out);
   return out;
 }

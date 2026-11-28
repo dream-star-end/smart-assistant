@@ -399,6 +399,7 @@ function stepToolName(obj: Record<string, unknown> | null): string {
 }
 
 interface TrackedToolCall {
+  readonly idx: number
   name: string
   readonly norm: string
   id: string
@@ -417,7 +418,9 @@ interface TerminalToolStep {
 
 interface CallReductionState {
   readonly calls: TrackedToolCall[]
+  readonly callIndicesById: Map<string, number[]>
   readonly accounted: Set<number>
+  readonly unaccountedNonBoard: Set<number>
   readonly idMatchedEpochNorms: Set<string>
   readonly plannerEpochNormCounts: Map<string, number>
   readonly plannerEpochCallCounts: Map<number, number>
@@ -430,17 +433,36 @@ interface CallReductionState {
 
 function createCallReductionState(): CallReductionState {
   return {
-    calls: [],
-    accounted: new Set<number>(),
-    idMatchedEpochNorms: new Set<string>(),
-    plannerEpochNormCounts: new Map<string, number>(),
-    plannerEpochCallCounts: new Map<number, number>(),
-    genericTerminalsByEpoch: new Map<number, number>(),
-    seenTerminalIds: new Set<string>(),
-    seenStepIndices: new Set<number>(),
-    seenUnindexedPayloads: new Set<string>(),
-    fallbackTerminals: [],
+    calls: [], callIndicesById: new Map(), accounted: new Set(), unaccountedNonBoard: new Set(),
+    idMatchedEpochNorms: new Set(), plannerEpochNormCounts: new Map(), plannerEpochCallCounts: new Map(),
+    genericTerminalsByEpoch: new Map(), seenTerminalIds: new Set(), seenStepIndices: new Set(),
+    seenUnindexedPayloads: new Set(), fallbackTerminals: [],
   }
+}
+
+function indexCallId(state: CallReductionState, id: string, idx: number): void {
+  if (!id) return
+  const bucket = state.callIndicesById.get(id)
+  if (bucket) bucket.push(idx)
+  else state.callIndicesById.set(id, [idx])
+}
+
+function markCallAccounted(state: CallReductionState, idx: number): void {
+  state.accounted.add(idx)
+  state.unaccountedNonBoard.delete(idx)
+}
+
+function findUnaccountedIndexById(
+  state: CallReductionState,
+  id: string,
+  accounted: ReadonlySet<number> = state.accounted,
+): number {
+  const bucket = state.callIndicesById.get(id)
+  if (!bucket) return -1
+  for (const idx of bucket) {
+    if (!accounted.has(idx)) return idx
+  }
+  return -1
 }
 
 function findUniqueArgsMatchedUnboundPlannerCall(
@@ -474,8 +496,9 @@ function bindIdDirectCall(
   hasPlannerRoot: boolean,
   epoch: number,
 ): boolean {
-  const existing = state.calls.find((c) => c.id === id)
-  if (existing) {
+  const existingIdx = state.callIndicesById.get(id)?.[0]
+  if (existingIdx !== undefined) {
+    const existing = state.calls[existingIdx]!
     if (!existing.args && args) existing.args = args
     existing.boundDirect = true
     return true
@@ -490,6 +513,7 @@ function bindIdDirectCall(
       : findUniqueArgsMatchedUnboundPlannerCall(state, epoch, norm, args)
   if (!unbound) return false
   unbound.id = id
+  indexCallId(state, id, unbound.idx)
   unbound.boundDirect = true
   if (!unbound.args && args) unbound.args = args
   return true
@@ -531,40 +555,25 @@ function bindExistingOrPlannerCall(
 }
 
 function registerTrackedCallStart(
-  state: CallReductionState,
-  rawName: string,
-  id: string,
-  args: Record<string, unknown> | null,
-  fromPlanner: boolean,
-  hasPlannerRoot: boolean,
-  epoch: number,
+  state: CallReductionState, rawName: string, id: string, args: Record<string, unknown> | null,
+  fromPlanner: boolean, hasPlannerRoot: boolean, epoch: number,
 ): void {
   const norm = normTool(rawName)
   if (!norm) return
   if (bindExistingOrPlannerCall(state, norm, id, args, fromPlanner, hasPlannerRoot, epoch)) return
   const idx = state.calls.length
-  state.calls.push({
-    name: rawName,
-    norm,
-    id,
-    isBoard: BOARD_COORD_TOOLS.has(norm),
-    args,
-    fromPlanner,
-    boundDirect: !fromPlanner,
-    epoch,
-  })
+  const isBoard = BOARD_COORD_TOOLS.has(norm)
+  state.calls.push({ idx, name: rawName, norm, id, isBoard, args, fromPlanner, boundDirect: !fromPlanner, epoch })
+  indexCallId(state, id, idx)
+  if (!isBoard) state.unaccountedNonBoard.add(idx)
   if (id && state.seenTerminalIds.has(id)) {
-    state.accounted.add(idx)
+    markCallAccounted(state, idx)
     state.idMatchedEpochNorms.add(`${epoch}:${norm}`)
   }
 }
 
 function registerCallList(
-  state: CallReductionState,
-  rawCalls: readonly unknown[],
-  fromPlanner: boolean,
-  hasPlannerRoot: boolean,
-  epoch: number,
+  state: CallReductionState, rawCalls: readonly unknown[], fromPlanner: boolean, hasPlannerRoot: boolean, epoch: number,
 ): void {
   if (fromPlanner) {
     let validPlannerCount = 0
@@ -584,15 +593,7 @@ function registerCallList(
   for (const raw of rawCalls) {
     const obj = recOf(raw)
     if (!obj) continue
-    registerTrackedCallStart(
-      state,
-      strOf(obj.name || obj.tool_name),
-      stepCallId(obj),
-      recOf(obj.arguments ?? obj.args),
-      fromPlanner,
-      hasPlannerRoot,
-      epoch,
-    )
+    registerTrackedCallStart(state, strOf(obj.name || obj.tool_name), stepCallId(obj), recOf(obj.arguments ?? obj.args), fromPlanner, hasPlannerRoot, epoch)
   }
 }
 
@@ -619,10 +620,10 @@ function recordTerminalToolEvent(state: CallReductionState, step: Record<string,
     return
   }
   if (cid) {
-    const idx = state.calls.findIndex((c, i) => !state.accounted.has(i) && c.id === cid)
+    const idx = findUnaccountedIndexById(state, cid)
     if (idx >= 0) {
       const matched = state.calls[idx]!
-      state.accounted.add(idx)
+      markCallAccounted(state, idx)
       state.idMatchedEpochNorms.add(`${matched.epoch}:${matched.norm}`)
       state.idMatchedEpochNorms.add(`${epoch}:${matched.norm}`)
       return
@@ -720,7 +721,7 @@ function resolveFallbackTerminals(
 ): void {
   for (const term of state.fallbackTerminals) {
     if (term.id) {
-      const idx = state.calls.findIndex((c, i) => !accounted.has(i) && c.id === term.id)
+      const idx = findUnaccountedIndexById(state, term.id, accounted)
       if (idx >= 0) {
         const matched = state.calls[idx]!
         accounted.add(idx)
@@ -737,11 +738,15 @@ function resolveFallbackTerminals(
 }
 
 function hasUnaccountedNonBoardToolSnapshot(state: CallReductionState): boolean {
-  if (!state.calls.some((c, i) => !c.isBoard && !state.accounted.has(i))) return false
+  if (state.unaccountedNonBoard.size === 0) return false
+  if (state.fallbackTerminals.length === 0 && state.genericTerminalsByEpoch.size === 0) return true
   const accounted = new Set(state.accounted)
   const idMatched = new Set(state.idMatchedEpochNorms)
   resolveFallbackTerminals(state, accounted, idMatched)
-  return state.calls.some((c, i) => !c.isBoard && !accounted.has(i))
+  for (const idx of state.unaccountedNonBoard) {
+    if (!accounted.has(idx)) return true
+  }
+  return false
 }
 
 /**

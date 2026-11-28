@@ -2533,6 +2533,84 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
     const r128 = measureTypeReads(128)
     assert.ok(r128 <= 200, `findTurnStartIndex must be O(N), got ${r128} type reads for N=128`)
     assert.ok(r128 - r64 <= (r64 - r32) * 2.5 + 4, `type reads must grow linearly (r32=${r32}, r64=${r64}, r128=${r128})`)
+
+    // Steward R2 Blocker #1: ERROR_MESSAGE while background task is still active MUST keep failed/lastError
+    // AND block onStallExhausted (0 before task finishes, 1 after task finishes)
+    const errBgTaskId = `${WORKER_CONV}/task-err-bg-1`
+    const errWithLiveBg = [
+      JSON.stringify({ step_index: 1, type: 'GENERIC', status: 'RUNNING', content: `Tool is running as a background task with task id: ${errBgTaskId}` }),
+      JSON.stringify({ step_index: 2, type: 'ERROR_MESSAGE', status: 'ERROR', content: 'quota exceeded' }),
+    ]
+    await writeFile(workerTranscript, `${errWithLiveBg.join('\n')}\n`)
+    const errLiveSnap = readAntigravitySwarmSnapshot({
+      brainDir, conversationId: COORD_CONV, phase: 'running', revision: 70,
+    })!
+    const errLiveWorker = errLiveSnap.members.find((m) => m.name === 'parser')!
+    assert.equal(errLiveWorker.failed, true, 'ERROR_MESSAGE must still surface failed=true')
+    assert.ok(errLiveWorker.lastError?.includes('quota exceeded'))
+    assert.equal(errLiveWorker.livenessEvidencePartial, true, 'active bg task on ERROR_MESSAGE must set livenessEvidencePartial=true')
+    let errLiveReclaimed = 0
+    const errLiveMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { errLiveReclaimed += 1 },
+    })
+    errLiveMon.evaluate(errLiveSnap, 1_000)
+    errLiveMon.evaluate({ ...errLiveSnap, revision: 71 }, 3_000)
+    errLiveMon.evaluate({ ...errLiveSnap, revision: 72 }, 5_000)
+    assert.equal(errLiveReclaimed, 0, 'ERROR_MESSAGE with active bg task must NOT trigger onStallExhausted')
+
+    // Positive control: once errBgTaskId terminates, onStallExhausted fires normally (1)
+    const errAfterBgDone = [
+      ...errWithLiveBg,
+      JSON.stringify({ step_index: 3, type: 'SYSTEM_MESSAGE', status: 'DONE', content: `[Message] sender=${errBgTaskId} content=Task id "${errBgTaskId}" finished with result: ok` }),
+      JSON.stringify({ step_index: 4, type: 'ERROR_MESSAGE', status: 'ERROR', content: 'quota exceeded' }),
+    ]
+    await writeFile(workerTranscript, `${errAfterBgDone.join('\n')}\n`)
+    const errDoneSnap = readAntigravitySwarmSnapshot({
+      brainDir, conversationId: COORD_CONV, phase: 'running', revision: 73,
+    })!
+    const errDoneWorker = errDoneSnap.members.find((m) => m.name === 'parser')!
+    assert.equal(errDoneWorker.failed, true)
+    assert.notEqual(errDoneWorker.livenessEvidencePartial, true)
+    let errDoneReclaimed = 0
+    const errDoneMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { errDoneReclaimed += 1 },
+    })
+    errDoneMon.evaluate(errDoneSnap, 1_000)
+    errDoneMon.evaluate({ ...errDoneSnap, revision: 74 }, 3_000)
+    errDoneMon.evaluate({ ...errDoneSnap, revision: 75 }, 5_000)
+    assert.equal(errDoneReclaimed, 1, 'after bg task finishes, errored stalled swarm must reclaim normally')
+
+    // Steward R2 Blocker #2: O(N) indexed ID lookup in findTurnStartIndex for distinct-ID tool pairs
+    // (both standalone and interleaved with SYSTEM_MESSAGEs)
+    const measureToolPairOps = (nPairs: number, interleaveSys: boolean): number => {
+      let propReads = 0
+      const wrap = (obj: Record<string, unknown>) =>
+        new Proxy(obj, {
+          get(target, prop, receiver) {
+            if (prop === 'type' || prop === 'tool_call_id' || prop === 'call_id' || prop === 'id') propReads += 1
+            return Reflect.get(target, prop, receiver)
+          },
+        })
+      const seq: Record<string, unknown>[] = [wrap({ step_index: 0, type: 'USER_INPUT', status: 'DONE' })]
+      let idx = 1
+      for (let k = 0; k < nPairs; k += 1) {
+        seq.push(wrap({ step_index: idx++, type: 'TOOL_CALL', tool_call_id: `cid-${k}`, tool_name: 'run_command', status: 'ACTIVE' }))
+        if (interleaveSys) seq.push(wrap({ step_index: idx++, type: 'SYSTEM_MESSAGE', status: 'DONE', content: `tick ${k}` }))
+        seq.push(wrap({ step_index: idx++, type: 'TOOL_RESULT', tool_call_id: `cid-${k}`, tool_name: 'run_command', status: 'DONE', content: 'ok' }))
+      }
+      assert.equal(findTurnStartIndex(seq), 0)
+      return propReads
+    }
+    const p32 = measureToolPairOps(32, false)
+    const p64 = measureToolPairOps(64, false)
+    const p128 = measureToolPairOps(128, false)
+    assert.ok(p128 - p64 <= (p64 - p32) * 2.5 + 16, `tool-pair ops must scale linearly (p32=${p32}, p64=${p64}, p128=${p128})`)
+    const i32 = measureToolPairOps(32, true)
+    const i64 = measureToolPairOps(64, true)
+    const i128 = measureToolPairOps(128, true)
+    assert.ok(i128 - i64 <= (i64 - i32) * 2.5 + 16, `interleaved tool+sys ops must scale linearly (i32=${i32}, i64=${i64}, i128=${i128})`)
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }

@@ -253,7 +253,7 @@ export function parseMemberTranscriptTail(
   const lastType = asStr(last.type).toUpperCase()
   const lastStatus = asStr(last.status).toUpperCase()
 
-  if (lastType === 'ERROR_MESSAGE') return buildErrorTranscriptSummary(telBase, maxStepIndex, last)
+  if (lastType === 'ERROR_MESSAGE') return { ...buildErrorTranscriptSummary(telBase, maxStepIndex, last), ...(mergedBg.activeIds.size > 0 || mergedBg.overflowed ? { incompleteBgEvidence: true } : {}) }
 
   const { lastPlanner, lastPlannerIdx, lastPlannerCalls } = findLastPlannerInTurn(turnSteps)
   const activeNonBoardTool = findActiveNonBoardToolInTurn(turnSteps, lastPlannerIdx, lastPlannerCalls, bgTasks)
