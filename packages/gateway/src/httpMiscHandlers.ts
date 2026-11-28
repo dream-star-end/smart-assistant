@@ -37,6 +37,12 @@ import {
   openAdvisorEngines,
 } from './advisorMode.js'
 import { CollaborationConfigError, resolveSessionCollab } from './advisorConfigStore.js'
+import {
+  handleMediaGetFailLocation,
+  mediaCacheControlForFilename,
+  tryServeCasMediaFallback,
+  tryServeRemoteHostApiFile,
+} from './httpMediaCasFallback.js'
 import { serveFileFdWithRange } from './httpRange.js'
 import { isEngineLocalTurnExempt } from './modelAuthority.js'
 import { getLocalCatalogView } from './modelCatalogClient.js'
@@ -246,51 +252,14 @@ export async function handleApiFile(
     if (
       mediaLoc.kind === 'fail' &&
       mediaLoc.reason === 'remote-host' &&
-      this.deps.commercial?.pullRemoteHostMedia
+      (await tryServeRemoteHostApiFile(this, res, {
+        resolvedPath: resolved,
+        mediaLocation: mediaLoc,
+        isScopedMediaPath: makeUserScopedMediaPredicate(mediaLoc.uploads, mediaLoc.generated),
+        isFileBlocked,
+      }))
     ) {
-      const remoteScoped = makeUserScopedMediaPredicate(mediaLoc.uploads, mediaLoc.generated)
-      if (remoteScoped(resolved)) {
-        let buf: Buffer | null = null
-        try {
-          buf = await this.deps.commercial.pullRemoteHostMedia({
-            hostUuid: mediaLoc.hostUuid,
-            remotePath: resolved,
-          })
-        } catch (err) {
-          this.log.error(
-            'api/file: remote-host pull failed',
-            { hostUuid: mediaLoc.hostUuid, remotePath: resolved, ...mediaLoc.logCtx },
-            err as Error,
-          )
-          this.sendError(res, 502, 'remote storage pull failed')
-          return
-        }
-        if (buf === null) {
-          // Codex review #1 (Phase 2): null 表示远端 404;空 Buffer(0 字节文件)
-          // 是合法命中,不能被 falsy 吞掉。
-          res.writeHead(404)
-          res.end('not found')
-          return
-        }
-        if (isFileBlocked(resolved)) {
-          this.log.warn('api/file: remote hit blocked by sensitive deny-list', { path: resolved })
-          res.writeHead(403)
-          res.end('access denied')
-          return
-        }
-        const remoteFileContentType = mimeFor(resolved)
-        const remoteFileDispositionMode = shouldServeInline(remoteFileContentType)
-          ? 'inline'
-          : 'attachment'
-        res.writeHead(200, {
-          'Content-Type': remoteFileContentType,
-          'Content-Length': buf.length,
-          'Cache-Control': 'private, max-age=3600',
-          'Content-Disposition': `${remoteFileDispositionMode}; filename="${encodeURIComponent(basename(resolved) || 'file')}"`,
-        })
-        res.end(buf)
-        return
-      }
+      return
     }
     res.writeHead(404)
     res.end('not found')
@@ -399,124 +368,7 @@ export async function handleMediaGet(
   const userIdForMedia = this.getUserId(req)
   const mediaLocation = await this._resolveMediaDirs(userIdForMedia)
   if (mediaLocation.kind === 'fail') {
-    // 2026-05-16 Phase 2:remote-host 用户走 node-agent /files GET 拉远端 user
-    // volume 文件回服。其余 fail 原因(not-ready / volume-missing / 等)继续
-    // 走 _sendMediaResolveError 既有语义。
-    //
-    // 与本地分支的安全/响应头**完全对称**(Codex review 2:确保 isFileBlocked /
-    // active MIME → attachment / Cache-Control / Content-Length 都跟本地一致,
-    // 不能"远端走捷径"):
-    //   - mimeFor 用 filename(无 realpath 可言,filename 经 traversal 校验)
-    //   - 命中前查 isFileBlocked(防 `.env` 等 deny-list)
-    //   - active content 强制 attachment + filename
-    //   - Content-Length 取 buffer.length(node-agent 已校 MaxFileSize)
-    if (mediaLocation.reason === 'remote-host' && (this.deps.commercial?.openRemoteHostMedia || this.deps.commercial?.pullRemoteHostMedia)) {
-      const remoteCandidates = [
-        `${mediaLocation.uploads}/${filename}`,
-        `${mediaLocation.generated}/${filename}`,
-      ]
-      const openRemote = this.deps.commercial?.openRemoteHostMedia
-      if (openRemote) {
-        for (const remotePath of remoteCandidates) {
-          try {
-            const outcome = await openRemote({
-              hostUuid: mediaLocation.hostUuid,
-              remotePath,
-              dest: res,
-              onReady: (info) => {
-                if (isFileBlocked(remotePath)) {
-                  this.log.warn('media: remote hit blocked by sensitive deny-list', { remotePath })
-                  res.writeHead(403)
-                  res.end('access denied')
-                  return false
-                }
-                const remoteContentType = mimeFor(remotePath)
-                const remoteHeaders: Record<string, string | number> = {
-                  'Content-Type': remoteContentType,
-                  'Content-Length': info.size,
-                  'Cache-Control': 'private, max-age=3600',
-                }
-                remoteHeaders['Content-Disposition'] =
-                  `${shouldServeInline(remoteContentType) ? 'inline' : 'attachment'}; filename="${encodeURIComponent(basename(remotePath) || 'file')}"`
-                res.writeHead(200, remoteHeaders)
-                return true
-              },
-            })
-            if (outcome === 'missing') continue
-            return
-          } catch (err) {
-            this.log.error(
-              'media: remote-host pull failed',
-              { hostUuid: mediaLocation.hostUuid, remotePath, ...mediaLocation.logCtx },
-              err as Error,
-            )
-            if (!res.headersSent) this.sendError(res, 502, 'remote storage pull failed')
-            return
-          }
-        }
-        if (!res.headersSent) {
-          res.writeHead(404)
-          res.end('not found')
-        }
-        return
-      }
-      const pullRemote = this.deps.commercial?.pullRemoteHostMedia
-      if (!pullRemote) {
-        if (!res.headersSent) {
-          res.writeHead(404)
-          res.end('not found')
-        }
-        return
-      }
-      let buf: Buffer | null = null
-      let hitPath: string | null = null
-      for (const remotePath of remoteCandidates) {
-        try {
-          const result = await pullRemote({
-            hostUuid: mediaLocation.hostUuid,
-            remotePath,
-          })
-          if (result !== null) {
-            buf = result
-            hitPath = remotePath
-            break
-          }
-        } catch (err) {
-          this.log.error(
-            'media: remote-host pull failed',
-            { hostUuid: mediaLocation.hostUuid, remotePath, ...mediaLocation.logCtx },
-            err as Error,
-          )
-          this.sendError(res, 502, 'remote storage pull failed')
-          return
-        }
-      }
-      if (buf === null || hitPath === null) {
-        // Codex review #1 (Phase 2):空 Buffer(0 字节文件)是合法命中,
-        // 必须用严格 === null 判定,不能用 falsy。
-        res.writeHead(404)
-        res.end('not found')
-        return
-      }
-      if (isFileBlocked(hitPath)) {
-        this.log.warn('media: remote hit blocked by sensitive deny-list', { hitPath })
-        res.writeHead(403)
-        res.end('access denied')
-        return
-      }
-      const remoteContentType = mimeFor(hitPath)
-      const remoteHeaders: Record<string, string | number> = {
-        'Content-Type': remoteContentType,
-        'Content-Length': buf.length,
-        'Cache-Control': 'private, max-age=3600',
-      }
-      remoteHeaders['Content-Disposition'] =
-        `${shouldServeInline(remoteContentType) ? 'inline' : 'attachment'}; filename="${encodeURIComponent(basename(hitPath) || 'file')}"`
-      res.writeHead(200, remoteHeaders)
-      res.end(buf)
-      return
-    }
-    this._sendMediaResolveError(res, mediaLocation, 'media')
+    await handleMediaGetFailLocation(this, req, res, { userId: userIdForMedia, filename, mediaLocation, isFileBlocked })
     return
   }
   // Search in uploads first, then generated. Resolve via realpath so a
@@ -548,6 +400,12 @@ export async function handleMediaGet(
     } catch {}
   }
   if (!realPath) {
+    if (
+      mediaLocation.kind === 'ok' &&
+      (await tryServeCasMediaFallback(this, req, res, { userId: userIdForMedia, filename, isFileBlocked }))
+    ) {
+      return
+    }
     res.writeHead(404)
     res.end('not found')
     return
@@ -589,7 +447,7 @@ export async function handleMediaGet(
   const mediaContentType = mimeFor(realPath)
   const mediaHeaders: Record<string, string | number> = {
     'Content-Type': mediaContentType,
-    'Cache-Control': 'private, max-age=3600',
+    'Cache-Control': mediaCacheControlForFilename(filename),
   }
   mediaHeaders['Content-Disposition'] =
     `${shouldServeInline(mediaContentType) ? 'inline' : 'attachment'}; filename="${encodeURIComponent(basename(realPath) || 'file')}"`

@@ -668,6 +668,24 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	offsetStr := r.URL.Query().Get("offset")
+	lengthStr := r.URL.Query().Get("length")
+	if offsetStr != "" || lengthStr != "" {
+		offset, err1 := strconv.ParseInt(offsetStr, 10, 64)
+		length, err2 := strconv.ParseInt(lengthStr, 10, 64)
+		if err1 != nil || err2 != nil || offset < 0 || length <= 0 || offset+length > st.Size() {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", st.Size()))
+			writeErr(w, http.StatusRequestedRangeNotSatisfiable, "RANGE_INVALID", "invalid byte range")
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, st.Size()))
+		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.Copy(w, io.NewSectionReader(f, offset, length))
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(st.Size(), 10))
 	w.WriteHeader(http.StatusOK)

@@ -8,8 +8,6 @@ import type {
   AuthSession,
   MediaSignResult,
   ChatProject,
-  DeletedChatProject,
-  ProjectAsset,
   MySubscription,
 } from "../types";
 import {
@@ -25,6 +23,12 @@ type ProjectsLazyImpl = typeof import("./projectsLazyImpl").projectsLazyImpl;
 const projectsLazyProxy = createLazyApiDomain<ProjectsLazyImpl>(
   () => import("./projectsLazyImpl").then((m) => m.projectsLazyImpl),
   [
+    "createChatProject",
+    "patchChatProject",
+    "deleteChatProject",
+    "listDeletedChatProjects",
+    "restoreChatProject",
+    "searchProjectAssets",
     "listProjectAssets",
     "createProjectAsset",
     "patchProjectAsset",
@@ -52,107 +56,6 @@ export const projectsApi = {
         fetch("/api/chat-projects", { credentials: "include", headers: bearerHeaders(t) }),
       ),
     ).then((b) => b.projects || []),
-
-  createChatProject: (
-    a: AuthSession,
-    input: { name: string; instructions?: string; color?: string },
-  ): Promise<ChatProject> =>
-    jsonOrThrow<{ project: ChatProject }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/chat-projects", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(input),
-        }),
-      ),
-    ).then((b) => b.project),
-
-  patchChatProject: (
-    a: AuthSession,
-    id: string,
-    patch: {
-      name?: string;
-      instructions?: string | null;
-      color?: string | null;
-      sortOrder?: number;
-      boardProjectId?: string | null;
-      archived?: boolean;
-      pinned?: boolean;
-    },
-  ): Promise<ChatProject> =>
-    jsonOrThrow<{ project: ChatProject }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/chat-projects/${encodeURIComponent(id)}`, {
-          method: "PATCH",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(patch),
-        }),
-      ),
-    ).then((b) => b.project),
-
-  /** pausedCronJobIds: jobs the client paused before deleting; kept for a restore. */
-  deleteChatProject: (a: AuthSession, id: string, pausedCronJobIds?: string[]): Promise<void> =>
-    jsonOrThrow<{ ok: true }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/chat-projects/${encodeURIComponent(id)}`, {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t, pausedCronJobIds !== undefined),
-          ...(pausedCronJobIds !== undefined ? { body: JSON.stringify({ pausedCronJobIds }) } : {}),
-        }),
-      ),
-    ).then(() => undefined),
-
-  listDeletedChatProjects: (a: AuthSession): Promise<DeletedChatProject[]> =>
-    jsonOrThrow<{ projects: DeletedChatProject[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/chat-projects?deleted=1", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.projects || []),
-
-  restoreChatProject: (
-    a: AuthSession,
-    id: string,
-  ): Promise<{ project: ChatProject; pausedCronJobIds: string[]; relinkedSessionIds: string[] }> =>
-    jsonOrThrow<{ project: ChatProject; pausedCronJobIds?: string[]; relinkedSessionIds?: string[] }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/chat-projects/${encodeURIComponent(id)}/restore`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => ({
-      project: b.project,
-      pausedCronJobIds: b.pausedCronJobIds ?? [],
-      relinkedSessionIds: b.relinkedSessionIds ?? [],
-    })),
-
-  /**
-   * Ctrl/⌘K: search the caller's files and outputs across all projects (and
-   * ungrouped) by name/excerpt, newest first. Server caps `limit` at 50.
-   */
-  searchProjectAssets: (
-    a: AuthSession,
-    q: string,
-    opts?: { source?: "upload" | "output"; limit?: number; signal?: AbortSignal },
-  ): Promise<ProjectAsset[]> => {
-    const params = new URLSearchParams();
-    params.set("q", q);
-    if (opts?.source) params.set("source", opts.source);
-    if (opts?.limit) params.set("limit", String(opts.limit));
-    return jsonOrThrow<{ assets: ProjectAsset[] }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/project-assets?${params.toString()}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-          signal: opts?.signal,
-        }),
-      ),
-    ).then((b) => b.assets || []);
-  },
 
   async uploadFile(
     a: AuthSession,

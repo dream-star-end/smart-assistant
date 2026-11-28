@@ -312,6 +312,19 @@ function assertReleaseSessionIfIdleResult(raw: unknown): ReleaseSessionIfIdleRes
   return { status }
 }
 
+function buildEnsureLanePayload(request: RemoteLaneRequest): Record<string, unknown> {
+  return {
+    uid: request.uid,
+    containerDbId: request.containerDbId,
+    sessionKey: request.sessionKey,
+    canonicalModel: request.canonicalModel,
+    ...(request.engine !== undefined ? { engine: request.engine } : {}),
+    ...(request.allowStickyFailover === true ? { allowStickyFailover: true } : {}),
+    ...(request.requiredCapabilities !== undefined ? { requiredCapabilities: request.requiredCapabilities } : {}),
+    ...(request.systemPromptSha256 !== undefined ? { systemPromptSha256: request.systemPromptSha256 } : {}),
+  }
+}
+
 export function createRemoteRelayClient(
   options: RemoteRelayClientOptions,
 ): ExternalRemoteLaneRuntimePort {
@@ -405,17 +418,11 @@ export function createRemoteRelayClient(
       })
     },
 
-    async ensureLane(
-      request: RemoteLaneRequest & { readonly allowStickyFailover?: boolean },
-    ): Promise<RemoteExecutionBackend> {
-      const result = await callRpc<RemoteExecutionBackend>(REMOTE_RELAY_PATHS.ensureLane, {
-        uid: request.uid,
-        containerDbId: request.containerDbId,
-        sessionKey: request.sessionKey,
-        canonicalModel: request.canonicalModel,
-        ...(request.engine !== undefined ? { engine: request.engine } : {}),
-        ...(request.allowStickyFailover === true ? { allowStickyFailover: true } : {}),
-      })
+    async ensureLane(request: RemoteLaneRequest): Promise<RemoteExecutionBackend> {
+      const result = await callRpc<RemoteExecutionBackend>(
+        REMOTE_RELAY_PATHS.ensureLane,
+        buildEnsureLanePayload(request),
+      )
       if (!result || typeof result !== 'object' || Array.isArray(result)) {
         throw new Error('REMOTE_LANE_UNAVAILABLE')
       }

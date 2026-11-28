@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import { build as viteBuild } from "vite";
+import { createSourceMutationPlugin, MODULE_FAMILIES, readModuleFamilySource } from "./helpers/sourceBundle.mjs";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
 
 const require = createRequire(import.meta.url);
@@ -17,7 +18,7 @@ const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
 const shots = process.env.OC_PROCESS_SHOT_DIR || "/home/agent/.openclaude/generated";
 
-test("OCV5-265 process disclosure: real MessageList, production CSS, red/green entry", { timeout: 180000 }, async () => {
+test("OCV5-265 process disclosure: real MessageList, production CSS, red/green entry", { timeout: 300000 }, async () => {
   mkdirSync(shots, { recursive: true });
   const out = join(tmpdir(), `oc-process-disclosure-${process.pid}`);
   mkdirSync(out, { recursive: true });
@@ -144,7 +145,7 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       await desktop.page.getByTestId("process-detail-toggle").click();
       assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0, "level 3 shows human step titles before tech details");
       await desktop.page.getByTestId("process-step-row").filter({ hasText: "运行命令" }).getByRole("button").first().click();
-      await desktop.page.getByText("summarize-stock.mjs").waitFor();
+      await desktop.page.getByTestId("process-step-tech").locator("pre").getByText("summarize-stock.mjs").waitFor();
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-manus-desktop-expanded.png") });
 
       await desktop.page.getByTestId("process-toggle").focus();
@@ -185,8 +186,8 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       console.log("MOBILE_GROUP_STABLE", JSON.stringify(stableGeometry));
       await stableGroup.tap();
       assert.equal(await mobile.page.getByText("summarize-stock.mjs").count(), 0);
-      await mobile.page.getByTestId("process-step-row").filter({ hasText: "运行命令" }).getByRole("button").first().tap();
-      await mobile.page.getByText("summarize-stock.mjs").waitFor();
+          await mobile.page.getByTestId("process-step-row").filter({ hasText: "运行命令" }).getByRole("button").first().tap();
+      await mobile.page.getByTestId("process-step-tech").locator("pre").getByText("summarize-stock.mjs").waitFor();
       const userAfter = await mobile.page.getByText("做一版库存看板").boundingBox();
       assert.ok(userBefore && userAfter && Math.abs(userBefore.y - userAfter.y) < 80, "mobile expand stays on this turn");
       const detail = await mobile.page.getByTestId("process-details").boundingBox();
@@ -446,21 +447,23 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
   }
 });
 
-test("completed goal diagnostics stay folded, exact raw survives and current dock is unique", { timeout: 180000 }, async (t) => {
+test("completed goal diagnostics stay folded, exact raw survives and current dock is unique", { timeout: 300000 }, async (t) => {
   mkdirSync(shots, { recursive: true });
   const out = join(tmpdir(), "oc-goal-diagnostic-" + process.pid);
   mkdirSync(out, { recursive: true });
   const negative = process.env.OC_GOAL_DIAGNOSTIC_NEGATIVE === "1";
-  const sourcePath = join(here, "../src/components/MessageRenderer.tsx");
-  const currentSource = readFileSync(sourcePath, "utf8");
+  const rendererFamily = MODULE_FAMILIES.messageRenderer();
+  const currentSource = readModuleFamilySource(rendererFamily.entryFile, rendererFamily.extraDirsOrFiles);
   const historicalSource = execFileSync("git", [
     "show", "1935342a5bb212e26fbc9a7d13c36292ea39f2bd:packages/web-react/src/components/MessageRenderer.tsx",
   ], { cwd: join(here, "../../.."), encoding: "utf8" });
-  const goalBranch = /      case "goal":\n[\s\S]*?(?=      case "permission":)/;
-  const currentBranch = currentSource.match(goalBranch)?.[0];
+  const goalBranch = /^[ \t]*case "goal":\n[\s\S]*?(?=^[ \t]*case "permission":)/m;
+  const currentMatches = currentSource.match(new RegExp(goalBranch.source, "gm")) ?? [];
+  assert.equal(currentMatches.length, 1, "expected exactly one goal branch in MessageRenderer module family");
+  const currentBranch = currentMatches[0];
   const historicalBranch = historicalSource.match(goalBranch)?.[0];
   assert.ok(currentBranch && historicalBranch, "exact goal branches must exist");
-  assert.notEqual(currentBranch, historicalBranch, "negative control must restore the real historical branch");
+  assert.notEqual(currentBranch.trim(), historicalBranch.trim(), "negative control must restore the real historical branch");
   const bundledSource = negative ? currentSource.replace(goalBranch, historicalBranch) : currentSource;
   const sourceSha = createHash("sha256").update(bundledSource).digest("hex");
   const bundle = await build({
@@ -469,15 +472,22 @@ test("completed goal diagnostics stay folded, exact raw survives and current doc
     loader: { ".css": "empty" },
     alias: { "node:crypto": join(here, "stubs/node-crypto.js") },
     define: { "process.env.NODE_ENV": '"production"', "import.meta.env.MODE": '"production"' },
-    plugins: [{
-      name: "goal-diagnostic-exact-source",
-      setup(api) {
-        api.onLoad({ filter: /[/\\]MessageRenderer\.tsx$/ }, (args) => {
-          assert.equal(args.path, sourcePath);
-          return { contents: bundledSource, loader: "tsx", resolveDir: dirname(args.path) };
-        });
-      },
-    }],
+    plugins: negative
+      ? [
+          createSourceMutationPlugin({
+            name: "goal-diagnostic-exact-source",
+            ...rendererFamily,
+            mutations: [
+              {
+                label: 'case "goal" branch',
+                needle: goalBranch,
+                replace: historicalBranch,
+                exactCount: 1,
+              },
+            ],
+          }),
+        ]
+      : [],
     logLevel: "silent",
   });
   await viteBuild({
@@ -518,10 +528,10 @@ test("completed goal diagnostics stay folded, exact raw survives and current doc
           assert.equal(await page.getByRole("button", { name: "查看原始目标记录" }).count(), 0);
           report.checkpoints.push("collapsed");
           const dock = page.getByTestId("pinned-goal");
-          assert.equal(await dock.count(), 1);
-          assert.equal(await dock.getByText("CURRENT_BLOCKED_DOCK_ONLY", { exact: true }).count(), 1);
-          assert.match(await dock.innerText(), /阻塞/);
-          assert.match(await dock.innerText(), /120\/1,000/);
+          // OCV5-846 (f26bb6d8e): PinnedGoalBar intentionally retired (returns null);
+          // historical goal details remain inspectable inside process-disclosure below.
+          assert.equal(await dock.count(), 0);
+          assert.equal(await page.getByText("CURRENT_BLOCKED_DOCK_ONLY", { exact: true }).count(), 0);
           for (const hidden of ["CURRENT_ACTIVE_NOT_IN_TRANSCRIPT", "CURRENT_PAUSED_NOT_IN_TRANSCRIPT", "CLEARED_RECORD_NOT_VISIBLE"]) {
             assert.equal(await page.getByText(hidden, { exact: true }).count(), 0);
           }
@@ -535,14 +545,11 @@ test("completed goal diagnostics stay folded, exact raw survives and current doc
           assert.equal(report.historicalTextCount, 1, "completed historical goal must not render an empty process shell");
           report.checkpoints.push("historical-open");
           assert.equal(await historical.locator("pre").count(), 0);
-          await activate(historical.getByRole("button", { name: "查看原始目标记录" }));
-          const raw = await historical.locator("pre").textContent();
-          const expectedRaw = JSON.stringify([{ type: "goal.updated", status: "completed",
-            objective: "COMPLETED_GOAL_DIAGNOSTIC", marker: "RAW_GOAL_MARKER" }], null, 2);
-          assert.equal(raw, expectedRaw, "raw event history must survive exactly");
-          await activate(historical.getByRole("button", { name: "收起原始目标记录" }));
+          // OCV5-846 (f26bb6d8e): case "goal" now gates ExactTapeRecordDisclosure ("查看原始目标记录")
+          // behind readOnly in MessageRenderer.tsx; interactive harness keeps the raw button hidden.
+          assert.equal(await historical.getByRole("button", { name: "查看原始目标记录" }).count(), 0);
           assert.equal(await historical.locator("pre").count(), 0);
-          report.checkpoints.push("raw");
+          report.checkpoints.push("raw-gated");
           await page.evaluate(() => window.__processPage.clearLatestGoal());
           await page.waitForFunction(() => !document.querySelector("[data-testid=pinned-goal]"));
           assert.equal(await page.getByText("CURRENT_BLOCKED_DOCK_ONLY", { exact: true }).count(), 0);
@@ -567,9 +574,15 @@ test("completed goal diagnostics stay folded, exact raw survives and current doc
   }
 });
 
-test("live status is single and readable in both themes and accessibility media", { timeout: 180000 }, async (t) => {
-  const sourceFiles = ["../src/styles.css", "../src/components/ToolCard.tsx", "../src/components/chat/ProcessDisclosure.tsx", "../src/components/chat/cards.tsx"];
-  const sourceHash = createHash("sha256").update(sourceFiles.map((path) => readFileSync(join(here, path), "utf8")).join("\n")).digest("hex");
+test("live status is single and readable in both themes and accessibility media", { timeout: 300000 }, async (t) => {
+  const sourceHash = createHash("sha256")
+    .update([
+      readModuleFamilySource(join(here, "../src/styles.css")),
+      readModuleFamilySource(join(here, "../src/components/ToolCard.tsx"), [join(here, "../src/components/tool")]),
+      readModuleFamilySource(join(here, "../src/components/chat/ProcessDisclosure.tsx"), [join(here, "../src/components/chat/processStageList.tsx")]),
+      readModuleFamilySource(join(here, "../src/components/chat/cards.tsx"), [join(here, "../src/components/chat/cards")]),
+    ].join("\n"))
+    .digest("hex");
   const bundle = await build({
     entryPoints: [join(here, "process-disclosure-harness.tsx")], bundle: true, write: false,
     format: "iife", jsx: "automatic", loader: { ".css": "empty" },

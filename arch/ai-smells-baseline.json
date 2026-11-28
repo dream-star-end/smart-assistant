@@ -9,11 +9,11 @@
     "lintSuppress"
   ],
   "totals": {
-    "emptyCatch": 1593,
-    "typeEscape": 911,
-    "syncIo": 2269,
-    "lintSuppress": 177,
-    "all": 4950
+    "emptyCatch": 1404,
+    "typeEscape": 894,
+    "syncIo": 2251,
+    "lintSuppress": 165,
+    "all": 4714
   },
   "files": {
     "packages/channels/feishu/src/client.ts": {
@@ -485,10 +485,10 @@
       "lintSuppress": 0
     },
     "packages/commercial/src/agent-sandbox/v3supervisor.ts": {
-      "emptyCatch": 6,
-      "typeEscape": 1,
-      "syncIo": 14,
-      "lintSuppress": 9
+      "emptyCatch": 0,
+      "typeEscape": 0,
+      "syncIo": 4,
+      "lintSuppress": 0
     },
     "packages/commercial/src/agent-sandbox/v3volumeGc.ts": {
       "emptyCatch": 3,
@@ -844,12 +844,6 @@
       "syncIo": 0,
       "lintSuppress": 0
     },
-    "packages/commercial/src/db/pgSessionsBackend.ts": {
-      "emptyCatch": 18,
-      "typeEscape": 0,
-      "syncIo": 0,
-      "lintSuppress": 0
-    },
     "packages/commercial/src/db/queries.ts": {
       "emptyCatch": 1,
       "typeEscape": 1,
@@ -870,12 +864,6 @@
     },
     "packages/commercial/src/db/sessionSnapshot.ts": {
       "emptyCatch": 2,
-      "typeEscape": 0,
-      "syncIo": 0,
-      "lintSuppress": 0
-    },
-    "packages/commercial/src/db/threeLayerStateStore.ts": {
-      "emptyCatch": 1,
       "typeEscape": 0,
       "syncIo": 0,
       "lintSuppress": 0
@@ -1067,7 +1055,7 @@
       "lintSuppress": 0
     },
     "packages/commercial/src/http/handlers.ts": {
-      "emptyCatch": 1,
+      "emptyCatch": 0,
       "typeEscape": 1,
       "syncIo": 0,
       "lintSuppress": 0
@@ -1081,12 +1069,6 @@
     "packages/commercial/src/http/internalCodexTokenRefresh.ts": {
       "emptyCatch": 2,
       "typeEscape": 0,
-      "syncIo": 0,
-      "lintSuppress": 0
-    },
-    "packages/commercial/src/http/internalServerAuthored.ts": {
-      "emptyCatch": 1,
-      "typeEscape": 1,
       "syncIo": 0,
       "lintSuppress": 0
     },
@@ -1385,10 +1367,10 @@
       "lintSuppress": 1
     },
     "packages/commercial/src/index.ts": {
-      "emptyCatch": 10,
+      "emptyCatch": 4,
       "typeEscape": 1,
       "syncIo": 2,
-      "lintSuppress": 3
+      "lintSuppress": 1
     },
     "packages/commercial/src/literatureProxy.ts": {
       "emptyCatch": 1,
@@ -2050,12 +2032,6 @@
       "syncIo": 0,
       "lintSuppress": 0
     },
-    "packages/commercial/src/ws/userChatBridge.ts": {
-      "emptyCatch": 92,
-      "typeEscape": 6,
-      "syncIo": 0,
-      "lintSuppress": 0
-    },
     "packages/commercial/src/ws/userChatBridgeLocalFallbackTransport.ts": {
       "emptyCatch": 3,
       "typeEscape": 0,
@@ -2381,7 +2357,7 @@
       "lintSuppress": 0
     },
     "packages/gateway/src/delegateRuntime.ts": {
-      "emptyCatch": 3,
+      "emptyCatch": 2,
       "typeEscape": 1,
       "syncIo": 1,
       "lintSuppress": 0
@@ -2405,9 +2381,9 @@
       "lintSuppress": 0
     },
     "packages/gateway/src/engine/antigravityAdapter.ts": {
-      "emptyCatch": 4,
+      "emptyCatch": 3,
       "typeEscape": 0,
-      "syncIo": 6,
+      "syncIo": 3,
       "lintSuppress": 0
     },
     "packages/gateway/src/engine/antigravityNativeTrajectory.ts": {
@@ -2668,16 +2644,10 @@
       "syncIo": 0,
       "lintSuppress": 0
     },
-    "packages/gateway/src/execEnv/containerLinkBrokerTransport.ts": {
-      "emptyCatch": 0,
-      "typeEscape": 1,
-      "syncIo": 0,
-      "lintSuppress": 0
-    },
     "packages/gateway/src/execEnv/jobRegistry.ts": {
-      "emptyCatch": 4,
+      "emptyCatch": 0,
       "typeEscape": 0,
-      "syncIo": 3,
+      "syncIo": 2,
       "lintSuppress": 0
     },
     "packages/gateway/src/execEnv/toolBroker.ts": {
@@ -3185,9 +3155,9 @@
       "lintSuppress": 0
     },
     "packages/gateway/src/sessionBgCommands.ts": {
-      "emptyCatch": 3,
+      "emptyCatch": 0,
       "typeEscape": 0,
-      "syncIo": 7,
+      "syncIo": 6,
       "lintSuppress": 0
     },
     "packages/gateway/src/sessionCheckpointStore.ts": {
@@ -3215,16 +3185,16 @@
       "lintSuppress": 0
     },
     "packages/gateway/src/sessionSubmit.ts": {
-      "emptyCatch": 1,
-      "typeEscape": 8,
+      "emptyCatch": 0,
+      "typeEscape": 7,
       "syncIo": 0,
       "lintSuppress": 0
     },
     "packages/gateway/src/sessionTurnRunner.ts": {
-      "emptyCatch": 4,
-      "typeEscape": 4,
+      "emptyCatch": 3,
+      "typeEscape": 2,
       "syncIo": 3,
-      "lintSuppress": 1
+      "lintSuppress": 0
     },
     "packages/gateway/src/skillEvalGen.ts": {
       "emptyCatch": 2,
@@ -3545,9 +3515,9 @@
       "lintSuppress": 0
     },
     "packages/mcp-memory/src/ocBashJobManager.ts": {
-      "emptyCatch": 8,
+      "emptyCatch": 0,
       "typeEscape": 0,
-      "syncIo": 9,
+      "syncIo": 6,
       "lintSuppress": 0
     },
     "packages/mcp-memory/src/ocMemoryCli.ts": {
@@ -3772,12 +3742,6 @@
       "syncIo": 0,
       "lintSuppress": 0
     },
-    "packages/storage/src/sessionsDb.ts": {
-      "emptyCatch": 28,
-      "typeEscape": 0,
-      "syncIo": 0,
-      "lintSuppress": 0
-    },
     "packages/storage/src/sessionsDbProjects.ts": {
       "emptyCatch": 0,
       "typeEscape": 0,
@@ -3824,12 +3788,6 @@
       "emptyCatch": 0,
       "typeEscape": 0,
       "syncIo": 1,
-      "lintSuppress": 0
-    },
-    "packages/storage/src/wechatBindings.ts": {
-      "emptyCatch": 2,
-      "typeEscape": 0,
-      "syncIo": 0,
       "lintSuppress": 0
     },
     "packages/web-react/src/App.tsx": {
@@ -4684,12 +4642,6 @@
       "syncIo": 0,
       "lintSuppress": 0
     },
-    "packages/web-react/src/lib/chat/reducer.ts": {
-      "emptyCatch": 4,
-      "typeEscape": 1,
-      "syncIo": 0,
-      "lintSuppress": 0
-    },
     "packages/web-react/src/lib/chat/sessionBackgroundTasks.ts": {
       "emptyCatch": 1,
       "typeEscape": 0,
@@ -4699,12 +4651,6 @@
     "packages/web-react/src/lib/chat/shareCard.ts": {
       "emptyCatch": 1,
       "typeEscape": 0,
-      "syncIo": 0,
-      "lintSuppress": 0
-    },
-    "packages/web-react/src/lib/chat/socket.ts": {
-      "emptyCatch": 10,
-      "typeEscape": 4,
       "syncIo": 0,
       "lintSuppress": 0
     },
@@ -4800,12 +4746,6 @@
     },
     "packages/web-react/src/lib/sessionServiceTier.ts": {
       "emptyCatch": 2,
-      "typeEscape": 0,
-      "syncIo": 0,
-      "lintSuppress": 0
-    },
-    "packages/web-react/src/lib/sessionSwarmMode.ts": {
-      "emptyCatch": 1,
       "typeEscape": 0,
       "syncIo": 0,
       "lintSuppress": 0

@@ -9,14 +9,14 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { readPgSessionsBackendSource } from './helpers/pgSessionsSource.js'
+import { readSqliteSessionsSource } from './helpers/sqliteSessionsSource.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const migration = join(here, '../db/migrations/0233_client_session_list_archived_at.sql')
-const backendSrc = readFileSync(join(here, '../db/pgSessionsBackend.ts'), 'utf8')
-// sessionsDb.ts plus the modules split out of it (OCV5-485): the SQLite side of the parity check
-const sqliteSrc = ['sessionsDb.ts', 'sessionsDbProjects.ts', 'sessionsDbSidebar.ts']
-  .map((f) => readFileSync(join(here, '../../../storage/src', f), 'utf8'))
-  .join('\n')
+const backendSrc = readPgSessionsBackendSource()
+// sessionsDb.ts plus the modules split out of it (OCV5-485 / OCV5-928): the SQLite side of the parity check
+const sqliteSrc = readSqliteSessionsSource()
 const metadata = JSON.parse(
   readFileSync(join(here, '../../../../deploy/v5/release-metadata.json'), 'utf8'),
 ) as { requiredMigrations: string[] }
@@ -41,16 +41,20 @@ describe('session sidebar PG/SQLite 契约对齐', () => {
       'listClientSessions',
       'patchClientSessionMeta',
     ]) {
-      assert.ok(backendSrc.includes(`async ${method}(`), `PG 缺 ${method}`)
+      assert.match(
+        backendSrc,
+        new RegExp(`(?:async\\s+${method}\\s*\\(|\\b${method}\\s*:\\s*(?:async\\s*)?\\()`),
+        `PG 缺 ${method}`,
+      )
       assert.ok(sqliteSrc.includes(`${method}:`), `sqliteBackend 缺 ${method}`)
     }
   })
 
   test('list 默认排除归档,SQL 侧截 last preview,不 N+1 拉 messages blob', () => {
-    const pgList = backendSrc.slice(
-      backendSrc.indexOf('async listClientSessions'),
-      backendSrc.indexOf('async listClientSessions') + 4500,
-    )
+    const pgListStart = backendSrc.indexOf('function buildListClientSessionsSql(')
+    const pgListEnd = backendSrc.indexOf('function projectFilterSql(', pgListStart + 1)
+    assert.ok(pgListStart >= 0 && pgListEnd > pgListStart, 'PG 缺 buildListClientSessionsSql/listClientSessionsImpl')
+    const pgList = backendSrc.slice(pgListStart, pgListEnd)
     const sqliteList = sqliteSrc.slice(
       sqliteSrc.indexOf('async function _sqliteListClientSessions'),
       sqliteSrc.indexOf('async function _sqliteListClientSessions') + 3500,

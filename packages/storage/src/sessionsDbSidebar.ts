@@ -5,14 +5,16 @@
  * imports these back and re-exports its former exports, so its import surface is unchanged.
  */
 import type Database from 'better-sqlite3'
+import { getSessionsDb } from './sessions/sqliteHandle.js'
 import {
-  toPlainSessionText,
-  UNREAD_OUTCOME_SQL,
+  escapeLikePattern,
   LAST_D_TERMINAL_MS_SQL,
   LAST_READ_AT_MS_SQL,
-  getSessionsDb,
   SESSION_SEARCH_JSON_EXPAND_MAX_BYTES,
-} from './sessionsDb.js'
+  toPlainSessionText,
+  UNREAD_OUTCOME_SQL,
+} from './sessions/types.js'
+export { escapeLikePattern }
 
 export const SESSION_SEARCH_LIMIT_DEFAULT = 30
 
@@ -111,11 +113,6 @@ export function buildSearchSnippet(haystack: string, q: string): string {
   if (start > 0) slice = `…${slice}`
   if (end < plain.length) slice = `${slice}…`
   return slice.length > SEARCH_SNIPPET_MAX ? slice.slice(0, SEARCH_SNIPPET_MAX) : slice
-}
-
-/** LIKE/ILIKE 通配符转义;调用方配合 ESCAPE '\'。 */
-export function escapeLikePattern(q: string): string {
-  return q.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
 }
 
 function parseExpectedSessions(raw: unknown): BatchSessionCasRow[] | { invalid: true } | undefined {

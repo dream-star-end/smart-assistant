@@ -11,11 +11,11 @@ import {
   CC5_TEST_UID_ENV,
   type Cc5PolicyEnvironment,
   type RemoteExecutionBackend,
+  type RequiredTurnCapabilities,
   canUseCc5TestModel,
   isRemoteBackendAuthority,
 } from '@openclaude/protocol'
 import {
-  placeRemoteLane,
   recordRemoteLaneState,
   recordRemoteNativeThread,
   recordRemoteStartAttempt,
@@ -26,18 +26,12 @@ import {
   type RemoteReleaseDrainCoordinator,
   getMasterRemoteReleaseDrainCoordinator,
   isReservedVerificationSessionKey,
-  placeRemoteDriverLane,
   recordRemoteDriverLaneState,
   recordRemoteDriverNativeSession,
   recordRemoteDriverStartAttempt,
-  selectSelfhostRemoteDriverViaUnifiedRouter,
   startRemoteReleaseDrainSocketServer,
 } from '../account-pool/remotePool/index.js'
-
-import {
-  reconcileRemoteChat,
-  reconcileStaleContainerLanes,
-} from '../account-pool/remoteLaneRecovery.js'
+import { placeSelfhostRemoteLaneWithRetry } from '../account-pool/remotePool/sharedLanePlacementRuntime.js'
 import { getPool } from '../db/index.js'
 import {
   DEFAULT_REMOTE_RELAY_ACTIVE_SOCKET,
@@ -46,48 +40,10 @@ import {
 } from './remoteRelayClient.js'
 
 const BASE_ROOT = '/run/oc-cc5-t1555u'
-
-/**
- * Model-level v4 cutover selector (Design §5.1 / §7):
- * - Sticky v4 chats stay pinned to their v4 `driver_id`.
- * - Once at least one v4 profile for `(canonicalModel, engine)` has been commissioned
- *   (`execution_ready = TRUE` or `verified_fingerprint IS NOT NULL`), new chats for that model
- *   route exclusively to v4 and NEVER auto-downgrade to legacy on drift (`REMOTE_DRIVER_REVERIFY_REQUIRED`).
- * - Uncommissioned staging rows (`execution_ready = FALSE AND verified_fingerprint IS NULL`) do NOT
- *   hijack traffic while a healthy legacy (`driver_id IS NULL`) offer exists for the same model.
- * - During cutover, `drainGate` closes new-session admission; warm resident lanes' subsequent turns
- *   are gated by `cutover_wait_for_user_idle` prior to master restart.
- */
-async function resolveDriverV4Selection(
-  pool: ReturnType<typeof getPool>,
-  request: {
-    uid: number
-    sessionKey: string
-    canonicalModel: string
-    engine?: 'ccb' | 'codex' | 'antigravity'
-    allowStickyFailover?: boolean
-  },
-): Promise<string | null> {
-  const selected = await selectSelfhostRemoteDriverViaUnifiedRouter(pool, {
-    selfhost: true,
-    uid: request.uid,
-    sessionKey: request.sessionKey,
-    canonicalModel: request.canonicalModel,
-    engine: request.engine,
-    ...(request.allowStickyFailover === true ? { allowStickyFailover: true } : {}),
-  })
-  if (selected.bindingStatus === 'read_error') {
-    console.warn('[selfhost] logical model binding read error during unified router selection', {
-      canonicalModel: request.canonicalModel,
-      sessionKey: request.sessionKey,
-      error: selected.bindingReadError ?? 'unknown',
-      fallbackSource: selected.source,
-      selectedDriverId: selected.driverId,
-      selectedProfileId: selected.selectedProfileId ?? null,
-    })
-  }
-  return selected.driverId
-}
+const NON_DEFAULT_LANE_ENGINES: ReadonlyMap<string, 'codex' | 'antigravity'> = new Map([
+  ['codex', 'codex'],
+  ['antigravity', 'antigravity'],
+])
 
 export const DEFAULT_REMOTE_RELAY_STATE_FILE =
   '/var/lib/openclaude-v5-selfhost/remote-relay-state.json'
@@ -312,66 +268,6 @@ export function createMasterCc5Runtime(
         socketPath: drainSockEnv || DEFAULT_REMOTE_V4_DRAIN_SOCKET,
       })
     }
-    const runPlaceOnce = async (request: {
-      engine?: 'ccb' | 'codex' | 'antigravity'
-      uid: number
-      containerDbId: string
-      dockerId: string
-      sessionKey: string
-      canonicalModel: string
-      allowStickyFailover?: boolean
-    }) => {
-      if (isReservedVerificationSessionKey(request.sessionKey)) {
-        throw new Error('REMOTE_SESSION_KEY_RESERVED')
-      }
-      drainGate.assertAdmissionOpen()
-      const pool = activePool()
-      const driverId = await resolveDriverV4Selection(pool, request)
-      if (driverId) {
-        const v4 = await placeRemoteDriverLane(
-          {
-            uid: request.uid,
-            containerDbId: request.containerDbId,
-            dockerId: request.dockerId,
-            sessionKey: request.sessionKey,
-            canonicalModel: request.canonicalModel,
-            driverId,
-          },
-          {
-            pool,
-            drainGate,
-            ...(fixture.v4PlacementOptions ?? {}),
-            ...(request.allowStickyFailover === true ? { allowStickyFailover: true } : {}),
-          },
-        )
-        return {
-          target: v4.sshTarget,
-          taskRoot: v4.spec.manifest.root,
-          operationId: v4.binding.operationId,
-          runId: v4.binding.runId,
-          provisionPacket: Buffer.alloc(0),
-          profileId: v4.profileUuid,
-          generation: v4.generation,
-          v4: {
-            binding: v4.binding,
-            spec: v4.spec,
-            sshTarget: v4.sshTarget,
-          },
-        }
-      }
-      if (request.engine === 'antigravity') {
-        throw new Error('REMOTE_LANE_UNAVAILABLE')
-      }
-      await input.legacyRetirementGate?.assertLegacyPlacementAllowedAsync()
-      return placeRemoteLane(
-        {
-          ...request,
-          engine: request.engine,
-        },
-        { controllerPath, pool },
-      )
-    }
-
     return (fixture.create ?? createRemoteLaneRuntime)({
       selfhost: true,
       env: input.env,
@@ -382,22 +278,20 @@ export function createMasterCc5Runtime(
         evidenceRoot: fixture.evidenceRoot ?? '/var/lib/openclaude/remote-native',
       }),
       hooks: {
-        place: async (request) => {
-          try {
-            return await runPlaceOnce(request)
-          } catch (error) {
-            const code = error instanceof Error ? error.message : ''
-            const pool = activePool()
-            if (code === 'REMOTE_LANE_STOP_UNPROVEN')
-              await reconcileRemoteChat(pool, request.uid, request.sessionKey)
-            else if (
-              code !== 'REMOTE_LANE_CAPACITY_EXHAUSTED' ||
-              !(await reconcileStaleContainerLanes(pool, request.uid, request.dockerId))
-            )
-              throw error
-            return runPlaceOnce(request)
-          }
-        },
+        place: (request) =>
+          placeSelfhostRemoteLaneWithRetry(request, {
+            getPool: activePool,
+            drainGate,
+            controllerPath,
+            legacyRetirementGate: input.legacyRetirementGate,
+            v4PlacementOptions: fixture.v4PlacementOptions,
+            onBindingReadWarning: (meta) => {
+              console.warn(
+                '[selfhost] logical model binding read error during unified router selection',
+                meta,
+              )
+            },
+          }),
         onState: (operationId, state, generation, isV4) =>
           isV4
             ? recordRemoteDriverLaneState(operationId, generation!, state, activePool())
@@ -429,6 +323,8 @@ export async function selectMasterCc5Backend(
     engine: string
     placement: 'local' | 'remote_pool'
     allowStickyFailover?: boolean
+    requiredCapabilities?: RequiredTurnCapabilities
+    systemPromptSha256?: string
   },
   selfhost: boolean,
   env: Cc5PolicyEnvironment,
@@ -437,16 +333,17 @@ export async function selectMasterCc5Backend(
     throw new Error('REMOTE_SESSION_KEY_RESERVED')
   }
   if (input.placement !== 'remote_pool') return undefined
+  const isSupportedRemoteEngine =
+    input.engine === 'ccb' || input.engine === 'codex' || input.engine === 'antigravity'
   if (
     !selfhost ||
     !runtime ||
-    !['ccb', 'codex', 'antigravity'].includes(input.engine) ||
+    !isSupportedRemoteEngine ||
     !canUseCc5TestModel(String(input.uid), env)
   ) {
     throw new Error('REMOTE_LANE_UNAVAILABLE')
   }
-  const laneEngine: 'codex' | 'antigravity' | undefined =
-    input.engine === 'codex' || input.engine === 'antigravity' ? input.engine : undefined
+  const laneEngine = NON_DEFAULT_LANE_ENGINES.get(input.engine)
   const laneRequest = {
     uid: input.uid,
     containerDbId: String(input.containerId),
@@ -454,6 +351,12 @@ export async function selectMasterCc5Backend(
     canonicalModel: input.canonicalModel,
     ...(laneEngine ? { engine: laneEngine } : {}),
     ...(input.allowStickyFailover === true ? { allowStickyFailover: true } : {}),
+    ...(input.requiredCapabilities !== undefined
+      ? { requiredCapabilities: input.requiredCapabilities }
+      : {}),
+    ...(input.systemPromptSha256 !== undefined
+      ? { systemPromptSha256: input.systemPromptSha256 }
+      : {}),
   }
   const backend = await runtime.ensureLane(laneRequest)
   if (

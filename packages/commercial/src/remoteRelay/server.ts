@@ -23,6 +23,7 @@ import type {
   RemoteLaneRequest,
   RemoteLaneRuntimePort,
 } from '@openclaude/gateway/cc5-container-runtime'
+import type { RequiredTurnCapabilities } from '@openclaude/protocol'
 import type { RemoteReleaseDrainCoordinator } from '../account-pool/remotePool/drainGate.js'
 import type { RemoteRelayPeerClient } from '../agent-sandbox/remoteRelayClient.js'
 import {
@@ -36,6 +37,7 @@ import {
   type RemoteRelayRuntimeState,
   type RemoteRelaySlot,
   httpStatusForRpcError,
+  parseRelayRequiredTurnCapabilities,
   serializeRpcError,
   verifyRelaySecret,
 } from './protocol.js'
@@ -173,6 +175,38 @@ function isHex64(v: unknown): v is string {
 
 function isNonEmptyStr(v: unknown, maxLen: number): v is string {
   return typeof v === 'string' && v.length > 0 && v.length <= maxLen
+}
+
+function parseEnsureLaneRequestBody(body: Record<string, unknown>): RemoteLaneRequest {
+  let requiredCapabilities: RequiredTurnCapabilities | undefined
+  try {
+    requiredCapabilities = parseRelayRequiredTurnCapabilities(
+      body.requiredCapabilities,
+    ) as RequiredTurnCapabilities | undefined
+  } catch {
+    throw new RequestBodyError(400, 'INVALID_REQUEST')
+  }
+  const validFields =
+    isPositiveInt(body.uid) &&
+    isPositiveIdStr(body.containerDbId) &&
+    isNonEmptyStr(body.sessionKey, 512) &&
+    isNonEmptyStr(body.canonicalModel, 128) &&
+    (body.engine === undefined || (typeof body.engine === 'string' && VALID_LANE_ENGINES.has(body.engine))) &&
+    (body.allowStickyFailover === undefined || typeof body.allowStickyFailover === 'boolean') &&
+    (body.systemPromptSha256 === undefined || isHex64(body.systemPromptSha256))
+  if (!validFields) {
+    throw new RequestBodyError(400, 'INVALID_REQUEST')
+  }
+  return {
+    uid: body.uid as number,
+    containerDbId: body.containerDbId as string,
+    sessionKey: body.sessionKey as string,
+    canonicalModel: body.canonicalModel as string,
+    ...(body.engine !== undefined ? { engine: body.engine as 'ccb' | 'codex' | 'antigravity' } : {}),
+    ...(body.allowStickyFailover === true ? { allowStickyFailover: true } : {}),
+    ...(requiredCapabilities !== undefined ? { requiredCapabilities } : {}),
+    ...(body.systemPromptSha256 !== undefined ? { systemPromptSha256: body.systemPromptSha256 as string } : {}),
+  }
 }
 
 function parsePreparedHandle(raw: unknown): Cc5PreparedContainer {
@@ -525,32 +559,10 @@ export async function createRemoteRelayRpcServer(
         }
 
         if (path === REMOTE_RELAY_PATHS.ensureLane) {
-          if (
-            !isPositiveInt(body.uid) ||
-            !isPositiveIdStr(body.containerDbId) ||
-            !isNonEmptyStr(body.sessionKey, 512) ||
-            !isNonEmptyStr(body.canonicalModel, 128) ||
-            (body.engine !== undefined &&
-              (typeof body.engine !== 'string' || !VALID_LANE_ENGINES.has(body.engine))) ||
-            (body.allowStickyFailover !== undefined &&
-              typeof body.allowStickyFailover !== 'boolean')
-          ) {
-            throw new RequestBodyError(400, 'INVALID_REQUEST')
-          }
+          const laneReq = parseEnsureLaneRequestBody(body)
           if (isDraining()) {
-            const err = serializeRpcError(new Error('REMOTE_POOL_DRAINING_RETRY_LATER'))
-            sendJson(res, 503, { ok: false, error: err })
+            sendJson(res, 503, { ok: false, error: serializeRpcError(new Error('REMOTE_POOL_DRAINING_RETRY_LATER')) })
             return
-          }
-          const laneReq: RemoteLaneRequest & { readonly allowStickyFailover?: boolean } = {
-            uid: body.uid,
-            containerDbId: body.containerDbId,
-            sessionKey: body.sessionKey,
-            canonicalModel: body.canonicalModel,
-            ...(body.engine !== undefined
-              ? { engine: body.engine as 'ccb' | 'codex' | 'antigravity' }
-              : {}),
-            ...(body.allowStickyFailover === true ? { allowStickyFailover: true } : {}),
           }
           const backend = await runtime.ensureLane(laneReq)
           sendJson(res, 200, { ok: true, result: backend })

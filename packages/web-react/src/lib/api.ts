@@ -1,4 +1,3 @@
-import type {ModelSwitchCostRequest,ModelSwitchCostQuote} from '@openclaude/protocol/browser';
 export interface WorkspaceDraftHint {
   viewId: string
   revision: number
@@ -10,8 +9,6 @@ export interface WorkspaceDraftHint {
 }
 
 import type {
-  AgentCancelResult,
-  AgentOpenResult,
   AgentStatus,
   AuthSession,
   LoginResult,
@@ -20,27 +17,20 @@ import type {
   LockedPublicModel,
   PublicModel,
   PatchSessionMetaInput,
-  SessionBatchInput,
-  SessionBatchResult,
   SessionListPage,
   SessionListQuery,
-  SessionSearchResponse,
   PutSessionInput,
   PutSessionResult,
   RefreshOutcome,
-  RegisterResult,
-  SessionArchivePage,
   SessionDetail,
   DurableLiveFramePage,
   SessionMeta,
-  SessionTimelinePage,
   TapeRecordPayload,
   User,
   VerifyEmailResult,
 } from "./types";
 import { assertResolvedIdentity, captureIdentityAttempt, resolveIdentity, type ResolvedIdentity } from './resolvedIdentity';
 import type { ContainerPreviewViewport } from "@openclaude/protocol/containerPreview";
-import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import {
   type RefreshSurface,
   refreshStates,
@@ -635,35 +625,34 @@ const secondaryAccountApiProxy = createLazyApiDomain<SecondaryAccountApiImpl>(
     "createChatGptProxyCredential",
     "revokeChatGptProxyCredential",
     "confirmDesktopEnroll",
+    "register",
+    "resendVerification",
+    "checkVerification",
+    "requestPasswordReset",
+    "confirmPasswordReset",
+    "openAgent",
+    "agentCancel",
+    "searchSessions",
+    "batchSessions",
+    "markAllSessionsRead",
+    "getLiveFramePayload",
+    "getSessionGoal",
+    "setSessionGoal",
+    "transitionSessionGoal",
+    "getSessionArchive",
+    "getSessionTimelinePage",
+    "submitResponseRating",
+    "submitResponseRatingNudge",
+    "getSessionRatings",
+    "modelSwitchCost",
+    "putCollaborationConfig",
+    "patchSessionModel",
+    "deleteSession",
+    "getMediaCapabilities",
   ],
 );
 
-const MODEL_SWITCH_ESTIMATE_TIMEOUT_MS = 5_000;
-
 export const api = {
-  async modelSwitchCost(auth:AuthSession,input:ModelSwitchCostRequest,proof?:{consent?:string;quoteToken?:string}):Promise<ModelSwitchCostQuote>{
-    const ac=new AbortController();
-    let timer:ReturnType<typeof setTimeout>|undefined;
-    const timeout=new Promise<never>((_,reject)=>{
-      timer=setTimeout(()=>{
-        ac.abort();
-        reject(new ApiError({status:503,code:'MODEL_SWITCH_UNAVAILABLE',message:'费用确认暂不可用，请重试'}));
-      },MODEL_SWITCH_ESTIMATE_TIMEOUT_MS);
-    });
-    const work=jsonOrThrow<ModelSwitchCostQuote>(callWithRefresh(auth,token=>fetch(`/api/me/sessions/${encodeURIComponent(input.sessionId)}/model-switch-estimate`,{
-      method:'POST',credentials:'include',signal:ac.signal,
-      headers:{...bearerHeaders(token),'content-type':'application/json'},body:JSON.stringify({...input,...proof}),
-    })));
-    void work.catch(()=>{});
-    try{
-      return await Promise.race([work,timeout]);
-    }catch(err){
-      if(ac.signal.aborted)throw new ApiError({status:503,code:'MODEL_SWITCH_UNAVAILABLE',message:'费用确认暂不可用，请重试'});
-      throw err;
-    }finally{
-      if(timer!==undefined)clearTimeout(timer);
-    }
-  },
   // ── 鉴权 ───────────────────────────────────────────────────────────
 
   /**
@@ -749,31 +738,6 @@ export const api = {
     }
   },
 
-  /** 注册（POST /api/auth/register，201）。turnstileToken 开启 Turnstile 时必填。 */
-  register(input: {
-    email: string;
-    password: string;
-    turnstileToken?: string;
-    displayName?: string;
-    /** 勾选同意的协议版本（lib/legal TERMS_VERSION），后端落 users.terms_version 留证。 */
-    termsVersion?: string;
-  }): Promise<RegisterResult> {
-    return jsonOrThrow<{ user_id: string; verify_email_sent: boolean }>(
-      fetch("/api/auth/register", {
-        method: "POST",
-        credentials: "include",
-        headers: { Accept: "application/json", "content-type": "application/json" },
-        body: JSON.stringify({
-          email: input.email,
-          password: input.password,
-          ...(input.turnstileToken ? { turnstile_token: input.turnstileToken } : {}),
-          ...(input.displayName ? { display_name: input.displayName } : {}),
-          ...(input.termsVersion ? { terms_version: input.termsVersion } : {}),
-        }),
-      }),
-    ).then((b) => ({ userId: b.user_id, verifyEmailSent: b.verify_email_sent }));
-  },
-
   /** 邮箱验证（POST /api/auth/verify-email）：成功同时签发 session(同 login cookie 语义)。 */
   async verifyEmail(email: string, code: string): Promise<VerifyEmailResult> {
     const res = await withAuthCookieMutation(() =>
@@ -813,65 +777,6 @@ export const api = {
       user: { ...user, lane },
       lane,
     };
-  },
-
-  /** 重发验证邮件（POST /api/auth/resend-verification）。恒 200;email_sent 区分真实发信失败。 */
-  resendVerification(email: string): Promise<{ accepted: boolean; emailSent: boolean }> {
-    return jsonOrThrow<{ accepted: boolean; email_sent?: boolean }>(
-      fetch("/api/auth/resend-verification", {
-        method: "POST",
-        headers: { Accept: "application/json", "content-type": "application/json" },
-        body: JSON.stringify({ email }),
-      }),
-    ).then((b) => ({ accepted: b.accepted, emailSent: b.email_sent !== false }));
-  },
-
-  /** 跨设备查邮箱验证态（GET /api/auth/check-verification?email=）。后端防枚举，恒 200。 */
-  checkVerification(email: string): Promise<{ verified: boolean }> {
-    return jsonOrThrow<{ verified: boolean }>(
-      fetch(`/api/auth/check-verification?email=${encodeURIComponent(email)}`, {
-        headers: { Accept: "application/json" },
-      }),
-    );
-  },
-
-  /**
-   * 发起密码重置（POST /api/auth/request-password-reset）。后端防枚举：无论邮箱是否存在
-   * 恒返 200 + accepted（仅 turnstile 校验失败会 400 TURNSTILE_FAILED）。校验通过后后端给
-   * 该邮箱发一封含 `/reset-password?token=…` 链接的邮件，用户点链接回站内走 confirmPasswordReset。
-   * turnstileToken：开启 Turnstile 时必填（生产）；canary bypass 发占位串即可。
-   */
-  requestPasswordReset(email: string, turnstileToken?: string): Promise<{ accepted: boolean }> {
-    return jsonOrThrow<{ accepted: boolean }>(
-      fetch("/api/auth/request-password-reset", {
-        method: "POST",
-        credentials: "include",
-        headers: { Accept: "application/json", "content-type": "application/json" },
-        body: JSON.stringify({
-          email,
-          ...(turnstileToken ? { turnstile_token: turnstileToken } : {}),
-        }),
-      }),
-    );
-  },
-
-  /**
-   * 完成密码重置（POST /api/auth/confirm-password-reset）。token 来自重置邮件链接的
-   * `?token=` 参数；成功后该用户**所有未吊销的 refresh token 全部被撤销**（强制各端重登）。
-   * token 失效 / 过期 / 已用 / 新密码不合规 → 400（经 ApiError 抛，调用方据 message 提示）。
-   */
-  confirmPasswordReset(
-    token: string,
-    newPassword: string,
-  ): Promise<{ userId: string; revokedRefreshTokens: number }> {
-    return jsonOrThrow<{ user_id: string; revoked_refresh_tokens: number }>(
-      fetch("/api/auth/confirm-password-reset", {
-        method: "POST",
-        credentials: "include",
-        headers: { Accept: "application/json", "content-type": "application/json" },
-        body: JSON.stringify({ token, new_password: newPassword }),
-      }),
-    ).then((b) => ({ userId: b.user_id, revokedRefreshTokens: b.revoked_refresh_tokens }));
   },
 
   // ── 账户 ───────────────────────────────────────────────────────────
@@ -930,43 +835,6 @@ export const api = {
           `/api/collaboration-config${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ""}`,
           { credentials: "include", headers: bearerHeaders(t), signal: opts?.signal },
         ),
-      ),
-    ),
-
-  putCollaborationConfig: (
-    a: AuthSession,
-    body: {
-      sessionId?: string
-      mode: "solo" | "advisor" | "team"
-      advisorModel?: string | null
-      expectedRev?: number
-      asDefault?: boolean
-    },
-  ) =>
-    jsonOrThrow<{
-      rev: number
-      defaultMode: "solo" | "advisor" | "team"
-      defaultAdvisorModel: string | null
-      session: {
-        mode: "solo" | "advisor" | "team"
-        advisorModel: string | null
-        configVersion: string
-        source: "session" | "default"
-      }
-      advisorModels?: Array<{ id: string; label: string; engine: string }>
-      advisorUnavailableReason?: string
-      advisorConsultParents?: string[]
-      advisorConsultParentReason?: string
-      advisorConsultAllowed?: boolean
-      parentEngine?: string
-    }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/collaboration-config", {
-          method: "PUT",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(body),
-        }),
       ),
     ),
 
@@ -1109,68 +977,6 @@ export const api = {
     })),
 
   /**
-   * 开通 Agent 订阅（POST /api/agent/open，Bearer）。成功 202（status='provisioning'，
-   * 容器异步开机，需随后 pollAgentReady）。失败经 ApiError 抛：
-   *   - 402（issues.shortfall = 缺口积分字符串）→ 余额不足
-   *   - 409（issues.subscription_id / issues.end_at）→ 已有有效订阅
-   * balanceAfter 为字符串大数，勿数值化。
-   */
-  openAgent: (a: AuthSession): Promise<AgentOpenResult> =>
-    jsonOrThrow<{
-      subscription_id: string;
-      container_id: string;
-      status: string;
-      start_at: string;
-      end_at: string;
-      balance_after: string;
-      ledger_id: string;
-      docker_name: string;
-      workspace_volume: string;
-      home_volume: string;
-    }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/agent/open", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => ({
-      subscriptionId: b.subscription_id,
-      containerId: b.container_id,
-      status: b.status,
-      startAt: b.start_at,
-      endAt: b.end_at,
-      balanceAfter: b.balance_after,
-      ledgerId: b.ledger_id,
-      dockerName: b.docker_name,
-      workspaceVolume: b.workspace_volume,
-      homeVolume: b.home_volume,
-    })),
-
-  /** 退订 Agent（POST /api/agent/cancel，Bearer）。404 = 未订阅（经 ApiError 抛）。 */
-  agentCancel: (a: AuthSession): Promise<AgentCancelResult> =>
-    jsonOrThrow<{
-      subscription_id: string;
-      end_at: string;
-      auto_renew: false;
-      was_auto_renew: boolean;
-    }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/agent/cancel", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => ({
-      subscriptionId: b.subscription_id,
-      endAt: b.end_at,
-      autoRenew: false as const,
-      wasAutoRenew: b.was_auto_renew,
-    })),
-
-  /**
    * 容器冷启轮询封装（对话前置）。openAgent 返 202 provisioning 后，容器在后台异步开机，
    * 此 helper 轮询 getAgentStatus 直到容器 'running'。
    *
@@ -1245,74 +1051,12 @@ export const api = {
   },
 
   /**
-   * 全文搜索会话（GET /api/sessions/search?q=&limit=30&includeArchived=0）。
-   * signal 用于输入变更取消在途请求。
-   */
-  searchSessions: (
-    a: AuthSession,
-    q: string,
-    opts?: {
-      limit?: number;
-      includeArchived?: boolean;
-      signal?: AbortSignal;
-      projectId?: string | null;
-    },
-  ): Promise<SessionSearchResponse> => {
-    const params = new URLSearchParams();
-    params.set("q", q);
-    params.set("limit", String(opts?.limit ?? 30));
-    params.set("includeArchived", opts?.includeArchived ? "1" : "0");
-    if (opts && "projectId" in opts) {
-      params.set(
-        "projectId",
-        opts.projectId === null || opts.projectId === undefined ? "none" : opts.projectId,
-      );
-    }
-    return jsonOrThrow<SessionSearchResponse>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/sessions/search?${params.toString()}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-          signal: opts?.signal,
-        }),
-      ),
-    ).then((b) => ({ results: Array.isArray(b.results) ? b.results : [] }));
-  },
-
-  /**
-   * 批量归档 / 取消归档 / 删除 / 移动项目（POST /api/sessions/batch）。
-   */
-  batchSessions: (a: AuthSession, body: SessionBatchInput): Promise<SessionBatchResult> =>
-    jsonOrThrow<SessionBatchResult>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/sessions/batch", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(body),
-        }),
-      ),
-    ),
-
-  /**
    * 打开会话标已读（POST /api/sessions/:id/read）。不挂 GET :id，避免预取/搜索误标。
    */
   markSessionRead: (a: AuthSession, id: string): Promise<{ ok: true; updated: number }> =>
     jsonOrThrow<{ ok: true; updated: number }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/sessions/${encodeURIComponent(id)}/read`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-        }),
-      ),
-    ),
-
-  /** 全部标已读（POST /api/sessions/read-all）。 */
-  markAllSessionsRead: (a: AuthSession): Promise<{ ok: true; updated: number }> =>
-    jsonOrThrow<{ ok: true; updated: number }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/sessions/read-all", {
           method: "POST",
           credentials: "include",
           headers: bearerHeaders(t, true),
@@ -1531,117 +1275,6 @@ export const api = {
     });
   },
 
-  getLiveFramePayload: (
-    a: AuthSession,
-    id: string,
-    ref: { recordId?: string; sha256?: string },
-  ): Promise<{ source: "live" | "tape"; payload: unknown; sha256?: string }> => {
-    const params = new URLSearchParams();
-    if (ref.recordId) params.set("recordId", ref.recordId);
-    if (ref.sha256) params.set("sha256", ref.sha256);
-    return jsonOrThrow(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/sessions/${encodeURIComponent(id)}/live-frames/payload?${params.toString()}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    );
-  },
-
-  getSessionGoal: (a: AuthSession, id: string): Promise<GoalStateSnapshot | null> =>
-    jsonOrThrow<{ goal: GoalStateSnapshot | null }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/session-goals/${encodeURIComponent(id)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((body) => body.goal),
-
-  setSessionGoal: (
-    a: AuthSession,
-    id: string,
-    input: {
-      objective: string;
-      tokenBudget: number | null;
-      creditBudget: string | null;
-      expectedStateRevision: number;
-    },
-  ): Promise<GoalStateSnapshot> =>
-    jsonOrThrow<{ goal: GoalStateSnapshot }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/session-goals/${encodeURIComponent(id)}`, {
-          method: "PUT",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(input),
-        }),
-      ),
-    ).then((body) => body.goal),
-
-  transitionSessionGoal: (
-    a: AuthSession,
-    id: string,
-    action: "pause" | "resume" | "complete" | "clear",
-    expectedStateRevision: number,
-  ): Promise<GoalStateSnapshot | null> =>
-    jsonOrThrow<{ goal: GoalStateSnapshot | null }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/session-goals/${encodeURIComponent(id)}/${action}`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ expectedStateRevision }),
-        }),
-      ),
-    ).then((body) => body.goal),
-
-  /**
-   * 取归档分页（GET /api/sessions/:id/archive，Bearer）——点击后从归档 chunk 读取一页更早历史。
-   * `beforeSeq>0` → 只返 `_seq < beforeSeq` 的最近 `limit` 条（升序，上翻游标）；
-   * 缺省(0) → server 从 archivedThroughSeq+1 起（最新归档页）。`limit` 默认 100、后端上限 200。
-   */
-  getSessionArchive: (
-    a: AuthSession,
-    id: string,
-    beforeSeq = 0,
-    limit = 100,
-  ): Promise<SessionArchivePage> => {
-    const params = new URLSearchParams();
-    if (beforeSeq > 0) params.set("before", String(beforeSeq));
-    if (limit > 0) params.set("limit", String(limit));
-    const qs = params.toString();
-    return jsonOrThrow<SessionArchivePage>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/sessions/${encodeURIComponent(id)}/archive${qs ? `?${qs}` : ""}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    );
-  },
-
-  /** Explicit older-page read for the one real history timeline. No scroll
-   * observer calls this method; the user-facing top button is the sole trigger. */
-  getSessionTimelinePage: (
-    a: AuthSession,
-    id: string,
-    cursor: string,
-    limit = 100,
-  ): Promise<SessionTimelinePage> => {
-    const params = new URLSearchParams({ cursor });
-    if (limit > 0) params.set("limit", String(limit));
-    return jsonOrThrow<SessionTimelinePage>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/sessions/${encodeURIComponent(id)}/timeline?${params}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    );
-  },
-
   /** 读取单条真实、脱敏后不可变 JSON；Range 分块，不发整条巨型响应。 */
   getTapeRecordPayload: async (
     a: AuthSession,
@@ -1719,28 +1352,6 @@ export const api = {
   ): Promise<{ ok: true; updatedAt: number }> => api.patchSessionMeta(a, id, { title }),
 
   /**
-   * 会话级模型选择持久化（PATCH /api/sessions/:id，Bearer，元数据专用，与 rename 同款）。
-   * best-effort 失败契约同 rename：本地已改,服务端失败则下次 listSessions server-wins
-   * 盖回,用户重选即重试。会话行尚未建（新会话未发首条消息）时 404,同样吞掉——建行
-   * PUT(ensureServerSession)会随体携带 modelId 收敛。
-   */
-  patchSessionModel: (
-    a: AuthSession,
-    id: string,
-    modelId: string,
-  ): Promise<{ ok: true; updatedAt: number }> =>
-    jsonOrThrow<{ ok: true; updatedAt: number }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/sessions/${encodeURIComponent(id)}`, {
-          method: "PATCH",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ modelId }),
-        }),
-      ),
-    ),
-
-  /**
    * 跨设备持久化「用户发送的消息」（POST /api/sessions/:id/user-message，Bearer）。
    * 带前端 client 消息 id；服务端直写(role:'user',绕乐观并发,scoped by userId),
    * getSession 回带同 id → 前端合并去重。best-effort，调用方吞错不阻断发送。
@@ -1776,96 +1387,8 @@ export const api = {
         }),
       ),
     ).then(() => undefined),
-
-  /** 删除会话（DELETE /api/sessions/:id，Bearer）。幂等，恒 200。 */
-  deleteSession: (a: AuthSession, id: string): Promise<void> =>
-    jsonOrThrow<{ ok: true }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/sessions/${encodeURIComponent(id)}`, {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then(() => undefined),
   ...projectsApi,
   ...memorySkillsApi,
   ...integrationsApi,
   ...orgApiProxy,
-
-  // ── 逐条响应评价反馈（commercial REST，需登录 401，限流 60/60s） ──────────────
-  //
-  // 提交/更新走同一 POST（(user,messageId) upsert，无 DELETE）；回读只用于标「已评」高亮。
-  // 维护期端点返 503 —— 调用方(App)静默吞错，不弹错、不打断对话。
-
-  /**
-   * 提交/更新一条响应评价（POST /api/response-rating，Bearer）。语义 upsert：重发覆盖
-   * rating/tags/comment/model/traceId/sessionId。成功 200 `{ok:true}`；失败经 ApiError 抛
-   * （VALIDATION / UNAUTHORIZED / RATE_LIMITED），调用方静默处理。
-   */
-  submitResponseRating: (a: AuthSession, input: ResponseRatingInput): Promise<void> =>
-    jsonOrThrow<{ ok: true }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/response-rating", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(input),
-        }),
-      ),
-    ).then(() => undefined),
-
-  /**
-   * 回读某会话已评状态（GET /api/response-rating?sessionId=，Bearer）。返回
-   * `{ [messageId]: {rating, tags} }`（无则 `{}`，不含 comment）。仅用于重开会话时标
-   * 「已评」高亮、避免重复采集。失败/503 由调用方兜底为空。
-   */
-  submitResponseRatingNudge: (
-    a: AuthSession,
-    input: ResponseRatingNudgeInput,
-  ): Promise<{ state: RatingNudgeState; newlyExposed: boolean }> =>
-    jsonOrThrow<{ ok: true; state: RatingNudgeState; newlyExposed: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/response-rating", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(input),
-        }),
-      ),
-    ).then((body) => ({ state: body.state, newlyExposed: body.newlyExposed })),
-
-  getSessionRatings: (a: AuthSession, sessionId: string): Promise<SessionRatingSnapshot> =>
-    jsonOrThrow<{ ratings?: SessionRatingsMap; nudges?: Record<string, RatingNudgeState> }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/response-rating?sessionId=${encodeURIComponent(sessionId)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => ({ ratings: b.ratings || {}, nudges: b.nudges || {} })),
-
-  /**
-   * 视频生成能力（GET /api/media-generation/capabilities，Bearer）。仅用于账号菜单
-   * 「视频任务」入口门控：`available:false` 时不渲染入口，未知/失败保持入口可见
-   * （由任务中心内部兜底提示），避免网络抖动误藏功能。
-   */
-  getMediaCapabilities: (a: AuthSession): Promise<{ available?: boolean }> =>
-    jsonOrThrow<{ available?: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/media-generation/capabilities", {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
-
-  // ── 对话传输（P4 已接入：WS user-chat-bridge） ────────────────────────
-  //
-  // v5 对话传输走 WebSocket（/ws/user-chat-bridge，bearer 子协议
-  // `new WebSocket(url, ['bearer', accessJWT])`，inbound.message 帧），不再是
-  // v4-trial 的 SSE。实现不在 api.ts（REST 专属），而在渲染树之外的单例 service
-  // `lib/chat/socket.ts`（ChatSocket：safeWsSend 2MB 背压 + per-sessionKey frameSeq
-  // 去重 + 三层断点续传 + 离线队列三段式 drain），由 React 绑定 `hooks/useChatSocket.ts`
-  // 消费。会话历史的 REST 全量 sync（断点续传最终权威源）走上面的 getSession。
 };

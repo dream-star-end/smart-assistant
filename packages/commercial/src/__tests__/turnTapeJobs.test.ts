@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import path from "node:path";
 import { describe, test } from "node:test";
-import { fileURLToPath } from "node:url";
 import { enqueueMaterializationJob } from "../db/turnTapeJobs.js";
+import { readPgSessionsBackendSource } from "./helpers/pgSessionsSource.js";
 
 function inListStatuses(sql: string, column: "status" | "next_attempt_at"): string[] {
   const pattern = new RegExp(
@@ -44,18 +42,21 @@ describe("enqueueMaterializationJob SQL", () => {
 
 describe("Phase B enqueue wiring", () => {
   test("finalizeLosslessTurnTape only enqueues on HTTP materialize:false, not on worker Phase B", () => {
-    const srcPath = path.resolve(
-      path.dirname(fileURLToPath(import.meta.url)),
-      "../db/pgSessionsBackend.ts",
-    );
-    const src = readFileSync(srcPath, "utf8");
-    const marker = "async finalizeLosslessTurnTape(";
-    const start = src.indexOf(marker);
-    assert.ok(start >= 0, "finalizeLosslessTurnTape missing");
+    const src = readPgSessionsBackendSource();
+    const runMarker = "async function runFinalizeLosslessTurnTape(";
+    const start = src.indexOf(runMarker);
+    assert.ok(start >= 0, "runFinalizeLosslessTurnTape missing");
     const slice = src.slice(start, start + 2500);
     assert.ok(
       slice.includes("enqueueMaterialization: finalizeOptions?.materialize === false"),
       "Phase B must pass enqueueMaterialization based on materialize:false (HTTP create) vs worker suppress",
+    );
+    const entryMarker = "async finalizeLosslessTurnTape(";
+    const entryStart = src.indexOf(entryMarker);
+    assert.ok(entryStart >= 0, "finalizeLosslessTurnTape missing");
+    assert.ok(
+      src.slice(entryStart, entryStart + 600).includes("runFinalizeLosslessTurnTape("),
+      "finalizeLosslessTurnTape must delegate to runFinalizeLosslessTurnTape",
     );
     const visibleMarker = "async commitVisibleLosslessTurnTape(";
     const visibleStart = src.indexOf(visibleMarker);

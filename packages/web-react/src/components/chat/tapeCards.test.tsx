@@ -9,9 +9,11 @@ import type { CardCallbacks } from "./cards";
 import { ResponseRatingProvider } from "./ResponseRating";
 import { loadBeforeAll } from "../../test/moduleLoad";
 import { preloadToolBody } from "../tool/lazyToolBody";
+import { preloadTimelineCards } from "./lazyTimelineCards";
 
-// 渲染工具卡展开体的断言要等懒加载的 tool bodies;先在用例窗口外取好(src/test/moduleLoad.ts)。
+// 渲染工具卡展开体与低频记录卡的断言先在用例窗口外取好(src/test/moduleLoad.ts)。
 loadBeforeAll(preloadToolBody);
+loadBeforeAll(preloadTimelineCards);
 
 afterEach(() => {
   cleanup();

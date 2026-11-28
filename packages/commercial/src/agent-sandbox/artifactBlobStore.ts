@@ -1,14 +1,5 @@
 /**
- * OCV5-890 Wave 1B — Content-Addressed Artifact Blob Store & Remote Media Bridge.
- *
- * Implements L0 `ArtifactBlobStore` backed by a local content-addressed store
- * (`objects/<sha[0..2]>/<sha>`), multipart chunked staging (`staging/<uploadId>`),
- * safe hardlink/copy materialization (`O_NOFOLLOW` + sha256 verification),
- * short-lived RFC 2104 SHA-256 signed tickets, fail-closed GC, and the
- * `resolveMediaOrBlobBridge` bridge for `userMedia.ts`.
- *
- * Layer: app-container (L4). Zero `process.env` reads; zero forbidden `R3-crypto`
- * calls (`createHash` + `randomUUID` only); zero engine/provider literal special cases.
+ * OCV5-890 Wave 1B — Content-Addressed Artifact Blob Store & Remote Media Bridge (`app-container` L4).
  */
 import { createHash, randomUUID } from 'node:crypto'
 import {
@@ -26,12 +17,12 @@ import {
   readFileSync,
   readdirSync,
   readSync,
-  realpathSync,
   renameSync,
   rmSync,
   unlinkSync,
   writeSync,
 } from 'node:fs'
+import { lstat, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import {
@@ -122,19 +113,14 @@ export interface MaterializeBlobInput {
   readonly blobId: string
   readonly targetDir: string
   readonly relativePath: string
-  /**
-   * Optional strategy (`'copy'` | `'hardlink_or_copy'`) or numeric POSIX file mode
-   * (e.g. `0o444`, `0o600`). Default materialization is ALWAYS safe copy.
-   */
+  /** Strategy (`'copy'` | `'hardlink_or_copy'`) or POSIX mode; defaults to safe copy. */
   readonly mode?: 'hardlink_or_copy' | 'copy' | number
-  /**
-   * Opt-in hardlink permission (default: `false`). Even when `true`, hardlink is
-   * ONLY permitted when the requested target file mode is explicitly non-writable
-   * (`(mode & 0o222) === 0`) AND the CAS object on disk is read-only (`0o444`).
-   */
+  /** Opt-in hardlink (only when target & CAS object are both read-only `(mode & 0o222) === 0`). */
   readonly allowHardlink?: boolean
   readonly fileMode?: number
   readonly overwrite?: boolean
+  /** Optional trusted root directory; `targetDir` must resolve strictly inside it without symlinks. */
+  readonly trustedRootDir?: string
 }
 
 export interface MaterializeBlobResult {
@@ -281,6 +267,10 @@ const HARDLINK_FALLBACK_CODES: ReadonlySet<string> = new Set<string>([
   'ENOSYS',
 ])
 
+let monotonicBlobSeq = 0
+function nextSortableBlobId(nowMs: number): string {
+  return `blob-${nowMs.toString(36).padStart(9, '0')}-${(++monotonicBlobSeq).toString(36).padStart(6, '0')}-${randomUUID().slice(0, 12)}`
+}
 function assertCondition(condition: unknown, code: string): asserts condition {
   if (!condition) throw new Error(code)
 }
@@ -382,20 +372,40 @@ function readRegularFileNoFollowAndHash(filePath: string): {
   }
 }
 
+async function lstatExistingOrNull(targetPath: string) {
+  try {
+    return await lstat(targetPath)
+  } catch (err: unknown) {
+    if (typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT') return null
+    throw err
+  }
+}
+
+async function resolveVerifiedMaterializeTargetDir(targetDir: string, trustedRootDir?: string): Promise<string> {
+  assertCondition(typeof targetDir === 'string' && targetDir.length > 0, 'BLOB_MATERIALIZE_TARGET_DIR_INVALID')
+  const targetDirLstat = await lstatExistingOrNull(targetDir)
+  assertCondition(targetDirLstat !== null, 'BLOB_MATERIALIZE_TARGET_DIR_INVALID')
+  assertCondition(!targetDirLstat.isSymbolicLink(), 'BLOB_MATERIALIZE_SYMLINK_FORBIDDEN')
+  assertCondition(targetDirLstat.isDirectory(), 'BLOB_MATERIALIZE_TARGET_DIR_INVALID')
+  const realTargetDir = await realpath(targetDir)
+  if (trustedRootDir !== undefined) {
+    assertCondition(typeof trustedRootDir === 'string' && trustedRootDir.length > 0, 'BLOB_MATERIALIZE_UNTRUSTED_TARGET_DIR')
+    const rootLstat = await lstatExistingOrNull(trustedRootDir)
+    assertCondition(rootLstat !== null && !rootLstat.isSymbolicLink() && rootLstat.isDirectory(), 'BLOB_MATERIALIZE_UNTRUSTED_TARGET_DIR')
+    const realTrustedRoot = await realpath(trustedRootDir)
+    assertCondition(realTargetDir === realTrustedRoot || realTargetDir.startsWith(`${realTrustedRoot}${path.sep}`), 'BLOB_MATERIALIZE_UNTRUSTED_TARGET_DIR')
+  }
+  return realTargetDir
+}
+
 function syncDirectoryBestEffort(dirPath: string): void {
   let fd: number | undefined
   try {
     fd = openSync(dirPath, fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0))
     fsyncSync(fd)
-  } catch {
-    // Some filesystems do not support directory fsync; file fsync already succeeded.
-  } finally {
+  } catch { /* unsupported fsync */ } finally {
     if (fd !== undefined) {
-      try {
-        closeSync(fd)
-      } catch {
-        // ignore
-      }
+      try { closeSync(fd) } catch { /* ignore */ }
     }
   }
 }
@@ -579,8 +589,9 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
     mkdirSync(path.dirname(objectPath), { recursive: true })
     writeAtomicFileNoFollow(objectPath, input.bytes, 0o444)
 
-    const blobId = `blob-${randomUUID()}`
-    const createdAt = new Date(this.now()).toISOString()
+    const nowMs = this.now()
+    const blobId = nextSortableBlobId(nowMs)
+    const createdAt = new Date(nowMs).toISOString()
     const ref = validateArtifactBlobRef({
       blobId,
       tenantId: input.tenantId,
@@ -805,19 +816,12 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
     const assembledTmpPath = path.join(uploadDir, `assembled-${randomUUID()}.tmp`)
     const wholeHash = createHash('sha256')
     let totalBytes = 0
-    const outFd = openSync(
-      assembledTmpPath,
-      fsConstants.O_CREAT |
-        fsConstants.O_EXCL |
-        fsConstants.O_WRONLY |
-        (fsConstants.O_NOFOLLOW ?? 0),
-      0o600,
-    )
+    const openFlags = fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | (fsConstants.O_NOFOLLOW ?? 0)
+    const outFd = openSync(assembledTmpPath, openFlags, 0o600)
     try {
       for (let i = 0; i < manifest.chunkCount; i += 1) {
         const expectedPart = manifest.parts[String(i)]!
-        const partPath = path.join(uploadDir, `part-${i}`)
-        const partData = readRegularFileNoFollowAndHash(partPath)
+        const partData = readRegularFileNoFollowAndHash(path.join(uploadDir, `part-${i}`))
         assertCondition(
           partData.sha256 === expectedPart.sha256 && partData.sizeBytes === expectedPart.sizeBytes,
           'BLOB_PART_SHA256_MISMATCH',
@@ -834,16 +838,8 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
       }
       fsyncSync(outFd)
     } catch (err) {
-      try {
-        closeSync(outFd)
-      } catch {
-        // ignore
-      }
-      try {
-        unlinkSync(assembledTmpPath)
-      } catch {
-        // ignore
-      }
+      try { closeSync(outFd) } catch { /* ignore */ }
+      try { unlinkSync(assembledTmpPath) } catch { /* ignore */ }
       throw err
     }
     closeSync(outFd)
@@ -864,8 +860,9 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
     renameSync(assembledTmpPath, objectPath)
     syncDirectoryBestEffort(path.dirname(objectPath))
 
-    const blobId = input.blobId ?? `blob-${randomUUID()}`
-    const createdAt = new Date(this.now()).toISOString()
+    const nowMs = this.now()
+    const blobId = input.blobId ?? nextSortableBlobId(nowMs)
+    const createdAt = new Date(nowMs).toISOString()
     const ref = validateArtifactBlobRef({
       blobId,
       tenantId: manifest.tenantId,
@@ -1009,13 +1006,7 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
     assertCondition(existsSync(objectPath), 'BLOB_OBJECT_MISSING')
 
     const segments = parseSafeRelativeSegments(input.relativePath)
-    assertCondition(
-      typeof input.targetDir === 'string' &&
-        input.targetDir.length > 0 &&
-        existsSync(input.targetDir),
-      'BLOB_MATERIALIZE_TARGET_DIR_INVALID',
-    )
-    const realTargetDir = realpathSync(input.targetDir)
+    const realTargetDir = await resolveVerifiedMaterializeTargetDir(input.targetDir, input.trustedRootDir)
 
     let currentDir = realTargetDir
     for (let i = 0; i < segments.length - 1; i += 1) {
@@ -1292,13 +1283,7 @@ export class LocalCasArtifactBlobStore implements ArtifactBlobStore {
   }
 }
 
-/**
- * Bridges `userMedia.ts` `UserMediaLocation` with `ArtifactBlobStore`:
- * - `kind === 'ok'` -> local host volume direct path (`local_direct`)
- * - `kind === 'fail' && reason === 'remote-host'` -> cross-node transfer via
- *   `ArtifactBlobStore` (`blob_bridge`) instead of failing hard
- * - All other fail reasons stay fail-closed.
- */
+/** Bridges `userMedia.ts` `UserMediaLocation` with `ArtifactBlobStore`. */
 export function resolveMediaOrBlobBridge(
   location: UserMediaLocation,
   opts: ResolveMediaOrBlobBridgeOptions = {},
@@ -1328,9 +1313,5 @@ export function resolveMediaOrBlobBridge(
       tenantId: `c:${location.uid}`,
     })
   }
-  return Object.freeze({
-    kind: 'fail',
-    reason: location.reason,
-    logCtx: location.logCtx,
-  })
+  return Object.freeze({ kind: 'fail', reason: location.reason, logCtx: location.logCtx })
 }

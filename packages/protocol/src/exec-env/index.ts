@@ -10,6 +10,7 @@ export {
   JOB_LIFECYCLE_CLASSES,
   SANDBOX_RED_CONTROL_IDS,
   TOOL_CALL_ATTESTATION_KINDS,
+  defaultCapabilitiesForHostKind,
 } from './contracts.js'
 
 export type {

@@ -5,12 +5,22 @@
  * the first-screen static closure.
  */
 import type { ContainerPreviewViewport } from "@openclaude/protocol/containerPreview";
+import type { ModelSwitchCostQuote, ModelSwitchCostRequest } from "@openclaude/protocol/browser";
+import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import type {
+  AgentCancelResult,
+  AgentOpenResult,
   ApiKeyPatch,
   ApiKeySummary,
   ApiKeyUsageReport,
   AuthSession,
   CreatedApiKey,
+  RegisterResult,
+  SessionArchivePage,
+  SessionBatchInput,
+  SessionBatchResult,
+  SessionSearchResponse,
+  SessionTimelinePage,
   UsageQuery,
   UsageReport,
   UsageReportWindow,
@@ -24,73 +34,47 @@ import type {
   FeedbackSubmitResult,
   QqBindingStart,
   QqBindingStatus,
+  RatingNudgeState,
+  ResponseRatingInput,
+  ResponseRatingNudgeInput,
+  SessionRatingSnapshot,
+  SessionRatingsMap,
 } from "../api";
-import { bearerHeaders, callWithRefresh, jsonOrThrow , fetchWithExecutionGuard } from "./http";
+import { ApiError, bearerHeaders, callWithRefresh, fetchWithExecutionGuard, jsonOrThrow } from "./http";
+
+const MODEL_SWITCH_ESTIMATE_TIMEOUT_MS = 5_000;
 
 /** /api/me/api-keys 线上形状（snake_case）；list / PATCH 共用。 */
 type ApiKeyWire = {
-  id: string;
-  label: string;
-  key_prefix: string;
-  created_at: string;
-  last_used_at: string | null;
-  disabled_at?: string | null;
-  credit_limit?: string | null;
-  spent_credits?: string;
+  id: string; label: string; key_prefix: string; created_at: string;
+  last_used_at: string | null; disabled_at?: string | null; credit_limit?: string | null; spent_credits?: string;
 };
 
 function apiKeyFromWire(k: ApiKeyWire): ApiKeySummary {
   return {
-    id: k.id,
-    label: k.label,
-    keyPrefix: k.key_prefix,
-    createdAt: k.created_at,
-    lastUsedAt: k.last_used_at,
-    disabledAt: k.disabled_at ?? null,
-    creditLimit: k.credit_limit ?? null,
-    spentCredits: k.spent_credits ?? "0",
+    id: k.id, label: k.label, keyPrefix: k.key_prefix, createdAt: k.created_at, lastUsedAt: k.last_used_at,
+    disabledAt: k.disabled_at ?? null, creditLimit: k.credit_limit ?? null, spentCredits: k.spent_credits ?? "0",
   };
 }
 
 export const secondaryAccountApiImpl = {
   getQqBinding: (a: AuthSession) =>
     jsonOrThrow<QqBindingStatus>(
-      callWithRefresh(a, (t) =>
-        fetchWithExecutionGuard("/api/me/qq-binding", {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
+      callWithRefresh(a, (t) => fetchWithExecutionGuard("/api/me/qq-binding", { credentials: "include", headers: bearerHeaders(t) })),
     ),
 
   startQqBinding: (a: AuthSession) =>
     jsonOrThrow<QqBindingStart>(
       callWithRefresh(a, (t) =>
-        fetchWithExecutionGuard("/api/me/qq-binding/start", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: "{}",
-        }),
+        fetchWithExecutionGuard("/api/me/qq-binding/start", { method: "POST", credentials: "include", headers: bearerHeaders(t, true), body: "{}" }),
       ),
     ),
 
   deleteQqBinding: (a: AuthSession) =>
     jsonOrThrow<{ ok: boolean; unbound: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetchWithExecutionGuard("/api/me/qq-binding", {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
+      callWithRefresh(a, (t) => fetchWithExecutionGuard("/api/me/qq-binding", { method: "DELETE", credentials: "include", headers: bearerHeaders(t) })),
     ),
 
-  /**
-   * 自由文本反馈（POST /api/feedback）。缺 Bearer 的公共调用仍可匿名；浏览器登录态提供
-   * 无效 Bearer 时后端返回 401，callWithRefresh 刷新重放，避免把登录用户静默记成匿名。
-   * 两种 source 分支分别重建 payload，消息上下文不会意外泄漏到设置反馈，反之亦然。
-   */
   submitFeedback: (a: AuthSession, input: FeedbackSubmitInput): Promise<FeedbackSubmitResult> =>
     jsonOrThrow<FeedbackSubmitResult>(
       callWithRefresh(a, (t) =>
@@ -374,4 +358,420 @@ export const secondaryAccountApiImpl = {
       enrollmentId: b.enrollment_id,
       deepLink: typeof b.deep_link === "string" && b.deep_link ? b.deep_link : null,
     })),
+
+  register(input: {
+    email: string;
+    password: string;
+    turnstileToken?: string;
+    displayName?: string;
+    termsVersion?: string;
+  }): Promise<RegisterResult> {
+    return jsonOrThrow<{ user_id: string; verify_email_sent: boolean }>(
+      fetchWithExecutionGuard("/api/auth/register", {
+        method: "POST",
+        credentials: "include",
+        headers: { Accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify({
+          email: input.email,
+          password: input.password,
+          ...(input.turnstileToken ? { turnstile_token: input.turnstileToken } : {}),
+          ...(input.displayName ? { display_name: input.displayName } : {}),
+          ...(input.termsVersion ? { terms_version: input.termsVersion } : {}),
+        }),
+      }),
+    ).then((b) => ({ userId: b.user_id, verifyEmailSent: b.verify_email_sent }));
+  },
+
+  resendVerification(email: string): Promise<{ accepted: boolean; emailSent: boolean }> {
+    return jsonOrThrow<{ accepted: boolean; email_sent?: boolean }>(
+      fetchWithExecutionGuard("/api/auth/resend-verification", {
+        method: "POST",
+        headers: { Accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify({ email }),
+      }),
+    ).then((b) => ({ accepted: b.accepted, emailSent: b.email_sent !== false }));
+  },
+
+  checkVerification(email: string): Promise<{ verified: boolean }> {
+    return jsonOrThrow<{ verified: boolean }>(
+      fetchWithExecutionGuard(`/api/auth/check-verification?email=${encodeURIComponent(email)}`, {
+        headers: { Accept: "application/json" },
+      }),
+    );
+  },
+
+  requestPasswordReset(email: string, turnstileToken?: string): Promise<{ accepted: boolean }> {
+    return jsonOrThrow<{ accepted: boolean }>(
+      fetchWithExecutionGuard("/api/auth/request-password-reset", {
+        method: "POST",
+        credentials: "include",
+        headers: { Accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify({
+          email,
+          ...(turnstileToken ? { turnstile_token: turnstileToken } : {}),
+        }),
+      }),
+    );
+  },
+
+  confirmPasswordReset(
+    token: string,
+    newPassword: string,
+  ): Promise<{ userId: string; revokedRefreshTokens: number }> {
+    return jsonOrThrow<{ user_id: string; revoked_refresh_tokens: number }>(
+      fetchWithExecutionGuard("/api/auth/confirm-password-reset", {
+        method: "POST",
+        credentials: "include",
+        headers: { Accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify({ token, new_password: newPassword }),
+      }),
+    ).then((b) => ({ userId: b.user_id, revokedRefreshTokens: b.revoked_refresh_tokens }));
+  },
+
+  openAgent: (a: AuthSession): Promise<AgentOpenResult> =>
+    jsonOrThrow<{
+      subscription_id: string;
+      container_id: string;
+      status: string;
+      start_at: string;
+      end_at: string;
+      balance_after: string;
+      ledger_id: string;
+      docker_name: string;
+      workspace_volume: string;
+      home_volume: string;
+    }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard("/api/agent/open", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => ({
+      subscriptionId: b.subscription_id,
+      containerId: b.container_id,
+      status: b.status,
+      startAt: b.start_at,
+      endAt: b.end_at,
+      balanceAfter: b.balance_after,
+      ledgerId: b.ledger_id,
+      dockerName: b.docker_name,
+      workspaceVolume: b.workspace_volume,
+      homeVolume: b.home_volume,
+    })),
+
+  agentCancel: (a: AuthSession): Promise<AgentCancelResult> =>
+    jsonOrThrow<{
+      subscription_id: string;
+      end_at: string;
+      auto_renew: false;
+      was_auto_renew: boolean;
+    }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard("/api/agent/cancel", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => ({
+      subscriptionId: b.subscription_id,
+      endAt: b.end_at,
+      autoRenew: false as const,
+      wasAutoRenew: b.was_auto_renew,
+    })),
+
+  searchSessions: (
+    a: AuthSession,
+    q: string,
+    opts?: {
+      limit?: number;
+      includeArchived?: boolean;
+      signal?: AbortSignal;
+      projectId?: string | null;
+    },
+  ): Promise<SessionSearchResponse> => {
+    const params = new URLSearchParams();
+    params.set("q", q);
+    params.set("limit", String(opts?.limit ?? 30));
+    params.set("includeArchived", opts?.includeArchived ? "1" : "0");
+    if (opts && "projectId" in opts) {
+      params.set(
+        "projectId",
+        opts.projectId === null || opts.projectId === undefined ? "none" : opts.projectId,
+      );
+    }
+    return jsonOrThrow<SessionSearchResponse>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard(`/api/sessions/search?${params.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+          signal: opts?.signal,
+        }),
+      ),
+    ).then((b) => ({ results: Array.isArray(b.results) ? b.results : [] }));
+  },
+
+  batchSessions: (a: AuthSession, body: SessionBatchInput): Promise<SessionBatchResult> =>
+    jsonOrThrow<SessionBatchResult>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard("/api/sessions/batch", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  markAllSessionsRead: (a: AuthSession): Promise<{ ok: true; updated: number }> =>
+    jsonOrThrow<{ ok: true; updated: number }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard("/api/sessions/read-all", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+        }),
+      ),
+    ),
+
+  getLiveFramePayload: (
+    a: AuthSession,
+    id: string,
+    ref: { recordId?: string; sha256?: string },
+  ): Promise<{ source: "live" | "tape"; payload: unknown; sha256?: string }> => {
+    const params = new URLSearchParams();
+    if (ref.recordId) params.set("recordId", ref.recordId);
+    if (ref.sha256) params.set("sha256", ref.sha256);
+    return jsonOrThrow(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard(`/api/sessions/${encodeURIComponent(id)}/live-frames/payload?${params.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    );
+  },
+
+  getSessionGoal: (a: AuthSession, id: string): Promise<GoalStateSnapshot | null> =>
+    jsonOrThrow<{ goal: GoalStateSnapshot | null }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard(`/api/session-goals/${encodeURIComponent(id)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((body) => body.goal),
+
+  setSessionGoal: (
+    a: AuthSession,
+    id: string,
+    input: {
+      objective: string;
+      tokenBudget: number | null;
+      creditBudget: string | null;
+      expectedStateRevision: number;
+    },
+  ): Promise<GoalStateSnapshot> =>
+    jsonOrThrow<{ goal: GoalStateSnapshot }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard(`/api/session-goals/${encodeURIComponent(id)}`, {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((body) => body.goal),
+
+  transitionSessionGoal: (
+    a: AuthSession,
+    id: string,
+    action: "pause" | "resume" | "complete" | "clear",
+    expectedStateRevision: number,
+  ): Promise<GoalStateSnapshot | null> =>
+    jsonOrThrow<{ goal: GoalStateSnapshot | null }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard(`/api/session-goals/${encodeURIComponent(id)}/${action}`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ expectedStateRevision }),
+        }),
+      ),
+    ).then((body) => body.goal),
+
+  getSessionArchive: (
+    a: AuthSession,
+    id: string,
+    beforeSeq = 0,
+    limit = 100,
+  ): Promise<SessionArchivePage> => {
+    const params = new URLSearchParams();
+    if (beforeSeq > 0) params.set("before", String(beforeSeq));
+    if (limit > 0) params.set("limit", String(limit));
+    const qs = params.toString();
+    return jsonOrThrow<SessionArchivePage>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard(`/api/sessions/${encodeURIComponent(id)}/archive${qs ? `?${qs}` : ""}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    );
+  },
+
+  getSessionTimelinePage: (
+    a: AuthSession,
+    id: string,
+    cursor: string,
+    limit = 100,
+  ): Promise<SessionTimelinePage> => {
+    const params = new URLSearchParams({ cursor });
+    if (limit > 0) params.set("limit", String(limit));
+    return jsonOrThrow<SessionTimelinePage>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard(`/api/sessions/${encodeURIComponent(id)}/timeline?${params}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    );
+  },
+
+  submitResponseRating: (a: AuthSession, input: ResponseRatingInput): Promise<void> =>
+    jsonOrThrow<{ ok: true }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard("/api/response-rating", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then(() => undefined),
+
+  submitResponseRatingNudge: (
+    a: AuthSession,
+    input: ResponseRatingNudgeInput,
+  ): Promise<{ state: RatingNudgeState; newlyExposed: boolean }> =>
+    jsonOrThrow<{ ok: true; state: RatingNudgeState; newlyExposed: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard("/api/response-rating", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((body) => ({ state: body.state, newlyExposed: body.newlyExposed })),
+
+  getSessionRatings: (a: AuthSession, sessionId: string): Promise<SessionRatingSnapshot> =>
+    jsonOrThrow<{ ratings?: SessionRatingsMap; nudges?: Record<string, RatingNudgeState> }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard(`/api/response-rating?sessionId=${encodeURIComponent(sessionId)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => ({ ratings: b.ratings || {}, nudges: b.nudges || {} })),
+
+  async modelSwitchCost(
+    auth: AuthSession,
+    input: ModelSwitchCostRequest,
+    proof?: { consent?: string; quoteToken?: string },
+  ): Promise<ModelSwitchCostQuote> {
+    const ac = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        ac.abort();
+        reject(new ApiError({ status: 503, code: "MODEL_SWITCH_UNAVAILABLE", message: "费用确认暂不可用，请重试" }));
+      }, MODEL_SWITCH_ESTIMATE_TIMEOUT_MS);
+    });
+    const work = jsonOrThrow<ModelSwitchCostQuote>(
+      callWithRefresh(auth, (token) =>
+        fetchWithExecutionGuard(`/api/me/sessions/${encodeURIComponent(input.sessionId)}/model-switch-estimate`, {
+          method: "POST",
+          credentials: "include",
+          signal: ac.signal,
+          headers: { ...bearerHeaders(token), "content-type": "application/json" },
+          body: JSON.stringify({ ...input, ...proof }),
+        }),
+      ),
+    );
+    void work.catch(() => {});
+    try {
+      return await Promise.race([work, timeout]);
+    } catch (err) {
+      if (ac.signal.aborted) {
+        throw new ApiError({ status: 503, code: "MODEL_SWITCH_UNAVAILABLE", message: "费用确认暂不可用，请重试" });
+      }
+      throw err;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  },
+
+  putCollaborationConfig: (
+    a: AuthSession,
+    body: {
+      sessionId?: string;
+      mode: "solo" | "advisor" | "team";
+      advisorModel?: string | null;
+      expectedRev?: number;
+      asDefault?: boolean;
+    },
+  ) =>
+    jsonOrThrow<{
+      rev: number;
+      defaultMode: "solo" | "advisor" | "team";
+      defaultAdvisorModel: string | null;
+      session: {
+        mode: "solo" | "advisor" | "team";
+        advisorModel: string | null;
+        configVersion: string;
+        source: "session" | "default";
+      };
+      advisorModels?: Array<{ id: string; label: string; engine: string }>;
+      advisorUnavailableReason?: string;
+      advisorConsultParents?: string[];
+      advisorConsultParentReason?: string;
+      advisorConsultAllowed?: boolean;
+      parentEngine?: string;
+    }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard("/api/collaboration-config", {
+          method: "PUT", credentials: "include", headers: bearerHeaders(t, true), body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  patchSessionModel: (a: AuthSession, id: string, modelId: string): Promise<{ ok: true; updatedAt: number }> =>
+    jsonOrThrow<{ ok: true; updatedAt: number }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "PATCH", credentials: "include", headers: bearerHeaders(t, true), body: JSON.stringify({ modelId }),
+        }),
+      ),
+    ),
+
+  deleteSession: (a: AuthSession, id: string): Promise<void> =>
+    jsonOrThrow<{ ok: true }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "DELETE", credentials: "include", headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
+
+  getMediaCapabilities: (a: AuthSession): Promise<{ available?: boolean }> =>
+    jsonOrThrow<{ available?: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetchWithExecutionGuard("/api/media-generation/capabilities", {
+          credentials: "include", headers: bearerHeaders(t),
+        }),
+      ),
+    ),
 };

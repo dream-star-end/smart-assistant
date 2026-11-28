@@ -1,13 +1,5 @@
 import { memoryRejection, nodeMemoryError } from './remoteNodeMemory.js'
-/**
- * Privileged master runtime for remote-pool chats.
- *
- * Per container the supervisor prepares one read-only view (mounted at CC5_MOUNT) holding the
- * public authority keyring. Per chat a lane is created on demand: the chat's task root on its
- * pool node is reset and provisioned, then a Cc5Relay + Cc5SshHost serve it through
- * `<view>/<operationId>/{binding.json,relay.sock}`. A master restart only loses lanes; the next
- * turn of a chat resets the node root and resumes the same native session.
- */
+/** Privileged master runtime for remote-pool chats (`CC5_MOUNT` read-only view + per-chat SSH relays). */
 import { randomBytes } from 'node:crypto'
 import {
   constants,
@@ -32,6 +24,7 @@ import { dirname, isAbsolute, join } from 'node:path'
 import {
   type AuthorityKeyring,
   type RemoteExecutionBackend,
+  type RequiredTurnCapabilities,
   parseRemoteExecutionBackend,
   REMOTE_DRIVER_BACKEND,
   CC5_INTERACTIVE_BACKEND,
@@ -200,6 +193,9 @@ export interface RemoteLaneRequest {
   readonly containerDbId: string
   readonly sessionKey: string
   readonly canonicalModel: string
+  readonly allowStickyFailover?: boolean
+  readonly requiredCapabilities?: RequiredTurnCapabilities
+  readonly systemPromptSha256?: string
 }
 export type RemoteLaneState = 'running' | 'released' | 'unknown'
 export interface RemoteLaneHooks {
@@ -301,6 +297,7 @@ interface Lane {
   /** Preparation may reset/provision remotely before the relay attempts a model launch. */
   preparationStop?: () => Promise<unknown>
   creationFailed?: boolean
+  verifiedCapabilityKeys?: Set<string>
 }
 interface ContainerState {
   readonly handle: Cc5PreparedContainer
@@ -310,11 +307,7 @@ interface ContainerState {
   state: 'prepared' | 'bound' | 'active' | 'released'
   release?: Promise<void>
 }
-/**
- * One owner per chat across all containers: its live lane and a serial tail. Placement, stopping
- * the previous lane (another container's, a dead one, another model's) and starting the next all
- * run on this tail, so the chat's node root is handed over strictly one lane at a time.
- */
+/** One owner per chat across all containers: its live lane and a serial tail. */
 interface ChatOwner {
   lane?: Lane
   tail: Promise<unknown>
@@ -854,19 +847,24 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
     requireLane(container?.state === 'active' && container.dockerId && String(request.uid) === this.uid &&
       isCc5CanonicalModel(request.canonicalModel))
     const owner = this.chat(request.sessionKey)
+    const reqCapEntries = request.requiredCapabilities
+      ? Object.entries(request.requiredCapabilities)
+          .filter(([, v]) => v !== undefined && v !== false)
+          .sort(([a], [b]) => a.localeCompare(b))
+      : []
+    const reqCapKey = reqCapEntries.length > 0 ? JSON.stringify(reqCapEntries) : null
     const live = (lane: Lane | undefined): lane is Lane => !!lane && lane.container === container &&
       !lane.creationFailed && !lane.stopping && !lane.relay.stopped && lane.canonicalModel === request.canonicalModel &&
       lane.binding.expiresAt > Date.now() &&
+      (reqCapKey === null || Boolean(lane.verifiedCapabilityKeys?.has(reqCapKey))) &&
       (lane.binding.version === 4
         ? lane.binding.authorityEngine === (request.engine ?? 'ccb')
         : request.engine !== 'antigravity' && (request.engine === 'codex') === (lane.binding.backendKind === 'codex-app-server-v1'))
-    // A resident lane answers without waiting; anything else is decided on the chat's tail.
     let lane = owner.lane
     if (!live(lane)) {
       lane = await this.serial(owner, async () => {
         if (live(owner.lane)) return owner.lane
         try {
-          // A request whose container was released while it queued must not touch the chat's lane.
           requireLane(
             container.state === 'active' &&
               container.dockerId &&
@@ -876,8 +874,7 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
           if (owner.lane) {
             const old = owner.lane
             await this.stopLane(old)
-            owner.lane = undefined // Only a proven stop permits replacement.
-            // // Another container's, a dead one, or another model's.
+            owner.lane = undefined
           }
           requireLane(
             container.state === 'active' &&
@@ -888,23 +885,26 @@ class RemoteLaneRuntime implements RemoteLaneRuntimePort {
           requireLane(UUID.test(placement.operationId) && UUID.test(placement.runId) &&
             placement.target.upstreamModel.length > 0)
           const next = await this.startLane(container, request, placement)
+          if (reqCapKey !== null) {
+            next.verifiedCapabilityKeys = new Set([reqCapKey])
+          }
           if (container.state !== 'active' || this.isContainerReleasingOnDisk(container)) {
-            await this.stopLane(next) // Released while the node was being prepared.
+            await this.stopLane(next)
             requireLane(false)
           }
           try { await this.hooks.onState?.(next.operationId, 'running', next.generation, next.isV4) }
           catch (error) {
-            try { await this.stopLane(next) } catch { owner.lane = next } // retain only a fenced lane for proof retry
+            try { await this.stopLane(next) } catch { owner.lane = next }
             throw error
           }
           owner.lane = next
           return next
         } catch (error) {
-          // Node memory admission & explicit R1 drain / drift reverify are actionable causes.
           if (error instanceof Error &&
             (error.message === REMOTE_LANE_UNAVAILABLE ||
               error.message === 'REMOTE_POOL_DRAINING_RETRY_LATER' ||
               error.message === 'REMOTE_DRIVER_REVERIFY_REQUIRED' ||
+              error.message === 'CAPABILITY_UNSATISFIED' ||
               memoryRejection(error) !== undefined)) throw error
           throw new Error(REMOTE_LANE_UNAVAILABLE, { cause: error })
         }

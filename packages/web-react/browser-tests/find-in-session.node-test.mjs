@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import { build as viteBuild } from "vite";
+import { createFileOverridePlugin, hashModuleFamily, MODULE_FAMILIES } from "./helpers/sourceBundle.mjs";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
 import { EXPECTED_SCENES, PEAK_BUDGET, catalogIsInvalid, finalizeRows, record as recordScene } from "./find-in-session-collector.mjs";
 
@@ -25,7 +26,8 @@ const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const negative = process.env.OC_FIND_NEGATIVE === "1";
 
 function sourceEvidence() {
-  const currentRenderer = readFileSync(new URL("../src/components/MessageRenderer.tsx", import.meta.url));
+  const rendererFamily = MODULE_FAMILIES.messageRendererCore();
+  const currentRendererHash = hashModuleFamily(rendererFamily.entryFile, rendererFamily.extraDirsOrFiles);
   const pinned = readFileSync(PINNED_RENDERER);
   const pinnedHash = sha256(pinned);
   if (negative) {
@@ -36,8 +38,8 @@ function sourceEvidence() {
     pinnedModulesCommit: negative ? NEGATIVE_SHA : null,
     overlay: negative ? "components/MessageRenderer.tsx" : null,
     sourceHashes: {
-      "components/MessageRenderer.tsx": negative ? pinnedHash : sha256(currentRenderer),
-      "components/MessageRenderer.tsx.worktree": sha256(currentRenderer),
+      "components/MessageRenderer.tsx": negative ? pinnedHash : currentRendererHash,
+      "components/MessageRenderer.tsx.worktree": currentRendererHash,
       "baselines/87d4554-MessageRenderer.tsx": pinnedHash,
     },
     harnessSha256: sha256(readFileSync(new URL("./find-in-session-harness.tsx", import.meta.url))),
@@ -534,15 +536,14 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
     define: { "process.env.NODE_ENV": '"production"', "import.meta.env.MODE": '"production"' },
     logLevel: "silent",
     plugins: negative
-      ? [{
-        name: "pinned-find-negative-control",
-        setup(b) {
-          b.onLoad({ filter: /src\/components\/MessageRenderer\.tsx$/ }, () => ({
-            contents: readFileSync(PINNED_RENDERER, "utf8"),
+      ? [
+          createFileOverridePlugin({
+            name: "pinned-find-negative-control",
+            targetFile: join(here, "../src/components/MessageRenderer.tsx"),
+            replacementContents: readFileSync(PINNED_RENDERER, "utf8"),
             loader: "tsx",
-          }));
-        },
-      }]
+          }),
+        ]
       : [],
   });
   try {

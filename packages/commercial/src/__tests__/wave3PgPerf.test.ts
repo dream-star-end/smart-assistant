@@ -18,6 +18,8 @@ import { MarketplaceError, RetryableInstallConflictError } from '../marketplace/
 import { replaceTutorialBlobRefs, upsertTutorialBlobs } from '../tutorials/tutorialBlobs.js'
 import type { TutorialBlobDraft } from '../tutorials/snapshotSanitizer.js'
 import { PreferencesError, resolvePreferencesPatch } from '../user/preferences.js'
+import { readPgSessionsBackendSource } from './helpers/pgSessionsSource.js'
+import { readUserChatBridgeSource } from './helpers/userChatBridgeSource.js'
 
 const JWT_SECRET = new Uint8Array(32).fill(7)
 
@@ -178,7 +180,7 @@ describe('Wave 3 PG perf, model projection, Auto-Dream, Law 2 & tutorial batchin
     assert.equal(sawDispatch, true)
     assert.equal(sawPermission, true)
 
-    const pgSrc = readFileSync(new URL('../db/pgSessionsBackend.ts', import.meta.url), 'utf8')
+    const pgSrc = readPgSessionsBackendSource()
     assert.match(pgSrc, /async function execPgSpillPlan[\s\S]*FROM unnest\(\$4::int\[\], \$5::int\[\], \$6::int\[\], \$7::text\[\]\)[\s\S]*ON CONFLICT \(session_id, first_seq\) DO NOTHING[\s\S]*RETURNING message_count/i)
     assert.match(pgSrc, /INSERT INTO client_session_archived_ids \(session_id, msg_id\)[\s\S]*FROM unnest\(\$2::text\[\]\)/i)
   })
@@ -378,10 +380,10 @@ describe('Wave 3 PG perf, model projection, Auto-Dream, Law 2 & tutorial batchin
   })
 
   test('Auditor R1/R2 regressions: userChatBridge strips untrusted _masterHistoricalMessages on all JSON/binary entries and autoDream keeps UI/PATCH mode symmetric', () => {
-    const bridgeSrc = readFileSync(new URL('../ws/userChatBridge.ts', import.meta.url), 'utf8')
+    const bridgeSrc = readUserChatBridgeSource()
     assert.match(
       bridgeSrc,
-      /delete enriched\._masterHistoricalMessages;/,
+      /(?:delete enriched\._masterHistoricalMessages;|Reflect\.deleteProperty\(enriched,\s*['"]_masterHistoricalMessages['"]\))/,
       'userChatBridge must unconditionally strip client _masterHistoricalMessages before master backfill',
     )
     assert.match(
@@ -391,7 +393,7 @@ describe('Wave 3 PG perf, model projection, Auto-Dream, Law 2 & tutorial batchin
     )
     assert.match(
       bridgeSrc,
-      /delete parsedObj\._masterHistoricalMessages;/,
+      /(?:delete parsedObj\._masterHistoricalMessages;|Reflect\.deleteProperty\(parsedObj,\s*['"]_masterHistoricalMessages['"]\))/,
       'userChatBridge text JSON entry must strip _masterHistoricalMessages for all frames',
     )
     const autoDreamSrc = readFileSync(new URL('../user/autoDream.ts', import.meta.url), 'utf8')

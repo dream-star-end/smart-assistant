@@ -9,15 +9,15 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { readPgSessionsBackendSource } from './helpers/pgSessionsSource.js'
+import { readSqliteSessionsSource } from './helpers/sqliteSessionsSource.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const migration = join(here, '../db/migrations/0230_chat_projects.sql')
 const bindMigration = join(here, '../db/migrations/0246_chat_project_board_bind.sql')
-const backendSrc = readFileSync(join(here, '../db/pgSessionsBackend.ts'), 'utf8')
-// sessionsDb.ts plus the modules split out of it (OCV5-485): the SQLite side of the parity check
-const sqliteSrc = ['sessionsDb.ts', 'sessionsDbProjects.ts', 'sessionsDbSidebar.ts']
-  .map((f) => readFileSync(join(here, '../../../storage/src', f), 'utf8'))
-  .join('\n')
+const backendSrc = readPgSessionsBackendSource()
+// sessionsDb.ts plus the modules split out of it (OCV5-485 / OCV5-928): the SQLite side of the parity check
+const sqliteSrc = readSqliteSessionsSource()
 const metadata = JSON.parse(
   readFileSync(join(here, '../../../../deploy/v5/release-metadata.json'), 'utf8'),
 ) as { requiredMigrations: string[] }
@@ -68,7 +68,11 @@ describe('chat_projects PG/SQLite 契约对齐', () => {
       'getChatProjectBindByBoardProjectId',
       'listPinnedProjectAssetsForChatProject',
     ]) {
-      assert.ok(backendSrc.includes(`async ${method}(`), `PG 缺 ${method}`)
+      assert.match(
+        backendSrc,
+        new RegExp(`(?:async\\s+${method}\\s*\\(|\\b${method}\\s*:\\s*(?:async\\s*)?\\()`),
+        `PG 缺 ${method}`,
+      )
       assert.ok(sqliteSrc.includes(`${method}:`), `sqliteBackend 缺 ${method}`)
     }
   })
@@ -79,8 +83,13 @@ describe('chat_projects PG/SQLite 契约对齐', () => {
     assert.match(backendSrc, /ROW_NUMBER\(\) OVER/)
     assert.match(sqliteSrc, /FROM turn_dispatch_inbox/)
     assert.match(sqliteSrc, /state NOT IN \('terminal', 'rejected'\)/)
+    const pgListAt =
+      backendSrc.indexOf('async function listClientSessionsImpl') >= 0
+        ? backendSrc.indexOf('async function listClientSessionsImpl')
+        : backendSrc.indexOf('async listClientSessions')
+    assert.ok(pgListAt >= 0, 'PG 缺 listClientSessions 实现')
     assert.doesNotMatch(
-      backendSrc.slice(backendSrc.indexOf('async listClientSessions'), backendSrc.indexOf('async listClientSessions') + 2500),
+      backendSrc.slice(pgListAt, pgListAt + 2500),
       /for \(const/,
       'list 不得对每条会话再查 dispatch',
     )

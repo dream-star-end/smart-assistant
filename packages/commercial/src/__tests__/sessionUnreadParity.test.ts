@@ -9,17 +9,17 @@ import { dirname, join } from "node:path";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { lastReadAtWatermarkMsSql, LAST_READ_AT_EPOCH_MS_FLOOR } from "@openclaude/storage";
+import { readPgSessionsBackendSource } from "./helpers/pgSessionsSource.js";
+import { readSqliteSessionsSource } from "./helpers/sqliteSessionsSource.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migration0240 = join(here, "../db/migrations/0240_client_session_last_read_at.sql");
 const rollback0240 = join(here, "../db/rollbacks/0240_client_session_last_read_at.sql");
 const migration0241 = join(here, "../db/migrations/0241_raise_last_read_watermark.sql");
 const rollback0241 = join(here, "../db/rollbacks/0241_raise_last_read_watermark.sql");
-const backendSrc = readFileSync(join(here, "../db/pgSessionsBackend.ts"), "utf8");
-// sessionsDb.ts plus the modules split out of it (OCV5-485): the SQLite side of the parity check
-const sqliteSrc = ["sessionsDb.ts", "sessionsDbProjects.ts", "sessionsDbSidebar.ts"]
-  .map((f) => readFileSync(join(here, "../../../storage/src", f), "utf8"))
-  .join("\n");
+const backendSrc = readPgSessionsBackendSource();
+// sessionsDb.ts plus the modules split out of it (OCV5-485 / OCV5-928): the SQLite side of the parity check
+const sqliteSrc = readSqliteSessionsSource();
 const metadata = JSON.parse(
   readFileSync(join(here, "../../../../deploy/v5/release-metadata.json"), "utf8"),
 ) as { requiredMigrations: string[] };
@@ -40,17 +40,21 @@ describe("0240 client_sessions.last_read_at", () => {
 
   test("两条 backend 覆盖 markRead / readAll,list SQL 派生 unread;无 unread-migrate", () => {
     for (const method of ["markClientSessionRead", "markAllClientSessionsRead"]) {
-      assert.ok(backendSrc.includes(`async ${method}(`), `PG 缺 ${method}`);
+      assert.match(
+        backendSrc,
+        new RegExp(`(?:async\\s+${method}\\s*\\(|\\b${method}\\s*:\\s*(?:async\\s*)?\\()`),
+        `PG 缺 ${method}`,
+      );
       assert.ok(sqliteSrc.includes(`${method}:`), `sqliteBackend 缺 ${method}`);
     }
     assert.doesNotMatch(backendSrc, /migrateClientSessionsUnread/);
     assert.doesNotMatch(sqliteSrc, /migrateClientSessionsUnread/);
-    const pgList = backendSrc.slice(
-      backendSrc.indexOf("async listClientSessions"),
-      backendSrc.indexOf("async listClientSessions") + 5500,
-    );
+    const pgListStart = backendSrc.indexOf("function buildListClientSessionsSql(");
+    const pgListEnd = backendSrc.indexOf("function projectFilterSql(", pgListStart + 1);
+    assert.ok(pgListStart >= 0 && pgListEnd > pgListStart, "PG 缺 buildListClientSessionsSql");
+    const pgList = backendSrc.slice(pgListStart, pgListEnd);
     assert.match(pgList, /last_d\.outcome IN \(/);
-    assert.match(pgList, /LAST_READ_AT_MS_SQL/);
+    assert.match(pgList, /(?:LAST_READ_AT_MS_SQL|buildLastReadAtMsSql)/);
     assert.match(pgList, /AS unread/);
     assert.match(sqliteSrc, /LAST_READ_AT_MS_SQL/);
     assert.match(sqliteSrc, /THEN 1 ELSE 0 END AS unread/);

@@ -8,12 +8,13 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { readPgSessionsBackendSource } from './helpers/pgSessionsSource.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const migration = join(here, '../db/migrations/0239_turn_dispatch_shutdown_ctx.sql')
 const storeSrc = readFileSync(join(here, '../dispatch/turnDispatchStore.ts'), 'utf8')
 const reconcilerSrc = readFileSync(join(here, '../dispatch/turnDispatchReconciler.ts'), 'utf8')
-const backendSrc = readFileSync(join(here, '../db/pgSessionsBackend.ts'), 'utf8')
+const backendSrc = readPgSessionsBackendSource()
 const metadata = JSON.parse(
   readFileSync(join(here, '../../../../deploy/v5/release-metadata.json'), 'utf8'),
 ) as { requiredMigrations: string[] }
