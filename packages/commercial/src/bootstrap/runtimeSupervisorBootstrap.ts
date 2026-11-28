@@ -30,7 +30,13 @@ import {
 import { syncLogicalModelPoolBindingsFromCatalog } from "../account-pool/remotePool/logicalModelBindingsSync.js";
 import { bootstrapLegacyRetirementGate, type LegacyTrackRetirementGate } from "../account-pool/remotePool/legacyRetirementRuntime.js";
 import type { LocalCasArtifactBlobStore } from "../agent-sandbox/artifactBlobStore.js";
-import { initMasterArtifactBlobStoreForBootstrap } from "../agent-sandbox/artifactBlobRuntime.js";
+import {
+  createCasBridgedRemoteHostUploadPusher,
+  createCasBridgedRemoteMediaPuller,
+  createCasBridgedUserMediaResolver,
+  initMasterArtifactBlobStoreForBootstrap,
+} from "../agent-sandbox/artifactBlobRuntime.js";
+import type { DockerLike, PoolLike } from "../agent-sandbox/userMedia.js";
 import { createMasterCc5Runtime } from "../agent-sandbox/cc5Runtime.js";
 import {
   makeDraftPreparation,
@@ -150,10 +156,55 @@ import { LiveBrowserTicketStore } from "../ws/liveBrowserTickets.js";
 import { createTunnelContainerSocket } from "../ws/tunnelContainerSocket.js";
 import type { ResolveContainerEndpoint } from "../ws/userChatBridge.js";
 
+let activeMasterArtifactBlobStore: LocalCasArtifactBlobStore | undefined;
+
+export function getActiveMasterArtifactBlobStore(): LocalCasArtifactBlobStore | undefined {
+  return activeMasterArtifactBlobStore;
+}
+
+async function pullNodeAgentMediaFile(args: { hostUuid: string; remotePath: string }): Promise<Buffer | null> {
+  const target = await resolveServiceableHostTarget(args.hostUuid);
+  try { return await nodeAgentGetFile(target, args.remotePath); } finally { target.psk?.fill(0); }
+}
+
+async function putNodeAgentMediaFile(args: { hostUuid: string; remotePath: string; content: Buffer }): Promise<void> {
+  const target = await resolveServiceableHostTarget(args.hostUuid);
+  try { await nodeAgentPutFile(target, args.remotePath, args.content, 0o644, 1000, 1000); } finally { target.psk?.fill(0); }
+}
+
+export function createCasAwareRemoteMediaPuller(
+  getBlobStore: () => LocalCasArtifactBlobStore | undefined = getActiveMasterArtifactBlobStore,
+) {
+  return createCasBridgedRemoteMediaPuller({ getBlobStore, pullFromNodeAgent: pullNodeAgentMediaFile });
+}
+
+export function createCasAwareUserMediaResolver(deps: {
+  pool: PoolLike;
+  docker: DockerLike;
+  getBlobStore?: () => LocalCasArtifactBlobStore | undefined;
+  bridgeRootDir?: string;
+}): (userId: string) => Promise<UserMediaLocation> {
+  return createCasBridgedUserMediaResolver({
+    ...deps,
+    getBlobStore: deps.getBlobStore ?? getActiveMasterArtifactBlobStore,
+  });
+}
+
+export function createCasAwareRemoteHostUploadPusher(opts?: {
+  getBlobStore?: () => LocalCasArtifactBlobStore | undefined;
+  putToNodeAgent?: (args: { hostUuid: string; remotePath: string; content: Buffer }) => Promise<void>;
+}) {
+  return createCasBridgedRemoteHostUploadPusher({
+    getBlobStore: opts?.getBlobStore ?? getActiveMasterArtifactBlobStore,
+    putToNodeAgent: opts?.putToNodeAgent ?? putNodeAgentMediaFile,
+  });
+}
+
 export function bootstrapPluginsRuntime(deps: {
   cfg: CommercialConfig;
   runtimeChannel: string;
   redis: IORedis;
+  artifactBlobStore?: LocalCasArtifactBlobStore;
   knowledgePlanetMediaResolverRef: {
     current: ((userId: string) => Promise<UserMediaLocation>) | undefined;
   };
@@ -164,14 +215,9 @@ export function bootstrapPluginsRuntime(deps: {
         throw new Error("Knowledge Planet media resolver unavailable");
       return deps.knowledgePlanetMediaResolverRef.current(userId);
     },
-    pullRemoteHostMedia: async (args: { hostUuid: string; remotePath: string }) => {
-      const target = await resolveServiceableHostTarget(args.hostUuid);
-      try {
-        return await nodeAgentGetFile(target, args.remotePath);
-      } finally {
-        target.psk?.fill(0);
-      }
-    },
+    pullRemoteHostMedia: createCasAwareRemoteMediaPuller(
+      () => deps.artifactBlobStore ?? activeMasterArtifactBlobStore,
+    ),
     stagingRoot: "/var/lib/openclaude-v5/plugin-media-staging",
     expectedOwnerUid: 0,
   };
@@ -680,18 +726,49 @@ export function wireRemoteMuxDeps(): void {
   console.log("[commercial] sshMux remote deps wired");
 }
 
+function initOptionalChatGptProxy(deps: { runtimeChannel: string; v3Deps: V3SupervisorDeps | undefined }): {
+  chatgptProxyServer: ChatGptProxyServer | undefined; chatgptProxyHttp: ChatGptProxyHttpDeps | undefined;
+} {
+  const cgpEnv = readChatGptProxyEnv();
+  if (!cgpEnv.enabled || deps.runtimeChannel !== "v5" || !deps.v3Deps) return { chatgptProxyServer: undefined, chatgptProxyHttp: undefined };
+  if (cgpEnv.configError || !cgpEnv.upstream) {
+    rootLogger.error("[commercial] chatgpt proxy disabled: bad config", { error: cgpEnv.configError ?? "no upstream" });
+    return { chatgptProxyServer: undefined, chatgptProxyHttp: undefined };
+  }
+  try {
+    const cgpLogger = rootLogger.child({ subsys: "commercial", module: "chatgptProxy" });
+    const pool = deps.v3Deps.pool;
+    const credentials = new ChatGptProxyCredentialStore(pool);
+    const chatgptProxyServer = createChatGptProxyServer({
+      publicHost: cgpEnv.publicHost, port: cgpEnv.port, tlsCertPath: cgpEnv.tlsCertPath, tlsKeyPath: cgpEnv.tlsKeyPath, upstream: cgpEnv.upstream,
+      verifyCredential: (uid, secret) => credentials.verify(uid, secret),
+      resolveUserRole: async (uid) => {
+        const r = await pool.query<{ role: string }>(`SELECT role FROM users WHERE id = $1::bigint AND status = 'active' LIMIT 1`, [uid]);
+        const role = r.rows[0]?.role;
+        return role === "admin" || role === "user" ? role : null;
+      },
+      getEntitlement: async () => { const snap = await getChatGptProxyFlagSnapshot(); return { assembled: snap.assembled, allowlist: snap.allowlist }; },
+      onTunnelUsed: (uid) => credentials.touchLastUsed(uid),
+      logger: cgpLogger,
+    });
+    const chatgptProxyHttp: ChatGptProxyHttpDeps = {
+      publicHost: cgpEnv.publicHost, port: cgpEnv.port, credentials, getFlags: () => getChatGptProxyFlagSnapshot(),
+    };
+    chatgptProxyServer.listenWithRetry();
+    defaultCutoverInFlightTracker.setChatgptProxyTunnelsGetter(() => chatgptProxyServer.activeTunnels());
+    rootLogger.info(`[commercial] ChatGPT direct-connect proxy ENABLED on ${cgpEnv.publicHost}:${cgpEnv.port}`);
+    return { chatgptProxyServer, chatgptProxyHttp };
+  } catch (err) {
+    rootLogger.error("[commercial] chatgpt proxy disabled: init failed", { error: err instanceof Error ? err.message : String(err) });
+    return { chatgptProxyServer: undefined, chatgptProxyHttp: undefined };
+  }
+}
+
 export function buildContainerHelpersAndPreview(deps: {
-  env: NodeJS.ProcessEnv;
-  runtimeChannel: string;
-  v3Deps: V3SupervisorDeps | undefined;
-  agentRuntimeDocker: Docker | undefined;
-  bridgeSecret: string | undefined;
-  loadUserModelAuthz: ReturnType<typeof makeLoadUserModelAuthz>;
-  dispatchAdmissionBackend: DispatchAdmissionBackend | undefined;
-  modelAuthoritySigner: AuthoritySigner | undefined;
-  gatewayPort: number | undefined;
-  containerPreviewTickets: ContainerPreviewTicketStore | undefined;
-  containerPreviewBaseUrl: string | undefined;
+  env: NodeJS.ProcessEnv; runtimeChannel: string; v3Deps: V3SupervisorDeps | undefined; agentRuntimeDocker: Docker | undefined;
+  artifactBlobStore?: LocalCasArtifactBlobStore; bridgeSecret: string | undefined; loadUserModelAuthz: ReturnType<typeof makeLoadUserModelAuthz>;
+  dispatchAdmissionBackend: DispatchAdmissionBackend | undefined; modelAuthoritySigner: AuthoritySigner | undefined;
+  gatewayPort: number | undefined; containerPreviewTickets: ContainerPreviewTicketStore | undefined; containerPreviewBaseUrl: string | undefined;
 }) {
   const clearResolvedEndpointSecret = (
     endpoint: Awaited<ReturnType<ResolveContainerEndpoint>>,
@@ -862,83 +939,24 @@ export function buildContainerHelpersAndPreview(deps: {
       )
     : undefined;
 
+  const resolveActiveCasStore = () => deps.artifactBlobStore ?? activeMasterArtifactBlobStore;
   const mediaResolverDocker = deps.agentRuntimeDocker ?? deps.v3Deps?.docker;
   const userMediaResolver = mediaResolverDocker
-    ? createUserMediaResolver({ pool: getPool(), docker: mediaResolverDocker })
+    ? createCasAwareUserMediaResolver({
+        pool: getPool(),
+        docker: mediaResolverDocker,
+        getBlobStore: resolveActiveCasStore,
+      })
     : undefined;
 
-  const pushRemoteHostUpload = async (args: {
-    hostUuid: string;
-    remotePath: string;
-    content: Buffer;
-  }) => {
-    const target = await resolveServiceableHostTarget(args.hostUuid);
-    try {
-      await nodeAgentPutFile(target, args.remotePath, args.content, 0o644, 1000, 1000);
-    } finally {
-      target.psk?.fill(0);
-    }
-  };
+  const pushRemoteHostUpload = createCasAwareRemoteHostUploadPusher({
+    getBlobStore: resolveActiveCasStore,
+  });
 
-  let chatgptProxyServer: ChatGptProxyServer | undefined;
-  let chatgptProxyHttp: ChatGptProxyHttpDeps | undefined;
-  {
-    const cgpEnv = readChatGptProxyEnv();
-    if (cgpEnv.enabled && deps.runtimeChannel === "v5" && deps.v3Deps) {
-      if (cgpEnv.configError || !cgpEnv.upstream) {
-        rootLogger.error("[commercial] chatgpt proxy disabled: bad config", {
-          error: cgpEnv.configError ?? "no upstream",
-        });
-      } else {
-        try {
-          const cgpLogger = rootLogger.child({ subsys: "commercial", module: "chatgptProxy" });
-          const credentials = new ChatGptProxyCredentialStore(deps.v3Deps.pool);
-          const pool = deps.v3Deps.pool;
-          chatgptProxyServer = createChatGptProxyServer({
-            publicHost: cgpEnv.publicHost,
-            port: cgpEnv.port,
-            tlsCertPath: cgpEnv.tlsCertPath,
-            tlsKeyPath: cgpEnv.tlsKeyPath,
-            upstream: cgpEnv.upstream,
-            verifyCredential: (uid, secret) => credentials.verify(uid, secret),
-            resolveUserRole: async (uid) => {
-              const r = await pool.query<{ role: string }>(
-                `SELECT role FROM users WHERE id = $1::bigint AND status = 'active' LIMIT 1`,
-                [uid],
-              );
-              const role = r.rows[0]?.role;
-              return role === "admin" || role === "user" ? role : null;
-            },
-            getEntitlement: async () => {
-              const snap = await getChatGptProxyFlagSnapshot();
-              return { assembled: snap.assembled, allowlist: snap.allowlist };
-            },
-            onTunnelUsed: (uid) => credentials.touchLastUsed(uid),
-            logger: cgpLogger,
-          });
-          chatgptProxyHttp = {
-            publicHost: cgpEnv.publicHost,
-            port: cgpEnv.port,
-            credentials,
-            getFlags: () => getChatGptProxyFlagSnapshot(),
-          };
-          chatgptProxyServer.listenWithRetry();
-          const cgpSrv = chatgptProxyServer;
-          defaultCutoverInFlightTracker.setChatgptProxyTunnelsGetter(() => cgpSrv.activeTunnels());
-          // eslint-disable-next-line no-console
-          console.log(
-            `[commercial] ChatGPT direct-connect proxy ENABLED on ${cgpEnv.publicHost}:${cgpEnv.port}`,
-          );
-        } catch (err) {
-          chatgptProxyServer = undefined;
-          chatgptProxyHttp = undefined;
-          rootLogger.error("[commercial] chatgpt proxy disabled: init failed", {
-            error: (err as Error)?.message ?? String(err),
-          });
-        }
-      }
-    }
-  }
+  const { chatgptProxyServer, chatgptProxyHttp } = initOptionalChatGptProxy({
+    runtimeChannel: deps.runtimeChannel,
+    v3Deps: deps.v3Deps,
+  });
 
   return {
     sharedEnsureRunning,
@@ -1093,17 +1111,26 @@ export function createOptionalContainerPreviewBridge(deps: {
   };
 }
 
-export async function bootstrapMailerBridgeAndAuthority(deps: {
-  env: NodeJS.ProcessEnv;
-}) {
+async function initOptionalThumbnailCache(env: NodeJS.ProcessEnv, mediaSignKey: Buffer | undefined): Promise<ThumbnailDiskCache | undefined> {
+  if (!mediaSignKey) return undefined;
+  try {
+    const home = env.OPENCLAUDE_HOME ?? path.join(homedir(), ".openclaude");
+    const cache = new ThumbnailDiskCache(path.join(home, "media-thumb-cache"));
+    await cache.init();
+    rootLogger.info("[commercial] media thumbnail cache ready (startup-cleared)");
+    return cache;
+  } catch (err) {
+    rootLogger.error("[commercial] thumbnail cache init failed; thumbnails DISABLED", { error: err instanceof Error ? err.message : String(err) });
+    return undefined;
+  }
+}
+
+export async function bootstrapMailerBridgeAndAuthority(deps: { env: NodeJS.ProcessEnv }) {
   const resendKey = deps.env.RESEND_API_KEY?.trim();
   const mailFrom = deps.env.MAIL_FROM?.trim() || "auth@claudeai.chat";
   const mailer = resendKey ? createResendMailer({ apiKey: resendKey, from: mailFrom }) : stubMailer;
-  if (resendKey) {
-    console.log(`[commercial] mailer = resend (from=${mailFrom})`);
-  } else {
-    console.log("[commercial] mailer = stub (RESEND_API_KEY 未设置, 验证邮件只打日志)");
-  }
+  if (resendKey) console.log(`[commercial] mailer = resend (from=${mailFrom})`);
+  else console.log("[commercial] mailer = stub (RESEND_API_KEY 未设置, 验证邮件只打日志)");
 
   let bridgeSecret: string | undefined;
   try {
@@ -1112,10 +1139,7 @@ export async function bootstrapMailerBridgeAndAuthority(deps: {
     console.log("[commercial] v3 bridge secret loaded", { path: DEFAULT_BRIDGE_SECRET_PATH });
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.error(
-      "[commercial] v3 bridge secret load/create failed; file proxy will be DISABLED",
-      { path: DEFAULT_BRIDGE_SECRET_PATH, error: (err as Error)?.message ?? String(err) },
-    );
+    console.error("[commercial] v3 bridge secret load/create failed; file proxy will be DISABLED", { path: DEFAULT_BRIDGE_SECRET_PATH, error: (err as Error)?.message ?? String(err) });
     bridgeSecret = undefined;
   }
 
@@ -1128,9 +1152,7 @@ export async function bootstrapMailerBridgeAndAuthority(deps: {
       console.log("[commercial] v3 media signing key derived");
     } catch (err) {
       // eslint-disable-next-line no-console
-      console.error("[commercial] media sign key derivation failed; signed URL DISABLED", {
-        error: (err as Error)?.message ?? String(err),
-      });
+      console.error("[commercial] media sign key derivation failed; signed URL DISABLED", { error: (err as Error)?.message ?? String(err) });
       mediaSignKey = undefined;
     }
     try {
@@ -1139,34 +1161,14 @@ export async function bootstrapMailerBridgeAndAuthority(deps: {
       console.log("[commercial] v3 wechat live link key derived");
     } catch (err) {
       // eslint-disable-next-line no-console
-      console.error("[commercial] wechat live key derivation failed; live links DISABLED", {
-        error: (err as Error)?.message ?? String(err),
-      });
+      console.error("[commercial] wechat live key derivation failed; live links DISABLED", { error: (err as Error)?.message ?? String(err) });
       wechatLiveLinkKey = undefined;
     }
   }
 
-  let thumbnailCache: ThumbnailDiskCache | undefined;
-  if (mediaSignKey) {
-    try {
-      const home = deps.env.OPENCLAUDE_HOME ?? path.join(homedir(), ".openclaude");
-      const cache = new ThumbnailDiskCache(path.join(home, "media-thumb-cache"));
-      await cache.init();
-      thumbnailCache = cache;
-      // eslint-disable-next-line no-console
-      console.log("[commercial] media thumbnail cache ready (startup-cleared)");
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("[commercial] thumbnail cache init failed; thumbnails DISABLED", {
-        error: (err as Error)?.message ?? String(err),
-      });
-      thumbnailCache = undefined;
-    }
-  }
-
+  const thumbnailCache = await initOptionalThumbnailCache(deps.env, mediaSignKey);
   const modelAuthorityFlag = deps.env.OC_MODEL_AUTHORITY === "1";
-  const modelAuthorityProvisionRequired =
-    modelAuthorityFlag && deps.env.OC_MODEL_AUTHORITY_PROVISION_REQUIRED !== "0";
+  const modelAuthorityProvisionRequired = modelAuthorityFlag && deps.env.OC_MODEL_AUTHORITY_PROVISION_REQUIRED !== "0";
   let modelAuthoritySigner: AuthoritySigner | undefined;
   let modelCatalogCache: ModelCatalogCache | undefined;
   if (modelAuthorityFlag) {
@@ -1175,8 +1177,7 @@ export async function bootstrapMailerBridgeAndAuthority(deps: {
     modelCatalogCache = await getModelCatalogCache();
     // eslint-disable-next-line no-console
     console.log("[commercial] model authority ENABLED", {
-      activeKeyId: modelAuthoritySigner.activeKeyId,
-      keyIds: modelAuthoritySigner.keyIds.length,
+      activeKeyId: modelAuthoritySigner.activeKeyId, keyIds: modelAuthoritySigner.keyIds.length,
       securityEpoch: modelCatalogCache.current().securityEpoch.toString(),
       executionRevision: modelCatalogCache.current().executionRevision.slice(0, 12),
     });
@@ -1184,21 +1185,12 @@ export async function bootstrapMailerBridgeAndAuthority(deps: {
 
   const artifactBlobStore = initMasterArtifactBlobStoreForBootstrap({
     openClaudeHome: deps.env.OPENCLAUDE_HOME ?? path.join(homedir(), ".openclaude"),
-    casRootDir: deps.env.OC_ARTIFACT_CAS_ROOT,
-    pgPool: getPool(),
-    bridgeSecret,
-    env: deps.env,
+    casRootDir: deps.env.OC_ARTIFACT_CAS_ROOT, pgPool: getPool(), bridgeSecret, env: deps.env,
   });
+  activeMasterArtifactBlobStore = artifactBlobStore;
 
   return {
-    mailer,
-    bridgeSecret,
-    mediaSignKey,
-    wechatLiveLinkKey,
-    thumbnailCache,
-    artifactBlobStore,
-    modelAuthorityProvisionRequired,
-    modelAuthoritySigner,
-    modelCatalogCache,
+    mailer, bridgeSecret, mediaSignKey, wechatLiveLinkKey, thumbnailCache,
+    artifactBlobStore, modelAuthorityProvisionRequired, modelAuthoritySigner, modelCatalogCache,
   };
 }

@@ -291,3 +291,51 @@ export interface ScopedCapabilityTokenClaims {
   readonly issuedAt: number
   readonly expiresAt: number
 }
+
+/**
+ * Canonical L0 capability defaults per `ExecEnvHostKind` (OCV5-928 W2-CS2).
+ *
+ * Single source of truth consumed by both `compute-pool/execEnvHandle.ts` and
+ * `ws/containerLinkToolBroker.ts` so `desktop-virtual` (`['ws_tunnel', 'uds_jsonrpc']`),
+ * `local-docker` (`['ws_tunnel', 'loopback_http']`), and `compute-pool-docker`
+ * (`['ws_tunnel']`) never diverge across adapters.
+ */
+export function defaultCapabilitiesForHostKind(
+  hostKind: ExecEnvHostKind,
+): ExecEnvCapabilities {
+  switch (hostKind) {
+    case 'local-docker':
+      return {
+        hostKind,
+        supportedChannels: ['ws_tunnel', 'loopback_http'],
+        supportsManagedJobs: true,
+        supportsDaemonServices: true,
+        supportsWorkspaceSnapshots: true,
+        supportsNetworkIsolation: true,
+        supportsSeccompProfile: true,
+        maxConcurrentJobs: 16,
+      }
+    case 'compute-pool-docker':
+      return {
+        hostKind,
+        supportedChannels: ['ws_tunnel'],
+        supportsManagedJobs: true,
+        supportsDaemonServices: true,
+        supportsWorkspaceSnapshots: true,
+        supportsNetworkIsolation: true,
+        supportsSeccompProfile: true,
+        maxConcurrentJobs: 16,
+      }
+    case 'desktop-virtual':
+      return {
+        hostKind,
+        supportedChannels: ['ws_tunnel', 'uds_jsonrpc'],
+        supportsManagedJobs: true,
+        supportsDaemonServices: false,
+        supportsWorkspaceSnapshots: false,
+        supportsNetworkIsolation: false,
+        supportsSeccompProfile: false,
+        maxConcurrentJobs: 8,
+      }
+  }
+}

@@ -52,39 +52,19 @@ export interface MigrationInstallReceiptContext {
   readonly warn?: (message: string, meta: Record<string, unknown>) => void;
 }
 
-/**
- * OCV5-902 B1: Only un-upgraded legacy containers performing a non-warm (`cold_degraded`)
- * migration may fall back to clearing `pendingInstallMigration` from a generic `running` or
- * `terminal` dispatch receipt. NEVER on `'queued'`, and NEVER for `tape_rebuilt`!
- */
+/** OCV5-902 B1 / OCV5-928 W2-CS1: Only non-warm (`cold_degraded` / legacy untiered) migrations may clear on generic `running`/`terminal` receipts. */
 export function shouldMarkInstallFromDispatchReceipt(
   pending: PendingMigrationInstallRecord | null | undefined,
   receiptState: unknown,
 ): boolean {
-  if (!pending) return false;
-  if (pending.continuityTier === "tape_rebuilt") return false;
-  if (
-    typeof pending.checkpointGeneration === "string" &&
-    pending.checkpointGeneration.trim().length > 0
-  ) {
-    return false;
-  }
+  if (!pending || pending.continuityTier === "tape_rebuilt" || pending.continuityTier === "warm_capsule") return false;
+  if (typeof pending.checkpointGeneration === "string" && pending.checkpointGeneration.trim().length > 0) return false;
   return receiptState === "running" || receiptState === "terminal";
 }
 
-/**
- * OCV5-902 B1: Clears legacy `cold_degraded` pending installs on verified `running`/`terminal`
- * dispatch receipts (including follow-up receipts after `queued` dropped `admittedDispatches`).
- * Never fires on `queued` or `tape_rebuilt`, and keeps `pendingMigrationInstalls` intact on PG failure.
- */
+/** OCV5-902 B1: Clears legacy `cold_degraded` pending installs on verified `running`/`terminal` dispatch receipts. */
 export function tryMarkLegacyColdInstallFromReceipt(
-  receipt: {
-    readonly clientMessageId: string;
-    readonly dispatchId: string;
-    readonly attemptNo: number;
-    readonly sessionId: string;
-    readonly state: unknown;
-  },
+  receipt: { readonly clientMessageId: string; readonly dispatchId: string; readonly attemptNo: number; readonly sessionId: string; readonly state: unknown },
   ctx: {
     readonly uid: number | bigint;
     readonly pendingMigrationInstalls: Map<string, MigrationInstallDispatchLookupRecord>;
@@ -95,66 +75,50 @@ export function tryMarkLegacyColdInstallFromReceipt(
   const rec = ctx.pendingMigrationInstalls.get(receipt.clientMessageId);
   const pending = rec?.pendingMigrationInstall;
   if (!rec || !pending || !ctx.markPlacementMigrationInstalled) return;
-  if (
-    rec.dispatchId !== receipt.dispatchId ||
-    rec.attemptNo !== receipt.attemptNo ||
-    (typeof rec.sessionId === "string" && rec.sessionId !== receipt.sessionId)
-  ) {
-    return;
-  }
+  if (rec.dispatchId !== receipt.dispatchId || rec.attemptNo !== receipt.attemptNo || (typeof rec.sessionId === "string" && rec.sessionId !== receipt.sessionId)) return;
   if (!shouldMarkInstallFromDispatchReceipt(pending, receipt.state)) return;
   void ctx
     .markPlacementMigrationInstalled({
-      uid: Number(ctx.uid),
-      sessionKey: pending.sessionKey,
-      placementEpoch: pending.placementEpoch,
-      migrationId: pending.migrationId,
-      checkpointGeneration: null,
-      consumedByTurnKey: rec.clientMessageId,
-      requireWarmCheckpointMatch: false,
+      uid: Number(ctx.uid), sessionKey: pending.sessionKey, placementEpoch: pending.placementEpoch,
+      migrationId: pending.migrationId, checkpointGeneration: null,
+      consumedByTurnKey: rec.clientMessageId, requireWarmCheckpointMatch: false,
     })
-    .then((installed) => {
-      if (installed) {
-        ctx.pendingMigrationInstalls.delete(rec.clientMessageId);
-      }
-    })
+    .then((installed) => { if (installed) ctx.pendingMigrationInstalls.delete(rec.clientMessageId); })
     .catch((err) => {
       ctx.warn?.("user-chat-bridge: legacy cold migration install PG commit failed", {
-        clientMessageId: rec.clientMessageId,
-        dispatchId: rec.dispatchId,
-        migrationId: pending.migrationId,
-        err,
+        clientMessageId: rec.clientMessageId, dispatchId: rec.dispatchId, migrationId: pending.migrationId, err,
       });
     });
 }
 
-/**
- * OCV5-902 B1: Master-side parser/handler for container `outbound.control.migration_install_receipt`
- * frames. Always consumes the control frame (returns `true`, never forwarded to browser) and
- * commits PG `markPlacementMigrationInstalled` ONLY after exact verification of
- * `(clientMessageId, dispatchId, attemptNo, sessionKey, migrationId, placementEpoch, checkpointGeneration)`.
- */
-export function parseAndHandleMigrationInstallReceipt(
-  frameText: string | null,
-  ctx: MigrationInstallReceiptContext,
-): boolean {
-  if (frameText === null || !frameText.includes(`"${MIGRATION_INSTALL_RECEIPT_TYPE}"`)) {
-    return false;
+function evaluateMigrationReceiptGenerationMatch(
+  pending: PendingMigrationInstallRecord,
+  continuityTier: string,
+  checkpointGeneration: string | null,
+): { readonly ok: true; readonly requireWarmCheckpointMatch: boolean } | { readonly ok: false; readonly warnMessage: string } {
+  const expectedGen = typeof pending.checkpointGeneration === "string" && pending.checkpointGeneration.trim().length > 0 ? pending.checkpointGeneration.trim() : null;
+  if (expectedGen !== null) {
+    if (continuityTier !== "tape_rebuilt" || checkpointGeneration !== expectedGen) {
+      return { ok: false, warnMessage: "user-chat-bridge: warm migration install receipt generation mismatch ignored" };
+    }
+    return { ok: true, requireWarmCheckpointMatch: true };
   }
+  if (pending.continuityTier === "tape_rebuilt" || pending.continuityTier === "warm_capsule") {
+    if (continuityTier === "cold_degraded" && checkpointGeneration === null) return { ok: true, requireWarmCheckpointMatch: false };
+    return { ok: false, warnMessage: "user-chat-bridge: warm migration install receipt generation mismatch ignored" };
+  }
+  if (checkpointGeneration !== null) {
+    return { ok: false, warnMessage: "user-chat-bridge: non-warm migration install receipt unexpected generation ignored" };
+  }
+  return { ok: true, requireWarmCheckpointMatch: false };
+}
+
+/** OCV5-902 B1: Master parser/handler for `outbound.control.migration_install_receipt` frames. */
+export function parseAndHandleMigrationInstallReceipt(frameText: string | null, ctx: MigrationInstallReceiptContext): boolean {
+  if (frameText === null || !frameText.includes(`"${MIGRATION_INSTALL_RECEIPT_TYPE}"`)) return false;
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(frameText);
-  } catch {
-    return false;
-  }
-  if (
-    !parsed ||
-    typeof parsed !== "object" ||
-    Array.isArray(parsed) ||
-    (parsed as { type?: unknown }).type !== MIGRATION_INSTALL_RECEIPT_TYPE
-  ) {
-    return false;
-  }
+  try { parsed = JSON.parse(frameText); } catch { return false; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || (parsed as { type?: unknown }).type !== MIGRATION_INSTALL_RECEIPT_TYPE) return false;
   const r = parsed as Record<string, unknown>;
   const cmid = typeof r.clientMessageId === "string" ? r.clientMessageId.trim() : "";
   const dispatchId = typeof r.dispatchId === "string" ? r.dispatchId.trim() : "";
@@ -164,107 +128,44 @@ export function parseAndHandleMigrationInstallReceipt(
   const placementEpoch = r.placementEpoch;
   const continuityTier = typeof r.continuityTier === "string" ? r.continuityTier.trim() : "";
   const rawGen = r.checkpointGeneration;
-  const checkpointGeneration =
-    rawGen === null
-      ? null
-      : typeof rawGen === "string" && rawGen.trim().length > 0 && rawGen.trim().length <= 128
-        ? rawGen.trim()
-        : undefined;
+  const checkpointGeneration = rawGen === null ? null : typeof rawGen === "string" && rawGen.trim().length > 0 && rawGen.trim().length <= 128 ? rawGen.trim() : undefined;
 
   if (
-    cmid.length === 0 ||
-    dispatchId.length === 0 ||
-    typeof attemptNo !== "number" ||
-    !Number.isSafeInteger(attemptNo) ||
-    attemptNo < 1 ||
-    sessionKey.length === 0 ||
-    !MIGRATION_ID_RE.test(migrationId) ||
-    typeof placementEpoch !== "number" ||
-    !Number.isSafeInteger(placementEpoch) ||
-    placementEpoch < 1 ||
-    continuityTier.length === 0 ||
-    checkpointGeneration === undefined
+    cmid.length === 0 || dispatchId.length === 0 || typeof attemptNo !== "number" || !Number.isSafeInteger(attemptNo) || attemptNo < 1 ||
+    sessionKey.length === 0 || !MIGRATION_ID_RE.test(migrationId) || typeof placementEpoch !== "number" || !Number.isSafeInteger(placementEpoch) ||
+    placementEpoch < 1 || continuityTier.length === 0 || checkpointGeneration === undefined
   ) {
-    ctx.warn?.("user-chat-bridge: malformed migration install receipt ignored", {
-      clientMessageId: cmid || undefined,
-      dispatchId: dispatchId || undefined,
-    });
+    ctx.warn?.("user-chat-bridge: malformed migration install receipt ignored", { clientMessageId: cmid || undefined, dispatchId: dispatchId || undefined });
     return true;
   }
 
   const rec = ctx.pendingMigrationInstalls?.get(cmid) ?? ctx.admittedDispatches.get(cmid);
   const pending = rec?.pendingMigrationInstall;
-  if (!rec || !pending) {
+  if (!rec || !pending) return true;
+
+  if (rec.dispatchId !== dispatchId || rec.attemptNo !== attemptNo || pending.sessionKey !== sessionKey || pending.migrationId !== migrationId || pending.placementEpoch !== placementEpoch) {
+    ctx.warn?.("user-chat-bridge: migration install receipt identity mismatch ignored", { clientMessageId: cmid, dispatchId, migrationId });
     return true;
   }
 
-  const expectedGen =
-    typeof pending.checkpointGeneration === "string" && pending.checkpointGeneration.trim().length > 0
-      ? pending.checkpointGeneration.trim()
-      : null;
-  const isWarm = pending.continuityTier === "tape_rebuilt" || expectedGen !== null;
-
-  if (
-    rec.dispatchId !== dispatchId ||
-    rec.attemptNo !== attemptNo ||
-    pending.sessionKey !== sessionKey ||
-    pending.migrationId !== migrationId ||
-    pending.placementEpoch !== placementEpoch
-  ) {
-    ctx.warn?.("user-chat-bridge: migration install receipt identity mismatch ignored", {
-      clientMessageId: cmid,
-      dispatchId,
-      migrationId,
-    });
-    return true;
-  }
-
-  if (isWarm) {
-    if (
-      expectedGen === null ||
-      continuityTier !== "tape_rebuilt" ||
-      checkpointGeneration !== expectedGen
-    ) {
-      ctx.warn?.("user-chat-bridge: warm migration install receipt generation mismatch ignored", {
-        clientMessageId: cmid,
-        dispatchId,
-        migrationId,
-      });
-      return true;
-    }
-  } else if (checkpointGeneration !== null) {
-    ctx.warn?.("user-chat-bridge: non-warm migration install receipt unexpected generation ignored", {
-      clientMessageId: cmid,
-      dispatchId,
-      migrationId,
-    });
+  const genCheck = evaluateMigrationReceiptGenerationMatch(pending, continuityTier, checkpointGeneration);
+  if (!genCheck.ok) {
+    ctx.warn?.(genCheck.warnMessage, { clientMessageId: cmid, dispatchId, migrationId });
     return true;
   }
 
   if (ctx.markPlacementMigrationInstalled) {
     void ctx
       .markPlacementMigrationInstalled({
-        uid: Number(ctx.uid),
-        sessionKey: pending.sessionKey,
-        placementEpoch: pending.placementEpoch,
-        migrationId: pending.migrationId,
-        checkpointGeneration,
-        consumedByTurnKey: rec.clientMessageId,
-        requireWarmCheckpointMatch: isWarm,
+        uid: Number(ctx.uid), sessionKey: pending.sessionKey, placementEpoch: pending.placementEpoch,
+        migrationId: pending.migrationId, checkpointGeneration, consumedByTurnKey: rec.clientMessageId,
+        requireWarmCheckpointMatch: genCheck.requireWarmCheckpointMatch,
       })
       .then((installed) => {
-        if (installed) {
-          ctx.pendingMigrationInstalls?.delete(rec.clientMessageId);
-          ctx.onInstalled?.(rec);
-        }
+        if (installed) { ctx.pendingMigrationInstalls?.delete(rec.clientMessageId); ctx.onInstalled?.(rec); }
       })
       .catch((err) => {
-        ctx.warn?.("user-chat-bridge: migration install receipt PG commit failed", {
-          clientMessageId: cmid,
-          dispatchId,
-          migrationId,
-          err,
-        });
+        ctx.warn?.("user-chat-bridge: migration install receipt PG commit failed", { clientMessageId: cmid, dispatchId, migrationId, err });
       });
   }
   return true;

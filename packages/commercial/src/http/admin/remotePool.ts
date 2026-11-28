@@ -18,7 +18,10 @@ import {
   type RemoteBrainEngine,
 } from '../../account-pool/remoteBrainPool.js'
 import { peekModelCatalogCache } from '../../billing/modelCatalogRuntime.js'
+import type { LogicalModelBindingReader } from '../../account-pool/remotePool/unifiedPlacementRouter.js'
+import { getPool } from '../../db/index.js'
 import { query } from '../../db/queries.js'
+import { PgLogicalModelBindingStore } from '../../db/threeLayerStateStore.js'
 import { requireAuth } from '../auth.js'
 import type { CommercialHttpDeps, RequestContext } from '../handlers.js'
 import { HttpError, readJsonBody, sendJson } from '../util.js'
@@ -225,6 +228,98 @@ export async function handleAdminRemotePoolBindingRevoke(
   sendJson(res, 200, result)
 }
 
+export interface SessionPreheatTargetResolution {
+  readonly isRemote: boolean
+  readonly canonicalModelId: string
+  readonly driverId?: string
+  readonly reason?: 'LOCAL_PLACEMENT' | 'MODEL_POOL_BINDING_DISABLED'
+}
+
+export interface ResolveSessionPreheatTargetOptions {
+  readonly bindingStore?: LogicalModelBindingReader
+  readonly resolveCatalogPlacement?: (modelId: string) => string | undefined
+}
+
+/**
+ * Resolves whether `POST /api/sessions/preheat` should preheat a `remote_pool` lane and
+ * which `canonicalModelId` to preheat (OCV5-928 W2-CS1).
+ *
+ * Checks `PgLogicalModelBindingStore` first so non-`-remote` logical model IDs bound to
+ * `remote_pool` (e.g. `claude-sonnet-4-6` -> `claude-sonnet-4-6-remote`) preheat accurately,
+ * while Q1 unconfigured / `42P01` deployments fall back cleanly to catalog placement or
+ * legacy `-remote` suffix detection.
+ */
+export async function resolveSessionPreheatTarget(
+  model: string,
+  opts: ResolveSessionPreheatTargetOptions = {},
+): Promise<SessionPreheatTargetResolution> {
+  const trimmed = model.trim()
+  if (!trimmed) {
+    return { isRemote: false, canonicalModelId: '', reason: 'LOCAL_PLACEMENT' }
+  }
+
+  try {
+    const store = opts.bindingStore ?? new PgLogicalModelBindingStore(getPool())
+    if (store.inspectLogicalModelBindings) {
+      const inspected = await store.inspectLogicalModelBindings(trimmed)
+      if (inspected.status === 'configured' && inspected.hasConfiguredBindings) {
+        if (inspected.enabledBindings.length === 0) {
+          return {
+            isRemote: false,
+            canonicalModelId: trimmed,
+            reason: 'MODEL_POOL_BINDING_DISABLED',
+          }
+        }
+        const primary = inspected.enabledBindings[0]!
+        if (primary.poolKind === 'remote_pool') {
+          return {
+            isRemote: true,
+            canonicalModelId: primary.canonicalModelId,
+            driverId: primary.driverId,
+          }
+        }
+        return {
+          isRemote: false,
+          canonicalModelId: primary.canonicalModelId,
+          reason: 'LOCAL_PLACEMENT',
+        }
+      }
+    } else {
+      const resolved = await store.resolveBindingsForModel(trimmed)
+      if (resolved.bindings.length > 0) {
+        const primary = resolved.bindings[0]!
+        if (primary.poolKind === 'remote_pool') {
+          return {
+            isRemote: true,
+            canonicalModelId: primary.canonicalModelId,
+            driverId: primary.driverId,
+          }
+        }
+        return {
+          isRemote: false,
+          canonicalModelId: primary.canonicalModelId,
+          reason: 'LOCAL_PLACEMENT',
+        }
+      }
+    }
+  } catch (err) {
+    // Q1 compatibility: missing table (`42P01`/`42703`) or uninitialized pool falls back to catalog/suffix.
+    void err
+  }
+
+  const catalogPlacement = opts.resolveCatalogPlacement
+    ? opts.resolveCatalogPlacement(trimmed)
+    : peekModelCatalogCache()?.current()?.resolve(trimmed)?.placement
+  const isLegacyRemote =
+    catalogPlacement === 'remote_pool' ||
+    trimmed.endsWith('-remote') ||
+    trimmed === 'box-claude-sonnet-5'
+
+  return isLegacyRemote
+    ? { isRemote: true, canonicalModelId: trimmed }
+    : { isRemote: false, canonicalModelId: trimmed, reason: 'LOCAL_PLACEMENT' }
+}
+
 /**
  * Fast preheat endpoint (`POST /api/sessions/preheat`) so picking a `remote_pool` model
  * or focusing the composer pre-establishes the hot_idle binding before the user hits Enter.
@@ -242,27 +337,28 @@ export async function handleSessionPreheat(
   }
   const model = typeof body.model === 'string' ? body.model.trim() : ''
   const sessionKey = typeof body.sessionKey === 'string' ? body.sessionKey.trim() : ''
-  const isRemote = model.endsWith('-remote') || model === 'box-claude-sonnet-5'
-  if (!isRemote) {
+  const target = await resolveSessionPreheatTarget(model)
+  if (!target.isRemote) {
     sendJson(res, 200, {
       ok: true,
       sessionKey,
       model,
       placement: 'local' as const,
       preheated: false,
-      reason: 'LOCAL_PLACEMENT',
+      reason: target.reason ?? 'LOCAL_PLACEMENT',
     })
     return
   }
   const outcome = await preheatRemotePoolSession({
     uid: String(user.id),
     sessionKey,
-    canonicalModelId: model,
+    canonicalModelId: target.canonicalModelId,
   })
   sendJson(res, 200, {
     ok: true,
     sessionKey,
     model,
+    canonicalModelId: target.canonicalModelId,
     placement: 'remote_pool' as const,
     preheated: outcome.preheated,
     reason: outcome.reason ?? null,

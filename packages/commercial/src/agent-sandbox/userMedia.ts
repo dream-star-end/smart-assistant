@@ -382,6 +382,35 @@ export function isUserVolumeMediaPath(resolvedPath: string): boolean {
   );
 }
 
+export interface ParsedUserVolumeMediaFilePath {
+  readonly uid: number;
+  readonly kind: MediaKind;
+  readonly filename: string;
+}
+
+/**
+ * Parses a canonical user media host file path for the active runtime channel
+ * (`/var/lib/docker/volumes/oc-<channel>-data-u<uid>/_data/(uploads|generated)/<filename>`),
+ * returning `{ uid, kind, filename }` or `null` when malformed or out-of-channel.
+ */
+export function parseUserVolumeMediaFilePath(
+  resolvedPath: string,
+): ParsedUserVolumeMediaFilePath | null {
+  if (!USER_VOLUME_MEDIA_FILE_REGEX.test(resolvedPath)) return null;
+  const parts = resolvedPath.split("/");
+  if (parts.length !== 9) return null;
+  const volumeSeg = parts[5] ?? "";
+  const kindSeg = parts[7] ?? "";
+  const filename = parts[8] ?? "";
+  const expectedPrefix = `${MEDIA_VOLUME_PREFIX}-u`;
+  if (!volumeSeg.startsWith(expectedPrefix)) return null;
+  const uid = parseCommercialUid(`c:${volumeSeg.slice(expectedPrefix.length)}`);
+  if (uid === null) return null;
+  if (kindSeg !== "uploads" && kindSeg !== "generated") return null;
+  if (!filename || filename === "." || filename === "..") return null;
+  return { uid, kind: kindSeg, filename };
+}
+
 // ─── internal helpers ───────────────────────────────────────────────────
 
 function isDockerNotFound(err: unknown): boolean {
