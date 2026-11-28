@@ -31,6 +31,7 @@ import {
   analyzeBackgroundTasksInSteps,
   buildDurableSwarmBoardInput,
   compactSwarmSnapshotForPersistence,
+  createBackgroundTaskState,
   describeToolActivity,
   findActiveNonBoardToolInTurn,
   findTurnStartIndex,
@@ -173,6 +174,17 @@ function buildErrorTranscriptSummary(
   }
 }
 
+function summarizeEmptyTranscriptTail(opts?: { incBgTasks?: BackgroundTaskTelemetrySummary; tailTruncated?: boolean }): TranscriptSummary {
+  const mergedBg = mergeBackgroundTaskStates(createBackgroundTaskState(), opts?.incBgTasks, { tailTruncated: opts?.tailTruncated })
+  const base: TranscriptSummary = {
+    stepCount: 0, status: null, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, thinkingTokens: 0, toolCalls: 0,
+    ...(mergedBg.incompleteEvidence ? { incompleteBgEvidence: true } : {}),
+  }
+  return mergedBg.activeIds.size > 0 || mergedBg.overflowed
+    ? { ...base, status: 'working', activity: '后台运行命令', waitingOnBoard: false, hasActiveNonWaitTool: true }
+    : base
+}
+
 /**
  * Inspect a member's compact `transcript.jsonl` tail to determine its live
  * status, step count, current activity, error state, and lightweight telemetry
@@ -182,12 +194,9 @@ export function parseMemberTranscriptTail(
   text: string | null,
   opts?: { incBgTasks?: BackgroundTaskTelemetrySummary; incPartial?: boolean; tailTruncated?: boolean },
 ): TranscriptSummary {
-  const empty: TranscriptSummary = {
-    stepCount: 0, status: null, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, thinkingTokens: 0, toolCalls: 0,
-  }
-  if (!text) return empty
+  if (!text) return summarizeEmptyTranscriptTail(opts)
   const lines = text.split('\n').filter((l) => l.trim().length > 0)
-  if (lines.length === 0) return empty
+  if (lines.length === 0) return summarizeEmptyTranscriptTail(opts)
 
   const steps: Array<Record<string, unknown>> = []
   for (const line of lines) {
@@ -199,7 +208,7 @@ export function parseMemberTranscriptTail(
       // Ignore partial trailing line while CLI is appending.
     }
   }
-  if (steps.length === 0) return empty
+  if (steps.length === 0) return summarizeEmptyTranscriptTail(opts)
 
   let maxStepIndex = steps.length
   let firstStepAt: number | undefined

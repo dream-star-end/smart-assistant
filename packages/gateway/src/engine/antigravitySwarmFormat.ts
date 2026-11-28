@@ -9,6 +9,7 @@ import {
 } from '@openclaude/protocol'
 import {
   analyzeBackgroundTasksInSteps,
+  createBackgroundTaskState,
   extractGenericBgTaskStartId,
   mergeBackgroundTaskStates,
   type BackgroundTaskState,
@@ -19,6 +20,7 @@ import {
 
 export {
   analyzeBackgroundTasksInSteps,
+  createBackgroundTaskState,
   mergeBackgroundTaskStates,
   type BackgroundTaskState,
   type BackgroundTaskTelemetrySummary,
@@ -208,98 +210,157 @@ function consumeAnonymousDoneStep(
   return true
 }
 
-function countUniqueDoneBatchResults(postSteps: readonly Record<string, unknown>[]): {
+interface BatchDoneTracker {
+  readonly seenIds: Set<string>
+  readonly unsettledIds: Set<string>
+  readonly unsettledAnonTools: Map<string, number>
+  readonly seenIndices: Set<number>
+  readonly seenPayloads: Set<string>
   doneCount: number
-  hasUnsettled: boolean
   explicitSwarmWaitDone: boolean
-} {
-  const seenIds = new Set<string>()
-  const unsettledIds = new Set<string>()
-  const unsettledAnonTools = new Map<string, number>()
-  const seenIndices = new Set<number>()
-  const seenPayloads = new Set<string>()
-  let doneCount = 0
-  let explicitSwarmWaitDone = false
-  for (const step of postSteps) {
-    const stepType = strOf(step.type).toUpperCase()
-    if (stepType === 'SYSTEM_MESSAGE' || stepType === 'USER_INPUT') continue
-    const st = strOf(step.status).toUpperCase()
-    const cid = stepCallId(step)
-    const tname = stepToolName(step)
-    if (st !== 'DONE') {
-      recordUnsettledStep(cid, tname, seenIds, unsettledIds, unsettledAnonTools)
-      continue
-    }
-    if (cid) {
-      unsettledIds.delete(cid)
-      if (seenIds.has(cid)) continue
-      seenIds.add(cid)
-    } else if (!consumeAnonymousDoneStep(step, tname, seenIndices, seenPayloads, unsettledAnonTools)) {
-      continue
-    }
-    if (tname === 'swarm_wait') explicitSwarmWaitDone = true
-    doneCount += 1
-  }
-  const hasUnsettled = unsettledIds.size > 0 || [...unsettledAnonTools.values()].some((n) => n > 0)
-  return { doneCount, hasUnsettled, explicitSwarmWaitDone }
 }
 
-function hasTurnEndedBeforeStep(
-  turnSteps: readonly Record<string, unknown>[],
+function createBatchDoneTracker(): BatchDoneTracker {
+  return {
+    seenIds: new Set(), unsettledIds: new Set(), unsettledAnonTools: new Map(),
+    seenIndices: new Set(), seenPayloads: new Set(), doneCount: 0, explicitSwarmWaitDone: false,
+  }
+}
+
+function ingestBatchDoneStep(b: BatchDoneTracker, step: Record<string, unknown>, stepType: string): void {
+  if (stepType === 'SYSTEM_MESSAGE' || stepType === 'USER_INPUT') return
+  const st = strOf(step.status).toUpperCase()
+  const cid = stepCallId(step)
+  const tname = stepToolName(step)
+  if (st !== 'DONE') {
+    recordUnsettledStep(cid, tname, b.seenIds, b.unsettledIds, b.unsettledAnonTools)
+    return
+  }
+  if (cid) {
+    b.unsettledIds.delete(cid)
+    if (b.seenIds.has(cid)) return
+    b.seenIds.add(cid)
+  } else if (!consumeAnonymousDoneStep(step, tname, b.seenIndices, b.seenPayloads, b.unsettledAnonTools)) {
+    return
+  }
+  if (tname === 'swarm_wait') b.explicitSwarmWaitDone = true
+  b.doneCount += 1
+}
+
+function batchHasUnsettled(b: BatchDoneTracker): boolean {
+  if (b.unsettledIds.size > 0) return true
+  for (const n of b.unsettledAnonTools.values()) {
+    if (n > 0) return true
+  }
+  return false
+}
+
+interface TurnBoundaryState {
+  hasSteps: boolean
+  lastType: string
+  lastSt: string
+  lastToolName: string
+  lastCallsLen: number
+  hasPlanner: boolean
+  lastPlannerSt: string
+  lastPlannerHasWait: boolean
+  lastPlannerCallsLen: number
+  epoch: number
+  readonly callState: CallReductionState
+  batch: BatchDoneTracker
+  cachedEnded: boolean | null
+}
+
+function createTurnBoundaryState(): TurnBoundaryState {
+  return {
+    hasSteps: false, lastType: '', lastSt: '', lastToolName: '', lastCallsLen: 0,
+    hasPlanner: false, lastPlannerSt: '', lastPlannerHasWait: false, lastPlannerCallsLen: 0,
+    epoch: 0, callState: createCallReductionState(), batch: createBatchDoneTracker(), cachedEnded: null,
+  }
+}
+
+function ingestTurnBoundaryStep(
+  t: TurnBoundaryState,
+  step: Record<string, unknown>,
+  stepType: string,
   bgTasks?: BackgroundTaskState,
-): boolean {
-  if (turnSteps.length === 0) return false
-  const last = turnSteps[turnSteps.length - 1]!
-  const lastType = strOf(last.type).toUpperCase()
-  const lastSt = strOf(last.status).toUpperCase()
-  if (lastType === 'ERROR_MESSAGE') return true
-  if (lastType === 'PLANNER_RESPONSE') {
-    const calls = Array.isArray(last.tool_calls) ? last.tool_calls : []
-    return lastSt === 'DONE' && calls.length === 0
+): void {
+  t.hasSteps = true
+  t.cachedEnded = null
+  t.lastType = stepType
+  t.lastSt = strOf(step.status).toUpperCase()
+  if (stepType === 'PLANNER_RESPONSE') {
+    const calls = Array.isArray(step.tool_calls) ? step.tool_calls : []
+    t.lastCallsLen = calls.length
+    t.lastToolName = ''
+    t.hasPlanner = true
+    t.lastPlannerSt = t.lastSt
+    t.lastPlannerHasWait = plannerBatchHasSwarmWait(calls)
+    t.lastPlannerCallsLen = calls.length
+    t.epoch += 1
+    t.batch = createBatchDoneTracker()
+    registerCallList(t.callState, calls, true, true, t.epoch)
+    return
   }
-  let lastPlannerIdx = -1
-  let lastPlannerCalls: unknown[] = []
-  let lastPlannerSt = ''
-  for (let i = turnSteps.length - 1; i >= 0; i -= 1) {
-    const step = turnSteps[i]!
-    if (strOf(step.type).toUpperCase() === 'PLANNER_RESPONSE') {
-      lastPlannerIdx = i
-      lastPlannerCalls = Array.isArray(step.tool_calls) ? step.tool_calls : []
-      lastPlannerSt = strOf(step.status).toUpperCase()
-      break
-    }
+  t.lastCallsLen = 0
+  t.lastToolName = stepToolName(step)
+  ingestTurnStep(t.callState, step, t.epoch > 0, t.epoch, bgTasks, stepType)
+  ingestBatchDoneStep(t.batch, step, stepType)
+}
+
+function isTurnEndedIncremental(t: TurnBoundaryState): boolean {
+  if (!t.hasSteps) return false
+  if (t.cachedEnded !== null) return t.cachedEnded
+  let ended = false
+  if (t.lastType === 'ERROR_MESSAGE') {
+    ended = true
+  } else if (t.lastType === 'PLANNER_RESPONSE') {
+    ended = t.lastSt === 'DONE' && t.lastCallsLen === 0
+  } else if (!t.hasPlanner) {
+    ended =
+      t.lastToolName === 'swarm_wait' &&
+      t.lastSt === 'DONE' &&
+      !batchHasUnsettled(t.batch) &&
+      t.batch.explicitSwarmWaitDone &&
+      !hasUnaccountedNonBoardToolSnapshot(t.callState)
+  } else if (
+    t.lastPlannerSt === 'DONE' &&
+    t.lastPlannerHasWait &&
+    !batchHasUnsettled(t.batch) &&
+    (t.batch.explicitSwarmWaitDone || t.batch.doneCount >= t.lastPlannerCallsLen)
+  ) {
+    ended = !hasUnaccountedNonBoardToolSnapshot(t.callState)
   }
-  // Fail closed when any non-board sibling tool in the turn (with or without planner) is unfinished.
-  if (findActiveNonBoardToolInTurn(turnSteps, lastPlannerIdx, lastPlannerCalls, bgTasks) !== null) {
-    return false
-  }
-  if (lastPlannerIdx < 0) {
-    const settled = countUniqueDoneBatchResults(turnSteps)
-    return !settled.hasUnsettled && settled.explicitSwarmWaitDone && stepToolName(last) === 'swarm_wait' && lastSt === 'DONE'
-  }
-  if (lastPlannerSt !== 'DONE' || !plannerBatchHasSwarmWait(lastPlannerCalls)) return false
-  const settled = countUniqueDoneBatchResults(turnSteps.slice(lastPlannerIdx + 1))
-  return !settled.hasUnsettled && (settled.explicitSwarmWaitDone || settled.doneCount >= lastPlannerCalls.length)
+  t.cachedEnded = ended
+  return ended
 }
 
 /**
- * Locate the current turn start without splitting on mid-turn `SYSTEM_MESSAGE` hooks.
- * `USER_INPUT` always starts a new turn; `SYSTEM_MESSAGE` starts a new turn only after
- * a prior turn has verifiably ended (deduplicated call-ID/step attribution for wait batches).
+ * Single-pass O(N) turn boundary locator: `USER_INPUT` always starts a new turn,
+ * while `SYSTEM_MESSAGE` starts a new turn only after the preceding turn has
+ * verifiably ended (never slicing or re-scanning prefixes on consecutive system messages).
  */
 export function findTurnStartIndex(
   steps: readonly Record<string, unknown>[],
   bgTasks?: BackgroundTaskState,
 ): number {
   let turnStart = 0
+  let tracker = createTurnBoundaryState()
   for (let i = 0; i < steps.length; i += 1) {
-    const stepType = strOf(steps[i]?.type).toUpperCase()
+    const step = steps[i]!
+    const stepType = strOf(step.type).toUpperCase()
     if (stepType === 'USER_INPUT') {
       turnStart = i
-    } else if (stepType === 'SYSTEM_MESSAGE' && i > turnStart) {
-      if (hasTurnEndedBeforeStep(steps.slice(turnStart, i), bgTasks)) {
+      tracker = createTurnBoundaryState()
+      ingestTurnBoundaryStep(tracker, step, stepType, bgTasks)
+    } else if (stepType === 'SYSTEM_MESSAGE') {
+      if (i > turnStart && isTurnEndedIncremental(tracker)) {
         turnStart = i
+        tracker = createTurnBoundaryState()
+        ingestTurnBoundaryStep(tracker, step, stepType, bgTasks)
       }
+    } else {
+      ingestTurnBoundaryStep(tracker, step, stepType, bgTasks)
     }
   }
   return turnStart
@@ -591,8 +652,7 @@ function findUnambiguousNameFallbackIndex(
   return candidates[0]!
 }
 
-function extractBatchCallsIfToolStep(step: Record<string, unknown>): readonly unknown[] | null {
-  const stepType = strOf(step.type).toUpperCase()
+function extractBatchCallsIfToolStep(step: Record<string, unknown>, stepType: string): readonly unknown[] | null {
   if ((stepType === 'TOOL_CALL' || stepType === 'TOOL_USE') && Array.isArray(step.tool_calls)) {
     return step.tool_calls
   }
@@ -605,11 +665,12 @@ function ingestTurnStep(
   hasPlannerRoot: boolean,
   epoch: number,
   bgTasks?: BackgroundTaskState,
+  knownStepType?: string,
 ): void {
-  const stepType = strOf(step.type).toUpperCase()
+  const stepType = knownStepType ?? strOf(step.type).toUpperCase()
   if (stepType === 'SYSTEM_MESSAGE' || stepType === 'USER_INPUT') return
   const st = strOf(step.status).toUpperCase()
-  const batchCalls = extractBatchCallsIfToolStep(step)
+  const batchCalls = extractBatchCallsIfToolStep(step, stepType)
   if (st === 'DONE' || st === 'ERROR') {
     if (batchCalls) {
       for (const raw of batchCalls) {
@@ -633,7 +694,7 @@ function ingestTurnStep(
   }
 }
 
-function resolveGenericEpochTerminals(state: CallReductionState): void {
+function resolveGenericEpochTerminals(state: CallReductionState, accounted: Set<number> = state.accounted): void {
   for (const [epoch, genericCount] of state.genericTerminalsByEpoch.entries()) {
     let epochCallCount = 0
     const retirableTargets: number[] = []
@@ -641,34 +702,46 @@ function resolveGenericEpochTerminals(state: CallReductionState): void {
       const c = state.calls[i]!
       if (c.epoch !== epoch) continue
       epochCallCount += 1
-      if (c.fromPlanner && !c.id && !c.boundDirect && !state.accounted.has(i)) {
+      if (c.fromPlanner && !c.id && !c.boundDirect && !accounted.has(i)) {
         retirableTargets.push(i)
       }
     }
     const possibleAnonymousSources = Math.max(epochCallCount, state.plannerEpochCallCounts.get(epoch) ?? 0)
     if (retirableTargets.length > 0 && genericCount >= possibleAnonymousSources) {
-      for (const idx of retirableTargets) state.accounted.add(idx)
+      for (const idx of retirableTargets) accounted.add(idx)
     }
   }
 }
 
-function resolveFallbackTerminals(state: CallReductionState): void {
+function resolveFallbackTerminals(
+  state: CallReductionState,
+  accounted: Set<number> = state.accounted,
+  idMatchedEpochNorms: Set<string> = state.idMatchedEpochNorms,
+): void {
   for (const term of state.fallbackTerminals) {
     if (term.id) {
-      const idx = state.calls.findIndex((c, i) => !state.accounted.has(i) && c.id === term.id)
+      const idx = state.calls.findIndex((c, i) => !accounted.has(i) && c.id === term.id)
       if (idx >= 0) {
         const matched = state.calls[idx]!
-        state.accounted.add(idx)
-        state.idMatchedEpochNorms.add(`${matched.epoch}:${matched.norm}`)
-        state.idMatchedEpochNorms.add(`${term.epoch}:${matched.norm}`)
+        accounted.add(idx)
+        idMatchedEpochNorms.add(`${matched.epoch}:${matched.norm}`)
+        idMatchedEpochNorms.add(`${term.epoch}:${matched.norm}`)
         continue
       }
     }
     if (!term.norm) continue
-    const fallbackIdx = findUnambiguousNameFallbackIndex(state.calls, state.accounted, state.idMatchedEpochNorms, term)
-    if (fallbackIdx >= 0) state.accounted.add(fallbackIdx)
+    const fallbackIdx = findUnambiguousNameFallbackIndex(state.calls, accounted, idMatchedEpochNorms, term)
+    if (fallbackIdx >= 0) accounted.add(fallbackIdx)
   }
-  resolveGenericEpochTerminals(state)
+  resolveGenericEpochTerminals(state, accounted)
+}
+
+function hasUnaccountedNonBoardToolSnapshot(state: CallReductionState): boolean {
+  if (!state.calls.some((c, i) => !c.isBoard && !state.accounted.has(i))) return false
+  const accounted = new Set(state.accounted)
+  const idMatched = new Set(state.idMatchedEpochNorms)
+  resolveFallbackTerminals(state, accounted, idMatched)
+  return state.calls.some((c, i) => !c.isBoard && !accounted.has(i))
 }
 
 /**

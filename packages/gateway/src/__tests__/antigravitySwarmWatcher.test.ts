@@ -2476,6 +2476,63 @@ test('OCV5-932 R1 P1-1..P1-3: >256KiB tail scrollout, >64 live task overflow, du
     const batch17Parsed = parseMemberTranscriptTail(`${batch17Steps.join('\n')}\n`)
     assert.equal(batch17Parsed.status, 'waiting', 'P1-3: all 17 batched finish notifications must be folded without dropping #17')
     assert.equal(batch17Parsed.waitingOnBoard, true)
+
+    // Steward Blocker #1: Empty or unparseable tail MUST still merge incremental bg-task evidence
+    // (preserving working for active tasks and livenessEvidencePartial=true to block onStallExhausted)
+    const emptyTailActive = parseMemberTranscriptTail('', {
+      incBgTasks: { activeIds: [`${WORKER_CONV}/task-901`], retiredIds: [], overflowed: false, sawServerRestart: false, evidenceIncomplete: true },
+    })
+    assert.equal(emptyTailActive.status, 'working', 'empty tail must preserve incremental active bg task')
+    assert.equal(emptyTailActive.incompleteBgEvidence, true)
+    const unparseableTailIncomplete = parseMemberTranscriptTail('{broken json\n', {
+      incBgTasks: { activeIds: [], retiredIds: [], overflowed: false, sawServerRestart: false, evidenceIncomplete: true },
+      tailTruncated: true,
+    })
+    assert.equal(unparseableTailIncomplete.incompleteBgEvidence, true, 'unparseable tail must preserve incompleteBgEvidence')
+    // Verify through full readAntigravitySwarmSnapshot + SwarmStallMonitor (oversized trailing unparseable chunk -> empty tail -> 0 reclaims)
+    await writeFile(workerTranscript, `${'x'.repeat(2_300_000)}`)
+    const emptyTailCache = new IncrementalTranscriptTelemetryCache()
+    const emptyTailSnap = readAntigravitySwarmSnapshot({
+      brainDir, conversationId: COORD_CONV, phase: 'running', revision: 60, telemetryCache: emptyTailCache, drainTelemetry: true,
+    })!
+    const emptyTailWorker = emptyTailSnap.members.find((m) => m.name === 'parser')!
+    assert.equal(emptyTailWorker.livenessEvidencePartial, true, 'unparseable/empty tail with incomplete inc evidence must NOT flip livenessEvidencePartial to false')
+    let emptyTailReclaimed = 0
+    const emptyTailMon = new SwarmStallMonitor({
+      stallThresholdMs: 1_000, retryCooldownMs: 1_000, exhaustedGraceMs: 1_000, maxAlerts: 1,
+      onStallExhausted: () => { emptyTailReclaimed += 1 },
+    })
+    emptyTailMon.evaluate(emptyTailSnap, 1_000)
+    emptyTailMon.evaluate({ ...emptyTailSnap, revision: 61 }, 3_000)
+    emptyTailMon.evaluate({ ...emptyTailSnap, revision: 62 }, 5_000)
+    assert.equal(emptyTailReclaimed, 0, 'empty/unparseable tail with incomplete evidence must block onStallExhausted')
+
+    // Steward Blocker #3: findTurnStartIndex MUST scale linearly O(N) on consecutive non-turn-ending SYSTEM_MESSAGE steps
+    const { findTurnStartIndex } = await import('../engine/antigravitySwarmFormat.js')
+    const measureTypeReads = (nSys: number): number => {
+      let reads = 0
+      const wrap = (obj: Record<string, unknown>) =>
+        new Proxy(obj, {
+          get(target, prop, receiver) {
+            if (prop === 'type') reads += 1
+            return Reflect.get(target, prop, receiver)
+          },
+        })
+      const seq: Record<string, unknown>[] = [
+        wrap({ step_index: 0, type: 'USER_INPUT', status: 'DONE' }),
+        wrap({ step_index: 1, type: 'TOOL_CALL', tool_call_id: 'long-a', tool_name: 'run_command', status: 'ACTIVE' }),
+        ...Array.from({ length: nSys }, (_, k) =>
+          wrap({ step_index: 2 + k, type: 'SYSTEM_MESSAGE', status: 'DONE', content: `reminder ${k}` }),
+        ),
+      ]
+      assert.equal(findTurnStartIndex(seq), 0)
+      return reads
+    }
+    const r32 = measureTypeReads(32)
+    const r64 = measureTypeReads(64)
+    const r128 = measureTypeReads(128)
+    assert.ok(r128 <= 200, `findTurnStartIndex must be O(N), got ${r128} type reads for N=128`)
+    assert.ok(r128 - r64 <= (r64 - r32) * 2.5 + 4, `type reads must grow linearly (r32=${r32}, r64=${r64}, r128=${r128})`)
   } finally {
     await rm(brainDir, { recursive: true, force: true })
   }

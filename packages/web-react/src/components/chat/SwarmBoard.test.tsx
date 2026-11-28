@@ -1,4 +1,4 @@
-import { SWARM_BOARD_TOOL_NAME, reduceLiveFrames, type SwarmSnapshot } from "@openclaude/protocol/browser";
+import { SWARM_BOARD_TOOL_NAME, extractSwarmMentions, reduceLiveFrames, type SwarmSnapshot } from "@openclaude/protocol/browser";
 import { act, cleanup, fireEvent, render, renderHook, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useSwarmBoard } from "../../hooks/useSwarmUi";
@@ -941,5 +941,16 @@ describe("Antigravity native swarm reducer & UI (OCV5-809)", () => {
     expect(linked).toContain("~~~sh\n`pwd`\necho @worker\n~~~");
     expect(linked).not.toContain("#swarm-mention:worker");
     expect(linked).toContain("[@real](#swarm-mention:real)");
+
+    // Steward Blocker #2: protocol extractSwarmMentions & Web tokenizeSwarmInlineText/linkifySwarmMarkdownTokens
+    // share one code-range scanner and agree on cross-paragraph unmatched backticks
+    const crossParagraph = "第一段含未配对反引号 `foo\n\n中间段点名 @reviewer 请复核\n\n第三段含另一未配对反引号 `bar";
+    const protoMentions = extractSwarmMentions(crossParagraph);
+    const uiMentions = tokenizeSwarmInlineText(crossParagraph)
+      .filter((t) => t.kind === "mention")
+      .map((t) => t.target);
+    expect(protoMentions).toEqual(["reviewer"]);
+    expect(uiMentions).toEqual(protoMentions);
+    expect(linkifySwarmMarkdownTokens(crossParagraph)).toContain("[@reviewer](#swarm-mention:reviewer)");
   });
 });

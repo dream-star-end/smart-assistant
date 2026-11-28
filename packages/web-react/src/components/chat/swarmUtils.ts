@@ -1,12 +1,14 @@
-import type {
-  SwarmBoardPost,
-  SwarmMemberRole,
-  SwarmMemberSnapshot,
-  SwarmMemberStatus,
-  SwarmPhase,
-  SwarmSnapshot,
+import {
+  collectSwarmCodeRanges,
+  type SwarmBoardPost,
+  type SwarmMemberRole,
+  type SwarmMemberSnapshot,
+  type SwarmMemberStatus,
+  type SwarmPhase,
+  type SwarmSnapshot,
 } from "@openclaude/protocol/browser";
 import { isSwarmActive } from "./swarmDetect";
+export { collectSwarmCodeRanges };
 export {
   extractSwarmSnapshotFromMessage,
   isSwarmActive,
@@ -504,100 +506,6 @@ export type SwarmTextToken =
   | { kind: "seq"; value: string; seq: number };
 
 const TOKEN_RE = /(@#[A-Za-z0-9][A-Za-z0-9._-]{0,63}|@[A-Za-z0-9][A-Za-z0-9._-]{0,63}|#\d{1,5})\b/g;
-
-function matchFenceOpenLine(line: string): { ch: string; len: number } | null {
-  let i = 0;
-  while (i < line.length && (line[i] === " " || line[i] === "\t" || line[i] === ">")) i += 1;
-  const ch = line[i];
-  if (ch !== "`" && ch !== "~") return null;
-  let len = 0;
-  while (i + len < line.length && line[i + len] === ch) len += 1;
-  if (len < 3) return null;
-  if (ch === "`" && line.indexOf("`", i + len) !== -1) return null;
-  return { ch, len };
-}
-
-function isFenceCloseLine(line: string, ch: string, minLen: number): boolean {
-  let i = 0;
-  while (i < line.length && (line[i] === " " || line[i] === "\t" || line[i] === ">")) i += 1;
-  let len = 0;
-  while (i + len < line.length && line[i + len] === ch) len += 1;
-  if (len < minLen) return false;
-  for (let j = i + len; j < line.length; j += 1) {
-    if (line[j] !== " " && line[j] !== "\t" && line[j] !== "\r") return false;
-  }
-  return true;
-}
-
-function collectInlineRangesInSlice(text: string, sliceStart: number, sliceEnd: number, out: Array<readonly [number, number]>): void {
-  const runs: Array<{ start: number; len: number }> = [];
-  const byLen = new Map<number, number[]>();
-  for (let i = sliceStart; i < sliceEnd; ) {
-    if (text[i] !== "`") {
-      i += 1;
-      continue;
-    }
-    let len = 1;
-    while (i + len < sliceEnd && text[i + len] === "`") len += 1;
-    const idx = runs.length;
-    runs.push({ start: i, len });
-    const bucket = byLen.get(len);
-    if (bucket) bucket.push(idx);
-    else byLen.set(len, [idx]);
-    i += len;
-  }
-  const ptrByLen = new Map<number, number>();
-  for (let r = 0; r < runs.length; ) {
-    const open = runs[r]!;
-    const bucket = byLen.get(open.len)!;
-    let ptr = ptrByLen.get(open.len) ?? 0;
-    while (ptr < bucket.length && bucket[ptr]! <= r) ptr += 1;
-    ptrByLen.set(open.len, ptr);
-    if (ptr < bucket.length) {
-      const close = runs[bucket[ptr]!]!;
-      out.push([open.start, close.start + close.len]);
-      ptrByLen.set(open.len, ptr + 1);
-      r = bucket[ptr]! + 1;
-    } else {
-      r += 1;
-    }
-  }
-}
-
-export function collectSwarmCodeRanges(text: string): Array<readonly [number, number]> {
-  if (text.indexOf("`") === -1 && text.indexOf("~") === -1) return [];
-  const ranges: Array<readonly [number, number]> = [];
-  let fence: { ch: string; len: number; start: number } | null = null;
-  let plainStart = 0;
-  let lineStart = 0;
-  while (lineStart <= text.length) {
-    const nl = text.indexOf("\n", lineStart);
-    const lineEnd = nl >= 0 ? nl : text.length;
-    const nextStart = nl >= 0 ? nl + 1 : text.length + 1;
-    const line = text.slice(lineStart, lineEnd);
-    if (fence) {
-      if (isFenceCloseLine(line, fence.ch, fence.len)) {
-        ranges.push([fence.start, Math.min(text.length, nextStart)]);
-        fence = null;
-        plainStart = Math.min(text.length, nextStart);
-      }
-    } else {
-      const opened = matchFenceOpenLine(line);
-      if (opened) {
-        if (lineStart > plainStart) collectInlineRangesInSlice(text, plainStart, lineStart, ranges);
-        fence = { ch: opened.ch, len: opened.len, start: lineStart };
-      }
-    }
-    if (nl < 0) break;
-    lineStart = nextStart;
-  }
-  if (fence) {
-    ranges.push([fence.start, text.length]);
-  } else if (plainStart < text.length) {
-    collectInlineRangesInSlice(text, plainStart, text.length, ranges);
-  }
-  return ranges;
-}
 
 export function tokenizeSwarmInlineText(text: string): SwarmTextToken[] {
   if (!text) return [];

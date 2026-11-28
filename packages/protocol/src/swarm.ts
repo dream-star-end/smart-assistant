@@ -113,17 +113,21 @@ function isSwarmFenceClose(line: string, ch: string, minLen: number): boolean {
   return true
 }
 
-function stripInlineCodeInParagraph(para: string): string {
-  if (para.indexOf('`') === -1) return para
+function collectInlineCodeRangesInSlice(
+  text: string,
+  sliceStart: number,
+  sliceEnd: number,
+  out: Array<readonly [number, number]>,
+): void {
   const runs: Array<{ start: number; len: number }> = []
   const byLen = new Map<number, number[]>()
-  for (let i = 0; i < para.length; ) {
-    if (para[i] !== '`') {
+  for (let i = sliceStart; i < sliceEnd; ) {
+    if (text[i] !== '`') {
       i += 1
       continue
     }
     let len = 1
-    while (i + len < para.length && para[i + len] === '`') len += 1
+    while (i + len < sliceEnd && text[i + len] === '`') len += 1
     const idx = runs.length
     runs.push({ start: i, len })
     const bucket = byLen.get(len)
@@ -132,8 +136,6 @@ function stripInlineCodeInParagraph(para: string): string {
     i += len
   }
   const ptrByLen = new Map<number, number>()
-  let out = ''
-  let textPos = 0
   for (let r = 0; r < runs.length; ) {
     const open = runs[r]!
     const bucket = byLen.get(open.len)!
@@ -142,49 +144,69 @@ function stripInlineCodeInParagraph(para: string): string {
     ptrByLen.set(open.len, ptr)
     if (ptr < bucket.length) {
       const close = runs[bucket[ptr]!]!
-      out += `${para.slice(textPos, open.start)} `
-      textPos = close.start + close.len
+      out.push([open.start, close.start + close.len])
       ptrByLen.set(open.len, ptr + 1)
       r = bucket[ptr]! + 1
     } else {
       r += 1
     }
   }
-  return textPos === 0 ? para : out + para.slice(textPos)
+}
+
+/**
+ * Single source of truth for Markdown code spans (fenced ``` / ~~~ blocks and
+ * paragraph-scoped inline backticks) shared by protocol mention routing and Web UI rendering.
+ */
+export function collectSwarmCodeRanges(text: string): Array<readonly [number, number]> {
+  if (text.indexOf('`') === -1 && text.indexOf('~') === -1) return []
+  const ranges: Array<readonly [number, number]> = []
+  let fence: { ch: string; len: number; start: number } | null = null
+  let paraStart = 0
+  let lineStart = 0
+  while (lineStart <= text.length) {
+    const nl = text.indexOf('\n', lineStart)
+    const lineEnd = nl >= 0 ? nl : text.length
+    const nextStart = nl >= 0 ? nl + 1 : text.length + 1
+    const line = text.slice(lineStart, lineEnd)
+    if (fence) {
+      if (isSwarmFenceClose(line, fence.ch, fence.len)) {
+        ranges.push([fence.start, Math.min(text.length, nextStart)])
+        fence = null
+        paraStart = Math.min(text.length, nextStart)
+      }
+    } else {
+      const opened = matchSwarmFenceOpen(line)
+      if (opened) {
+        if (lineStart > paraStart) collectInlineCodeRangesInSlice(text, paraStart, lineStart, ranges)
+        fence = { ch: opened.ch, len: opened.len, start: lineStart }
+      } else if (line.trim().length === 0) {
+        if (lineStart > paraStart) collectInlineCodeRangesInSlice(text, paraStart, lineStart, ranges)
+        paraStart = Math.min(text.length, nextStart)
+      }
+    }
+    if (nl < 0) break
+    lineStart = nextStart
+  }
+  if (fence) {
+    ranges.push([fence.start, text.length])
+  } else if (paraStart < text.length) {
+    collectInlineCodeRangesInSlice(text, paraStart, text.length, ranges)
+  }
+  return ranges
 }
 
 function stripSwarmMarkdownCode(text: string): string {
-  if (text.indexOf('`') === -1 && text.indexOf('~') === -1) return text
-  const lines = text.split('\n')
-  const kept: string[] = []
-  let paraLines: string[] = []
-  let fence: { ch: string; len: number } | null = null
-  const flushPara = () => {
-    if (paraLines.length === 0) return
-    kept.push(stripInlineCodeInParagraph(paraLines.join('\n')))
-    paraLines = []
+  const ranges = collectSwarmCodeRanges(text)
+  if (ranges.length === 0) return text
+  let out = ''
+  let pos = 0
+  for (const [start, end] of ranges) {
+    if (start > pos) out += text.slice(pos, start)
+    out += ' '
+    pos = end
   }
-  for (const line of lines) {
-    if (fence) {
-      if (isSwarmFenceClose(line, fence.ch, fence.len)) fence = null
-      continue
-    }
-    const opened = matchSwarmFenceOpen(line)
-    if (opened) {
-      flushPara()
-      kept.push('')
-      fence = opened
-      continue
-    }
-    if (line.trim().length === 0) {
-      flushPara()
-      kept.push('')
-      continue
-    }
-    paraLines.push(line)
-  }
-  flushPara()
-  return kept.join('\n')
+  if (pos < text.length) out += text.slice(pos)
+  return out
 }
 
 export function extractSwarmMentions(text: string): string[] {
