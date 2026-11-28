@@ -159,6 +159,37 @@ describe('lintBashCommand — false positives (must not fire)', () => {
     assert.deepEqual(codes('timeout 60 npm test'), [])
     assert.deepEqual(codes('cat /etc/os-release'), [])
   })
+
+  it('allows downstream pipe filters (| grep / | rg / | head / | tail) even when matching source paths', () => {
+    assert.deepEqual(codes('git diff --name-only | grep packages/gateway/src/server.ts'), [])
+    assert.deepEqual(codes('git ls-files |\n  grep packages/gateway/src/server.ts'), [])
+    assert.deepEqual(codes('git status -s | rg packages/commercial/src/index.ts'), [])
+    assert.deepEqual(codes('npm test 2>&1 | head -n 50'), [])
+    assert.deepEqual(codes('ls -la packages/gateway/src | tail -n 20'), [])
+  })
+
+  it('exempts rg/grep for Antigravity native run_command (allowNativeSearchCli) while pointing cat/head at read_file', async () => {
+    const { evaluateShellForHook } = await import('../agentEfficiencyGuard.js')
+    const grepCmd =
+      'grep -rn "pgSessionsBackend" /home/agent/.openclaude/workspace/wt-b1-cs1/packages/commercial/src/__tests__/ | head -n 60 && rg "HYDRATE_TAPE_ID_CHUNK" packages/commercial/src/ || true'
+    assert.equal(
+      evaluateShellForHook(grepCmd, 'deny', { engine: 'antigravity', allowNativeSearchCli: true }).decision,
+      'allow',
+    )
+    const catDeny = evaluateShellForHook('cat packages/gateway/src/server.ts', 'deny', {
+      engine: 'antigravity',
+      allowNativeSearchCli: true,
+    })
+    assert.equal(catDeny.decision, 'deny')
+    assert.match(catDeny.message ?? '', /read_file/)
+    assert.equal((catDeny.message ?? '').includes('Read/Grep/Glob'), false)
+    assert.equal((catDeny.message ?? '').includes('oc_grep'), false)
+    // Runaway sleep is still blocked in deny mode even when allowNativeSearchCli is true.
+    assert.equal(
+      evaluateShellForHook('sleep 120', 'deny', { engine: 'antigravity', allowNativeSearchCli: true }).decision,
+      'deny',
+    )
+  })
 })
 
 describe('observeToolUse — fan-out + counters', () => {

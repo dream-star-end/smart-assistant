@@ -264,7 +264,7 @@ def main():
         _deny("broker_hook_token_invalid")
         return
 
-    req_body = {"toolName": name, "arguments": args}
+    req_body = {"toolName": name, "arguments": args, "engine": "antigravity"}
     cmd = _extract_command(args)
     if cmd is not None:
         req_body["command"] = cmd

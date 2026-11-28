@@ -36,7 +36,10 @@ import {
   scrubToolBrokerEnv,
   type ToolBrokerApprovalBridge,
 } from '../../toolBrokerRuntime.js'
-import { isGatewayToolBrokerSelfhostEnabled } from '../../remoteSwarmLocal.js'
+import {
+  createGatewayToolBrokerRuntime,
+  isGatewayToolBrokerSelfhostEnabled,
+} from '../../remoteSwarmLocal.js'
 import { Gateway } from '../../server.js'
 import { handlePermissionResponse, type AskUserPermissionsHost } from '../../askUserPermissions.js'
 import {
@@ -3311,6 +3314,110 @@ test('Steward S9: Rejected policy relaxation never mutates session baseline, blo
     assert.throws(() => runtime.setSessionPolicy(sessAllow, normalPolicy), { code: 'EXEC_POLICY_RELAXATION_FORBIDDEN' })
   } finally {
     runtime.dispose()
+    await rm(workDir, { recursive: true, force: true })
+  }
+})
+
+test('OCV5-930: Antigravity broker PreToolUse honors default warn mode and never blocks native swarm rg/grep or pipe filters even in deny mode', async () => {
+  const workDir = await mkdtemp(join(tmpdir(), 'oc-p32-930-'))
+  const origGuard = process.env.OPENCLAUDE_EFFICIENCY_GUARD
+  Reflect.deleteProperty(process.env, 'OPENCLAUDE_EFFICIENCY_GUARD')
+  const warnRuntime = createGatewayToolBrokerRuntime({ homeDir: workDir })
+  const denyRuntime = createGatewayToolBrokerRuntime({
+    homeDir: join(workDir, 'deny'),
+    shellHookGuardMode: 'deny',
+  })
+  const warnSrv = await startPreAuthBrokerServer(warnRuntime)
+  const denySrv = await startPreAuthBrokerServer(denyRuntime)
+  try {
+    const sess = 'agent:main:webchat:dm:p32-ocv5-930'
+    const launchWarn = join(workDir, 'launch-warn')
+    const cfgWarn = join(launchWarn, '.gemini', 'config')
+    await mkdir(cfgWarn, { recursive: true })
+    const warnTok = warnRuntime.issueTurnHookToken({ sessionKey: sess, mode: 'normal' })
+    const warnHook = installAntigravityBrokerHook({
+      launchHome: launchWarn,
+      configDir: cfgWarn,
+      mode: 'normal',
+      brokerUrl: warnSrv.baseUrl,
+      hookToken: warnTok.token,
+    })
+
+    const runPy = async (pythonBin: string, scriptPath: string, payload: Record<string, unknown>) => {
+      const res = await runCmd(pythonBin, ['-I', '-B', scriptPath], { input: JSON.stringify(payload) })
+      assert.equal(res.code, 0, `hook stderr=${res.stderr}`)
+      return JSON.parse(res.stdout.trim()) as { decision: string; reason?: string }
+    }
+
+    // 1. Default runtime (OPENCLAUDE_EFFICIENCY_GUARD unset -> warn): never denies efficiency hints, still denies destructive ActionPolicy
+    const swarmGrepCmd =
+      'grep -rn "pgSessionsBackend" /home/agent/.openclaude/workspace/wt-b1-cs1/packages/commercial/src/__tests__/ | head -n 60 && rg "HYDRATE" packages/gateway/src/ || true'
+    assert.equal(
+      (await runPy(warnHook.pythonBin, warnHook.guardScriptPath, {
+        tool_name: 'run_command',
+        tool_input: { CommandLine: swarmGrepCmd },
+      })).decision,
+      'allow',
+    )
+    assert.equal(
+      (await runPy(warnHook.pythonBin, warnHook.guardScriptPath, {
+        tool_name: 'run_command',
+        tool_input: { CommandLine: 'cat packages/gateway/src/server.ts' },
+      })).decision,
+      'allow',
+    )
+    const destructiveRes = await runPy(warnHook.pythonBin, warnHook.guardScriptPath, {
+      tool_name: 'run_command',
+      tool_input: { CommandLine: 'rm -rf /' },
+    })
+    assert.equal(destructiveRes.decision, 'deny')
+
+    // 2. Explicit deny mode: Antigravity run_command rg/grep & pipe filters stay allowed; cat points at read_file; sleep >= 60 stays denied
+    const launchDeny = join(workDir, 'launch-deny')
+    const cfgDeny = join(launchDeny, '.gemini', 'config')
+    await mkdir(cfgDeny, { recursive: true })
+    const denyTok = denyRuntime.issueTurnHookToken({ sessionKey: sess, mode: 'normal' })
+    const denyHook = installAntigravityBrokerHook({
+      launchHome: launchDeny,
+      configDir: cfgDeny,
+      mode: 'normal',
+      brokerUrl: denySrv.baseUrl,
+      hookToken: denyTok.token,
+    })
+    assert.equal(
+      (await runPy(denyHook.pythonBin, denyHook.guardScriptPath, {
+        tool_name: 'run_command',
+        tool_input: { CommandLine: swarmGrepCmd },
+      })).decision,
+      'allow',
+    )
+    assert.equal(
+      (await runPy(denyHook.pythonBin, denyHook.guardScriptPath, {
+        tool_name: 'run_command',
+        tool_input: { CommandLine: 'git diff --name-only | grep packages/gateway/src/server.ts' },
+      })).decision,
+      'allow',
+    )
+    const denyCat = await runPy(denyHook.pythonBin, denyHook.guardScriptPath, {
+      tool_name: 'run_command',
+      tool_input: { CommandLine: 'cat packages/gateway/src/server.ts' },
+    })
+    assert.equal(denyCat.decision, 'deny')
+    assert.match(String(denyCat.reason ?? ''), /read_file/)
+    assert.equal(String(denyCat.reason ?? '').includes('Read/Grep/Glob'), false)
+
+    const denySleep = await runPy(denyHook.pythonBin, denyHook.guardScriptPath, {
+      tool_name: 'run_command',
+      tool_input: { CommandLine: 'sleep 120' },
+    })
+    assert.equal(denySleep.decision, 'deny')
+  } finally {
+    if (origGuard === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_EFFICIENCY_GUARD')
+    else process.env.OPENCLAUDE_EFFICIENCY_GUARD = origGuard
+    warnRuntime.dispose()
+    denyRuntime.dispose()
+    await warnSrv.close()
+    await denySrv.close()
     await rm(workDir, { recursive: true, force: true })
   }
 })
